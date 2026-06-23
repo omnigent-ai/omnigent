@@ -520,25 +520,6 @@ def test_codex_command_session_and_resume_mutually_exclusive(
     assert "mutually exclusive" in result.output
 
 
-def test_qwen_command_forwards_to_run_main(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``omnigent qwen`` forwards to ``run.main`` with --harness qwen."""
-    captured_args: list[str] = []
-    
-    def fake_run_main(args: list[str], **kwargs: object) -> None:
-        captured_args.extend(args)
-    
-    monkeypatch.setattr("omnigent.cli.run.main", fake_run_main)
-
-    result = CliRunner().invoke(cli, ["qwen", "--model", "qwen/qwen-plus", "-p", "hi"])
-
-    assert result.exit_code == 0, result.output
-    # Should forward to run.main with --harness qwen and all args
-    assert captured_args[0] == "--harness"
-    assert captured_args[1] == "qwen"
-    assert "--model" in captured_args
-    assert "-p" in captured_args or "--prompt" in captured_args
-
-
 # ── bundled-agent shorthands (omnigent polly / omnigent debby) ──────────
 
 
@@ -4607,3 +4588,97 @@ def test_run_agent_with_native_terminal_harness_is_rejected() -> None:
             prompt=None,
             system_prompt=None,
         )
+
+
+# ── omnigent setup: Qwen Code drill-in (_manage_qwen_harness) ────────────
+
+
+def test_qwen_auth_configured_detects_env_var(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Env-var auth is detected; a fresh install with no auth is NOT.
+
+    Guards the reported bug: a just-installed qwen (no env vars, no ~/.qwen
+    creds) must report unauthenticated rather than a false "signed in".
+    """
+    import omnigent.cli as c
+
+    # Point HOME at an empty dir so on-disk creds/settings are absent
+    # (Path.home() honors $HOME on POSIX).
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for var in ("OPENAI_API_KEY", "BAILIAN_CODING_PLAN_API_KEY", "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+    assert c._qwen_auth_configured() is False
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    assert c._qwen_auth_configured() is True
+
+
+def test_qwen_auth_configured_reads_settings_selected_type(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An auth type selected via /auth (persisted to settings.json) is detected."""
+    import omnigent.cli as c
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for var in ("OPENAI_API_KEY", "BAILIAN_CODING_PLAN_API_KEY", "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    qwen_dir = tmp_path / ".qwen"
+    qwen_dir.mkdir()
+    (qwen_dir / "settings.json").write_text(
+        '{"security": {"auth": {"selectedType": "openai"}}}', encoding="utf-8"
+    )
+
+    assert c._qwen_auth_configured() is True
+
+
+def test_manage_qwen_harness_declines_install_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the qwen CLI is missing and the user declines, the drill-in returns.
+
+    Declining install (choice 1) must bail without installing or launching qwen.
+    """
+    import omnigent.cli as c
+    import omnigent.onboarding.harness_install as hi
+    import omnigent.onboarding.interactive as it
+
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda key: False)
+    monkeypatch.setattr(it, "console", Mock())
+    install = Mock()
+    monkeypatch.setattr(hi, "install_harness_cli", install)
+    launch = Mock()
+    monkeypatch.setattr(c, "_launch_qwen_auth", launch)
+    # The install prompt offers [install, no, show-command]; pick "No".
+    monkeypatch.setattr(it, "select", lambda *a, **k: 1)
+
+    c._manage_qwen_harness()
+
+    install.assert_not_called()
+    launch.assert_not_called()
+
+
+def test_manage_qwen_harness_back_does_not_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the CLI installed, choosing "← Back" exits without launching qwen.
+
+    There is no ``qwen login`` to drive — the drill-in only offers /auth launch
+    and help, so a plain Back must be a clean no-op.
+    """
+    import omnigent.cli as c
+    import omnigent.onboarding.harness_install as hi
+    import omnigent.onboarding.interactive as it
+
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
+    monkeypatch.setattr(c, "_qwen_auth_configured", lambda: False)
+    monkeypatch.setattr(it, "console", Mock())
+    launch = Mock(return_value="x")
+    monkeypatch.setattr(c, "_launch_qwen_auth", launch)
+    # rows = [Open Qwen to run /auth, Show auth options, ← Back]; pick Back (2).
+    monkeypatch.setattr(it, "select", lambda *a, **k: 2)
+
+    c._manage_qwen_harness()
+
+    launch.assert_not_called()

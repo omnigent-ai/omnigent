@@ -28,6 +28,11 @@ Env vars read at startup:
   ``OSEnvSpec(type="caller_process", sandbox=type="none")`` so
   Omnigent mode parity with the legacy non-AP path holds for
   specs that don't declare an ``os_env:`` block.
+- ``HARNESS_QWEN_GATEWAY_BASE_URL`` / ``HARNESS_QWEN_GATEWAY_AUTH_COMMAND``:
+  OpenAI-compatible provider/gateway routing from the spec's ``auth:`` /
+  ``providers:`` config. When both are set, the executor exports
+  ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY`` / ``OPENAI_MODEL`` into the ``qwen``
+  subprocess instead of relying on the CLI's ambient auth.
 """
 
 from __future__ import annotations
@@ -56,6 +61,13 @@ _ENV_MODEL = "HARNESS_QWEN_MODEL"
 _ENV_CWD = "HARNESS_QWEN_CWD"
 _ENV_QWEN_PATH = "HARNESS_QWEN_PATH"
 _ENV_OS_ENV = "HARNESS_QWEN_OS_ENV"
+# Generic-provider / gateway routing: an OpenAI-compatible base URL plus a
+# shell command that prints a bearer token. Emitted by the spawn-env builder
+# (workflow.configure_agent_harness_with_provider) from the spec's
+# auth:/providers: config; the executor translates them into the OPENAI_* env
+# vars the qwen CLI reads. See docs/QWEN_FOLLOWUPS.md.
+_ENV_GATEWAY_BASE_URL = "HARNESS_QWEN_GATEWAY_BASE_URL"
+_ENV_GATEWAY_AUTH_COMMAND = "HARNESS_QWEN_GATEWAY_AUTH_COMMAND"
 
 # Truthy strings the wrap accepts for boolean env vars. Must
 # match the claude-sdk and codex wraps' parsers for consistency
@@ -128,12 +140,16 @@ def _build_qwen_executor() -> Executor:
     model = model_raw or None
     qwen_path_raw = os.environ.get(_ENV_QWEN_PATH, "").strip()
     qwen_path = qwen_path_raw or None
+    gateway_base_url = os.environ.get(_ENV_GATEWAY_BASE_URL, "").strip() or None
+    gateway_auth_command = os.environ.get(_ENV_GATEWAY_AUTH_COMMAND, "").strip() or None
 
     return QwenExecutor(
         cwd=cwd,
         os_env=_resolve_os_env(),
         model=model,
         qwen_path=qwen_path,
+        gateway_base_url=gateway_base_url,
+        gateway_auth_command=gateway_auth_command,
     )
 
 
@@ -153,5 +169,5 @@ def create_app() -> FastAPI:
         ``qwen`` CLI surfaces as a request-time error, not a
         FastAPI app-boot crash).
     """
-    adapter = ExecutorAdapter(executor_factory=_build_qwen_executor)
+    adapter = ExecutorAdapter(executor_factory=_build_qwen_executor, harness_label="Qwen")
     return adapter.build()

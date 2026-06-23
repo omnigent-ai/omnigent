@@ -6618,3 +6618,90 @@ async def test_create_session_reinit_preserves_existing_inbox() -> None:
             )
     finally:
         runner_app._session_inboxes_ref.pop(session_id, None)
+
+
+# ── approval-event flattening (elicitation-approval hang regression) ──────
+
+
+@pytest.mark.asyncio
+async def test_approval_event_flattened_for_harness_scaffold() -> None:
+    """A nested approval envelope is flattened to the scaffold's ApprovalEvent.
+
+    Regression for the elicitation-approval hang: the server forwards the
+    verdict as ``{"type": "approval", "data": {...}}``, but the harness
+    scaffold's ``ApprovalEvent`` requires ``elicitation_id`` / ``action`` /
+    ``content`` at the TOP level. If the runner forwards the envelope verbatim
+    the harness 422s and the parked ``ctx.elicit`` Future never resolves (the
+    turn hangs after a human approves). The runner must translate the envelope
+    into the flat event the scaffold validates — for every scaffold harness.
+    """
+    from omnigent.runtime.harnesses._scaffold import ApprovalEvent
+
+    captured: dict[str, Any] = {}
+
+    class _CapturingHarnessClient:
+        async def post(
+            self, url: str, *, json: dict[str, Any], timeout: float | None = None
+        ) -> httpx.Response:
+            captured["url"] = url
+            captured["body"] = json
+            return httpx.Response(204)
+
+    mgr = _FakeProcessManager(harness_client=cast(Any, _CapturingHarnessClient()))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, mgr),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            "/v1/sessions/conv_x/events",
+            json={
+                "type": "approval",
+                "data": {
+                    "elicitation_id": "elicit_x",
+                    "action": "accept",
+                    "content": {"note": "ok"},
+                },
+            },
+        )
+
+    assert resp.status_code == 204
+    # Forwarded body is FLAT — no ``data`` envelope.
+    assert captured["body"] == {
+        "type": "approval",
+        "elicitation_id": "elicit_x",
+        "action": "accept",
+        "content": {"note": "ok"},
+    }
+    # And it validates as the scaffold's ApprovalEvent (i.e. no 422).
+    ApprovalEvent.model_validate(captured["body"])
+
+
+@pytest.mark.asyncio
+async def test_approval_event_without_content_flattened() -> None:
+    """A decline verdict with no form content flattens without a ``content`` key."""
+    from omnigent.runtime.harnesses._scaffold import ApprovalEvent
+
+    captured: dict[str, Any] = {}
+
+    class _CapturingHarnessClient:
+        async def post(
+            self, url: str, *, json: dict[str, Any], timeout: float | None = None
+        ) -> httpx.Response:
+            captured["body"] = json
+            return httpx.Response(204)
+
+    mgr = _FakeProcessManager(harness_client=cast(Any, _CapturingHarnessClient()))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, mgr),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            "/v1/sessions/conv_y/events",
+            json={"type": "approval", "data": {"elicitation_id": "e2", "action": "decline"}},
+        )
+
+    assert resp.status_code == 204
+    assert captured["body"] == {"type": "approval", "elicitation_id": "e2", "action": "decline"}
+    ApprovalEvent.model_validate(captured["body"])

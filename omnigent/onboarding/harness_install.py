@@ -122,9 +122,14 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         "Qwen Code",
         "qwen",
         "@qwen-code/qwen-code",
-        login_args=("login",),
-        logout_args=("logout",),
-        status_args=("auth", "status"),
+        # NB: deliberately no login/logout/status args. Qwen *removed* its
+        # ``auth`` subcommand and has no CLI login — ``qwen login`` doesn't
+        # exist and ``qwen auth status`` prints "auth has been removed" and
+        # exits 0 (which would make harness_cli_logged_in falsely report a
+        # login via its exit-code fallback). Auth is via OpenAI-compatible env
+        # vars or the interactive ``/auth`` command; the setup wizard handles
+        # that in ``_manage_qwen_harness``. Leaving these None keeps
+        # harness_login/logout/cli_logged_in no-ops for qwen.
     ),
     CURSOR_KEY: HarnessInstallSpec(
         "Cursor",

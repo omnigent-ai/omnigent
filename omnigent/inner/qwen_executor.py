@@ -68,6 +68,58 @@ _INIT_TIMEOUT_SECONDS = 30.0
 _PROTOCOL_VERSION = 1
 
 
+def _inline_text_file_data(file_data: Any) -> str:  # type: ignore[explicit-any]
+    """Decode a text ``input_file`` ``file_data`` data URI into inline text.
+
+    Mirrors the codex executor: ``input_file`` blocks may carry a
+    ``data:<mime>;base64,<payload>`` URI. Text files are decoded so the model
+    sees their content; binary files (PDF, images) can't be inlined as text and
+    return ``""`` (the caller falls back to an attachment marker). A bare,
+    non-data-URI string is treated as already-inline text.
+
+    :param file_data: The block's ``file_data`` value (or ``None``).
+    :returns: Decoded text, or ``""`` when absent/binary/undecodable.
+    """
+    if not isinstance(file_data, str) or not file_data:
+        return ""
+    if not file_data.startswith("data:"):
+        return file_data
+    try:
+        import base64
+
+        meta, b64 = file_data.split(",", 1)
+        mime = meta.split(";")[0].replace("data:", "")
+        if not mime.startswith("text/"):
+            return ""  # binary payloads can't be inlined as prompt text
+        return base64.b64decode(b64).decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 — best-effort; never break a turn on a bad URI
+        return ""
+
+
+def _parse_image_data_uri(data_uri: Any) -> tuple[str, str] | None:  # type: ignore[explicit-any]
+    """Split an ``image/*`` ``data:`` URI into ``(mime_type, base64_payload)``.
+
+    ACP's ``image`` content block carries the raw base64 payload plus its media
+    type separately (``{"type": "image", "mimeType": ..., "data": ...}``), so we
+    peel those out of the ``data:image/png;base64,<payload>`` URI the runner
+    resolves a ``file_id`` into. Returns ``None`` for anything that isn't an
+    inline ``image/*`` data URI (external URLs are never fetched — SSRF).
+
+    :param data_uri: A block's ``image_url`` / ``file_data`` value (or ``None``).
+    :returns: ``(mime_type, base64_payload)`` for an image data URI, else ``None``.
+    """
+    if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
+        return None
+    try:
+        meta, payload = data_uri.split(",", 1)
+    except ValueError:
+        return None
+    mime = meta.split(";")[0].replace("data:", "")
+    if not mime.startswith("image/") or not payload:
+        return None
+    return mime, payload
+
+
 class QwenExecutor(Executor):
     """Executor that drives Qwen Code via its ACP (``--acp``) mode.
 
@@ -81,6 +133,8 @@ class QwenExecutor(Executor):
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
         qwen_path: str | None = None,
+        gateway_base_url: str | None = None,
+        gateway_auth_command: str | None = None,
     ) -> None:
         """Initialize the Qwen executor.
 
@@ -91,11 +145,22 @@ class QwenExecutor(Executor):
         :param model: Model identifier to pass in ``session/new``.
         :param qwen_path: Absolute path to qwen CLI binary.
             Defaults to ``"qwen"`` (PATH lookup).
+        :param gateway_base_url: OpenAI-compatible base URL of an Omnigent
+            provider/gateway (from ``HARNESS_QWEN_GATEWAY_BASE_URL``). When set
+            with *gateway_auth_command*, the executor exports ``OPENAI_BASE_URL``
+            / ``OPENAI_API_KEY`` / ``OPENAI_MODEL`` into the ``qwen`` subprocess
+            so the spec's ``auth:`` / ``providers:`` routing takes effect instead
+            of qwen's ambient CLI auth.
+        :param gateway_auth_command: Shell command that prints a bearer token to
+            stdout (from ``HARNESS_QWEN_GATEWAY_AUTH_COMMAND``); run once at
+            process start to snapshot ``OPENAI_API_KEY``.
         """
         self._cwd = cwd or os.getcwd()
         self._os_env = os_env
         self._model = model
         self._qwen_path = qwen_path or "qwen"
+        self._gateway_base_url = gateway_base_url
+        self._gateway_auth_command = gateway_auth_command
 
         # Asyncio subprocess (created on first run_turn call).
         self._proc: asyncio.subprocess.Process | None = None  # type: ignore[name-defined]
@@ -103,6 +168,9 @@ class QwenExecutor(Executor):
         # Queue fed by the stdout-reader coroutine.
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()  # type: ignore[explicit-any]
         self._reader_task: asyncio.Task[None] | None = None
+        # Drains qwen stderr so a chatty CLI can't fill the pipe buffer
+        # (~64 KiB) and wedge the subprocess mid-turn — see _read_stderr.
+        self._stderr_task: asyncio.Task[None] | None = None
 
         # Monotonically increasing JSON-RPC request id.
         self._rpc_id: int = 0
@@ -118,6 +186,30 @@ class QwenExecutor(Executor):
         # Whether initialize has been sent already.
         self._initialized: bool = False
 
+        # Whether qwen accepts ``image`` prompt blocks, learned from the
+        # ``initialize`` handshake (``agentCapabilities.promptCapabilities.image``).
+        # When True we forward attached images as ACP ``image`` content blocks so
+        # vision-capable models can see them; when False they degrade to a text
+        # ``[attached image: <name>]`` marker rather than vanishing.
+        self._image_supported: bool = False
+
+        # Whether the system prompt has been folded into a turn already.
+        # ACP has no dedicated system-prompt field, so we prepend it to the
+        # first user turn only (subsequent turns reuse the same session and
+        # qwen retains the earlier context).
+        self._system_prompt_sent: bool = False
+
+        # Bridges the ExecutorAdapter installs (best-effort, via
+        # ``getattr(..., None) is None``) so qwen's mid-turn
+        # ``session/request_permission`` routes through Omnigent's TOOL_CALL
+        # policy + human-consent elicitation instead of blind auto-approve —
+        # mirrors ClaudeSDKExecutor. Declared here so the install check sees
+        # them and the intent is explicit. ``None`` means "no bridge wired"
+        # (standalone use / unit tests), in which case permission falls back
+        # to allow. See _decide_permission.
+        self._policy_evaluator: Any | None = None  # type: ignore[explicit-any]
+        self._elicitation_handler: Any | None = None  # type: ignore[explicit-any]
+
     # ------------------------------------------------------------------
     # Low-level ACP helpers
     # ------------------------------------------------------------------
@@ -131,6 +223,10 @@ class QwenExecutor(Executor):
         "Separator is not found, and chunk exceed the limit".
         """
         env = os.environ.copy()
+        # Translate Omnigent's provider/gateway routing into the OpenAI-compatible
+        # env vars qwen reads (overriding any ambient values). No-op when no
+        # gateway is wired (the CLI's own ambient auth is used).
+        env.update(await self._resolve_gateway_env())
         # 16 MiB per-line limit for the stdout StreamReader.
         _STREAM_LIMIT = 16 * 1024 * 1024
         self._proc = await asyncio.create_subprocess_exec(
@@ -144,6 +240,71 @@ class QwenExecutor(Executor):
             limit=_STREAM_LIMIT,
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
+        self._stderr_task = asyncio.create_task(self._read_stderr())
+
+    async def _resolve_gateway_env(self) -> dict[str, str]:
+        """Build the OpenAI-compatible env qwen reads from the gateway config.
+
+        When a provider/gateway is wired (base URL + a bearer-token command),
+        run the command **once** to snapshot a token and return
+        ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY`` / ``OPENAI_MODEL``. Returns an
+        empty dict when no gateway is configured (the CLI's ambient auth path).
+
+        The token is captured at process start; qwen has no token-refresh hook,
+        so a short-lived rotating token (e.g. the Databricks gateway) can expire
+        over a long session — restart the subprocess to refresh. See
+        docs/QWEN_FOLLOWUPS.md.
+
+        :returns: The OPENAI_* overrides, or ``{}`` when no gateway is wired.
+        :raises RuntimeError: If the auth command fails or yields no token.
+        """
+        if not self._gateway_base_url or not self._gateway_auth_command:
+            return {}
+        proc = await asyncio.create_subprocess_exec(
+            "sh",
+            "-c",
+            self._gateway_auth_command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+        if proc.returncode != 0:
+            detail = err.decode("utf-8", errors="replace").strip()[:200]
+            raise RuntimeError(
+                f"qwen gateway auth command failed (exit {proc.returncode}): {detail}"
+            )
+        token = out.decode("utf-8", errors="replace").strip()
+        if not token:
+            raise RuntimeError("qwen gateway auth command produced an empty token")
+        env: dict[str, str] = {
+            "OPENAI_BASE_URL": self._gateway_base_url,
+            "OPENAI_API_KEY": token,
+        }
+        if self._model:
+            env["OPENAI_MODEL"] = self._model
+        return env
+
+    async def _read_stderr(self) -> None:
+        """Continuously drain qwen stderr, logging each line at debug.
+
+        With ``stderr=PIPE`` and no reader, a chatty ``qwen`` process can
+        fill the OS pipe buffer (~64 KiB), block on its next stderr write,
+        and stall the whole turn until the prompt timeout fires. Draining
+        keeps the pipe clear; the lines are logged so diagnostics aren't lost.
+        """
+        assert self._proc and self._proc.stderr
+        try:
+            while True:
+                raw_line = await self._proc.stderr.readline()
+                if not raw_line:
+                    break  # EOF — process exited
+                line = raw_line.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    logger.debug("qwen stderr: %s", line)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("qwen stderr reader stopped: %s", exc)
 
     async def _read_stdout(self) -> None:
         """Continuously read NDJSON lines from qwen stdout.
@@ -186,7 +347,7 @@ class QwenExecutor(Executor):
                     await self._queue.put(msg)
         except (asyncio.CancelledError, EOFError):
             pass
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("qwen stdout reader error: %s", exc)
             # Wake any pending futures with an error so callers don't block
             # forever when the process dies unexpectedly.
@@ -266,6 +427,10 @@ class QwenExecutor(Executor):
             raise RuntimeError(
                 f"qwen ACP initialize failed: {resp['error'].get('message', resp['error'])}"
             )
+        prompt_caps = (
+            (resp.get("result") or {}).get("agentCapabilities", {}).get("promptCapabilities", {})
+        )
+        self._image_supported = bool(prompt_caps.get("image"))
         self._initialized = True
 
     async def _ensure_session(self) -> str:
@@ -300,11 +465,283 @@ class QwenExecutor(Executor):
         server_session_id = result.get("sessionId")
         if not server_session_id:
             raise RuntimeError(
-                "qwen ACP session/new response missing sessionId: "
-                + json.dumps(resp)[:200]
+                "qwen ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
         self._session_id = server_session_id
         return self._session_id
+
+    # ------------------------------------------------------------------
+    # Server-initiated requests (agent → client)
+    # ------------------------------------------------------------------
+
+    async def _respond_to_agent_request(self, request: dict[str, Any]) -> None:  # type: ignore[explicit-any]
+        """Answer a server-initiated ACP request from qwen.
+
+        qwen can drive the client mid-turn (e.g. permission prompts). A blanket
+        ``{"result": {}}`` reply would be wrong, so we branch on the method:
+
+        - ``session/request_permission`` — decide via Omnigent's TOOL_CALL
+          policy + human-consent elicitation (:meth:`_decide_permission`),
+          then select the matching allow/reject option. NOT a blind approve.
+        - anything else — reply with a JSON-RPC ``method not found`` error
+          rather than a bogus success, so qwen fails loudly instead of acting
+          on empty data.
+
+        NB: we do **not** advertise ``clientCapabilities.fs`` in ``initialize``,
+        so qwen never delegates file ops to us — it uses its own file tools, and
+        any ``fs/*`` request would hit the ``method not found`` branch. To route
+        file I/O through Omnigent, advertise the capability and add
+        ``fs/read_text_file`` / ``fs/write_text_file`` handlers (see
+        docs/QWEN_FOLLOWUPS.md).
+
+        :param request: The decoded JSON-RPC request object (has ``id`` and
+            ``method``).
+        """
+        req_id = request.get("id")
+        method = request.get("method", "")
+        params = request.get("params", {}) or {}
+        # Log every server-initiated request so DEBUG reveals whether qwen
+        # actually delegates permissions/fs to us (vs handling them itself).
+        logger.debug("qwen agent request: method=%s id=%s", method, req_id)
+
+        result: dict[str, Any] | None = None  # type: ignore[explicit-any]
+        error: dict[str, Any] | None = None  # type: ignore[explicit-any]
+
+        try:
+            if method == "session/request_permission":
+                allow = await self._decide_permission(params)
+                result = {"outcome": self._permission_outcome(params, allow=allow)}
+            else:
+                error = {
+                    "code": -32601,
+                    "message": f"omnigent: unsupported ACP request method {method!r}",
+                }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("qwen agent request %s failed: %s", method, exc)
+            error = {"code": -32603, "message": f"{method} failed: {exc}"}
+
+        reply: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id}  # type: ignore[explicit-any]
+        if error is not None:
+            reply["error"] = error
+        else:
+            reply["result"] = result
+        await self._send(reply)
+
+    @staticmethod
+    def _extract_tool_call(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:  # type: ignore[explicit-any]
+        """Pull ``(tool_name, tool_input)`` from a ``session/request_permission``.
+
+        Qwen's payload carries a ``toolCall`` with ``_meta.toolName`` (e.g.
+        ``"run_shell_command"``) and a ``rawInput`` dict (e.g.
+        ``{"command": "rm -f …", …}``). Falls back to the tool-call ``kind``
+        (e.g. ``"execute"``) and an empty dict when fields are absent.
+        """
+        tool_call = params.get("toolCall") or {}
+        meta = tool_call.get("_meta") or {}
+        name = meta.get("toolName") or tool_call.get("kind") or "tool"
+        args = tool_call.get("rawInput")
+        if not isinstance(args, dict):
+            args = {}
+        return str(name), args
+
+    async def _decide_permission(self, params: dict[str, Any]) -> bool:  # type: ignore[explicit-any]
+        """Decide allow/deny for a permission request — policy then elicitation.
+
+        Mirrors ``ClaudeSDKExecutor``'s ``can_use_tool`` gate, composed of two
+        independent checks read from the adapter-installed bridges:
+
+        1. **TOOL_CALL policy** (:attr:`_policy_evaluator`): a hard
+           ``POLICY_ACTION_DENY`` denies; ``POLICY_ACTION_ASK`` defers to
+           elicitation (and **fails closed** — deny — when no elicitation
+           handler is wired); ``ALLOW`` / unspecified falls through.
+        2. **Human-consent elicitation** (:attr:`_elicitation_handler`): routes
+           to the user via ``ctx.elicit`` and returns their accept/deny.
+
+        When neither bridge is wired (standalone use / unit tests), falls back
+        to allow so direct use of the executor isn't blocked. In normal runner
+        operation the adapter always installs both, so destructive actions are
+        gated rather than blindly approved.
+
+        :param params: The ``session/request_permission`` params.
+        :returns: ``True`` to allow the tool call, ``False`` to deny it.
+        """
+        tool_name, tool_input = self._extract_tool_call(params)
+        handler = getattr(self, "_elicitation_handler", None)
+        policy_eval = getattr(self, "_policy_evaluator", None)
+
+        if policy_eval is not None:
+            action: str | None
+            try:
+                verdict = await policy_eval(
+                    "PHASE_TOOL_CALL", {"name": tool_name, "arguments": tool_input}
+                )
+                action = getattr(verdict, "action", None)
+            except Exception as exc:  # noqa: BLE001 — fail open to elicitation
+                logger.warning("qwen TOOL_CALL policy eval failed for %s: %s", tool_name, exc)
+                action = None
+            if action == "POLICY_ACTION_DENY":
+                logger.info("qwen permission denied by policy: tool=%s", tool_name)
+                return False
+            if action == "POLICY_ACTION_ASK":
+                if handler is None:
+                    logger.warning(
+                        "qwen TOOL_CALL policy ASK with no elicitation handler; denying tool=%s",
+                        tool_name,
+                    )
+                    return False
+                allowed = bool(await handler(tool_name, tool_input))
+                logger.info(
+                    "qwen permission %s by user (policy ASK): tool=%s",
+                    "allowed" if allowed else "denied",
+                    tool_name,
+                )
+                return allowed
+            # ALLOW / UNSPECIFIED / unknown → fall through to elicitation.
+
+        if handler is not None:
+            allowed = bool(await handler(tool_name, tool_input))
+            logger.info(
+                "qwen permission %s by user: tool=%s",
+                "allowed" if allowed else "denied",
+                tool_name,
+            )
+            return allowed
+
+        # No gates wired (standalone / tests) — allow.
+        logger.debug("qwen permission allowed (no policy/elicitation wired): tool=%s", tool_name)
+        return True
+
+    @staticmethod
+    def _permission_outcome(  # type: ignore[explicit-any]
+        params: dict[str, Any], *, allow: bool
+    ) -> dict[str, Any]:
+        """Map an allow/deny decision to an ACP permission ``outcome``.
+
+        On allow, prefer a once-scoped grant (``allow_once``) over
+        ``allow_always`` so we never persist a blanket "always allow". On deny,
+        pick a ``reject_*`` option, or ``cancelled`` when none is offered.
+        """
+        options = [o for o in (params.get("options") or []) if isinstance(o, dict)]
+
+        def _pick(*kinds: str) -> dict[str, Any] | None:  # type: ignore[explicit-any]
+            for kind in kinds:  # exact-kind preference order
+                for opt in options:
+                    if opt.get("kind") == kind:
+                        return opt
+            return None
+
+        if allow:
+            chosen = _pick("allow_once", "allow_always") or next(
+                (o for o in options if "allow" in str(o.get("kind", ""))), None
+            )
+            if chosen is None:  # no allow option offered — fail safe
+                return {"outcome": "cancelled"}
+        else:
+            chosen = _pick("reject_once", "reject_always") or next(
+                (o for o in options if "reject" in str(o.get("kind", ""))), None
+            )
+            if chosen is None:  # no explicit reject option — cancel
+                return {"outcome": "cancelled"}
+        return {"outcome": "selected", "optionId": chosen.get("optionId")}
+
+    @staticmethod
+    def _image_blocks_from_content(content: Any) -> list[dict[str, Any]]:  # type: ignore[explicit-any]
+        """Build ACP ``image`` prompt blocks from a message's ``input_image`` blocks.
+
+        The runner resolves a ``file_id`` into an inline ``image_url`` (or
+        ``file_data``) ``data:image/…;base64,…`` URI before the message reaches
+        us; we peel that into ACP's ``{"type": "image", "mimeType", "data"}``
+        shape. External URLs and non-image payloads are skipped (they're handled
+        as text / markers by :meth:`_text_from_blocks`).
+
+        :param content: A message's ``content`` (block list, or non-list → none).
+        :returns: A list of ACP image content blocks (possibly empty).
+        """
+        out: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+        if not isinstance(content, list):
+            return out
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "input_image":
+                continue
+            parsed = _parse_image_data_uri(block.get("image_url") or block.get("file_data"))
+            if parsed:
+                mime, data = parsed
+                out.append({"type": "image", "mimeType": mime, "data": data})
+        return out
+
+    @staticmethod
+    def _text_from_blocks(
+        blocks: list[Any],
+        *,
+        emit_image_marker: bool = False,  # type: ignore[explicit-any]
+    ) -> str:
+        """Extract prompt text from a Responses-API content-block list.
+
+        The harness adapter passes a content **list** (rather than a plain
+        string) whenever a message carries a non-text block — e.g. a file
+        attachment becomes ``[{"type": "input_text", …}, {"type":
+        "input_file", …}]``. ACP's ``session/prompt`` is text-only, so we
+        fold each block into text:
+
+        - ``input_text`` / ``output_text`` / ``text`` → the text verbatim.
+        - ``input_file`` → the file's inlined content (fenced with a labeled
+          ``--- attached file: <name> ---`` header/footer) when the runner
+          resolved it into a text ``file_data`` data URI; otherwise a
+          ``[attached file: <name>]`` marker so the attachment isn't silently
+          dropped. The fence keeps the action request and the file body
+          separate — bare-appending raw content derails weaker models into
+          narrating tool calls as prose (full file delivery via ``file_id`` and
+          audio input are deferred — see docs/QWEN_FOLLOWUPS.md).
+        - ``input_image`` → handled out-of-band as a real ACP ``image`` prompt
+          block (:meth:`_image_blocks_from_content`); this fold emits a
+          ``[attached image: <name>]`` marker only when *emit_image_marker* is
+          set (qwen lacks image capability), so the image isn't silently lost.
+
+        Crucially, the block ``type`` is ``input_text`` (not ``text``): the
+        previous ``type == "text"`` filter matched nothing, dropping the whole
+        message — text and file alike — whenever an attachment was present.
+
+        :param blocks: The message ``content`` list.
+        :param emit_image_marker: When ``True``, append a ``[attached image:
+            …]`` marker for each ``input_image`` (used when qwen can't accept a
+            real image block); when ``False``, skip images here (the caller
+            forwards them as ACP image blocks).
+        :returns: The concatenated prompt text (may be empty).
+        """
+        parts: list[str] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype in ("input_text", "output_text", "text"):
+                text = block.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+            elif btype == "input_file":
+                name = block.get("filename") or block.get("file_id") or "file"
+                inlined = _inline_text_file_data(block.get("file_data"))
+                if inlined:
+                    # Fence the content with a labeled header/footer so the model
+                    # reads it as an *attachment*, not as instructions. Bare-
+                    # appending the raw text derails weaker models (notably
+                    # qwen3-coder:free): they lose the tool-calling thread and
+                    # narrate the shell command as prose instead of emitting a
+                    # structured call. Fencing keeps the action request and the
+                    # file body visually separate. See docs/QWEN_FOLLOWUPS.md.
+                    parts.append(
+                        f"--- attached file: {name} ---\n{inlined}\n--- end of {name} ---"
+                    )
+                else:
+                    parts.append(f"[attached file: {name}]")
+            elif btype == "input_image" and emit_image_marker:
+                # Only when qwen can't take a real image block (capability off):
+                # leave a marker so the image isn't silently dropped. When it
+                # can, the image is sent via _image_blocks_from_content instead.
+                name = block.get("filename") or block.get("file_id")
+                parts.append(f"[attached image: {name}]" if name else "[attached image]")
+            # input_audio: no audio over the ACP text prompt yet (deferred —
+            # see docs/QWEN_FOLLOWUPS.md).
+        return "\n".join(parts)
 
     # ------------------------------------------------------------------
     # Executor interface
@@ -313,9 +750,9 @@ class QwenExecutor(Executor):
     async def run_turn(
         self,
         messages: list[Message],
-        tools: list[Any],  # type: ignore[explicit-any]
+        tools: list[Any],  # type: ignore[explicit-any]  # noqa: ARG002 — qwen runs its own tool registry; param required by the Executor interface
         system_prompt: str,
-        config: ExecutorConfig | None = None,
+        config: ExecutorConfig | None = None,  # noqa: ARG002 — unused; required by the Executor interface
     ) -> AsyncIterator[ExecutorEvent]:
         """Run one turn of the Qwen agent loop via ACP.
 
@@ -329,11 +766,12 @@ class QwenExecutor(Executor):
         :param system_prompt: Instructions for the session.
         :param config: Optional executor config (model override etc.).
         """
-        # Lazily boot the subprocess.
-        if self._proc is None or self._proc.returncode is not None:
-            await self._start_process()
-
         try:
+            # Lazily boot the subprocess. A missing/unspawnable ``qwen`` binary
+            # raises here (FileNotFoundError / OSError) — surface it as a clean
+            # ExecutorError instead of letting it escape the generator.
+            if self._proc is None or self._proc.returncode is not None:
+                await self._start_process()
             await self._ensure_initialized()
             session_id = await self._ensure_session()
         except Exception as exc:  # noqa: BLE001
@@ -342,6 +780,7 @@ class QwenExecutor(Executor):
 
         # Build the prompt payload from the most recent user message.
         user_text = ""
+        image_blocks: list[dict[str, Any]] = []  # type: ignore[explicit-any]
         for msg in reversed(messages):
             role = msg.get("role", "") if isinstance(msg, dict) else ""
             if role == "user":
@@ -349,22 +788,40 @@ class QwenExecutor(Executor):
                 if isinstance(content, str):
                     user_text = content
                 elif isinstance(content, list):
-                    parts = [
-                        block.get("text", "")
-                        for block in content
-                        if isinstance(block, dict) and block.get("type") == "text"
-                    ]
-                    user_text = "\n".join(parts)
+                    # Forward attached images as real ACP image blocks when qwen
+                    # supports them (vision models can then see them); otherwise
+                    # fall back to a text marker so they aren't silently dropped.
+                    if self._image_supported:
+                        image_blocks = self._image_blocks_from_content(content)
+                    user_text = self._text_from_blocks(
+                        content, emit_image_marker=not self._image_supported
+                    )
                 break
 
-        prompt_blocks = [{"type": "text", "text": user_text}]
+        # ACP has no system-prompt field, so fold it into the first turn's
+        # user text. Without this the agent's persona / instructions (the
+        # spec ``prompt:``) never reach qwen and it runs uninstructed.
+        if not self._system_prompt_sent and system_prompt:
+            user_text = f"{system_prompt}\n\n{user_text}" if user_text else system_prompt
+            self._system_prompt_sent = True
 
-        # Drain any stale notifications from a prior turn.
+        # Text first, then any image blocks (ACP prompt is an ordered array).
+        prompt_blocks: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+        if user_text or not image_blocks:
+            prompt_blocks.append({"type": "text", "text": user_text})
+        prompt_blocks.extend(image_blocks)
+
+        # Drain stale items from a prior turn. Notifications (no ``id``) are
+        # safe to drop, but a server-initiated *request* left in the queue is
+        # still awaiting a reply — answer it instead of discarding it, or qwen
+        # blocks forever on a response that never comes.
         while not self._queue.empty():
             try:
-                self._queue.get_nowait()
+                stale = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            if isinstance(stale, dict) and stale.get("id") is not None and stale.get("method"):
+                await self._respond_to_agent_request(stale)
 
         # Send the turn — this is a JSON-RPC *request*, so we wait for
         # both streaming notifications AND the final response.
@@ -392,19 +849,28 @@ class QwenExecutor(Executor):
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
-                yield ExecutorError(
-                    message="Timeout waiting for qwen response", retryable=True
-                )
+                yield ExecutorError(message="Timeout waiting for qwen response", retryable=True)
                 return
 
             # Check if the final response arrived.
             if fut.done():
-                response = fut.result()
+                try:
+                    response = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    # The stdout reader sets an exception on the future when the
+                    # subprocess dies. Surface it as a clean retryable error
+                    # rather than letting it raise out of the generator.
+                    self._session_id = None
+                    self._system_prompt_sent = False
+                    yield ExecutorError(message=f"qwen process error: {exc}", retryable=True)
+                    return
                 if "error" in response:
                     error_msg = response["error"].get("message", "Unknown ACP error")
-                    # If the session was lost, reset so next turn creates a new one.
+                    # If the session was lost, reset so next turn creates a new
+                    # one — and re-send the system prompt into that fresh session.
                     if "Session not found" in error_msg:
                         self._session_id = None
+                        self._system_prompt_sent = False
                     yield ExecutorError(message=error_msg, retryable=True)
                     return
                 # Successful completion.
@@ -449,18 +915,11 @@ class QwenExecutor(Executor):
                     # Status update on an in-progress tool call — skip.
                     pass
 
-            elif notification.get("id") is not None:
-                # An incoming *request* from qwen (e.g. session/request_permission,
-                # fs/read_text_file, terminal/*).  For now, auto-approve everything
-                # and return an empty success response so qwen doesn't hang.
-                req_id_from_agent = notification["id"]
-                await self._send(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id_from_agent,
-                        "result": {},
-                    }
-                )
+            elif notification.get("id") is not None and notification.get("method"):
+                # An incoming *request* from qwen (e.g. session/request_permission).
+                # Dispatch by method — auto-approve permissions, method-not-found
+                # for anything else (we advertise no fs capability).
+                await self._respond_to_agent_request(notification)
 
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; sessions are per-process)."""
@@ -472,6 +931,12 @@ class QwenExecutor(Executor):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._reader_task
             self._reader_task = None
+
+        if self._stderr_task:
+            self._stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._stderr_task
+            self._stderr_task = None
 
         if self._proc:
             with contextlib.suppress(Exception):

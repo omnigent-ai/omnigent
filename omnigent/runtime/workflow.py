@@ -1308,10 +1308,10 @@ def _build_qwen_spawn_env(
     :func:`_build_codex_spawn_env`.
 
     :param spec: The agent spec.
-    :param workdir: The bundle's on-disk path (extracted by the
-        agent cache). Threaded through as ``HARNESS_QWEN_BUNDLE_DIR``
-        so the harness wrap's executor can source bundled skills
-        from ``<bundle>/skills/<name>/``.
+    :param workdir: The bundle's on-disk path (extracted by the agent
+        cache). Accepted for signature parity with the other
+        ``_build_*_spawn_env`` builders; the qwen wrap does not yet
+        consume a bundle dir (no skills bridge — see docs/QWEN_FOLLOWUPS.md).
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
@@ -1343,14 +1343,12 @@ def _build_qwen_spawn_env(
             str(profile) if profile else None,
             harness_type="qwen",
         )
-    # Skills bridge — same shape as the claude-sdk + codex variants.
-    # Always set so the harness wrap doesn't fall back to ``"all"``
-    # and override an explicit ``skills: none`` from the spec.
-    env["HARNESS_QWEN_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
-    if spec.name:
-        env["HARNESS_QWEN_AGENT_NAME"] = spec.name
-    if workdir is not None:
-        env["HARNESS_QWEN_BUNDLE_DIR"] = str(workdir)
+    # NB: no skills bridge for qwen yet. Unlike the claude-sdk / codex
+    # variants, the qwen wrap (omnigent/inner/qwen_harness.py) and
+    # QwenExecutor have no skills concept, so emitting
+    # HARNESS_QWEN_SKILLS_FILTER / _AGENT_NAME / _BUNDLE_DIR would set env
+    # nothing reads. Wire those through when skills land — see
+    # docs/QWEN_FOLLOWUPS.md.
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_QWEN_OS_ENV"] = os_env_payload

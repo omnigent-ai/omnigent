@@ -10680,10 +10680,15 @@ def create_runner_app(
         # Resolve pending policy approval Futures.
         if body_type == "approval":
             _data = body.get("data") or body
-            _elic = _data.get("elicitation_id", "")
-            _action = _data.get("action", "")
-            _approved = _action == "accept"
-            pending_approvals.resolve(_elic, _approved)
+            pending_approvals.resolve(
+                _data.get("elicitation_id", ""), _data.get("action") == "accept"
+            )
+            # The server wraps the verdict as ``{"type": "approval", "data": {…}}``,
+            # but the harness scaffold's ``ApprovalEvent`` wants the fields at the
+            # top level — forwarding the envelope verbatim 422s and hangs the turn.
+            # Unwrap ``data`` to the top level (robust to added/renamed fields —
+            # the model ignores extras) and keep the discriminator.
+            body = {**_data, "type": "approval"}
 
         # Control event (interrupt / tool_result / approval): get a
         # harness client for this conversation and POST the body

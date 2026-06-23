@@ -1174,7 +1174,6 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "pane-split",
         "pi",
         "polly",
-        "qwen",
         "resume",
         "run",
         "sandbox",
@@ -4573,34 +4572,6 @@ def cursor(
         resume_picker=choice.picker,
         cursor_args=cursor_args,
         auto_open_conversation=auto_open_conversation,
-    )
-
-
-@cli.command(
-    context_settings={
-        "ignore_unknown_options": True,
-        "allow_extra_args": True,
-    }
-)
-@click.argument("qwen_args", nargs=-1, type=click.UNPROCESSED)
-def qwen(
-    qwen_args: tuple[str, ...],
-) -> None:
-    """Launch Qwen Code headlessly via the Omnigent REPL.
-
-    \b
-    Examples:
-      omnigent qwen
-      omnigent qwen --model qwen/qwen-2.5-coder
-      omnigent qwen -p "review my latest commit"
-    """
-    # Forward to omnigent run with --harness qwen, inheriting all run's flags.
-    from omnigent.cli import run
-
-    run.main(
-        args=["--harness", "qwen", *qwen_args],
-        prog_name="omnigent run",
-        standalone_mode=False,
     )
 
 
@@ -8939,6 +8910,185 @@ def _set_antigravity_api_key() -> str | None:
     return "✓ Gemini API key stored"
 
 
+def _qwen_auth_configured() -> bool:
+    """Best-effort check whether Qwen Code can authenticate non-interactively.
+
+    Qwen has **no CLI login** — its ``auth`` subcommand was removed. For our
+    ``qwen --acp`` executor, auth must come from one of:
+
+    - API-key / provider env vars (the headless path): ``OPENAI_API_KEY``,
+      ``BAILIAN_CODING_PLAN_API_KEY``, or ``OPENROUTER_API_KEY``; or
+    - an auth type selected via the interactive ``/auth`` flow (API key or the
+      Alibaba Cloud Coding Plan), persisted to ``~/.qwen/settings.json``.
+
+    (Qwen OAuth was discontinued on 2026-04-15, so it is not an auth path here.)
+
+    Best-effort: the env-var check is reliable; the on-disk check keys off
+    ``settings.json`` fields whose schema is not contract-stable (see
+    docs/QWEN_FOLLOWUPS.md). Returns ``False`` for a fresh install with no auth —
+    the case that must NOT render as "signed in".
+
+    :returns: ``True`` when auth is detectable, else ``False``.
+    """
+    import json
+    from pathlib import Path
+
+    if any(
+        os.environ.get(v)
+        for v in ("OPENAI_API_KEY", "BAILIAN_CODING_PLAN_API_KEY", "OPENROUTER_API_KEY")
+    ):
+        return True
+    settings = Path.home() / ".qwen" / "settings.json"
+    if settings.is_file():
+        try:
+            data = json.loads(settings.read_text())
+        except (OSError, ValueError):
+            return False
+        if isinstance(data, dict):
+            if data.get("selectedAuthType"):
+                return True
+            security = data.get("security")
+            auth = security.get("auth") if isinstance(security, dict) else None
+            if isinstance(auth, dict) and (
+                auth.get("selectedType") or auth.get("selectedAuthType")
+            ):
+                return True
+    return False
+
+
+def _print_qwen_auth_help() -> None:
+    """Print Qwen's authentication options (it has no ``qwen login``)."""
+    from omnigent.onboarding.interactive import console
+
+    console.print(
+        "\n  [bold]Authenticate Qwen Code[/bold]:\n"
+        "    • Interactive: run [bold]qwen[/bold] and use [bold]/auth[/bold] "
+        "(API key or Alibaba Cloud Coding Plan)\n"
+        "    • Headless / ACP: set [bold]OPENAI_API_KEY[/bold] + "
+        "[bold]OPENAI_BASE_URL[/bold] + [bold]OPENAI_MODEL[/bold]\n"
+        "    • Coding Plan: [bold]BAILIAN_CODING_PLAN_API_KEY[/bold] + the "
+        "Coding Plan base URL\n"
+        "    • OpenRouter: [bold]OPENROUTER_API_KEY[/bold] + "
+        "OPENAI_BASE_URL=https://openrouter.ai/api/v1\n"
+    )
+
+
+def _launch_qwen_auth() -> str | None:
+    """Launch the interactive ``qwen`` TUI so the user can run ``/auth``.
+
+    The ``/auth`` flow (API key or Alibaba Cloud Coding Plan) is interactive, so
+    this hands the terminal to ``qwen``; when the user exits, re-check auth.
+
+    :returns: A status line for the menu reflecting the post-launch auth state.
+    """
+    from omnigent.onboarding.harness_install import (
+        QWEN_KEY,
+        harness_cli_installed,
+        harness_install_spec,
+    )
+    from omnigent.onboarding.interactive import console
+
+    if not harness_cli_installed(QWEN_KEY):
+        return "✗ qwen CLI not found"
+    spec = harness_install_spec(QWEN_KEY)
+    assert spec is not None
+    console.print(
+        "  [dim]Launching Qwen — type [bold]/auth[/bold] to configure authentication, "
+        "then exit (/quit) to return.[/dim]"
+    )
+    with contextlib.suppress(OSError, KeyboardInterrupt):
+        subprocess.run([spec.binary], check=False)
+    return "✓ authentication detected" if _qwen_auth_configured() else "Auth not detected yet"
+
+
+def _manage_qwen_harness() -> None:
+    """Run the level-2 loop for Qwen Code: install the CLI and guide auth setup.
+
+    Qwen has **no CLI subscription login** — its ``auth`` subcommand was removed.
+    Authentication is either OpenAI-compatible env vars (for the headless
+    ``qwen --acp`` path) or the interactive ``/auth`` command (API key or
+    Alibaba Cloud Coding Plan). So this drill-in installs the CLI when missing,
+    reports best-effort auth status (:func:`_qwen_auth_configured`), and offers
+    to launch ``qwen`` for ``/auth`` — it does **not** pretend to run a ``qwen
+    login``
+    (there isn't one). Storing/injecting an OpenAI-compatible key *through
+    Omnigent* is deferred (see docs/QWEN_FOLLOWUPS.md, Provider Injection).
+
+    Like the CLI-backed harnesses, a missing CLI gates the drill-in — there's
+    nothing to configure for a harness you can't run.
+
+    :returns: None. Side effects: may ``npm install`` the qwen CLI and launch the
+        interactive ``qwen`` TUI for ``/auth``.
+    """
+    from omnigent.onboarding.harness_install import (
+        QWEN_KEY,
+        harness_cli_installed,
+        harness_install_command,
+        install_harness_cli,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    # Gate on the CLI. Offer to install it; declining (or copy-the-command)
+    # returns to the harness picker.
+    if not harness_cli_installed(QWEN_KEY):
+        cmd = " ".join(harness_install_command(QWEN_KEY))
+        choice = select(
+            "Qwen Code's CLI isn't installed. Install it now?",
+            [
+                f"Yes — install ({cmd})",
+                "No — back to harnesses",
+                "I'll run it myself (show the command)",
+            ],
+            descriptions=[
+                f"Runs `{cmd}` (needs npm), then continues to auth setup.",
+                "Return to the harness picker without installing.",
+                "Print the command so you can install it yourself, then return.",
+            ],
+            default=0,
+            clear_on_exit=True,
+        )
+        if choice == 0:
+            console.print(f"  [dim]Installing Qwen Code — running `{cmd}`…[/dim]")
+            if install_harness_cli(QWEN_KEY):
+                console.print("  [green]✓ Qwen Code installed[/green]")
+            else:
+                console.print(
+                    f"  [red]Install failed.[/red] Run it manually, then re-open: "
+                    f"[bold]{cmd}[/bold]"
+                )
+                return
+        else:
+            if choice == 2:  # run it yourself
+                console.print(f"  Install Qwen Code with:\n    [bold]{cmd}[/bold]")
+            return
+
+    # Carry the prior action's confirmation as a transient status line.
+    status: str | None = None
+    while True:
+        configured = _qwen_auth_configured()
+        header = (
+            "Qwen Code — authentication detected"
+            if configured
+            else "Qwen Code — not authenticated yet"
+        )
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow("Open Qwen to run /auth", action="auth"),
+            _HarnessMenuRow("Show auth options", action="help"),
+            _HarnessMenuRow("← Back", action="back"),
+        ]
+        idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
+        if idx < 0:  # Esc / q
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "auth":
+            status = _launch_qwen_auth()
+        elif action == "help":
+            _print_qwen_auth_help()
+            status = None
+
+
 def _manage_credential(provider: str, family: str) -> str | None:
     """Run the level-3 loop for one credential: make default / remove.
 
@@ -9210,8 +9360,8 @@ def _run_configure_harnesses_interactive() -> None:
     Opening it backfills a legacy databricks ``auth:`` block into a real
     provider and adopts any ambient-detected credential — announcing the
     newly auto-configured machine credentials in a callout — then loops on
-    the level-1 harness overview (Claude / Codex / Pi / Quit) until the
-    user quits or presses Esc.
+    the level-1 harness overview (Claude / Codex / Pi / Cursor / Antigravity /
+    Qwen Code / Quit) until the user quits or presses Esc.
 
     :returns: None. Side effect: may write ``~/.omnigent/config.yaml`` via
         the backfill/adopt steps and any add/set-default/remove the user
@@ -9229,7 +9379,12 @@ def _run_configure_harnesses_interactive() -> None:
         cursor_api_key_configured,
         cursor_sdk_installed,
     )
-    from omnigent.onboarding.harness_install import CURSOR_KEY, harness_cli_installed
+    from omnigent.onboarding.harness_install import (
+        CURSOR_KEY,
+        QWEN_KEY,
+        harness_cli_installed,
+        harness_install_command,
+    )
     from omnigent.onboarding.interactive import select
     from omnigent.onboarding.provider_config import (
         ANTHROPIC_FAMILY,
@@ -9268,6 +9423,10 @@ def _run_configure_harnesses_interactive() -> None:
     # is outside the anthropic/openai machinery), so it dispatches to its own
     # credential manager rather than ``_manage_harness_providers``.
     _ANTIGRAVITY = "\x00antigravity"
+    # Sentinel marking the Qwen Code row — like Antigravity/Cursor it is not a
+    # provider family (its v1 auth is the CLI's own env vars / ``/auth`` flow,
+    # not an Omnigent credential), so it dispatches to its own drill-in.
+    _QWEN = "\x00qwen"
     families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE]
     while True:
         config = _load_global_config()
@@ -9375,6 +9534,29 @@ def _run_configure_harnesses_interactive() -> None:
             options.append(f"  {ag_sub}")
             selectable.append(False)
             row_target.append(None)
+        # Qwen Code (OpenAI-compatible auth, no provider family — like Cursor /
+        # Antigravity). Qwen has no CLI login (its ``auth`` subcommand was
+        # removed); auth comes from OpenAI-compatible env vars or the interactive
+        # ``/auth`` flow. "Ready" means the CLI is installed AND we can detect
+        # auth — ``_qwen_auth_configured`` reads env vars / ~/.qwen creds, so the
+        # overview never falsely shows "signed in" for a fresh, unauthed install.
+        qwen_installed = harness_cli_installed(QWEN_KEY)
+        qwen_authed = qwen_installed and _qwen_auth_configured()
+        options.append(f"{'  ' if qwen_authed else '[red]✗[/] '}Qwen Code")
+        selectable.append(True)
+        row_target.append(_QWEN)
+        if not qwen_installed:
+            from rich.markup import escape as _rich_escape
+
+            qwen_cmd = _rich_escape(" ".join(harness_install_command(QWEN_KEY)))
+            qwen_sub = f"[dim]not installed — open to install ({qwen_cmd})[/]"
+        elif qwen_authed:
+            qwen_sub = "[green]✓[/] authentication detected"
+        else:
+            qwen_sub = "[dim]installed — open to set up auth (/auth or env vars)[/]"
+        options.append(f"  {qwen_sub}")
+        selectable.append(False)
+        row_target.append(None)
         options.append("Quit")
         selectable.append(True)
         row_target.append(_QUIT)
@@ -9393,6 +9575,8 @@ def _run_configure_harnesses_interactive() -> None:
             _manage_harness_providers(target)
         elif target == _ANTIGRAVITY:
             _manage_antigravity_harness()
+        elif target == _QWEN:
+            _manage_qwen_harness()
         else:  # Quit row (or, defensively, a non-family row)
             return
 

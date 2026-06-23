@@ -97,22 +97,17 @@ no profile flag.
 ## Qwen Code
 
 `harness: qwen` runs the agent through [Qwen Code](https://github.com/QwenLM/qwen)
-(`npm install -g @qwen/qwen-code`). It routes through an OpenAI-compatible
-provider, so authenticate with a provider in `~/.omnigent/config.yaml`, or set
-`auth.base_url` alongside an API key.
+(`npm install -g @qwen-code/qwen-code`). It drives the `qwen` CLI in ACP mode
+(`qwen --acp`).
 
 ```yaml
 executor:
   harness: qwen                # aliases: qwen-code
   model: qwen/qwen-2.5-coder
-  auth:
-    type: api_key
-    api_key: ${OPENAI_API_KEY}
 ```
 
-To use the Databricks gateway, set `auth.type: databricks` with a profile,
-or use a `databricks-*` model id. CLI flags such as `--harness qwen`
-and `--model <id>` can override or supply missing executor values.
+CLI flags such as `--harness qwen` and `--model <id>` can override or supply
+missing executor values.
 
 ## Local OS access
 
