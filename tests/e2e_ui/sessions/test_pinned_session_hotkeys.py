@@ -120,8 +120,10 @@ def _pinned_slot_ids(page: Page) -> list[str]:
     :param page: Playwright page with the Pinned section rendered.
     :returns: Ordered ``/c/{id}`` -> ``id`` for each pinned row.
     """
-    hrefs = _section(page, "Pinned").locator('a[href^="/c/"]').evaluate_all(
-        "els => els.map(e => e.getAttribute('href'))"
+    hrefs = (
+        _section(page, "Pinned")
+        .locator('a[href^="/c/"]')
+        .evaluate_all("els => els.map(e => e.getAttribute('href'))")
     )
     return [h[len("/c/") :] for h in hrefs]
 
