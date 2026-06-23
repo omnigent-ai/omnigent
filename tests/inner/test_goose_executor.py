@@ -676,3 +676,203 @@ async def test_run_turn_tracks_context_window_from_usage_update() -> None:
     executor._send = fake_send  # type: ignore[method-assign]
     [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
     assert executor.max_context_tokens() == 200000
+
+
+# ---------------------------------------------------------------------------
+# Attachment / image helpers
+# ---------------------------------------------------------------------------
+
+
+def test_inline_text_file_data_variants() -> None:
+    from omnigent.inner.goose_executor import _inline_text_file_data
+
+    assert _inline_text_file_data("plain text") == "plain text"  # non-data-URI passthrough
+    assert _inline_text_file_data("") == ""
+    assert _inline_text_file_data(123) == ""  # non-str
+    assert _inline_text_file_data("data:image/png;base64,AAA=") == ""  # binary → not inlined
+    assert _inline_text_file_data("data:text/plain;base64,aGk=") == "hi"  # text decoded
+
+
+def test_image_blocks_from_content_parses_and_skips() -> None:
+    blocks = [
+        {"type": "input_text", "text": "ignore"},
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAB"},
+        {"type": "input_image", "image_url": "https://x/y.png"},  # external → skipped (SSRF)
+    ]
+    assert GooseExecutor._image_blocks_from_content(blocks) == [
+        {"type": "image", "mimeType": "image/png", "data": "AAAB"}
+    ]
+    assert GooseExecutor._image_blocks_from_content("not a list") == []
+
+
+def test_text_from_blocks_image_marker_toggle() -> None:
+    blocks = [{"type": "input_image", "filename": "pic.png"}]
+    assert "[attached image: pic.png]" in GooseExecutor._text_from_blocks(
+        blocks, emit_image_marker=True
+    )
+    assert GooseExecutor._text_from_blocks(blocks, emit_image_marker=False) == ""
+
+
+@pytest.mark.asyncio
+async def test_run_turn_forwards_image_block_when_supported() -> None:
+    """With image capability on, an input_image is sent as a real ACP image block
+    alongside the text block."""
+    executor = GooseExecutor()
+    executor._initialized = True
+    executor._session_id = "s"
+    executor._image_supported = True
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    loop = asyncio.get_event_loop()
+    prompts: list = []
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            prompts.append(msg["params"]["prompt"])
+            rid = msg["id"]
+            loop.call_soon(
+                lambda: executor._pending[rid].set_result(
+                    {"id": rid, "result": {"stopReason": "end_turn"}}
+                )
+            )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+    content = [
+        {"type": "input_text", "text": "look at this"},
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAB"},
+    ]
+    [e async for e in executor.run_turn([{"role": "user", "content": content}], [], "")]
+    prompt = prompts[0]
+    assert any(b.get("type") == "image" for b in prompt)
+    assert any(b.get("type") == "text" for b in prompt)
+
+
+# ---------------------------------------------------------------------------
+# _decide_permission branch coverage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_no_gates_allows() -> None:
+    assert await GooseExecutor()._decide_permission(_perm_request()["params"]) is True
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_policy_ask_without_handler_denies() -> None:
+    executor = GooseExecutor()
+    executor._policy_evaluator = AsyncMock(  # type: ignore[attr-defined]
+        return_value=MagicMock(action="POLICY_ACTION_ASK")
+    )  # no elicitation handler wired → fail closed
+    assert await executor._decide_permission(_perm_request()["params"]) is False
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_policy_exception_falls_through_to_elicit() -> None:
+    executor = GooseExecutor()
+
+    async def _boom(*_a) -> object:
+        raise RuntimeError("policy backend down")
+
+    executor._policy_evaluator = _boom  # type: ignore[attr-defined]
+    executor._elicitation_handler = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    assert await executor._decide_permission(_perm_request()["params"]) is True
+
+
+@pytest.mark.asyncio
+async def test_respond_to_agent_request_exception_yields_error_reply() -> None:
+    executor = GooseExecutor()
+
+    async def _boom(_params) -> bool:
+        raise RuntimeError("kaboom")
+
+    executor._decide_permission = _boom  # type: ignore[method-assign]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+    await executor._respond_to_agent_request(_perm_request())
+    assert sent[0]["error"]["code"] == -32603
+
+
+# ---------------------------------------------------------------------------
+# Harness wrap (goose_harness)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_os_env_default(monkeypatch) -> None:
+    from omnigent.inner import goose_harness
+
+    monkeypatch.delenv("HARNESS_GOOSE_OS_ENV", raising=False)
+    spec = goose_harness._resolve_os_env()
+    assert spec.type == "caller_process"
+    assert spec.sandbox is not None and spec.sandbox.type == "none"
+
+
+def test_resolve_os_env_from_json(monkeypatch) -> None:
+    from omnigent.inner import goose_harness
+
+    monkeypatch.setenv(
+        "HARNESS_GOOSE_OS_ENV",
+        json.dumps(
+            {
+                "type": "caller_process",
+                "cwd": "/w",
+                "sandbox": {"type": "linux_bwrap"},
+                "fork": True,
+            }
+        ),
+    )
+    spec = goose_harness._resolve_os_env()
+    assert spec.cwd == "/w"
+    assert spec.sandbox is not None and spec.sandbox.type == "linux_bwrap"
+    assert spec.fork is True
+
+
+def test_resolve_os_env_malformed_json_falls_back(monkeypatch) -> None:
+    from omnigent.inner import goose_harness
+
+    monkeypatch.setenv("HARNESS_GOOSE_OS_ENV", "{not valid json")
+    spec = goose_harness._resolve_os_env()
+    assert spec.type == "caller_process"
+    assert spec.sandbox is not None and spec.sandbox.type == "none"
+
+
+def test_build_goose_executor_reads_env(monkeypatch) -> None:
+    from omnigent.inner import goose_harness
+
+    monkeypatch.setenv("HARNESS_GOOSE_MODEL", "claude-x")
+    monkeypatch.setenv("HARNESS_GOOSE_PROVIDER", "anthropic")
+    monkeypatch.setenv("HARNESS_GOOSE_CWD", "/work")
+    monkeypatch.setenv("HARNESS_GOOSE_PATH", "/bin/goose")
+    monkeypatch.setenv("HARNESS_GOOSE_BUILTINS", "developer, computercontroller")
+    monkeypatch.delenv("HARNESS_GOOSE_OS_ENV", raising=False)
+    ex = goose_harness._build_goose_executor()
+    assert ex._model == "claude-x"
+    assert ex._provider == "anthropic"
+    assert ex._cwd == "/work"
+    assert ex._goose_path == "/bin/goose"
+    assert ex._builtins == ("developer", "computercontroller")
+
+
+def test_build_goose_executor_defaults(monkeypatch) -> None:
+    from omnigent.inner import goose_harness
+
+    for var in (
+        "HARNESS_GOOSE_MODEL",
+        "HARNESS_GOOSE_PROVIDER",
+        "HARNESS_GOOSE_CWD",
+        "HARNESS_GOOSE_PATH",
+        "HARNESS_GOOSE_BUILTINS",
+        "OMNIGENT_RUNNER_WORKSPACE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    ex = goose_harness._build_goose_executor()
+    assert ex._model is None and ex._provider is None
+    assert ex._goose_path == "goose"
+    assert ex._builtins == ("developer",)
+
+
+def test_create_app_returns_fastapi() -> None:
+    from fastapi import FastAPI
+
+    from omnigent.inner import goose_harness
+
+    assert isinstance(goose_harness.create_app(), FastAPI)
