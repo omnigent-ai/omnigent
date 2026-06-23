@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -393,7 +394,7 @@ def test_update_conversation_id_mutates_correctly(bridge_dir: Path) -> None:
     the Omnigent session stays the same, the bridge must reflect the new id.
     """
     _seed_active_turn(bridge_dir, "turn_old")
-    update_conversation_id(bridge_dir, "agy_conv_new", active_turn_id="turn_fresh")
+    assert update_conversation_id(bridge_dir, "agy_conv_new", active_turn_id="turn_fresh") is True
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.conversation_id == "agy_conv_new"
@@ -408,22 +409,34 @@ def test_update_conversation_id_clears_active_turn_by_default(bridge_dir: Path) 
     the caller explicitly supplies one.
     """
     _seed_active_turn(bridge_dir, "turn_old")
-    update_conversation_id(bridge_dir, "agy_conv_new")
+    assert update_conversation_id(bridge_dir, "agy_conv_new") is True
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.conversation_id == "agy_conv_new"
     assert state.active_turn_id is None
 
 
-def test_update_conversation_id_noop_when_no_state(bridge_dir: Path) -> None:
+def test_update_conversation_id_returns_false_and_warns_when_no_state(
+    bridge_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """
-    update_conversation_id is a no-op when no state file exists.
+    update_conversation_id returns False and WARNs when there is no state.
 
-    Guards missing-state resilience: should not raise when called before
-    initial state is written.
+    Guards observability (Fix C): on a missing/invalid state file the real
+    cascade id must NOT be silently dropped — the function returns ``False`` and
+    logs a WARNING naming the dropped id so the cold-start caller can report that
+    the reader will stay bound to the ``agy_conv_*`` placeholder.
     """
-    update_conversation_id(bridge_dir, "agy_conv_new")  # must not raise
+    with caplog.at_level(logging.WARNING, logger="omnigent.antigravity_native_bridge"):
+        result = update_conversation_id(bridge_dir, "agy_conv_new")  # empty bridge dir
+    assert result is False
     assert read_bridge_state(bridge_dir) is None
+    # The WARNING names the dropped conversation id.
+    assert any(
+        record.levelno == logging.WARNING and "agy_conv_new" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------

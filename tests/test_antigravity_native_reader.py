@@ -1207,6 +1207,48 @@ async def test_stream_reasoning_no_growth_frame_emits_nothing(
 
 
 @pytest.mark.asyncio
+async def test_stream_reasoning_reanchors_after_non_monotonic_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A non-monotonic ``thinking`` rewrite re-anchors the tracker so growth resumes.
+
+    Regression for Fix A: the reasoning tracker must re-anchor UNCONDITIONALLY
+    (like the text path), not only when a delta is emitted. A frame streams
+    ``"abcdef"``; the next frame is a non-monotonic rewrite ``"XYZ"`` (does not
+    extend the forwarded prefix → no delta); the third frame ``"XYZmore"`` DOES
+    extend the rewrite. Before the fix the tracker stayed pinned at ``"abcdef"``,
+    so ``"XYZmore"`` (which does not start with ``"abcdef"``) emitted nothing and
+    the step's reasoning froze forever; after the fix the rewrite re-anchors the
+    tracker to ``"XYZ"`` and the final ``"more"`` suffix is emitted.
+    """
+    frames = [
+        _frame([_generating_planner_with_thinking(thinking="abcdef")]),
+        # Non-monotonic rewrite: does not extend "abcdef" → no delta, but must
+        # re-anchor the tracker to "XYZ".
+        _frame([_generating_planner_with_thinking(thinking="XYZ")]),
+        # Extends the re-anchored "XYZ" → the "more" suffix must be emitted.
+        _frame([_generating_planner_with_thinking(thinking="XYZmore")]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    deltas = [r["delta"] for r in sink.reasonings()]
+    # The first frame emits "abcdef"; the rewrite emits nothing; the recovery
+    # frame emits "more" only because the tracker re-anchored to "XYZ".
+    assert deltas == ["abcdef", "more"]
+
+
+@pytest.mark.asyncio
 async def test_stream_resent_done_snapshot_does_not_repost(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1658,6 +1700,32 @@ def _user_input_with_model(
     return step
 
 
+def _user_input_real_wire(
+    *,
+    execution_id: str,
+    model_enum: str = "MODEL_PLACEHOLDER_M20",
+) -> dict[str, Any]:
+    """A USER_INPUT step shaped like the REAL agy wire: per-turn id, NO stepIndex.
+
+    Unlike :func:`_user_input_with_model` (which can inject a synthetic
+    ``stepIndex`` to hand two turns distinct dedup keys), this models the live
+    shape exactly: USER_INPUT carries ``metadata.executionId`` (a per-turn uuid)
+    but NO ``sourceTrajectoryStepInfo.stepIndex``, so the only thing that
+    distinguishes two turns' USER_INPUT steps is the discriminator. The static
+    fixture's fixed ``executionId`` is overridden per turn so the two turns do
+    not themselves collide.
+    """
+    step = copy.deepcopy(_load("user_input"))
+    metadata = cast(dict[str, Any], step["metadata"])
+    metadata["executionId"] = execution_id
+    # Make absolutely sure no stepIndex sneaks in (the base fixture has none).
+    metadata["sourceTrajectoryStepInfo"].pop("stepIndex", None)
+    user_input = cast(dict[str, Any], step["userInput"])
+    planner_cfg = cast(dict[str, Any], user_input["userConfig"]["plannerConfig"])
+    planner_cfg["requestedModel"] = {"model": model_enum}
+    return step
+
+
 async def _run_with_telemetry(
     *,
     bridge_dir: Path,
@@ -1994,6 +2062,78 @@ async def test_two_turn_usage_is_cumulative(
     assert usage_events[1][1]["cumulative_input_tokens"] == 2000
     assert usage_events[1][1]["cumulative_output_tokens"] == 100
     assert usage_events[1][1]["cumulative_cache_read_input_tokens"] == 200
+
+
+# ---------------------------------------------------------------------------
+# USER_INPUT dedup key: real-wire turns (no stepIndex) must not collide
+# ---------------------------------------------------------------------------
+
+
+def test_step_key_distinct_for_user_input_turns_without_step_index() -> None:
+    """Two USER_INPUT steps with distinct executionId key distinctly.
+
+    Regression for the dedup-key collision (Fix I-1): on the real wire a
+    USER_INPUT step has a per-conversation-stable ``trajectory_id`` and NO
+    ``stepIndex``, so a ``(trajectory_id, None)`` key collides across every turn.
+    Folding the per-turn ``executionId`` into the key keeps each turn distinct.
+    Without the fix both keys are ``(trajectory_id, None)`` and compare equal.
+    """
+    turn1 = _user_input_real_wire(execution_id="exec-turn-1")
+    turn2 = _user_input_real_wire(execution_id="exec-turn-2")
+    key1 = reader._step_key(turn1)
+    key2 = reader._step_key(turn2)
+    assert key1 != key2, f"USER_INPUT keys collided across turns: {key1} == {key2}"
+    # The discriminator (3rd element) is what separates them — the first two
+    # elements are identical (same trajectory_id, both step_index None).
+    assert key1[:2] == key2[:2]
+    assert key1[2] == "exec-turn-1"
+    assert key2[2] == "exec-turn-2"
+
+
+@pytest.mark.asyncio
+async def test_two_real_wire_turns_each_emit_running_then_idle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Two turns whose USER_INPUT carries NO stepIndex each fire RUNNING + IDLE.
+
+    End-to-end regression for Fix I-1. Each turn is a USER_INPUT (opens the
+    turn → RUNNING) followed by a DONE assistant-text planner (closes the turn →
+    IDLE). The USER_INPUT steps are built with the REAL wire shape (per-turn
+    ``executionId``, no ``stepIndex``) — NOT the synthetic-stepIndex helper that
+    masks this bug. Before the fix, turn 2's USER_INPUT collides with turn 1's on
+    ``(trajectory_id, None)``, is treated as already-seen, and its emit block is
+    skipped → no second RUNNING edge (the web spinner never restarts), so the
+    sequence would be ``["running", "idle", "idle"]`` instead of the expected
+    per-turn ``["running", "idle", "running", "idle"]``.
+    """
+    user1 = _user_input_real_wire(execution_id="exec-turn-1")
+    user2 = _user_input_real_wire(execution_id="exec-turn-2")
+    done1 = _done_planner("First answer.", step_index=2)
+    done2 = _done_planner("Second answer.", step_index=6)
+    # The stream delivers cumulative snapshots: turn 2's frames include turn 1's
+    # already-committed steps.
+    frames = [
+        _frame([user1]),
+        _frame([user1, done1]),
+        _frame([user1, done1, user2]),
+        _frame([user1, done1, user2, done2]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    assert sink.statuses() == ["running", "idle", "running", "idle"]
+    # Each turn commits exactly one assistant message; USER_INPUT commits none.
+    assert sink.item_types() == ["message", "message"]
 
 
 # ---------------------------------------------------------------------------

@@ -816,10 +816,13 @@ async def stream_agent_state_updates(
         stream updates for.
     :returns: An async iterator over DATA frames' parsed JSON dicts, in arrival
         order, ending when the trailer frame is seen or the stream closes.
-    :raises AntigravityRpcError: On a compressed frame (unexpected from agy) or a
-        connect end-of-stream trailer error (``{"error": ...}``). The Task T-D
-        reader is responsible for reconnect/poll-fallback on transport errors,
-        which propagate as ``httpx.HTTPError`` from the underlying stream.
+    :raises AntigravityRpcError: On a non-2xx HTTP status (httpx ``stream()`` does
+        not raise on its own, so an unframed error body would otherwise look like
+        a clean empty stream and reconnect forever), a compressed frame
+        (unexpected from agy), a malformed-JSON DATA frame, or a connect
+        end-of-stream trailer error (``{"error": ...}``). All route into the Task
+        T-D reader's poll-fallback. Transport errors propagate as
+        ``httpx.HTTPError`` from the underlying stream (also poll-fallback).
     """
     url = _rpc_url(port, _METHOD_STREAM_AGENT_STATE_UPDATES)
     _assert_loopback_url(url)
@@ -833,6 +836,14 @@ async def stream_agent_state_updates(
             content=body,
         ) as response,
     ):
+        # httpx ``client.stream()`` does NOT raise on a non-2xx status; a 4xx/5xx
+        # body is not connect-framed, so the frame loop below would yield nothing
+        # and return cleanly — which the reader treats as a normal end-of-stream
+        # and reconnects every backoff forever. Surface it instead so it routes
+        # into the reader's poll-fallback. ``status_code`` is available without
+        # reading the (lazy) streaming body, so this does not consume the stream.
+        if response.status_code >= 400:
+            raise AntigravityRpcError(f"agy connect-stream returned HTTP {response.status_code}")
         buffer = bytearray()
         async for chunk in response.aiter_bytes():
             buffer.extend(chunk)
@@ -860,7 +871,12 @@ async def stream_agent_state_updates(
                     if error is not None:
                         raise AntigravityRpcError(f"agy connect-stream error: {error}")
                     return
-                parsed = json.loads(payload)
+                try:
+                    parsed = json.loads(payload)
+                except json.JSONDecodeError as e:
+                    raise AntigravityRpcError(
+                        f"malformed JSON in agy connect-stream DATA frame: {e}"
+                    ) from e
                 if isinstance(parsed, dict):
                     yield parsed
 

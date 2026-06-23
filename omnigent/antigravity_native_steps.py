@@ -231,6 +231,29 @@ def _trajectory_id(step: dict[str, object]) -> str | None:
     return tid if isinstance(tid, str) else None
 
 
+def _execution_discriminator(step: dict[str, object]) -> str | None:
+    """
+    Per-turn-unique dedup discriminator for a step with no ``step_index``.
+
+    USER_INPUT steps carry no ``sourceTrajectoryStepInfo.stepIndex`` and share a
+    per-conversation-stable ``trajectory_id``, so a ``(trajectory_id, None)`` key
+    collides across every turn. ``metadata.executionId`` is a per-turn uuid (and
+    ``metadata.createdAt`` a per-turn timestamp); either disambiguates turns.
+
+    :param step: One step dict from ``GetCascadeTrajectorySteps``.
+    :returns: ``executionId`` (preferred) or ``createdAt`` when a non-empty
+        string, else ``None``.
+    """
+    metadata = step.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    for field_name in ("executionId", "createdAt"):
+        value = metadata.get(field_name)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _merge_is_multi_select(
     ask_block: dict[str, object],
     step: dict[str, object],

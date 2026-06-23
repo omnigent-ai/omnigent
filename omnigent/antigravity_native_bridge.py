@@ -338,7 +338,7 @@ def update_conversation_id(
     bridge_dir: Path,
     conversation_id: str,
     active_turn_id: str | None = None,
-) -> None:
+) -> bool:
     """
     Update the agy conversation id in bridge state.
 
@@ -346,16 +346,29 @@ def update_conversation_id(
     Omnigent session stays the same (e.g. the runner cold-start replacing the
     ``agy_conv_*`` placeholder with agy's real cascade id).
 
+    When there is no existing state to update (a missing or invalid state file),
+    the write is SKIPPED and a WARNING is logged naming the dropped id — silently
+    dropping it would leave the reader bound to the ``agy_conv_*`` placeholder
+    forever, surfaced only as a generic "conversation not ready". The caller
+    decides how to react (it stays best-effort; this never raises).
+
     :param bridge_dir: Native Antigravity bridge directory.
     :param conversation_id: New agy conversation id, e.g.
         ``"agy_conv_abc123"``.
     :param active_turn_id: Active turn id for the new conversation, e.g.
         ``"turn_abc123"``, or ``None`` when no turn is running yet.
-    :returns: None.
+    :returns: ``True`` when the new id was written, ``False`` when there was no
+        existing state to update (the id was dropped; a WARNING was logged).
     """
     state = read_bridge_state(bridge_dir)
     if state is None:
-        return
+        _logger.warning(
+            "Antigravity bridge: no existing state at %s to update; dropping "
+            "conversation_id=%s (the reader will stay on the placeholder id)",
+            bridge_dir,
+            conversation_id,
+        )
+        return False
     write_bridge_state(
         bridge_dir,
         AntigravityNativeBridgeState(
@@ -364,6 +377,7 @@ def update_conversation_id(
             active_turn_id=active_turn_id,
         ),
     )
+    return True
 
 
 # ── Web-turn TUI delivery (tmux send-keys) ───────────────────────────────────

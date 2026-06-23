@@ -1265,7 +1265,13 @@ async def _cold_start_agy_conversation(
     # Persist the real id (replacing the placeholder) so ``read_bridge_state``
     # returns it and the reader/executor address the cold-started conversation.
     # Offloaded (file I/O).
-    await asyncio.to_thread(update_conversation_id, bridge_dir, cascade_id)
+    if not await asyncio.to_thread(update_conversation_id, bridge_dir, cascade_id):
+        _logger.warning(
+            "Antigravity cold-start: could not persist cold-started conversation id %s for "
+            "session %s (no bridge state to update); the reader will stay on the placeholder id.",
+            cascade_id,
+            session_id,
+        )
     # PATCH the real id onto the session so a later ``--resume`` continues this
     # conversation (best-effort; mirrors the runner cold-start + codex/pi). A
     # short-lived client suffices for this one call.

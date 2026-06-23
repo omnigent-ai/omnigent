@@ -73,6 +73,10 @@ _AGY_ELICITATION_ID_DIGEST_LENGTH = 32
 # Substring agy returns (inside an HTTP 500 body) when the targeted step is no
 # longer accepting input — either a missing ``trajectoryId`` or, the case this
 # module retries, a step that already timed out (status ERROR) before delivery.
+# Matched case-INSENSITIVELY against agy's raw body (see the delivery
+# error-handling below): this substring is the SOLE discriminator between a
+# retryable step-timeout race and a fatal delivery error, so a capitalization
+# change in agy's message must not silently reclassify the race as fatal.
 _INPUT_NOT_REGISTERED = "input not registered"
 
 # Default bound on the detect→elicit→deliver loop. Each iteration surfaces one
@@ -193,34 +197,34 @@ def _freshest_waiting(
 
     The crux of the timeout handling: when several WAITING steps are present
     (agy left timed-out ones behind and issued retries), the freshest — highest
-    ``step_index`` — is the live one to deliver against. Same-``kind`` steps are
-    preferred so a question is not answered against a stray permission step that
-    happens to sit at a higher index; if none of the requested kind exists, the
-    highest-index WAITING of any kind is returned as a fallback.
+    ``step_index`` — is the live one to deliver against. Only steps of the
+    requested ``kind`` are eligible: agy keys delivery on
+    ``trajectoryId``+``stepIndex`` with no kind check, so pairing a payload built
+    for one kind with a WAITING step of a different kind would mis-deliver (e.g.
+    answer a question against a stray permission step). When no WAITING step of
+    the requested kind exists, ``None`` is returned and the caller stops cleanly.
 
     :param steps: A trajectory steps snapshot (from ``get_steps``).
-    :param kind: Preferred interaction kind (``"ask_question"`` / ``"permission"``).
+    :param kind: Required interaction kind (``"ask_question"`` / ``"permission"``).
     :param after_index: When set, only steps with ``step_index > after_index``
         are considered — used after a timeout to require a strictly NEWER step
         than the one that just failed, so the loop cannot re-target the same
         stale index.
-    :returns: The freshest matching :class:`PendingInteraction`, or ``None``.
+    :returns: The freshest same-``kind`` :class:`PendingInteraction`, or ``None``
+        when no WAITING step of that kind exists.
     """
     same_kind: PendingInteraction | None = None
-    any_kind: PendingInteraction | None = None
     for step in steps:
         pending = pending_interaction(step)
         if pending is None:
             continue
         if after_index is not None and pending["step_index"] <= after_index:
             continue
-        if any_kind is None or pending["step_index"] > any_kind["step_index"]:
-            any_kind = pending
-        if pending["kind"] == kind and (
-            same_kind is None or pending["step_index"] > same_kind["step_index"]
-        ):
+        if pending["kind"] != kind:
+            continue
+        if same_kind is None or pending["step_index"] > same_kind["step_index"]:
             same_kind = pending
-    return same_kind if same_kind is not None else any_kind
+    return same_kind
 
 
 async def bridge_interaction(
@@ -278,11 +282,15 @@ async def bridge_interaction(
 
         result = await request_elicitation(eid, params)
         if result is None:
-            # Human timed out / cancelled. Don't deliver: agy's own WAITING
-            # timeout reclaims the step. (Forcing a deny is a separate policy.)
+            # No verdict. Usually a human timeout/cancel (agy's own WAITING
+            # timeout reclaims the step; forcing a deny is a separate policy), but
+            # ``request_elicitation`` also returns ``None`` on a hook rejection
+            # (a 4xx logged distinctly by the reader's elicitation poster), so the
+            # cause is not exclusively timeout/cancel. Don't deliver either way.
             _logger.info(
-                "agy elicitation %s returned no verdict (timeout/cancel); "
-                "not delivering (cascade=%s, kind=%s, step=%d)",
+                "agy elicitation %s returned no verdict (human timeout/cancel, or "
+                "hook rejection — see reader warnings); not delivering "
+                "(cascade=%s, kind=%s, step=%d)",
                 eid,
                 cascade_id,
                 current["kind"],
@@ -315,7 +323,7 @@ async def bridge_interaction(
             )
             return  # delivered successfully
         except AntigravityRpcError as exc:
-            if _INPUT_NOT_REGISTERED not in str(exc):
+            if _INPUT_NOT_REGISTERED not in str(exc).lower():
                 # A genuine shape/transport error — not the timed-out-step race.
                 # Log and stop; retrying would not help and could loop forever.
                 _logger.warning(

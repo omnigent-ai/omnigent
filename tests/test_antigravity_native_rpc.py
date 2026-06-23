@@ -1458,6 +1458,53 @@ async def test_stream_agent_state_updates_rejects_non_loopback_url(
         await _collect(52548, _CONVERSATION_ID)
 
 
+async def test_stream_agent_state_updates_raises_on_malformed_json_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DATA frame whose payload is not valid JSON raises ``AntigravityRpcError``.
+
+    Regression for Fix B: ``json.loads`` on the frame payload was unguarded, so a
+    malformed DATA frame raised a bare ``json.JSONDecodeError`` that the reader's
+    supervisor does not catch — the reader task died silently with no
+    poll-fallback. The parse must surface as ``AntigravityRpcError`` (which the
+    supervisor catches) instead. The data frame BEFORE the bad one is still
+    yielded in order.
+    """
+    chunks = [
+        _data_frame({"n": "good"}),
+        # A data frame whose payload is not valid JSON.
+        _frame(0x00, b"{not valid json"),
+    ]
+    monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", _stream_transport(chunks, {}))
+    collected: list[dict[str, object]] = []
+    with pytest.raises(rpc.AntigravityRpcError, match="malformed JSON"):
+        async for update in rpc.stream_agent_state_updates(52548, _CONVERSATION_ID):
+            collected.append(update)
+    # The valid frame before the malformed one was delivered first.
+    assert collected == [{"n": "good"}]
+
+
+async def test_stream_agent_state_updates_raises_on_non_2xx_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-2xx stream response raises rather than yielding nothing forever.
+
+    Regression for Fix D: httpx ``client.stream()`` does not raise on a non-2xx
+    status, and a 4xx/5xx body is not connect-framed — so the frame loop yielded
+    nothing and the generator returned cleanly, which the reader treated as a
+    normal end-of-stream and reconnected every backoff forever. The status must
+    surface as ``AntigravityRpcError`` so the reader takes ONE poll-fallback
+    transition instead of busy-reconnecting.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"message": "service unavailable"})
+
+    monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", httpx.MockTransport(handler))
+    with pytest.raises(rpc.AntigravityRpcError, match="HTTP 503"):
+        await _collect(52548, _CONVERSATION_ID)
+
+
 # ---------------------------------------------------------------------------
 # Functional-RPC timeout: the four functional calls use _RPC_CALL_TIMEOUT_S, the
 # discovery probes keep the tight _PROBE_TIMEOUT_S

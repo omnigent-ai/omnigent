@@ -82,6 +82,7 @@ from omnigent.antigravity_native_rpc import (
 from omnigent.antigravity_native_steps import (
     OutboundEvent,
     PendingInteraction,
+    _execution_discriminator,
     _step_index,
     _ToolCallIdAllocator,
     _trajectory_id,
@@ -150,10 +151,13 @@ _TERMINAL_STATUSES = frozenset({_STATUS_DONE, _STATUS_ERROR})
 
 # Dedup key for a step within a run. ``step_index`` is ``None`` for USER_INPUT
 # (no trajectory slot) and proto-omitted (treated as ``None`` here) for step 0;
-# pairing it with ``trajectory_id`` keeps the key stable per step. USER_INPUT
-# maps to ``[]`` so a key collision across turns only skips re-processing a
-# no-op, never drops content.
-_StepKey = tuple[str | None, int | None]
+# pairing it with ``trajectory_id`` keeps the key stable per step. The third
+# element is a per-turn discriminator used ONLY for a step that has no
+# ``step_index``: a USER_INPUT step has a per-conversation-stable
+# ``trajectory_id`` and no index, so ``(trajectory_id, None)`` would collide
+# across every turn and silently dedup turns ≥2 — folding ``executionId`` /
+# ``createdAt`` in keeps each turn distinct (see :func:`_step_key`).
+_StepKey = tuple[str | None, int | None, str | None]
 
 # Telemetry event types (design §10.3 + §10.4).
 _EXTERNAL_SESSION_USAGE = "external_session_usage"
@@ -319,10 +323,20 @@ def _step_key(step: dict[str, object]) -> _StepKey:
     "the same step" for de-dup, status, and interaction purposes consistently.
 
     :param step: One step dict from ``GetCascadeTrajectorySteps``.
-    :returns: ``(trajectory_id, step_index)`` identity tuple (either element may
-        be ``None``).
+    :returns: A ``(trajectory_id, step_index, discriminator)`` identity tuple.
+        The first two elements may be ``None``; the third is ``None`` for any
+        step that has a ``step_index`` (its ``(trajectory_id, step_index)``
+        pair is already unique) and a per-turn-unique discriminator only for a
+        step that lacks one.
     """
-    return (_trajectory_id(step), _step_index(step))
+    idx = _step_index(step)
+    # A step WITH a step_index keeps its (trajectory_id, step_index) identity
+    # (discriminator None) — unchanged dedup. A step withOUT one (USER_INPUT)
+    # would otherwise collide on (trajectory_id, None) across every turn and be
+    # silently de-duped after turn 1, dropping per-turn status + model-change;
+    # fold a per-turn-unique discriminator so each turn keys distinctly.
+    discriminator = None if idx is not None else _execution_discriminator(step)
+    return (_trajectory_id(step), idx, discriminator)
 
 
 def _is_user_turn_step(step: dict[str, object]) -> bool:
@@ -637,9 +651,9 @@ class _ReaderState:
     :param allocator: Per-run fallback tool-call id allocator (real agy ids are
         preferred by the mapper; this only covers resume-mid-turn results that
         lack ``metadata.toolCall.id``).
-    :param seen: ``(trajectory_id, step_index)`` identities whose COMMITTED items
-        have been posted, so the on-connect snapshot replay (and steady-state
-        re-reads) post nothing.
+    :param seen: :func:`_step_key` identities whose COMMITTED items have been
+        posted, so the on-connect snapshot replay (and steady-state re-reads)
+        post nothing.
     :param interacted: Identities whose WAITING interaction was already handed to
         the bridge, so a re-sent WAITING frame does not re-fire it.
     :param prefixes: Per-PLANNER ``step_index`` → the length of ``modifiedResponse``
@@ -951,9 +965,9 @@ async def _process_committed_step(
     """
     Emit one step's committed items + status edges + interaction (poll path).
 
-    De-dups by ``(trajectory_id, step_index)`` against ``state.seen`` so a
-    re-read posts nothing, then emits via :func:`_emit_step` and hands a WAITING
-    step to the bridge once. This is the committed-only path (no deltas).
+    De-dups by :func:`_step_key` against ``state.seen`` so a re-read posts
+    nothing, then emits via :func:`_emit_step` and hands a WAITING step to the
+    bridge once. This is the committed-only path (no deltas).
 
     De-dup is only RECORDED once the step is *settled* (:func:`_is_settled`): a
     tool-result step is observed non-contiguously through PENDING/RUNNING/WAITING
@@ -1258,7 +1272,10 @@ async def _emit_partial_reasoning_delta(
                 started=started,
             ),
         )
-        reasoning_prefixes[idx] = text
+    # Re-anchor unconditionally (mirrors the text path's ``prefixes[idx] = text``):
+    # a non-monotonic rewrite emits no delta but must still advance the tracker, or
+    # reasoning deltas freeze permanently for this step once a rewrite occurs.
+    reasoning_prefixes[idx] = text
 
 
 async def _emit_step(
@@ -1659,7 +1676,9 @@ async def _request_agy_elicitation(
         return None
     if response.status_code >= 400:
         _logger.warning(
-            "Antigravity elicitation hook rejected request: status=%s elicitation_id=%s body=%s",
+            "Antigravity elicitation hook rejected request (likely a misconfigured "
+            "elicitation hook — a 4xx is a client/config error, not transient): "
+            "status=%s elicitation_id=%s body=%s",
             response.status_code,
             elicitation_id,
             response.text[:512],

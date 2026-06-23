@@ -27,6 +27,7 @@ from typing import Any, cast
 
 from omnigent.antigravity_native_steps import (
     OutboundEvent,
+    _execution_discriminator,
     _ToolCallIdAllocator,
     map_step_to_events,
     output_reasoning_delta_event,
@@ -1087,3 +1088,42 @@ class TestMapStepEmitsNoReasoning:
             e.data.get("item_type") for e in events if e.event_type == "external_conversation_item"
         ]
         assert "message" in item_types
+
+
+class TestExecutionDiscriminator:
+    """``_execution_discriminator`` extracts the per-turn dedup discriminator."""
+
+    def test_prefers_execution_id(self) -> None:
+        """``executionId`` is returned when present (preferred over createdAt)."""
+        step = {
+            "metadata": {
+                "executionId": "exec-123",
+                "createdAt": "2026-06-22T23:57:36.256051Z",
+            }
+        }
+        assert _execution_discriminator(step) == "exec-123"
+
+    def test_falls_back_to_created_at(self) -> None:
+        """``createdAt`` is used when ``executionId`` is absent."""
+        step = {"metadata": {"createdAt": "2026-06-22T23:57:36.256051Z"}}
+        assert _execution_discriminator(step) == "2026-06-22T23:57:36.256051Z"
+
+    def test_skips_empty_execution_id(self) -> None:
+        """An empty ``executionId`` is skipped in favour of ``createdAt``."""
+        step = {"metadata": {"executionId": "", "createdAt": "2026-06-22T23:57:36Z"}}
+        assert _execution_discriminator(step) == "2026-06-22T23:57:36Z"
+
+    def test_none_when_no_metadata(self) -> None:
+        """A step with no ``metadata`` dict yields ``None``."""
+        assert _execution_discriminator({}) is None
+        assert _execution_discriminator({"metadata": "not-a-dict"}) is None
+
+    def test_none_when_no_discriminating_fields(self) -> None:
+        """``metadata`` without ``executionId`` or ``createdAt`` yields ``None``."""
+        assert _execution_discriminator({"metadata": {"source": "user"}}) is None
+
+    def test_real_fixture_has_execution_id(self) -> None:
+        """The recorded USER_INPUT fixture carries a usable ``executionId``."""
+        step = _load("user_input")
+        # Confirms the live wire shape this fix relies on (per-turn executionId).
+        assert _execution_discriminator(step) == "1df76a5f-0318-4c71-b31d-7e3b51a3d981"

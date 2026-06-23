@@ -35,6 +35,7 @@ from typing import Any
 import pytest
 
 from omnigent.antigravity_native_interactions import (
+    _freshest_waiting,
     agy_elicitation_id,
     bridge_interaction,
 )
@@ -321,6 +322,43 @@ async def test_input_not_registered_reads_new_step_and_redelivers() -> None:
     assert elicit_calls[1][0] == agy_elicitation_id(_CASCADE, _TRAJ, 4)
 
 
+@pytest.mark.asyncio
+async def test_input_not_registered_match_is_case_insensitive() -> None:
+    """A mixed-case 'Input Not Registered' is the retryable race, not a fatal error.
+
+    Regression for Fix G: the race discriminator is matched case-INSENSITIVELY
+    against agy's raw 500 body. A capitalized variant ('Input Not Registered for
+    step 3') must still be treated as the timed-out-step race (re-read for a NEW
+    higher-index WAITING step and re-deliver), NOT misclassified as fatal — which
+    would silently drop the human's verdict.
+    """
+    pending = _pending_question(step_index=3)
+    stale = _question_step(step_index=3)
+    retry = _question_step(step_index=4)
+    request, _ = _elicitation_returner(
+        ElicitationResult(action="accept", content={"selectedOptionIds": ["2"]}),
+        ElicitationResult(action="accept", content={"selectedOptionIds": ["2"]}),
+    )
+    # Mixed-case message (note the capitalization) — must still match the race.
+    deliver = _DeliverRecorder(
+        errors=[AntigravityRpcError("Input Not Registered for step 3"), None]
+    )
+    get_steps = _steps_returner([stale], [retry], [retry])
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=get_steps,
+        request_elicitation=request,
+        deliver=deliver,
+    )
+
+    # Treated as the retryable race: a second delivery was attempted at N+1.
+    assert len(deliver.calls) == 2
+    assert deliver.calls[1]["step_index"] == 4
+
+
 # ---------------------------------------------------------------------------
 # (c) permission accept
 # ---------------------------------------------------------------------------
@@ -426,6 +464,41 @@ async def test_no_fresh_waiting_step_skips_delivery() -> None:
     )
 
     assert deliver.calls == []
+
+
+# ---------------------------------------------------------------------------
+# _freshest_waiting: strict same-kind selection (Fix E)
+# ---------------------------------------------------------------------------
+
+
+def test_freshest_waiting_returns_none_for_only_different_kind() -> None:
+    """A snapshot with ONLY a different-kind WAITING step yields ``None``.
+
+    Regression for Fix E: the cross-kind ``any_kind`` fallback was dropped. agy
+    keys delivery on ``trajectoryId``+``stepIndex`` with no kind check, so
+    pairing an ask_question payload with a WAITING permission step would
+    mis-deliver. With no same-kind WAITING step present, the function must return
+    ``None`` (the caller then stops cleanly) rather than the other kind.
+    """
+    steps = [_permission_step(step_index=5)]
+    assert _freshest_waiting(steps, kind="ask_question") is None
+
+
+def test_freshest_waiting_returns_highest_same_kind() -> None:
+    """Among same-kind WAITING steps the highest ``step_index`` is returned.
+
+    Confirms the strict-same-kind change did not regress the freshest-wins
+    selection, and that a higher-index DIFFERENT-kind step does not shadow it.
+    """
+    steps = [
+        _question_step(step_index=2),
+        _permission_step(step_index=9),  # higher index, wrong kind → ignored
+        _question_step(step_index=4),
+    ]
+    fresh = _freshest_waiting(steps, kind="ask_question")
+    assert fresh is not None
+    assert fresh["kind"] == "ask_question"
+    assert fresh["step_index"] == 4
 
 
 @pytest.mark.asyncio
