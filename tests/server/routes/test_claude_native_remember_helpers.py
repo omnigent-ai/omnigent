@@ -101,11 +101,21 @@ class TestClaudeNativeRememberHost:
             == "github.com"
         )
 
-    def test_ipv6_host_brackets_stripped(self) -> None:
-        # urlparse().hostname returns the IPv6 literal without brackets.
+    def test_ipv6_host_is_bracketed(self) -> None:
+        # urlparse().hostname strips the brackets off an IPv6 literal, but
+        # Claude's colon-delimited ``domain:<host>`` grammar needs them
+        # re-added so the persisted rule (``domain:[2001:db8::1]``) is
+        # valid rather than a broken/inert colon-laden atom.
         assert (
             _claude_native_remember_host("WebFetch", {"url": "https://[2001:db8::1]:8443/x"})
-            == "2001:db8::1"
+            == "[2001:db8::1]"
+        )
+
+    def test_ipv6_host_without_port_is_bracketed(self) -> None:
+        # Bracketing is independent of the port being present.
+        assert (
+            _claude_native_remember_host("WebFetch", {"url": "https://[2001:db8::1]/x"})
+            == "[2001:db8::1]"
         )
 
     def test_non_http_scheme_returns_none(self) -> None:

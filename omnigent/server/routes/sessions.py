@@ -640,8 +640,9 @@ def _claude_native_remember_host(tool_name: str, tool_input: Any) -> str | None:
     :param tool_name: The gated tool from Claude's PermissionRequest
         payload.
     :param tool_input: The tool's input dict (``None``/non-dict tolerated).
-    :returns: The lowercased host (no port), or ``None`` when no
-        domain scope applies.
+    :returns: The lowercased host (no port), bracketed when it is an IPv6
+        literal (``[2001:db8::1]``), or ``None`` when no domain scope
+        applies.
     """
     if tool_name != "WebFetch" or not isinstance(tool_input, dict):
         return None
@@ -655,9 +656,22 @@ def _claude_native_remember_host(tool_name: str, tool_input: Any) -> str | None:
     if parsed.scheme.lower() not in ("http", "https"):
         return None
     host = parsed.hostname
+    if not host:
+        return None
     # urlparse already lowercases ``hostname`` and strips the port and
     # any userinfo; lower() again makes the documented invariant explicit.
-    return host.lower() if host else None
+    host = host.lower()
+    # urlparse strips the brackets off an IPv6 literal authority
+    # (``[2001:db8::1]`` → ``2001:db8::1``), but Claude's
+    # ``domain:<host>`` rule grammar is colon-delimited, so a bare
+    # colon-laden IPv6 atom persists a broken/inert rule (the user
+    # clicks "don't ask again" and keeps getting prompted). A registered
+    # domain name can never contain a colon, so a ``:`` here is an
+    # unambiguous IPv6 literal — re-bracket it so the emitted rule is
+    # ``domain:[2001:db8::1]``.
+    if ":" in host:
+        return f"[{host}]"
+    return host
 
 
 # Server-side wait budget for Codex app-server requests forwarded by
