@@ -104,6 +104,10 @@ export interface WorkspaceChangedFile {
   lines_added: number | null;
   /** Lines removed, or null when unknown. */
   lines_removed: number | null;
+  /** Whether the change is staged in git's index. Omitted by older runners. */
+  staged?: boolean;
+  /** Whether the change exists in the working tree. Omitted by older runners. */
+  unstaged?: boolean;
 }
 
 export interface WorkspaceChangedFilesResult {
@@ -186,6 +190,8 @@ interface ChangedFilesResponse {
     modified_at: number | null;
     lines_added: number | null;
     lines_removed: number | null;
+    staged?: boolean | null;
+    unstaged?: boolean | null;
   }[];
   has_more: boolean;
 }
@@ -228,6 +234,8 @@ async function fetchWorkspaceChangedFiles(
     modified_at: e.modified_at,
     lines_added: e.lines_added ?? null,
     lines_removed: e.lines_removed ?? null,
+    staged: typeof e.staged === "boolean" ? e.staged : undefined,
+    unstaged: typeof e.unstaged === "boolean" ? e.unstaged : undefined,
   }));
   return { available: true, data };
 }
