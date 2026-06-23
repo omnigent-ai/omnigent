@@ -131,6 +131,11 @@ e2b = ["e2b>=2.26,<3"]
 # Self-hosted gRPC gateway; the SDK pulls grpcio + protobuf. Same
 # lazy-import posture as above. Pre-1.0 SDK: pin minor.
 openshell = ["openshell>=0.0.7,<1"]
+# Declaw sandbox launcher (`omnigent sandbox --provider declaw` and
+# server-managed `sandbox.provider: declaw`). Secure microVM sandboxes with
+# a built-in security plane (PII / injection / network / vault / governance).
+# Same lazy-import posture as above.
+declaw = ["declaw>=1.3,<2"]
 # MLflow tracing is opt-in: tracing is disabled by default and the
 # server degrades gracefully when mlflow is absent, so the (heavy) mlflow
 # dependency only installs for users who want it (`omnigent[tracing]`).
@@ -533,6 +538,12 @@ ignore_missing_imports = true
 # a base dependency, so its imports are unresolved in the default env too.
 [[tool.mypy.overrides]]
 module = "openshell.*"
+ignore_missing_imports = true
+
+# declaw is an optional dep (the `declaw` extra); same lazy-import posture as
+# modal above.
+[[tool.mypy.overrides]]
+module = "declaw.*"
 ignore_missing_imports = true
 
 # boxlite is an optional dep (the `boxlite` extra); same lazy-import posture

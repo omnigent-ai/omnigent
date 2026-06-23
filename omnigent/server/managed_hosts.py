@@ -136,10 +136,10 @@ _logger = logging.getLogger(__name__)
 # ManagedSandboxConfig directly are not constrained by either set —
 # their launcher factory IS the support.)
 SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
-    {"lakebox", "modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell"}
+    {"lakebox", "modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "declaw"}
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell"}
+    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "declaw"}
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -683,6 +683,20 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             cluster=_parse_provider_string(raw, "openshell", "cluster"),
         )
         token_ttl_s = OPENSHELL_MANAGED_TOKEN_TTL_S
+    elif provider == "declaw":
+        from omnigent.onboarding.sandboxes.declaw import managed_token_ttl_s
+
+        section = _declaw_section(raw)
+        launcher_factory = _declaw_launcher_factory(
+            template=_parse_declaw_template(section),
+            env=_parse_declaw_env(section),
+            security=_parse_declaw_security(section),
+            vault_refs=_parse_declaw_vault_refs(section),
+        )
+        # Derived from OMNIGENT_DECLAW_MAX_LIFETIME_S so the token always
+        # outlives the (operator-overridable) sandbox lifetime — mirrors the
+        # cwsandbox / e2b path.
+        token_ttl_s = managed_token_ttl_s()
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -1420,6 +1434,200 @@ def _parse_provider_positive_int(raw: dict[str, object], provider: str, key: str
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ValueError(f"server config 'sandbox.{provider}.{key}' must be a positive integer")
     return value
+
+
+# Keys accepted in the `sandbox.declaw` block and its nested `security` block.
+# The security sub-keys mirror Declaw's SecurityPolicy surface; structural
+# validation here (keys + leaf types) stays decoupled from Declaw's semantic
+# schema — the launcher maps the block to a SecurityPolicy via the SDK's own
+# config classes, and the policy_ref / inline_rego escape hatch covers anything
+# not surfaced as a named knob.
+_DECLAW_SECTION_KEYS: frozenset[str] = frozenset({"template", "env", "vault_refs", "security"})
+_DECLAW_SECURITY_KEYS: frozenset[str] = frozenset(
+    {
+        "mode",
+        "agent_policy",
+        "governance_pack",
+        "pii",
+        "injection_defense",
+        "network",
+        "audit",
+        "toxicity",
+        "code_security",
+        "content_gate",
+        "policy_ref",
+        "inline_rego",
+        "inline_modules",
+    }
+)
+
+
+def _reject_unknown_keys(mapping: dict[str, object], allowed: frozenset[str], path: str) -> None:
+    """
+    Fail loud on any key outside *allowed* — catches typos that would
+    otherwise be silently ignored and surface later as a confusing runtime
+    failure.
+    """
+    unknown = sorted(set(mapping) - allowed)
+    if unknown:
+        raise ValueError(
+            f"server config '{path}' has unknown key(s): {', '.join(unknown)} "
+            f"(allowed: {', '.join(sorted(allowed))})"
+        )
+
+
+def _declaw_section(raw: dict[str, object]) -> dict[str, object]:
+    """
+    Return the validated ``sandbox.declaw`` mapping (empty when absent).
+
+    :raises ValueError: When ``sandbox.declaw`` is present but not a mapping,
+        or carries an unknown key.
+    """
+    section = raw.get("declaw")
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        raise ValueError("server config 'sandbox.declaw' must be a mapping")
+    _reject_unknown_keys(section, _DECLAW_SECTION_KEYS, "sandbox.declaw")
+    return section
+
+
+def _parse_declaw_template(section: dict[str, object]) -> str | None:
+    """
+    Extract and validate ``sandbox.declaw.template`` (optional).
+
+    Like E2B, Declaw boots from a NAMED template the omnigent host image was
+    built into — NOT a registry image reference. Absent → the launcher
+    resolves its env-var fallback then the default template.
+    """
+    template = section.get("template")
+    if template is None:
+        return None
+    if not isinstance(template, str) or not template.strip():
+        raise ValueError(
+            "server config 'sandbox.declaw.template' must be the NAME of a Declaw "
+            "template the omnigent host image was built into (e.g. 'omnigent-host'; "
+            "see deploy/declaw/README.md) — NOT a registry image reference (omit it "
+            "to use the default template)"
+        )
+    return template.strip()
+
+
+def _parse_declaw_env(section: dict[str, object]) -> list[str] | None:
+    """Extract and validate ``sandbox.declaw.env`` — server env var NAMES (optional)."""
+    env = section.get("env")
+    if env is None:
+        return None
+    if not isinstance(env, list) or not all(
+        isinstance(name, str) and name.strip() for name in env
+    ):
+        raise ValueError(
+            "server config 'sandbox.declaw.env' must be a list of server environment "
+            "variable NAMES to inject, e.g. ['ANTHROPIC_API_KEY', 'GIT_TOKEN']"
+        )
+    return [name.strip() for name in env]
+
+
+def _parse_declaw_vault_refs(section: dict[str, object]) -> dict[str, str] | None:
+    """
+    Extract and validate ``sandbox.declaw.vault_refs`` (optional).
+
+    A mapping of in-sandbox ENV_VAR_NAME → stored Declaw vault secret name.
+    The secret value is resolved server-side at provision and never enters the
+    config file or the VM image — the Declaw-native alternative to plaintext
+    ``env`` passthrough for harness credentials.
+    """
+    vault_refs = section.get("vault_refs")
+    if vault_refs is None:
+        return None
+    if not isinstance(vault_refs, dict) or not all(
+        isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
+        for k, v in vault_refs.items()
+    ):
+        raise ValueError(
+            "server config 'sandbox.declaw.vault_refs' must be a mapping of in-sandbox "
+            "ENV_VAR_NAME → stored vault secret name, e.g. {OPENAI_API_KEY: openai-prod}"
+        )
+    return {k.strip(): v.strip() for k, v in vault_refs.items()}
+
+
+def _parse_declaw_security(section: dict[str, object]) -> dict[str, object] | None:
+    """
+    Structurally validate ``sandbox.declaw.security`` and return it for the launcher.
+
+    Validates only the top-level shape (allowed keys + leaf types); the
+    launcher maps it to a Declaw ``SecurityPolicy`` via the SDK's own config
+    classes, which own the semantic validation. This keeps the server config
+    parser decoupled from Declaw's evolving policy schema.
+    """
+    security = section.get("security")
+    if security is None:
+        return None
+    if not isinstance(security, dict):
+        raise ValueError("server config 'sandbox.declaw.security' must be a mapping")
+    _reject_unknown_keys(security, _DECLAW_SECURITY_KEYS, "sandbox.declaw.security")
+    for key in ("mode", "agent_policy", "governance_pack", "policy_ref", "inline_rego"):
+        value = security.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(
+                f"server config 'sandbox.declaw.security.{key}' must be a non-empty string"
+            )
+    audit = security.get("audit")
+    if audit is not None and not isinstance(audit, (dict, bool)):
+        raise ValueError(
+            "server config 'sandbox.declaw.security.audit' must be a mapping or boolean"
+        )
+    for key in (
+        "pii",
+        "injection_defense",
+        "network",
+        "toxicity",
+        "code_security",
+        "content_gate",
+    ):
+        value = security.get(key)
+        if value is not None and not isinstance(value, dict):
+            raise ValueError(f"server config 'sandbox.declaw.security.{key}' must be a mapping")
+    modules = security.get("inline_modules")
+    if modules is not None and (
+        not isinstance(modules, list) or not all(isinstance(m, str) and m.strip() for m in modules)
+    ):
+        raise ValueError(
+            "server config 'sandbox.declaw.security.inline_modules' must be a list of "
+            "Rego module strings"
+        )
+    return security
+
+
+def _declaw_launcher_factory(
+    *,
+    template: str | None,
+    env: list[str] | None,
+    security: dict[str, object] | None,
+    vault_refs: dict[str, str] | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: declaw`` path.
+
+    :param template: Declaw template NAME the omnigent host image was built
+        into, or ``None`` for the launcher's env-var fallback / default.
+    :param env: Names of server-process environment variables injected into
+        every sandbox, or ``None`` to resolve from the launcher's fallback.
+    :param security: The validated ``sandbox.declaw.security`` mapping, or
+        ``None`` for the balanced secure-by-default policy.
+    :param vault_refs: ENV_VAR_NAME → vault secret name mapping, or ``None``.
+    :returns: A factory producing parameterized Declaw launchers.
+    """
+
+    def _build() -> SandboxLauncher:
+        """Construct the Declaw launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.declaw import DeclawSandboxLauncher
+
+        return DeclawSandboxLauncher(
+            template=template, env=env, security=security, vault_refs=vault_refs
+        )
+
+    return _build
 
 
 async def launch_managed_host(
