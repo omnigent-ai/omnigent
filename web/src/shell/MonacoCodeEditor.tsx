@@ -384,6 +384,7 @@ function MonacoCodeEditorInner({
     onSetActiveSelection,
     canComment: canEdit && !isDirty,
     pendingBodyRef,
+    path,
   });
 
   const options = useMemo<EditorOptions>(

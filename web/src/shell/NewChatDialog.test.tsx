@@ -29,6 +29,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { setPendingInitialPrompt } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 // Only authenticatedFetch is stubbed (the create POST under test);
@@ -58,6 +59,13 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
   useProjects: () => ({ data: [] }),
 }));
+// Partial mock: only spy on the first-message handoff so the "@"-mention
+// tests can assert the prepended attachment marker. Everything else
+// (composerAttachmentKey, useChatStore, …) stays real for the render tree.
+vi.mock("@/store/chatStore", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/store/chatStore")>()),
+  setPendingInitialPrompt: vi.fn(),
+}));
 
 const authenticatedFetchMock = vi.mocked(authenticatedFetch);
 const useHostsMock = vi.mocked(useHosts);
@@ -65,6 +73,7 @@ const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const useDirectorySessionsMock = vi.mocked(useDirectorySessions);
 const useRunnerHealthMock = vi.mocked(useRunnerHealthRegistration);
+const setPendingInitialPromptMock = vi.mocked(setPendingInitialPrompt);
 
 const RECENT_KEY = "omnigent:recent-workspaces";
 
@@ -1647,5 +1656,142 @@ describe("NewChatLandingScreen attachments", () => {
     // state clears rather than sticking when moving between child elements.
     fireEvent.dragLeave(composer, { dataTransfer: { files: [] } });
     expect(screen.queryByText("Drop files here")).toBeNull();
+  });
+});
+
+// The "@"-file-mention browser on the launcher mirrors the in-session
+// composer, but its file source is the *host filesystem* (no session/runner
+// exists yet) and its paths are converted from the host's absolute form to
+// workspace-relative for the chip and the "[Attached: …]" marker.
+describe("NewChatLandingScreen @-file-mention", () => {
+  const ROOT = "/Users/corey/repo";
+  function dir(path: string): HostFilesystemEntry {
+    return { name: path.split("/").pop() ?? "", path, type: "directory", bytes: null, modified_at: 0 };
+  }
+  function file(path: string): HostFilesystemEntry {
+    return { name: path.split("/").pop() ?? "", path, type: "file", bytes: 10, modified_at: 0 };
+  }
+  // Path-aware listing: the workspace root holds an "omnigent" folder + a
+  // README; drilling into "omnigent" reveals a nested folder + a file. Keyed by
+  // the absolute path so drill-down and relative-path mapping are exercised for
+  // real (a fixed stub couldn't distinguish the two levels).
+  function mockFsByPath() {
+    useHostFilesystemMock.mockImplementation(((_hostId: string | null, path: string | null) => {
+      let entries: HostFilesystemEntry[] = [];
+      if (path === ROOT) entries = [dir(`${ROOT}/omnigent`), file(`${ROOT}/README.md`)];
+      else if (path === `${ROOT}/omnigent`)
+        entries = [dir(`${ROOT}/omnigent/inner`), file(`${ROOT}/omnigent/cli.py`)];
+      return {
+        data: { entries, truncated: false },
+        isLoading: false,
+        error: null,
+        isPlaceholderData: false,
+      };
+    }) as unknown as typeof useHostFilesystem);
+  }
+
+  beforeEach(() => {
+    setupLandingMocks();
+    setPendingInitialPromptMock.mockReset();
+    mockFsByPath();
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  function input() {
+    return screen.getByTestId("new-chat-landing-input");
+  }
+
+  it("opens the menu listing workspace files when '@' is typed (native agent)", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
+    // Host absolute paths are shown as workspace-relative rows (folders first).
+    expect(screen.getByTitle("Open omnigent")).toBeInTheDocument();
+    expect(screen.getByTitle("Attach README.md")).toBeInTheDocument();
+  });
+
+  it("does NOT open the menu for a non-native (SDK) agent", () => {
+    // Gate parity with the in-session composer: mentions are native-only.
+    mockAgents([
+      {
+        id: "sdk1",
+        name: "my-sdk-agent",
+        display_name: "SDK Agent",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+    fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
+    expect(screen.queryByTitle("Open omnigent")).not.toBeInTheDocument();
+  });
+
+  it("drills into a folder and delivers the chosen file as a workspace-relative marker", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
+    // Nested files are hidden until the folder is opened (drill-down).
+    expect(screen.queryByTitle("Attach cli.py")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTitle("Open omnigent"));
+    fireEvent.click(screen.getByTitle("Attach cli.py"));
+    // The chip shows the workspace-relative path, not the host-absolute one.
+    expect(screen.getByText("@omnigent/cli.py")).toBeInTheDocument();
+
+    fireEvent.change(input(), { target: { value: "explain this", selectionStart: 12 } });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    // The contract: the first message carries "[Attached: <relpath>]" so the
+    // runner (rooted at the workspace) reads the on-disk file — relative, never
+    // the "/Users/corey/repo/…" absolute path the host filesystem returned.
+    await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
+    const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
+    expect((payload as { text: string }).text).toBe(
+      "[Attached: omnigent/cli.py]\n\nexplain this",
+    );
+  });
+
+  it("attaches a whole folder with a trailing-slash marker", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
+    // The folder row's "+" button attaches the directory as a unit.
+    fireEvent.click(screen.getByLabelText("Attach whole folder omnigent"));
+    expect(screen.getByText("@omnigent/")).toBeInTheDocument();
+
+    fireEvent.change(input(), { target: { value: "review it", selectionStart: 9 } });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
+    const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
+    expect((payload as { text: string }).text).toBe("[Attached: omnigent/]\n\nreview it");
+  });
+
+  it("removes a tagged chip when its ✕ is clicked", () => {
+    renderLanding();
+    fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
+    fireEvent.click(screen.getByTitle("Attach README.md"));
+    expect(screen.getByText("@README.md")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Remove README.md"));
+    expect(screen.queryByText("@README.md")).not.toBeInTheDocument();
   });
 });
