@@ -46,6 +46,8 @@ error. The stream-mode assertions:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import copy
 import json
 from collections.abc import AsyncIterator
@@ -281,7 +283,9 @@ async def _run_stream(
     monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
 
     async def _noop_sleep(_seconds: float) -> None:
-        return None
+        # Yield to the event loop (no real delay) so the off-loop interaction
+        # bridge tasks the reader spawns get a turn to run in the bounded loop.
+        await asyncio.sleep(0)
 
     monkeypatch.setattr(reader, "_sleep", _noop_sleep)
 
@@ -359,7 +363,9 @@ async def _run(
     monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
 
     async def _noop_sleep(_seconds: float) -> None:
-        return None
+        # Yield to the event loop (no real delay) so the off-loop interaction
+        # bridge tasks the reader spawns get a turn to run in the bounded loop.
+        await asyncio.sleep(0)
 
     monkeypatch.setattr(reader, "_sleep", _noop_sleep)
 
@@ -556,6 +562,165 @@ async def test_waiting_step_invokes_callback_once(
 
 
 # ---------------------------------------------------------------------------
+# Interaction bridge runs OFF the reader loop (no streaming starvation)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_streaming_continues_while_interaction_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A pending (blocking) interaction must NOT freeze mirroring of later steps.
+
+    Regression for the inline-await starvation (gemini repro): with the bridge run
+    off the reader loop, a DONE planner that follows a WAITING step in the same
+    snapshot is still mirrored while the human is still answering.
+    """
+    waiting = _load("ask_question_waiting")
+    planner = _done_planner("Answer arrives later", step_index=99)
+    script = _StepScript([[waiting, planner], [waiting, planner]])
+    sink = _PostSink()
+
+    async def _block(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        await asyncio.Event().wait()  # never completes — simulates a human holding
+
+    await asyncio.wait_for(
+        _run(
+            bridge_dir=_bridge_dir(tmp_path),
+            sink=sink,
+            steps=script,
+            monkeypatch=monkeypatch,
+            iterations=2,
+            on_pending=_block,
+        ),
+        timeout=5.0,
+    )
+
+    # The planner message was mirrored despite the interaction still pending.
+    assert "message" in sink.item_types()
+
+
+@pytest.mark.asyncio
+async def test_single_in_flight_guard_skips_second_interaction() -> None:
+    """While one interaction is handled off-loop, a second (e.g. agy's higher-index
+    WAITING retry) is NOT fired again — the in-flight bridge owns the retries."""
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    waiting = _load("ask_question_waiting")
+    fired: list[int] = []
+
+    async def _block(_cascade_id: str, _port: int, pending: PendingInteraction) -> None:
+        fired.append(pending["step_index"])
+        await asyncio.Event().wait()
+
+    reader._maybe_handle_interaction(
+        waiting,
+        key=("traj", 0),
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _block),
+    )
+    reader._maybe_handle_interaction(
+        waiting,
+        key=("traj", 1),
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _block),
+    )
+    await asyncio.sleep(0)  # let the spawned task start
+
+    assert len(fired) == 1  # the guard suppressed the second despite a distinct key
+
+    task = state.interaction_task
+    assert task is not None
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_interaction_done_callback_clears_slot() -> None:
+    """When an interaction task completes, the slot clears so a later distinct
+    interaction can fire."""
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    waiting = _load("ask_question_waiting")
+    fired: list[int] = []
+
+    async def _quick(_cascade_id: str, _port: int, pending: PendingInteraction) -> None:
+        fired.append(pending["step_index"])
+
+    reader._maybe_handle_interaction(
+        waiting,
+        key=("traj", 0),
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _quick),
+    )
+    first = state.interaction_task
+    assert first is not None
+    await first
+    await asyncio.sleep(0)  # let the done-callback run
+    assert state.interaction_task is None  # slot cleared
+
+    reader._maybe_handle_interaction(
+        waiting,
+        key=("traj", 1),
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _quick),
+    )
+    second = state.interaction_task
+    assert second is not None
+    await second
+    assert len(fired) == 2  # the slot cleared, so the second interaction fired
+
+
+@pytest.mark.asyncio
+async def test_reader_teardown_cancels_in_flight_interaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A stopped reader cancels an interaction bridge still awaiting a verdict."""
+    waiting = _load("ask_question_waiting")
+    script = _StepScript([[waiting], [waiting]])
+    sink = _PostSink()
+    tasks: list[asyncio.Task[object]] = []
+
+    async def _block(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        current = asyncio.current_task()
+        assert current is not None
+        tasks.append(current)
+        await asyncio.Event().wait()
+
+    await asyncio.wait_for(
+        _run(
+            bridge_dir=_bridge_dir(tmp_path),
+            sink=sink,
+            steps=script,
+            monkeypatch=monkeypatch,
+            iterations=2,
+            on_pending=_block,
+        ),
+        timeout=5.0,
+    )
+
+    assert len(tasks) == 1  # the bridge started
+    assert tasks[0].cancelled()  # reader teardown cancelled it
+
+
+# ---------------------------------------------------------------------------
 # Status edges: RUNNING on user turn, IDLE on assistant-text close
 # ---------------------------------------------------------------------------
 
@@ -726,7 +891,9 @@ async def test_placeholder_conversation_id_waits_for_real_id(
     monkeypatch.setattr(reader, "read_bridge_state", _read_then_flip)
 
     async def _noop_sleep(_seconds: float) -> None:
-        return None
+        # Yield to the event loop (no real delay) so the off-loop interaction
+        # bridge tasks the reader spawns get a turn to run in the bounded loop.
+        await asyncio.sleep(0)
 
     monkeypatch.setattr(reader, "_sleep", _noop_sleep)
 
@@ -968,7 +1135,7 @@ async def test_stream_waiting_frame_invokes_callback_once(
         stream=_FrameScript(frames),
         poll_steps=_StepScript([[]]),
         monkeypatch=monkeypatch,
-        iterations=1,
+        iterations=2,
         on_pending=_on_pending,
     )
 
@@ -1225,7 +1392,9 @@ async def _run_with_telemetry(
     )
 
     async def _noop_sleep(_seconds: float) -> None:
-        return None
+        # Yield to the event loop (no real delay) so the off-loop interaction
+        # bridge tasks the reader spawns get a turn to run in the bounded loop.
+        await asyncio.sleep(0)
 
     monkeypatch.setattr(reader, "_sleep", _noop_sleep)
 

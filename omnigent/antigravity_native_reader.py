@@ -54,6 +54,7 @@ The loop is finite under test via an injectable ``stop`` predicate.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -612,6 +613,14 @@ async def supervise_reader(
             poll_interval_s=poll_interval_s,
             stop=should_stop,
         )
+    finally:
+        # The interaction bridge now runs off the loop; cancel one still awaiting
+        # a human verdict so a cancelled/stopped reader does not leak it.
+        active = state.interaction_task
+        if active is not None and not active.done():
+            active.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await active
 
 
 @dataclass
@@ -654,6 +663,12 @@ class _ReaderState:
     :param cumulative_output_tokens: Running session total of output tokens.
     :param cumulative_cache_read_input_tokens: Running session total of
         cache-read input tokens.
+    :param interaction_task: The single in-flight interaction-bridge task, or
+        ``None`` when none is running. The bridge runs OFF the reader loop so
+        streaming/mirroring continues while a human answers (a long-poll can last
+        a day); at most one runs at a time because the in-flight bridge owns agy's
+        WAITING-timeout retries (a second would double-fire). Cancelled on reader
+        teardown.
     """
 
     allocator: _ToolCallIdAllocator
@@ -667,6 +682,7 @@ class _ReaderState:
     cumulative_input_tokens: int = 0
     cumulative_output_tokens: int = 0
     cumulative_cache_read_input_tokens: int = 0
+    interaction_task: asyncio.Task[None] | None = None
 
 
 async def _poll_loop(
@@ -896,12 +912,11 @@ async def _process_committed_step(
             session_id=session_id,
             state=state,
         )
-    await _maybe_handle_interaction(
+    _maybe_handle_interaction(
         step,
         key=key,
         cascade_id=cascade_id,
-        port=state.port,
-        interacted=state.interacted,
+        state=state,
         on_pending_interaction=on_pending_interaction,
     )
 
@@ -1109,42 +1124,77 @@ async def _emit_step(
     return turn_active
 
 
-async def _maybe_handle_interaction(
+def _maybe_handle_interaction(
     step: dict[str, object],
     *,
     key: _StepKey,
     cascade_id: str,
-    port: int,
-    interacted: set[_StepKey],
+    state: _ReaderState,
     on_pending_interaction: OnPendingInteraction,
 ) -> None:
     """
-    Hand a WAITING step's pending interaction to the bridge, exactly once.
+    Spawn the bridge for a WAITING step's interaction OFF the reader loop.
 
     A non-WAITING step yields no interaction. A WAITING step is handed to the
     callback only the first time its ``(trajectory_id, step_index)`` is seen as
-    pending, so a re-read of the same WAITING snapshot does not re-fire the
-    bridge. The callback is handed the SAME ``cascade_id`` + ``port`` the reader
-    discovered, so the bridge it drives delivers against agy's live conversation
-    without re-discovering (which could bind a recycled/foreign port).
+    pending, so a re-read of the same WAITING snapshot does not re-fire it.
+
+    The callback (the Task 8 bridge) runs as a tracked background task rather than
+    inline so the reader keeps streaming/mirroring while a human answers — the
+    elicitation long-poll can last up to a day, and an inline ``await`` here would
+    freeze the whole stream/poll loop for that duration (no deltas, no tool-output,
+    no status edges, and the idle HTTP stream could be severed).
+
+    SINGLE-IN-FLIGHT GUARD: at most one interaction task runs at a time. agy
+    re-issues a timed-out WAITING step at a HIGHER ``step_index``; the in-flight
+    ``bridge_interaction`` already owns those retries via its own freshest-WAITING
+    re-read, so spawning a second task for a retry step would surface a duplicate
+    elicitation and a competing delivery. Subsequent WAITING steps are skipped
+    while a task is active; its done-callback then clears the slot so a genuinely
+    new later interaction can fire.
+
+    The callback gets the SAME ``cascade_id`` + ``port`` (from ``state``) the
+    reader discovered, so the bridge targets agy's live conversation without
+    re-discovering (which could bind a recycled/foreign port).
 
     :param step: One new RPC step dict.
     :param key: The step's identity key (already computed by the caller).
-    :param cascade_id: agy cascade id (equal to the conversation id) the reader
-        is bound to.
-    :param port: Validated connect-RPC port the reader is bound to.
-    :param interacted: Set of interaction keys already handed to the bridge
-        (mutated here).
+    :param cascade_id: agy cascade id (equal to the conversation id) bound here.
+    :param state: Per-run reader state — ``interacted`` (dedup) and the single
+        ``interaction_task`` slot are mutated here; ``port`` is read.
     :param on_pending_interaction: Async callback for a distinct interaction.
     :returns: None.
     """
     pending = pending_interaction(step)
     if pending is None:
         return
-    if key in interacted:
+    if key in state.interacted:
         return
-    interacted.add(key)
-    await on_pending_interaction(cascade_id, port, pending)
+    active = state.interaction_task
+    if active is not None and not active.done():
+        # An interaction is already being handled off-loop; its bridge owns agy's
+        # WAITING-timeout retries, so don't double-fire on the retry step.
+        return
+    state.interacted.add(key)
+
+    async def _run_bridge() -> None:
+        await on_pending_interaction(cascade_id, state.port, pending)
+
+    def _clear_slot(completed: asyncio.Task[None]) -> None:
+        if state.interaction_task is completed:
+            state.interaction_task = None
+        if not completed.cancelled():
+            exc = completed.exception()
+            if exc is not None:
+                _logger.warning(
+                    "agy interaction bridge task failed (cascade=%s): %r",
+                    cascade_id,
+                    exc,
+                )
+
+    task = asyncio.create_task(_run_bridge(), name="antigravity-interaction-bridge")
+    state.interaction_task = task
+    task.add_done_callback(_clear_slot)
 
 
 async def _maybe_emit_session_usage(
