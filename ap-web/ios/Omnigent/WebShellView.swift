@@ -31,8 +31,7 @@ struct WebShellView: View {
           maxWidth: ServerSwitcherMetrics.maxWidth(for: geometry.size.width),
           switchServer: switchServer,
           connectToNewServer: connectToNewServer,
-          reload: model.reload,
-          find: model.showFind
+          reload: model.reload
         )
         .padding(.top, 8)
         .opacity(model.serverSwitcherHidden ? 0 : 1)
@@ -65,7 +64,6 @@ private struct ServerSwitcher: View {
   let switchServer: (String) -> Void
   let connectToNewServer: () -> Void
   let reload: () -> Void
-  let find: () -> Void
 
   @Environment(\.colorScheme) private var colorScheme
 
@@ -95,10 +93,6 @@ private struct ServerSwitcher: View {
         Label("Reload", systemImage: "arrow.clockwise")
       }
 
-      Button(action: find) {
-        Label("Find in Page", systemImage: "magnifyingglass")
-      }
-
       Divider()
 
       Button(action: connectToNewServer) {
@@ -126,15 +120,20 @@ private struct ServerSwitcher: View {
       .padding(.horizontal, 10)
       .frame(height: 28)
       .frame(maxWidth: maxWidth)
-      .background(.ultraThinMaterial)
-      .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-      .overlay {
-        RoundedRectangle(cornerRadius: 9, style: .continuous)
-          .stroke(Color.primary.opacity(colorScheme == .dark ? 0.16 : 0.10), lineWidth: 0.5)
-      }
-      .shadow(color: .black.opacity(colorScheme == .dark ? 0.22 : 0.08), radius: 10, y: 4)
+      .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
     }
     .buttonStyle(.plain)
+    // The material/border/shadow live OUTSIDE the `label:` closure, on the
+    // Menu's persistent host view. Applied inside the closure, UIKit's menu
+    // presentation snapshots the styled label for its open/dismiss morph and
+    // drops the shadow layer — leaving the pill flat (no shadow) for a beat
+    // after dismissal. Keeping the chrome on the Menu sidesteps that snapshot.
+    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+    .overlay {
+      RoundedRectangle(cornerRadius: 9, style: .continuous)
+        .stroke(Color.primary.opacity(colorScheme == .dark ? 0.16 : 0.10), lineWidth: 0.5)
+    }
+    .shadow(color: .black.opacity(colorScheme == .dark ? 0.22 : 0.08), radius: 10, y: 4)
     .accessibilityLabel("Switch server")
   }
 }

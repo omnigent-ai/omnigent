@@ -13,12 +13,6 @@ final class WebViewModel: ObservableObject {
     webView?.reload()
   }
 
-  func showFind() {
-    guard let webView else { return }
-    webView.isFindInteractionEnabled = true
-    webView.findInteraction?.presentFindNavigator(showingReplace: false)
-  }
-
   func emitNotificationActivation(_ path: String) {
     guard path.starts(with: "/") else { return }
     let script = "window.__omnigentNativeEmitNotificationActivated?.(\(Self.javascriptString(path)));"
