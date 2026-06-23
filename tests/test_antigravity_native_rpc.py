@@ -755,7 +755,9 @@ def test_get_trajectory_steps_posts_cascade_id_and_returns_steps(
         "https://127.0.0.1:52548/exa.language_server_pb.LanguageServerService/"
         "GetCascadeTrajectorySteps"
     )
-    assert json.loads(seen["body"]) == {"cascadeId": "conv-uuid"}  # type: ignore[arg-type]
+    body = seen["body"]
+    assert isinstance(body, (bytes, bytearray))
+    assert json.loads(body) == {"cascadeId": "conv-uuid"}
     assert steps[0]["stepIndex"] == 0
 
 
@@ -770,3 +772,21 @@ def test_cancel_cascade_steps_true_on_200(monkeypatch: pytest.MonkeyPatch) -> No
         httpx.MockTransport(lambda r: httpx.Response(200, json={})),
     )
     assert rpc.cancel_cascade_steps(52548, "conv-uuid") is True
+
+
+def test_cancel_cascade_steps_false_on_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A transport error during ``cancel_cascade_steps`` returns ``False``.
+
+    Cancel is best-effort: a connection reset (e.g. agy already exited) must
+    not propagate an exception to the executor, which treats ``False`` as a
+    soft no-op.
+    """
+
+    def raise_transport(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(raise_transport))
+    assert rpc.cancel_cascade_steps(52548, "conv-uuid") is False

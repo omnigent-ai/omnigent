@@ -389,7 +389,10 @@ def get_trajectory_steps(port: int, cascade_id: str) -> list[dict[str, object]]:
     :param cascade_id: agy cascade id (equal to the conversation id) to query.
     :returns: List of step dicts, each containing at least ``stepIndex`` and
         ``status`` (may be empty when no steps have been recorded yet).
-    :raises httpx.HTTPError: On transport-level failures (callers should catch).
+    :raises httpx.HTTPError: On transport errors or non-2xx responses; the
+        Task 6 read driver is responsible for retry/backoff. Intentionally NOT
+        fail-open (unlike ``_conversation_matches`` which is a discovery probe);
+        a non-2xx here is a hard read failure, not a "not found" signal.
     """
     url = _rpc_url(port, _METHOD_GET_CASCADE_TRAJECTORY_STEPS)
     _assert_loopback_url(url)
@@ -399,6 +402,9 @@ def get_trajectory_steps(port: int, cascade_id: str) -> list[dict[str, object]]:
             headers={"Content-Type": "application/json"},
             content=json.dumps({"cascadeId": cascade_id}).encode("utf-8"),
         )
+    # Raises httpx.HTTPStatusError (subclass of httpx.HTTPError) on non-2xx so
+    # the body is never decoded on error paths (which may not be JSON).
+    response.raise_for_status()
     return list(response.json().get("steps", []))
 
 
