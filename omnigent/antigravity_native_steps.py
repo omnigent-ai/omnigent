@@ -118,6 +118,67 @@ def _trajectory_id(step: dict[str, object]) -> str | None:
     return tid if isinstance(tid, str) else None
 
 
+def _merge_is_multi_select(
+    ask_block: dict[str, object],
+    step: dict[str, object],
+) -> dict[str, object]:
+    """
+    Return a fresh copy of ``ask_block`` with ``is_multi_select`` injected.
+
+    ``requestedInteraction.askQuestion`` does not carry ``is_multi_select``; it
+    lives in ``metadata.toolCall.argumentsJson`` (a JSON-encoded string of the
+    original tool-call arguments).  This helper parses that string and merges
+    the flag into each ``questions[i]`` by index, defaulting to ``False`` when
+    the string is absent, malformed, or missing a particular entry.
+
+    The original ``ask_block`` and ``step`` dicts are never mutated.
+
+    :param ask_block: The ``requestedInteraction.askQuestion`` dict.
+    :param step: The full step dict (used to read ``metadata.toolCall.argumentsJson``).
+    :returns: A new spec dict with ``is_multi_select`` present on every question.
+    """
+    # Parse argumentsJson from metadata.toolCall.
+    args_questions: list[object] = []
+    try:
+        metadata = step.get("metadata")
+        if isinstance(metadata, dict):
+            tool_call = metadata.get("toolCall")
+            if isinstance(tool_call, dict):
+                raw = tool_call.get("argumentsJson")
+                if isinstance(raw, str):
+                    parsed: object = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        aq = parsed.get("questions")
+                        if isinstance(aq, list):
+                            args_questions = aq
+    except (json.JSONDecodeError, Exception):
+        _logger.warning(
+            "agy RPC ask_question WAITING: failed to parse argumentsJson for is_multi_select"
+        )
+
+    # Build a fresh spec dict — never mutate the input block.
+    source_questions = ask_block.get("questions")
+    if not isinstance(source_questions, list):
+        return dict(ask_block)
+
+    merged_questions: list[object] = []
+    for i, q in enumerate(source_questions):
+        if not isinstance(q, dict):
+            merged_questions.append(q)
+            continue
+        is_multi_select = False
+        if i < len(args_questions):
+            aq_entry = args_questions[i]
+            if isinstance(aq_entry, dict):
+                flag = aq_entry.get("is_multi_select")
+                if isinstance(flag, bool):
+                    is_multi_select = flag
+        new_q: dict[str, object] = {**q, "is_multi_select": is_multi_select}
+        merged_questions.append(new_q)
+
+    return {**ask_block, "questions": merged_questions}
+
+
 def pending_interaction(step: dict[str, object]) -> PendingInteraction | None:
     """
     Extract a pending interaction from a WAITING step.
@@ -165,7 +226,7 @@ def pending_interaction(step: dict[str, object]) -> PendingInteraction | None:
             kind="ask_question",
             trajectory_id=trajectory_id,
             step_index=step_idx,
-            spec=ask,
+            spec=_merge_is_multi_select(ask, step),
         )
 
     permission = requested.get("permission")

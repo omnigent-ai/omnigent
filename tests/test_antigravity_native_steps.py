@@ -698,3 +698,127 @@ class TestPendingInteractionDoneReturnsNone:
         """
         step = _load("run_command_done")
         assert pending_interaction(step) is None
+
+
+class TestPendingInteractionIsMultiSelect:
+    """
+    pending_interaction merges is_multi_select from metadata.toolCall.argumentsJson
+    into each spec.questions[i].
+
+    requestedInteraction.askQuestion does not carry is_multi_select; it lives
+    in argumentsJson.  The fix builds a fresh spec dict with the flag injected.
+    """
+
+    def test_fixture_is_multi_select_false(self) -> None:
+        """
+        ask_question_waiting.json has is_multi_select=false in argumentsJson.
+        The merged spec must expose is_multi_select=False on questions[0].
+        """
+        step = _load("ask_question_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        questions = result["spec"].get("questions")
+        assert isinstance(questions, list)
+        q = questions[0]
+        assert isinstance(q, dict)
+        assert q.get("is_multi_select") is False
+
+    def test_synthetic_is_multi_select_true(self) -> None:
+        """
+        Synthetic WAITING step with is_multi_select=true in argumentsJson.
+        The merged spec must expose is_multi_select=True on questions[0].
+        """
+        import copy
+
+        base = _load("ask_question_waiting")
+        step = copy.deepcopy(base)
+
+        # Patch argumentsJson to set is_multi_select: true
+        metadata = step.get("metadata")
+        assert isinstance(metadata, dict)
+        tool_call = metadata.get("toolCall")
+        assert isinstance(tool_call, dict)
+        raw = tool_call.get("argumentsJson")
+        assert isinstance(raw, str)
+        args = json.loads(raw)
+        assert isinstance(args, dict)
+        aq_list = args.get("questions")
+        assert isinstance(aq_list, list)
+        first_q = aq_list[0]
+        assert isinstance(first_q, dict)
+        first_q["is_multi_select"] = True
+        tool_call["argumentsJson"] = json.dumps(args)
+
+        result = pending_interaction(step)
+        assert result is not None
+        questions = result["spec"].get("questions")
+        assert isinstance(questions, list)
+        q = questions[0]
+        assert isinstance(q, dict)
+        assert q.get("is_multi_select") is True
+
+    def test_absent_arguments_json_defaults_false(self) -> None:
+        """
+        When argumentsJson is absent, is_multi_select defaults to False without crashing.
+        """
+        import copy
+
+        base = _load("ask_question_waiting")
+        step = copy.deepcopy(base)
+
+        # Remove argumentsJson from toolCall.
+        metadata = step.get("metadata")
+        assert isinstance(metadata, dict)
+        tool_call = metadata.get("toolCall")
+        assert isinstance(tool_call, dict)
+        tool_call.pop("argumentsJson", None)
+
+        result = pending_interaction(step)
+        assert result is not None
+        questions = result["spec"].get("questions")
+        assert isinstance(questions, list)
+        q = questions[0]
+        assert isinstance(q, dict)
+        assert q.get("is_multi_select") is False
+
+    def test_malformed_arguments_json_defaults_false(self) -> None:
+        """
+        When argumentsJson is not valid JSON, is_multi_select defaults to False without crashing.
+        """
+        import copy
+
+        base = _load("ask_question_waiting")
+        step = copy.deepcopy(base)
+
+        metadata = step.get("metadata")
+        assert isinstance(metadata, dict)
+        tool_call = metadata.get("toolCall")
+        assert isinstance(tool_call, dict)
+        tool_call["argumentsJson"] = "{ not valid json !!!"
+
+        result = pending_interaction(step)
+        assert result is not None
+        questions = result["spec"].get("questions")
+        assert isinstance(questions, list)
+        q = questions[0]
+        assert isinstance(q, dict)
+        assert q.get("is_multi_select") is False
+
+    def test_input_step_not_mutated(self) -> None:
+        """
+        pending_interaction must not mutate the input step dict.
+        requestedInteraction.askQuestion.questions[0] must remain unchanged.
+        """
+        import copy
+
+        step = _load("ask_question_waiting")
+        original = copy.deepcopy(step)
+
+        pending_interaction(step)
+
+        # The original requestedInteraction.askQuestion block must be unchanged.
+        ri = step.get("requestedInteraction")
+        assert isinstance(ri, dict)
+        orig_ri = original.get("requestedInteraction")
+        assert isinstance(orig_ri, dict)
+        assert ri == orig_ri
