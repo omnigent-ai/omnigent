@@ -597,6 +597,10 @@ _HARNESS_ELICITATION_REPARK_GRACE_S = 10.0
 # Client-supplied re-attach ids, namespaced so they cannot collide
 # with Codex deterministic ids or server-minted ids.
 _CLAUDE_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_claude_[0-9a-f]{32}$")
+# Stable re-attach id for ``POST /policies/evaluate`` retries. Allows the
+# server to re-park the existing ASK elicitation rather than minting a new
+# approval card when a transient 5xx or connect-drop triggered a retry.
+_EVALUATE_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_evaluate_[0-9a-f]{32}$")
 
 # Cap on reaping a cancelled disconnect/terminal-resolved race task in
 # the harness-elicitation gate's cleanup. Reaping normally completes in
@@ -3644,6 +3648,7 @@ async def _hold_native_ask_gate(
     engine: PolicyEngine,
     result: PolicyResult,
     conversation_store: ConversationStore,
+    elicitation_id: str | None = None,
 ) -> bool:
     """
     Hold a server-side ASK gate until a human resolves it.
@@ -3686,6 +3691,13 @@ async def _hold_native_ask_gate(
         the reason, deciding_policy, and withheld set_labels.
     :param conversation_store: Store used to mirror child-session
         prompts into ancestor streams.
+    :param elicitation_id: Optional stable re-attach id from the
+        calling hook, e.g. ``"elicit_evaluate_abc123"``. When supplied,
+        ``_publish_and_wait_for_harness_elicitation`` re-attaches to the
+        existing parked elicitation rather than publishing a new card —
+        used by ``POST /policies/evaluate`` retries so a hook retry after
+        a transient 5xx / connect-drop does not prompt the human twice.
+        ``None`` mints a fresh id (the default for non-retry callers).
     :returns: ``True`` iff a human accepted; ``False`` on decline /
         cancel / timeout / disconnect (fail closed).
     """
@@ -3701,11 +3713,11 @@ async def _hold_native_ask_gate(
     )
     # Per-policy ``ask_timeout`` override wins over the spec-level default.
     timeout_s = float(resolve_ask_timeout(engine, result))
-    # Mint the id up front so we can also surface this ASK in the native
-    # terminal (a tmux popup) before parking on the web verdict; both
-    # surfaces resolve the same id, so whichever answers first releases the
-    # gate.
-    elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    # Use the caller-supplied id when present (hook retries re-attach to
+    # the same elicitation); otherwise mint a fresh one so we can surface
+    # this ASK in the native terminal before parking on the web verdict.
+    if elicitation_id is None:
+        elicitation_id = f"elicit_{secrets.token_hex(16)}"
     _spawn_native_approval_popup_forward(
         session_id, elicitation_id, params.message, result.deciding_policy
     )
@@ -7563,19 +7575,30 @@ async def _forward_event_to_runner(
             _resolve_message_content,
         )
 
-        try:
-            forwarded_data["content"] = _resolve_message_content(
-                forwarded_data["content"],
-                file_store,
-                artifact_store,
-                session_id=session_id,
-            )
-        except (ValueError, KeyError):
-            _logger.warning(
-                "File reference resolution failed for session=%s",
-                session_id,
-                exc_info=True,
-            )
+        _unresolved = [
+            b for b in forwarded_data["content"] if isinstance(b, dict) and "file_id" in b
+        ]
+        if _unresolved:
+            try:
+                forwarded_data["content"] = _resolve_message_content(
+                    forwarded_data["content"],
+                    file_store,
+                    artifact_store,
+                    session_id=session_id,
+                )
+                _logger.debug(
+                    "Resolved %d file_id block(s) for session=%s before forwarding",
+                    len(_unresolved),
+                    session_id,
+                )
+            except (ValueError, KeyError):
+                _logger.warning(
+                    "File reference resolution failed for session=%s "
+                    "(unresolved file_id blocks will reach the runner unresolved — "
+                    "runner will attempt fallback resolution)",
+                    session_id,
+                    exc_info=True,
+                )
 
     # Flatten SessionEventInput {type, data} into the runner's
     # discriminated-union shape {type, ...data_fields}. The runner's
@@ -9012,7 +9035,7 @@ async def _register_policy_elicitation(
         message=result.reason or "Approval required",
         requested_schema={},
         phase=Phase.TOOL_CALL.value,
-        policy_name=result.deciding_policy or "unknown",
+        policy_names=result.deciding_policies or ["unknown"],
         content_preview=arguments_preview[:1024],
     )
     # Approval state lives on the runner (in-memory
@@ -10601,6 +10624,8 @@ async def _create_session_from_existing_agent(
     user_id: str | None = None,
     permission_store: PermissionStore | None = None,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
+    file_store: FileStore | None = None,
+    artifact_store: ArtifactStore | None = None,
 ) -> SessionResponse:
     """
     Create a session bound to an already-registered agent.
@@ -10626,6 +10651,10 @@ async def _create_session_from_existing_agent(
         ``parent_session_id`` and session-scoped ``agent_id``.
     :param liveness_lookup: Optional session-scoped liveness lookup
         to populate ``SessionResponse.runner_online``.
+    :param file_store: Optional file metadata store for resolving
+        ``file_id`` references in ``initial_items`` before forwarding
+        to the runner.
+    :param artifact_store: Optional binary content store for the same.
     :returns: The newly created session snapshot.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
@@ -10898,6 +10927,8 @@ async def _create_session_from_existing_agent(
                     conversation_store,
                     runner_client,
                     agent_name=agent.name,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
                     created_by=_attribution_user(user_id),
                 )
     # Re-read rather than reusing the local ``conv``: the label-only branch
@@ -12202,6 +12233,8 @@ def create_sessions_router(
             user_id=user_id,
             permission_store=permission_store,
             liveness_lookup=liveness_lookup,
+            file_store=file_store,
+            artifact_store=artifact_store,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -14254,6 +14287,20 @@ def create_sessions_router(
                 f"Expected one of {list(_PROTO_EVENT_TYPE_TO_PHASE)}.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        # Optional stable re-attach id for hook retries. Validated but not
+        # required — absent on non-retrying callers (old hooks, direct API use).
+        raw_elicitation_id = payload.get("_omnigent_elicitation_id")
+        hook_elicitation_id: str | None = None
+        if raw_elicitation_id is not None:
+            if not isinstance(raw_elicitation_id, str) or not (
+                _EVALUATE_HOOK_ELICITATION_ID_RE.fullmatch(raw_elicitation_id)
+            ):
+                raise OmnigentError(
+                    "Policy evaluate '_omnigent_elicitation_id' must match "
+                    "'elicit_evaluate_' + 32 hex chars.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            hook_elicitation_id = raw_elicitation_id
         data = event.get("data") or {}
 
         conv = conversation_store.get_conversation(session_id)
@@ -14369,6 +14416,7 @@ def create_sessions_router(
                             engine=engine,
                             result=result,
                             conversation_store=conversation_store,
+                            elicitation_id=hook_elicitation_id,
                         )
                         verdict_body: dict[str, Any] = (
                             {"result": "POLICY_ACTION_ALLOW"}
@@ -18177,30 +18225,31 @@ async def _get_session_snapshot(
     if runner_client is None:
         runner_client = get_runner_client()
 
-    status = _session_status_cache.get(session_id)
-    if status is None:
-        # Cache miss: either the server restarted, or the relay
-        # has not yet published the first ``"running"`` event
-        # for a freshly bound session (the relay's GET /stream
-        # is still in its tunnel handshake). Ask the runner for
-        # live status so we don't synthesize a stale ``"idle"``
-        # while a turn is actually in flight.
-        if runner_client is not None:
+    status = _session_status_from_cache(session_id)
+    if status == "idle":
+        # Cache miss (or truly idle): either the server restarted, or the
+        # relay has not yet published the first ``"running"`` event for a
+        # freshly bound session (the relay's GET /stream is still in its
+        # tunnel handshake). Ask the runner for live status so we don't
+        # synthesize a stale ``"idle"`` while a turn is actually in flight.
+        # ``_session_status_from_cache`` already collapses the fine-grained
+        # relay values (``"waiting"`` → ``"running"``), so the raw cache value
+        # is only needed here when it is actually missing (None).
+        if _session_status_cache.get(session_id) is None and runner_client is not None:
             try:
                 resp = await runner_client.get(
                     f"/v1/sessions/{session_id}",
                     timeout=5.0,
                 )
                 if resp.status_code == 200:
-                    status = resp.json().get("status", "idle")
-                    _session_status_cache[session_id] = status
+                    raw = resp.json().get("status", "idle")
+                    _session_status_cache[session_id] = raw
+                    status = _session_status_from_cache(session_id)
             except httpx.HTTPError:
                 _logger.debug(
                     "Runner status query failed for %s",
                     session_id,
                 )
-        if status is None:
-            status = "idle"
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
     last_total_tokens: int | None = None

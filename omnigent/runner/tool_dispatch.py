@@ -394,8 +394,8 @@ async def _execute_local_python_tool(
 ) -> str:
     if agent_spec is None:
         return f"Error: {tool_name} not in local dispatch table (no agent spec)"
+    manager = ToolManager(agent_spec, workdir=runner_workspace)
     try:
-        manager = ToolManager(agent_spec, workdir=runner_workspace)
         workspace = None
         if runner_workspace is not None and conversation_id is not None:
             workspace = runner_workspace / conversation_id
@@ -410,6 +410,8 @@ async def _execute_local_python_tool(
     except Exception as exc:
         _logger.exception("runner local Python tool dispatch failed for %s", tool_name)
         return f"Error: {type(exc).__name__}: {exc}"
+    finally:
+        manager.shutdown()
 
 
 # Cache of resolved callables keyed by dotted path. Avoids

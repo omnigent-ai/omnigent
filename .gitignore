@@ -54,6 +54,11 @@ artifacts/
 # Playwright test run output (screenshots, traces, videos).
 test-results/
 
+# Visual-snapshot failure output (actual/expected/diff PNGs from the UI diff
+# gate). Regenerated each run; only the baseline under
+# tests/e2e_ui/visual/snapshots/ is committed.
+tests/e2e_ui/visual/snapshot_failures/
+
 # ap-web SPA build output, emitted into the server's static dir by
 # `npm run build` / the e2e_ui test fixture. Regenerated on demand;
 # never committed.

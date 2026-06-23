@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import atexit
+import base64
+import codecs
 import contextlib
 import json
 import os
@@ -18,7 +20,10 @@ from pathlib import Path
 from typing import Any, TypeAlias, cast
 from urllib.parse import urlparse, urlunparse
 
-from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.runner.identity import (
+    OMNIGENT_SESSION_ENV_VAR,
+    strip_runner_auth_secrets,
+)
 
 from .async_utils import run_sync_on_thread
 from .credential_proxy import (
@@ -119,6 +124,11 @@ _DEFAULT_ENV_PASSTHROUGH: tuple[str, ...] = (
     "PYTHONUNBUFFERED",
     "PYTHONDONTWRITEBYTECODE",
     "PYTHONFAULTHANDLER",
+    # Omnigent session marker: always pass the "inside Omnigent" marker
+    # through so an agent's sandboxed shell can detect the session, the
+    # way CLAUDE_CODE / CODEX are visible in their agents' shells. Set on
+    # the runner via runner.identity.OMNIGENT_SESSION_ENV_VAR.
+    OMNIGENT_SESSION_ENV_VAR,
 )
 
 
@@ -743,6 +753,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
         path: str,
         offset: int = 1,
         limit: int | None = None,
+        max_binary_bytes: int | None = None,
     ) -> OpResult:
         if offset < 1:
             return {"error": "offset must be >= 1"}
@@ -755,6 +766,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 "path": path,
                 "offset": offset,
                 "limit": limit,
+                "max_binary_bytes": max_binary_bytes,
             },
         )
         return cast(OpResult, result)
@@ -891,10 +903,13 @@ def _handle_helper_request(
             return {"error": str(exc)}
         offset_raw = request.get("offset", 1)
         offset = offset_raw if isinstance(offset_raw, int) else 1
+        max_binary_raw = request.get("max_binary_bytes")
+        max_binary_bytes = max_binary_raw if isinstance(max_binary_raw, int) else None
         return _read_impl(
             path,
             offset,
             request.get("limit"),
+            max_binary_bytes=max_binary_bytes,
         )
 
     if op == "write":
@@ -1014,26 +1029,137 @@ def _assert_write_allowed(policy: SandboxPolicy, path: Path) -> None:
     raise PermissionError(f"Write access to '{path}' is blocked by sandbox.")
 
 
-def _read_impl(path: Path, offset: int, limit: JsonValue) -> OpResult:
+# Bytes sampled to classify a file as text vs binary. A NUL byte or an invalid
+# UTF-8 sequence in this prefix marks the file binary (the same prefix-sniff
+# heuristic git uses), so a multi-MB binary is never read in full just to find
+# out it is not text.
+_BINARY_SNIFF_BYTES = 8192
+
+
+def _is_binary_file(path: Path) -> bool:
+    """Classify *path* as binary by inspecting only its first chunk.
+
+    Reads at most :data:`_BINARY_SNIFF_BYTES` and reports binary when those
+    bytes contain a NUL or are not valid UTF-8. The NUL check matters because
+    ``\x00`` *is* valid UTF-8, so a UTF-16/NUL-laden file would otherwise be
+    misread as text; checking for it explicitly matches git's heuristic. An
+    incremental decoder is used with ``final=False`` so a multi-byte character
+    straddling the chunk boundary is treated as *incomplete* (text), not
+    invalid (binary).
+
+    :param path: Absolute path of the file to classify.
+    :returns: ``True`` if the prefix contains a NUL or is not decodable UTF-8.
     """
-    Read lines from a text file.
+    with path.open("rb") as fh:
+        prefix = fh.read(_BINARY_SNIFF_BYTES)
+    if b"\x00" in prefix:
+        return True
+    try:
+        codecs.getincrementaldecoder("utf-8")("strict").decode(prefix, final=False)
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+def _read_binary_impl(path: Path, max_binary_bytes: int | None) -> OpResult:
+    """Read a binary file as base64, bounded by *max_binary_bytes*.
+
+    Only ``stat`` (for the total size) and at most *max_binary_bytes* are read
+    from disk, so a large file neither saturates memory nor inflates IPC.
+
+    :param path: Absolute path of the binary file.
+    :param max_binary_bytes: Byte cap. ``None`` returns a descriptor only (the
+        agent ``sys_os_read`` path); a positive int inlines up to that many
+        base64-encoded bytes (the filesystem-service path).
+    :returns: An :class:`OpResult` with ``encoding="base64"`` (see
+        :func:`_read_impl`).
+    """
+    total = path.stat().st_size
+    if max_binary_bytes is None:
+        # Agent tool path: return a descriptor only — inlining base64 the
+        # model cannot use would waste (and risk saturating) the context.
+        return {
+            "path": str(path),
+            "encoding": "base64",
+            "content": "",
+            "total_bytes": total,
+            # Not truncated — the content was deliberately not inlined.
+            "truncated": False,
+            "note": (
+                f"Binary file not inlined ({total} bytes). "
+                "View or download it via the file viewer."
+            ),
+        }
+    with path.open("rb") as fh:
+        payload = fh.read(max_binary_bytes)
+    return {
+        "path": str(path),
+        "content": base64.b64encode(payload).decode("ascii"),
+        "encoding": "base64",
+        "total_bytes": total,
+        "returned_bytes": len(payload),
+        "truncated": len(payload) < total,
+    }
+
+
+def _read_impl(
+    path: Path,
+    offset: int,
+    limit: JsonValue,
+    max_binary_bytes: int | None = None,
+) -> OpResult:
+    """
+    Read a file as UTF-8 text, or as base64-encoded bytes when it is binary.
+
+    The file's first chunk is sniffed for UTF-8 validity (see
+    :func:`_is_binary_file`). Files that look like text are read and returned
+    with the usual line-oriented ``offset``/``limit`` windowing. Files that do
+    *not* (images, archives, fonts, …) cannot be line-windowed, so they are
+    capped by *bytes* instead, reading at most ``max_binary_bytes`` from disk.
+
+    For binary files the behaviour depends on ``max_binary_bytes``:
+
+    * ``None`` (the default, used by the agent ``sys_os_read`` tool) — the
+      base64 payload is **not** inlined. A model cannot decode base64, and a
+      multi-MB blob would saturate the context window, so only a descriptor
+      (``total_bytes`` + a ``note``) is returned.
+    * a positive int (used by the filesystem service that feeds the web
+      viewer / downloads) — up to that many raw bytes are base64-encoded and
+      returned, with ``truncated`` set when the file was larger.
 
     :param path: Absolute path of the file to read.
-    :param offset: 1-based line number to start reading from.
+    :param offset: 1-based line number to start reading from (text only).
     :param limit: Maximum number of lines to return, or ``None`` for no
         limit (return all lines from *offset* to end of file).  Callers
         that want the default agent-tool cap should pass
-        :data:`_DEFAULT_READ_LIMIT` explicitly.
-    :returns: An :class:`OpResult` dict with ``path``, ``content``,
-        ``offset``, ``limit``, ``returned_lines``, and ``total_lines``.
+        :data:`_DEFAULT_READ_LIMIT` explicitly.  Ignored for binary files.
+    :param max_binary_bytes: Byte cap for binary files (see above). ``None``
+        returns a descriptor only.
+    :returns: For text, an :class:`OpResult` with ``encoding="utf-8"``,
+        ``content``, ``offset``, ``limit``, ``returned_lines``, and
+        ``total_lines``.  For binary, ``encoding="base64"``, ``total_bytes``,
+        ``truncated`` and either ``content`` (the base64 string, byte-capped
+        callers) or a ``note`` (descriptor-only callers).
     """
     if offset < 1:
         return {"error": "offset must be >= 1"}
     if limit is not None:
         if not isinstance(limit, int) or limit < 1:
             return {"error": "limit must be >= 1"}
+    if max_binary_bytes is not None and max_binary_bytes < 1:
+        return {"error": "max_binary_bytes must be >= 1"}
 
-    text = path.read_text(encoding="utf-8", errors="replace")
+    if _is_binary_file(path):
+        return _read_binary_impl(path, max_binary_bytes)
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="strict")
+    except UnicodeDecodeError:
+        # The sniffed prefix decoded cleanly but bytes further in did not (a
+        # file that is text up front and binary later). Fall back to the binary
+        # path so we never return garbled text.
+        return _read_binary_impl(path, max_binary_bytes)
+
     lines = text.splitlines(keepends=True)
     start = offset - 1
     effective_limit = len(lines) if limit is None else limit
@@ -1042,6 +1168,7 @@ def _read_impl(path: Path, offset: int, limit: JsonValue) -> OpResult:
     return {
         "path": str(path),
         "content": content,
+        "encoding": "utf-8",
         "offset": offset,
         "limit": effective_limit,
         "returned_lines": max(0, resolved_limit - start),

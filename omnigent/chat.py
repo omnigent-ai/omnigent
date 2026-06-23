@@ -2258,39 +2258,63 @@ async def _query_sessions_once(
     # sub-agents and are auto-woken by inbox completions across multiple
     # turns.
     #
-    # Fast-exit: refresh() at the TOP of each iteration catches the common
-    # case (single-turn agent, session already idle) with one HTTP round-
-    # trip (~100 ms) instead of waiting up to _PER_TURN_TIMEOUT_S for a
-    # stream subscription to time out.
+    # Why not _collect_query for the fast-exit signal: the runtime emits
+    # ``session.status: waiting`` AFTER ``response.completed`` (the runner
+    # finishes dispatching tools, then enters the async drain). _collect_query
+    # exits at CompletedEvent and never sees the subsequent "waiting".
     #
-    # Race window: a turn MAY complete in the gap between the top-of-loop
-    # refresh() showing "waiting" and await_turn() opening its subscription.
-    # The window is O(ms) in practice (subagents take seconds). If it fires,
-    # await_turn() times out, the bottom refresh() shows "idle", and we exit
-    # — the only cost is one _PER_TURN_TIMEOUT_S wait and possibly missing
-    # that turn's text.
+    # Why not refresh() for the fast-exit signal: the snapshot API collapses
+    # the ``"waiting"`` relay status to ``"idle"`` once the turn loop exits,
+    # even while sub-agents are still running.
     #
-    # Timeouts: 120 s per turn bounds the race-window penalty. A global
-    # 1800 s wall-clock budget caps the loop regardless of turn count.
+    # Probe approach: subscribe to the live stream for a short window after
+    # the first turn. The "waiting" event arrives O(ms–s) after CompletedEvent
+    # (runner dispatches tools, spawns sub-agents, then parks). The probe
+    # catches it before sub-agents have a chance to complete.
+    #
+    # ``await_turn`` resets ``last_turn_saw_waiting`` to False on
+    # ``session.status: running`` (synthesis starting), so the flag cleanly
+    # reflects only the most recent dispatch state after each call.
+    #
+    # Single-turn agents: no "waiting" event ever → probe times out in
+    # _STATUS_PROBE_TIMEOUT_S (~30 s) and the loop exits.
     _MAX_EXTRA_TURNS = 30
-    _PER_TURN_TIMEOUT_S = 120.0
-    _LOOP_TIMEOUT_S = 1800.0
+    # The runner emits session.status:waiting (not idle) when a turn ends with
+    # running sub-agents. The relay cache holds "waiting", which the snapshot
+    # collapses to "running". refresh() is therefore the authoritative signal:
+    # "running" → async orchestrator still waiting for inbox; "idle" → done.
+    #
+    # A short probe await_turn runs first: it catches synthesis text or the
+    # status event if the subscription opens before the event arrives. Both
+    # "waiting" and "idle" break the probe immediately so the generator closes
+    # cleanly without hitting the timeout.
+    #
+    # refresh() is called after every await_turn (probe + loop) — it is correct
+    # even when await_turn times out (sub-agents still running), unlike the
+    # last_turn_saw_waiting flag which would incorrectly exit on timeout.
+    _STATUS_PROBE_TIMEOUT_S = 5.0  # brief window; status events arrive fast
+    _PER_TURN_TIMEOUT_S = 120.0  # race-window guard per synthesis turn
+    _LOOP_TIMEOUT_S = 1800.0  # 30 min total
 
     async def _drain_extra_turns() -> None:
+        # Probe: collect synthesis text or status events that arrive quickly.
+        probe = await chat.await_turn(timeout=_STATUS_PROBE_TIMEOUT_S)
+        if probe.text:
+            all_text_parts.append(probe.text)
+        # refresh() is the authoritative check: "running" means the runner's
+        # relay cache holds "waiting" (sub-agents still running); "idle" means
+        # truly done (single-turn agent, or synthesis completed in the probe).
+        await chat.refresh()
+        if chat.status not in ("running", "launching"):
+            return
+        # Async orchestrator confirmed. Loop, refreshing after each turn.
         for _ in range(_MAX_EXTRA_TURNS):
-            # Fast-exit for single-turn agents.
-            await chat.refresh()
-            if chat.status not in ("waiting", "running", "launching"):
-                return
-            # Session still active; subscribe before the next check to
-            # reduce (not eliminate) the race where a turn completes
-            # between refresh and subscribe.
             extra = await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
             if extra.text:
                 all_text_parts.append(extra.text)
             await chat.refresh()
-            if chat.status not in ("waiting", "running", "launching"):
-                return
+            if chat.status not in ("running", "launching"):
+                return  # Idle: synthesis done or all sub-agents complete.
         logger.warning(
             "headless -p hit the %d-turn guard for session %s; "
             "the orchestrator may still be running",

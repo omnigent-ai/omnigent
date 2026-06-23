@@ -270,9 +270,13 @@ jobs:
           SHARD_ID: ${{ matrix.shard_id }}
           NUM_SHARDS: ${{ matrix.num_shards }}
         run: |
-          EXTRA_ARGS=()
+          # Always exclude @visual: the UI diff snapshot runs in its own
+          # pinned-runner gate (ui-snapshot.yml) so its baseline matches the
+          # comparison environment; on this unpinned ubuntu-latest it would
+          # flake on font drift. Add the nightly exclusion for PR/push runs.
+          MARKER="not visual"
           if [[ "$NIGHTLY_FULL" != "true" ]]; then
-            EXTRA_ARGS+=(-m "not nightly")
+            MARKER="$MARKER and not nightly"
           fi
           # --splits/--group partition the suite via a strided slice (see
           # pytest_collection_modifyitems in tests/e2e_ui/conftest.py), which
@@ -286,7 +290,7 @@ jobs:
             --tracing=retain-on-failure \
             --screenshot=only-on-failure \
             --video=retain-on-failure \
-            "${EXTRA_ARGS[@]}" \
+            -m "$MARKER" \
             || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
 
       - name: Upload Playwright traces / videos / screenshots on failure

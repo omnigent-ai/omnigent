@@ -2665,8 +2665,9 @@ def test_databricks_default_model_is_resolvable_in_models_json() -> None:
 def test_models_json_lists_only_gateway_verified_models() -> None:
     """
     The hardcoded model lists match the set verified live against the
-    Databricks gateway on the API paths pi uses (Anthropic Messages for
-    Claude, Chat Completions for GPT).
+    Databricks gateway endpoint metadata and the API paths pi uses
+    (Anthropic Messages for Claude, OpenAI-compatible serving endpoints for
+    GPT).
 
     Failure direction matters: a missing working id silently shrinks pi's
     model menu; a reintroduced broken id (``sonnet-4-5-v2`` rejects
@@ -2682,10 +2683,24 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
         "databricks-claude-sonnet-4-5",
     ]
     openai_ids = [m["id"] for m in providers["databricks"]["models"]]
-    assert openai_ids == ["databricks-gpt-5-4-mini", "databricks-gpt-5-4"]
+    assert openai_ids == [
+        "databricks-gpt-5-4-mini",
+        "databricks-gpt-5-4",
+        "databricks-gpt-5-5",
+        "databricks-gpt-5-5-pro",
+    ]
     # The llama serving endpoint no longer exists; the provider stays as
     # the routing home for future non-Claude/GPT endpoints.
     assert providers["databricks-completions"]["models"] == []
+
+
+def test_models_json_uses_oss_verified_gpt_55_caps() -> None:
+    """GPT-5.5 endpoint metadata on the OSS profile advertises 128K output."""
+    models = _build_models_json("https://host.example.com", "tok")
+    by_id = {m["id"]: m for m in models["providers"]["databricks"]["models"]}
+    for model_id in ("databricks-gpt-5-5", "databricks-gpt-5-5-pro"):
+        assert by_id[model_id]["contextWindow"] == 400000
+        assert by_id[model_id]["maxTokens"] == 128000
 
 
 if __name__ == "__main__":
@@ -2833,6 +2848,28 @@ def test_clean_pi_env_passes_pi_and_proxy_config(monkeypatch) -> None:
     assert env.get("PI_SKIP_VERSION_CHECK") == "1"
     assert env.get("HTTPS_PROXY") == "http://proxy:8080"
     assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/ssl/corp-ca.pem"
+
+
+def test_clean_pi_env_includes_omnigent_session_marker(monkeypatch) -> None:
+    """The ``OMNIGENT`` session marker survives the Pi env scrub.
+
+    The marker (set once on the runner) must reach the Pi CLI so the
+    shell commands Pi runs can detect they are inside an Omnigent
+    session, like ``CLAUDE_CODE`` / ``CODEX``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.pi_executor import _clean_pi_env
+    from omnigent.runner.identity import (
+        OMNIGENT_SESSION_ENV_VALUE,
+        OMNIGENT_SESSION_ENV_VAR,
+    )
+
+    monkeypatch.setenv(OMNIGENT_SESSION_ENV_VAR, OMNIGENT_SESSION_ENV_VALUE)
+
+    env = _clean_pi_env()
+
+    assert env.get(OMNIGENT_SESSION_ENV_VAR) == OMNIGENT_SESSION_ENV_VALUE
 
 
 def test_rpc_start_spawns_with_exact_env(monkeypatch) -> None:
@@ -3206,16 +3243,25 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
         captured["policy"] = sandbox
         return "/fake/launcher"
 
+    def _fake_resolve_sandbox(_os_env: OSEnvSpec, cwd: Path) -> SandboxPolicy:
+        return SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=[cwd.resolve(strict=False)],
+            write_roots=[cwd.resolve(strict=False)],
+            write_files=[],
+            allow_network=False,
+        )
+
     # ``_try_sandbox_pi`` resolves this name from the module at call
     # time (function-local ``from .sandbox import ...``), so patching
     # the module attribute intercepts the real call.
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve_sandbox)
     monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_create_exec_launcher)
 
     with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor(
             cwd=str(tmp_path),
-            # linux_bwrap policy resolution is pure-Python (the binary
-            # is only needed at wrap time), so this runs anywhere.
             os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
         )
 

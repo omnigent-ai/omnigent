@@ -1,0 +1,533 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 60;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		B10000000000000000000001 /* OmnigentApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000001 /* OmnigentApp.swift */; };
+		B10000000000000000000002 /* AppRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000002 /* AppRootView.swift */; };
+		B10000000000000000000003 /* ConnectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000003 /* ConnectView.swift */; };
+		B10000000000000000000004 /* DesignTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000004 /* DesignTokens.swift */; };
+		B10000000000000000000005 /* SettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000005 /* SettingsStore.swift */; };
+		B10000000000000000000006 /* ServerURL.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000006 /* ServerURL.swift */; };
+		B10000000000000000000007 /* WorkspaceURLExpander.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000007 /* WorkspaceURLExpander.swift */; };
+		B10000000000000000000008 /* NativeNotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000008 /* NativeNotificationManager.swift */; };
+		B10000000000000000000009 /* WebShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000009 /* WebShellView.swift */; };
+		B1000000000000000000000A /* WebViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000A /* WebViewModel.swift */; };
+		B1000000000000000000000B /* OmnigentWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000B /* OmnigentWebView.swift */; };
+		B1000000000000000000000C /* URL+Omnigent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000C /* URL+Omnigent.swift */; };
+		B1000000000000000000000D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000D /* Assets.xcassets */; };
+		B1000000000000000000000E /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000E /* AppIcon.icon */; };
+		B20000000000000000000001 /* ServerURLTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* ServerURLTests.swift */; };
+		B20000000000000000000002 /* SettingsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* SettingsStoreTests.swift */; };
+		B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		E00000000000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A00000000000000000000005 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A00000000000000000000006;
+			remoteInfo = Omnigent;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		A10000000000000000000001 /* OmnigentApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmnigentApp.swift; sourceTree = "<group>"; };
+		A10000000000000000000002 /* AppRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRootView.swift; sourceTree = "<group>"; };
+		A10000000000000000000003 /* ConnectView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectView.swift; sourceTree = "<group>"; };
+		A10000000000000000000004 /* DesignTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignTokens.swift; sourceTree = "<group>"; };
+		A10000000000000000000005 /* SettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStore.swift; sourceTree = "<group>"; };
+		A10000000000000000000006 /* ServerURL.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerURL.swift; sourceTree = "<group>"; };
+		A10000000000000000000007 /* WorkspaceURLExpander.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpander.swift; sourceTree = "<group>"; };
+		A10000000000000000000008 /* NativeNotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeNotificationManager.swift; sourceTree = "<group>"; };
+		A10000000000000000000009 /* WebShellView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebShellView.swift; sourceTree = "<group>"; };
+		A1000000000000000000000A /* WebViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebViewModel.swift; sourceTree = "<group>"; };
+		A1000000000000000000000B /* OmnigentWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmnigentWebView.swift; sourceTree = "<group>"; };
+		A1000000000000000000000C /* URL+Omnigent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "URL+Omnigent.swift"; sourceTree = "<group>"; };
+		A1000000000000000000000D /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A1000000000000000000000E /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; name = AppIcon.icon; path = "../platform-assets/AppIcon.icon"; sourceTree = "<group>"; };
+		A1000000000000000000000F /* Info-Debug.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Info-Debug.plist"; sourceTree = "<group>"; };
+		A10000000000000000000010 /* Info-Release.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Info-Release.plist"; sourceTree = "<group>"; };
+		A20000000000000000000001 /* ServerURLTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerURLTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000002 /* SettingsStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStoreTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpanderTests.swift; sourceTree = "<group>"; };
+		A30000000000000000000001 /* Omnigent.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Omnigent.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A30000000000000000000002 /* OmnigentTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmnigentTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		C00000000000000000000002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C00000000000000000000005 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A00000000000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000003 /* Omnigent */,
+				A00000000000000000000004 /* OmnigentTests */,
+				A00000000000000000000008 /* Platform Assets */,
+				A00000000000000000000002 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A00000000000000000000002 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A30000000000000000000001 /* Omnigent.app */,
+				A30000000000000000000002 /* OmnigentTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000003 /* Omnigent */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000001 /* OmnigentApp.swift */,
+				A10000000000000000000002 /* AppRootView.swift */,
+				A10000000000000000000003 /* ConnectView.swift */,
+				A10000000000000000000004 /* DesignTokens.swift */,
+				A10000000000000000000005 /* SettingsStore.swift */,
+				A10000000000000000000006 /* ServerURL.swift */,
+				A10000000000000000000007 /* WorkspaceURLExpander.swift */,
+				A10000000000000000000008 /* NativeNotificationManager.swift */,
+				A10000000000000000000009 /* WebShellView.swift */,
+				A1000000000000000000000A /* WebViewModel.swift */,
+				A1000000000000000000000B /* OmnigentWebView.swift */,
+				A1000000000000000000000C /* URL+Omnigent.swift */,
+				A1000000000000000000000D /* Assets.xcassets */,
+				A1000000000000000000000F /* Info-Debug.plist */,
+				A10000000000000000000010 /* Info-Release.plist */,
+			);
+			path = Omnigent;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000004 /* OmnigentTests */ = {
+			isa = PBXGroup;
+			children = (
+				A20000000000000000000001 /* ServerURLTests.swift */,
+				A20000000000000000000002 /* SettingsStoreTests.swift */,
+				A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */,
+			);
+			path = OmnigentTests;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000008 /* Platform Assets */ = {
+			isa = PBXGroup;
+			children = (
+				A1000000000000000000000E /* AppIcon.icon */,
+			);
+			name = "Platform Assets";
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A00000000000000000000006 /* Omnigent */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D10000000000000000000001 /* Build configuration list for PBXNativeTarget "Omnigent" */;
+			buildPhases = (
+				C00000000000000000000001 /* Sources */,
+				C00000000000000000000002 /* Frameworks */,
+				C00000000000000000000003 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Omnigent;
+			productName = Omnigent;
+			productReference = A30000000000000000000001 /* Omnigent.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A00000000000000000000007 /* OmnigentTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D20000000000000000000001 /* Build configuration list for PBXNativeTarget "OmnigentTests" */;
+			buildPhases = (
+				C00000000000000000000004 /* Sources */,
+				C00000000000000000000005 /* Frameworks */,
+				C00000000000000000000006 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				E00000000000000000000002 /* PBXTargetDependency */,
+			);
+			name = OmnigentTests;
+			productName = OmnigentTests;
+			productReference = A30000000000000000000002 /* OmnigentTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A00000000000000000000005 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					A00000000000000000000006 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+					A00000000000000000000007 = {
+						CreatedOnToolsVersion = 16.0;
+						TestTargetID = A00000000000000000000006;
+					};
+				};
+			};
+			buildConfigurationList = D00000000000000000000001 /* Build configuration list for PBXProject "Omnigent" */;
+			compatibilityVersion = "Xcode 15.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A00000000000000000000001;
+			productRefGroup = A00000000000000000000002 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A00000000000000000000006 /* Omnigent */,
+				A00000000000000000000007 /* OmnigentTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		C00000000000000000000003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B1000000000000000000000D /* Assets.xcassets in Resources */,
+				B1000000000000000000000E /* AppIcon.icon in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C00000000000000000000006 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		C00000000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B10000000000000000000001 /* OmnigentApp.swift in Sources */,
+				B10000000000000000000002 /* AppRootView.swift in Sources */,
+				B10000000000000000000003 /* ConnectView.swift in Sources */,
+				B10000000000000000000004 /* DesignTokens.swift in Sources */,
+				B10000000000000000000005 /* SettingsStore.swift in Sources */,
+				B10000000000000000000006 /* ServerURL.swift in Sources */,
+				B10000000000000000000007 /* WorkspaceURLExpander.swift in Sources */,
+				B10000000000000000000008 /* NativeNotificationManager.swift in Sources */,
+				B10000000000000000000009 /* WebShellView.swift in Sources */,
+				B1000000000000000000000A /* WebViewModel.swift in Sources */,
+				B1000000000000000000000B /* OmnigentWebView.swift in Sources */,
+				B1000000000000000000000C /* URL+Omnigent.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C00000000000000000000004 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B20000000000000000000001 /* ServerURLTests.swift in Sources */,
+				B20000000000000000000002 /* SettingsStoreTests.swift in Sources */,
+				B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		E00000000000000000000002 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A00000000000000000000006 /* Omnigent */;
+			targetProxy = E00000000000000000000001 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		D00000000000000000000002 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		D00000000000000000000003 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		D10000000000000000000002 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_ASSET_PATHS = "";
+				DEVELOPMENT_TEAM = 8RMX4WU6F8;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "Omnigent/Info-Debug.plist";
+				VERSIONING_SYSTEM = "apple-generic";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.omnigent.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		D10000000000000000000003 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_ASSET_PATHS = "";
+				DEVELOPMENT_TEAM = 8RMX4WU6F8;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "Omnigent/Info-Release.plist";
+				VERSIONING_SYSTEM = "apple-generic";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.omnigent.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		D20000000000000000000002 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.omnigent.ios.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Omnigent.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Omnigent";
+			};
+			name = Debug;
+		};
+		D20000000000000000000003 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.omnigent.ios.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Omnigent.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Omnigent";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		D00000000000000000000001 /* Build configuration list for PBXProject "Omnigent" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D00000000000000000000002 /* Debug */,
+				D00000000000000000000003 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D10000000000000000000001 /* Build configuration list for PBXNativeTarget "Omnigent" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D10000000000000000000002 /* Debug */,
+				D10000000000000000000003 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D20000000000000000000001 /* Build configuration list for PBXNativeTarget "OmnigentTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D20000000000000000000002 /* Debug */,
+				D20000000000000000000003 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A00000000000000000000005 /* Project object */;
+}
