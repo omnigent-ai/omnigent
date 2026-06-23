@@ -1994,6 +1994,10 @@ class _StubHost:
         """Record timer start calls like the real host."""
         self.output_calls.append("<start_timer>")
 
+    def clear_subagents(self) -> None:
+        """Drop the sub-agent tree like the real host (no-op for the stub)."""
+        self.output_calls.append("<clear_subagents>")
+
 
 class _StubFmt:
     """Minimal fmt stub: welcome() returns a sentinel, muted is a Rich style name."""

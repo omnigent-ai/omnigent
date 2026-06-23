@@ -46,6 +46,11 @@ from ._blocks import (
     ToolGroup,
     ToolResultBlock,
 )
+from ._child_status import (
+    TERMINAL_TASK_STATUSES,
+    child_session_busy,
+    child_summary_busy,
+)
 from ._client import OmnigentClient
 from ._errors import OmnigentError, ToolCallDenied
 from ._events import MCP_ELICITATION_METHOD, ElicitationRequest
@@ -73,6 +78,7 @@ from .tools import ToolMetadata, ToolState, tool
 
 __all__ = [
     "MCP_ELICITATION_METHOD",
+    "TERMINAL_TASK_STATUSES",
     "AnyBlock",
     "BlockContext",
     "BlockStream",
@@ -111,6 +117,8 @@ __all__ = [
     "ToolMetadata",
     "ToolResultBlock",
     "ToolState",
+    "child_session_busy",
+    "child_summary_busy",
     "format_tool_args_brief",
     "merge_text_across_iterations",
     "only_agent",
