@@ -253,7 +253,10 @@ HARNESS_DESCRIPTORS: dict[str, HarnessDescriptor] = {
         web_capabilities=("approvalMode",),
         terminal_first=True,
         transport_kind="http-sse",
-        openapi_schema="opencode/openapi-1.17.7.json",
+        # No vendored OpenAPI fixture: the typed client is hand-maintained and
+        # the live wire-contract e2e (test_opencode_native_wire_contract_e2e)
+        # validates it against a real `opencode serve` — a far better drift
+        # guard than a 35k-line checked-in schema dump.
         description="Native OpenCode server bridge (HTTP + SSE).",
     ),
     "pi": HarnessDescriptor(
