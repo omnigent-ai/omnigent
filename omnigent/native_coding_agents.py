@@ -8,6 +8,7 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
+    GOOSE_NATIVE_WRAPPER_VALUE,
     PI_NATIVE_WRAPPER_VALUE,
     UI_MODE_LABEL_KEY,
     UI_MODE_TERMINAL_VALUE,
@@ -75,11 +76,21 @@ CURSOR_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="cursor",
 )
 
+GOOSE_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="goose",
+    display_name="Goose",
+    agent_name="goose-native-ui",
+    harness="goose-native",
+    wrapper_label=GOOSE_NATIVE_WRAPPER_VALUE,
+    terminal_name="goose",
+)
+
 NATIVE_CODING_AGENTS: tuple[NativeCodingAgent, ...] = (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    GOOSE_NATIVE_CODING_AGENT,
 )
 
 _BY_AGENT_NAME = {agent.agent_name: agent for agent in NATIVE_CODING_AGENTS}

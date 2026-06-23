@@ -15,6 +15,9 @@ HARNESS_ALIASES: dict[str, str] = {
     # canonical id is "antigravity" (matches the registry / workflow type).
     "agy": "antigravity",
     "google-antigravity": "antigravity",
+    # User-facing reversed spelling for the Goose native-CLI harness; canonical
+    # id is "goose-native".
+    "native-goose": "goose-native",
     # Qwen Code harness alias.
     "qwen-code": "qwen",
 }
@@ -35,6 +38,8 @@ NATIVE_HARNESSES: frozenset[str] = frozenset(
         "native-pi",
         "cursor-native",
         "native-cursor",
+        "goose-native",
+        "native-goose",
     }
 )
 

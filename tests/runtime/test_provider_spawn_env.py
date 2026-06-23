@@ -28,6 +28,7 @@ import yaml as _yaml
 from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
     _build_codex_spawn_env,
+    _build_goose_spawn_env,
     _build_openai_agents_sdk_spawn_env,
     _build_pi_spawn_env,
     _build_qwen_spawn_env,
@@ -595,6 +596,41 @@ def test_qwen_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_QWEN_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
     # Model comes from provider's default_model
     assert env["HARNESS_QWEN_MODEL"] == "gpt-default-model"
+
+
+def test_goose_spawn_env_forwards_model_and_no_gateway(config_home: Path) -> None:
+    """The headless goose builder forwards a spec model as ``HARNESS_GOOSE_MODEL``
+    and wires NO provider/gateway credential (Goose owns its own auth)."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness="goose", model="claude-haiku-4-5")
+
+    env = _build_goose_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_GOOSE_MODEL"] == "claude-haiku-4-5"
+    # Unlike qwen, goose emits no gateway/provider env (uses goose configure).
+    assert not any(k.startswith("HARNESS_GOOSE_GATEWAY") for k in env)
+    assert "OPENAI_API_KEY" not in env and "GOOSE_PROVIDER" not in env
+
+
+def test_goose_spawn_env_drops_databricks_model(config_home: Path) -> None:
+    """A ``databricks-*`` model isn't a valid Goose model id, so it's dropped
+    (provider/model then come from the user's goose config)."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness="goose", model="databricks-claude-opus-4-8")
+
+    env = _build_goose_spawn_env(spec, workdir=None)
+
+    assert "HARNESS_GOOSE_MODEL" not in env
+
+
+def test_goose_spawn_env_no_model_is_empty(config_home: Path) -> None:
+    """With no spec model, goose falls back entirely to its ambient config."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness="goose")
+
+    env = _build_goose_spawn_env(spec, workdir=None)
+
+    assert "HARNESS_GOOSE_MODEL" not in env
 
 
 def test_qwen_falls_back_to_catalog_default_model(config_home: Path) -> None:

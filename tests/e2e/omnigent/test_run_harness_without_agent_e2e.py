@@ -158,6 +158,16 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     wrap routes through ``HARNESS_QWEN_GATEWAY_BASE_URL`` /
     ``HARNESS_QWEN_GATEWAY_AUTH_COMMAND`` instead. Its live round-trip is
     covered by the dedicated ``test_per_harness_qwen.py`` suite.
+
+    ``goose`` (headless ACP) is excluded for the same reason as ``qwen``: it
+    authenticates from Goose's own config (``goose configure``), not the shared
+    gateway/profile probe wiring, so ``_build_goose_spawn_env`` emits no
+    ``HARNESS_GOOSE_GATEWAY*`` vars for this matrix to drive. Its live round-trip
+    is covered by the dedicated ``test_goose_acp_e2e.py`` suite.
+
+    ``goose-native`` is excluded for the same reason as ``claude-native`` /
+    ``cursor-native``: it is a terminal-first TUI launched via ``omni goose``
+    (tmux pane + bridge dir), not ``omnigent run --harness goose-native``.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
@@ -167,5 +177,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "cursor-native",
         "antigravity",
         "qwen",
+        "goose",
+        "goose-native",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses
