@@ -40,6 +40,12 @@ final class WebViewModel: ObservableObject {
     webView?.evaluateJavaScript(script)
   }
 
+  func emitSidebarDrag(phase: String, progress: Double) {
+    let clamped = max(0, min(1, progress))
+    let script = "window.__omnigentNativeEmitSidebarDrag?.(\(Self.javascriptString(phase)), \(clamped));"
+    webView?.evaluateJavaScript(script)
+  }
+
   static func javascriptString(_ value: String) -> String {
     guard let data = try? JSONEncoder().encode(value),
           let encoded = String(data: data, encoding: .utf8) else {

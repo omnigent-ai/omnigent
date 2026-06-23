@@ -21,6 +21,13 @@
 //     notifications in the browser path.
 
 /**
+ * Phase of a native sidebar-drag gesture (see `onSidebarDrag`). `begin` and
+ * `move` are live drag frames carrying an open fraction; `open` and `close`
+ * are the settle decision the shell made on release.
+ */
+export type SidebarDragPhase = "begin" | "move" | "open" | "close";
+
+/**
  * Minimal API surface exposed by native shells. Electron exposes the legacy
  * `window.omnigentDesktop`; newer shells expose `window.omnigentNative`.
  * Kept intentionally tiny and string/number only so it survives bridge
@@ -41,6 +48,15 @@ interface NativeShellApi {
    * path the notification carried (its `navigatePath`); returns an unsubscribe.
    */
   onNotificationActivated?: (callback: (path: string) => void) => () => void;
+  /**
+   * Subscribe to native sidebar-drag events. The iOS shell streams a left-edge
+   * swipe here (the gesture it repurposed from back-navigation) so the renderer
+   * can drive its sidebar as an interactive drawer: `begin`/`move` carry a 0→1
+   * open fraction the sidebar should track live (no transition), and
+   * `open`/`close` are the settle decision on release (animate to that resting
+   * state). Returns an unsubscribe.
+   */
+  onSidebarDrag?: (callback: (phase: SidebarDragPhase, progress: number) => void) => () => void;
   /**
    * Let native chrome react to web UI state. The iOS shell uses this to show
    * its floating server switcher only when the chat transcript is visible.
@@ -203,6 +219,29 @@ export function onNativeNotificationActivated(callback: (path: string) => void):
     return native.onNotificationActivated(callback);
   } catch (err) {
     console.warn("[nativeBridge] native onNotificationActivated failed:", err);
+    return () => {};
+  }
+}
+
+/**
+ * Subscribe to native sidebar-drag events from the iOS shell's left-edge swipe
+ * (the gesture it repurposed from back-navigation), so the renderer can drive
+ * its sidebar as an interactive drawer — tracking the finger on `begin`/`move`
+ * and animating to the settled state on `open`/`close`.
+ *
+ * Returns an unsubscribe function. A no-op (returning a no-op unsubscribe)
+ * outside a native shell or under a shell too old to support the gesture, so
+ * callers can register it unconditionally.
+ */
+export function onNativeSidebarDrag(
+  callback: (phase: SidebarDragPhase, progress: number) => void,
+): () => void {
+  const native = nativeApi();
+  if (!native?.onSidebarDrag) return () => {};
+  try {
+    return native.onSidebarDrag(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onSidebarDrag failed:", err);
     return () => {};
   }
 }

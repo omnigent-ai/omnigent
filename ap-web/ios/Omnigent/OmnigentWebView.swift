@@ -31,13 +31,24 @@ struct OmnigentWebView: UIViewRepresentable {
     let webView = AccessoryFreeWebView(frame: .zero, configuration: configuration)
     webView.navigationDelegate = context.coordinator
     webView.uiDelegate = context.coordinator
-    webView.allowsBackForwardNavigationGestures = true
+    // The left-edge swipe is repurposed to open the web app's sidebar (see the
+    // edge-pan recognizer below), so the native back/forward gesture is off —
+    // the two would otherwise fight over the same edge.
+    webView.allowsBackForwardNavigationGestures = false
     webView.isFindInteractionEnabled = true
     webView.isOpaque = false
     webView.backgroundColor = .clear
     webView.underPageBackgroundColor = .clear
     webView.scrollView.backgroundColor = .clear
     webView.scrollView.contentInsetAdjustmentBehavior = .never
+
+    let edgePan = UIScreenEdgePanGestureRecognizer(
+      target: context.coordinator,
+      action: #selector(Coordinator.handleLeftEdgePan(_:))
+    )
+    edgePan.edges = .left
+    edgePan.delegate = context.coordinator
+    webView.addGestureRecognizer(edgePan)
 
     model.webView = webView
     context.coordinator.attach(webView)
@@ -124,6 +135,22 @@ struct OmnigentWebView: UIViewRepresentable {
         try { callback(mode); } catch {}
       }
     });
+    const sidebarDragCallbacks = new Set();
+    Object.defineProperty(window, "__omnigentNativeEmitSidebarDrag", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value(phase, progress) {
+        if (typeof phase !== "string") return;
+        const fraction =
+          typeof progress === "number" && Number.isFinite(progress)
+            ? Math.max(0, Math.min(1, progress))
+            : 0;
+        for (const callback of sidebarDragCallbacks) {
+          try { callback(phase, fraction); } catch {}
+        }
+      },
+    });
     window.omnigentNative = Object.freeze({
       kind: "ios",
       setBadgeCount(count) {
@@ -148,6 +175,11 @@ struct OmnigentWebView: UIViewRepresentable {
         if (typeof callback !== "function") return () => {};
         callbacks.add(callback);
         return () => callbacks.delete(callback);
+      },
+      onSidebarDrag(callback) {
+        if (typeof callback !== "function") return () => {};
+        sidebarDragCallbacks.add(callback);
+        return () => sidebarDragCallbacks.delete(callback);
       },
       setServerSwitcherHidden(hidden) {
         window.webkit.messageHandlers.omnigentNative.postMessage({
@@ -181,7 +213,7 @@ struct OmnigentWebView: UIViewRepresentable {
   """
 
   @MainActor
-  final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+  final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, UIGestureRecognizerDelegate {
     var parent: OmnigentWebView
     private weak var webView: WKWebView?
     private(set) var pinnedURL: URL?
@@ -197,6 +229,43 @@ struct OmnigentWebView: UIViewRepresentable {
 
     func detach() {
       webView = nil
+    }
+
+    // A left-edge swipe drives the web app's sidebar as an interactive drawer.
+    // The sidebar's right edge tracks the finger — progress 0→1 maps the drag
+    // across the view width to closed→open — and on release we settle open or
+    // closed from how far it was dragged and the flick velocity. This replaces
+    // the native back gesture (disabled above), which owned this same edge.
+    private static let openProgressThreshold = 0.33
+    private static let openVelocityThreshold: CGFloat = 600
+
+    @objc func handleLeftEdgePan(_ recognizer: UIScreenEdgePanGestureRecognizer) {
+      guard let view = recognizer.view, view.bounds.width > 0 else { return }
+      let width = view.bounds.width
+      let progress = Double(max(0, min(width, recognizer.translation(in: view).x)) / width)
+
+      switch recognizer.state {
+      case .began:
+        parent.model.emitSidebarDrag(phase: "begin", progress: progress)
+      case .changed:
+        parent.model.emitSidebarDrag(phase: "move", progress: progress)
+      case .ended:
+        let velocity = recognizer.velocity(in: view).x
+        let open = progress > Self.openProgressThreshold || velocity > Self.openVelocityThreshold
+        parent.model.emitSidebarDrag(phase: open ? "open" : "close", progress: progress)
+      case .cancelled, .failed:
+        parent.model.emitSidebarDrag(phase: "close", progress: progress)
+      default:
+        break
+      }
+    }
+
+    // Let the edge swipe coexist with the page's own scrolling/pan gestures.
+    func gestureRecognizer(
+      _ gestureRecognizer: UIGestureRecognizer,
+      shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+    ) -> Bool {
+      true
     }
 
     func load(_ url: URL, in webView: WKWebView) {
