@@ -29,11 +29,10 @@ masks: the host/workspace/agent chips render fixed, known values. ``/v1/info`` /
 
 from __future__ import annotations
 
-import json
 import re
 
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Page, expect
 
 # Host the composer auto-selects (the tunneled e2e runner registers none).
 _HOST_ID = "host_e2e"
@@ -62,36 +61,34 @@ _HOSTS_BODY = {
 _EMPTY_LIST_BODY = {"object": "list", "data": [], "has_more": False}
 
 
-def _fulfill_json(route: Route, payload: object) -> None:
-    route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))
-
-
 @pytest.mark.visual
 def test_empty_landing_matches_baseline(
-    page: Page,
+    snapshot_page: Page,
     live_server: str,
+    fulfill_json,
+    settle_for_snapshot,
     assert_snapshot,
 ) -> None:
     """The default empty "/" view renders pixel-identical to the committed baseline.
 
-    :param page: pytest-playwright page (fresh context per test).
+    :param snapshot_page: page pinned to a fixed viewport + light palette (see
+        the suite ``conftest.py``).
     :param live_server: Base URL of the spawned ``omnigent server`` serving the
         built SPA. The landing's data calls are stubbed below, so no real agent
         catalog / host / session state (or LLM credentials) is involved.
+    :param fulfill_json: 200-JSON route helper (suite ``conftest.py``).
+    :param settle_for_snapshot: fonts + caret settle, run before capture.
     :param assert_snapshot: ``pytest-playwright-visual-snapshot`` fixture; writes
         the baseline under ``--update-snapshots`` and otherwise compares against
         it, failing (and emitting actual/expected/diff PNGs) on any mismatch.
     """
-    page.set_viewport_size({"width": 1280, "height": 800})
-    # Pin the resolved color scheme so the whole palette is deterministic
-    # regardless of the runner's prefers-color-scheme default.
-    page.emulate_media(color_scheme="light")
+    page = snapshot_page
 
     # Stub the landing's data endpoints so the view is fully deterministic.
-    page.route("**/v1/agents", lambda r: _fulfill_json(r, _AGENTS_BODY))
-    page.route("**/v1/hosts", lambda r: _fulfill_json(r, _HOSTS_BODY))
-    page.route(_FILESYSTEM_RE, lambda r: _fulfill_json(r, _EMPTY_LIST_BODY))
-    page.route(_SESSIONS_RE, lambda r: _fulfill_json(r, _EMPTY_LIST_BODY))
+    page.route("**/v1/agents", lambda r: fulfill_json(r, _AGENTS_BODY))
+    page.route("**/v1/hosts", lambda r: fulfill_json(r, _HOSTS_BODY))
+    page.route(_FILESYSTEM_RE, lambda r: fulfill_json(r, _EMPTY_LIST_BODY))
+    page.route(_SESSIONS_RE, lambda r: fulfill_json(r, _EMPTY_LIST_BODY))
 
     # Seed a recent workspace for the stubbed host so the working-directory chip
     # auto-fills to a fixed value ("repo") without hitting the file browser. Set
@@ -111,14 +108,10 @@ def test_empty_landing_matches_baseline(
     expect(page.get_by_test_id("new-chat-landing-agent-select")).to_be_visible(timeout=30_000)
     expect(page.get_by_text("No active sessions")).to_be_visible(timeout=30_000)
 
-    # Settle web fonts so glyph metrics don't shift mid-capture. The expression
-    # must *return* the Promise so Playwright's sync API awaits it; an arrow
-    # function that calls .then() returns undefined and never waits.
-    page.evaluate("document.fonts.ready")
+    # Settle web fonts + kill the blinking caret (both time-dependent).
+    settle_for_snapshot(page)
 
-    # Pin the focused-composer border state and kill the blinking caret, both of
-    # which are otherwise time-dependent.
-    page.add_style_tag(content="* { caret-color: transparent !important; }")
+    # Pin the focused-composer border state (after the caret is already killed).
     page.get_by_test_id("new-chat-landing-input").focus()
 
     # Full viewport: the open sidebar + the hero + the composer.

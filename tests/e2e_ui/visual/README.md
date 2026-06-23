@@ -1,18 +1,27 @@
 # UI diff snapshot tests
 
-A single visual-regression baseline of the default empty view (`/`) — the open
-left sidebar plus the `NewChatLandingScreen` ("What should we do?") hero and
-composer, captured full-viewport at 1280×800 with the color scheme pinned to
-`light` — gated in CI.
+One committed visual-regression baseline per page, each captured full-viewport at
+1280×800 with the color scheme pinned to `light`, gated together in CI.
 
-The landing's data calls (agent catalog, host list, session list, filesystem)
-are stubbed via `page.route` with fixed fixtures, so the rendered view is a pure
-function of the committed bundle and needs no element masking. `live_server`
-still serves the SPA bundle; only `/v1/info` / `/v1/me` reach the real (and
-deterministic) server.
+Each page's data calls are stubbed via `page.route` with fixed fixtures, so the
+rendered view is a pure function of the committed bundle and needs no element
+masking. `live_server` still serves the SPA bundle; only `/v1/info` / `/v1/me`
+reach the real (and deterministic) server. The shared bits (fixed viewport +
+light palette, the JSON-route helper, the pre-capture fonts/caret settle) live in
+[`conftest.py`](conftest.py), so each `test_*_snapshot.py` only declares its own
+stubs.
 
-- Test: [`test_landing_snapshot.py`](test_landing_snapshot.py)
-- Baseline (committed): `snapshots/test_landing_snapshot/test_empty_landing_matches_baseline/test_empty_landing_matches_baseline[chromium][linux].png`
+Pages covered:
+
+- **Empty landing (`/`)** — the open left sidebar plus the `NewChatLandingScreen`
+  ("What should we do?") hero and composer.
+  [`test_landing_snapshot.py`](test_landing_snapshot.py)
+- **Chat conversation (`/c/{id}`)** — a fully-mocked one-turn transcript (user
+  question + assistant markdown reply) rendered as message bubbles, with the
+  composer below. [`test_chat_snapshot.py`](test_chat_snapshot.py)
+
+Baselines are committed under `snapshots/<test_module>/<test_name>/<name>[chromium][linux].png`.
+
 - Gate workflow: [`.github/workflows/ui-snapshot.yml`](../../../.github/workflows/ui-snapshot.yml)
 - Local regen (Docker): [`regen_baseline_docker.sh`](regen_baseline_docker.sh)
 - Plugin: [`pytest-playwright-visual-snapshot`](https://github.com/iloveitaly/pytest-playwright-visual-snapshot)
@@ -33,7 +42,7 @@ it.
 
 ## Is this check merge-blocking?
 
-The check **`UI Snapshot (empty landing)`** blocks merges only if it's listed in
+The check **`UI Snapshot (visual baselines)`** blocks merges only if it's listed in
 the repo's required-checks set (branch protection / `.github/scripts/merge-ready`,
 which is generated and synced separately). Until it's added there it's an
 **advisory** red check — visible, but not enforced. Registering it as required is
@@ -41,30 +50,33 @@ a one-line change to that synced config, outside this directory.
 
 ## How the gate behaves
 
-- On every PR, `ui-snapshot.yml` renders the default `/` view and compares it to
-  the committed baseline. Any pixel difference fails the check.
+- On every PR, `ui-snapshot.yml` renders each page and compares it to its
+  committed baseline. Any pixel difference on any page fails the check.
 - **Every run (pass or fail)** uploads one artifact and links it in the job
   summary, so the screenshots are always one click away:
-  `ui-snapshot-<run_id>` carries this run's render (`snapshots/`); on a mismatch
+  `ui-snapshot-<run_id>` carries this run's renders (`snapshots/`); on a mismatch
   `snapshot_failures/` also holds the `expected_` (baseline), `actual_`
-  (current) and `diff_` PNGs. That single artifact is baseline + current + diff.
-- The baseline is **never** changed by the compare gate. The only ways to change
-  it are the update flows below.
+  (current) and `diff_` PNGs for each failing page. That single artifact is
+  baseline + current + diff.
+- The baselines are **never** changed by the compare gate. The only ways to
+  change them are the update flows below.
 
 ## Updating the baseline
 
-When a UI change is intentional, pick whichever path fits — all produce a PNG
-rendered in the pinned image, so the regenerated baseline matches the gate.
+When a UI change is intentional, pick whichever path fits — all render in the
+pinned image, so the result matches the gate. The label and Docker paths rewrite
+**only** the baselines that drift (or are missing) and leave already-passing ones
+byte-for-byte untouched. Review each changed image before committing.
 
 ### Same-repo branch — label the PR (recommended)
 
 1. Push your branch and open the PR.
 2. Add the **`update-ui-snapshot`** label.
    [`ui-snapshot-update.yml`](../../../.github/workflows/ui-snapshot-update.yml)
-   regenerates the baseline with `--update-snapshots` in the same pinned image
-   and commits the new PNG back to your branch, then removes the label and
-   comments the result.
-3. **Review the committed PNG** in the bot's commit.
+   re-renders in the same pinned image, regenerates only the baselines that drift
+   (or are missing) — passing ones are left untouched — and commits the changed
+   PNGs back to your branch, then removes the label and comments the result.
+3. **Review the committed PNG(s)** in the bot's commit.
 4. The bot pushes with the `OMNIGENT_BOT_APP` token, so the push re-fires the
    PR's checks automatically — no manual re-run. (If the App isn't configured it
    falls back to `GITHUB_TOKEN`, which won't re-trigger CI; the bot's comment
@@ -78,11 +90,12 @@ This works for **same-repo branches only** — Actions tokens can't push to a fo
 tests/e2e_ui/visual/regen_baseline_docker.sh
 ```
 
-This renders inside the exact pinned image CI uses, so the PNG it writes matches
+This renders inside the exact pinned image CI uses, so the PNGs it writes match
 the gate byte-for-byte. Only Docker is required (it builds the SPA in a Node
-container, then renders the baseline). **Review the image**, then commit and push
-— your push re-runs the checks. Pass `--skip-build` to reuse an existing
-`ap-web` build.
+container, then renders the suite and rewrites only the baselines that drift —
+passing ones stay untouched). **Review the image(s)**, then commit and push —
+your push re-runs the checks. Pass `--skip-build` to reuse an existing `ap-web`
+build.
 
 ### Fork PR without Docker — adopt the run's render
 
@@ -115,6 +128,27 @@ Whenever the check fails (same-repo or fork),
 upserts a PR comment pointing back to these paths. It runs as `workflow_run` so
 it can comment without ever executing PR/fork code, which means it only activates
 once merged to `main` (it does not fire on its own PR).
+
+## Adding a new page snapshot
+
+Each page is one `@pytest.mark.visual` test in its own `test_<page>_snapshot.py`.
+The gate, the update flows, and the artifact already cover every test in this
+directory, so a new page is just a test + its committed baseline — no workflow
+changes.
+
+1. Add `test_<page>_snapshot.py`. Take `snapshot_page` (fixed viewport + light
+   palette), `live_server`, `fulfill_json`, `settle_for_snapshot`, and
+   `assert_snapshot` from [`conftest.py`](conftest.py).
+2. `page.route`-stub **every** call the page makes so the view is a pure function
+   of the bundle — no real backend data, no live stream. Drive any dynamic data
+   from fixed fixtures; the chat test ([`test_chat_snapshot.py`](test_chat_snapshot.py))
+   is the worked example (mocked session/items/agent/health + a `[DONE]` stream).
+   Watch for non-determinism: relative timestamps, streaming, working shimmers,
+   randomized ids.
+3. Navigate, wait for the page's content to finish painting (a stable selector,
+   not a timer), call `settle_for_snapshot(page)`, then `assert_snapshot(page)`.
+4. Generate the baseline in the pinned image — label the PR or run
+   `regen_baseline_docker.sh` — then **review the PNG** and commit it.
 
 ## Running locally without Docker (debugging only — never commit the result)
 
