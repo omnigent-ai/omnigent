@@ -4500,6 +4500,78 @@ def _should_skip_futile_recompaction(
     return provider_tokens >= last_compacted_provider_tokens
 
 
+def _resolve_compaction_context(
+    cached_cc: dict[str, Any] | None,
+    spec: AgentSpec | None,
+    body_model: str | None,
+    turn_override: str | None,
+) -> dict[str, Any] | None:
+    """
+    Resolve the compaction-budget context entry for the current turn.
+
+    The compaction budget must size against the model the turn will ACTUALLY
+    run on: an active per-turn override (user ``/model`` or the advisor's
+    optimize verdict), else the spec model, else the request-body model. This
+    *effective model* is the cache key — recomputing whenever it changes covers
+    BOTH directions: pinning an override mid-session (override now differs from
+    the cached spec model) AND later clearing it (the effective model reverts to
+    the spec model, which differs from the cached override). The earlier guard
+    only fired while an override was active, so a cleared override kept budgeting
+    against the stale override window indefinitely — under-sizing the budget and
+    over-compacting, the exact failure this path exists to prevent. (The server
+    display ring recomputes from scratch each snapshot, so it self-corrected; the
+    runner cache did not.)
+
+    Mirrors the create-time pre-seed dict shape (``context_window`` / ``model`` /
+    ``config``) and prefers the spec's declared ``executor.context_window`` over
+    the catalog lookup (see :func:`resolve_effective_context_window`), except an
+    active override bypasses the declared window and sizes against the override
+    model's real catalog window.
+
+    :param cached_cc: The currently cached compaction context for the session,
+        or ``None`` when none is cached yet.
+    :param spec: The resolved agent spec, or ``None`` when unavailable.
+    :param body_model: The model carried on the request body (fallback when the
+        spec pins no model).
+    :param turn_override: The active per-turn model override, or ``None``.
+    :returns: The compaction-context entry to store — the unchanged ``cached_cc``
+        when the effective model has not changed (or no usable window resolves),
+        or a freshly computed entry otherwise. ``None`` only when there is no
+        cached entry and no usable window could be resolved.
+    """
+    from omnigent.llms.context_window import resolve_effective_context_window
+    from omnigent.runtime.workflow import _resolve_spec_model
+
+    model: str | None = None
+    spec_ctx_window: int | None = None
+    compaction_cfg = None
+    if spec is not None:
+        model = _resolve_spec_model(spec)
+        spec_ctx_window = spec.executor.context_window
+        compaction_cfg = spec.compaction
+    if not model:
+        model = body_model or "unknown"
+    effective_model = turn_override or model
+
+    if cached_cc is not None and cached_cc.get("model") == effective_model:
+        return cached_cc
+
+    ctx_window = resolve_effective_context_window(
+        spec_ctx_window, model, model_override=turn_override
+    )
+    if ctx_window is None:
+        # No usable window (e.g. no spec window and an unresolvable model):
+        # leave any existing cache as-is rather than dropping it.
+        return cached_cc
+    return {
+        "context_window": ctx_window,
+        # Store the effective model so count_tokens tokenizes against the
+        # model the turn actually runs on.
+        "model": effective_model,
+        "config": compaction_cfg,
+    }
+
+
 def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
@@ -9218,48 +9290,19 @@ def create_runner_app(
         if conv not in _session_histories:
             _session_histories[conv] = await _load_history_as_input(conv)
 
-        # Per-turn model pin (user /model, or the advisor's optimize verdict).
-        # It overrides the spec model, so the budget must size against it —
-        # exactly like the server ring (executor.context_window describes only
-        # the spec model).
+        # Per-turn model pin (user /model, or the advisor's optimize verdict)
+        # overrides the spec model, so the compaction budget must size against
+        # the model the turn actually runs on — recomputed whenever that
+        # effective model changes, in BOTH directions (pin set AND cleared).
         _turn_override = msg_body.get("model_override") or None
-        _cached_cc = _compaction_contexts.get(conv)
-        # (Re)compute when not yet cached, or when an active override no longer
-        # matches the cached entry's effective model — e.g. a mid-session
-        # /model pin, or the create-time pre-seed which can't know the override
-        # and would otherwise keep budgeting the declared window forever.
-        if _cached_cc is None or (
-            _turn_override is not None and _cached_cc.get("model") != _turn_override
-        ):
-            from omnigent.llms.context_window import resolve_effective_context_window
-
-            _model: str | None = None
-            _spec_ctx_window: int | None = None
-            _compaction_cfg = None
-            if cached_spec is not None:
-                from omnigent.runtime.workflow import _resolve_spec_model
-
-                _model = _resolve_spec_model(cached_spec)
-                _spec_ctx_window = cached_spec.executor.context_window
-                _compaction_cfg = cached_spec.compaction
-            if not _model:
-                _model = msg_body.get("model") or "unknown"
-            # Prefer the spec's declared executor.context_window over the
-            # model-catalog lookup (see resolve_effective_context_window):
-            # keeps a high-window agent from compacting against the 128K
-            # catalog default — but an active override bypasses the declared
-            # window and sizes against the override model's real window.
-            _ctx_window = resolve_effective_context_window(
-                _spec_ctx_window, _model, model_override=_turn_override
-            )
-            if _ctx_window is not None:
-                _compaction_contexts[conv] = {
-                    "context_window": _ctx_window,
-                    # Store the effective model so count_tokens tokenizes
-                    # against the model the turn actually runs on.
-                    "model": _turn_override or _model,
-                    "config": _compaction_cfg,
-                }
+        _cc_entry = _resolve_compaction_context(
+            _compaction_contexts.get(conv),
+            cached_spec,
+            msg_body.get("model"),
+            _turn_override,
+        )
+        if _cc_entry is not None:
+            _compaction_contexts[conv] = _cc_entry
 
         # Proactive compaction: if the history exceeds the token
         # budget, compact before sending to the harness.
