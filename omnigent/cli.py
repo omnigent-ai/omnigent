@@ -2408,7 +2408,7 @@ def _ensure_backend(server: str | None) -> str:
         # otherwise the session-create call deep in the REPL bring-up
         # surfaces the edge redirect as an opaque non-JSON-response
         # traceback.
-        server = _workspace_api_server_url(server)
+        server = _workspace_api_server_url(_with_default_scheme(server))
         _ensure_databricks_server_auth(server)
         with runner_startup_progress(initial_message=STARTUP_PHASE_CONNECTING_REMOTE):
             _ensure_host_daemon(server)
@@ -4701,8 +4701,9 @@ def resume(
 
     run_resume(
         target=target,
-        # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
-        server=_workspace_api_server_url(server) if server else server,
+        # A schemeless or /omnigent web-UI workspace URL is normalized to the
+        # /api/2.0/omnigent mount (matches `omnigent login`).
+        server=_workspace_api_server_url(_with_default_scheme(server)) if server else server,
     )
 
 
@@ -5404,8 +5405,9 @@ def _resolve_attach_server(server: str | None, configured_server: str | None) ->
     """
     chosen = server if server is not None else configured_server
     if chosen:
-        # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
-        return _workspace_api_server_url(chosen.rstrip("/"))
+        # A schemeless or /omnigent web-UI workspace URL is normalized to the
+        # /api/2.0/omnigent mount (matches `omnigent login`).
+        return _workspace_api_server_url(_with_default_scheme(chosen.rstrip("/")))
     local = local_server_url_if_healthy()
     return local.rstrip("/") if local else None
 

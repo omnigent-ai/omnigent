@@ -1207,6 +1207,24 @@ def test_ensure_backend_local_discovers_url(monkeypatch: pytest.MonkeyPatch) -> 
     assert calls == [None, None]
 
 
+def test_ensure_backend_defaults_scheme_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A schemeless ``--server`` URL is defaulted to https before expansion.
+
+    Covers run / claude / codex / chat, which all resolve ``--server``
+    through ``_ensure_backend``; the guide hands out schemeless URLs.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda s: False)
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda server: None)
+
+    result = _ensure_backend("dbc-x.cloud.databricks.com/omnigent")
+
+    # Scheme defaulted to https before the workspace expansion ran.
+    assert seen == ["https://dbc-x.cloud.databricks.com/omnigent"]
+    assert result == _expand_marker("https://dbc-x.cloud.databricks.com/omnigent")
+
+
 def test_discover_local_server_url_returns_when_healthy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1512,6 +1530,17 @@ def test_resolve_attach_server_local_fallback_not_expanded(
     assert _resolve_attach_server(None, configured_server=None) == "http://127.0.0.1:8123"
 
 
+def test_resolve_attach_server_defaults_scheme_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``attach --server <ws>/omnigent`` (no scheme) is defaulted to https."""
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+
+    result = _resolve_attach_server("dbc-x.cloud.databricks.com/omnigent", configured_server=None)
+
+    assert seen == ["https://dbc-x.cloud.databricks.com/omnigent"]
+    assert result == _expand_marker("https://dbc-x.cloud.databricks.com/omnigent")
+
+
 def test_resolve_host_server_expands_explicit_workspace_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1643,3 +1672,23 @@ def test_resume_command_without_server_skips_expansion(
 
     assert result.exit_code == 0, result.output
     assert captured == {"target": "conv_abc123", "server": None}
+
+
+def test_resume_command_defaults_scheme_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``omnigent resume --server <ws>/omnigent`` (no scheme) is defaulted to https."""
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.resume_dispatch.run_resume",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["resume", "conv_abc123", "--server", "dbc-x.cloud.databricks.com/omnigent"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == ["https://dbc-x.cloud.databricks.com/omnigent"]
+    assert captured["server"] == _expand_marker("https://dbc-x.cloud.databricks.com/omnigent")
