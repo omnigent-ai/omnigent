@@ -267,10 +267,10 @@ def _parse_loopback_listen_ports(lsof_output: str) -> list[int]:
     :param lsof_output: Raw ``lsof -iTCP -sTCP:LISTEN`` stdout.
     :returns: Sorted, de-duplicated loopback port numbers (lowest first).
     """
+    prefix = f"{_LOOPBACK}:"
     ports: set[int] = set()
     for line in lsof_output.splitlines():
         for token in line.split():
-            prefix = f"{_LOOPBACK}:"
             if not token.startswith(prefix):
                 continue
             port_text = token[len(prefix) :]
@@ -879,11 +879,7 @@ def _list_agy_pids() -> list[int]:
         # can still be injected. ``exc_info`` records the real cause.
         _logger.debug("pgrep failed; falling back to /proc scan for agy pids", exc_info=True)
         return _list_agy_pids_from_proc()
-    pids: list[int] = []
-    for line in completed.stdout.split():
-        if line.isdigit():
-            pids.append(int(line))
-    return pids
+    return [int(line) for line in completed.stdout.split() if line.isdigit()]
 
 
 def _list_agy_pids_from_proc() -> list[int]:

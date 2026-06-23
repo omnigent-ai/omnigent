@@ -568,10 +568,7 @@ def _function_call_events(
         # Prefer the real agy-assigned id; fall back to the allocator only
         # when absent (resume-mid-turn case).
         real_id = _real_call_id(entry)
-        if real_id is not None:
-            call_id = real_id
-        else:
-            call_id = allocator.claim_call_id()
+        call_id = real_id if real_id is not None else allocator.claim_call_id()
         events.append(
             OutboundEvent(
                 event_type="external_conversation_item",
