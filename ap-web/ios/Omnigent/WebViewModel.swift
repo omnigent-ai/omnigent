@@ -30,25 +30,29 @@ final class WebViewModel: ObservableObject {
 
   func emitNotificationActivation(_ path: String) {
     guard path.starts(with: "/") else { return }
-    let script = "window.__omnigentNativeEmitNotificationActivated?.(\(Self.javascriptString(path)));"
+    let script =
+      "window.__omnigentNativeEmitNotificationActivated?.(\(Self.javascriptString(path)));"
     webView?.evaluateJavaScript(script)
   }
 
   /// Tell the web app the user tapped a segment in the native switcher.
   func emitViewModeChanged(_ mode: WebViewMode) {
-    let script = "window.__omnigentNativeEmitViewModeChanged?.(\(Self.javascriptString(mode.rawValue)));"
+    let script =
+      "window.__omnigentNativeEmitViewModeChanged?.(\(Self.javascriptString(mode.rawValue)));"
     webView?.evaluateJavaScript(script)
   }
 
   func emitSidebarDrag(phase: String, progress: Double) {
     let clamped = max(0, min(1, progress))
-    let script = "window.__omnigentNativeEmitSidebarDrag?.(\(Self.javascriptString(phase)), \(clamped));"
+    let script =
+      "window.__omnigentNativeEmitSidebarDrag?.(\(Self.javascriptString(phase)), \(clamped));"
     webView?.evaluateJavaScript(script)
   }
 
   static func javascriptString(_ value: String) -> String {
     guard let data = try? JSONEncoder().encode(value),
-          let encoded = String(data: data, encoding: .utf8) else {
+      let encoded = String(data: data, encoding: .utf8)
+    else {
       return "\"\""
     }
     return encoded

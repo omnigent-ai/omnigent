@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import Omnigent
 
 final class ServerURLTests: XCTestCase {
@@ -13,13 +14,15 @@ final class ServerURLTests: XCTestCase {
   }
 
   func testReleasePolicyRejectsHTTP() {
-    XCTAssertThrowsError(try ServerURL.normalize("http://example.com", allowsInsecureHTTP: false)) { error in
+    XCTAssertThrowsError(try ServerURL.normalize("http://example.com", allowsInsecureHTTP: false)) {
+      error in
       XCTAssertEqual(error as? ServerURLError, .insecureHTTPNotAllowed)
     }
   }
 
   func testRejectsNonWebSchemes() {
-    XCTAssertThrowsError(try ServerURL.normalize("ftp://example.com", allowsInsecureHTTP: true)) { error in
+    XCTAssertThrowsError(try ServerURL.normalize("ftp://example.com", allowsInsecureHTTP: true)) {
+      error in
       XCTAssertEqual(error as? ServerURLError, .unsupportedScheme("ftp"))
     }
   }
