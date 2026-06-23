@@ -269,10 +269,6 @@ jobs:
           NIGHTLY_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
           SHARD_ID: ${{ matrix.shard_id }}
           NUM_SHARDS: ${{ matrix.num_shards }}
-          # Needed at runtime by the native render-parity tests: the runner
-          # subprocess inherits this so the native CLI can resolve
-          # api_key_ref: "env:LLM_API_KEY" from ~/.omnigent/config.yaml.
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
           # Always exclude @visual: the UI diff snapshot runs in its own
           # pinned-runner gate (ui-snapshot.yml) so its baseline matches the
