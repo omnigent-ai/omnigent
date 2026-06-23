@@ -376,38 +376,45 @@ class ToolManager:
         Register the sub-agent tool surface.
 
         The read-only discovery tools — ``sys_session_list``,
-        ``sys_session_get_history``, and ``sys_session_get_info`` — plus
-        ``sys_session_share`` are registered for **every** agent. Any
-        agent can be part of a multi-agent session (most importantly a
-        user-added agent that declares no sub-agents of its own but needs
-        to read ``main``/siblings for context), so listing, peeking, and
+        ``sys_session_get_history``, and ``sys_session_get_info`` — are
+        registered for **every** agent. Any agent can be part of a
+        multi-agent session (most importantly a user-added agent that
+        declares no sub-agents of its own but needs to read
+        ``main``/siblings for context), so listing, peeking, and
         metadata reads are always available; access is enforced
         server-side (each proxies an auth-gated ``GET`` endpoint).
-        ``sys_session_share`` defaults to the caller's own session and
-        is likewise server-gated (the caller needs manage-level access),
-        so it is always advertised without granting extra authority.
         ``peek`` / ``get_info`` take a ``conversation_id`` (from
         ``sys_session_list`` or a prior ``sys_session_send`` handle),
         so they need no ``sub_specs`` map.
 
-        The spawn-lifecycle tools are opt-in, with two distinct grants:
+        The mutating tools are opt-in, gated behind ``tools.agents``
+        (declared sub-agents) or the top-level ``spawn: true`` flag:
 
-        - ``tools.agents`` (declared sub-agents) registers
-          ``sys_session_send`` (named ``(agent, title)`` mode limited
-          to the declared-type enum, plus ``session_id`` mode for
-          driving existing children), ``sys_session_close``, and
-          ``sys_list_models`` (per-worker model availability for
-          picking a valid ``args.model``) — the agent may spawn THE
-          SPECIFIED LIST of sub-agents, nothing else.
-        - ``spawn: true`` (top-level flag) additionally registers
-          ``sys_session_create`` — launching arbitrary children from
-          an existing agent_id or a custom locally-authored bundle
-          (``config_path``). It also registers send/close (an agent
-          must be able to drive and tombstone the children it
-          creates); without declared sub-agents, send's schema omits
-          the named-mode parameters.
+        - ``tools.agents`` registers ``sys_session_send`` (named
+          ``(agent, title)`` mode limited to the declared-type enum,
+          plus ``session_id`` mode for driving existing children),
+          ``sys_session_close``, and ``sys_list_models`` (per-worker
+          model availability for picking a valid ``args.model``) — the
+          agent may spawn THE SPECIFIED LIST of sub-agents, nothing else.
+        - ``spawn: true`` additionally registers ``sys_session_create``
+          — launching arbitrary children from an existing agent_id or a
+          custom locally-authored bundle (``config_path``). It also
+          registers send/close (an agent must be able to drive and
+          tombstone the children it creates); without declared
+          sub-agents, send's schema omits the named-mode parameters.
 
-        All writes are child-only, enforced at dispatch/server level;
+        ``sys_session_share`` is gated behind the SAME opt-in (either
+        grant). Unlike the read-only discovery tools it MUTATES access
+        control — it can expose a session to a third party or, via
+        ``__public__``, to anonymous read of the full transcript. The
+        server can confirm the caller holds manage-level access but
+        cannot distinguish "the owner intended this" from "the agent
+        was prompt-injected into sharing", so it is not advertised to
+        every agent by default — only to specs that have already opted
+        into the multi-agent / spawn surface, matching send/close.
+
+        The spawn writes are child-only and ``sys_session_share`` is
+        owner-authority-bounded, both enforced at dispatch/server level;
         the opt-ins control advertisement, not authority.
         (Cancellation uses the unified ``sys_cancel_task``; inspection
         is via inbox auto-delivery.)
@@ -416,13 +423,8 @@ class ToolManager:
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
         self._tools[SysSessionGetInfoTool.name()] = SysSessionGetInfoTool()
-        # Session sharing: always available. Acts on the caller's own
-        # session by default; the server enforces that the caller holds
-        # manage-level access (the session owner does), so advertising it
-        # to every agent grants no authority the server wouldn't check.
-        self._tools[SysSessionShareTool.name()] = SysSessionShareTool()
 
-        # send + close: opt-in via declared sub-agents or spawn: true.
+        # send + close + share: opt-in via declared sub-agents or spawn: true.
         if not (self._spec.tools.agents or self._spec.spawn):
             return
 
@@ -431,6 +433,14 @@ class ToolManager:
             sub_specs=sub_specs,
         )
         self._tools[SysSessionCloseTool.name()] = SysSessionCloseTool()
+        # Session sharing MUTATES access control (it can expose the
+        # session to a third party or, via __public__, to anonymous read
+        # of the full transcript), so it is opt-in behind the same grant
+        # as send/close rather than always-on like the read-only
+        # discovery tools: the server can confirm the caller has
+        # manage-level access but not that the owner — versus a
+        # prompt-injected agent — intended the share.
+        self._tools[SysSessionShareTool.name()] = SysSessionShareTool()
         # Model awareness pairs with the dispatch grant: the per-worker
         # listing exists to pick a valid ``args.model`` for send.
         self._tools[SysListModelsTool.name()] = SysListModelsTool(spec=self._spec)

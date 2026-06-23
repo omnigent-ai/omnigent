@@ -53,14 +53,11 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # Read-only session discovery tools are registered for every
         # agent (a user-added agent that declares no sub-agents still
         # needs to list/peek/get-info on its session-mates); the
-        # spawn-lifecycle writes (sys_session_send/close/create) are
+        # mutating tools (sys_session_send/close/create/share) are
         # opt-in via tools.agents or the top-level ``spawn: true``.
         "sys_session_get_history",
         "sys_session_list",
         "sys_session_get_info",
-        # Session sharing is always available; it defaults to the caller's
-        # own session and the server enforces manage-level access.
-        "sys_session_share",
         # Read-only agent discovery tools are likewise always available
         # (global, permission-bounded reads of any accessible session's
         # agent / bundle).
@@ -303,11 +300,13 @@ def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     ``sys_session_list`` / ``sys_session_get_info``) is registered for
     **every** agent, even one that declares no sub-agents — so a
     user-added agent can read its session-mates for context. The
-    spawn-lifecycle writes (``sys_session_send`` /
-    ``sys_session_close`` / ``sys_session_create``) are NOT registered
-    without an opt-in (``tools.agents`` or top-level ``spawn: true``).
-    A regression that registered the writes by default would expose
-    the child-session spawn surface to every custom agent.
+    mutating session tools (``sys_session_send`` /
+    ``sys_session_close`` / ``sys_session_create`` /
+    ``sys_session_share``) are NOT registered without an opt-in
+    (``tools.agents`` or top-level ``spawn: true``). A regression that
+    registered the writes by default would expose the child-session
+    spawn surface — and, for share, the ability to expose the session
+    to a third party or ``__public__`` — to every custom agent.
     """
     mgr = ToolManager(_make_spec([]))
     names = {s["function"]["name"] for s in mgr.get_tool_schemas()}
@@ -318,13 +317,15 @@ def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     # in _register_sub_agent_tools regressed and the orchestrator can't
     # check session status.
     assert "sys_session_get_info" in names
-    # Sharing is always available too: it defaults to the caller's own
-    # session and the server enforces manage-level access, so advertising
-    # it to every agent grants no authority the server wouldn't check.
-    assert "sys_session_share" in names
     assert "sys_session_send" not in names
     assert "sys_session_close" not in names
     assert "sys_session_create" not in names
+    # Sharing MUTATES access control (it can expose the session to a
+    # third party or, via __public__, to anonymous read), so it is
+    # gated behind the same opt-in as send/close — NOT always-on like
+    # the read-only discovery tools. A regression registering it here
+    # would let any prompt-injected agent share its session by default.
+    assert "sys_session_share" not in names
     # Model awareness pairs with the dispatch grant — without send there
     # is no args.model to pick, so the listing tool must stay gated too.
     assert "sys_list_models" not in names
@@ -349,6 +350,8 @@ def test_spawn_flag_registers_write_tools_without_sub_agents() -> None:
     assert "sys_session_create" in names
     # The dispatch grant brings model awareness along with it.
     assert "sys_list_models" in names
+    # Sharing is gated behind the same opt-in — present once spawn is on.
+    assert "sys_session_share" in names
 
 
 def test_session_send_schema_drops_named_mode_without_sub_agents() -> None:
@@ -406,6 +409,8 @@ def test_declared_agents_grant_send_close_but_not_create() -> None:
     assert "sys_session_create" not in names
     # Model awareness rides the same grant as send.
     assert "sys_list_models" in names
+    # Declaring sub-agents also opts into sharing (same gate as send/close).
+    assert "sys_session_share" in names
 
 
 def test_both_grants_compose() -> None:

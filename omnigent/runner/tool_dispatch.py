@@ -2615,6 +2615,36 @@ async def _session_get_info_via_rest(
     )
 
 
+def _omnigent_error_message(resp: httpx.Response) -> str | None:
+    """
+    Extract the human-readable message from an Omnigent error response.
+
+    The server renders :class:`omnigent.errors.OmnigentError` as
+    ``{"error": {"code": ..., "message": ...}}`` (see the exception
+    handler in ``omnigent/server/app.py``). Return that ``message`` so a
+    tool can surface the server's own explanation rather than a bare
+    status code; return ``None`` when the body is not that envelope (a
+    non-JSON body, or a differently-shaped payload) so the caller can
+    fall back to a generic message.
+
+    :param resp: The HTTP response whose body to parse, e.g. a 400 from
+        ``PUT /v1/sessions/{id}/permissions``.
+    :returns: The ``error.message`` string, or ``None`` if absent.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        # Non-JSON error body (e.g. an HTML proxy page) — no detail to surface.
+        return None
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            message = err.get("message")
+            if isinstance(message, str) and message:
+                return message
+    return None
+
+
 async def _session_share_via_rest(
     args: dict[str, Any],
     conversation_id: str,
@@ -2631,7 +2661,10 @@ async def _session_share_via_rest(
     manage-level access on the target (the session owner does), and caps
     public (``__public__``) grants at read.
 
-    Maps 404 to ``session_not_found`` and 401/403 to ``access_denied``.
+    Maps 404 to ``session_not_found`` and 401/403 to ``access_denied``;
+    other 4xx/5xx surface the server's own error message when present
+    (e.g. the "public is read-only" rejection of a ``__public__`` grant
+    above read level) instead of a bare status code.
 
     :param args: Parsed tool arguments. Requires ``user_id`` (grantee
         email or ``"__public__"``); optional ``level`` (``"read"``
@@ -2669,6 +2702,15 @@ async def _session_share_via_rest(
     if resp.status_code in (401, 403):
         return json.dumps({"error": "access_denied", "session_id": target})
     if resp.status_code >= 400:
+        # Surface the server's own message when present — e.g. the 400
+        # rejecting a __public__ grant above read level carries "Public
+        # access is limited to read-only (level 1)", which is far more
+        # actionable for the agent than a bare status code.
+        detail = _omnigent_error_message(resp)
+        if detail is not None:
+            return json.dumps(
+                {"error": detail, "status_code": resp.status_code, "session_id": target}
+            )
         return json.dumps({"error": f"sys_session_share returned {resp.status_code}"})
     return json.dumps(
         {"shared": True, "session_id": target, "user_id": user_id, "level": level_name}

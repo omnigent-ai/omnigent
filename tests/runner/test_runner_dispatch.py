@@ -6342,6 +6342,47 @@ async def test_sys_session_share_rejects_bad_level_without_calling_server() -> N
 
 
 @pytest.mark.asyncio
+async def test_sys_session_share_surfaces_server_message_on_4xx() -> None:
+    """
+    A 4xx the typed branches don't claim (here the server's 400 for a
+    ``__public__`` grant above read level) surfaces the server's own
+    ``{"error": {"message": ...}}`` text rather than a bare "returned
+    400". If the detail-extraction regressed, the agent would see only
+    the status code and couldn't tell that public is read-only — the
+    exact actionable reason the server gave.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    # Mirrors the OmnigentError envelope the server's exception handler
+    # emits (omnigent/server/app.py) for the public + level>read guard.
+    server_message = "Public access is limited to read-only (level 1)"
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"error": {"code": "INVALID_INPUT", "message": server_message}}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps(
+                {"user_id": "__public__", "level": "edit", "session_id": "conv_x"}
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    result = json.loads(output)
+    # The server's verbatim message is surfaced, not flattened to a status.
+    assert result["error"] == server_message
+    assert result["status_code"] == 400
+    assert result["session_id"] == "conv_x"
+
+
+@pytest.mark.asyncio
 async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() -> None:
     """
     ``sys_session_get_info`` projects ``GET /v1/sessions/{id}`` metadata
