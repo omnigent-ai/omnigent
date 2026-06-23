@@ -22,6 +22,15 @@ Key differences from the transcript-based ``step_to_events``:
    and ``argumentsJson`` (a JSON string) instead of the transcript's flat
    ``type``, ``content``, and ``tool_calls[].args`` (a dict).
 
+4. **Real agy tool-call ids.** The RPC carries a stable, agy-assigned id on
+   both the invocation (``plannerResponse.toolCalls[].id``) and the result
+   (``metadata.toolCall.id``). The mapper uses those ids directly so
+   ``function_call`` / ``function_call_output`` pairs are keyed by the real
+   shared id (order-independent), not by FIFO position. The
+   :class:`~omnigent.antigravity_native_forwarder._ToolCallIdAllocator` is
+   retained as a fallback only for the resume-mid-turn case where a result
+   step lacks the ``metadata.toolCall.id`` field.
+
 :func:`map_step_to_events` is the public API; all other symbols are private.
 """
 
@@ -46,14 +55,12 @@ _TYPE_PLANNER_RESPONSE = "CORTEX_STEP_TYPE_PLANNER_RESPONSE"
 _TYPE_RUN_COMMAND = "CORTEX_STEP_TYPE_RUN_COMMAND"
 _TYPE_LIST_DIRECTORY = "CORTEX_STEP_TYPE_LIST_DIRECTORY"
 _TYPE_ASK_QUESTION = "CORTEX_STEP_TYPE_ASK_QUESTION"
-_TYPE_CHECKPOINT = "CORTEX_STEP_TYPE_CHECKPOINT"
-_TYPE_CONVERSATION_HISTORY = "CORTEX_STEP_TYPE_CONVERSATION_HISTORY"
 
 # RPC step status constants (CORTEX_STEP_STATUS_* enum values).
 _STATUS_DONE = "CORTEX_STEP_STATUS_DONE"
 _STATUS_WAITING = "CORTEX_STEP_STATUS_WAITING"
 
-# RPC step source constant for model-generated steps.
+# RPC step source constant for user-submitted input steps.
 _SOURCE_USER = "CORTEX_STEP_SOURCE_USER_EXPLICIT"
 
 
@@ -62,10 +69,13 @@ def _step_index(step: dict[str, object]) -> int | None:
     Extract the trajectory step index from a RPC step dict.
 
     The index lives at ``metadata.sourceTrajectoryStepInfo.stepIndex``; it is
-    absent for USER_INPUT steps (which have no trajectory slot of their own).
+    absent (proto default-omits zero) for step-0 steps and for USER_INPUT steps
+    (which have no trajectory slot).  Accepts both bare ``int`` and digit strings
+    (agy sends some numerics as strings).
 
     :param step: One step dict from ``GetCascadeTrajectorySteps``.
-    :returns: The step index integer, or ``None`` when absent.
+    :returns: The step index as ``int``, or ``None`` when absent or
+        non-numeric.
     """
     metadata = step.get("metadata")
     if not isinstance(metadata, dict):
@@ -74,7 +84,11 @@ def _step_index(step: dict[str, object]) -> int | None:
     if not isinstance(traj_info, dict):
         return None
     idx = traj_info.get("stepIndex")
-    return int(idx) if isinstance(idx, int) else None
+    if isinstance(idx, int):
+        return idx
+    if isinstance(idx, str) and idx.isdigit():
+        return int(idx)
+    return None
 
 
 class PendingInteraction(TypedDict):
@@ -151,7 +165,7 @@ def _merge_is_multi_select(
                         aq = parsed.get("questions")
                         if isinstance(aq, list):
                             args_questions = aq
-    except (json.JSONDecodeError, Exception):
+    except Exception:
         _logger.warning(
             "agy RPC ask_question WAITING: failed to parse argumentsJson for is_multi_select"
         )
@@ -282,6 +296,41 @@ def _strip_tool_display_args(args: dict[str, object]) -> dict[str, object]:
     return {key: val for key, val in args.items() if key not in _TOOL_ARG_DISPLAY_KEYS}
 
 
+def _real_call_id(entry: dict[str, object]) -> str | None:
+    """
+    Extract the agy-assigned tool-call id from an invocation entry.
+
+    The RPC carries a stable id in ``plannerResponse.toolCalls[].id``; using
+    it directly makes the invocation↔output pairing order-independent (both
+    ends share the same id) rather than relying on FIFO position.
+
+    :param entry: One ``plannerResponse.toolCalls[]`` dict.
+    :returns: The id string, or ``None`` when absent.
+    """
+    cid = entry.get("id")
+    return cid if isinstance(cid, str) and cid else None
+
+
+def _result_call_id(step: dict[str, object]) -> str | None:
+    """
+    Extract the agy-assigned tool-call id from a tool-result step.
+
+    The RPC carries the id at ``metadata.toolCall.id``; it matches the id on
+    the invocation step so the pair can be correlated without FIFO ordering.
+
+    :param step: A tool-result step dict (RUN_COMMAND, LIST_DIRECTORY, etc.).
+    :returns: The id string, or ``None`` when absent.
+    """
+    metadata = step.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    tool_call = metadata.get("toolCall")
+    if not isinstance(tool_call, dict):
+        return None
+    cid = tool_call.get("id")
+    return cid if isinstance(cid, str) and cid else None
+
+
 def _message_event(
     *,
     conversation_id: str,
@@ -296,7 +345,8 @@ def _message_event(
 
     :param conversation_id: agy conversation id.
     :param step_idx: Step index.
-    :param text: Assistant text (``plannerResponse.response``).
+    :param text: Assistant text (``plannerResponse.modifiedResponse`` or
+        ``plannerResponse.response``).
     :returns: One ``external_conversation_item`` event.
     """
     return OutboundEvent(
@@ -324,14 +374,19 @@ def _function_call_events(
     """
     Build ``function_call`` items for a PLANNER_RESPONSE's tool calls.
 
-    The RPC ``toolCalls`` entries carry ``name`` and ``argumentsJson`` (a JSON
-    string); ``argumentsJson`` is parsed to a dict and display keys are stripped
-    before re-serializing as the canonical arguments text.
+    The RPC ``toolCalls`` entries carry ``id``, ``name``, and ``argumentsJson``
+    (a JSON string).  The real agy ``id`` is used as the ``call_id`` directly
+    so the output step can pair by the same id without FIFO ordering.  The
+    allocator is used as a fallback only when the ``id`` field is absent (e.g.
+    a resume-mid-turn snapshot that pre-dates the id field).
+
+    ``argumentsJson`` is parsed to a dict and display keys are stripped before
+    re-serializing as the canonical arguments text.
 
     :param conversation_id: agy conversation id.
     :param step_idx: Owning step index.
     :param tool_calls: ``plannerResponse.toolCalls`` list.
-    :param allocator: Positional call-id allocator (advanced per emitted call).
+    :param allocator: Fallback call-id allocator when real id is absent.
     :returns: One ``external_conversation_item`` event per valid tool call.
     """
     response_id = _response_id(conversation_id, step_idx)
@@ -365,7 +420,13 @@ def _function_call_events(
                 name,
             )
             continue
-        call_id = allocator.claim_call_id()
+        # Prefer the real agy-assigned id; fall back to the allocator only
+        # when absent (resume-mid-turn case).
+        real_id = _real_call_id(entry)
+        if real_id is not None:
+            call_id = real_id
+        else:
+            call_id = allocator.claim_call_id()
         events.append(
             OutboundEvent(
                 event_type="external_conversation_item",
@@ -390,18 +451,24 @@ def _function_call_output_event(
     conversation_id: str,
     step_idx: int,
     output: str,
+    real_id: str | None,
     allocator: _ToolCallIdAllocator,
 ) -> OutboundEvent:
     """
     Build a ``function_call_output`` item for one completed agy tool step.
 
+    Prefers the real agy ``metadata.toolCall.id`` for pairing; falls back to
+    the allocator's FIFO match only when the id is absent.
+
     :param conversation_id: agy conversation id.
     :param step_idx: Tool-result step index.
     :param output: Human-readable tool result text.
-    :param allocator: Call-id correlator; oldest pending id is paired.
+    :param real_id: agy-assigned call id from ``metadata.toolCall.id``, or
+        ``None`` when absent.
+    :param allocator: Fallback call-id correlator when real id is absent.
     :returns: One ``external_conversation_item`` event.
     """
-    call_id = allocator.match_output_id()
+    call_id = real_id if real_id is not None else allocator.match_output_id()
     return OutboundEvent(
         event_type="external_conversation_item",
         data={
@@ -475,21 +542,28 @@ def map_step_to_events(
       already persisted by the direct ``POST /events`` hook; emitting it here
       would duplicate the user message).
     * ``CORTEX_STEP_TYPE_PLANNER_RESPONSE`` → one ``message`` item (role
-      assistant) when ``plannerResponse.response`` is non-empty, then one
-      ``function_call`` item per ``plannerResponse.toolCalls`` entry. **No
-      ``output_text_delta``** — that is the live double-render fix.
+      assistant) when ``plannerResponse.modifiedResponse`` (or ``response``)
+      is non-empty, then one ``function_call`` item per
+      ``plannerResponse.toolCalls`` entry. **No ``output_text_delta``** — that
+      is the live double-render fix.  ``modifiedResponse`` takes precedence
+      over ``response`` because it is the post-moderation text (both fields
+      present in the live fixtures; they are equal when no moderation occurred).
     * ``CORTEX_STEP_TYPE_RUN_COMMAND`` / ``LIST_DIRECTORY`` / ``ASK_QUESTION``
       (status DONE) → one ``function_call_output`` item carrying the result
-      text. WAITING steps → ``[]`` (no result yet; Task 5 extracts the pending
-      interaction).
-    * ``CORTEX_STEP_TYPE_CHECKPOINT`` / ``CONVERSATION_HISTORY`` → ``[]``
-      (system noise; no conversation content).
+      text, keyed on ``metadata.toolCall.id``.  WAITING steps → ``[]`` (no
+      result yet; Task 5 extracts the pending interaction).
+    * Any other step type (CHECKPOINT, CONVERSATION_HISTORY, unrecognized) →
+      ``[]`` (system noise; no conversation content).
+
+    Step-index handling: ``sourceTrajectoryStepInfo.stepIndex`` is proto-omitted
+    when zero.  A missing index is treated as ``0`` so slot-0 steps (which in
+    practice are USER_INPUT and are already skipped) are never silently dropped.
 
     :param step: One step dict from ``GetCascadeTrajectorySteps``.
     :param conversation_id: agy conversation id (namespaces response ids and
         call ids).
-    :param allocator: Positional tool-call id allocator, mutated as calls and
-        results are emitted so invocations and outputs line up across the run.
+    :param allocator: Fallback tool-call id allocator, used only when a step
+        lacks the real agy ``id`` field (resume-mid-turn case).
     :returns: Ordered events to POST for this step (possibly empty).
     """
     step_type = step.get("type")
@@ -497,15 +571,6 @@ def map_step_to_events(
         return []
 
     # USER_INPUT: skip entirely — user turn already persisted by direct POST.
-    # Mirror the source check from step_to_events: key on type+source, not
-    # just type, so a hypothetically mis-typed MODEL step is not silently eaten.
-    metadata = step.get("metadata")
-    source: object = None
-    if isinstance(metadata, dict):
-        source = metadata.get("source")
-    if step_type == _TYPE_USER_INPUT and source == _SOURCE_USER:
-        return []
-    # Also skip USER_INPUT without a recognized source (conservative).
     if step_type == _TYPE_USER_INPUT:
         return []
 
@@ -513,15 +578,16 @@ def map_step_to_events(
 
     # PLANNER_RESPONSE: emit assistant text message and/or function_call(s).
     if step_type == _TYPE_PLANNER_RESPONSE:
+        # Treat absent stepIndex as 0 (proto omits zero-valued scalar).
         idx = _step_index(step)
-        if idx is None:
-            return []
+        step_idx = idx if idx is not None else 0
         events: list[OutboundEvent] = []
         planner = step.get("plannerResponse")
         if isinstance(planner, dict):
             response_text = planner.get("response")
-            # Use modifiedResponse when present (it is the post-moderation text);
-            # fall back to response.
+            # modifiedResponse is the post-moderation text; prefer it over
+            # response when present.  Both fields appear in live fixtures and
+            # are equal when no moderation has occurred.
             modified = planner.get("modifiedResponse")
             text = modified if isinstance(modified, str) and modified else response_text
             if isinstance(text, str) and text:
@@ -529,7 +595,7 @@ def map_step_to_events(
                 events.append(
                     _message_event(
                         conversation_id=conversation_id,
-                        step_idx=idx,
+                        step_idx=step_idx,
                         text=text,
                     )
                 )
@@ -538,7 +604,7 @@ def map_step_to_events(
                 events.extend(
                     _function_call_events(
                         conversation_id=conversation_id,
-                        step_idx=idx,
+                        step_idx=step_idx,
                         tool_calls=tool_calls,
                         allocator=allocator,
                     )
@@ -556,16 +622,16 @@ def map_step_to_events(
         if status != _STATUS_DONE:
             return []
         idx = _step_index(step)
-        if idx is None:
-            return []
+        step_idx = idx if idx is not None else 0
         output = _tool_result_output(step, step_type)
         if output is None:
             return []
         return [
             _function_call_output_event(
                 conversation_id=conversation_id,
-                step_idx=idx,
+                step_idx=step_idx,
                 output=output,
+                real_id=_result_call_id(step),
                 allocator=allocator,
             )
         ]
