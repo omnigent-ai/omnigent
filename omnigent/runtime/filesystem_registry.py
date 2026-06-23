@@ -224,12 +224,12 @@ def _strip_git_quotes(path_part: str) -> str:
     return path_part
 
 
-def _parse_git_porcelain_line(line: str) -> tuple[str, str] | None:
+def _parse_git_porcelain_line(line: str) -> tuple[str, str, bool, bool] | None:
     """Parse one line of ``git status --porcelain`` output.
 
-    Returns ``(git_relative_path, operation)`` where *operation* is one of
-    ``"created"``, ``"modified"``, or ``"deleted"``, or ``None`` when the
-    line is too short or otherwise malformed.
+    Returns ``(git_relative_path, operation, staged, unstaged)`` where
+    *operation* is one of ``"created"``, ``"modified"``, or ``"deleted"``,
+    or ``None`` when the line is too short or otherwise malformed.
 
     Status mapping:
 
@@ -237,13 +237,17 @@ def _parse_git_porcelain_line(line: str) -> tuple[str, str] | None:
     - ``D`` in either column → ``"deleted"``
     - Everything else (``M``, ``R``, ``C``, ``U``, …) → ``"modified"``
 
+    The ``staged`` flag reflects the index column (X), and ``unstaged``
+    reflects the working-tree column (Y).  A path may be both staged and
+    unstaged when it has partially-staged changes.
+
     Renames appear as ``R  old -> new``; only the destination path is
     returned.  Git-quoted paths (wrapping double-quotes for names with
     spaces or special characters, including non-ASCII octal sequences) are
     fully unquoted and unescaped via :func:`_unquote_git_path`.
 
     :param line: A single line from ``git status --porcelain`` output.
-    :returns: ``(path, operation)`` tuple or ``None``.
+    :returns: ``(path, operation, staged, unstaged)`` tuple or ``None``.
     """
     if len(line) < 4:
         return None
@@ -266,7 +270,9 @@ def _parse_git_porcelain_line(line: str) -> tuple[str, str] | None:
     else:
         operation = "modified"
 
-    return path_part, operation
+    staged = x not in (" ", "?")
+    unstaged = y != " "
+    return path_part, operation, staged, unstaged
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -283,6 +289,8 @@ class _FileEvent:
         or the file was deleted.
     :param modified_at: File modification time as Unix timestamp (int),
         or ``None`` if stat failed or the file was deleted.
+    :param staged: Whether the change is staged in the git index.
+    :param unstaged: Whether the change exists in the working tree.
     """
 
     path: str
@@ -290,6 +298,8 @@ class _FileEvent:
     timestamp: float
     bytes: int | None
     modified_at: int | None
+    staged: bool = False
+    unstaged: bool = True
 
 
 # ── Abstract base ─────────────────────────────────────────────────────────────
@@ -391,7 +401,8 @@ class FilesystemRegistry(ABC):
         :param conversation_id: The session to query, e.g. ``"conv_abc123"``.
         :param limit: Maximum number of records to return.
         :returns: List of file-record dicts with ``path``, ``status``,
-            ``bytes``, and ``modified_at`` fields, newest first.
+            ``bytes``, ``modified_at``, ``staged``, and ``unstaged`` fields,
+            newest first.
         """
 
     @abstractmethod
@@ -400,8 +411,9 @@ class FilesystemRegistry(ABC):
 
         :param session_id: The session to query, e.g. ``"conv_abc123"``.
         :param path: Path relative to the workspace root, e.g. ``"src/foo.py"``.
-        :returns: A file-record dict with ``path``, ``status``, ``bytes``, and
-            ``modified_at`` fields, or ``None`` when the file has no changes.
+        :returns: A file-record dict with ``path``, ``status``, ``bytes``,
+            ``modified_at``, ``staged``, and ``unstaged`` fields, or ``None``
+            when the file has no changes.
         """
 
     @abstractmethod
@@ -496,6 +508,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             timestamp=time.time(),
             bytes=bytes_,
             modified_at=modified_at,
+            staged=False,
+            unstaged=True,
         )
         with self._lock:
             self._session_events.setdefault(session_id, []).append(fe)
@@ -560,6 +574,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
                 "status": r.operation,
                 "bytes": r.bytes,
                 "modified_at": r.modified_at,
+                "staged": r.staged,
+                "unstaged": r.unstaged,
             }
             for r in records[:limit]
         ]
@@ -576,8 +592,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         :param path: Path relative to the workspace root, e.g.
             ``"src/foo.py"``.
         :returns: A file-record dict (``path``, ``status``, ``bytes``,
-            ``modified_at``) when the file was changed this session, or
-            ``None`` when it was not touched.
+            ``modified_at``, ``staged``, ``unstaged``) when the file was
+            changed this session, or ``None`` when it was not touched.
         """
         norm = _normalize_path(path, self._cwd)
         if norm is None:
@@ -597,6 +613,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             "status": op,
             "bytes": last_event.bytes,
             "modified_at": last_event.modified_at,
+            "staged": last_event.staged,
+            "unstaged": last_event.unstaged,
         }
 
     def get_baseline(self, path: str) -> str | None:
@@ -707,7 +725,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
             parsed = _parse_git_porcelain_line(line)
             if parsed is None:
                 continue
-            git_path, operation = parsed
+            git_path, operation, staged, unstaged = parsed
             rel_path = self._git_to_rel(git_path)
             if rel_path is None:
                 continue
@@ -716,7 +734,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
             first_component = Path(rel_path).parts[0] if Path(rel_path).parts else ""
             if first_component in _SKIP_DIRS:
                 continue
-            records.append(self._make_record(rel_path, operation))
+            records.append(self._make_record(rel_path, operation, staged, unstaged))
 
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
         return records[:limit]
@@ -762,8 +780,8 @@ class GitFilesystemRegistry(FilesystemRegistry):
             parsed = _parse_git_porcelain_line(line)
             if parsed is None:
                 continue
-            _, operation = parsed
-            return self._make_record(norm, operation)
+            _, operation, staged, unstaged = parsed
+            return self._make_record(norm, operation, staged, unstaged)
 
         return None
 
@@ -815,13 +833,21 @@ class GitFilesystemRegistry(FilesystemRegistry):
         except ValueError:
             return None
 
-    def _make_record(self, rel_path: str, operation: str) -> dict[str, Any]:
+    def _make_record(
+        self,
+        rel_path: str,
+        operation: str,
+        staged: bool,
+        unstaged: bool,
+    ) -> dict[str, Any]:
         """Build a file-record dict for *rel_path*.
 
         :param rel_path: Path relative to ``self._cwd``.
         :param operation: One of ``"created"``, ``"modified"``, ``"deleted"``.
-        :returns: File-record dict with ``path``, ``status``, ``bytes``, and
-            ``modified_at`` fields.
+        :param staged: Whether the change is staged in the git index.
+        :param unstaged: Whether the change exists in the working tree.
+        :returns: File-record dict with ``path``, ``status``, ``bytes``,
+            ``modified_at``, ``staged``, and ``unstaged`` fields.
         """
         bytes_: int | None = None
         modified_at: int | None = None
@@ -832,7 +858,14 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 modified_at = int(st.st_mtime)
             except OSError:
                 pass
-        return {"path": rel_path, "status": operation, "bytes": bytes_, "modified_at": modified_at}
+        return {
+            "path": rel_path,
+            "status": operation,
+            "bytes": bytes_,
+            "modified_at": modified_at,
+            "staged": staged,
+            "unstaged": unstaged,
+        }
 
 
 # ── Factory ───────────────────────────────────────────────────────────────────

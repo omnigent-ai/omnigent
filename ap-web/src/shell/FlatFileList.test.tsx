@@ -1,7 +1,7 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
+import { RunnerOfflineError, type WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
 import { FlatFileList } from "./FlatFileList";
 
 afterEach(cleanup);
@@ -25,6 +25,20 @@ function renderList(props: Partial<Parameters<typeof FlatFileList>[0]> = {}) {
       />
     </TooltipProvider>,
   );
+}
+
+function changedFile(
+  path: string,
+  staging: Pick<WorkspaceChangedFile, "staged" | "unstaged"> = {},
+): WorkspaceChangedFile {
+  return {
+    path,
+    name: path.split("/").pop() ?? path,
+    status: "modified",
+    bytes: 12,
+    modified_at: 1,
+    ...staging,
+  };
 }
 
 describe("FlatFileList runner-offline state", () => {
@@ -58,5 +72,45 @@ describe("FlatFileList runner-offline state", () => {
 
     expect(screen.getByText(/failed to load: 500 internal server error/i)).toBeInTheDocument();
     expect(screen.queryByText(/agent is asleep/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("FlatFileList staged filter", () => {
+  it("filters changed files by staged and unstaged state", () => {
+    renderList({
+      files: [
+        changedFile("src/staged.ts", { staged: true, unstaged: false }),
+        changedFile("src/unstaged.ts", { staged: false, unstaged: true }),
+        changedFile("src/both.ts", { staged: true, unstaged: true }),
+      ],
+    });
+
+    expect(screen.getByText("src/staged.ts")).toBeInTheDocument();
+    expect(screen.getByText("src/unstaged.ts")).toBeInTheDocument();
+    expect(screen.getByText("src/both.ts")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Staged" }));
+    expect(screen.getByText("src/staged.ts")).toBeInTheDocument();
+    expect(screen.queryByText("src/unstaged.ts")).not.toBeInTheDocument();
+    expect(screen.getByText("src/both.ts")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Unstaged" }));
+    expect(screen.queryByText("src/staged.ts")).not.toBeInTheDocument();
+    expect(screen.getByText("src/unstaged.ts")).toBeInTheDocument();
+    expect(screen.getByText("src/both.ts")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("radio", { name: "All" }));
+    expect(screen.getByText("src/staged.ts")).toBeInTheDocument();
+    expect(screen.getByText("src/unstaged.ts")).toBeInTheDocument();
+    expect(screen.getByText("src/both.ts")).toBeInTheDocument();
+  });
+
+  it("hides the staged filter for older payloads without staging fields", () => {
+    renderList({
+      files: [changedFile("src/legacy.ts")],
+    });
+
+    expect(screen.queryByRole("radiogroup", { name: "Change stage" })).not.toBeInTheDocument();
+    expect(screen.getByText("src/legacy.ts")).toBeInTheDocument();
   });
 });

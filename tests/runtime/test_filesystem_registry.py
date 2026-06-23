@@ -85,6 +85,8 @@ def test_created_then_modified_shows_added(registry: AgentEditFilesystemRegistry
         "A 'M' result means the modified event incorrectly replaced the created event."
     )
     assert results[0]["path"] == "trip.md"
+    assert results[0]["staged"] is False
+    assert results[0]["unstaged"] is True
 
 
 def test_modified_only_shows_modified(registry: AgentEditFilesystemRegistry) -> None:
@@ -514,6 +516,8 @@ def test_git_list_changed_files_expands_untracked_nested_dir(tmp_path: Path) -> 
     assert record["status"] == "created", (
         f"Expected status 'created' for the new file, got {record['status']!r}."
     )
+    assert record["staged"] is False
+    assert record["unstaged"] is True
 
 
 # ── _normalize_path ──────────────────────────────────────────────────────────
@@ -663,38 +667,38 @@ def test_create_filesystem_registry_nested_git_workspace(tmp_path: Path) -> None
     "line, expected",
     [
         # Untracked file (both columns '?') → created
-        ("?? new_file.py", ("new_file.py", "created")),
+        ("?? new_file.py", ("new_file.py", "created", False, True)),
         # Staged new file (index 'A') → created
-        ("A  staged.py", ("staged.py", "created")),
+        ("A  staged.py", ("staged.py", "created", True, False)),
         # Staged new + modified in worktree (index 'A' takes precedence) → created
-        ("AM staged_then_modified.py", ("staged_then_modified.py", "created")),
+        ("AM staged_then_modified.py", ("staged_then_modified.py", "created", True, True)),
         # Staged modification (index 'M') → modified
-        ("M  staged_mod.py", ("staged_mod.py", "modified")),
+        ("M  staged_mod.py", ("staged_mod.py", "modified", True, False)),
         # Unstaged modification (worktree 'M') → modified
-        (" M unstaged_mod.py", ("unstaged_mod.py", "modified")),
+        (" M unstaged_mod.py", ("unstaged_mod.py", "modified", False, True)),
         # Both staged and unstaged modifications → modified
-        ("MM both_mod.py", ("both_mod.py", "modified")),
+        ("MM both_mod.py", ("both_mod.py", "modified", True, True)),
         # Staged deletion (index 'D') → deleted
-        ("D  staged_del.py", ("staged_del.py", "deleted")),
+        ("D  staged_del.py", ("staged_del.py", "deleted", True, False)),
         # Unstaged deletion (worktree 'D') → deleted
-        (" D unstaged_del.py", ("unstaged_del.py", "deleted")),
+        (" D unstaged_del.py", ("unstaged_del.py", "deleted", False, True)),
         # Rename: destination path (after ' -> ') is used, operation is modified
-        ("R  old.py -> new.py", ("new.py", "modified")),
+        ("R  old.py -> new.py", ("new.py", "modified", True, False)),
         # git-quoted path (spaces in filename) → quotes are stripped
-        ('?? "dir/file with spaces.py"', ("dir/file with spaces.py", "created")),
+        ('?? "dir/file with spaces.py"', ("dir/file with spaces.py", "created", False, True)),
         # Quoted rename destination
-        ('R  old.py -> "new with spaces.py"', ("new with spaces.py", "modified")),
+        ('R  old.py -> "new with spaces.py"', ("new with spaces.py", "modified", True, False)),
         # Both source and destination git-quoted (both paths have spaces).
         # The outer-quote strip must NOT fire before the ' -> ' split —
         # 'R  "old name.py" -> "new name.py"' starts and ends with '"' so
         # a naive strip would corrupt the separator and leave a dangling quote.
-        ('R  "old name.py" -> "new name.py"', ("new name.py", "modified")),
+        ('R  "old name.py" -> "new name.py"', ("new name.py", "modified", True, False)),
         # Non-rename file whose name literally contains ' -> ': must NOT be
         # treated as a rename — the old path-content heuristic would misfire here.
-        (" M file -> backup.py", ("file -> backup.py", "modified")),
+        (" M file -> backup.py", ("file -> backup.py", "modified", False, True)),
         # Git C-quoted non-ASCII filename (UTF-8 bytes as octal sequences).
         # git encodes 'é' (U+00E9) as the two UTF-8 bytes \303\251.
-        ('?? "caf\\303\\251.py"', ("café.py", "created")),
+        ('?? "caf\\303\\251.py"', ("café.py", "created", False, True)),
         # Lines shorter than 4 characters → None (no valid XY + space + path)
         ("", None),
         ("??", None),
@@ -720,7 +724,10 @@ def test_create_filesystem_registry_nested_git_workspace(tmp_path: Path) -> None
         "three-char-line",
     ],
 )
-def test_parse_git_porcelain_line(line: str, expected: tuple[str, str] | None) -> None:
+def test_parse_git_porcelain_line(
+    line: str,
+    expected: tuple[str, str, bool, bool] | None,
+) -> None:
     """``_parse_git_porcelain_line`` maps every ``git status --porcelain`` status code correctly.
 
     Failure on any case means the corresponding operation will be misclassified

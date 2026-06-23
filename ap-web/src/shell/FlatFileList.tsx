@@ -1,4 +1,5 @@
 import { FileIcon } from "lucide-react";
+import { useState } from "react";
 import { RunnerOfflineError, type WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { cn } from "@/lib/utils";
@@ -8,6 +9,7 @@ import { FileDownloadButton } from "./FileDownloadButton";
 import { useCursorTooltip } from "./useCursorTooltip";
 
 export type ChangedSort = "alpha" | "recent";
+type ChangedStageFilter = "all" | "staged" | "unstaged";
 
 /**
  * Comparator for the changed-files list. Shared between the displayed list
@@ -34,6 +36,71 @@ export function compareChangedFiles(sort: ChangedSort) {
 
 function normalizeSearchQuery(query: string): string {
   return query.trim().toLowerCase();
+}
+
+const STAGE_FILTERS: { value: ChangedStageFilter; label: string }[] = [
+  { value: "all", label: "All" },
+  { value: "staged", label: "Staged" },
+  { value: "unstaged", label: "Unstaged" },
+];
+
+function stageChangeLabel(filter: ChangedStageFilter): string {
+  if (filter === "staged") return "staged changes";
+  if (filter === "unstaged") return "unstaged changes";
+  return "changes";
+}
+
+function stageFileLabel(filter: ChangedStageFilter): string {
+  if (filter === "staged") return "staged files";
+  if (filter === "unstaged") return "unstaged files";
+  return "changed files";
+}
+
+function ChangedStageFilterControl({
+  value,
+  onChange,
+}: {
+  value: ChangedStageFilter;
+  onChange: (next: ChangedStageFilter) => void;
+}) {
+  const pill =
+    "flex cursor-pointer items-center rounded-full px-2.5 py-[2px] text-[12px] font-medium leading-5 transition-colors";
+  const activePill =
+    "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground";
+  const idlePill = "text-muted-foreground hover:text-foreground";
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Change stage"
+      className="mb-1 flex items-center gap-1 px-0.5"
+    >
+      {STAGE_FILTERS.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          role="radio"
+          aria-checked={value === option.value}
+          aria-label={option.label}
+          onClick={() => onChange(option.value)}
+          className={cn(pill, value === option.value ? activePill : idlePill)}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function supportsStageFiltering(files: WorkspaceChangedFile[]): boolean {
+  return files.some(
+    (file) => typeof file.staged === "boolean" || typeof file.unstaged === "boolean",
+  );
+}
+
+function matchesStageFilter(file: WorkspaceChangedFile, filter: ChangedStageFilter): boolean {
+  if (filter === "staged") return file.staged === true;
+  if (filter === "unstaged") return file.unstaged === true;
+  return true;
 }
 
 function FileListItem({
@@ -136,6 +203,8 @@ export function FlatFileList({
    */
   runnerWentOffline?: boolean;
 }) {
+  const [stageFilter, setStageFilter] = useState<ChangedStageFilter>("all");
+
   if (isLoading) {
     return <p className="px-2 py-1 text-muted-foreground text-xs">Loading…</p>;
   }
@@ -157,8 +226,12 @@ export function FlatFileList({
   if (!files || files.length === 0) {
     return <p className="px-2 py-1 text-muted-foreground text-xs">No workspace changes yet</p>;
   }
+  const canFilterByStage = supportsStageFiltering(files);
+  const stageFilteredFiles = canFilterByStage
+    ? files.filter((file) => matchesStageFilter(file, stageFilter))
+    : files;
   const normalizedSearchQuery = normalizeSearchQuery(searchQuery);
-  const visibleFiles = files.filter(
+  const visibleFiles = stageFilteredFiles.filter(
     (f) => showHidden || !f.path.split("/").some((seg) => seg.startsWith(".")),
   );
   const sorted = visibleFiles
@@ -169,30 +242,51 @@ export function FlatFileList({
         f.path.toLowerCase().includes(normalizedSearchQuery),
     )
     .sort(compareChangedFiles(sort));
-  const hiddenCount = files.length - visibleFiles.length;
+  const hiddenCount = stageFilteredFiles.length - visibleFiles.length;
+  const stageControl = canFilterByStage ? (
+    <ChangedStageFilterControl value={stageFilter} onChange={setStageFilter} />
+  ) : null;
+  const stageChange = stageChangeLabel(stageFilter);
+  const stageFiles = stageFileLabel(stageFilter);
+
+  if (stageFilteredFiles.length === 0) {
+    return (
+      <>
+        {stageControl}
+        <p className="px-2 py-1 text-muted-foreground text-xs">No {stageChange}</p>
+      </>
+    );
+  }
   if (visibleFiles.length === 0) {
     return (
-      <p className="px-2 py-1 text-muted-foreground text-xs">
-        All changes are in hidden files.{" "}
-        <button
-          type="button"
-          className="cursor-pointer underline hover:text-foreground"
-          onClick={onShowHidden}
-        >
-          Click to show
-        </button>
-      </p>
+      <>
+        {stageControl}
+        <p className="px-2 py-1 text-muted-foreground text-xs">
+          All {stageChange} are in hidden files.{" "}
+          <button
+            type="button"
+            className="cursor-pointer underline hover:text-foreground"
+            onClick={onShowHidden}
+          >
+            Click to show
+          </button>
+        </p>
+      </>
     );
   }
   if (sorted.length === 0) {
     return (
-      <p className="px-2 py-1 text-muted-foreground text-xs">
-        No changed files match "{searchQuery.trim()}"
-      </p>
+      <>
+        {stageControl}
+        <p className="px-2 py-1 text-muted-foreground text-xs">
+          No {stageFiles} match "{searchQuery.trim()}"
+        </p>
+      </>
     );
   }
   return (
     <>
+      {stageControl}
       {hiddenCount > 0 && (
         <p className="px-2 py-1 text-muted-foreground text-xs">
           {hiddenCount} file{hiddenCount === 1 ? "" : "s"} hidden.{" "}
