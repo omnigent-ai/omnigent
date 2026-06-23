@@ -262,11 +262,14 @@ def test_read_bridge_state_empty_conversation_id_returns_none(bridge_dir: Path) 
 
 def test_read_bridge_state_ignores_legacy_sidecar_fields(bridge_dir: Path) -> None:
     """
-    Legacy state.json carrying the removed sidecar_port / data_dir fields
-    still reads back via the current (reduced) schema.
+    Legacy state.json carrying removed fields still reads back via the current
+    (reduced) schema.
 
-    Guards forward-compat: a state file written by a prior build must not
-    crash the reader; the obsolete keys are simply ignored.
+    Guards forward-compat across the Task 12 cutover: a state file written by a
+    prior build must not crash the reader. This covers the removed sidecar_port /
+    data_dir fields AND the durable read cursor (forwarded_step_index /
+    forwarded_steps) the transcript forwarder persisted before the RPC reader
+    superseded it — all obsolete keys are simply ignored.
     """
     (bridge_dir / "state.json").write_text(
         json.dumps(
@@ -276,6 +279,10 @@ def test_read_bridge_state_ignores_legacy_sidecar_fields(bridge_dir: Path) -> No
                 "conversation_id": "agy_conv",
                 "data_dir": "/tmp/data",
                 "active_turn_id": None,
+                # Retired durable cursor keys (Task 12 cutover): a forwarder-era
+                # state.json carries these; the reader must tolerate + drop them.
+                "forwarded_step_index": 14,
+                "forwarded_steps": [0, 2, 14],
             }
         )
         + "\n",
@@ -286,6 +293,9 @@ def test_read_bridge_state_ignores_legacy_sidecar_fields(bridge_dir: Path) -> No
     assert state.session_id == "conv_abc"
     assert state.conversation_id == "agy_conv"
     assert state.active_turn_id is None
+    # The retired cursor fields are gone from the dataclass entirely.
+    assert not hasattr(state, "forwarded_step_index")
+    assert not hasattr(state, "forwarded_steps")
 
 
 # ---------------------------------------------------------------------------
