@@ -17,6 +17,7 @@ import pytest
 from omnigent.runner.app import (
     _CLAUDE_NATIVE_COMMAND_ENV_VAR,
     _build_claude_native_base_args,
+    _compose_native_launch,
     _resolve_claude_native_command,
 )
 
@@ -185,3 +186,31 @@ class TestResolveClaudeNativeCommand:
         # swallow it and fall back rather than crash the launch.
         monkeypatch.setenv(_CLAUDE_NATIVE_COMMAND_ENV_VAR, 'isaac "unterminated')
         assert _resolve_claude_native_command() == ["claude"]
+
+
+class TestComposeNativeLaunch:
+    """Terminal (command, args) assembly for a (wrapper, claude-args) pair.
+
+    The wrapper argv must lead and the Claude args must follow intact — that
+    ordering is what keeps Omnigent's appended args (bundle --plugin-dir,
+    permission hooks, the session bridge) reaching Claude so the session binds.
+    A silent reorder or drop here would break the integration without failing
+    the resolver's own tests.
+    """
+
+    def test_no_override_runs_claude_with_args_unchanged(self):
+        assert _compose_native_launch(["claude"], ["--foo", "--bar"]) == (
+            "claude",
+            ["--foo", "--bar"],
+        )
+
+    def test_wrapper_leads_and_claude_args_follow_in_order(self):
+        assert _compose_native_launch(
+            ["dbexec", "repo", "run", "isaac"], ["--plugin-dir", "/b", "--resume", "x"]
+        ) == ("dbexec", ["repo", "run", "isaac", "--plugin-dir", "/b", "--resume", "x"])
+
+    def test_no_claude_args(self):
+        assert _compose_native_launch(["dbexec", "repo", "run", "isaac"], []) == (
+            "dbexec",
+            ["repo", "run", "isaac"],
+        )
