@@ -78,6 +78,7 @@ from omnigent.antigravity_native_rpc import (
     AntigravityRpcError,
     _candidate_agy_rpc_ports,
     _conversation_matches,
+    get_available_models,
     get_trajectory_steps,
     stream_agent_state_updates,
 )
@@ -144,8 +145,125 @@ _TERMINAL_STATUSES = frozenset({_STATUS_DONE, _STATUS_ERROR})
 # no-op, never drops content.
 _StepKey = tuple[str | None, int | None]
 
+# Telemetry event types (design §10.3 + §10.4).
+_EXTERNAL_SESSION_USAGE = "external_session_usage"
+_EXTERNAL_MODEL_CHANGE = "external_model_change"
+
 OnPendingInteraction = Callable[[PendingInteraction], Awaitable[None]]
 StopPredicate = Callable[[], bool]
+
+
+def _model_usage_from_step(step: dict[str, object]) -> dict[str, object] | None:
+    """
+    Extract ``modelUsage`` from a PLANNER_RESPONSE DONE step.
+
+    Returns ``None`` when the step has no usable usage data (wrong type, wrong
+    status, missing field, or all zero/invalid values).  The design (§10.3)
+    specifies that agy encodes all usage counts as STRING ints; we parse them
+    defensively — a missing or non-numeric value is treated as 0 and excluded
+    from the output unless it contributes.
+
+    :param step: One RPC step dict.
+    :returns: A dict with any of ``cumulative_input_tokens`` /
+        ``cumulative_output_tokens`` / ``cumulative_cache_read_input_tokens`` /
+        ``model`` (raw enum), or ``None`` when the step carries no usage.
+    """
+    if step.get("type") != _TYPE_PLANNER_RESPONSE or step.get("status") != _STATUS_DONE:
+        return None
+    metadata = step.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    raw_usage = metadata.get("modelUsage")
+    if not isinstance(raw_usage, dict):
+        return None
+
+    def _to_int(val: object) -> int:
+        """Parse a string-encoded int defensively; return 0 on failure."""
+        if isinstance(val, int):
+            return val
+        if isinstance(val, str):
+            try:
+                return int(val)
+            except ValueError:
+                return 0
+        return 0
+
+    data: dict[str, object] = {}
+    input_tokens = _to_int(raw_usage.get("inputTokens"))
+    output_tokens = _to_int(raw_usage.get("outputTokens"))
+    cache_read = _to_int(raw_usage.get("cacheReadTokens"))
+    model_enum = raw_usage.get("model")
+
+    if input_tokens > 0:
+        data["cumulative_input_tokens"] = input_tokens
+    if output_tokens > 0:
+        data["cumulative_output_tokens"] = output_tokens
+    if cache_read > 0:
+        data["cumulative_cache_read_input_tokens"] = cache_read
+    if isinstance(model_enum, str) and model_enum:
+        data["model"] = model_enum  # resolved to displayName by caller
+
+    if not data:
+        return None
+    return data
+
+
+def _requested_model_enum_from_step(step: dict[str, object]) -> str | None:
+    """
+    Extract the model enum from a USER_INPUT step's plannerConfig.
+
+    Reads ``step.userInput.userConfig.plannerConfig.requestedModel.model``
+    (design §10.4). Returns ``None`` when the field is absent or the step is not
+    a USER_INPUT.
+
+    :param step: One RPC step dict.
+    :returns: The model enum string, e.g. ``"MODEL_PLACEHOLDER_M20"``, or
+        ``None`` when absent.
+    """
+    if step.get("type") != _TYPE_USER_INPUT:
+        return None
+    user_input = step.get("userInput")
+    if not isinstance(user_input, dict):
+        return None
+    user_config = user_input.get("userConfig")
+    if not isinstance(user_config, dict):
+        return None
+    planner_config = user_config.get("plannerConfig")
+    if not isinstance(planner_config, dict):
+        return None
+    requested_model = planner_config.get("requestedModel")
+    if not isinstance(requested_model, dict):
+        return None
+    model = requested_model.get("model")
+    return model if isinstance(model, str) and model else None
+
+
+def _resolve_display_name(model_enum: str, catalog: dict[str, object]) -> str:
+    """
+    Resolve a model enum to its human-readable ``displayName``.
+
+    Iterates the ``catalog["models"]`` dict (live shape from
+    :func:`get_available_models`) and returns the first entry whose ``model``
+    field matches ``model_enum``. Falls back to the raw enum when the catalog
+    is absent, malformed, or does not contain the enum — so an unknown enum is
+    always reported rather than silently dropped.
+
+    :param model_enum: agy model enum string, e.g. ``"MODEL_PLACEHOLDER_M20"``.
+    :param catalog: Parsed response from ``GetAvailableModels``.
+    :returns: The ``displayName`` string, e.g. ``"Gemini 2.5 Flash"``, or the
+        raw enum as a fallback.
+    """
+    models = catalog.get("models")
+    if not isinstance(models, dict):
+        return model_enum
+    for entry in models.values():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("model") == model_enum:
+            display = entry.get("displayName")
+            if isinstance(display, str) and display:
+                return display
+    return model_enum
 
 
 async def _sleep(seconds: float) -> None:
@@ -419,6 +537,7 @@ async def supervise_reader(
         allocator=_ToolCallIdAllocator(conversation_id=cascade_id),
         seen=set(),
         interacted=set(),
+        port=port,
     )
 
     # STREAM-primary (Task T-D): consume the connect server-stream for live
@@ -481,6 +600,13 @@ class _ReaderState:
         only; the poll path never populates it).
     :param turn_active: Whether a turn is currently considered open (a RUNNING
         edge fired and no closing IDLE edge yet).
+    :param posted_model_enum: The last model enum already mirrored via
+        ``external_model_change``. ``None`` = none posted yet.  Tracks the raw
+        enum (NOT the displayName) so de-dup comparison is enum-stable.
+    :param model_catalog: Cached result of ``GetAvailableModels`` for this
+        reader run (fetched once on first model-change detection; ``None``
+        until needed).
+    :param port: Validated connect-RPC port used for lazy catalog fetch.
     """
 
     allocator: _ToolCallIdAllocator
@@ -488,6 +614,9 @@ class _ReaderState:
     interacted: set[_StepKey]
     prefixes: dict[int, str] = field(default_factory=dict)
     turn_active: bool = False
+    posted_model_enum: str | None = None
+    model_catalog: dict[str, object] | None = None
+    port: int = 0
 
 
 async def _poll_loop(
@@ -694,6 +823,20 @@ async def _process_committed_step(
             cascade_id=cascade_id,
             allocator=state.allocator,
             turn_active=state.turn_active,
+        )
+        # Telemetry: model-change detection on USER_INPUT (design §10.4).
+        await _maybe_emit_model_change(
+            step,
+            client=client,
+            session_id=session_id,
+            state=state,
+        )
+        # Telemetry: token usage on PLANNER_RESPONSE DONE (design §10.3).
+        await _maybe_emit_session_usage(
+            step,
+            client=client,
+            session_id=session_id,
+            state=state,
         )
     await _maybe_handle_interaction(
         step,
@@ -935,3 +1078,117 @@ async def _maybe_handle_interaction(
         return
     interacted.add(key)
     await on_pending_interaction(pending)
+
+
+async def _maybe_emit_session_usage(
+    step: dict[str, object],
+    *,
+    client: httpx.AsyncClient,
+    session_id: str,
+    state: _ReaderState,
+) -> None:
+    """
+    Emit ``external_session_usage`` when a PLANNER_RESPONSE DONE carries usage.
+
+    Maps agy's string-int ``modelUsage`` fields onto the Omnigent event shape
+    (design §10.3). The model enum is resolved to a displayName via the cached
+    catalog (the catalog was already fetched for model-change detection; if
+    it has not been fetched yet it is fetched here and cached).
+
+    De-dup is via ``state.seen``: this function is only called inside the
+    ``key not in state.seen`` branch of :func:`_process_committed_step`, so
+    a replay of the same DONE step (already in ``seen``) never reaches here.
+
+    :param step: One RPC step dict (must be a PLANNER_RESPONSE DONE).
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id.
+    :param state: Per-run trackers (port + model_catalog cache).
+    :returns: None.
+    """
+    usage = _model_usage_from_step(step)
+    if not usage:
+        return
+    # Resolve the raw model enum to a displayName if the catalog is available.
+    model_enum = usage.get("model")
+    if isinstance(model_enum, str) and model_enum:
+        catalog = await _ensure_catalog(state)
+        usage["model"] = _resolve_display_name(model_enum, catalog)
+    await _post_event(
+        client,
+        session_id,
+        OutboundEvent(
+            event_type=_EXTERNAL_SESSION_USAGE,
+            data=usage,
+            step_index=0,
+        ),
+    )
+
+
+async def _maybe_emit_model_change(
+    step: dict[str, object],
+    *,
+    client: httpx.AsyncClient,
+    session_id: str,
+    state: _ReaderState,
+) -> None:
+    """
+    Emit ``external_model_change`` when a USER_INPUT step carries a new model enum.
+
+    Tracks the per-run ``state.posted_model_enum`` baseline; emits only when the
+    turn's requested model differs from the last-emitted enum (design §10.4).
+    Effort is encoded in the model enum (no separate field), so one change event
+    covers both. The catalog is fetched once per run and cached in ``state``.
+
+    De-dup: this function is only called inside the ``key not in state.seen``
+    branch, so a replayed USER_INPUT (already in ``seen``) never reaches here.
+    The enum-vs-posted_enum comparison further deduplicates same-model turns.
+
+    :param step: One RPC step dict (must be a USER_INPUT).
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id.
+    :param state: Per-run trackers (posted_model_enum + model_catalog + port).
+    :returns: None.
+    """
+    model_enum = _requested_model_enum_from_step(step)
+    if model_enum is None:
+        return
+    if model_enum == state.posted_model_enum:
+        return
+    catalog = await _ensure_catalog(state)
+    display_name = _resolve_display_name(model_enum, catalog)
+    await _post_event(
+        client,
+        session_id,
+        OutboundEvent(
+            event_type=_EXTERNAL_MODEL_CHANGE,
+            data={"model": display_name},
+            step_index=0,
+        ),
+    )
+    state.posted_model_enum = model_enum
+
+
+async def _ensure_catalog(state: _ReaderState) -> dict[str, object]:
+    """
+    Return the cached ``GetAvailableModels`` catalog, fetching it when needed.
+
+    Fetched at most once per reader run; stored in ``state.model_catalog``.
+    Falls back to an empty dict on error so a catalog failure never kills the
+    telemetry path (the display-name resolver falls back to the raw enum).
+
+    :param state: Per-run shared trackers.
+    :returns: The catalog dict (possibly empty on fetch failure).
+    """
+    if state.model_catalog is not None:
+        return state.model_catalog
+    try:
+        catalog = await asyncio.to_thread(get_available_models, state.port)
+    except Exception:
+        _logger.warning(
+            "agy RPC reader: GetAvailableModels failed; "
+            "model display names will fall back to raw enums",
+            exc_info=True,
+        )
+        catalog = {}
+    state.model_catalog = catalog
+    return catalog

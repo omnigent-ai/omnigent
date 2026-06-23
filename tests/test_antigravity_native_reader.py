@@ -1102,3 +1102,367 @@ async def test_stream_error_midway_falls_back_without_losing_prior_deltas(
     assert [d["delta"] for d in sink.deltas()] == [full]
     # The poll fallback delivered the committed message.
     assert sink.item_types() == ["message"]
+
+
+# ---------------------------------------------------------------------------
+# Telemetry: external_session_usage (Task T-EF)
+# ---------------------------------------------------------------------------
+
+# Fake model catalog returned by the injected ``get_available_models`` stub.
+_FAKE_CATALOG: dict[str, object] = {
+    "models": {
+        "m20": {
+            "model": "MODEL_PLACEHOLDER_M20",
+            "displayName": "Gemini 2.5 Flash",
+            "recommended": True,
+            "supportsThinking": True,
+            "thinkingBudget": 8192,
+        },
+        "m132": {
+            "model": "MODEL_PLACEHOLDER_M132",
+            "displayName": "Gemini 2.5 Pro",
+            "recommended": False,
+            "supportsThinking": True,
+            "thinkingBudget": 16384,
+        },
+    }
+}
+
+
+def _planner_with_model_usage(
+    *,
+    step_index: int = 2,
+    input_tokens: str = "1000",
+    output_tokens: str = "100",
+    thinking_tokens: str = "40",
+    response_tokens: str = "60",
+    cache_read_tokens: str = "200",
+    model_enum: str = "MODEL_PLACEHOLDER_M20",
+    with_requested_model: bool = True,
+) -> dict[str, Any]:
+    """A DONE PLANNER_RESPONSE step with modelUsage and requestedModel populated.
+
+    Built from the real fixture so metadata shape is authentic; the usage
+    fields are overridden so tests can control exact values.
+    """
+    step = copy.deepcopy(_load("planner_response_text"))
+    step["status"] = "CORTEX_STEP_STATUS_DONE"
+    metadata = cast(dict[str, Any], step["metadata"])
+    metadata["modelUsage"] = {
+        "model": model_enum,
+        "inputTokens": input_tokens,
+        "outputTokens": output_tokens,
+        "thinkingOutputTokens": thinking_tokens,
+        "responseOutputTokens": response_tokens,
+        "cacheReadTokens": cache_read_tokens,
+    }
+    metadata["sourceTrajectoryStepInfo"]["stepIndex"] = step_index
+    if with_requested_model:
+        metadata.setdefault("requestedModel", {})["model"] = model_enum
+    return step
+
+
+def _user_input_with_model(
+    model_enum: str = "MODEL_PLACEHOLDER_M20",
+    *,
+    step_index: int | None = None,
+) -> dict[str, Any]:
+    """A USER_INPUT step with a specific requestedModel enum.
+
+    :param model_enum: agy model enum string.
+    :param step_index: Optional step index override; when provided it is written
+        into ``metadata.sourceTrajectoryStepInfo.stepIndex`` so two consecutive
+        turns can be assigned distinct dedup keys (the base fixture has no
+        ``stepIndex``, so they would otherwise share the same ``(trajectory_id,
+        None)`` key and the second turn would be silently de-duped).
+    """
+    step = copy.deepcopy(_load("user_input"))
+    user_input = cast(dict[str, Any], step["userInput"])
+    planner_cfg = cast(dict[str, Any], user_input["userConfig"]["plannerConfig"])
+    planner_cfg["requestedModel"] = {"model": model_enum}
+    if step_index is not None:
+        traj_info = cast(dict[str, Any], step["metadata"])["sourceTrajectoryStepInfo"]
+        traj_info["stepIndex"] = step_index
+    return step
+
+
+async def _run_with_telemetry(
+    *,
+    bridge_dir: Path,
+    sink: _PostSink,
+    stream: object,
+    poll_steps: object,
+    monkeypatch: pytest.MonkeyPatch,
+    iterations: int,
+    catalog: dict[str, object] | None = None,
+) -> None:
+    """Drive ``supervise_reader`` in STREAM mode with a fake model catalog."""
+    fake_catalog = catalog if catalog is not None else _FAKE_CATALOG
+    monkeypatch.setattr(reader, "stream_agent_state_updates", stream)
+    monkeypatch.setattr(reader, "get_trajectory_steps", poll_steps)
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    monkeypatch.setattr(
+        reader,
+        "get_available_models",
+        lambda port: fake_catalog,
+    )
+
+    async def _noop_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    async def _on_pending(_pending: PendingInteraction) -> None:
+        return None
+
+    await reader.supervise_reader(
+        bridge_dir,
+        _SESSION_ID,
+        client=cast(httpx.AsyncClient, object()),
+        on_pending_interaction=cast(Any, _on_pending),
+        poll_interval_s=0.0,
+        stop=_stop_after(iterations),
+    )
+
+
+@pytest.mark.asyncio
+async def test_planner_done_emits_session_usage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A PLANNER_RESPONSE DONE with modelUsage emits exactly one external_session_usage.
+
+    The event data must map agy's string-int fields onto the Omnigent shape:
+    - cumulative_input_tokens = inputTokens (int)
+    - cumulative_output_tokens = outputTokens (int)
+    - cumulative_cache_read_input_tokens = cacheReadTokens (int)
+    - model = the displayName from the catalog (not the raw enum)
+    """
+    planner = _planner_with_model_usage(
+        input_tokens="1000",
+        output_tokens="100",
+        cache_read_tokens="200",
+        model_enum="MODEL_PLACEHOLDER_M20",
+    )
+    frames = [_frame([planner])]
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    usage_events = [(et, d) for et, d in sink.posts if et == "external_session_usage"]
+    assert len(usage_events) == 1, f"expected 1 usage event, got {len(usage_events)}"
+    _, usage_data = usage_events[0]
+    assert usage_data["cumulative_input_tokens"] == 1000
+    assert usage_data["cumulative_output_tokens"] == 100
+    assert usage_data["cumulative_cache_read_input_tokens"] == 200
+    assert usage_data["model"] == "Gemini 2.5 Flash"
+
+
+@pytest.mark.asyncio
+async def test_usage_replay_does_not_re_emit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A DONE planner step replayed on the same stream does NOT re-emit usage.
+
+    The step's ``(trajectory_id, step_index)`` identity is already in
+    ``state.seen`` after the first DONE frame, so subsequent re-sends of the
+    same step post nothing (usage included).
+    """
+    planner = _planner_with_model_usage()
+    # Same DONE step repeated across three frames (snapshot replay pattern).
+    frames = [_frame([planner]), _frame([planner]), _frame([planner])]
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    usage_events = [et for et, _ in sink.posts if et == "external_session_usage"]
+    assert usage_events == ["external_session_usage"]
+
+
+@pytest.mark.asyncio
+async def test_usage_missing_fields_skipped_gracefully(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A planner DONE step without modelUsage emits no usage event (no crash)."""
+    planner = copy.deepcopy(_load("planner_response_text"))
+    planner["status"] = "CORTEX_STEP_STATUS_DONE"
+    metadata = cast(dict[str, Any], planner["metadata"])
+    metadata.pop("modelUsage", None)
+    frames = [_frame([planner])]
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    usage_events = [et for et, _ in sink.posts if et == "external_session_usage"]
+    assert usage_events == []
+
+
+# ---------------------------------------------------------------------------
+# Telemetry: external_model_change (Task T-EF)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_first_turn_emits_model_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """The first USER_INPUT step with a new model enum emits external_model_change.
+
+    The event data must carry the resolved displayName, NOT the raw enum.
+    """
+    user = _user_input_with_model("MODEL_PLACEHOLDER_M20")
+    frames = [_frame([user])]
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    model_change_events = [(et, d) for et, d in sink.posts if et == "external_model_change"]
+    assert len(model_change_events) == 1, (
+        f"expected 1 model_change event, got {len(model_change_events)}"
+    )
+    _, mc_data = model_change_events[0]
+    assert mc_data["model"] == "Gemini 2.5 Flash"
+
+
+@pytest.mark.asyncio
+async def test_same_model_second_turn_no_new_model_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A second turn with the SAME model enum emits no additional model_change event."""
+    user1 = _user_input_with_model("MODEL_PLACEHOLDER_M20", step_index=0)
+    user2 = _user_input_with_model("MODEL_PLACEHOLDER_M20", step_index=4)
+    # Two separate turns each start with a USER_INPUT, same model.
+    frames = [_frame([user1]), _frame([user1, user2])]
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    model_change_events = [et for et, _ in sink.posts if et == "external_model_change"]
+    assert len(model_change_events) == 1, (
+        f"expected exactly 1 model_change, got {len(model_change_events)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_switch_mid_session_emits_new_model_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A turn with a DIFFERENT model enum triggers a new external_model_change."""
+    user_m20 = _user_input_with_model("MODEL_PLACEHOLDER_M20", step_index=0)
+    user_m132 = _user_input_with_model("MODEL_PLACEHOLDER_M132", step_index=4)
+    # Turn 1 with M20, then turn 2 with M132.
+    frames = [_frame([user_m20]), _frame([user_m20, user_m132])]
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    model_change_events = [(et, d) for et, d in sink.posts if et == "external_model_change"]
+    assert len(model_change_events) == 2, (
+        f"expected 2 model_change events (one per distinct model), got {len(model_change_events)}"
+    )
+    assert model_change_events[0][1]["model"] == "Gemini 2.5 Flash"
+    assert model_change_events[1][1]["model"] == "Gemini 2.5 Pro"
+
+
+@pytest.mark.asyncio
+async def test_model_change_replay_no_re_emit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A USER_INPUT step replayed across frames emits model_change only once."""
+    user = _user_input_with_model("MODEL_PLACEHOLDER_M20")
+    frames = [_frame([user]), _frame([user]), _frame([user])]
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    model_change_events = [et for et, _ in sink.posts if et == "external_model_change"]
+    assert len(model_change_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_enum_posts_raw_enum(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """An unresolvable model enum falls back to the raw enum string as the model name."""
+    unknown_enum = "MODEL_PLACEHOLDER_M999"
+    user = _user_input_with_model(unknown_enum)
+    frames = [_frame([user])]
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    model_change_events = [(et, d) for et, d in sink.posts if et == "external_model_change"]
+    assert len(model_change_events) == 1
+    # Falls back to the raw enum when the catalog does not contain it.
+    assert model_change_events[0][1]["model"] == unknown_enum
