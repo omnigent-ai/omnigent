@@ -144,7 +144,7 @@ jobs:
 
       - name: Set up uv
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        uses: astral-sh/setup-uv@f0ec1fc3b38f5e7cd731bb6ce540c5af426746bb  # v6.1.0
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
           enable-cache: true
 
@@ -375,14 +375,13 @@ jobs:
           cfg = yaml.safe_load(cfg_path.read_text())
 
           # Allowlist: GitHub API (gh CLI reads) + gateway (LLM calls).
+          # CONNECT is not a valid egress_rules method — only HTTP verbs.
           rules = [
-              'CONNECT api.github.com/**',
               'GET api.github.com/**',
               'POST api.github.com/**',
           ]
           if gw_host:
               rules += [
-                  f'CONNECT {gw_host}/**',
                   f'GET {gw_host}/**',
                   f'POST {gw_host}/**',
               ]
