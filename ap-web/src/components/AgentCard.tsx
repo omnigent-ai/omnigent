@@ -16,8 +16,9 @@ import { AgentHoverCard } from "@/components/AgentHoverCard";
  *
  * Named agents win first (nessie runs on the claude-sdk harness, so a
  * harness check would mislabel it with the Claude glyph), then harness/kind
- * so any Claude-, Codex-, pi-, or qwen-backed agent gets the right glyph
- * regardless of its registered name, then a generic bot.
+ * so any Claude-, Codex-, Cursor-, pi-, or Goose-backed agent (native TUI or
+ * headless) gets the right glyph regardless of its registered name, then a
+ * generic bot (qwen falls back to bot for now).
  *
  * @param agent - The catalog entry to render.
  * @returns The icon component to render for the agent.
