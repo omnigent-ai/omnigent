@@ -761,6 +761,24 @@ def test_get_trajectory_steps_posts_cascade_id_and_returns_steps(
     assert steps[0]["stepIndex"] == 0
 
 
+def test_get_trajectory_steps_raises_on_500(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A non-2xx response from ``GetCascadeTrajectorySteps`` raises
+    ``httpx.HTTPStatusError``.
+
+    Pins the "non-2xx raises, not fail-open" contract: the Task 6 read driver
+    is responsible for retry/backoff, and a 500 must propagate rather than
+    silently returning an empty list.
+    """
+    monkeypatch.setattr(
+        rpc,
+        "_HTTP_TRANSPORT",
+        httpx.MockTransport(lambda r: httpx.Response(500, json={"code": "unknown"})),
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        rpc.get_trajectory_steps(52548, "conv-uuid")
+
+
 def test_cancel_cascade_steps_true_on_200(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     ``cancel_cascade_steps`` POSTs ``{"cascadeId": ...}`` to
@@ -855,3 +873,29 @@ def test_handle_user_interaction_raises_on_500(monkeypatch: pytest.MonkeyPatch) 
             payload={"permission": {"allow": True}},
         )
     assert "input not registered" in str(exc_info.value)
+
+
+def test_handle_user_interaction_raises_rpc_error_on_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A transport failure from ``HandleCascadeUserInteraction`` raises
+    ``AntigravityRpcError``, NOT a raw ``httpx.HTTPError``.
+
+    The Task 8 bridge catches ``AntigravityRpcError`` as the single failure
+    surface for all delivery problems; a raw transport error bypassing that
+    type would crash the bridge. Asserts the unified failure surface contract.
+    """
+
+    def raise_transport(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(raise_transport))
+    with pytest.raises(rpc.AntigravityRpcError, match="transport error"):
+        rpc.handle_user_interaction(
+            52548,
+            "c",
+            trajectory_id="t",
+            step_index=0,
+            payload={"permission": {"allow": True}},
+        )

@@ -393,6 +393,8 @@ def get_trajectory_steps(port: int, cascade_id: str) -> list[dict[str, object]]:
         Task 6 read driver is responsible for retry/backoff. Intentionally NOT
         fail-open (unlike ``_conversation_matches`` which is a discovery probe);
         a non-2xx here is a hard read failure, not a "not found" signal.
+    :raises ValueError: When the 2xx response body is not valid JSON (body is
+        decoded; the Task 6 driver catches broadly).
     """
     url = _rpc_url(port, _METHOD_GET_CASCADE_TRAJECTORY_STEPS)
     _assert_loopback_url(url)
@@ -405,7 +407,9 @@ def get_trajectory_steps(port: int, cascade_id: str) -> list[dict[str, object]]:
     # Raises httpx.HTTPStatusError (subclass of httpx.HTTPError) on non-2xx so
     # the body is never decoded on error paths (which may not be JSON).
     response.raise_for_status()
-    return list(response.json().get("steps", []))
+    body = response.json()  # ValueError on non-JSON 200 propagates (documented)
+    steps = body.get("steps") if isinstance(body, dict) else None
+    return list(steps) if isinstance(steps, list) else []
 
 
 def cancel_cascade_steps(port: int, cascade_id: str) -> bool:
@@ -431,7 +435,7 @@ def cancel_cascade_steps(port: int, cascade_id: str) -> bool:
                 headers={"Content-Type": "application/json"},
                 content=json.dumps({"cascadeId": cascade_id}).encode("utf-8"),
             )
-    except httpx.HTTPError:
+    except Exception:  # deliberate fail-open: ssl.SSLError etc. outside httpx hierarchy
         return False
     return response.status_code < 400
 
@@ -478,10 +482,12 @@ def handle_user_interaction(
     :param step_index: Step index the interaction targets.
     :param payload: Variant dict, e.g. ``{"permission": {"allow": True}}`` or
         ``{"askQuestion": {...}}``.
-    :raises AntigravityRpcError: On any HTTP status >= 400, carrying the raw
-        response body text. Do NOT use ``raise_for_status()`` here so that the
-        body is always available to callers that need to detect the overloaded
-        ``"input not registered"`` string.
+    :raises AntigravityRpcError: On transport errors (e.g. connection refused)
+        or any HTTP status >= 400. Transport errors are wrapped so the bridge
+        has one exception type to catch, regardless of whether the failure was
+        on the wire or at the application layer. On non-2xx, the raw response
+        body text is the message (NOT ``raise_for_status()``) so callers can
+        detect the overloaded ``"input not registered for step N"`` string.
     """
     url = _rpc_url(port, _METHOD_HANDLE_CASCADE_USER_INTERACTION)
     _assert_loopback_url(url)
@@ -489,12 +495,15 @@ def handle_user_interaction(
         "cascadeId": cascade_id,
         "interaction": {"trajectoryId": trajectory_id, "stepIndex": step_index, **payload},
     }
-    with _sync_client(_PROBE_TIMEOUT_S) as client:
-        response = client.post(
-            url,
-            headers={"Content-Type": "application/json"},
-            content=json.dumps(body).encode("utf-8"),
-        )
+    try:
+        with _sync_client(_PROBE_TIMEOUT_S) as client:
+            response = client.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                content=json.dumps(body).encode("utf-8"),
+            )
+    except httpx.HTTPError as e:
+        raise AntigravityRpcError(f"transport error contacting agy: {e}") from e
     if response.status_code >= 400:
         raise AntigravityRpcError(response.text)
 
