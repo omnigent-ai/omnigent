@@ -136,7 +136,7 @@ jobs:
         run: echo "LLM_API_KEY=${{ secrets.LLM_API_KEY }}" >> "$GITHUB_ENV"
 
       - name: Install project + dev extras
-        run: uv sync --extra all --extra dev
+        run: uv sync --locked --extra all --extra dev
 
       - name: Install bubblewrap + tmux
         # bubblewrap: the UI tests open terminals under os_env, whose

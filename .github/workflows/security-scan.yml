@@ -132,6 +132,23 @@ jobs:
         if: ${{ steps.gate.outputs.scan == 'true' }}
         uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
 
+      - name: OSV advisory scan (uv.lock)
+        # Checks every package version pinned in the PR's uv.lock against the
+        # OSV advisory database, which covers known-malicious, typosquatted,
+        # and CVE-flagged versions. Only fires when uv.lock is in the changeset
+        # to avoid blocking PRs when main's baseline lockfile already has open
+        # advisories on main.
+        if: ${{ steps.gate.outputs.scan == 'true' }}
+        working-directory: pr
+        run: |
+          if ! grep -qxF 'uv.lock' "$GITHUB_WORKSPACE/changed.txt"; then
+            echo "uv.lock not changed; skipping OSV scan."
+            exit 0
+          fi
+          uv export --frozen --format requirements-txt --all-extras \
+            > /tmp/uv-req.txt
+          uvx pip-audit --requirement /tmp/uv-req.txt --no-deps
+
       - name: Semgrep (changed files, local rules)
         if: ${{ steps.gate.outputs.scan == 'true' }}
         env:

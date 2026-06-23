@@ -83,7 +83,7 @@ runs:
 
     - name: Install project and dev dependencies
       shell: bash
-      run: uv sync --extra all --extra dev
+      run: uv sync --locked --extra all --extra dev
 
     - name: Install binary dependencies
       # npm install against .github/ci-deps/package.json with --ignore-scripts

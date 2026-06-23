@@ -144,7 +144,7 @@ jobs:
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install dependencies
-        run: uv sync --extra all --extra dev
+        run: uv sync --locked --extra all --extra dev
 
       - name: Run pytest
         shell: bash
@@ -241,7 +241,7 @@ jobs:
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install dependencies
-        run: uv sync --extra all --extra dev
+        run: uv sync --locked --extra all --extra dev
 
       - name: Build parity sidecar
         run: |
