@@ -398,17 +398,19 @@ function MarkdownRichTextViewerInner({
       <div
         ref={scrollContainerRef}
         className="relative flex-1 overflow-auto px-8 py-6"
-        onClick={
-          !canEdit
-            ? (e) => {
-                const anchor = (e.target as Element).closest("a[href]");
-                if (anchor) {
-                  e.preventDefault();
-                  window.open(anchor.getAttribute("href")!, "_blank", "noopener,noreferrer");
-                }
-              }
-            : undefined
-        }
+        // Link following. The Link extension runs with openOnClick:false so a
+        // plain click in edit mode positions the cursor instead of navigating.
+        // Read-only: any click on a link opens it. Edit mode: only a
+        // modifier-click (⌘/Ctrl) opens it, so plain-click-to-edit is preserved
+        // while still giving an escape hatch to follow links (incl. in tables).
+        onClick={(e) => {
+          if (canEdit && !e.metaKey && !e.ctrlKey) return;
+          const anchor = (e.target as Element).closest("a[href]");
+          if (anchor) {
+            e.preventDefault();
+            window.open(anchor.getAttribute("href")!, "_blank", "noopener,noreferrer");
+          }
+        }}
       >
         {!canEdit && (
           <button

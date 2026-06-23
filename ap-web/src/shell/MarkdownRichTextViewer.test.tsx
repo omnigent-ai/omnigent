@@ -275,6 +275,65 @@ describe("MarkdownRichTextViewer dirty banners", () => {
   });
 });
 
+// ── Link following ───────────────────────────────────────────────────────────
+
+describe("MarkdownRichTextViewer link following", () => {
+  const HREF = "https://omnigent.ai/docs/build/harnesses";
+
+  // The TipTap editor (and the links it renders, incl. those in table cells)
+  // is mocked to null here, so inject an anchor into the scroll container to
+  // exercise the container's click handler directly.
+  function clickLink(
+    container: HTMLElement,
+    eventInit: Parameters<typeof fireEvent.click>[1] = {},
+  ) {
+    const scroll = container.querySelector(".overflow-auto");
+    if (!scroll) throw new Error("scroll container not found");
+    const anchor = document.createElement("a");
+    anchor.setAttribute("href", HREF);
+    scroll.appendChild(anchor);
+    fireEvent.click(anchor, eventInit);
+  }
+
+  it("opens a link in a new tab on a plain click in read-only mode", () => {
+    const open = vi.fn();
+    vi.stubGlobal("open", open);
+    setupReadOnlyHooks();
+    const { container } = renderViewer("[harnesses](" + HREF + ")");
+
+    clickLink(container);
+
+    // Read-only: nothing to edit, so any link click should follow.
+    expect(open).toHaveBeenCalledWith(HREF, "_blank", "noopener,noreferrer");
+  });
+
+  it("does NOT follow a link on a plain click in edit mode (click places the cursor)", () => {
+    const open = vi.fn();
+    vi.stubGlobal("open", open);
+    setupEditHooks();
+    const { container } = renderViewer("[harnesses](" + HREF + ")");
+
+    clickLink(container);
+
+    // Edit mode: a bare click must position the cursor, not navigate away.
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it("follows a link on ⌘/Ctrl+click in edit mode (escape hatch)", () => {
+    const open = vi.fn();
+    vi.stubGlobal("open", open);
+    setupEditHooks();
+    const { container } = renderViewer("[harnesses](" + HREF + ")");
+
+    clickLink(container, { metaKey: true });
+    expect(open).toHaveBeenCalledWith(HREF, "_blank", "noopener,noreferrer");
+
+    open.mockClear();
+    clickLink(container, { ctrlKey: true });
+    expect(open).toHaveBeenCalledWith(HREF, "_blank", "noopener,noreferrer");
+  });
+});
+
 // ── Truncated-file guard ─────────────────────────────────────────────────────
 
 describe("MarkdownRichTextViewer truncated guard", () => {
