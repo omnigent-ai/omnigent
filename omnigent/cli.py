@@ -4943,6 +4943,155 @@ def _build_resume_parts() -> list[str]:
     return parts
 
 
+def _dispatch_native_terminal_harness(
+    *,
+    harness: str,
+    server: str | None,
+    model: str | None,
+    prompt: str | None,
+    system_prompt: str | None,
+    tools: str | None,
+    log: bool,
+    debug_events: bool,
+    resume_conversation_id: str | None,
+    resume_picker: bool,
+    resume_latest: bool,
+    fork_session_id: str | None,
+    ephemeral: bool,
+    auto_open_conversation: bool,
+) -> bool:
+    """
+    Launch a ``*-native`` terminal harness via its TUI wrapper directly.
+
+    ``run --harness cursor-native`` (and the claude/codex/pi equivalents)
+    must NOT go through the materialized-launcher REPL: that drives an
+    Omnigent turn per message — which persists its own user item — *while*
+    the harness forwarder mirrors the same message back from the TUI's
+    transcript, recording every user message twice. These harnesses are
+    terminal-mirror sessions whose turns originate in the TUI, so dispatch
+    straight to the native wrapper (the same code ``omnigent cursor`` /
+    ``omnigent claude`` / etc. run), keeping the TUI the single source of
+    turns. A top-level ``--model`` is forwarded as a passthrough CLI flag.
+
+    ``--continue`` is honored (not rejected): it resolves to this harness's
+    most-recent conversation and hands that off to the wrapper, matching the
+    pre-dispatch launcher behavior so it is not a silent resume regression.
+
+    :param harness: The requested ``--harness`` value (canonical or alias).
+    :returns: ``True`` when *harness* is a native terminal harness and was
+        dispatched here; ``False`` when it is not one (caller continues).
+    """
+    from omnigent.native_coding_agents import native_coding_agent_for_harness
+
+    native_agent = native_coding_agent_for_harness(harness)
+    if native_agent is None:
+        return False
+
+    # The native TUI wrappers attach to a tmux pane and own their own turn
+    # loop, so REPL-only options have no analog there. Reject them loudly
+    # rather than silently dropping them, and point at the dedicated
+    # subcommand. (``--continue``/``--resume <id>``/``--resume`` picker ARE
+    # supported below — they map onto the wrapper's session selection.)
+    unsupported = [
+        flag
+        for flag, active in (
+            ("-p/--prompt", prompt is not None),
+            ("--system-prompt", system_prompt is not None),
+            ("--tools", tools is not None),
+            ("--log", log),
+            ("--debug-events", debug_events),
+            ("--fork", fork_session_id is not None),
+            ("--no-session", ephemeral),
+        )
+        if active
+    ]
+    if unsupported:
+        # These are REPL-only options with no analog in the TUI — and the
+        # dedicated subcommand doesn't accept them either (it would treat them
+        # as passthrough args), so tell the user to drop them rather than
+        # redirect. ``--model`` and session selection (--resume/--continue) ARE
+        # honored here.
+        raise click.ClickException(
+            f"`run --harness {harness}` launches the {native_agent.display_name} TUI directly; "
+            f"the REPL-only option(s) {', '.join(unsupported)} have no effect there — remove them."
+        )
+
+    server = _ensure_backend(server)
+    passthrough = ("--model", model) if model else ()
+
+    # Resolve --continue to a concrete conversation id (the wrappers take a
+    # session id / picker, not a "latest" flag). Precedence matches the REPL:
+    # an explicit id wins, then the picker, then --continue.
+    session_id = resume_conversation_id
+    if session_id is None and not resume_picker and resume_latest:
+        from omnigent.chat import _remote_headers, _resolve_latest_conversation_id
+
+        session_id = _resolve_latest_conversation_id(
+            base_url=server,
+            agent_name=native_agent.agent_name,
+            headers=_remote_headers(server_url=server),
+        )
+        # The user explicitly asked to continue; if there's nothing to continue,
+        # fail loud rather than silently starting fresh (matches the REPL's
+        # _resolve_resume_target behavior).
+        if session_id is None:
+            raise click.ClickException(
+                f"No prior conversation for agent {native_agent.agent_name!r}."
+            )
+
+    common = {
+        "server": server,
+        "session_id": session_id,
+        "resume_picker": resume_picker,
+        "auto_open_conversation": auto_open_conversation,
+    }
+    if native_agent.key == "claude":
+        from omnigent.claude_native import run_claude_native
+
+        run_claude_native(claude_args=passthrough, **common)
+    elif native_agent.key == "codex":
+        from omnigent.codex_native import run_codex_native
+
+        # Codex takes its model as a first-class arg, not a passthrough flag.
+        run_codex_native(codex_args=(), model=model, **common)
+    elif native_agent.key == "pi":
+        from omnigent.pi_native import run_pi_native
+
+        run_pi_native(pi_args=passthrough, **common)
+    elif native_agent.key == "cursor":
+        from omnigent.cursor_native import run_cursor_native
+
+        run_cursor_native(cursor_args=passthrough, **common)
+    else:  # pragma: no cover - new native agent added without a dispatch arm
+        raise click.ClickException(f"No native terminal launcher wired for harness {harness!r}.")
+    return True
+
+
+def _reject_agent_with_native_terminal_harness(harness: str) -> None:
+    """
+    Reject ``run AGENT --harness <x>-native``: native harnesses own their TUI.
+
+    A ``*-native`` harness mirrors an external CLI's own TUI; the agent spec's
+    prompt/tools are never consulted, and driving it through the REPL would
+    double-record every message (Omnigent turn + forwarder mirror). So an
+    explicit AGENT path combined with a native terminal harness has no coherent
+    meaning — fail loud and point at the dedicated subcommand.
+
+    :param harness: The requested ``--harness`` value (canonical or alias).
+    :raises click.ClickException: When *harness* is a native terminal harness.
+    """
+    from omnigent.native_coding_agents import native_coding_agent_for_harness
+
+    native_agent = native_coding_agent_for_harness(harness)
+    if native_agent is None:
+        return
+    raise click.ClickException(
+        f"`--harness {harness}` launches the {native_agent.display_name} TUI and "
+        f"ignores an AGENT spec; drop the AGENT path and run "
+        f"`omnigent {native_agent.terminal_name}` (or `run --harness {harness}`)."
+    )
+
+
 def _dispatch_run(
     *,
     target: str | None,
@@ -5086,6 +5235,27 @@ def _dispatch_run(
             return
         if harness is None:
             raise click.ClickException(_missing_run_agent_message())
+        # ``*-native`` terminal harnesses launch their own TUI wrapper instead of
+        # the materialized-launcher REPL — the REPL would double-record every
+        # user message (Omnigent turn + forwarder mirror). Returns False for
+        # non-native harnesses, which fall through to the launcher below.
+        if _dispatch_native_terminal_harness(
+            harness=harness,
+            server=server,
+            model=model,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            tools=tools,
+            log=log,
+            debug_events=debug_events,
+            resume_conversation_id=resume_conversation_id,
+            resume_picker=resume_picker,
+            resume_latest=resume_latest,
+            fork_session_id=fork_session_id,
+            ephemeral=ephemeral,
+            auto_open_conversation=auto_open_conversation,
+        ):
+            return
         if ephemeral:
             raise click.ClickException(
                 "--no-session requires an AGENT path; no-AGENT harness launch "
@@ -5103,6 +5273,11 @@ def _dispatch_run(
         system_prompt = None
     elif harness is not None:
         _validate_harness(harness)
+        # A ``*-native`` harness IS its own TUI agent — pairing it with an AGENT
+        # spec is meaningless, and routing it through the REPL would double-record
+        # every message (Omnigent turn + forwarder mirror, same as the no-AGENT
+        # path above). Reject rather than silently launch the broken surface.
+        _reject_agent_with_native_terminal_harness(harness)
 
     if server is not None:
         if _is_server_url(target):
