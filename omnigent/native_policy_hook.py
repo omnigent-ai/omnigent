@@ -346,8 +346,10 @@ def post_evaluate_with_retry(
                 return resp
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code < 500:
+                body_preview = exc.response.text[:200] if exc.response.content else ""
                 print(
-                    f"omnigent {hook_label}: Omnigent returned {exc.response.status_code}",
+                    f"omnigent {hook_label}: Omnigent returned {exc.response.status_code}"
+                    + (f": {body_preview}" if body_preview else ""),
                     file=sys.stderr,
                 )
                 return None
