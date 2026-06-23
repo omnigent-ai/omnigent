@@ -1188,6 +1188,83 @@ def test_get_available_models_raises_on_500(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 # ---------------------------------------------------------------------------
+# get_all_cascade_trajectories (unary RPC, Task T-G /clear-rotation signal)
+# ---------------------------------------------------------------------------
+
+
+def test_get_all_cascade_trajectories_posts_empty_body_and_returns_summaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``get_all_cascade_trajectories`` POSTs ``{}`` to ``GetAllCascadeTrajectories``
+    and returns the parsed body (the ``trajectorySummaries`` map).
+
+    Asserts the exact URL and wire body so a refactor cannot silently change the
+    method or add unexpected request fields, and that the returned body is the
+    raw response (the reader's detection helper does the summary selection).
+    """
+    seen: dict[str, object] = {}
+    body = {
+        "trajectorySummaries": {
+            "0715c922-02fc-4278-bab8-3a6ea565bbbf": {
+                "trajectoryId": "0b3d852b-b4b4-4aa4-b51c-ca80d3b2df94",
+                "status": "CASCADE_RUN_STATUS_IDLE",
+                "lastUserInputTime": "2026-06-23T17:50:29.232919Z",
+                "trajectoryType": "CORTEX_TRAJECTORY_TYPE_CASCADE",
+            }
+        }
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["url"] = str(req.url)
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json=body)
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(handler))
+    result = rpc.get_all_cascade_trajectories(52548)
+    assert seen["url"] == (
+        "https://127.0.0.1:52548/exa.language_server_pb.LanguageServerService/"
+        "GetAllCascadeTrajectories"
+    )
+    assert seen["body"] == {}
+    assert result == body
+
+
+def test_get_all_cascade_trajectories_non_dict_body_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 200 whose body is not a JSON object yields ``{}`` (defensive).
+
+    Guards against a future agy returning a non-object 200 — the reader then sees
+    no summaries and simply does not rotate, rather than crashing.
+    """
+    monkeypatch.setattr(
+        rpc,
+        "_HTTP_TRANSPORT",
+        httpx.MockTransport(lambda r: httpx.Response(200, json=[1, 2, 3])),
+    )
+    assert rpc.get_all_cascade_trajectories(52548) == {}
+
+
+def test_get_all_cascade_trajectories_raises_on_500(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A non-2xx response raises ``httpx.HTTPStatusError`` (NOT fail-open).
+
+    Mirrors ``get_trajectory_steps`` / ``get_available_models``: a hard read
+    failure raises rather than silently returning ``{}`` (which would be
+    indistinguishable from "no rotation"); the reader owns retry/backoff.
+    """
+    monkeypatch.setattr(
+        rpc,
+        "_HTTP_TRANSPORT",
+        httpx.MockTransport(lambda r: httpx.Response(500, json={"code": "unknown"})),
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        rpc.get_all_cascade_trajectories(52548)
+
+
+# ---------------------------------------------------------------------------
 # stream_agent_state_updates (connect server-stream, Task T-C)
 # ---------------------------------------------------------------------------
 #

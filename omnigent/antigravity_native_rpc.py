@@ -88,6 +88,7 @@ _METHOD_HANDLE_CASCADE_USER_INTERACTION = "HandleCascadeUserInteraction"
 _METHOD_SEND_USER_CASCADE_MESSAGE = "SendUserCascadeMessage"
 _METHOD_START_CASCADE = "StartCascade"
 _METHOD_GET_AVAILABLE_MODELS = "GetAvailableModels"
+_METHOD_GET_ALL_CASCADE_TRAJECTORIES = "GetAllCascadeTrajectories"
 _METHOD_STREAM_AGENT_STATE_UPDATES = "StreamAgentStateUpdates"
 
 _LOOPBACK = "127.0.0.1"
@@ -741,6 +742,73 @@ def get_available_models(port: int) -> dict[str, object]:
     return inner if isinstance(inner, dict) else body
 
 
+def get_all_cascade_trajectories(port: int) -> dict[str, object]:
+    """
+    Return agy's cascade-trajectory summaries from ``GetAllCascadeTrajectories``.
+
+    POSTs ``{}`` to ``GetAllCascadeTrajectories`` and returns the parsed response
+    body. This is the PRIMARY ``/clear``-rotation signal for the Task T-G reader: a
+    ``StreamAgentStateUpdates`` stream is bound to ONE cascade and only ever
+    reports THAT cascade's id, so it cannot observe a sibling conversation; this
+    surface, by contrast, lists EVERY live root cascade, so a freshly ``/clear``-
+    minted conversation becomes visible here as a new, more-recently-active entry.
+
+    The response shape (live-verified, agy 1.0.10) keys each summary by its ROOT
+    conversation id::
+
+        {"trajectorySummaries": {
+            "<rootConversationId>": {
+                "trajectoryId": "<uuid>",
+                "status": "CASCADE_RUN_STATUS_IDLE",
+                "createdTime": "2026-06-23T17:18:24.402333Z",
+                "lastModifiedTime": "2026-06-23T17:50:32.565300Z",
+                "lastUserInputTime": "2026-06-23T17:50:29.232919Z",
+                "lastUserInputStepIndex": 8,
+                "stepCount": 10,
+                "summary": "<human label>",
+                "trajectoryType": "CORTEX_TRAJECTORY_TYPE_CASCADE",
+                "trajectoryMetadata": {
+                    "createdAt": "...",
+                    "rootConversationId": "<rootConversationId>",
+                    ...
+                }
+            },
+            ...
+        }}
+
+    A freshly ``/clear``-minted cascade appears with ``lastUserInputTime`` /
+    ``lastModifiedTime`` ABSENT (``null``) until it is actually used — so the
+    reader's :func:`~omnigent.antigravity_native_reader._detect_rotated_cascade`
+    treats a never-used sibling as not-yet-the-current-conversation (no premature
+    rotation). The caller is responsible for selecting the current cascade from
+    these summaries; this function only fetches them.
+
+    :param port: Validated connect-RPC port, e.g. ``52548``.
+    :returns: The parsed response body (at minimum ``{"trajectorySummaries":
+        {...}}``), or ``{}`` when the 200 body is not a dict (guards against a
+        future agy returning a non-object 200).
+    :raises httpx.HTTPError: On transport errors or non-2xx responses; the Task
+        T-G reader is responsible for retry/backoff. Intentionally NOT fail-open
+        (mirrors :func:`get_trajectory_steps` / :func:`get_available_models`): a
+        non-2xx is a hard read failure, not a "no rotation" signal.
+    :raises ValueError: When the 2xx response body is not valid JSON (body is
+        decoded; the caller catches broadly).
+    """
+    url = _rpc_url(port, _METHOD_GET_ALL_CASCADE_TRAJECTORIES)
+    _assert_loopback_url(url)
+    with _sync_client(_PROBE_TIMEOUT_S) as client:
+        response = client.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            content=b"{}",
+        )
+    # Raises httpx.HTTPStatusError (subclass of httpx.HTTPError) on non-2xx so
+    # the body is never decoded on error paths (which may not be JSON).
+    response.raise_for_status()
+    body = response.json()  # ValueError on non-JSON 200 propagates (documented)
+    return body if isinstance(body, dict) else {}
+
+
 def _encode_connect_envelope(payload: dict[str, object]) -> bytes:
     """
     Encode a single connect-protocol request message.
@@ -901,10 +969,10 @@ async def stream_agent_state_updates(
                     ) from e
                 if isinstance(parsed, dict):
                     # Each DATA frame is a connect envelope ``{"update": {...}}``;
-                    # unwrap it so the reader's _frame_steps / _frame_conversation_id
-                    # see ``mainTrajectoryUpdate`` / ``conversationId`` at the top
-                    # level. Fall back to the parsed dict if a future agy ever
-                    # drops the envelope (defensive — keeps the reader working).
+                    # unwrap it so the reader's ``_frame_steps`` sees
+                    # ``mainTrajectoryUpdate`` at the top level. Fall back to the
+                    # parsed dict if a future agy ever drops the envelope
+                    # (defensive — keeps the reader working).
                     inner = parsed.get("update")
                     yield inner if isinstance(inner, dict) else parsed
 

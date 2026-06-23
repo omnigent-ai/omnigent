@@ -185,22 +185,6 @@ def _frame(steps: list[dict[str, Any]]) -> dict[str, Any]:
     return {"mainTrajectoryUpdate": {"stepsUpdate": {"steps": copy.deepcopy(steps)}}}
 
 
-def _frame_with_conversation(steps: list[dict[str, Any]], conversation_id: str) -> dict[str, Any]:
-    """A stream frame with a top-level ``conversationId`` (design §10.5 ASSUMPTION).
-
-    Design §10.5 assumes each live frame carries ``update.conversationId`` and
-    that a TUI ``/clear`` mints a NEW id so post-rotation frames begin naming it;
-    the reader keys its /clear-rotation guard off this field. NOTE: that top-level
-    field path is unverified (the only live-verified id echo is nested,
-    ``metadata.rootConversationId``). This helper hand-sets the field to exercise
-    the guard's logic; it does NOT prove the real frame shape — replace it with a
-    captured post-``/clear`` fixture once Task 13 confirms the path.
-    """
-    frame = _frame(steps)
-    frame["conversationId"] = conversation_id
-    return frame
-
-
 def _generating_planner(text: str, *, step_index: int = 2) -> dict[str, Any]:
     """A PLANNER_RESPONSE step mid-generation (status GENERATING).
 
@@ -366,6 +350,18 @@ def patched_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make port + cascade-id discovery resolve immediately (no OS/network)."""
     monkeypatch.setattr(reader, "_candidate_agy_rpc_ports", lambda: [_PORT])
     monkeypatch.setattr(reader, "_conversation_matches", lambda port, cid: port == _PORT)
+
+
+@pytest.fixture(autouse=True)
+def no_rotation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default the Task T-G rotation detector to "no rotation" for every test.
+
+    ``supervise_reader`` always spawns the ``GetAllCascadeTrajectories`` rotation
+    detector; by default it must hit no real socket and report no rotation, so the
+    existing reader tests exercise only the stream/poll body. A rotation-specific
+    test overrides ``reader.get_all_cascade_trajectories`` itself.
+    """
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", lambda port: {})
 
 
 def _bridge_dir(tmp_path: Path) -> Path:
@@ -1428,90 +1424,6 @@ async def test_stream_status_running_then_idle(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_stream_rotated_conversation_stops_and_warns(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    patched_discovery: None,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A frame naming a DIFFERENT conversation (TUI /clear) stops the reader.
-
-    The bound conversation is dead after a /clear rotation; continuing would
-    mirror a frozen conversation while the live one's turns are lost. The reader
-    must stop (not silently mirror the dead conversation) and log a warning. The
-    step in the rotated frame must NOT be mirrored.
-    """
-    user = _load("user_input")
-    done = _done_planner("From the dead conversation.")
-    frames = [
-        # First frame still names the bound conversation: mirrored normally.
-        _frame_with_conversation([user], _CASCADE_ID),
-        # Then a /clear rotation: a new conversation id appears. Its step must
-        # not be mirrored, and the reader must stop.
-        _frame_with_conversation([user, done], "rotated-conv-9999"),
-    ]
-    sink = _PostSink()
-
-    with caplog.at_level("WARNING"):
-        await _run_stream(
-            bridge_dir=_bridge_dir(tmp_path),
-            sink=sink,
-            stream=_FrameScript(frames),
-            poll_steps=_StepScript([[]]),
-            monkeypatch=monkeypatch,
-            iterations=2,
-        )
-
-    # The rotation warning was logged (failure is visible, not silent).
-    assert any(
-        "rotated away" in rec.message and "rotated-conv-9999" in rec.message
-        for rec in caplog.records
-    )
-    # The post-rotation assistant message was NOT mirrored (we stopped first).
-    assert sink.item_types() == []
-
-
-@pytest.mark.asyncio
-async def test_stream_same_conversation_frames_do_not_trigger_rotation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    patched_discovery: None,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Frames naming the bound conversation (or omitting the id) are not rotations.
-
-    The guard must be false-positive-free on the normal path: a frame whose
-    ``conversationId`` matches the bound cascade id — and a frame that omits the
-    field entirely — must mirror normally without a rotation warning.
-    """
-    user = _load("user_input")
-    full = "All set."
-    frames = [
-        # Explicit matching id.
-        _frame_with_conversation([user], _CASCADE_ID),
-        # Field omitted (the existing _frame helper): must not be read as rotation.
-        _frame([user, _generating_planner(full)]),
-        _frame_with_conversation([user, _done_planner(full)], _CASCADE_ID),
-    ]
-    sink = _PostSink()
-
-    with caplog.at_level("WARNING"):
-        await _run_stream(
-            bridge_dir=_bridge_dir(tmp_path),
-            sink=sink,
-            stream=_FrameScript(frames),
-            poll_steps=_StepScript([[]]),
-            monkeypatch=monkeypatch,
-            iterations=1,
-        )
-
-    # No rotation warning, and the conversation mirrored end to end.
-    assert not any("rotated away" in rec.message for rec in caplog.records)
-    assert sink.statuses() == ["running", "idle"]
-    assert sink.item_types() == ["message"]
-
-
 # ---------------------------------------------------------------------------
 # Stream mode: a stream error falls back to the poll loop (no crash)
 # ---------------------------------------------------------------------------
@@ -2264,3 +2176,531 @@ async def test_stream_reentry_backoff_between_clean_immediate_returns(
     # that only the re-entry backoff (not the poll-interval sleep) ran.
     assert empty_stream.calls == target_entries
     assert backoff_sleeps and all(s == reader._STREAM_REENTRY_BACKOFF_S for s in backoff_sleeps)
+
+
+# ---------------------------------------------------------------------------
+# T-G: _detect_rotated_cascade (pure /clear-rotation detection)
+# ---------------------------------------------------------------------------
+#
+# Fixtures mirror the real ``GetAllCascadeTrajectories`` capture shape: each
+# summary is keyed by its root conversation id and carries a ``trajectoryType``
+# plus ISO-8601 ``lastUserInputTime`` / ``lastModifiedTime`` (a ``Z`` UTC
+# suffix), with the freshly-minted-but-unused cascade omitting both.
+
+_BOUND_CASCADE = "0715c922-02fc-4278-bab8-3a6ea565bbbf"
+_OTHER_CASCADE = "ef42f24d-7dfd-4810-a5f0-9e069c88709a"
+
+
+def _summary(
+    *,
+    last_user_input_time: str | None = None,
+    last_modified_time: str | None = None,
+    trajectory_type: str = "CORTEX_TRAJECTORY_TYPE_CASCADE",
+) -> dict[str, Any]:
+    """Build one ``trajectorySummaries`` entry (real-capture shape).
+
+    Omitting a timestamp (``None``) models a never-set field, exactly as the live
+    capture omits ``lastUserInputTime`` / ``lastModifiedTime`` for a freshly
+    ``/clear``-minted, never-used cascade.
+    """
+    entry: dict[str, Any] = {
+        "trajectoryId": "tid-" + trajectory_type[-4:],
+        "status": "CASCADE_RUN_STATUS_IDLE",
+        "trajectoryType": trajectory_type,
+    }
+    if last_user_input_time is not None:
+        entry["lastUserInputTime"] = last_user_input_time
+    if last_modified_time is not None:
+        entry["lastModifiedTime"] = last_modified_time
+    return entry
+
+
+def test_detect_rotation_newer_active_sibling_returns_its_id() -> None:
+    """A sibling cascade with strictly newer activity is the rotation target."""
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time="2026-06-23T17:34:54.152668Z"),
+        _OTHER_CASCADE: _summary(last_user_input_time="2026-06-23T17:50:29.232919Z"),
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) == _OTHER_CASCADE
+
+
+def test_detect_rotation_minted_but_unused_sibling_returns_none() -> None:
+    """A freshly /clear-minted sibling (no activity timestamps) is NOT a rotation.
+
+    The bare mint reports no ``lastUserInputTime`` / ``lastModifiedTime`` until its
+    first turn runs, so it must not trigger rotation — only a USED new conversation
+    does.
+    """
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time="2026-06-23T17:34:54.152668Z"),
+        _OTHER_CASCADE: _summary(),  # minted, never used
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) is None
+
+
+def test_detect_rotation_only_bound_present_returns_none() -> None:
+    """With only the bound cascade present there is nothing to rotate to."""
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time="2026-06-23T17:34:54.152668Z"),
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) is None
+
+
+def test_detect_rotation_older_sibling_returns_none() -> None:
+    """A sibling that is OLDER than the bound cascade is not a rotation."""
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time="2026-06-23T17:50:29.232919Z"),
+        _OTHER_CASCADE: _summary(last_user_input_time="2026-06-23T17:34:54.152668Z"),
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) is None
+
+
+def test_detect_rotation_non_cascade_sibling_returns_none() -> None:
+    """A newer NON-cascade (subagent) sibling must not be a rotation target.
+
+    Rotating to a child/subagent trajectory would mirror a sub-conversation, not
+    the user's top-level conversation — so a newer subagent is ignored.
+    """
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time="2026-06-23T17:34:54.152668Z"),
+        _OTHER_CASCADE: _summary(
+            last_user_input_time="2026-06-23T17:50:29.232919Z",
+            trajectory_type="CORTEX_TRAJECTORY_TYPE_SUBAGENT",
+        ),
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) is None
+
+
+def test_detect_rotation_bound_absent_returns_none() -> None:
+    """When the bound cascade is missing from the summaries, do not rotate blindly.
+
+    We cannot prove the bound conversation is staler than a sibling, so the reader
+    must stay on its current binding rather than chase a sibling on incomplete
+    information.
+    """
+    summaries = {
+        _OTHER_CASCADE: _summary(last_user_input_time="2026-06-23T17:50:29.232919Z"),
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) is None
+
+
+def test_detect_rotation_falls_back_to_last_modified_time() -> None:
+    """``lastModifiedTime`` is used when ``lastUserInputTime`` is absent.
+
+    A cascade whose only activity signal is ``lastModifiedTime`` is still a valid
+    comparison/candidate (the helper prefers ``lastUserInputTime`` but falls back).
+    """
+    summaries = {
+        _BOUND_CASCADE: _summary(last_modified_time="2026-06-23T17:34:54.000000Z"),
+        _OTHER_CASCADE: _summary(last_modified_time="2026-06-23T17:50:32.565300Z"),
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) == _OTHER_CASCADE
+
+
+def test_detect_rotation_equal_activity_is_not_a_rotation() -> None:
+    """A sibling whose activity merely EQUALS the bound cascade is not a rotation.
+
+    Rotation requires STRICTLY newer activity, so a steady state (equal stamps)
+    never flaps.
+    """
+    stamp = "2026-06-23T17:50:29.232919Z"
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time=stamp),
+        _OTHER_CASCADE: _summary(last_user_input_time=stamp),
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) is None
+
+
+def test_detect_rotation_malformed_timestamp_is_not_candidate() -> None:
+    """A sibling with a malformed activity timestamp is treated as no-activity.
+
+    A parse failure must never spuriously rotate: the malformed sibling reports no
+    activity and is skipped.
+    """
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time="2026-06-23T17:34:54.152668Z"),
+        _OTHER_CASCADE: _summary(last_user_input_time="not-a-timestamp"),
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) is None
+
+
+def test_detect_rotation_real_capture_shape() -> None:
+    """The exact two-entry capture: the used sibling rotates away from the idle one.
+
+    Mirrors ``wire_ref/all_cascade_trajectories.json`` — the bound cascade has no
+    activity timestamps (never used) while the sibling carries a
+    ``lastUserInputTime`` — so the active sibling is the rotation target.
+    """
+    summaries = {
+        # The capture's first entry: created, never used (no activity stamps).
+        _BOUND_CASCADE: _summary(),
+        # The capture's second entry: used (has lastUserInputTime/lastModifiedTime).
+        _OTHER_CASCADE: _summary(
+            last_user_input_time="2026-06-23T17:50:29.232919Z",
+            last_modified_time="2026-06-23T17:50:32.565300Z",
+        ),
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) == _OTHER_CASCADE
+
+
+# ---------------------------------------------------------------------------
+# T-G: supervise_reader signals rotation; _rotate_session_for_cascade API;
+#      run_reader_with_bridge rebind loop
+# ---------------------------------------------------------------------------
+
+
+def _rotation_body(new_cascade_id: str) -> dict[str, Any]:
+    """A ``GetAllCascadeTrajectories`` body where ``new_cascade_id`` is newer-active.
+
+    The bound cascade (``_CASCADE_ID``, the discovery fixture's id) is present but
+    never-used; the new cascade carries a ``lastUserInputTime`` so the detector
+    treats it as the current conversation.
+    """
+    return {
+        "trajectorySummaries": {
+            _CASCADE_ID: _summary(),
+            new_cascade_id: _summary(last_user_input_time="2026-06-23T18:00:00.000000Z"),
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_supervise_reader_returns_new_cascade_on_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A detected /clear rotation makes ``supervise_reader`` stop and return the id.
+
+    With the rotation detector reporting a newer-active sibling, the stream body
+    must stop mirroring the (now-dead) bound conversation and ``supervise_reader``
+    must return the NEW cascade id so the caller can rotate + rebind.
+    """
+    new_cascade = "11111111-2222-3333-4444-555555555555"
+    monkeypatch.setattr(
+        reader, "get_all_cascade_trajectories", lambda port: _rotation_body(new_cascade)
+    )
+    monkeypatch.setattr(reader, "stream_agent_state_updates", _FrameScript([]))
+    monkeypatch.setattr(reader, "get_trajectory_steps", _StepScript([[]]))
+    monkeypatch.setattr(reader, "post_session_event_with_retry", _PostSink())
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    async def _noop_pending(_cid: str, _port: int, _pending: PendingInteraction) -> None:
+        return None
+
+    # No bounded ``stop``: the run ends ONLY because the detector fires (proving
+    # rotation, not the test harness, terminated the body).
+    result = await reader.supervise_reader(
+        _bridge_dir(tmp_path),
+        _SESSION_ID,
+        client=cast(httpx.AsyncClient, object()),
+        on_pending_interaction=cast(Any, _noop_pending),
+        poll_interval_s=0.0,
+        detect_rotation_interval_s=0.0,
+    )
+    assert result == new_cascade
+
+
+@pytest.mark.asyncio
+async def test_supervise_reader_skips_failed_rotation_cascade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A cascade in ``skip_cascade_ids`` does NOT trigger a rotation signal.
+
+    After a failed rotation attempt the caller re-enters with the failed cascade in
+    ``skip_cascade_ids``; the detector must ignore it, so the bounded body runs to
+    its ``stop`` and ``supervise_reader`` returns ``None`` (no rotation), letting
+    the reader keep serving the old binding instead of hot-looping.
+    """
+    skipped = "deadbeef-0000-0000-0000-000000000000"
+    monkeypatch.setattr(
+        reader, "get_all_cascade_trajectories", lambda port: _rotation_body(skipped)
+    )
+    monkeypatch.setattr(reader, "stream_agent_state_updates", _FrameScript([]))
+    monkeypatch.setattr(reader, "get_trajectory_steps", _StepScript([[]]))
+    monkeypatch.setattr(reader, "post_session_event_with_retry", _PostSink())
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    async def _noop_pending(_cid: str, _port: int, _pending: PendingInteraction) -> None:
+        return None
+
+    result = await reader.supervise_reader(
+        _bridge_dir(tmp_path),
+        _SESSION_ID,
+        client=cast(httpx.AsyncClient, object()),
+        on_pending_interaction=cast(Any, _noop_pending),
+        poll_interval_s=0.0,
+        detect_rotation_interval_s=0.0,
+        stop=_stop_after(2),
+        skip_cascade_ids=frozenset({skipped}),
+    )
+    assert result is None
+
+
+def _rotation_client(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    calls: list[tuple[str, str, dict[str, object]]],
+    snapshot: dict[str, object],
+    new_session_id: str = "conv_new",
+) -> httpx.AsyncClient:
+    """Build an httpx.AsyncClient over a MockTransport that records the rotation calls.
+
+    Records every ``(method, path, json_body)`` so a test can assert the exact
+    session-rotation API sequence the codex forwarder mirrors. The session-create
+    POST returns ``{"id": new_session_id}``; the GET returns ``snapshot``; PATCHes
+    and the terminal transfer return 200.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body: dict[str, object] = {}
+        if request.content:
+            with contextlib.suppress(ValueError):
+                parsed = json.loads(request.content)
+                if isinstance(parsed, dict):
+                    body = parsed
+        calls.append((request.method, request.url.path, body))
+        if request.method == "GET":
+            return httpx.Response(200, json=snapshot)
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(200, json={"id": new_session_id})
+        return httpx.Response(200, json={"id": "terminal_antigravity_main"})
+
+    return httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.asyncio
+async def test_rotate_session_for_cascade_mirrors_codex_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_rotate_session_for_cascade`` runs the exact codex session-rotation sequence.
+
+    Asserts: GET old snapshot → POST /v1/sessions (agent_id + inherited labels) →
+    PATCH runner_id → PATCH external_session_id=new cascade → POST terminal
+    transfer → PATCH old runner_id="" — and that bridge state is rewritten with the
+    new session id + new cascade id.
+    """
+    from omnigent.antigravity_native_bridge import (
+        ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+        read_bridge_state,
+    )
+
+    bridge_dir = _bridge_dir(tmp_path)
+    new_cascade = "99999999-8888-7777-6666-555555555555"
+    snapshot: dict[str, object] = {
+        "agent_id": "agent_xyz",
+        "runner_id": "runner_abc",
+        "labels": {ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: "bridge-123"},
+    }
+    calls: list[tuple[str, str, dict[str, object]]] = []
+    async with _rotation_client(monkeypatch, calls=calls, snapshot=snapshot) as client:
+        new_session_id = await reader._rotate_session_for_cascade(
+            client=client,
+            old_session_id=_SESSION_ID,
+            new_cascade_id=new_cascade,
+            bridge_dir=bridge_dir,
+        )
+
+    assert new_session_id == "conv_new"
+    # The exact ordered API sequence (method, path) mirroring codex rotation.
+    methods_paths = [(m, p) for (m, p, _b) in calls]
+    assert methods_paths == [
+        ("GET", f"/v1/sessions/{_SESSION_ID}"),
+        ("POST", "/v1/sessions"),
+        ("PATCH", "/v1/sessions/conv_new"),  # runner_id bind
+        ("PATCH", "/v1/sessions/conv_new"),  # external_session_id
+        (
+            "POST",
+            f"/v1/sessions/{_SESSION_ID}/resources/terminals/terminal_antigravity_main/transfer",
+        ),
+        ("PATCH", f"/v1/sessions/{_SESSION_ID}"),  # release old runner
+    ]
+    # The create POST inherited the old agent_id + bridge-id label (so the new
+    # session resolves to the same bridge_dir).
+    create_body = calls[1][2]
+    assert create_body["agent_id"] == "agent_xyz"
+    assert isinstance(create_body["labels"], dict)
+    assert create_body["labels"][ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] == "bridge-123"
+    # external_session_id PATCH carried the NEW cascade id.
+    assert calls[3][2] == {"external_session_id": new_cascade}
+    # The terminal transfer targeted the new session.
+    assert calls[4][2] == {"target_session_id": "conv_new"}
+    # Old runner released.
+    assert calls[5][2] == {"runner_id": ""}
+    # Bridge state was rewritten to the new session + new cascade.
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.session_id == "conv_new"
+    assert state.conversation_id == new_cascade
+
+
+@pytest.mark.asyncio
+async def test_rotate_session_for_cascade_returns_none_on_create_failure(
+    tmp_path: Path,
+) -> None:
+    """A failed session-create yields ``None`` and does NOT rewrite bridge state.
+
+    The replacement could not be created, so the reader must stay on the old
+    binding: ``_rotate_session_for_cascade`` returns ``None`` and bridge state still
+    names the OLD cascade (no half-rotation).
+    """
+    from omnigent.antigravity_native_bridge import read_bridge_state
+
+    bridge_dir = _bridge_dir(tmp_path)
+    snapshot: dict[str, object] = {"agent_id": "agent_xyz", "runner_id": "runner_abc"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=snapshot)
+        # The create POST fails (500) — rotation must abort cleanly.
+        return httpx.Response(500, json={"error": {"message": "boom"}})
+
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await reader._rotate_session_for_cascade(
+            client=client,
+            old_session_id=_SESSION_ID,
+            new_cascade_id="new-cascade-xyz",
+            bridge_dir=bridge_dir,
+        )
+
+    assert result is None
+    # Bridge state untouched: still the original cascade id.
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == _CASCADE_ID
+
+
+@pytest.mark.asyncio
+async def test_run_reader_with_bridge_rebinds_after_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rebind loop: supervise_reader signals rotation → rotate → re-bind once.
+
+    Mocks ``supervise_reader`` to return a new cascade id on the FIRST call and
+    ``None`` on the second (the rebound run ending), and ``_rotate_session_for_cascade``
+    to create a replacement session. Asserts: the replacement session was created
+    for the detected cascade, and the SECOND supervise_reader run was driven with
+    the NEW (rotated) session id — proving the loop rebinds and advances ownership.
+    """
+    new_cascade = "abcdef00-1111-2222-3333-444444444444"
+    new_session = "conv_rotated"
+    supervise_session_ids: list[str] = []
+    rotate_calls: list[tuple[str, str]] = []
+
+    async def _fake_supervise(
+        bridge_dir: Path,
+        session_id: str,
+        *,
+        client: object,
+        on_pending_interaction: object,
+        skip_cascade_ids: frozenset[str] = frozenset(),
+        **_kwargs: object,
+    ) -> str | None:
+        supervise_session_ids.append(session_id)
+        # First run detects a rotation; the rebound second run ends normally.
+        return new_cascade if len(supervise_session_ids) == 1 else None
+
+    async def _fake_rotate(
+        *,
+        client: object,
+        old_session_id: str,
+        new_cascade_id: str,
+        bridge_dir: Path,
+    ) -> str | None:
+        rotate_calls.append((old_session_id, new_cascade_id))
+        return new_session
+
+    monkeypatch.setattr(reader, "supervise_reader", _fake_supervise)
+    monkeypatch.setattr(reader, "_rotate_session_for_cascade", _fake_rotate)
+    # Avoid importing the heavy interaction-bridge module in this unit test.
+    monkeypatch.setattr(
+        "omnigent.antigravity_native_interactions.bridge_interaction",
+        lambda *a, **k: None,
+    )
+
+    await reader.run_reader_with_bridge(
+        base_url="http://test",
+        headers={},
+        auth=None,
+        session_id=_SESSION_ID,
+        bridge_dir=_bridge_dir(tmp_path),
+    )
+
+    # Exactly one rotation, for the detected cascade, off the original session.
+    assert rotate_calls == [(_SESSION_ID, new_cascade)]
+    # supervise_reader ran twice: first on the original session, then rebound on
+    # the new (rotated) session id.
+    assert supervise_session_ids == [_SESSION_ID, new_session]
+
+
+@pytest.mark.asyncio
+async def test_run_reader_with_bridge_keeps_old_binding_when_rotation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed rotation keeps the old binding and skips the failed cascade.
+
+    When ``_rotate_session_for_cascade`` returns ``None``, the loop must re-enter
+    supervise_reader on the SAME (old) session id with the failed cascade in
+    ``skip_cascade_ids`` — so it keeps serving rather than losing the reader, and
+    never hot-loops on the un-rotatable cascade.
+    """
+    failed_cascade = "00000000-9999-8888-7777-666666666666"
+    supervise_calls: list[tuple[str, frozenset[str]]] = []
+
+    async def _fake_supervise(
+        bridge_dir: Path,
+        session_id: str,
+        *,
+        client: object,
+        on_pending_interaction: object,
+        skip_cascade_ids: frozenset[str] = frozenset(),
+        **_kwargs: object,
+    ) -> str | None:
+        supervise_calls.append((session_id, skip_cascade_ids))
+        # First run detects the rotation; the second (post-failure) run ends.
+        return failed_cascade if len(supervise_calls) == 1 else None
+
+    async def _fake_rotate_fail(
+        *,
+        client: object,
+        old_session_id: str,
+        new_cascade_id: str,
+        bridge_dir: Path,
+    ) -> str | None:
+        return None  # rotation fails
+
+    monkeypatch.setattr(reader, "supervise_reader", _fake_supervise)
+    monkeypatch.setattr(reader, "_rotate_session_for_cascade", _fake_rotate_fail)
+    monkeypatch.setattr(
+        "omnigent.antigravity_native_interactions.bridge_interaction",
+        lambda *a, **k: None,
+    )
+
+    await reader.run_reader_with_bridge(
+        base_url="http://test",
+        headers={},
+        auth=None,
+        session_id=_SESSION_ID,
+        bridge_dir=_bridge_dir(tmp_path),
+    )
+
+    # Two runs, both on the ORIGINAL session id (rotation failed, no advance); the
+    # second carries the failed cascade in skip_cascade_ids.
+    assert len(supervise_calls) == 2
+    assert supervise_calls[0] == (_SESSION_ID, frozenset())
+    assert supervise_calls[1] == (_SESSION_ID, frozenset({failed_cascade}))

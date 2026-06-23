@@ -58,19 +58,24 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 
 from omnigent._native_post_delivery import post_session_event_with_retry
 from omnigent.antigravity_native_bridge import (
+    ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+    AntigravityNativeBridgeState,
     is_placeholder_conversation_id,
     read_bridge_state,
+    write_bridge_state,
 )
 from omnigent.antigravity_native_rpc import (
     AntigravityRpcError,
     _candidate_agy_rpc_ports,
     _conversation_matches,
+    get_all_cascade_trajectories,
     get_available_models,
     get_trajectory_steps,
     stream_agent_state_updates,
@@ -92,6 +97,7 @@ from omnigent.antigravity_native_steps import (
     pending_interaction,
 )
 from omnigent.claude_native_bridge import url_component
+from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 _logger = logging.getLogger(__name__)
@@ -100,6 +106,13 @@ _logger = logging.getLogger(__name__)
 # and steps finalize only at DONE (no token streaming), so a sub-second cadence
 # keeps the mirror responsive without hammering the loopback server.
 _DEFAULT_POLL_INTERVAL_S = 0.25
+
+# Default seconds between Task T-G ``/clear``-rotation checks
+# (``GetAllCascadeTrajectories``). Coarse on purpose: a ``/clear`` is a rare,
+# human-initiated event, so a few seconds of detection latency is fine and keeps
+# this off the hot path — far slower than the per-turn poll cadence so it does not
+# hammer the loopback RPC.
+_DEFAULT_ROTATION_INTERVAL_S = 3.0
 
 # Backoff between connect-stream re-entries in :func:`_stream_loop`. In steady
 # state the re-opened stream blocks awaiting frames, so this delay is paid only
@@ -128,6 +141,13 @@ _STATUS_IDLE = "idle"
 # keys turn transitions on.
 _TYPE_USER_INPUT = "CORTEX_STEP_TYPE_USER_INPUT"
 _TYPE_PLANNER_RESPONSE = "CORTEX_STEP_TYPE_PLANNER_RESPONSE"
+
+# Root-cascade trajectory type in ``GetAllCascadeTrajectories`` summaries. Only a
+# root cascade is a rotation candidate — a subagent/child trajectory carries a
+# different ``trajectoryType`` and must never be rotated to (its turns are not the
+# user's top-level conversation). Live-verified value (agy 1.0.10; see the
+# ``get_all_cascade_trajectories`` capture).
+_TRAJECTORY_TYPE_CASCADE = "CORTEX_TRAJECTORY_TYPE_CASCADE"
 
 # Step status the STREAM path keys partial text on (Task T-D). A PLANNER_RESPONSE
 # step carries its growing partial at ``plannerResponse.modifiedResponse`` while
@@ -304,6 +324,126 @@ def _resolve_display_name(model_enum: str, catalog: dict[str, object]) -> str:
             if isinstance(display, str) and display:
                 return display
     return model_enum
+
+
+def _parse_activity_timestamp(value: object) -> datetime | None:
+    """
+    Parse one ISO-8601 activity timestamp from a cascade summary, robustly.
+
+    agy emits ``lastUserInputTime`` / ``lastModifiedTime`` as ISO-8601 strings
+    with a trailing ``Z`` (UTC), e.g. ``"2026-06-23T17:50:29.232919Z"``.
+    :func:`datetime.fromisoformat` did not accept a literal ``Z`` before Python
+    3.11, so the ``Z`` is normalised to ``+00:00`` first. A naive parse (no
+    offset, e.g. a future agy dropping the suffix) is pinned to UTC so all
+    comparisons in :func:`_detect_rotated_cascade` are offset-aware and never
+    raise ``TypeError`` on a naive/aware mix.
+
+    A missing (``None``), non-string, or malformed value yields ``None`` — the
+    caller treats such an entry as having NO activity (not a rotation candidate,
+    and a bound entry with no parseable activity blocks rotation), so a parse
+    failure can never spuriously rotate.
+
+    :param value: The raw timestamp field from a trajectory summary.
+    :returns: An offset-aware UTC :class:`datetime`, or ``None`` when absent or
+        unparseable.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _summary_activity(summary: dict[str, object]) -> datetime | None:
+    """
+    Return a cascade summary's newest activity time, or ``None`` if never used.
+
+    Activity is the user's last turn (``lastUserInputTime``) when present, else
+    the cascade's ``lastModifiedTime``. A freshly ``/clear``-minted cascade has
+    BOTH absent (``null``) until its first turn runs, so it reports ``None`` and
+    is not yet a rotation candidate — the rotation only fires once the new
+    conversation has actually been used, never on the bare mint.
+
+    :param summary: One ``trajectorySummaries`` entry.
+    :returns: The newest offset-aware activity :class:`datetime`, or ``None``
+        when the cascade has no parseable activity timestamp yet.
+    """
+    return _parse_activity_timestamp(
+        summary.get("lastUserInputTime")
+    ) or _parse_activity_timestamp(summary.get("lastModifiedTime"))
+
+
+def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str) -> str | None:
+    """
+    Return the id of a newer-active root cascade than the bound one, else ``None``.
+
+    The pure core of Task T-G ``/clear``-rotation detection. A TUI ``/clear`` mints
+    a NEW root cascade and leaves the bound one idle; the new cascade is invisible
+    to the bound ``StreamAgentStateUpdates`` stream (bound to one cascade) but
+    appears here in ``GetAllCascadeTrajectories`` as a more-recently-active sibling.
+
+    Selection:
+
+    * Consider ONLY root cascades (``trajectoryType ==
+      CORTEX_TRAJECTORY_TYPE_CASCADE``) — a subagent/child trajectory is never a
+      rotation target (rotating to it would mirror a sub-conversation, not the
+      user's top-level one).
+    * The "current" cascade is the one with the newest activity timestamp
+      (:func:`_summary_activity`: ``lastUserInputTime`` preferred, else
+      ``lastModifiedTime``). An entry with NO parseable activity (a bare ``/clear``
+      mint, both timestamps ``null``) is not a candidate.
+    * Rotate ONLY when the current cascade is BOTH a different id than the bound
+      one AND strictly more recently active than the bound cascade's OWN activity.
+      The bound entry's activity is looked up from ``summaries`` itself; if the
+      bound entry is absent (we cannot prove the bound conversation is staler), we
+      do NOT rotate — returning ``None`` keeps the reader on its current binding
+      rather than chasing a sibling on incomplete information.
+
+    Deterministic on ties: a sibling whose activity merely EQUALS the bound
+    cascade's (not strictly newer) is not a rotation, so a steady state never
+    flaps. Selection of the newest among multiple siblings is by ``>`` so the
+    single most-recent wins.
+
+    :param summaries: The ``trajectorySummaries`` map from
+        :func:`~omnigent.antigravity_native_rpc.get_all_cascade_trajectories`
+        (keyed by root conversation id).
+    :param bound_cascade_id: The conversation id this reader is currently bound to.
+    :returns: The newer-active root cascade's id when a rotation is warranted,
+        else ``None``.
+    """
+    bound_summary = summaries.get(bound_cascade_id)
+    if not isinstance(bound_summary, dict):
+        # The bound conversation is not in the summary map — we cannot prove it is
+        # staler than any sibling, so we must not rotate blindly. Stay bound.
+        return None
+    bound_activity = _summary_activity(bound_summary)
+
+    best_id: str | None = None
+    best_activity: datetime | None = None
+    for cascade_id, summary in summaries.items():
+        if not isinstance(summary, dict):
+            continue
+        if summary.get("trajectoryType") != _TRAJECTORY_TYPE_CASCADE:
+            continue  # never rotate to a subagent/child trajectory
+        if cascade_id == bound_cascade_id:
+            continue
+        activity = _summary_activity(summary)
+        if activity is None:
+            continue  # a never-used (e.g. bare /clear-minted) cascade is not current
+        if best_activity is None or activity > best_activity:
+            best_id, best_activity = cascade_id, activity
+
+    if best_id is None or best_activity is None:
+        return None
+    # Rotate only when the most-recent sibling is STRICTLY newer than the bound
+    # cascade's own activity. A bound cascade that itself has no parseable activity
+    # (bound_activity is None) is treated as the oldest, so any active sibling wins.
+    if bound_activity is None or best_activity > bound_activity:
+        return best_id
+    return None
 
 
 async def _sleep(seconds: float) -> None:
@@ -527,6 +667,75 @@ async def _discover(
         await _sleep(poll_interval_s)
 
 
+async def _watch_for_rotation(
+    *,
+    port: int,
+    bound_cascade_id: str,
+    interval_s: float,
+    skip_cascade_ids: frozenset[str],
+    on_rotation: Callable[[str], None],
+) -> None:
+    """
+    Poll ``GetAllCascadeTrajectories`` for a ``/clear`` rotation, then signal once.
+
+    The Task T-G rotation DETECTOR, run as a background task alongside the
+    stream/poll reader body (which is bound to one cascade and so cannot itself
+    observe a sibling conversation). Every ``interval_s`` it fetches the cascade
+    summaries and asks :func:`_detect_rotated_cascade` whether a newer-active root
+    cascade exists; the FIRST time one does, it invokes ``on_rotation`` with the
+    new cascade id and returns (one rotation per detector — the caller tears the
+    reader body down, rotates the session, and starts a fresh detector on rebind).
+
+    ``skip_cascade_ids`` are cascades a PRIOR rotation attempt already failed to
+    bind (e.g. the Omnigent session-create errored); ignoring them here is what
+    prevents a hot re-detect/re-fail loop when rotation cannot complete — the
+    reader then keeps serving the old binding without this detector flapping.
+
+    Termination is by CANCELLATION only (``supervise_reader``'s ``finally`` always
+    cancels this task): the detector deliberately does NOT consult the reader's
+    ``stop`` predicate, so it never races the bounded body loop's shared
+    iteration counter under test. Best-effort: a fetch failure
+    (``httpx.HTTPError`` / ``ValueError``) is logged and skipped (the next tick
+    retries) so a transient agy fault never kills the detector.
+
+    :param port: Validated connect-RPC port (the bound reader's port).
+    :param bound_cascade_id: The cascade id the reader is currently bound to.
+    :param interval_s: Seconds between rotation checks (kept coarse — a few seconds
+        — so the loopback RPC is not hammered).
+    :param skip_cascade_ids: Cascade ids a prior rotation attempt failed to bind;
+        never re-signalled.
+    :param on_rotation: Called once with the detected new cascade id.
+    :returns: None.
+    """
+    while True:
+        await _sleep(interval_s)
+        try:
+            body = await asyncio.to_thread(get_all_cascade_trajectories, port)
+        except (httpx.HTTPError, ValueError) as exc:
+            _logger.warning(
+                "agy rotation detector: GetAllCascadeTrajectories failed; retrying: "
+                "bound_cascade=%s port=%s error=%r",
+                bound_cascade_id,
+                port,
+                exc,
+            )
+            continue
+        summaries = body.get("trajectorySummaries")
+        if not isinstance(summaries, dict):
+            continue
+        new_cascade_id = _detect_rotated_cascade(summaries, bound_cascade_id)
+        if new_cascade_id is None or new_cascade_id in skip_cascade_ids:
+            continue
+        _logger.info(
+            "agy rotation detector: bound conversation %s was rotated away (newer-active "
+            "cascade %s, likely a TUI /clear); signalling rebind",
+            bound_cascade_id,
+            new_cascade_id,
+        )
+        on_rotation(new_cascade_id)
+        return
+
+
 async def supervise_reader(
     bridge_dir: Path,
     session_id: str,
@@ -535,7 +744,9 @@ async def supervise_reader(
     on_pending_interaction: OnPendingInteraction,
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     stop: StopPredicate | None = None,
-) -> None:
+    detect_rotation_interval_s: float = _DEFAULT_ROTATION_INTERVAL_S,
+    skip_cascade_ids: frozenset[str] = frozenset(),
+) -> str | None:
     """
     Poll agy's RPC for trajectory steps and mirror them into the Omnigent session.
 
@@ -564,6 +775,15 @@ async def supervise_reader(
     and swallowed so a transient fault never kills the loop; the next poll
     recovers.
 
+    Task T-G ``/clear`` rotation: ALONGSIDE the stream/poll reader body, a
+    :func:`_watch_for_rotation` background task polls ``GetAllCascadeTrajectories``
+    every ``detect_rotation_interval_s`` (the stream is bound to one cascade and
+    cannot see a sibling). When it detects a newer-active root cascade (a TUI
+    ``/clear`` mints one), this function tears the reader body down cleanly and
+    RETURNS the new cascade id so :func:`run_reader_with_bridge` can rotate the
+    Omnigent session and rebind. When the body ends on its own (the ``stop``
+    predicate fired, or the stream+poll both exited), it returns ``None``.
+
     :param bridge_dir: Native Antigravity bridge directory (identifies the
         session whose agy conversation to mirror).
     :param session_id: Omnigent conversation id to mirror into, e.g.
@@ -580,13 +800,20 @@ async def supervise_reader(
         returns ``True`` the loop exits. ``None`` (production) loops until the
         task is cancelled. Provided so tests drive a bounded number of
         iterations.
-    :returns: None.
+    :param detect_rotation_interval_s: Seconds between ``/clear``-rotation checks
+        (kept coarse so the loopback RPC is not hammered).
+    :param skip_cascade_ids: Cascade ids a prior rotation attempt failed to bind;
+        the rotation detector never re-signals them (prevents a hot
+        detect/rotate-fail loop — the reader keeps the old binding instead).
+    :returns: The detected new cascade id when a ``/clear`` rotation was observed
+        (the caller rotates + rebinds), or ``None`` when the reader body ended on
+        its own (``stop`` fired / both paths exited).
     """
     should_stop: StopPredicate = stop if stop is not None else (lambda: False)
 
     discovered = await _discover(bridge_dir, poll_interval_s=poll_interval_s, stop=should_stop)
     if discovered is None:
-        return
+        return None
     cascade_id, port = discovered
 
     # One allocator + one set of cross-poll/cross-frame trackers per reader run,
@@ -599,48 +826,84 @@ async def supervise_reader(
         port=port,
     )
 
+    # Task T-G: the rotation detector records the new cascade id here and the
+    # ``stop`` predicate the reader body consults flips to True so the body exits
+    # cleanly at its next checkpoint (between stream re-entries / poll iterations);
+    # a still-blocked stream is then cancelled below. One-shot per supervise_reader
+    # run — the caller rebinds with a fresh detector.
+    rotation_holder: list[str] = []
+
+    def _on_rotation(new_cascade_id: str) -> None:
+        if not rotation_holder:
+            rotation_holder.append(new_cascade_id)
+
+    def _body_should_stop() -> bool:
+        # The reader body stops either on the caller's stop OR once a rotation was
+        # detected (so it does not keep mirroring the now-dead conversation).
+        return should_stop() or bool(rotation_holder)
+
+    rotation_task = asyncio.create_task(
+        _watch_for_rotation(
+            port=port,
+            bound_cascade_id=cascade_id,
+            interval_s=detect_rotation_interval_s,
+            skip_cascade_ids=skip_cascade_ids,
+            on_rotation=_on_rotation,
+        ),
+        name="antigravity-rotation-detector",
+    )
+
     # STREAM-primary (Task T-D): consume the connect server-stream for live
     # ``output_text_delta`` typing parity. On a stream error (transport
     # ``httpx.HTTPError`` or a connect-trailer ``AntigravityRpcError``) fall back
     # to the committed-only poll loop — graceful degradation to Phase-1 behaviour
     # — rather than letting the error kill the reader. The shared ``state`` makes
-    # the fallback idempotent against whatever the stream already delivered.
+    # the fallback idempotent against whatever the stream already delivered. Both
+    # paths consult ``_body_should_stop`` so a detected rotation ends them.
     try:
-        await _stream_loop(
-            port=port,
-            cascade_id=cascade_id,
-            client=client,
-            session_id=session_id,
-            on_pending_interaction=on_pending_interaction,
-            state=state,
-            stop=should_stop,
-        )
-    except (httpx.HTTPError, AntigravityRpcError) as exc:
-        _logger.warning(
-            "agy RPC reader stream failed; falling back to poll (committed-only, "
-            "no live deltas): cascade=%s port=%s error=%r",
-            cascade_id,
-            port,
-            exc,
-        )
-        await _poll_loop(
-            port=port,
-            cascade_id=cascade_id,
-            client=client,
-            session_id=session_id,
-            on_pending_interaction=on_pending_interaction,
-            state=state,
-            poll_interval_s=poll_interval_s,
-            stop=should_stop,
-        )
+        try:
+            await _stream_loop(
+                port=port,
+                cascade_id=cascade_id,
+                client=client,
+                session_id=session_id,
+                on_pending_interaction=on_pending_interaction,
+                state=state,
+                stop=_body_should_stop,
+            )
+        except (httpx.HTTPError, AntigravityRpcError) as exc:
+            _logger.warning(
+                "agy RPC reader stream failed; falling back to poll (committed-only, "
+                "no live deltas): cascade=%s port=%s error=%r",
+                cascade_id,
+                port,
+                exc,
+            )
+            await _poll_loop(
+                port=port,
+                cascade_id=cascade_id,
+                client=client,
+                session_id=session_id,
+                on_pending_interaction=on_pending_interaction,
+                state=state,
+                poll_interval_s=poll_interval_s,
+                stop=_body_should_stop,
+            )
     finally:
-        # The interaction bridge now runs off the loop; cancel one still awaiting
-        # a human verdict so a cancelled/stopped reader does not leak it.
+        # Stop the rotation detector (it may still be sleeping between ticks) and
+        # the off-loop interaction bridge before returning, so a cancelled/stopped
+        # reader leaks neither task. Order: detector first (it owns no human-facing
+        # state), then the interaction task (may be awaiting a day-long verdict).
+        rotation_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await rotation_task
         active = state.interaction_task
         if active is not None and not active.done():
             active.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await active
+
+    return rotation_holder[0] if rotation_holder else None
 
 
 @dataclass
@@ -684,8 +947,9 @@ class _ReaderState:
         accumulated across all PLANNER_RESPONSE DONE steps this run. The server
         treats ``external_session_usage.cumulative_input_tokens`` as a SET
         (new value = current total), so we must sum, not emit per-call values.
-        Reset to 0 at the start of each reader run; T-G /clear rotation must
-        also zero this when it rotates to a fresh conversation.
+        Reset to 0 at the start of each reader run; a T-G /clear rotation rebinds
+        with a FRESH ``_ReaderState`` (``supervise_reader`` is re-entered), so the
+        new conversation's cost badge starts from 0 automatically.
     :param cumulative_output_tokens: Running session total of output tokens.
     :param cumulative_cache_read_input_tokens: Running session total of
         cache-read input tokens.
@@ -839,43 +1103,14 @@ async def _stream_loop(
     """
     while not stop():
         async for frame in stream_agent_state_updates(port, cascade_id):
-            # /clear-rotation guard (best-effort, secondary signal): a TUI
-            # ``/clear`` mints a NEW cascade id and retires the bound one. If a
-            # frame ever names a DIFFERENT conversation than the one this reader
-            # bound, the bound conversation is dead — continuing would mirror a
-            # stale, frozen conversation while the live one's turns are lost
-            # silently. We stop mirroring (the failure is now logged, not silent).
-            #
-            # CAVEAT (unverified field path — gated on Task 13 live capture): this
-            # reads ``conversationId`` at the frame top level per design §10.5, but
-            # §10.5 is planning intent, NOT a capture, and the only live-verified
-            # id echo is NESTED (``metadata.rootConversationId`` from
-            # GetConversationMetadata). No captured frame in the repo pairs a
-            # top-level ``conversationId`` with ``mainTrajectoryUpdate``. So this
-            # guard may be a harmless no-op until a live ``/clear`` capture
-            # confirms where the active id actually lives (Task 13: do a TUI
-            # ``/clear``, dump the raw post-rotation frame, fix the field path +
-            # swap the hand-built test helper for a real fixture if it is nested).
-            # Two-axis uncertainty: (1) field location above, and (2) whether a
-            # foreign frame ever reaches THIS stream at all — §10.5 names
-            # GetAllCascadeTrajectories as the PRIMARY rotation signal; this
-            # per-frame check is only the secondary one.
-            #
-            # Full automatic rotation — rebinding to the new conversation and
-            # rotating the Omnigent session, like the codex forwarder does — is a
-            # larger change tracked as a follow-up (T-G); for the headless runner
-            # path it is OBVIATED by the 1:1 design, and for the CLI-fallback TUI
-            # edge this detect+stop keeps the failure visible rather than silent.
-            if _frame_names_other_conversation(frame, cascade_id):
-                _logger.warning(
-                    "agy RPC reader: bound conversation %s was rotated away (a "
-                    "frame named conversation %s, likely a TUI /clear); stopping "
-                    "the reader rather than mirroring the now-dead conversation. "
-                    "Automatic re-bind/rotation is not yet implemented (follow-up).",
-                    cascade_id,
-                    _frame_conversation_id(frame),
-                )
-                return
+            # NOTE on /clear rotation: this stream is bound to ONE cascade and only
+            # ever reports THAT cascade's id, so it can NEVER observe a sibling
+            # conversation — a per-frame "did the conversation change?" guard here
+            # would be a guaranteed no-op. ``/clear`` rotation is handled OUT OF
+            # BAND by :func:`_watch_for_rotation` (via ``GetAllCascadeTrajectories``,
+            # which lists every live root cascade); on detection ``supervise_reader``
+            # flips this loop's ``stop`` and returns the new cascade id so
+            # :func:`run_reader_with_bridge` rotates the Omnigent session + rebinds.
             for step in _frame_steps(frame):
                 await _process_stream_step(
                     step,
@@ -914,48 +1149,6 @@ def _frame_steps(frame: dict[str, object]) -> list[dict[str, object]]:
     if not isinstance(steps, list):
         return []
     return [step for step in steps if isinstance(step, dict)]
-
-
-def _frame_conversation_id(frame: dict[str, object]) -> str | None:
-    """
-    Extract a top-level ``conversationId`` from one ``StreamAgentStateUpdates``
-    frame.
-
-    Design §10.5 ASSUMES each stream frame names the active conversation at the
-    frame top level (the rotation signal for a TUI ``/clear``, which mints a new
-    conversation id). That field path is UNVERIFIED — §10.5 is planning intent,
-    and the only live-verified id echo is nested (``metadata.rootConversationId``)
-    — so this may return ``None`` for every real frame until a Task 13 live
-    ``/clear`` capture confirms where the active id lives. A frame without a
-    string top-level ``conversationId`` yields ``None``.
-
-    :param frame: One parsed DATA-frame ``update`` dict from the stream.
-    :returns: The frame's conversation id string, or ``None`` when absent.
-    """
-    conv = frame.get("conversationId")
-    return conv if isinstance(conv, str) and conv else None
-
-
-def _frame_names_other_conversation(frame: dict[str, object], cascade_id: str) -> bool:
-    """
-    Return whether a frame names a conversation OTHER than the bound cascade id.
-
-    A frame that omits ``conversationId`` (or carries an empty/non-string one)
-    is NOT treated as a rotation — only an explicit, different id is. This keeps
-    the guard false-positive-free on the normal same-conversation path (where the
-    field either matches or is absent). It is INTENDED to fire on a real rotation
-    (design §10.5: a TUI ``/clear`` mints a new id, so frames would begin naming
-    it) — but see :func:`_frame_conversation_id`: the top-level field path is
-    unverified, so on the real wire this may never fire until confirmed by a
-    Task 13 live ``/clear`` capture.
-
-    :param frame: One parsed DATA-frame ``update`` dict from the stream.
-    :param cascade_id: The conversation id this reader bound at discovery.
-    :returns: ``True`` only when the frame names a different, non-empty
-        conversation id.
-    """
-    conv = _frame_conversation_id(frame)
-    return conv is not None and conv != cascade_id
 
 
 async def _process_committed_step(
@@ -1414,9 +1607,9 @@ async def _maybe_emit_session_usage(
     thread-wide counter, forwarded as SET values by
     :class:`~omnigent.codex_native_forwarder._SessionUsageCoalescer`).
 
-    NOTE: ``state.cumulative_*`` accumulators are zeroed at reader-run start;
-    T-G /clear rotation must also zero them when rotating to a fresh conversation
-    so the new session's cost badge starts from 0.
+    NOTE: ``state.cumulative_*`` accumulators are zeroed at reader-run start; a
+    T-G /clear rotation rebinds with a fresh ``_ReaderState`` (``supervise_reader``
+    is re-entered), so the new session's cost badge starts from 0 automatically.
 
     De-dup is via ``state.seen``: this function is only called inside the
     ``key not in state.seen`` branch of :func:`_process_committed_step`, so
@@ -1707,6 +1900,205 @@ async def _request_agy_elicitation(
         return None
 
 
+# ── Task T-G: /clear-rotation session rotation ───────────────────────────────
+#
+# A TUI ``/clear`` mints a NEW agy root cascade and leaves the bound one idle. The
+# reader detects it via ``GetAllCascadeTrajectories`` (see
+# :func:`_detect_rotated_cascade`) and then must move Omnigent ownership onto a
+# fresh conversation bound to the NEW cascade — otherwise web turns keep targeting
+# the old (now-dead) conversation and streaming appears to end. This mirrors the
+# codex forwarder's ``_create_thread_replacement_session`` session-rotation API
+# sequence, adapted to the agy bridge: the replacement session inherits the OLD
+# session's bridge-id label (so it resolves to the SAME ``bridge_dir`` the reader
+# is already using — agy's bridge_dir is keyed off the launcher's bridge-id, not
+# the session id), and bridge state is rewritten with the new conversation id.
+
+# Deterministic agy terminal resource id (matches
+# ``antigravity_native._TERMINAL_NAME`` / ``_TERMINAL_SESSION_KEY``). Single
+# terminal per agy session ("main"), transferred old→new on rotation so the live
+# tmux pane keeps running under the new conversation. Built from the lightweight
+# ``session_resources`` helper (as the codex forwarder does) rather than importing
+# the heavy ``antigravity_native`` runner module into the reader.
+_AGY_TERMINAL_RESOURCE_ID = terminal_resource_id("antigravity", "main")
+
+
+async def _fetch_session_snapshot(client: httpx.AsyncClient, session_id: str) -> dict[str, object]:
+    """
+    Fetch an Omnigent session snapshot for agy ``/clear`` rotation.
+
+    Mirrors :func:`omnigent.codex_native_forwarder._fetch_session_snapshot`: the
+    rotation needs the old session's ``agent_id`` (required to create the
+    replacement), ``runner_id`` (to re-bind it to the same runner), and ``labels``
+    (to inherit the bridge-id so the new session resolves to the same bridge_dir).
+
+    :param client: Omnigent HTTP client (the reader's client).
+    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
+    :returns: Decoded JSON session snapshot.
+    :raises httpx.HTTPStatusError: If Omnigent rejects the request.
+    :raises RuntimeError: If the response body is not a JSON object.
+    """
+    resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
+    resp.raise_for_status()
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Antigravity session snapshot response was not an object")
+    return payload
+
+
+async def _rotate_session_for_cascade(
+    *,
+    client: httpx.AsyncClient,
+    old_session_id: str,
+    new_cascade_id: str,
+    bridge_dir: Path,
+) -> str | None:
+    """
+    Create + activate a replacement Omnigent session bound to a new agy cascade.
+
+    The Task T-G rotation effect: after a TUI ``/clear`` mints ``new_cascade_id``,
+    this moves Omnigent ownership onto a fresh conversation bound to that cascade,
+    MIRRORING codex's ``_create_thread_replacement_session`` API sequence (verified
+    against ``omnigent/codex_native_forwarder.py`` and
+    ``omnigent/server/routes/sessions.py``):
+
+    1. GET the old session snapshot (``agent_id`` / ``runner_id`` / ``labels``).
+    2. POST ``/v1/sessions`` with the old ``agent_id`` + inherited ``labels`` — the
+       labels carry agy's bridge-id (:data:`ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY`),
+       so the NEW session resolves to the SAME ``bridge_dir`` the reader uses (agy's
+       bridge_dir is keyed off the launcher's bridge-id, NOT the session id — so we
+       inherit the old label rather than stamping the old session id like codex
+       does, whose bridge_dir IS keyed off the session id).
+    3. PATCH the new session's ``runner_id`` to the old runner (so the same runner
+       owns it), when the old session had one.
+    4. PATCH the new session's ``external_session_id`` to ``new_cascade_id`` (so a
+       later ``--resume`` continues agy's actual new conversation).
+    5. POST the terminal ``/transfer`` to move the live agy tmux pane old→new
+       (the pane keeps running under the new conversation).
+    6. Rewrite agy bridge state in ``bridge_dir`` with the new session id + new
+       conversation id (the reader re-reads this on rebind to bind the new cascade).
+    7. PATCH the old session's ``runner_id`` to ``""`` to release it (best-effort;
+       a failure is logged, not raised — the new session is already live).
+
+    Best-effort: ANY failure (snapshot, create, bind, external-id, transfer, state
+    write) is logged at WARNING and yields ``None``, and the caller keeps serving
+    the OLD binding rather than crashing or losing the reader. The bridge-state
+    rewrite is performed only AFTER the new session is created and bound, so a
+    mid-sequence failure never leaves bridge state pointing at a session that does
+    not exist.
+
+    :param client: Omnigent HTTP client (the reader's client).
+    :param old_session_id: The Omnigent session being rotated away from.
+    :param new_cascade_id: agy's freshly ``/clear``-minted cascade/conversation id.
+    :param bridge_dir: The agy bridge directory the reader is using (rewritten in
+        place so the new session shares it).
+    :returns: The new Omnigent session id on success, or ``None`` on any failure
+        (the caller then stays on the old binding).
+    """
+    try:
+        old = await _fetch_session_snapshot(client, old_session_id)
+        agent_id = old.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id:
+            raise RuntimeError(f"session {old_session_id!r} has no agent_id")
+        runner_id = old.get("runner_id")
+        raw_labels = old.get("labels")
+        labels = (
+            {str(key): str(value) for key, value in raw_labels.items()}
+            if isinstance(raw_labels, dict)
+            else {}
+        )
+        # Inherit the old session's bridge-id so the new session resolves to the
+        # SAME bridge_dir; only fall back to stamping the old session id when the
+        # label is somehow absent (keeps a deterministic, non-empty bridge id).
+        if ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY not in labels:
+            labels[ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] = old_session_id
+
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"agent_id": agent_id, "labels": labels},
+        )
+        create_resp.raise_for_status()
+        created = create_resp.json()
+        new_session_id = created.get("id") if isinstance(created, dict) else None
+        if not isinstance(new_session_id, str) or not new_session_id:
+            raise RuntimeError("Antigravity session replacement response did not include id")
+
+        if isinstance(runner_id, str) and runner_id:
+            bind_resp = await client.patch(
+                f"/v1/sessions/{url_component(new_session_id)}",
+                json={"runner_id": runner_id},
+            )
+            bind_resp.raise_for_status()
+
+        external_resp = await client.patch(
+            f"/v1/sessions/{url_component(new_session_id)}",
+            json={"external_session_id": new_cascade_id},
+        )
+        external_resp.raise_for_status()
+
+        transfer_resp = await client.post(
+            (
+                f"/v1/sessions/{url_component(old_session_id)}"
+                f"/resources/terminals/{url_component(_AGY_TERMINAL_RESOURCE_ID)}/transfer"
+            ),
+            json={"target_session_id": new_session_id},
+        )
+        transfer_resp.raise_for_status()
+    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+        _logger.warning(
+            "agy /clear rotation failed to create the replacement session; staying on "
+            "the old binding (old_session=%s new_cascade=%s): %r",
+            old_session_id,
+            new_cascade_id,
+            exc,
+        )
+        return None
+
+    # The new session is live + bound; commit bridge state so the reader's rebind
+    # discovers the new cascade. Done last so a mid-sequence failure above never
+    # points bridge state at a half-created session.
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(
+            session_id=new_session_id,
+            conversation_id=new_cascade_id,
+        ),
+    )
+
+    # Release the old session's runner binding (best-effort): the new session is
+    # already serving, so a failure here is logged, not raised.
+    try:
+        clear_resp = await client.patch(
+            f"/v1/sessions/{url_component(old_session_id)}",
+            json={"runner_id": ""},
+        )
+        if clear_resp.status_code >= 400:
+            _logger.warning(
+                "agy /clear rotation: failed to release old runner binding; "
+                "old_session=%s new_session=%s status=%s body=%s",
+                old_session_id,
+                new_session_id,
+                clear_resp.status_code,
+                clear_resp.text,
+            )
+    except httpx.HTTPError:
+        _logger.warning(
+            "agy /clear rotation: error releasing old runner binding; "
+            "old_session=%s new_session=%s",
+            old_session_id,
+            new_session_id,
+            exc_info=True,
+        )
+
+    _logger.info(
+        "agy reader rotated Omnigent session after /clear: old_session=%s new_session=%s "
+        "new_cascade=%s",
+        old_session_id,
+        new_session_id,
+        new_cascade_id,
+    )
+    return new_session_id
+
+
 async def run_reader_with_bridge(
     *,
     base_url: str,
@@ -1735,6 +2127,19 @@ async def run_reader_with_bridge(
     callback, so the bridge targets agy's live conversation without
     re-discovering (which could bind a recycled/foreign port).
 
+    Task T-G ``/clear`` rotation: this LOOPS. :func:`supervise_reader` returns the
+    new cascade id when it detects a TUI ``/clear`` (via
+    :func:`_watch_for_rotation`); this then rotates the Omnigent session onto a
+    fresh conversation bound to the new cascade (:func:`_rotate_session_for_cascade`,
+    which rewrites bridge state in ``bridge_dir``) and re-enters
+    :func:`supervise_reader` — which rediscovers the new cascade from the same
+    ``bridge_dir`` with a fresh :class:`_ReaderState`. If the session rotation
+    FAILS, the old binding is kept (the failed cascade is added to ``skip``) so the
+    reader keeps serving rather than being lost; if rotation succeeds, ``session_id``
+    advances so the interaction-bridge elicitation hook targets the new session.
+    The loop ends only when ``supervise_reader`` returns ``None`` (the reader was
+    cancelled / its bounded ``stop`` fired).
+
     :param base_url: Omnigent server base URL, e.g. ``"http://127.0.0.1:6767"``.
     :param headers: Auth headers for the Omnigent client (best-effort static
         bearer; ``auth`` carries any refresh-capable flow).
@@ -1751,6 +2156,12 @@ async def run_reader_with_bridge(
     # process without eagerly loading the server stack.
     from omnigent.antigravity_native_interactions import bridge_interaction
 
+    # Mutable current session id: rotation advances it, and the elicitation hook
+    # closure below reads it through this holder so a post-rotation interaction
+    # POSTs to the NEW session (a closure over the bare ``session_id`` argument
+    # would keep targeting the rotated-away session).
+    current = {"session_id": session_id}
+
     async with httpx.AsyncClient(
         base_url=base_url,
         headers=headers,
@@ -1765,7 +2176,7 @@ async def run_reader_with_bridge(
                 eid: str, params: ElicitationRequestParams
             ) -> ElicitationResult | None:
                 return await _request_agy_elicitation(
-                    client, session_id, elicitation_id=eid, params=params
+                    client, current["session_id"], elicitation_id=eid, params=params
                 )
 
             async def _get_steps() -> list[dict[str, object]]:
@@ -1779,9 +2190,32 @@ async def run_reader_with_bridge(
                 request_elicitation=_request_elicitation,
             )
 
-        await supervise_reader(
-            bridge_dir,
-            session_id,
-            client=client,
-            on_pending_interaction=_on_pending,
-        )
+        # Cascades a prior rotation attempt failed to bind — the detector skips them
+        # so a persistent rotation failure does not hot-loop detect→fail→detect.
+        failed_rotations: set[str] = set()
+        while True:
+            new_cascade_id = await supervise_reader(
+                bridge_dir,
+                current["session_id"],
+                client=client,
+                on_pending_interaction=_on_pending,
+                skip_cascade_ids=frozenset(failed_rotations),
+            )
+            if new_cascade_id is None:
+                # The reader body ended on its own (cancelled / bounded stop): done.
+                return
+            # A /clear rotation was detected: move Omnigent ownership onto a fresh
+            # conversation bound to the new cascade, then rebind by re-entering
+            # supervise_reader (which rediscovers from the rewritten bridge state).
+            new_session_id = await _rotate_session_for_cascade(
+                client=client,
+                old_session_id=current["session_id"],
+                new_cascade_id=new_cascade_id,
+                bridge_dir=bridge_dir,
+            )
+            if new_session_id is None:
+                # Rotation failed — keep serving the old binding, but never re-fire
+                # on this same cascade (it would just fail again every few seconds).
+                failed_rotations.add(new_cascade_id)
+                continue
+            current["session_id"] = new_session_id
