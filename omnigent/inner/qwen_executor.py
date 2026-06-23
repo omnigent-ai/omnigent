@@ -47,9 +47,7 @@ logger = logging.getLogger(__name__)
 # ACP protocol constants (JSON-RPC 2.0 method names)
 _AGENT_METHOD_INITIALIZE = "initialize"
 _AGENT_METHOD_SESSION_NEW = "session/new"
-_AGENT_METHOD_SESSION_LOAD = "session/load"
 _AGENT_METHOD_SESSION_PROMPT = "session/prompt"
-_AGENT_METHOD_SESSION_CANCEL = "session/cancel"
 
 # Notifications sent *from* the agent to the client
 _CLIENT_NOTIFICATION_SESSION_UPDATE = "session/update"

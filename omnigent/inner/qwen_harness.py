@@ -69,10 +69,6 @@ _ENV_OS_ENV = "HARNESS_QWEN_OS_ENV"
 _ENV_GATEWAY_BASE_URL = "HARNESS_QWEN_GATEWAY_BASE_URL"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_QWEN_GATEWAY_AUTH_COMMAND"
 
-# Truthy strings the wrap accepts for boolean env vars. Must
-# match the claude-sdk and codex wraps' parsers for consistency
-_TRUTHY_STRINGS = ("1", "true", "yes")
-
 
 def _resolve_os_env() -> OSEnvSpec:
     """

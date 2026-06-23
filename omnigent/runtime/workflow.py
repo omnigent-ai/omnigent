@@ -418,13 +418,6 @@ _PI_FAMILY_KEY: dict[str, str] = {
     OPENAI_FAMILY: "openai",
 }
 
-# Maps a generic-provider family to the key qwen uses in its
-# ``HARNESS_QWEN_GATEWAY_BASE_URLS`` JSON object.
-_QWEN_FAMILY_KEY: dict[str, str] = {
-    ANTHROPIC_FAMILY: "claude",
-    OPENAI_FAMILY: "openai",
-}
-
 # Per-harness ``HARNESS_*_DATABRICKS_PROFILE`` env var name, used by the
 # databricks-kind provider branch (which delegates to the existing ucode
 # path). This stays Databricks-named: it is a ``~/.databrickscfg`` profile
