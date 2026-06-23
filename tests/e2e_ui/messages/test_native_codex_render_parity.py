@@ -21,6 +21,7 @@ extra LLM calls Codex makes internally.
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 
 import pytest
@@ -98,6 +99,10 @@ def _type_into_tui(page: Page, text: str) -> None:
     page.keyboard.press("Enter")
 
 
+@pytest.mark.skipif(
+    not os.environ.get("LLM_API_KEY"),
+    reason="Native Codex render-parity needs real OpenAI credentials (LLM_API_KEY).",
+)
 @pytest.mark.timeout(300)
 def test_native_codex_message_render_parity(
     page: Page,
