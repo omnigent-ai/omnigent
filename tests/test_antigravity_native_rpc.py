@@ -790,3 +790,68 @@ def test_cancel_cascade_steps_false_on_transport_error(
 
     monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(raise_transport))
     assert rpc.cancel_cascade_steps(52548, "conv-uuid") is False
+
+
+# ---------------------------------------------------------------------------
+# handle_user_interaction (unary RPC, Task 3)
+# ---------------------------------------------------------------------------
+
+
+def test_handle_user_interaction_nests_traj_and_step_inside_interaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``handle_user_interaction`` POSTs a body where ``trajectoryId`` and
+    ``stepIndex`` are nested inside ``interaction``, not at the top level.
+
+    The proto-JSON encoding drops top-level extras, so the ``trajectoryId`` and
+    ``stepIndex`` MUST be inside the ``interaction`` key, alongside the payload
+    variant dict. Asserts the exact wire body so a refactor cannot silently
+    break the contract consumed by the interaction bridge.
+    """
+    seen: dict[str, bytes] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = req.content
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(handler))
+    rpc.handle_user_interaction(
+        52548,
+        "c",
+        trajectory_id="t",
+        step_index=14,
+        payload={"permission": {"allow": True}},
+    )
+    assert json.loads(seen["body"]) == {
+        "cascadeId": "c",
+        "interaction": {"trajectoryId": "t", "stepIndex": 14, "permission": {"allow": True}},
+    }
+
+
+def test_handle_user_interaction_raises_on_500(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A non-2xx response from ``HandleCascadeUserInteraction`` raises
+    ``AntigravityRpcError`` carrying the raw response body text.
+
+    The body text is load-bearing: the Task 8 interaction bridge detects the
+    overloaded ``"input not registered for step N"`` string to handle the
+    race-condition case where agy has not yet registered the interaction. The
+    exception must carry the body, not httpx's generic message.
+    """
+    monkeypatch.setattr(
+        rpc,
+        "_HTTP_TRANSPORT",
+        httpx.MockTransport(
+            lambda r: httpx.Response(500, json={"message": "input not registered for step 14"})
+        ),
+    )
+    with pytest.raises(rpc.AntigravityRpcError) as exc_info:
+        rpc.handle_user_interaction(
+            52548,
+            "c",
+            trajectory_id="t",
+            step_index=14,
+            payload={"permission": {"allow": True}},
+        )
+    assert "input not registered" in str(exc_info.value)

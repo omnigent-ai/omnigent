@@ -436,6 +436,69 @@ def cancel_cascade_steps(port: int, cascade_id: str) -> bool:
     return response.status_code < 400
 
 
+class AntigravityRpcError(Exception):
+    """
+    Raised by :func:`handle_user_interaction` when the server returns a
+    non-2xx status.
+
+    The raw response body text is the exception message so callers can detect
+    the overloaded ``"input not registered for step N"`` string that agy
+    returns when the interaction has not yet been registered for the step
+    (a race the Task 8 bridge must retry on).
+    """
+
+
+_METHOD_HANDLE_CASCADE_USER_INTERACTION = "HandleCascadeUserInteraction"
+
+
+def handle_user_interaction(
+    port: int,
+    cascade_id: str,
+    *,
+    trajectory_id: str,
+    step_index: int,
+    payload: dict[str, object],
+) -> None:
+    """
+    Deliver an interaction answer (question response / approval) to agy.
+
+    POSTs ``{"cascadeId": cascade_id, "interaction": {"trajectoryId":
+    trajectory_id, "stepIndex": step_index, **payload}}`` to
+    ``HandleCascadeUserInteraction``. The ``trajectoryId`` and ``stepIndex``
+    are nested inside ``interaction`` because the proto-JSON encoding drops
+    top-level extras — they must be co-located with the payload variant dict.
+
+    ``cascade_id`` is identical to the conversation id (agy uses the same
+    UUID for both).
+
+    :param port: Validated connect-RPC port, e.g. ``52548``.
+    :param cascade_id: agy cascade id (equal to the conversation id) to
+        address.
+    :param trajectory_id: agy trajectory id identifying the active trajectory.
+    :param step_index: Step index the interaction targets.
+    :param payload: Variant dict, e.g. ``{"permission": {"allow": True}}`` or
+        ``{"askQuestion": {...}}``.
+    :raises AntigravityRpcError: On any HTTP status >= 400, carrying the raw
+        response body text. Do NOT use ``raise_for_status()`` here so that the
+        body is always available to callers that need to detect the overloaded
+        ``"input not registered"`` string.
+    """
+    url = _rpc_url(port, _METHOD_HANDLE_CASCADE_USER_INTERACTION)
+    _assert_loopback_url(url)
+    body: dict[str, object] = {
+        "cascadeId": cascade_id,
+        "interaction": {"trajectoryId": trajectory_id, "stepIndex": step_index, **payload},
+    }
+    with _sync_client(_PROBE_TIMEOUT_S) as client:
+        response = client.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps(body).encode("utf-8"),
+        )
+    if response.status_code >= 400:
+        raise AntigravityRpcError(response.text)
+
+
 def _list_agy_pids() -> list[int]:
     """
     Return pids of running ``agy`` processes (best-effort).
