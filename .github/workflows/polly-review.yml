@@ -301,6 +301,14 @@ jobs:
           Do NOT comment on code style, formatting, naming conventions, or other cosmetic issues — omit them entirely.
           Be concise. Do not restate the diff. Focus on what matters.
 
+          Before labeling anything **blocking**, double-check: does this issue actually exist in the diff? Verify the problem is real and present in the changed code — not inferred, speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces a correctness bug, breaks an explicit contract, or creates a real security risk; otherwise downgrade to non-blocking.
+
+          **Package extras** — when the diff adds or modifies optional dependency groups (extras):
+          - Each harness deserves its own extra.
+          - Combine harnesses and other integrations from the same vendor into one extra (e.g. a single `google` extra may cover Vertex and Antigravity).
+          - Each sandbox deserves its own extra.
+          - Nothing else warrants a new extra — flag any new extras that don't fit one of these three categories as a blocking issue.
+
           IMPORTANT: Your output will be posted directly as a PR comment. Output
           ONLY the final structured review — no coordination messages, no status
           updates about dispatching sub-agents, no referring to "reviewers", no "waiting for results" narration.
