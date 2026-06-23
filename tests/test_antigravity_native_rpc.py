@@ -1782,3 +1782,138 @@ def test_resolve_pane_agy_rpc_port_none_when_port_not_bound(
     monkeypatch.setattr(rpc, "_agy_pid_in_pane_subtree", lambda _pid: 300)
     monkeypatch.setattr(rpc, "discover_language_server_port", lambda _pid: None)
     assert rpc.resolve_pane_agy_rpc_port(Path("/tmp/agy/tmux.sock"), "main") is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_pane_agy_rpc_port_state (3-state)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_pane_state_found_with_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    """State 1: our agy is in the pane subtree and its port resolves."""
+    monkeypatch.setattr(rpc, "_pane_pid", lambda socket_path, target: 100)
+    monkeypatch.setattr(rpc, "_agy_pid_in_pane_subtree", lambda _pid: 300)
+    monkeypatch.setattr(rpc, "discover_language_server_port", lambda _pid: 61000)
+    state = rpc.resolve_pane_agy_rpc_port_state(Path("/tmp/agy/tmux.sock"), "main")
+    assert state == rpc.PaneAgyResolution(agy_found=True, port=61000)
+
+
+def test_resolve_pane_state_found_without_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    """State 2: our agy IS in the subtree but its port is not lsof-attributable.
+
+    ``agy_found`` MUST be ``True`` so the cold-start treats the candidate fallback
+    as safe (agy is up in this pane; restricted-/proc one-agy-pod).
+    """
+    monkeypatch.setattr(rpc, "_pane_pid", lambda socket_path, target: 100)
+    monkeypatch.setattr(rpc, "_agy_pid_in_pane_subtree", lambda _pid: 300)
+    monkeypatch.setattr(rpc, "discover_language_server_port", lambda _pid: None)
+    state = rpc.resolve_pane_agy_rpc_port_state(Path("/tmp/agy/tmux.sock"), "main")
+    assert state == rpc.PaneAgyResolution(agy_found=True, port=None)
+
+
+def test_resolve_pane_state_no_agy_when_no_pane_pid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """State 3 (no pane pid): ``agy_found`` is ``False`` so the caller keeps polling."""
+    monkeypatch.setattr(rpc, "_pane_pid", lambda socket_path, target: None)
+    monkeypatch.setattr(
+        rpc,
+        "_agy_pid_in_pane_subtree",
+        lambda _pid: (_ for _ in ()).throw(AssertionError("unreachable")),
+    )
+    state = rpc.resolve_pane_agy_rpc_port_state(Path("/tmp/agy/tmux.sock"), "main")
+    assert state == rpc.PaneAgyResolution(agy_found=False, port=None)
+
+
+def test_resolve_pane_state_no_agy_when_not_in_subtree(monkeypatch: pytest.MonkeyPatch) -> None:
+    """State 3 (agy not exec'd yet): ``agy_found`` is ``False`` (CLI early-poll)."""
+    monkeypatch.setattr(rpc, "_pane_pid", lambda socket_path, target: 100)
+    monkeypatch.setattr(rpc, "_agy_pid_in_pane_subtree", lambda _pid: None)
+    monkeypatch.setattr(
+        rpc,
+        "discover_language_server_port",
+        lambda _pid: (_ for _ in ()).throw(AssertionError("unreachable")),
+    )
+    state = rpc.resolve_pane_agy_rpc_port_state(Path("/tmp/agy/tmux.sock"), "main")
+    assert state == rpc.PaneAgyResolution(agy_found=False, port=None)
+
+
+# ---------------------------------------------------------------------------
+# resolve_cold_start_agy_rpc_port (3-state dispatch)
+# ---------------------------------------------------------------------------
+
+
+def test_cold_start_port_uses_scoped_when_resolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    """State 1: a resolved pane-scoped port wins over a lower foreign candidate."""
+    monkeypatch.setattr(
+        rpc,
+        "resolve_pane_agy_rpc_port_state",
+        lambda _sock, _tgt: rpc.PaneAgyResolution(agy_found=True, port=61000),
+    )
+    monkeypatch.setattr(
+        rpc,
+        "_candidate_agy_rpc_ports",
+        lambda: (_ for _ in ()).throw(AssertionError("scoped port resolved; no candidate scan")),
+    )
+    assert rpc.resolve_cold_start_agy_rpc_port(Path("/tmp/agy/tmux.sock"), "main") == 61000
+
+
+def test_cold_start_port_keeps_polling_when_no_agy_in_pane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """State 3 (THE FIX): pane present, NO agy yet, FOREIGN candidate up → None.
+
+    The CLI ``tmux_start_on_attach`` early-poll window: our agy is not ``exec``-ed
+    yet. A foreign agy is the only candidate (52548). The resolver MUST return
+    ``None`` (keep polling) and NOT bind the foreign candidate — the durable
+    cross-bind this whole change prevents.
+    """
+    monkeypatch.setattr(
+        rpc,
+        "resolve_pane_agy_rpc_port_state",
+        lambda _sock, _tgt: rpc.PaneAgyResolution(agy_found=False, port=None),
+    )
+    monkeypatch.setattr(
+        rpc,
+        "_candidate_agy_rpc_ports",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("must NOT consult candidates when our agy is not up yet")
+        ),
+    )
+    assert rpc.resolve_cold_start_agy_rpc_port(Path("/tmp/agy/tmux.sock"), "main") is None
+
+
+def test_cold_start_port_falls_back_when_agy_found_but_no_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """State 2: our agy IS up in the pane but its port is not lsof-attributable.
+
+    Restricted-/proc one-agy-per-pod: agy exists here so the lone candidate is
+    ours — the candidate fallback is safe and necessary.
+    """
+    monkeypatch.setattr(
+        rpc,
+        "resolve_pane_agy_rpc_port_state",
+        lambda _sock, _tgt: rpc.PaneAgyResolution(agy_found=True, port=None),
+    )
+    monkeypatch.setattr(rpc, "_candidate_agy_rpc_ports", lambda: [52548])
+    assert rpc.resolve_cold_start_agy_rpc_port(Path("/tmp/agy/tmux.sock"), "main") == 52548
+
+
+def test_cold_start_port_no_pane_uses_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No pane supplied (remote runner) → lowest candidate; pane resolver untouched."""
+    monkeypatch.setattr(
+        rpc,
+        "resolve_pane_agy_rpc_port_state",
+        lambda _sock, _tgt: (_ for _ in ()).throw(
+            AssertionError("no pane → pane resolver must not be consulted")
+        ),
+    )
+    monkeypatch.setattr(rpc, "_candidate_agy_rpc_ports", lambda: [52548, 61000])
+    assert rpc.resolve_cold_start_agy_rpc_port(None, None) == 52548
+
+
+def test_cold_start_port_no_pane_none_when_no_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No pane and no candidates yet → ``None`` (keep polling)."""
+    monkeypatch.setattr(rpc, "_candidate_agy_rpc_ports", list)
+    assert rpc.resolve_cold_start_agy_rpc_port(None, None) is None

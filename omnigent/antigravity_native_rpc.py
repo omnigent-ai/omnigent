@@ -61,6 +61,7 @@ import struct
 import subprocess
 from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlparse
 
 import httpx
@@ -1111,9 +1112,28 @@ def _agy_pid_in_pane_subtree(pane_pid: int) -> int | None:
     return None
 
 
-def resolve_pane_agy_rpc_port(socket_path: Path, tmux_target: str) -> int | None:
+class PaneAgyResolution(NamedTuple):
     """
-    Resolve THIS session's own agy connect-RPC port via its tmux pane.
+    The outcome of scoping a cold-start port to a tmux pane's own agy.
+
+    Distinguishes the THREE states the cold-start must treat differently — a bare
+    ``int | None`` cannot, because "agy is up but its port is not lsof-attributable"
+    and "no agy is running in this pane yet" both collapse to "no port" yet demand
+    opposite fallbacks (candidate scan vs. keep polling). See
+    :func:`resolve_pane_agy_rpc_port_state`.
+
+    :param agy_found: Whether an agy process was found at/under the pane pid.
+    :param port: That agy's validated connect-RPC port, or ``None`` when agy was
+        found but its port is not yet resolvable (or no agy was found).
+    """
+
+    agy_found: bool
+    port: int | None
+
+
+def resolve_pane_agy_rpc_port_state(socket_path: Path, tmux_target: str) -> PaneAgyResolution:
+    """
+    Resolve THIS session's own agy connect-RPC port via its tmux pane (3-state).
 
     The cold-start's disambiguation seam: before any conversation exists there is
     nothing to confirm ownership with (:func:`resolve_language_server_port` needs
@@ -1125,19 +1145,29 @@ def resolve_pane_agy_rpc_port(socket_path: Path, tmux_target: str) -> int | None
     -> that pid's Heartbeat-validated connect-RPC port
     (:func:`discover_language_server_port`).
 
-    Best-effort and non-raising: ``None`` at any step (no local pane / tmux gone,
-    no agy resolvable in the pane subtree, or agy's port not bound yet) tells the
-    caller to fall back to the existing candidate scan — so single-agy hosts and
-    remote runners (no local socket) keep their current behavior.
+    Returns a :class:`PaneAgyResolution` so the caller can tell the three outcomes
+    apart (best-effort, non-raising):
+
+    * ``(agy_found=True, port=<int>)`` — our agy is up and its port is resolved.
+    * ``(agy_found=True, port=None)`` — our agy IS in the pane subtree but its port
+      is not (yet) lsof-attributable (e.g. a restricted ``/proc`` where the
+      listener is owned by a backend the agy pid does not hold as an fd). The
+      caller may safely use the candidate scan: agy exists here, so on the
+      one-agy-per-pod hosts where this happens the lone candidate is ours.
+    * ``(agy_found=False, port=None)`` — no agy is running in this pane yet (no
+      pane pid, or agy has not been ``exec``-ed — the CLI ``tmux_start_on_attach``
+      early-poll window). The caller MUST keep polling rather than fall back to
+      candidates, because a FOREIGN agy could be the only candidate and binding it
+      would durably cross-bind the session.
 
     :param socket_path: Private tmux socket path for this session's terminal.
     :param tmux_target: Tmux target (session name), e.g. ``"main"``.
-    :returns: The pane agy's validated connect-RPC port, or ``None`` when it
-        cannot be scoped (the caller then uses the candidate fallback).
+    :returns: The :class:`PaneAgyResolution` for the three states above.
     """
     pane_pid = _pane_pid(socket_path, tmux_target)
     if pane_pid is None:
-        return None
+        # No pane pid (tmux gone / target absent) — agy is not reachable here.
+        return PaneAgyResolution(agy_found=False, port=None)
     agy_pid = _agy_pid_in_pane_subtree(pane_pid)
     if agy_pid is None:
         _logger.debug(
@@ -1145,7 +1175,7 @@ def resolve_pane_agy_rpc_port(socket_path: Path, tmux_target: str) -> int | None
             pane_pid,
             tmux_target,
         )
-        return None
+        return PaneAgyResolution(agy_found=False, port=None)
     port = discover_language_server_port(agy_pid)
     if port is not None:
         _logger.info(
@@ -1154,7 +1184,22 @@ def resolve_pane_agy_rpc_port(socket_path: Path, tmux_target: str) -> int | None
             agy_pid,
             port,
         )
-    return port
+    return PaneAgyResolution(agy_found=True, port=port)
+
+
+def resolve_pane_agy_rpc_port(socket_path: Path, tmux_target: str) -> int | None:
+    """
+    Resolve THIS session's own agy connect-RPC port via its tmux pane.
+
+    Thin ``port``-only view of :func:`resolve_pane_agy_rpc_port_state` for callers
+    that do not need the agy-found / no-agy distinction.
+
+    :param socket_path: Private tmux socket path for this session's terminal.
+    :param tmux_target: Tmux target (session name), e.g. ``"main"``.
+    :returns: The pane agy's validated connect-RPC port, or ``None`` when it
+        cannot be scoped.
+    """
+    return resolve_pane_agy_rpc_port_state(socket_path, tmux_target).port
 
 
 def resolve_cold_start_agy_rpc_port(
@@ -1169,28 +1214,47 @@ def resolve_cold_start_agy_rpc_port(
     (:func:`resolve_language_server_port`) is not yet usable. To avoid binding a
     FOREIGN agy on a host running several (sub-agent fan-out / shared runner /
     ``omnigent run --server`` multi-session), this scopes the port to THIS
-    session's own agy via its tmux pane (:func:`resolve_pane_agy_rpc_port`).
+    session's own agy via its tmux pane
+    (:func:`resolve_pane_agy_rpc_port_state`), distinguishing three outcomes:
 
-    Falls back to the lowest Heartbeat-answering candidate
-    (:func:`_candidate_agy_rpc_ports`) when the pane is unavailable — a remote
-    runner with no local socket (``tmux_socket``/``tmux_target`` is ``None``), or
-    a pane whose agy pid / port cannot be resolved yet — so single-agy hosts and
-    remote runners keep their existing behavior. The fallback is logged so a
-    wrong-agy bind on a multi-agy host is diagnosable.
+    1. **Pane present, our agy found, port resolved** → that scoped port.
+    2. **Pane present, our agy found, port not resolvable** (e.g. restricted
+       ``/proc`` where lsof cannot attribute the listener) → the lowest candidate
+       (:func:`_candidate_agy_rpc_ports`). agy IS up in this pane, and the hosts
+       where this happens run one agy per pod, so the lone candidate is ours.
+    3. **Pane present, NO agy found yet** (the CLI ``tmux_start_on_attach``
+       early-poll window: the pane is still the shell, agy not yet ``exec``-ed) →
+       ``None``, so the caller keeps polling. It must NOT fall back to candidates
+       here: a foreign agy could be the only candidate, and binding it would
+       durably cross-bind this session — the exact defect this scoping prevents.
+
+    With **no pane supplied** (``tmux_socket``/``tmux_target`` is ``None`` — e.g. a
+    remote runner with no local socket) there is nothing to scope to, so this
+    falls back to the lowest candidate (best-effort; cannot disambiguate). The
+    candidate fallback is logged so a wrong-agy bind on a multi-agy host is
+    diagnosable.
 
     :param tmux_socket: This session's tmux socket path, or ``None`` when no local
         pane is reachable (remote runner).
     :param tmux_target: This session's tmux target, or ``None`` as above.
-    :returns: The port to ``StartCascade`` onto, or ``None`` when neither the
-        pane nor any candidate has bound yet (the caller keeps polling).
+    :returns: The port to ``StartCascade`` onto, or ``None`` when the port is not
+        resolvable yet (the caller keeps polling until its deadline).
     """
     if tmux_socket is not None and tmux_target is not None:
-        scoped = resolve_pane_agy_rpc_port(tmux_socket, tmux_target)
-        if scoped is not None:
-            return scoped
+        resolution = resolve_pane_agy_rpc_port_state(tmux_socket, tmux_target)
+        if resolution.port is not None:
+            return resolution.port  # state 1: our agy, scoped port
+        if not resolution.agy_found:
+            # state 3: our agy is not up yet (CLI early-poll). Keep polling — do
+            # NOT fall back to candidates, where a foreign agy could be the only
+            # one and would cross-bind this session.
+            return None
+        # state 2: our agy IS up but its port is not lsof-attributable (restricted
+        # /proc; one-agy-per-pod) — the candidate scan below is safe and necessary.
         _logger.debug(
-            "agy cold-start: pane-scoped port not resolvable yet (target=%s); "
-            "trying the host-wide candidate scan",
+            "agy cold-start: pane agy found for target=%s but its port is not "
+            "lsof-attributable; using the host-wide candidate scan (safe — agy is "
+            "up in this pane)",
             tmux_target,
         )
     candidates = _candidate_agy_rpc_ports()
@@ -1203,14 +1267,6 @@ def resolve_cold_start_agy_rpc_port(
             "candidate connect-RPC port %s (single-agy hosts and remote runners "
             "are unaffected; a multi-agy host risks a wrong-agy bind)",
             port,
-        )
-    else:
-        _logger.warning(
-            "agy cold-start: falling back to the lowest candidate connect-RPC port "
-            "%s for pane target=%s (pane->agy-pid->port unresolved); on a host with "
-            "several agy instances this can bind a foreign agy",
-            port,
-            tmux_target,
         )
     return port
 

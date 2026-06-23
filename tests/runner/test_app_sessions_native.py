@@ -2557,6 +2557,7 @@ async def _run_antigravity_auto_create(
     candidate_ports: list[int],
     pane: tuple[Path, str] | None = None,
     pane_scoped_port: int | None = None,
+    pane_agy_found: bool = True,
 ) -> tuple[Any, list[tuple[int, str]], list[dict[str, Any]], list[tuple[str, dict[str, Any]]]]:
     """
     Drive ``_auto_create_antigravity_terminal`` with every live collaborator faked.
@@ -2564,13 +2565,14 @@ async def _run_antigravity_auto_create(
     No real agy is launched: ``build_agy_launch`` is stubbed to a no-op argv, the
     onboarding seed is a no-op, the resource registry records the launched spec,
     the forwarder is a counting stub, and the connect-RPC layer
-    (``_candidate_agy_rpc_ports`` / ``resolve_pane_agy_rpc_port`` / ``start_cascade``)
-    is mocked so the cold-start bootstrap runs without a socket.
+    (``_candidate_agy_rpc_ports`` / ``resolve_pane_agy_rpc_port_state`` /
+    ``start_cascade``) is mocked so the cold-start bootstrap runs without a socket.
 
-    The cold-start exercises the REAL
-    ``resolve_cold_start_agy_rpc_port`` dispatch: with no ``pane`` the pane is
-    absent (``_terminal_tmux_pane`` → ``(None, None)``) and it falls back to the
-    candidate scan; with a ``pane`` the pane-scoped resolver is consulted first.
+    The cold-start exercises the REAL ``resolve_cold_start_agy_rpc_port`` dispatch:
+    with no ``pane`` the pane is absent (``_terminal_tmux_pane`` → ``(None, None)``)
+    and it falls back to the candidate scan; with a ``pane`` the pane-scoped
+    resolver's 3-state result (driven by ``pane_scoped_port`` + ``pane_agy_found``)
+    is consulted first.
 
     :param tmp_path: Temporary directory for isolated bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -2580,9 +2582,11 @@ async def _run_antigravity_auto_create(
         the bootstrap never finds a candidate port).
     :param pane: ``(tmux_socket, tmux_target)`` ``_terminal_tmux_pane`` returns,
         or ``None`` (the default) → ``(None, None)`` (no local pane).
-    :param pane_scoped_port: The port ``resolve_pane_agy_rpc_port`` returns for
-        the pane (``None`` → the pane cannot be scoped, so the resolver falls
-        through to the candidate scan).
+    :param pane_scoped_port: The port the pane-scoped resolver reports (``None`` →
+        no port; combined with ``pane_agy_found`` to pick state 1/2/3).
+    :param pane_agy_found: Whether the pane-scoped resolver found our agy in the
+        pane subtree. ``True`` + a port → scoped (state 1); ``True`` + no port →
+        candidate fallback (state 2); ``False`` → keep polling (state 3).
     :returns: ``(bridge_state_after, start_cascade_calls, reader_calls,
         external_session_id_patch_calls)``.
     """
@@ -2627,8 +2631,11 @@ async def _run_antigravity_auto_create(
     resolved_pane = (None, None) if pane is None else pane
     monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: resolved_pane)
     # The pane-scoped resolver the REAL ``resolve_cold_start_agy_rpc_port``
-    # consults first when a pane is present.
-    monkeypatch.setattr(rpc_mod, "resolve_pane_agy_rpc_port", lambda _sock, _tgt: pane_scoped_port)
+    # consults first when a pane is present — returns the 3-state result.
+    pane_resolution = rpc_mod.PaneAgyResolution(agy_found=pane_agy_found, port=pane_scoped_port)
+    monkeypatch.setattr(
+        rpc_mod, "resolve_pane_agy_rpc_port_state", lambda _sock, _tgt: pane_resolution
+    )
 
     # Mock the connect-RPC cold-start surface. Collapse the port-poll budget +
     # backoff so the no-port case bails immediately instead of waiting the real
@@ -2809,6 +2816,70 @@ async def test_auto_create_antigravity_cold_start_falls_back_when_no_pane(
     assert len(start_cascade_calls) == 1
     called_port, _called_id = start_cascade_calls[0]
     assert called_port == 52548  # the lowest candidate, NOT the (ignored) pane port
+    assert state is not None
+    assert patch_calls == [
+        (f"/v1/sessions/{session_id}", {"external_session_id": state.conversation_id})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_cold_start_waits_when_pane_agy_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Pane present, our agy NOT up yet, FOREIGN candidate present → no cold-start.
+
+    The cross-bind guard: with a local pane whose agy has not appeared yet
+    (``agy_found=False``) and a foreign agy as the only candidate, the cold-start
+    must NOT bind the foreign candidate — it keeps polling until its (collapsed)
+    deadline, leaving the placeholder for the reader to bind later. No
+    ``StartCascade``, no ``external_session_id`` PATCH.
+    """
+    session_id = "conv_agy_paneEarlyPoll"
+    state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={},
+        candidate_ports=[52548],  # a FOREIGN agy is the only candidate
+        pane=(tmp_path / "agy.sock", "main"),
+        pane_agy_found=False,  # our agy not exec'd into the pane yet
+        pane_scoped_port=None,
+    )
+    # Never cold-started onto the foreign candidate; placeholder stands.
+    assert start_cascade_calls == []
+    assert patch_calls == []
+    assert state is not None
+    assert bridge_mod_is_placeholder(state.conversation_id)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_cold_start_falls_back_when_port_unattributable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Pane present, our agy found, port not lsof-attributable → candidate fallback.
+
+    The restricted-/proc one-agy-per-pod case: our agy IS up in the pane
+    (``agy_found=True``) but lsof cannot attribute its listener, so the scoped
+    port is ``None``. Since agy exists here, the lone candidate is ours and the
+    candidate fallback is safe.
+    """
+    session_id = "conv_agy_paneNoPort"
+    state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={},
+        candidate_ports=[52548],  # one-agy-per-pod → the lone candidate is ours
+        pane=(tmp_path / "agy.sock", "main"),
+        pane_agy_found=True,  # our agy IS up...
+        pane_scoped_port=None,  # ...but its port is not lsof-attributable
+    )
+    assert len(start_cascade_calls) == 1
+    assert start_cascade_calls[0][0] == 52548  # safe candidate fallback
     assert state is not None
     assert patch_calls == [
         (f"/v1/sessions/{session_id}", {"external_session_id": state.conversation_id})

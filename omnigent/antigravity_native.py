@@ -1071,18 +1071,26 @@ async def _attach_terminal(
             ),
             name="antigravity-native-rpc-reader",
         )
+        # Scope the StartCascade port to THIS session's pane agy so a multi-agy
+        # host cannot cross-bind to a foreign agy — but ONLY when the tmux socket
+        # exists on THIS host. A remote runner advertises a server-side socket
+        # PATH that is not local; running ``tmux -S <remote-path> display-message``
+        # against it would fail on every poll (~80 doomed spawns over the budget),
+        # so gate on local existence (mirroring ``_can_attach_direct_tmux``) and
+        # route the remote case to the no-pane -> candidate fallback instead.
+        pane_local = (
+            prepared.tmux_socket is not None
+            and prepared.tmux_target is not None
+            and prepared.tmux_socket.exists()
+        )
         cold_start = asyncio.create_task(
             _cold_start_agy_conversation(
                 prepared.bridge_dir,
                 prepared.session_id,
                 base_url=base_url,
                 headers=headers,
-                # Scope the StartCascade port to THIS session's pane agy so a
-                # multi-agy host cannot cross-bind to a foreign agy. The attach
-                # already knows the pane (direct-tmux attaches use it); a remote
-                # runner with no local socket falls back to the candidate scan.
-                tmux_socket=prepared.tmux_socket,
-                tmux_target=prepared.tmux_target,
+                tmux_socket=prepared.tmux_socket if pane_local else None,
+                tmux_target=prepared.tmux_target if pane_local else None,
             ),
             name="antigravity-native-cold-start",
         )
@@ -1166,10 +1174,15 @@ async def _cold_start_agy_conversation(
     scoped to THIS session's own agy via its tmux pane (``tmux_socket`` /
     ``tmux_target``) so a host running several agy instances cannot
     ``StartCascade`` onto a FOREIGN agy (the conversation-ownership check that
-    normally disambiguates is not usable yet — no conversation exists), falling
-    back to the lowest ``Heartbeat``-answering candidate when no local pane is
-    reachable or it cannot be resolved. This polls that resolver until a port
-    binds, then ``StartCascade``s a generated ``uuid4``.
+    normally disambiguates is not usable yet — no conversation exists). Crucially
+    on this CLI path the terminal uses ``tmux_start_on_attach=True``, so agy is
+    not ``exec``-ed until the human attaches while this poll runs concurrently:
+    until our agy appears in the pane the resolver returns no port and this KEEPS
+    POLLING rather than falling back to a candidate (which could be a foreign
+    agy). It falls back to the lowest ``Heartbeat``-answering candidate only when
+    no local pane was supplied, or once our agy is up but its port is not
+    lsof-attributable. This polls that resolver until a port binds, then
+    ``StartCascade``s a generated ``uuid4``.
 
     The cold-started id is also PATCHed onto the Omnigent session as
     ``external_session_id`` (best-effort, mirroring the runner cold-start and

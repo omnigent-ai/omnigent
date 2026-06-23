@@ -2072,10 +2072,12 @@ async def _cold_start_agy_conversation(
     ``tmux_target``) so a host running several agy instances (sub-agent fan-out /
     shared runner) cannot ``StartCascade`` onto a FOREIGN agy and permanently
     cross-bind the session — the conversation-ownership check that normally
-    disambiguates is not usable yet (no conversation exists). When no local pane
-    is reachable (remote runner) or the pane cannot be resolved, it falls back to
-    the lowest ``Heartbeat``-answering candidate (current behavior). This polls
-    that resolver until a port binds, then ``StartCascade``s a runner-generated
+    disambiguates is not usable yet (no conversation exists). It falls back to the
+    lowest ``Heartbeat``-answering candidate (current behavior) only when no local
+    pane is reachable (remote runner), or once our agy is up in the pane but its
+    port is not lsof-attributable; while our agy is NOT yet up in the pane it keeps
+    polling rather than risk a foreign-agy candidate. This polls that resolver
+    until a port binds, then ``StartCascade``s a runner-generated
     ``uuid4`` and writes THAT real id into bridge state (replacing the
     ``agy_conv_*`` placeholder) so :func:`read_bridge_state` returns the real id
     and the reader/executor address the cold-started conversation directly.
