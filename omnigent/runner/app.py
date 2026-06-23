@@ -748,6 +748,10 @@ async def _auto_create_pi_terminal(
         terminal.
     :param publish_event: Runner session event publisher.
     :param server_client: Runner Omnigent server client.
+    :param agent_spec: The session's resolved agent spec, passed so the Pi
+        terminal inherits the agent's ``os_env.sandbox`` rather than falling
+        back to the platform default. ``None`` only when the session has no
+        spec; callers must not pass ``None`` to paper over a resolution error.
     :returns: Created terminal resource view.
     """
     from omnigent.conversation_browser import conversation_url
@@ -5732,10 +5736,15 @@ def create_runner_app(
                 if not _has_pi_terminal:
                     _publish_terminal_pending(_publish_event, session_id, True)
                     try:
-                        try:
-                            _pi_spec = await _resolve_session_agent_spec(session_id)
-                        except OmnigentError:
-                            _pi_spec = None
+                        # Inherit the session's os_env.sandbox via its agent
+                        # spec. A genuine resolution error must propagate to the
+                        # outer handler (-> start error), not be swallowed to
+                        # agent_spec=None, which silently drops the sandbox
+                        # policy and falls back to the platform default (the
+                        # failure mode #569 fixed). _resolve_session_agent_spec
+                        # returns None legitimately when there is no spec; only
+                        # genuine errors raise.
+                        _pi_spec = await _resolve_session_agent_spec(session_id)
                         await _auto_create_pi_terminal(
                             session_id,
                             resource_registry,
@@ -11056,10 +11065,11 @@ def create_runner_app(
                         content=session_resource_view_to_dict(existing),
                     )
                 try:
-                    try:
-                        _pi_ensure_spec = await _resolve_session_agent_spec(session_id)
-                    except OmnigentError:
-                        _pi_ensure_spec = None
+                    # See _auto_create_pi_terminal: a genuine spec resolution
+                    # error must propagate to the outer handler (-> start error
+                    # response) rather than be swallowed to agent_spec=None,
+                    # which silently drops the agent's sandbox policy.
+                    _pi_ensure_spec = await _resolve_session_agent_spec(session_id)
                     terminal_view = await _auto_create_pi_terminal(
                         session_id,
                         resource_registry,
