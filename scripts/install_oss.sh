@@ -10,6 +10,8 @@
 #   --version X   install a specific PyPI release (default: latest)
 #   --repo URL    install from a git checkout instead (builds from source;
 #                 requires Node 22+/npm) — for development
+#   --extra NAME  install an optional-dependency extra (repeatable, or
+#                 comma-separated), e.g. --extra databricks
 #   --non-interactive, --verbose
 #
 # uv and git (only with --repo) are required; the installer offers to install
@@ -23,6 +25,10 @@ set -eu
 # Published PyPI package, the default install. --version pins a release.
 PACKAGE_NAME="omnigent"
 VERSION=
+# Comma-separated optional-dependency extras to install with the package
+# (e.g. "databricks"), accumulated from one or more --extra flags. Empty =>
+# the base install with no extras.
+EXTRAS=
 # Set by --repo to install from a git checkout instead (development; builds
 # the web UI from source). Empty => install the published wheel from PyPI.
 REPO_URL=
@@ -34,7 +40,7 @@ ESC=$(printf '\033')
 RESET=
 BOLD=
 DIM=
-CYAN=
+MAGENTA=
 GREEN=
 YELLOW=
 RED=
@@ -48,19 +54,36 @@ init_style() {
     RESET="${ESC}[0m"
     BOLD="${ESC}[1m"
     DIM="${ESC}[2m"
-    CYAN="${ESC}[36m"
+    # Brand accent — Otto's magenta-pink (#F43BA6), matching the Python CLI
+    # palette in omnigent/inner/ui.py so the installer and the tool agree.
+    MAGENTA="${ESC}[38;2;244;59;166m"
     GREEN="${ESC}[32m"
     YELLOW="${ESC}[33m"
     RED="${ESC}[31m"
   fi
 }
 
+# The Otto + "omnigent" wordmark lockup, printed once at the top of an
+# interactive install. Mirrors omnigent.inner.wordmark.lockup_lines(); the
+# whole lockup is painted in the brand magenta (flat — no gradient in sh).
+# Skipped off a TTY (use_terminal_ui) so piped/CI installs stay clean.
+print_banner() {
+  use_terminal_ui || return 0
+  printf '\n'
+  printf '%s  ⠀⠀⠀⢠⣿⡄⠀⠀⠀   ██████╗ ███╗   ███╗███╗   ██╗██╗ ██████╗ ███████╗███╗   ██╗████████╗%s\n' "$MAGENTA" "$RESET"
+  printf '%s  ⢴⣶⣶⠉⣿⠉⣶⣶⡦  ██╔═══██╗████╗ ████║████╗  ██║██║██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝%s\n' "$MAGENTA" "$RESET"
+  printf '%s  ⠀⠙⣿⣶⣿⣶⣿⠋⠀  ██║   ██║██╔████╔██║██╔██╗ ██║██║██║  ███╗█████╗  ██╔██╗ ██║   ██║%s\n' "$MAGENTA" "$RESET"
+  printf '%s  ⠀⢠⣿⡿⠿⢿⣿⡄⠀  ╚██████╔╝██║ ╚═╝ ██║██║ ╚████║██║╚██████╔╝███████╗██║ ╚████║   ██║%s\n' "$MAGENTA" "$RESET"
+  printf '%s  ⠀⠈⠁⠀⠀⠀⠈⠁⠀   ╚═════╝ ╚═╝     ╚═╝╚═╝  ╚═══╝╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝%s\n' "$MAGENTA" "$RESET"
+  printf '%s  all your agents, one cli%s\n\n' "$DIM" "$RESET"
+}
+
 usage() {
-  printf 'Usage: install_oss.sh [--non-interactive] [--verbose] [--version X] [--repo URL]\n'
+  printf 'Usage: install_oss.sh [--non-interactive] [--verbose] [--version X] [--repo URL] [--extra NAME]\n'
 }
 
 step() {
-  printf '%s==>%s %s\n' "$CYAN" "$RESET" "$1"
+  printf '%s==>%s %s\n' "$MAGENTA" "$RESET" "$1"
 }
 
 verbose() {
@@ -118,7 +141,7 @@ run_with_spinner() {
   frame=0
   while [ ! -f "$status_file" ]; do
     spinner="$(spinner_frame "$frame")"
-    printf '\r\033[K%s%s%s %s%s%s' "$CYAN" "$spinner" "$RESET" "$BOLD" "$label" "$RESET"
+    printf '\r\033[K%s%s%s %s%s%s' "$MAGENTA" "$spinner" "$RESET" "$BOLD" "$label" "$RESET"
     frame=$((frame + 1))
     sleep 0.1
   done
@@ -163,6 +186,20 @@ parse_args() {
           exit 1
         fi
         VERSION="$2"
+        shift
+        ;;
+      --extra)
+        if [ "$#" -lt 2 ]; then
+          usage >&2
+          exit 1
+        fi
+        # Accumulate repeated flags into one comma-separated list; a value that
+        # is itself comma-separated (--extra a,b) just concatenates cleanly.
+        if [ -n "$EXTRAS" ]; then
+          EXTRAS="$EXTRAS,$2"
+        else
+          EXTRAS="$2"
+        fi
         shift
         ;;
       *)
@@ -430,15 +467,29 @@ install_omnigent() {
   # The wheel ships the prebuilt web UI, so there is no npm/Node step and no
   # source build — the fast, reliable path. `--repo` switches INSTALL_URL to a
   # git ref, which builds from source (and needs npm, checked above).
+  # Extras suffix like "[databricks]" appended to the package name so the
+  # optional-dependency group(s) install alongside the base package. Applies to
+  # every mode below; empty when no --extra was given.
+  extras_suffix=
+  if [ -n "$EXTRAS" ]; then
+    extras_suffix="[$EXTRAS]"
+  fi
   if building_from_source; then
-    target="$INSTALL_URL"
-    step "Installing Omnigent from source (Python $PYTHON_VERSION)"
+    # A PEP 508 direct reference attaches extras to a git source install:
+    # "omnigent[databricks] @ git+https://...". Without extras, keep the bare
+    # URL (the long-standing form uv accepts directly).
+    if [ -n "$extras_suffix" ]; then
+      target="${PACKAGE_NAME}${extras_suffix} @ ${INSTALL_URL}"
+    else
+      target="$INSTALL_URL"
+    fi
+    step "Installing Omnigent from source${extras_suffix:+ $extras_suffix} (Python $PYTHON_VERSION)"
   elif [ -n "$VERSION" ]; then
-    target="${PACKAGE_NAME}==${VERSION}"
-    step "Installing Omnigent $VERSION (Python $PYTHON_VERSION)"
+    target="${PACKAGE_NAME}${extras_suffix}==${VERSION}"
+    step "Installing Omnigent $VERSION${extras_suffix:+ $extras_suffix} (Python $PYTHON_VERSION)"
   else
-    target="$PACKAGE_NAME"
-    step "Installing Omnigent (Python $PYTHON_VERSION)"
+    target="${PACKAGE_NAME}${extras_suffix}"
+    step "Installing Omnigent${extras_suffix:+ $extras_suffix} (Python $PYTHON_VERSION)"
   fi
   # --force so re-running upgrades instead of no-op'ing; -q hides uv's
   # "Installed N executables" summary (the package also ships an `omni` alias).
@@ -559,7 +610,7 @@ print_next_steps() {
 
   printf '\n%sOmnigent installed successfully.%s\n\n' "$BOLD" "$RESET"
   printf 'Start chatting — first run sets up a model and a local web UI:\n'
-  printf '  %s%somnigent%s\n\n' "$command_prefix" "$CYAN" "$RESET"
+  printf '  %s%somnigent%s\n\n' "$command_prefix" "$MAGENTA" "$RESET"
   printf 'Or launch a specific coding harness:\n'
   printf '  %somnigent claude          # Claude Code\n' "$command_prefix"
   printf '  %somnigent codex           # Codex\n\n' "$command_prefix"
@@ -573,6 +624,7 @@ print_next_steps() {
 main() {
   init_style
   parse_args "$@"
+  print_banner
   normalize_repo_url
   check_platform
   check_prerequisites

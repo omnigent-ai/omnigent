@@ -19,7 +19,7 @@ import { Button } from "@/components/ui/button";
 import { switchSessionAgent } from "@/lib/sessionsApi";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useSessionAgent } from "@/hooks/useAgents";
-import { agentBaseName, forkTargetCarriesHistory, harnessFamily } from "@/lib/forkHarness";
+import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/forkHarness";
 
 // "" means no target chosen yet. It must be empty (not a sentinel like
 // "__none__"): Radix only renders the trigger placeholder when the controlled
@@ -68,20 +68,21 @@ export function SwitchAgentDialog({
   const { data: agents } = useAvailableAgents({ enabled: open });
   const { data: currentAgent } = useSessionAgent(open ? sessionId : null);
 
-  // The bound agent stripped of any " (fork <id>)" / " (switch <id>)" suffix
-  // the fork/switch routes append when cloning, so a clone of a built-in
-  // still matches that built-in by name and is excluded below.
+  // The bound agent stripped of EVERY " (fork <id>)" / " (switch <id>)"
+  // suffix the fork/switch routes append when cloning (a fork of a fork
+  // nests them), so a clone of a built-in — however deep — still matches
+  // that built-in by name and is excluded below.
   const currentAgentName = currentAgent?.name ?? null;
-  const currentAgentBaseName = currentAgentName ? agentBaseName(currentAgentName) : null;
+  const currentAgentRootName = currentAgentName ? agentRootName(currentAgentName) : null;
 
   // Friendly label for the currently-bound agent, shown as the trigger's
   // default (greyed) so the box isn't blank and the user sees what they're on.
   // Prefer the matching built-in's display_name (e.g. "nessie" → "Nessie");
   // fall back to the bound agent's own (suffix-stripped) name.
   const currentDisplay =
-    (agents ?? []).find((a) => a.name === currentAgentName || a.name === currentAgentBaseName)
+    (agents ?? []).find((a) => a.name === currentAgentName || a.name === currentAgentRootName)
       ?.display_name ??
-    currentAgentBaseName ??
+    currentAgentRootName ??
     currentAgentName;
 
   // Targets, excluding the session's own agent (switching to it is a no-op)
@@ -92,7 +93,7 @@ export function SwitchAgentDialog({
     (a) =>
       a.id !== currentAgent?.id &&
       a.name !== currentAgentName &&
-      a.name !== currentAgentBaseName &&
+      a.name !== currentAgentRootName &&
       forkTargetCarriesHistory(a.harness),
   );
 

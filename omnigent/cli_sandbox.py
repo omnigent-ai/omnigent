@@ -17,6 +17,7 @@ from pathlib import Path
 
 import click
 
+from omnigent.inner import ui
 from omnigent.onboarding.sandboxes import (
     SandboxLauncher,
     available_providers,
@@ -139,9 +140,12 @@ def _print_ready_banner(provider: str, sandbox_id: str, server_url: str) -> None
     :param server_url: Server URL for the connect hint (``--server``
         is required on create, so it is always known here).
     """
-    click.secho("\n✓ Sandbox ready.\n", fg="green", bold=True)
-    click.echo(f"Sandbox:  {sandbox_id}  (provider: {provider})")
-    click.echo(f"Server:   {server_url}\n")
+    ui.console.print()
+    ui.success("Sandbox ready.")
+    ui.console.print()
+    ui.kv("Sandbox", f"{sandbox_id}  (provider: {provider})")
+    ui.kv("Server", server_url)
+    ui.console.print()
     click.echo("To register the sandbox as a host with your server:")
     click.echo(
         f"  omnigent sandbox connect --provider {provider} --sandbox-id {sandbox_id} "
@@ -335,7 +339,9 @@ def sandbox_auth(
         server_url=app_url,
         workspace=workspace,
     )
-    click.secho("\n✓ Sandbox logged in.\n", fg="green", bold=True)
+    ui.console.print()
+    ui.success("Sandbox logged in.")
+    ui.console.print()
 
 
 @sandbox.command("connect")

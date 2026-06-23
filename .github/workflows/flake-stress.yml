@@ -14,7 +14,7 @@ name: Flake stress
 #     -f test_target=tests/server/integration/test_routes_responses.py
 #   gh workflow run flake-stress.yml --ref main \
 #     -f test_target='tests/foo.py::test_x[case1]' \
-#     -f workers=1 -f extra_pytest_args=--no-skip-known
+#     -f workers=1 -f extra_pytest_args=-x
 
 on:
   workflow_dispatch:
@@ -39,7 +39,7 @@ on:
         required: false
         default: "worksteal"
       extra_pytest_args:
-        description: "Extra pytest args appended to the command, e.g. '--no-skip-known' (default: empty)"
+        description: "Extra pytest args appended to the command, e.g. '-x' (default: empty)"
         required: false
         default: ""
 
@@ -126,7 +126,7 @@ jobs:
 
     steps:
       - name: Check out repo
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.inputs.target_branch }}
 

@@ -81,7 +81,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
@@ -164,6 +164,7 @@ jobs:
 
       # No build-args: the Dockerfile ARGs default to public registries.
       - name: Build and push
+        id: build-server
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:
           context: .
@@ -174,11 +175,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
-          sbom: false
+          sbom: true
 
       # Host image: same Dockerfile, `host` target. Runs after the server build
       # so it reuses the shared builder-stage layers from the gha cache.
       - name: Build and push host image
+        id: build-host
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:
           context: .
@@ -190,12 +192,61 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
-          sbom: false
+          sbom: true
+    outputs:
+      server-digest: ${{ steps.build-server.outputs.digest }}
+      host-digest: ${{ steps.build-host.outputs.digest }}
+
+  generate-sbom:
+    # Runs in a separate job with read-only permissions so the Syft
+    # install script cannot influence the image push. Scans the
+    # already-pushed images by digest (immutable).
+    needs: build-and-push
+    permissions:
+      contents: read
+      packages: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Log in to GHCR (read-only)
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@fc46e51fd3cb168ffb36c6d1915723c47db58abb  # v0.17.7
+
+      - name: Generate server SBOM
+        run: |
+          set -euo pipefail
+          syft "ghcr.io/omnigent-ai/omnigent-server@${{ needs.build-and-push.outputs.server-digest }}" \
+            -o cyclonedx-json=server-sbom.cdx.json \
+            -o spdx-json=server-sbom.spdx.json
+
+      - name: Generate host SBOM
+        run: |
+          set -euo pipefail
+          syft "ghcr.io/omnigent-ai/omnigent-host@${{ needs.build-and-push.outputs.host-digest }}" \
+            -o cyclonedx-json=host-sbom.cdx.json \
+            -o spdx-json=host-sbom.spdx.json
+
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: sbom
+          path: |
+            server-sbom.cdx.json
+            server-sbom.spdx.json
+            host-sbom.cdx.json
+            host-sbom.spdx.json
+          retention-days: 90
 
   promote-nightly:
     # Daily cron (or a manual force_nightly dispatch): move :latest-nightly to
-    # the current main build by retagging the existing :latest-dev manifest
-    # (multi-arch safe, no rebuild).
+    # the current main build by retagging :latest-dev with `crane tag`
+    # (digest-preserving, no rebuild).
     if: github.repository == 'omnigent-ai/omnigent' && (github.event_name == 'schedule' || inputs.force_nightly)
     permissions:
       contents: read
@@ -203,8 +254,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+      - name: Set up crane
+        uses: imjasonh/setup-crane@59c71e96a00b28651f10369ba3359a6d730740a0  # v0.6
+        with:
+          version: v0.21.6
 
       - name: Log in to GHCR
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
@@ -216,10 +269,12 @@ jobs:
       - name: Promote latest-dev -> latest-nightly
         run: |
           set -euo pipefail
+          # crane tag points a new tag at an EXISTING manifest digest without
+          # re-serializing it, so :latest-nightly keeps :latest-dev's exact digest.
           for img in ghcr.io/omnigent-ai/omnigent-server ghcr.io/omnigent-ai/omnigent-host; do
-            if docker buildx imagetools inspect "${img}:latest-dev" >/dev/null 2>&1; then
-              docker buildx imagetools create -t "${img}:latest-nightly" "${img}:latest-dev"
-              echo "promoted ${img}:latest-dev -> ${img}:latest-nightly"
+            if crane digest "${img}:latest-dev" >/dev/null 2>&1; then
+              crane tag "${img}:latest-dev" latest-nightly
+              echo "promoted ${img}:latest-dev -> :latest-nightly ($(crane digest "${img}:latest-nightly"))"
             else
               echo "::warning::${img}:latest-dev not found yet; skipping nightly promotion"
             fi
@@ -228,8 +283,8 @@ jobs:
   reconcile-floating:
     # Manual reconcile (workflow_dispatch with reconcile_floating=true): repoint
     # :latest and :latest-rc onto the correct EXISTING version images, computed
-    # from the tag list with PEP 440 ordering. Retags via imagetools (no
-    # rebuild). Idempotent — also a "fix the floating tags if they ever drift"
+    # from the tag list with PEP 440 ordering. Retags with `crane tag`
+    # (digest-preserving). Idempotent — also a "fix the floating tags if they drift"
     # button, and the way to backfill them for releases cut before this scheme.
     if: github.repository == 'omnigent-ai/omnigent' && inputs.reconcile_floating
     permissions:
@@ -239,10 +294,12 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+      - name: Set up crane
+        uses: imjasonh/setup-crane@59c71e96a00b28651f10369ba3359a6d730740a0  # v0.6
+        with:
+          version: v0.21.6
 
       - name: Set up uv
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
@@ -267,16 +324,19 @@ jobs:
             uv run --with packaging --no-project python .github/scripts/oss-publish-images/reconcile_targets.py)
           echo "targets: latest-rc<-${RC_TAG}  latest<-${LATEST_TAG}"
 
-          # dst=floating tag, src=version tag (skip when src is "-" or its image is absent).
+          # crane tag repoints a tag onto an EXISTING manifest digest without
+          # re-serializing it (unlike `imagetools create`, which wraps a
+          # single-platform image in a fresh manifest list and changes the
+          # digest). dst=floating tag, src=version tag.
           retag() {
             local img="$1" dst="$2" src="$3"
             if [ "${src}" = "-" ]; then
               echo "::warning::no source for ${img}:${dst}; skipping"
               return
             fi
-            if docker buildx imagetools inspect "${img}:${src}" >/dev/null 2>&1; then
-              docker buildx imagetools create -t "${img}:${dst}" "${img}:${src}"
-              echo "set ${img}:${dst} -> ${src}"
+            if crane digest "${img}:${src}" >/dev/null 2>&1; then
+              crane tag "${img}:${src}" "${dst}"
+              echo "set ${img}:${dst} -> ${src} ($(crane digest "${img}:${dst}"))"
             else
               echo "::warning::${img}:${src} image not found; skipping ${img}:${dst}"
             fi

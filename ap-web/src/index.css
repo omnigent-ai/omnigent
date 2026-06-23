@@ -401,6 +401,151 @@
 [data-electron-mac] :is(a, button, input, textarea, [role="button"]) {
   -webkit-app-region: no-drag;
 }
+
+/* iOS native shell (SwiftUI/WKWebView) runs the webview full-screen under the
+ * system status bar and home indicator. Keep the web app visually full-bleed,
+ * but move interactive mobile chrome out of unsafe areas. Scoped to the native
+ * bridge marker so normal iOS Safari keeps its existing browser-safe layout. */
+@media (width < 48rem) {
+  [data-ios-native].app-shell {
+    height: 100vh;
+    height: 100lvh;
+    min-height: 100vh;
+    min-height: 100lvh;
+    max-height: 100vh;
+    max-height: 100lvh;
+    overflow: hidden;
+  }
+
+  [data-ios-native] .conversations-sidebar {
+    transition: transform 360ms cubic-bezier(0.32, 0.72, 0, 1);
+    will-change: transform;
+  }
+
+  [data-ios-native] :is(input, textarea, select, [contenteditable="true"]) {
+    font-size: 16px;
+  }
+
+  [data-ios-native] .chat-header {
+    top: max(0px, calc(env(safe-area-inset-top, 0px) - 0.5rem));
+  }
+
+  [data-ios-native] .chat-conversation-content {
+    padding-top: calc(5rem + env(safe-area-inset-top, 0px));
+  }
+
+  [data-ios-native] .main-terminal-view {
+    padding-top: calc(3.25rem + env(safe-area-inset-top, 0px));
+  }
+
+  [data-ios-native] .chat-scroll-fade {
+    mask-image: linear-gradient(
+      to bottom,
+      transparent calc(48px + env(safe-area-inset-top, 0px)),
+      black calc(80px + env(safe-area-inset-top, 0px))
+    );
+    -webkit-mask-image: linear-gradient(
+      to bottom,
+      transparent calc(48px + env(safe-area-inset-top, 0px)),
+      black calc(80px + env(safe-area-inset-top, 0px))
+    );
+  }
+
+  [data-ios-native] .chat-composer-form {
+    padding-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px));
+  }
+
+  [data-ios-native] .chat-composer-form.terminal-first-composer-form {
+    padding-bottom: 0.25rem;
+  }
+
+  [data-ios-native] .terminal-first-switcher-container {
+    padding-bottom: calc(0.35rem + env(safe-area-inset-bottom, 0px));
+  }
+
+  [data-ios-native] .terminal-first-switcher {
+    min-height: 46px;
+    gap: 0.25rem;
+    padding: 0.25rem;
+    border-color: color-mix(in srgb, var(--border) 72%, transparent);
+    background: color-mix(in srgb, var(--card) 88%, transparent);
+    -webkit-backdrop-filter: saturate(180%) blur(18px);
+    backdrop-filter: saturate(180%) blur(18px);
+    box-shadow:
+      0 12px 28px rgb(0 0 0 / 0.13),
+      0 1px 0 rgb(255 255 255 / 0.55) inset;
+    font-size: 16px;
+    line-height: 1;
+  }
+
+  [data-ios-native] .terminal-first-switcher > div {
+    gap: 0.25rem;
+  }
+
+  [data-ios-native] .terminal-first-switcher-option {
+    min-height: 38px;
+    gap: 0.45rem;
+    padding: 0 0.85rem;
+    font-size: 16px;
+    font-weight: 500;
+    letter-spacing: 0;
+    transition:
+      background-color 160ms ease,
+      color 160ms ease,
+      box-shadow 160ms ease,
+      transform 160ms ease;
+  }
+
+  [data-ios-native] .terminal-first-switcher-option:active:not(:disabled) {
+    transform: scale(0.97);
+  }
+
+  [data-ios-native] .terminal-first-switcher-option[aria-pressed="true"] {
+    background: color-mix(in srgb, var(--background) 82%, white 18%);
+    box-shadow:
+      0 3px 10px rgb(0 0 0 / 0.1),
+      0 1px 0 rgb(255 255 255 / 0.72) inset;
+  }
+
+  [data-ios-native] .terminal-first-switcher-option svg {
+    width: 1.15rem;
+    height: 1.15rem;
+  }
+
+  .dark [data-ios-native] .terminal-first-switcher {
+    border-color: color-mix(in srgb, var(--border) 82%, transparent);
+    background: color-mix(in srgb, var(--card) 78%, transparent);
+    box-shadow:
+      0 14px 30px rgb(0 0 0 / 0.35),
+      0 1px 0 rgb(255 255 255 / 0.1) inset;
+  }
+
+  .dark [data-ios-native] .terminal-first-switcher-option[aria-pressed="true"] {
+    background: color-mix(in srgb, var(--muted) 82%, white 6%);
+    box-shadow:
+      0 3px 12px rgb(0 0 0 / 0.28),
+      0 1px 0 rgb(255 255 255 / 0.12) inset;
+  }
+
+  [data-ios-native]
+    :is(
+      .conversations-sidebar,
+      [data-testid="file-viewer"],
+      [data-testid="files-panel-drawer"],
+      [data-testid="terminals-panel"],
+      [data-testid="subagents-panel-drawer"],
+      [data-testid="todos-panel-drawer"]
+    ) {
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+}
+
+@media (width < 48rem) and (prefers-reduced-motion: reduce) {
+  [data-ios-native] .conversations-sidebar {
+    transition-duration: 1ms;
+  }
+}
 /* Share button — glassy pink effect (both modes). The vertical
  * gradient alone does the embossed work (lighter top = light catch,
  * darker bottom = shadow, simulating a convex surface lit from above);
@@ -825,6 +970,58 @@
 }
 .tiptap-md-content .ProseMirror li {
   margin: 0.25em 0;
+}
+/* GitHub-style task lists (`- [ ]` / `- [x]`), rendered by
+   @tiptap/extension-list's TaskList/TaskItem (registered in
+   MarkdownRichTextViewer.tsx). TaskList renders <ul data-type="taskList">;
+   each item is drawn by TaskItem's node-view as
+   <li data-checked><label><input type=checkbox><span></span></label><div>…</div></li>
+   — note the live editor DOM carries data-checked on the <li> but NOT
+   data-type (that only appears on the static renderHTML/clipboard path), so we
+   target items as `ul[data-type="taskList"] > li`. The data-attribute selector
+   out-specifies the plain ul/li rules above: drop the inherited disc marker and
+   lay the checkbox out beside the content instead of stacking on top of it. */
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] {
+  list-style: none;
+  padding-left: 0;
+  margin: 0.5em 0;
+}
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5em;
+  margin: 0.25em 0;
+}
+/* The checkbox lives in a contenteditable=false <label>. Give the label the
+   height of one content line (paragraph line-height: 1.7) and center the
+   checkbox within it, so it sits on the first text line at any font size
+   instead of relying on a fixed margin nudge. */
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li > label {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  height: 1.7em;
+  user-select: none;
+}
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li > label input[type="checkbox"] {
+  width: 0.95em;
+  height: 0.95em;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--primary);
+}
+/* Content column: the <div> wraps the item's paragraph(s). Collapse the
+   paragraph's default vertical margin so a single-line item hugs the checkbox. */
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li > div {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li > div > p {
+  margin: 0;
+}
+/* Nested checklists tuck under their parent item, not the page margin. */
+.tiptap-md-content .ProseMirror ul[data-type="taskList"] > li ul[data-type="taskList"] {
+  margin: 0.25em 0 0;
 }
 .tiptap-md-content .ProseMirror blockquote {
   border-left: 3px solid var(--border);

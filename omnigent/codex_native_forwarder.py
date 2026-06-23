@@ -60,6 +60,8 @@ _POST_RETRY_DELAY_SECONDS = 0.1
 _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _DELTA_FLUSH_INTERVAL_SECONDS = 0.05
 _DELTA_FLUSH_CHAR_THRESHOLD = 64
+_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE = "external_reasoning_effort_change"
+_EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE = "external_codex_collaboration_mode_change"
 # Per-attempt client budget for the elicitation long-poll, slightly above
 # the server-side wait (``_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S``) so
 # the server's own timeout (empty-body fail-ask) wins over a client cut.
@@ -201,6 +203,20 @@ class _CodexForwarderState:
         the resume/startup model so the spawn default is not echoed back as
         a change; only a later in-TUI ``/model`` switch is mirrored. ``None``
         until seeded.
+    :param effort: Latest known Codex reasoning effort for this thread, e.g.
+        ``"medium"``. ``None`` means Codex is using its model/default effort.
+    :param posted_effort: Last reasoning effort already mirrored to Omnigent
+        via ``external_reasoning_effort_change``. ``None`` is a valid mirrored
+        value, so ``posted_effort_known`` tracks whether the baseline has been
+        seeded.
+    :param posted_effort_known: Whether ``posted_effort`` has been mirrored at
+        least once. Without this, the initial ``None`` default would be
+        indistinguishable from "not yet posted".
+    :param collaboration_mode: Latest known Codex collaboration mode kind, e.g.
+        ``"plan"`` or ``"default"``.
+    :param posted_collaboration_mode: Last collaboration mode kind already
+        mirrored to Omnigent via
+        ``external_codex_collaboration_mode_change``.
     :param parent_session_id: Omnigent parent session id, e.g.
         ``"conv_parent"``. Set by ``supervise_forwarder`` so collab-agent
         helpers can register child sessions without extra parameter
@@ -243,6 +259,11 @@ class _CodexForwarderState:
 
     model: str | None = None
     posted_model: str | None = None
+    effort: str | None = None
+    posted_effort: str | None = None
+    posted_effort_known: bool = False
+    collaboration_mode: str | None = None
+    posted_collaboration_mode: str | None = None
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
@@ -289,6 +310,8 @@ class _CodexForwarderState:
         settings = params.get("threadSettings")
         if isinstance(settings, dict):
             self._note_model_fields(settings)
+            self._note_effort_fields(settings)
+            self._note_collaboration_mode_fields(settings)
 
     def record_completed_plan(self, params: dict[str, Any]) -> None:
         """
@@ -572,6 +595,44 @@ class _CodexForwarderState:
         model = payload.get("model")
         if isinstance(model, str) and model:
             self.model = model
+
+    def _note_effort_fields(self, payload: dict[str, Any]) -> None:
+        """
+        Record reasoning effort from a Codex settings-like payload.
+
+        App-server's public ``ThreadSettings`` wire field is ``effort``. The
+        other two names are accepted because upstream docs and lower-level
+        snapshots use ``reasoningEffort`` / ``reasoning_effort`` when referring
+        to the same concept.
+
+        :param payload: Settings payload with ``effort`` or an equivalent
+            reasoning-effort key, e.g. ``{"effort": "medium"}``.
+        :returns: None.
+        """
+        for key in ("effort", "reasoningEffort", "reasoning_effort"):
+            if key not in payload:
+                continue
+            effort = payload[key]
+            if effort is None or (isinstance(effort, str) and effort):
+                self.effort = effort
+            return
+
+    def _note_collaboration_mode_fields(self, payload: dict[str, Any]) -> None:
+        """
+        Record Codex collaboration mode from a settings-like payload.
+
+        :param payload: Settings payload with ``collaborationMode``, e.g.
+            ``{"collaborationMode": {"mode": "plan", "settings": {...}}}``.
+        :returns: None.
+        """
+        raw_mode = payload.get("collaborationMode")
+        if not isinstance(raw_mode, dict):
+            raw_mode = payload.get("collaboration_mode")
+        if not isinstance(raw_mode, dict):
+            return
+        mode = raw_mode.get("mode")
+        if isinstance(mode, str) and mode:
+            self.collaboration_mode = mode
 
 
 @dataclass(frozen=True)
@@ -2236,6 +2297,65 @@ async def _sync_model_change(
         forwarder_state.posted_model = model
 
 
+async def _sync_reasoning_effort_change(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Mirror Codex's active reasoning effort to Omnigent session metadata.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param forwarder_state: Mutable forwarder state carrying the current
+        Codex effort and last-mirrored baseline.
+    :returns: None.
+    """
+    effort = forwarder_state.effort
+    if forwarder_state.posted_effort_known and effort == forwarder_state.posted_effort:
+        return
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+        data={"reasoning_effort": effort},
+    )
+    _log_failed_session_event_post(_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE, response)
+    if response is not None and response.status_code < 400:
+        forwarder_state.posted_effort = effort
+        forwarder_state.posted_effort_known = True
+
+
+async def _sync_codex_collaboration_mode_change(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Mirror Codex's active collaboration mode kind to Omnigent labels.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param forwarder_state: Mutable forwarder state carrying the current
+        Codex collaboration mode and last-mirrored baseline.
+    :returns: None.
+    """
+    mode = forwarder_state.collaboration_mode
+    if not mode or mode == forwarder_state.posted_collaboration_mode:
+        return
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
+        data={"mode": mode},
+    )
+    _log_failed_session_event_post(_EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE, response)
+    if response is not None and response.status_code < 400:
+        forwarder_state.posted_collaboration_mode = mode
+
+
 async def _maybe_handle_turn_event(
     client: httpx.AsyncClient,
     *,
@@ -2303,6 +2423,12 @@ async def _maybe_handle_turn_event(
         if forwarder_state is not None:
             forwarder_state.note_thread_settings_updated(params)
             await _sync_model_change(
+                client, session_id=session_id, forwarder_state=forwarder_state
+            )
+            await _sync_reasoning_effort_change(
+                client, session_id=session_id, forwarder_state=forwarder_state
+            )
+            await _sync_codex_collaboration_mode_change(
                 client, session_id=session_id, forwarder_state=forwarder_state
             )
         return True
@@ -4192,6 +4318,40 @@ def _codex_tool_call_from_item(item: dict[str, Any]) -> _CodexToolCall | None:
     return builder(call_id, item)
 
 
+# Codex runs each model-issued shell command inside its OWN bwrap command
+# sandbox. In a hardened container that disallows unprivileged user namespaces,
+# that sandbox cannot start and every command hard-fails with this raw bwrap
+# error, with no hint at how to recover. Detect the marker and append actionable
+# guidance so a top-level session degrades with direction instead of an opaque
+# failure (issue #657; mirrors the degrade-not-crash ask in #517). The codex
+# ``--approval-mode`` presets do NOT disable this sandbox — only the "Full
+# access" preset's ``danger-full-access`` (or a config ``sandbox_mode``) does.
+_CODEX_SANDBOX_NAMESPACE_ERROR_MARKER = "No permissions to create new namespace"
+_CODEX_SANDBOX_BYPASS_GUIDANCE = (
+    "Omnigent: Codex's command sandbox could not start because this container "
+    "disallows unprivileged user namespaces, so the command did not run. To run "
+    'shell commands here, start a new Codex session with the "Full access" '
+    "approval preset (New chat → Advanced settings), or set "
+    'sandbox_mode = "danger-full-access" in ~/.codex/config.toml on the runner.'
+)
+
+
+def _augment_sandbox_namespace_error(output_text: str) -> str:
+    """Append recovery guidance when a Codex shell command failed because its
+    own command sandbox could not start (no unprivileged user namespaces).
+
+    Returns *output_text* unchanged when the bwrap-namespace marker is absent,
+    so ordinary command output is never altered. See issue #657.
+
+    :param output_text: Aggregated command output, any exit-code suffix already
+        appended, e.g. ``"bwrap: No permissions ...\\n[exit code: 1]"``.
+    :returns: The output with a trailing guidance paragraph, or unchanged.
+    """
+    if _CODEX_SANDBOX_NAMESPACE_ERROR_MARKER not in output_text:
+        return output_text
+    return f"{output_text}\n\n{_CODEX_SANDBOX_BYPASS_GUIDANCE}"
+
+
 def _command_execution_tool_call(call_id: str, item: dict[str, Any]) -> _CodexToolCall | None:
     """
     Build a tool call from a Codex ``commandExecution`` item.
@@ -4223,6 +4383,9 @@ def _command_execution_tool_call(call_id: str, item: dict[str, Any]) -> _CodexTo
     if isinstance(exit_code, int) and exit_code != 0:
         suffix = f"[exit code: {exit_code}]"
         output_text = f"{output_text}\n{suffix}" if output_text else suffix
+    # Turn codex's opaque "sandbox can't start" bwrap failure into actionable
+    # recovery guidance (issue #657); a no-op for any other output.
+    output_text = _augment_sandbox_namespace_error(output_text)
     return _CodexToolCall(call_id=call_id, name="shell", arguments=arguments, output=output_text)
 
 

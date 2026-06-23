@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omnigent"
-version = "0.1.0"
+version = "0.3.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -25,12 +25,13 @@ dependencies = [
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
     # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.1.0",
-    "omnigent-ui-sdk==0.1.0",
+    "omnigent-client==0.3.0.dev0",
+    "omnigent-ui-sdk==0.3.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
     "openai>=1.0,<3",
-    "rich>=13.0,<14",
+    # >=14: the `e2b` extra's SDK (>=2.26) needs rich>=14 (was >=13,<14).
+    "rich>=14,<15",
     "prompt_toolkit>=3.0,<4",
     "mcp>=1.0,<2",
     "starlette>=0.27,<1",
@@ -42,9 +43,10 @@ dependencies = [
     "psutil>=5.9,<8",
     # CEL (Common Expression Language) for inline policy evaluation.
     # Non-Turing-complete, side-effect-free, guaranteed to terminate.
-    # No ARM64 Linux wheel; excluded on aarch64 so installation succeeds.
-    # The CEL policy module degrades gracefully when the library is absent.
-    'cel-expr-python>=0.1; platform_machine != "aarch64"',
+    # No wheels for Linux aarch64 or macOS x86_64 (Intel); excluded so
+    # installation succeeds. The CEL policy module degrades gracefully
+    # when the library is absent.
+    'cel-expr-python>=0.1; platform_machine != "aarch64" and (sys_platform != "darwin" or platform_machine != "x86_64")',
     # OS keychain for storing model-provider API keys (OSS model
     # selection). Used by omnigent/onboarding/secrets.py; falls back to
     # a 0600 file when no keyring backend is available (e.g. headless).
@@ -78,10 +80,6 @@ dependencies = [
     # to remember `--extra all`. Issue #406.
     "claude-agent-sdk>=0.1.62",
     "openai-agents>=0.0.17",
-    # The Cursor harness drives the cursor-sdk (custom_tools tool bridge over a
-    # local bridge); like the other first-party harnesses it is part of the
-    # baseline install so `--harness cursor` works without `--extra`.
-    "cursor-sdk>=0.1.7",
     "PyJWT[crypto]>=2.8,<3",
     "argon2-cffi>=23.1,<24",
     # PEP 440 version comparison for the update check / `omni upgrade`
@@ -103,6 +101,10 @@ openai-agents = []
 all = ["databricks-sdk>=0.56.0,<1"]
 # From omnigent.
 bedrock = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
+# S3-compatible artifact store (AWS S3, Cloudflare R2, MinIO, …). Selected
+# with ``OMNIGENT_ARTIFACT_URI=s3://bucket/prefix``; the store imports boto3
+# lazily, so only users of this backend need the extra.
+s3 = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 vertex = ["google-auth>=2.0,<3"]
 # Modal sandbox launcher (`omnigent sandbox --provider modal`). The
 # launcher module ships in the base package and imports the SDK lazily,
@@ -112,10 +114,23 @@ modal = ["modal>=1.0,<2"]
 # server-managed `sandbox.provider: daytona`).
 # Same lazy-import posture as the modal extra. Pre-1.0 SDK: pin minor.
 daytona = ["daytona>=0.180,<1"]
+# Boxlite sandbox launcher: server-managed `sandbox.provider: boxlite`, either
+# local embedded micro-VMs (KVM/HVF, no daemon) or a remote `boxlite serve`
+# pool. Same lazy-import posture as the modal/daytona extras. Pre-1.0 SDK: pin
+# minor.
+boxlite = ["boxlite>=0.9.5,<1"]
 # CoreWeave Sandbox launcher (`omnigent sandbox --provider cwsandbox` and
 # server-managed `sandbox.provider: cwsandbox`).
 # Same lazy-import posture as above. Pre-1.0 SDK: pin minor.
 cwsandbox = ["cwsandbox>=0.24,<1"]
+# E2B sandbox launcher (`omnigent sandbox --provider e2b` and
+# server-managed `sandbox.provider: e2b`).
+# Same lazy-import posture as above.
+e2b = ["e2b>=2.26,<3"]
+# NVIDIA OpenShell launcher (`omnigent sandbox --provider openshell`).
+# Self-hosted gRPC gateway; the SDK pulls grpcio + protobuf. Same
+# lazy-import posture as above. Pre-1.0 SDK: pin minor.
+openshell = ["openshell>=0.0.7,<1"]
 # MLflow tracing is opt-in: tracing is disabled by default and the
 # server degrades gracefully when mlflow is absent, so the (heavy) mlflow
 # dependency only installs for users who want it (`omnigent[tracing]`).
@@ -130,6 +145,11 @@ agents-sdk = [
 # harness module imports the SDK lazily on first turn, so only users of the
 # harness need this extra. Early SDK (v0.1.x) — pin minor.
 antigravity = ["google-antigravity>=0.1,<1"]
+# Cursor SDK harness (`harness: cursor`). Optional like antigravity: the
+# harness imports the cursor-sdk lazily on first turn, so only `--harness
+# cursor` users need this extra (`omnigent[cursor]`). Was a baseline dependency;
+# now opt-in to keep the default install lean.
+cursor = ["cursor-sdk>=0.1.7"]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
@@ -156,7 +176,12 @@ dev = [
     # `[tool.coverage.run]` below for the relative-files setting that makes
     # cross-runner combine work.
     "pytest-cov>=5",
-    "pytest-playwright>=0.5",
+    "pytest-playwright>=0.7",
+    # Visual-regression snapshot plugin for the e2e_ui suite. Provides the
+    # `assert_snapshot` fixture + `--update-snapshots` flag the UI diff gate
+    # uses (see tests/e2e_ui/visual/ and .github/workflows/ui-snapshot.yml).
+    # Requires pytest-playwright>=0.7 (hence the floor bump above).
+    "pytest-playwright-visual-snapshot>=0.5.1",
     # Hash-partition the test suite across N shards for the nightly
     # matrix. Pinned to a known-stable older release. Used by e2e.yml;
     # the e2e-ui suite uses its own round-robin `--splits`/`--group`
@@ -191,6 +216,16 @@ dev = [
     # gitwildmatch glob matching for repo tooling manifests. Declared
     # explicitly rather than relied on transitively (via mypy).
     "pathspec>=0.12",
+    # Cloud-service mocks for the artifact-store / Cloudflare integration
+    # tests: moto is the standard S3-compatible mock (used for R2), respx is
+    # the standard HTTPX mock (used to back the Cloudflare D1 REST API with an
+    # in-memory SQLite), and boto3 backs the S3 artifact store under test.
+    "moto[s3]>=5,<6",
+    "respx>=0.21,<1",
+    "boto3>=1.30,<2",
+    # The Cloudflare D1 SQLAlchemy dialect, exercised by the D1 FTS integration
+    # test (tests/db/test_d1_fts_dialect.py) via respx + sqlite3.
+    "sqlalchemy-cloudflare-d1==0.3.10",
 ]
 
 [project.scripts]
@@ -267,7 +302,16 @@ markers = [
     "llm_flaky(reruns=2, reruns_delay=1): rerun a nondeterministic real-LLM test on failure, rotating to a different model each attempt (tests/_model_pools.py). Never apply to heavy e2e tests that can hit the CI --timeout=180 cap (rerun + loadscope can crash the shard).",
     "in_process_sessions: run a server integration test with the legacy in-process sessions path instead of sessions-native runner dispatch.",
     "nightly: runs only in the scheduled/dispatch pass of its suite; PR and push runs exclude it via -m 'not nightly'. Remove the marker to promote a burned-in test to the PR gate.",
+    "min_server_version(version): skip this test when the live server under test is older than `version` (PEP 440 release-tuple comparison, so a `.devN` of X satisfies X). Used by the server-version backwards-compat CI (docs/SERVER_VERSION_COMPAT_CI.md); inert in normal runs where the server is current.",
+    "mock_only: tests/integration test that only works in mock-LLM mode (no --llm-api-key). Skipped by tests/integration/conftest.py when a real --llm-api-key is supplied (the real-LLM Integration jobs). Use for tests whose mock LLM is scripted with a fixed tool-call sequence — a real LLM cannot reproduce the scripted markers.",
+    "visual: UI diff visual-regression snapshot (pytest-playwright-visual-snapshot). Runs only in the pinned-runner gate (.github/workflows/ui-snapshot.yml); the main e2e_ui suite excludes it via -m 'not visual' since it runs on the unpinned ubuntu-latest.",
 ]
+# Visual snapshot baselines are committed here, keyed per-OS by the plugin
+# (e.g. test_empty_landing_matches_baseline[linux].png). Failure artifacts
+# (actual/expected/diff PNGs) land in the gitignored sibling dir. Both are
+# relative to the repo root, which is where pytest is always invoked.
+playwright_visual_snapshots_path = "tests/e2e_ui/visual/snapshots"
+playwright_visual_snapshot_failures_path = "tests/e2e_ui/visual/snapshot_failures"
 
 [tool.coverage.run]
 # Measure the shipped package only; tests live under tests/.
@@ -475,6 +519,29 @@ ignore_missing_imports = true
 # posture as modal above.
 [[tool.mypy.overrides]]
 module = "cwsandbox.*"
+ignore_missing_imports = true
+
+# e2b is an optional dep (the `e2b` extra); same lazy-import posture as
+# modal above.
+[[tool.mypy.overrides]]
+module = "e2b.*"
+ignore_missing_imports = true
+
+# openshell is an optional dep (the `openshell` extra); same lazy-import
+# posture as modal above. grpc rides in via the openshell SDK and is not
+# a base dependency, so its imports are unresolved in the default env too.
+[[tool.mypy.overrides]]
+module = "openshell.*"
+ignore_missing_imports = true
+
+# boxlite is an optional dep (the `boxlite` extra); same lazy-import posture
+# as modal above.
+[[tool.mypy.overrides]]
+module = "boxlite.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "grpc.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

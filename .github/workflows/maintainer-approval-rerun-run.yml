@@ -80,3 +80,30 @@ jobs:
               core.info(`Re-running Maintainer Approval run ${run_id} for PR #${pull_number}`);
               await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: Number(run_id) });
             }
+
+      # Fork PRs: maintainer approval also gates e2e (replacing the old
+      # e2e-approved label). Dispatch the fork-e2e-mirror workflow so the
+      # approval triggers e2e on the trusted mirror branch.
+      - name: Dispatch fork e2e mirror for fork PRs
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            if (!fs.existsSync('pr_number')) {
+              core.info('No pr_number file; nothing to do.');
+              return;
+            }
+            const pull_number = Number(fs.readFileSync('pr_number', 'utf8').trim());
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number });
+            if (!pr.head.repo || pr.head.repo.full_name === `${owner}/${repo}`) {
+              core.info(`PR #${pull_number} is same-repo; skipping fork-e2e-mirror dispatch.`);
+              return;
+            }
+            core.info(`PR #${pull_number} is a fork PR; dispatching fork-e2e-mirror.`);
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo,
+              workflow_id: 'fork-e2e-mirror.yml',
+              ref: 'main',
+              inputs: { pr: String(pull_number) },
+            });

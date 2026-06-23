@@ -158,7 +158,7 @@ class FunctionPolicy(Policy):
         would accumulate forever and a "15 calls per turn"
         limit would silently degrade to "15 calls per session"
         under Omnigent mode — see
-        :meth:`omnigent.inner.policies.FunctionPolicy.reset_turn`
+        :meth:`omnigent.runtime.policies.engine.PolicyEngine.reset_turn`
         for the native equivalent we mirror.
 
         Stateless callables (no ``reset_turn`` attribute) are a
@@ -304,6 +304,16 @@ def resolve_function_policy(spec: FunctionPolicySpec) -> FunctionPolicy:
             f"{func_ref.path!r} is not callable (got "
             f"{type(callable_obj).__name__})",
         )
+    # Deferred import avoids a circular init cycle:
+    # function.py → _omnigent_legacy_shim → policies.types →
+    # policies.__init__ → function.py (partially initialised).
+    from omnigent.spec._omnigent_legacy_shim import (
+        _has_legacy_signature,
+        _wrap_legacy,
+    )
+
+    if _has_legacy_signature(callable_obj):
+        callable_obj = _wrap_legacy(callable_obj)
     return FunctionPolicy(spec, callable_obj)
 
 

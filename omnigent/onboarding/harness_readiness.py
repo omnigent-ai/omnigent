@@ -50,6 +50,14 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
 # be gated explicitly or they fail open like an unknown harness.
 _PI_HARNESSES: frozenset[str] = frozenset({PI_SURFACE, "pi-native"})
 
+# Native Cursor harnesses. These boot the ``cursor-agent`` TUI (``omni cursor``)
+# and so, like the other native CLI harnesses, can't launch without that binary
+# on ``PATH`` — gate them on it. Distinct from the SDK ``cursor`` harness
+# (``CURSOR_KEY`` below), which runs in-process via ``cursor-sdk`` and gates on
+# a ``CURSOR_API_KEY`` instead. Without these entries they'd fail open like an
+# unknown harness, letting a binary-less launch die inside the executor.
+_CURSOR_NATIVE_HARNESSES: frozenset[str] = frozenset({"cursor-native", "native-cursor"})
+
 
 def _canonical_harness(harness: str) -> str:
     """Normalize a harness id to its canonical spelling.
@@ -100,16 +108,26 @@ def harness_is_configured(harness: str) -> bool:
     canonical = _canonical_harness(harness)
     if canonical in _SDK_HARNESSES:
         return True
+    if canonical in _CURSOR_NATIVE_HARNESSES:
+        # Native Cursor (``omni cursor``) wraps the ``cursor-agent`` CLI — gate
+        # on that binary, like ``claude-native`` / ``codex-native``. (Login
+        # state surfaces at run time; the daemon gates only on binary presence,
+        # mirroring the other native harnesses.)
+        return harness_cli_installed(CURSOR_KEY)
     if canonical == CURSOR_KEY:
-        # Cursor runs in-process via the ``cursor-sdk`` package (a baseline
-        # dependency, always importable) and authenticates against Cursor's own
-        # backend with a ``CURSOR_API_KEY`` — the SDK requires one, and a
-        # ``cursor-agent login`` does not apply. So, unlike the CLI-wrapping
-        # harnesses, there is no binary to gate on: readiness is whether a key
-        # is resolvable — one stored by ``omnigent setup`` (the ``cursor:``
-        # config block — see :mod:`omnigent.onboarding.cursor_auth`) or
-        # inherited from the environment. That is the one cursor credential the
-        # daemon can check cheaply and locally; a bad key surfaces at run time.
+        # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
+        # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
+        # unlike the CLI-wrapping harnesses, there is no binary to gate on:
+        # readiness is whether a key is resolvable — stored by ``omnigent setup``
+        # (the ``cursor:`` block — see :mod:`omnigent.onboarding.cursor_auth`)
+        # or inherited from the env. A bad key surfaces at run time.
+        #
+        # ``cursor-sdk`` is now an OPTIONAL extra, but we deliberately do NOT
+        # also gate on SDK presence: this mirrors ``antigravity`` (also SDK-only
+        # and now-optional, never gated on the SDK). A missing SDK surfaces as
+        # the executor's import error on the first turn
+        # (:mod:`omnigent.inner.cursor_executor`); gating here would only
+        # duplicate that, less actionably. So cursor keeps its single key check.
         from omnigent.onboarding.cursor_auth import cursor_api_key_configured
 
         return cursor_api_key_configured() or bool(os.environ.get("CURSOR_API_KEY"))
@@ -138,5 +156,6 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_EXECUTOR_TYPE_HARNESS_ALIASES)
     spellings.update(HARNESS_ALIASES)
     spellings.update(_PI_HARNESSES)
+    spellings.update(_CURSOR_NATIVE_HARNESSES)
     spellings.add(CURSOR_KEY)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}

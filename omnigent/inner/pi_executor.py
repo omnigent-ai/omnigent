@@ -51,6 +51,7 @@ from urllib.parse import urlparse as _urlparse
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
+from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_subprocess_transport
@@ -124,6 +125,37 @@ JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dic
 # ---------------------------------------------------------------------------
 # TCP tool server — serves Omnigent tools to the Pi extension
 # ---------------------------------------------------------------------------
+
+
+def _safe_dumps(response: dict[str, Any], req_id: str | None) -> str:  # type: ignore[explicit-any]
+    """Serialize a tool-server response, never raising on bad payloads.
+
+    Tool callbacks may return values ``json.dumps`` can't encode (a
+    ``datetime``, ``set``, ``bytes``, custom object, ...). Encoding happens
+    on the response path *outside* :meth:`_ToolServer._execute`'s try, so an
+    unguarded ``json.dumps`` would propagate and the connection would close
+    with zero bytes written — leaving the JS ``callTool`` promise pending and
+    hanging the entire Pi turn. Mirrors codex's ``_result_text`` guard: on a
+    serialization failure, fall back to an ``{"error": ...}`` envelope so the
+    client always receives a valid frame.
+
+    :param response: The response dict to serialize.
+    :param req_id: The originating request id, echoed back on the error
+        envelope so the client correlates the failure with its call.
+    :returns: A compact JSON string (no trailing newline).
+    """
+    try:
+        return json.dumps(response, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        # Stringify ``req_id`` so the fallback envelope itself can never raise
+        # on a non-serializable id (the caller passes a ``str`` today, but the
+        # guard must hold for any future caller). ``None`` stays ``None`` so the
+        # client still sees a null id rather than the literal "None".
+        safe_id: str | None = req_id if req_id is None or isinstance(req_id, str) else str(req_id)
+        return json.dumps(
+            {"id": safe_id, "error": f"unserializable tool result: {exc}"},
+            separators=(",", ":"),
+        )
 
 
 class _ToolServer:
@@ -215,7 +247,14 @@ class _ToolServer:
                 else:
                     response = await self._execute(raw_tool_name, tool_args)
                     response["id"] = raw_req_id
-                out = json.dumps(response, separators=(",", ":")) + "\n"
+                # Serialize defensively: a tool result may carry a value
+                # ``json.dumps`` can't encode (e.g. ``datetime``/``set``).
+                # If it raises here — outside ``_execute``'s try — the frame
+                # is never written and the JS ``callTool`` promise hangs the
+                # whole turn (no ``data``/``error`` event). Always emit a JSON
+                # frame: a serializable error envelope when the response can't
+                # be encoded, mirroring codex's ``_result_text`` guard.
+                out = _safe_dumps(response, raw_req_id) + "\n"
                 writer.write(out.encode("utf-8"))
                 await writer.drain()
         except (asyncio.CancelledError, ConnectionError):
@@ -373,7 +412,17 @@ const TOKEN = {token_json};
 
 /** Send a tool call request over TCP and return the result. */
 function callTool(toolName, args) {{
-  return new Promise((resolve, reject) => {{
+  return new Promise((resolve) => {{
+    // Idempotent settle: a tool call must resolve exactly once. Route every
+    // resolve through finish() so a late "close" after a real "data" response
+    // can't clobber the result, and a bare close with no data still resolves
+    // (rather than hanging Pi's agent loop forever).
+    let settled = false;
+    const finish = (v) => {{ if (!settled) {{ settled = true; resolve(v); }} }};
+    const errorResult = (text) => ({{
+      content: [{{ type: "text", text: JSON.stringify({{ error: text }}) }}],
+      isError: true
+    }});
     const client = net.createConnection({{ port: PORT, host: "127.0.0.1" }}, () => {{
       const id = Math.random().toString(36).slice(2);
       const req = JSON.stringify({{ id, token: TOKEN, tool: toolName, args }}) + "\\n";
@@ -386,39 +435,33 @@ function callTool(toolName, args) {{
             const resp = JSON.parse(buf.slice(0, nl));
             client.end();
             if (resp.error) {{
-              resolve({{
-                content: [{{ type: "text", text: JSON.stringify({{ error: resp.error }}) }}],
-                isError: true
-              }});
+              finish(errorResult(resp.error));
             }} else {{
               const text = typeof resp.result === "string"
                 ? resp.result
                 : JSON.stringify(resp.result);
               const isError = resp.result && (resp.result.error || resp.result.blocked);
-              resolve({{ content: [{{ type: "text", text }}], isError: !!isError }});
+              finish({{ content: [{{ type: "text", text }}], isError: !!isError }});
             }}
           }} catch (e) {{
             client.end();
-            resolve({{
-              content: [{{ type: "text", text: JSON.stringify({{ error: e.message }}) }}],
-              isError: true
-            }});
+            finish(errorResult(e.message));
           }}
         }}
       }});
       client.on("error", (err) => {{
-        resolve({{
-          content: [{{ type: "text", text: JSON.stringify({{ error: err.message }}) }}],
-          isError: true
-        }});
+        finish(errorResult(err.message));
+      }});
+      // A clean FIN with no bytes (e.g. the server failed to serialize the
+      // result and closed) emits neither "data" nor "error"; without this
+      // the promise would hang forever. finish() is a no-op if already settled.
+      client.on("close", () => {{
+        finish(errorResult("tool server closed connection without a response"));
       }});
       client.write(req);
     }});
     client.on("error", (err) => {{
-      resolve({{
-        content: [{{ type: "text", text: JSON.stringify({{ error: err.message }}) }}],
-        isError: true
-      }});
+      finish(errorResult(err.message));
     }});
   }});
 }}
@@ -533,6 +576,22 @@ _DATABRICKS_RESPONSES_MODELS = [
         "maxTokens": 32768,
         "input": ["text", "image"],
     },
+    {
+        "id": "databricks-gpt-5-5",
+        "name": "GPT-5.5",
+        # OSS profile endpoint metadata: 400K total context, 128K max output.
+        "contextWindow": 400000,
+        "maxTokens": 128000,
+        "input": ["text", "image"],
+    },
+    {
+        "id": "databricks-gpt-5-5-pro",
+        "name": "GPT-5.5 Pro",
+        # OSS profile endpoint metadata: 400K total context, 128K max output.
+        "contextWindow": 400000,
+        "maxTokens": 128000,
+        "input": ["text", "image"],
+    },
 ]
 
 _DATABRICKS_ANTHROPIC_MODELS = [
@@ -597,9 +656,51 @@ _PI_ENV_ALLOW_EXACT: frozenset[str] = frozenset(
         "LOGNAME",
         "SHELL",
         "TZ",
+        OMNIGENT_SESSION_ENV_VAR,  # "inside Omnigent" marker (CLAUDE_CODE/CODEX analog)
     }
 )
 _STREAM_READ_CHUNK_SIZE = 65536
+
+# CLI flags whose values are sensitive (e.g. the full system prompt) and must
+# not be written to logs verbatim. The value following these flags is replaced
+# with a length-only placeholder.
+_REDACTED_ARGV_FLAGS = frozenset({"--append-system-prompt", "--system-prompt"})
+
+
+def _redact_argv_for_log(args: Sequence[str]) -> list[str]:
+    """
+    Return a copy of ``args`` with sensitive flag values redacted for logging.
+
+    The system prompt value (e.g. passed via ``--append-system-prompt``) is
+    replaced with a ``[system prompt N chars]`` placeholder so it never leaks
+    into debug logs. Two argv forms are handled:
+
+    * the two-token form ``--append-system-prompt <value>`` (what the current
+      spawn code emits), and
+    * the equals-joined form ``--append-system-prompt=<value>`` (not emitted
+      today, but redacted defensively in case a future refactor switches to it).
+
+    All other tokens are preserved so the command remains useful for debugging.
+    """
+    redacted: list[str] = []
+    redact_next = False
+    for arg in args:
+        if redact_next:
+            redacted.append(f"[system prompt {len(arg)} chars]")
+            redact_next = False
+            continue
+        if arg in _REDACTED_ARGV_FLAGS:
+            # Two-token form: redact the following value token.
+            redacted.append(arg)
+            redact_next = True
+            continue
+        flag, sep, value = arg.partition("=")
+        if sep and flag in _REDACTED_ARGV_FLAGS:
+            # Equals-joined form: redact the inline value, keep the flag name.
+            redacted.append(f"{flag}=[system prompt {len(value)} chars]")
+            continue
+        redacted.append(arg)
+    return redacted
 
 
 def _build_models_json(
@@ -843,7 +944,7 @@ class _PiRpcSession:
         if extra_args:
             args.extend(extra_args)
 
-        logger.debug("PiExecutor: spawning %s", " ".join(args))
+        logger.debug("PiExecutor: spawning %s", " ".join(_redact_argv_for_log(args)))
         self.process = await _create_subprocess_exec(
             *args,
             stdin=asyncio.subprocess.PIPE,

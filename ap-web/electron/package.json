@@ -1,7 +1,7 @@
 {
   "name": "omnigent-desktop-electron",
   "productName": "Omnigent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Omnigent desktop shell (Electron edition) — a thin native wrapper around the server-served web UI.",
   "private": true,
   "main": "src/main.js",
@@ -31,6 +31,15 @@
       "setup/**/*",
       "find/**/*",
       "icons/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../platform-assets",
+        "to": "platform-assets",
+        "filter": [
+          "**/*"
+        ]
+      }
     ],
     "mac": {
       "category": "public.app-category.developer-tools",

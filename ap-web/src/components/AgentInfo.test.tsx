@@ -8,8 +8,11 @@ import { useChatStore } from "@/store/chatStore";
 // Mock the policies data layer so SessionPoliciesSection and AddPolicyDialog
 // render deterministically without network. The add/delete mutations expose
 // `mutate` spies we can assert on.
-const addMutate = vi.fn();
-const deleteMutate = vi.fn();
+const { addMutate, deleteMutate, copyTextMock } = vi.hoisted(() => ({
+  addMutate: vi.fn(),
+  deleteMutate: vi.fn(),
+  copyTextMock: vi.fn(() => Promise.resolve()),
+}));
 const policiesData = { current: [] as unknown[] };
 const registryData = { current: [] as unknown[] };
 vi.mock("@/hooks/usePolicies", () => ({
@@ -18,11 +21,13 @@ vi.mock("@/hooks/usePolicies", () => ({
   useAddPolicy: () => ({ mutate: addMutate, isPending: false, isError: false, error: null }),
   useDeletePolicy: () => ({ mutate: deleteMutate }),
 }));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 
-import { AgentInfoButton, AgentInfoContent } from "./AgentInfo";
+import { AgentInfoButton, AgentInfoContent, agentDisplayLabel } from "./AgentInfo";
 
 afterEach(() => {
   cleanup();
+  copyTextMock.mockClear();
 });
 
 function renderButton(agent: Agent | undefined) {
@@ -150,6 +155,21 @@ describe("AgentInfoButton session cost row", () => {
     // The rest of the popover still renders (agent name proves it opened).
     expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
     expect(screen.queryByTestId("agent-info-session-cost")).toBeNull();
+  });
+});
+
+describe("AgentInfoButton session id row", () => {
+  it("shows and copies the active session id in the popover", async () => {
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_info123");
+
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    expect(screen.getByTestId("agent-info-session-id")).toHaveTextContent("conv_info123");
+    fireEvent.click(screen.getByTestId("agent-info-copy-session-id"));
+
+    expect(copyTextMock).toHaveBeenCalledTimes(1);
+    expect(copyTextMock).toHaveBeenCalledWith("conv_info123");
+    expect(await screen.findByRole("button", { name: "Copied session ID" })).toBeInTheDocument();
   });
 });
 
@@ -353,5 +373,37 @@ describe("SessionPoliciesSection", () => {
     expect(
       within(dialog).getByText("All available policies are already applied."),
     ).toBeInTheDocument();
+  });
+});
+
+describe("agentDisplayLabel", () => {
+  it("maps native wrapper slugs to their display name", () => {
+    expect(agentDisplayLabel("pi-native-ui")).toBe("Pi");
+    expect(agentDisplayLabel("claude-native-ui")).toBe("Claude");
+    expect(agentDisplayLabel("codex-native-ui")).toBe("Codex");
+  });
+
+  it("strips the fork/switch clone suffix before resolving the native label", () => {
+    // Fork/switch routes clone a bound agent as "<name> (fork|switch <id>)".
+    // The label must still resolve to "Pi" rather than the capitalized raw
+    // slug "Pi-native-ui …" shown in the in-session model picker.
+    expect(agentDisplayLabel("pi-native-ui (fork conv_ab12)")).toBe("Pi");
+    expect(agentDisplayLabel("pi-native-ui (switch conv_ab12)")).toBe("Pi");
+    expect(agentDisplayLabel("claude-native-ui (fork conv_ab12)")).toBe("Claude");
+    expect(agentDisplayLabel("codex-native-ui (switch conv_ab12)")).toBe("Codex");
+  });
+
+  it("strips EVERY clone layer of a fork-of-a-fork before resolving", () => {
+    // A fork of a fork nests suffixes. A single-layer strip would leave
+    // "pi-native-ui (fork conv_a)" — no native match → the raw slug leaks
+    // into the model picker. agentRootName peels every layer to the root.
+    expect(agentDisplayLabel("pi-native-ui (fork conv_a) (fork conv_b)")).toBe("Pi");
+    expect(agentDisplayLabel("claude-native-ui (fork conv_a) (switch conv_b)")).toBe("Claude");
+    expect(agentDisplayLabel("polly (fork conv_a) (fork conv_b)")).toBe("Polly");
+  });
+
+  it("capitalizes non-native names and strips their clone suffix", () => {
+    expect(agentDisplayLabel("polly")).toBe("Polly");
+    expect(agentDisplayLabel("polly (fork conv_ab12)")).toBe("Polly");
   });
 });

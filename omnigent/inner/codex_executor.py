@@ -25,6 +25,7 @@ from typing import Any, Protocol, TypeAlias
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
+from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_subprocess_transport
@@ -39,6 +40,7 @@ from .executor import (
     ExecutorError,
     ExecutorEvent,
     Message,
+    ReasoningChunk,
     TextChunk,
     ToolArgs,
     ToolCallComplete,
@@ -399,6 +401,7 @@ def _clean_codex_env() -> dict[str, str]:
         "PYTHONUTF8",
         "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
         "DATABRICKS_CODEX_TOKEN",  # env_key referenced by ~/.codex/config.toml's DB provider
+        OMNIGENT_SESSION_ENV_VAR,  # "inside Omnigent" marker (CLAUDE_CODE/CODEX analog)
     }
     for key, value in os.environ.items():
         if key in _CODEX_ENV_DENY_EXACT:
@@ -1339,12 +1342,15 @@ class _CodexAppServerSession:
             if not isinstance(item, dict) or item.get("type") != "agentMessage":
                 continue
             phase, completed_text = _completed_agent_message_text(item, message_buffers)
-            if phase == "final_answer" or not final_response:
+            if phase == "commentary":
+                item_id = item.get("id")
+                if isinstance(item_id, str):
+                    message_buffers.pop(item_id, None)
+                continue
+            if phase == "final_answer" or phase is None:
                 final_response = completed_text
             if phase == "final_answer":
                 return final_response
-            if not final_response:
-                final_response = _latest_buffered_agent_message(message_buffers)
 
     async def run_turn(
         self,
@@ -1580,6 +1586,15 @@ class _CodexAppServerSession:
                     yield TextChunk(text=delta)
                     continue
 
+                if method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
+                    if not _event_turn_matches(params):
+                        continue
+                    raw_reasoning_delta = params.get("delta")
+                    if not isinstance(raw_reasoning_delta, str) or not raw_reasoning_delta:
+                        continue
+                    yield ReasoningChunk(delta=raw_reasoning_delta, event_type="reasoning_text")
+                    continue
+
                 if method == "item/completed":
                     if not _event_turn_matches(params):
                         continue
@@ -1605,7 +1620,10 @@ class _CodexAppServerSession:
                         phase, completed_text = _completed_agent_message_text(
                             item, message_buffers
                         )
-                        if phase == "final_answer" or not final_response:
+                        if phase == "commentary":
+                            message_buffers.pop(completed_item_id, None)
+                            continue
+                        if phase == "final_answer" or phase is None:
                             final_response = completed_text
                         if phase == "final_answer":
                             # Diagnostic: log response head + turn id so
@@ -1663,6 +1681,8 @@ class _CodexAppServerSession:
                     return
 
                 if method == "turn/failed":
+                    if isinstance(params, dict) and params.get("willRetry") is True:
+                        continue
                     turn = params.get("turn", {}) if isinstance(params, dict) else {}
                     raw_failed_turn_id = turn.get("id")
                     failed_turn_id: str | None = (
@@ -1685,6 +1705,8 @@ class _CodexAppServerSession:
                     return
 
                 if method == "error":
+                    if isinstance(params, dict) and params.get("willRetry") is True:
+                        continue
                     # JSON-RPC-shaped error frames from the app server
                     # carry ``code`` / ``message`` / ``data``. Some error
                     # paths populate only ``code``+``data`` and leave

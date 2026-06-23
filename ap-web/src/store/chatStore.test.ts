@@ -175,6 +175,8 @@ let sessionPendingInputs: Map<
 // Per-session cost-control switch the snapshot/PATCH handlers serve;
 // absent key = unset (the wire field comes back null).
 let sessionCostControlOverrides: Map<string, "on" | "off">;
+// Per-session labels the snapshot/PATCH handlers serve.
+let sessionLabels: Map<string, Record<string, string>>;
 
 /** Default fetch router: dispatch by URL. Tests override per-call as needed. */
 function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Response {
@@ -243,8 +245,10 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       ? (JSON.parse(init.body as string) as {
           runner_id?: string;
           cost_control_mode_override?: "on" | "off" | null;
+          collaboration_mode?: string;
         })
       : {};
+    const labels = { ...(sessionLabels.get(sessionId) ?? {}) };
     // Echo a cost-switch write back like the real server does, so the
     // store's canonical refresh sees the persisted value.
     if ("cost_control_mode_override" in body) {
@@ -254,6 +258,10 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
         sessionCostControlOverrides.set(sessionId, body.cost_control_mode_override);
       }
     }
+    if ("collaboration_mode" in body && typeof body.collaboration_mode === "string") {
+      labels["omnigent.codex_native.collaboration_mode"] = body.collaboration_mode;
+      sessionLabels.set(sessionId, labels);
+    }
     return mockResponse({
       id: sessionId,
       agent_id: "agent_xyz",
@@ -261,6 +269,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       status: "idle",
       created_at: 0,
       items: sessionSnapshots.get(sessionId) ?? [],
+      labels,
       cost_control_mode_override: sessionCostControlOverrides.get(sessionId) ?? null,
     });
   }
@@ -272,6 +281,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       status: "idle",
       created_at: 0,
       items: sessionSnapshots.get(sessionId) ?? [],
+      labels: sessionLabels.get(sessionId) ?? {},
       pending_elicitations: sessionPendingElicitations.get(sessionId) ?? [],
       pending_inputs: sessionPendingInputs.get(sessionId) ?? [],
       cost_control_mode_override: sessionCostControlOverrides.get(sessionId) ?? null,
@@ -334,6 +344,7 @@ beforeEach(() => {
   sessionPendingElicitations = new Map();
   sessionPendingInputs = new Map();
   sessionCostControlOverrides = new Map();
+  sessionLabels = new Map();
   initChatStore(client);
   useChatStore.setState({
     conversationId: null,
@@ -350,6 +361,7 @@ beforeEach(() => {
     loadingConversation: false,
     conversationLoadError: null,
     costControlModeOverride: null,
+    codexPlanMode: false,
     abortController: null,
   });
   fetchMock.mockReset();
@@ -983,6 +995,7 @@ describe("chatStore — switchTo", () => {
     // One GET proves bindStream refetched instead of trusting the
     // pre-populated React Query session cache.
     expect(sessionFetches).toHaveLength(1);
+    expect(String(sessionFetches[0]?.[0])).toContain("refresh_state=true");
 
     const blocks = useChatStore.getState().blocks;
     // The server snapshot has one message; seeing any other count would
@@ -3306,17 +3319,156 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("refreshSessionState", () => {
+    it("forces a fresh snapshot and applies runner-backed Codex model options", async () => {
+      useChatStore.setState({
+        conversationId: "conv_codex",
+        skills: [],
+        codexModelOptions: [],
+        terminalPending: false,
+      });
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.split("?")[0] === "/v1/sessions/conv_codex" && (init?.method ?? "GET") === "GET") {
+          return mockResponse({
+            id: "conv_codex",
+            agent_id: "agent_xyz",
+            agent_name: "Codex Agent",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            labels: { "omnigent.wrapper": "codex-native-ui" },
+            llm_model: "gpt-5.5",
+            harness: "codex",
+            skills: [{ name: "inspect", description: "Read session state" }],
+            model_options: [
+              {
+                id: "gpt-5.5",
+                model: "gpt-5.5",
+                displayName: "GPT-5.5",
+                defaultReasoningEffort: "medium",
+                supportedReasoningEfforts: [
+                  { reasoningEffort: "low", description: "Low" },
+                  { reasoningEffort: "medium", description: "Medium" },
+                  { reasoningEffort: "xhigh", description: "Extra high" },
+                ],
+                isDefault: true,
+              },
+            ],
+            terminal_pending: true,
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().refreshSessionState("conv_codex");
+
+      const sessionFetch = fetchMock.mock.calls.find(([u]) =>
+        String(u).startsWith("/v1/sessions/conv_codex?"),
+      );
+      expect(String(sessionFetch?.[0])).toContain("refresh_state=true");
+      expect(useChatStore.getState()).toMatchObject({
+        boundAgentName: "Codex Agent",
+        isNativeTerminalSession: true,
+        llmModel: "gpt-5.5",
+        sessionHarness: "codex",
+        terminalPending: true,
+        skills: [{ name: "inspect", description: "Read session state" }],
+        codexModelOptions: [
+          {
+            id: "gpt-5.5",
+            model: "gpt-5.5",
+            displayName: "GPT-5.5",
+            defaultReasoningEffort: "medium",
+            supportedReasoningEfforts: [
+              { reasoningEffort: "low", description: "Low" },
+              { reasoningEffort: "medium", description: "Medium" },
+              { reasoningEffort: "xhigh", description: "Extra high" },
+            ],
+            isDefault: true,
+          },
+        ],
+      });
+    });
+  });
+
   describe("session.model", () => {
     it("reflects a TUI-side model switch in selectedModel", () => {
       // A `/model` change typed into the Claude Code terminal arrives
       // as session.model; the picker selection must follow it.
-      useChatStore.setState({ selectedModel: "opus" });
+      useChatStore.setState({ conversationId: "conv_abc", selectedModel: "opus" });
       handleSessionEvent({
         type: "session_model",
         conversationId: "conv_abc",
         model: "sonnet",
       });
       expect(useChatStore.getState().selectedModel).toBe("sonnet");
+    });
+
+    it("ignores a model event from a different session", () => {
+      useChatStore.setState({ conversationId: "conv_open", selectedModel: "opus" });
+      handleSessionEvent({
+        type: "session_model",
+        conversationId: "conv_other",
+        model: "sonnet",
+      });
+      expect(useChatStore.getState().selectedModel).toBe("opus");
+    });
+  });
+
+  describe("session.reasoning_effort", () => {
+    it("reflects a TUI-side effort switch in selectedEffort", () => {
+      // A thinking-level change inside a native terminal arrives as
+      // session.reasoning_effort; the effort picker must follow it.
+      useChatStore.setState({ conversationId: "conv_abc", selectedEffort: "high" });
+      handleSessionEvent({
+        type: "session_reasoning_effort",
+        conversationId: "conv_abc",
+        reasoningEffort: "medium",
+      });
+      expect(useChatStore.getState().selectedEffort).toBe("medium");
+    });
+
+    it("reflects a terminal effort clear in selectedEffort", () => {
+      useChatStore.setState({ conversationId: "conv_abc", selectedEffort: "medium" });
+      handleSessionEvent({
+        type: "session_reasoning_effort",
+        conversationId: "conv_abc",
+        reasoningEffort: null,
+      });
+      expect(useChatStore.getState().selectedEffort).toBeNull();
+    });
+
+    it("ignores an effort event from a different session", () => {
+      useChatStore.setState({ conversationId: "conv_open", selectedEffort: "high" });
+      handleSessionEvent({
+        type: "session_reasoning_effort",
+        conversationId: "conv_other",
+        reasoningEffort: "medium",
+      });
+      expect(useChatStore.getState().selectedEffort).toBe("high");
+    });
+  });
+
+  describe("session.collaboration_mode", () => {
+    it("reflects a collaboration-mode event for the active session", () => {
+      useChatStore.setState({ conversationId: "conv_abc", codexPlanMode: false });
+      handleSessionEvent({
+        type: "session_collaboration_mode",
+        conversationId: "conv_abc",
+        mode: "plan",
+      });
+      expect(useChatStore.getState().codexPlanMode).toBe(true);
+    });
+
+    it("ignores a collaboration-mode event from a different session", () => {
+      useChatStore.setState({ conversationId: "conv_open", codexPlanMode: false });
+      handleSessionEvent({
+        type: "session_collaboration_mode",
+        conversationId: "conv_other",
+        mode: "plan",
+      });
+      expect(useChatStore.getState().codexPlanMode).toBe(false);
     });
   });
 
@@ -3931,6 +4083,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       session_name: "auth",
       current_task_status: "in_progress",
       busy: true,
+      last_task_error: null,
       last_message_preview: "looking…",
       ...overrides,
     });
@@ -3952,6 +4105,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
           session_name: "auth",
           labels: {},
           current_task_status: "in_progress",
+          last_task_error: null,
           busy: true,
           last_message_preview: "looking…",
           // Insert path defaults the count to 0 when the delta omits it.
@@ -4043,6 +4197,80 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       expect(row?.last_message_preview).toBe("found the bug"); // updated
       expect(row?.busy).toBe(true); // preserved
       expect(row?.current_task_status).toBe("in_progress"); // preserved
+    });
+
+    it("merges a failed status delta with a durable error", () => {
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
+        {
+          id: "conv_child1",
+          title: "researcher:auth",
+          tool: "researcher",
+          session_name: "auth",
+          current_task_status: "in_progress",
+          busy: true,
+          last_message_preview: "booting worker",
+          pending_elicitations_count: 0,
+        },
+      ]);
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: {
+          id: "conv_child1",
+          busy: false,
+          current_task_status: "failed",
+          last_task_error: {
+            code: "required_terminal_exited",
+            message: "Required terminal exited unexpectedly",
+          },
+        },
+      });
+      const row = client.getQueryData<ChildSessionInfo[]>(
+        childSessionsQueryKey("conv_parent"),
+      )?.[0];
+      expect(row?.busy).toBe(false);
+      expect(row?.current_task_status).toBe("failed");
+      expect(row?.last_task_error).toEqual({
+        code: "required_terminal_exited",
+        message: "Required terminal exited unexpectedly",
+      });
+    });
+
+    it("clears a stale child error when the runner sends an active status", () => {
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
+        {
+          id: "conv_child1",
+          title: "researcher:auth",
+          tool: "researcher",
+          session_name: "auth",
+          current_task_status: "failed",
+          busy: false,
+          last_task_error: {
+            code: "required_terminal_exited",
+            message: "Required terminal exited unexpectedly",
+          },
+          last_message_preview: "boot failed",
+          pending_elicitations_count: 0,
+        },
+      ]);
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: {
+          id: "conv_child1",
+          busy: true,
+          current_task_status: "in_progress",
+          last_task_error: null,
+        },
+      });
+      const row = client.getQueryData<ChildSessionInfo[]>(
+        childSessionsQueryKey("conv_parent"),
+      )?.[0];
+      expect(row?.busy).toBe(true);
+      expect(row?.current_task_status).toBe("in_progress");
+      expect(row?.last_task_error).toBeNull();
     });
 
     it("initializes a cold child-sessions cache from a full delta", () => {
@@ -4517,19 +4745,21 @@ describe("chatStore — elicitation_resolved", () => {
 });
 
 // Sticky-pref handoff: a sessions's snapshot trumps the store; an
-// empty snapshot picks up the user's last pick (claude-native only
-// for model). PATCH fires as a side effect so the next turn uses
-// the override server-side.
+// empty snapshot picks up the user's last compatible native pick.
+// PATCH fires as a side effect so the next turn uses the override
+// server-side.
 describe("chatStore — bindStream sticky-pref handoff", () => {
   interface SnapshotOverrides {
     labels?: Record<string, string>;
     reasoning_effort?: string | null;
     model_override?: string | null;
     parent_session_id?: string | null;
+    model_options?: Array<Record<string, unknown>>;
   }
 
   /** Override the snapshot GET so a test can inject labels + overrides. */
   function withSnapshot(id: string, overrides: SnapshotOverrides): void {
+    sessionLabels.set(id, { ...(overrides.labels ?? {}) });
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.split("?")[0] === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
@@ -4543,6 +4773,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
           reasoning_effort: overrides.reasoning_effort ?? null,
           model_override: overrides.model_override ?? null,
           parent_session_id: overrides.parent_session_id ?? null,
+          model_options: overrides.model_options ?? [],
         });
       }
       return defaultFetchHandler(input, init);
@@ -4587,6 +4818,46 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     expect(state.selectedEffort).toBe("high");
   });
 
+  it("PATCHes sticky model and effort onto a codex-native session with no overrides", async () => {
+    seedSession("conv_codex", []);
+    withSnapshot("conv_codex", {
+      labels: { "omnigent.wrapper": "codex-native-ui" },
+      model_options: [
+        {
+          id: "gpt-5.4",
+          model: "databricks-gpt-5-4",
+          displayName: "GPT-5.4",
+          defaultReasoningEffort: "high",
+          supportedReasoningEfforts: [
+            { reasoningEffort: "low", description: "Low" },
+            { reasoningEffort: "medium", description: "Medium" },
+            { reasoningEffort: "high", description: "High" },
+            { reasoningEffort: "xhigh", description: "Extra high" },
+          ],
+          isDefault: false,
+        },
+      ],
+    });
+
+    useChatStore.setState({
+      selectedEffort: "xhigh",
+      selectedModel: "gpt-5.4",
+    });
+    await useChatStore.getState().switchTo("conv_codex");
+
+    const patches = patchCallsFor("conv_codex");
+    expect(patches).toEqual(
+      expect.arrayContaining([
+        { model_override: "gpt-5.4", silent: true },
+        { reasoning_effort: "xhigh" },
+      ]),
+    );
+
+    const state = useChatStore.getState();
+    expect(state.selectedModel).toBe("gpt-5.4");
+    expect(state.selectedEffort).toBe("xhigh");
+  });
+
   it("does NOT apply sticky effort or model to a sub-agent (child) session", async () => {
     // Observer sticky prefs must not overwrite child sessions.
     seedSession("conv_child", []);
@@ -4625,6 +4896,19 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     await useChatStore.getState().switchTo("conv_cn_gpt");
 
     const patches = patchCallsFor("conv_cn_gpt");
+    expect(patches.some((p) => "model_override" in p)).toBe(false);
+  });
+
+  it("does NOT PATCH a non-Codex sticky model onto a codex-native session", async () => {
+    // Same guard in the opposite direction: a Claude alias from the global
+    // picker must not be handed to Codex app-server as its next-turn model.
+    seedSession("conv_codex_claude", []);
+    withSnapshot("conv_codex_claude", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "opus" });
+    await useChatStore.getState().switchTo("conv_codex_claude");
+
+    const patches = patchCallsFor("conv_codex_claude");
     expect(patches.some((p) => "model_override" in p)).toBe(false);
   });
 
@@ -4687,6 +4971,90 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
 
     expect(patchCallsFor("conv_supported")).toEqual([{ reasoning_effort: "high" }]);
     expect(useChatStore.getState().selectedEffort).toBe("high");
+  });
+
+  it("PATCHes effort on an active codex-native session", async () => {
+    seedSession("conv_codex_supported", []);
+    withSnapshot("conv_codex_supported", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+    await useChatStore.getState().switchTo("conv_codex_supported");
+    fetchMock.mockClear();
+
+    await useChatStore.getState().setEffort("high");
+
+    expect(patchCallsFor("conv_codex_supported")).toEqual([{ reasoning_effort: "high" }]);
+    expect(useChatStore.getState().selectedEffort).toBe("high");
+  });
+
+  it("hydrates Codex Plan mode from the session label", async () => {
+    seedSession("conv_plan", []);
+    withSnapshot("conv_plan", {
+      labels: {
+        "omnigent.wrapper": "codex-native-ui",
+        "omnigent.codex_native.collaboration_mode": "plan",
+      },
+    });
+
+    await useChatStore.getState().switchTo("conv_plan");
+
+    expect(useChatStore.getState().codexPlanMode).toBe(true);
+  });
+
+  it("ignores Codex Plan mode labels on non-Codex sessions", async () => {
+    seedSession("conv_not_codex_plan", []);
+    withSnapshot("conv_not_codex_plan", {
+      labels: {
+        "omnigent.codex_native.collaboration_mode": "plan",
+      },
+    });
+
+    await useChatStore.getState().switchTo("conv_not_codex_plan");
+
+    expect(useChatStore.getState().codexPlanMode).toBe(false);
+  });
+
+  it("PATCHes Codex Plan mode and settles from the returned labels", async () => {
+    seedSession("conv_plan_toggle", []);
+    withSnapshot("conv_plan_toggle", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+    await useChatStore.getState().switchTo("conv_plan_toggle");
+    fetchMock.mockClear();
+
+    await useChatStore.getState().setCodexPlanMode(true);
+
+    expect(patchCallsFor("conv_plan_toggle")).toEqual([{ collaboration_mode: "plan" }]);
+    expect(useChatStore.getState().codexPlanMode).toBe(true);
+  });
+
+  it("rolls back Codex Plan mode when the PATCH is rejected", async () => {
+    seedSession("conv_plan_failure", []);
+    withSnapshot("conv_plan_failure", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+    await useChatStore.getState().switchTo("conv_plan_failure");
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0]!;
+      if (path === "/v1/sessions/conv_plan_failure" && init?.method === "PATCH") {
+        return mockResponse(
+          {
+            error: {
+              code: "runner_unavailable",
+              message: "Could not enter Plan mode: no live Codex runner is available.",
+            },
+          },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+    fetchMock.mockClear();
+
+    await expect(useChatStore.getState().setCodexPlanMode(true)).rejects.toThrow(
+      "Could not enter Plan mode",
+    );
+
+    expect(patchCallsFor("conv_plan_failure")).toEqual([{ collaboration_mode: "plan" }]);
+    expect(useChatStore.getState().codexPlanMode).toBe(false);
+    expect(sessionLabels.get("conv_plan_failure")).not.toHaveProperty(
+      "omnigent.codex_native.collaboration_mode",
+    );
   });
 
   it("server-side overrides win over sticky pref and skip the PATCH", async () => {

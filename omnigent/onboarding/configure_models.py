@@ -52,9 +52,9 @@ from omnigent.onboarding.provider_config import (
 # The ADMISSION TICKETS glyph (subscription) carries a VARIATION SELECTOR-16 so
 # terminals render it as a 2-cell emoji (matching 🔑 / 🌐 / 🧱 and the 🎟️ in
 # README.oss.md) instead of a cramped 1-cell text glyph — that VS16, not extra
-# padding, is what aligns the subscription label with the wider glyphs. (NB:
-# rich.cells.cell_len under-counts a VS16 emoji as 1 cell; the banner box
-# corrects for that — see omnigent.inner.banner._display_width.)
+# padding, is what aligns the subscription label with the wider glyphs.
+# (rich >= 14's cell_len counts such a VS16-forced wide emoji as 2 cells —
+# see omnigent.inner.banner._display_width.)
 _KIND_GLYPH: dict[str, str] = {
     KEY_KIND: "\N{KEY}",
     SUBSCRIPTION_KIND: "\N{ADMISSION TICKETS}\N{VARIATION SELECTOR-16}",

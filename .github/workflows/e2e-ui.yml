@@ -14,6 +14,9 @@ name: E2E UI Tests
 
 on:
   pull_request:
+    # No labeled/unlabeled: a skip-security-scan waiver re-runs this workflow's
+    # Security Gate via rerun-security-gate.yml, so label churn need not re-run
+    # the heavy Playwright suite. (#399 added these for the gate; superseded.)
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches:
@@ -74,7 +77,7 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: Check out CI scripts
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           # Triggering ref (not main): the script must exist on it, and it
           # only shards tests -- no secrets exposure, so the PR's copy is fine.
@@ -107,7 +110,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.inputs.branch || github.ref }}
 
@@ -197,7 +200,7 @@ jobs:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/.codex-cli" && cd "${GITHUB_WORKSPACE}/.codex-cli"
-          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.128.0-alpha.1
+          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
           echo "${GITHUB_WORKSPACE}/.codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Configure native-claude/codex gateway provider
@@ -255,20 +258,25 @@ jobs:
         # --ui-skip-build: the SPA was built in the previous step.
         # --tracing/--screenshot/--video default to off; retain-on-failure
         # keeps green runs cheap while capturing artifacts on failures.
-        # OPENAI_API_KEY / OPENAI_BASE_URL flow into the spawned server via
-        # the conftest's live_server fixture for the openai-agents harness.
+        # OPENAI_API_KEY / OPENAI_BASE_URL are set by the conftest's
+        # live_server fixture to point at the in-process mock LLM server —
+        # no real gateway credentials needed for the openai-agents harness.
+        # Native render-parity tests (claude-sdk/codex) still use the
+        # ~/.omnigent/config.yaml written in the step above.
         env:
-          OPENAI_API_KEY: ${{ env.LLM_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           # Scheduled / manually dispatched runs are the full pass;
           # PR and push runs exclude @pytest.mark.nightly tests.
           NIGHTLY_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
           SHARD_ID: ${{ matrix.shard_id }}
           NUM_SHARDS: ${{ matrix.num_shards }}
         run: |
-          EXTRA_ARGS=()
+          # Always exclude @visual: the UI diff snapshot runs in its own
+          # pinned-runner gate (ui-snapshot.yml) so its baseline matches the
+          # comparison environment; on this unpinned ubuntu-latest it would
+          # flake on font drift. Add the nightly exclusion for PR/push runs.
+          MARKER="not visual"
           if [[ "$NIGHTLY_FULL" != "true" ]]; then
-            EXTRA_ARGS+=(-m "not nightly")
+            MARKER="$MARKER and not nightly"
           fi
           # --splits/--group partition the suite via a strided slice (see
           # pytest_collection_modifyitems in tests/e2e_ui/conftest.py), which
@@ -282,7 +290,7 @@ jobs:
             --tracing=retain-on-failure \
             --screenshot=only-on-failure \
             --video=retain-on-failure \
-            "${EXTRA_ARGS[@]}" \
+            -m "$MARKER" \
             || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
 
       - name: Upload Playwright traces / videos / screenshots on failure
@@ -362,3 +370,40 @@ jobs:
               echo "- 📜 server.log: _no artifact uploaded (glob matched nothing)_"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Explicitly re-dispatch Merge Ready (same-repo PR or fork-e2e push): the
+  # workflow_run hop is brittle and was dropped on #751/#792. No checkout,
+  # actions:write only; GITHUB_TOKEN workflow_dispatch is exempt from recursion.
+  merge-ready-rerun:
+    name: Merge Ready rerun
+    needs: e2e-ui
+    if: >-
+      always()
+      && needs.e2e-ui.result != 'skipped'
+      && (
+        (github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository)
+        || (github.event_name == 'push'
+          && startsWith(github.ref_name, 'fork-e2e/pr-'))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      REF_NAME: ${{ github.ref_name }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Re-dispatch Merge Ready
+        run: |
+          set -euo pipefail
+          # same-repo PR -> event number; fork-e2e push -> parse fork-e2e/pr-<N>
+          PR="${PR_NUMBER:-${REF_NAME##*/pr-}}"
+          if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+            echo "::notice::could not resolve PR number (ref='$REF_NAME'); nothing to do."
+            exit 0
+          fi
+          echo "Re-dispatching merge-ready.yml for PR #$PR after $GITHUB_WORKFLOW."
+          gh workflow run merge-ready.yml --repo "$REPO" -f pr="$PR"

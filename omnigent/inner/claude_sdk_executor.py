@@ -680,6 +680,47 @@ def _build_mcp_tools(
     return mcp_tools
 
 
+def _augment_system_prompt_for_omnigent_mcp_tools(
+    system_prompt: str,
+    tool_schemas: list[ToolSpec],
+) -> str:
+    """
+    Add Claude SDK-specific MCP tool-name guidance to the system prompt.
+
+    Omnigent schemas use bare names such as ``sys_session_send``. The
+    Claude SDK exposes tools from our in-process MCP server to the model
+    as ``mcp__omnigent__<bare_name>``. Bundled agent prompts and skills use
+    bare names because other executors call those directly, so the SDK needs
+    a bridge note to stop the model from trying a non-existent bare tool first.
+    """
+    tool_names = [
+        name for schema in tool_schemas if isinstance((name := schema.get("name")), str) and name
+    ]
+    if not tool_names:
+        return system_prompt
+
+    examples = [name for name in ("sys_session_send", "sys_session_create") if name in tool_names]
+    if examples:
+        example_text = "; ".join(
+            f"use `mcp__omnigent__{name}` when instructions say `{name}`" for name in examples
+        )
+        note = (
+            "Claude SDK tool naming: Omnigent tools are exposed as MCP tools. "
+            f"{example_text}. For any other Omnigent tool, use "
+            "`mcp__omnigent__<tool_name>` rather than the bare name."
+        )
+    else:
+        note = (
+            "Claude SDK tool naming: Omnigent tools are exposed as MCP tools. "
+            "When instructions mention a bare Omnigent tool name, invoke "
+            "`mcp__omnigent__<tool_name>` rather than the bare name."
+        )
+
+    if not system_prompt:
+        return note
+    return f"{system_prompt.rstrip()}\n\n{note}"
+
+
 def _find_system_claude() -> str | None:
     """Find a system-installed ``claude`` CLI binary on PATH.
 
@@ -735,6 +776,18 @@ def _resolve_gateway_env(
         corresponding base URL or auth command.
     """
     host = host_override.rstrip("/") if host_override else None
+    if host is None and base_url_override is not None and auth_command_override is not None:
+        # Generic-provider gateway: explicit base_url + auth command,
+        # no Databricks host or profile required (e.g. ApiKeyAuth with
+        # a mock LLM server URL).
+        return {
+            "ANTHROPIC_BASE_URL": base_url_override,
+            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
+                auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
+            ),
+            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+            _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command_override,
+        }
     if host is None:
         try:
             from .databricks_executor import _read_databrickscfg
@@ -1046,7 +1099,7 @@ class ClaudeSDKExecutor(Executor):
         cwd: str | None = None,
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
-        permission_mode: str = "bypassPermissions",
+        permission_mode: str = "auto",
         gateway: bool = False,
         databricks_profile: str | None = None,
         gateway_host: str | None = None,
@@ -1070,8 +1123,8 @@ class ClaudeSDKExecutor(Executor):
                 sandbox the Claude CLI process itself on supported Linux
                 hosts, but does not enable native OS tools.
             model: Override the model name.
-            permission_mode: SDK permission mode (default: bypassPermissions
-                so the agent can run autonomously).
+            permission_mode: SDK permission mode (default: auto
+                so the agent runs autonomously with background safety checks).
             gateway: If True, route through a vendor-neutral gateway
                 (base URL + bearer-token command + model). Enables the
                 gateway path regardless of which producer fed it (the
@@ -1826,6 +1879,10 @@ class ClaudeSDKExecutor(Executor):
                 version="1.0.0",
                 tools=mcp_tools,
             )
+            system_prompt = _augment_system_prompt_for_omnigent_mcp_tools(
+                system_prompt,
+                tools,
+            )
 
         # Build allowed_tools list.  OS-environment operations route
         # through Omnigent ``sys_os_*`` MCP tools rather than the
@@ -1833,8 +1890,10 @@ class ClaudeSDKExecutor(Executor):
         # the scaffold's ``dispatch_tool`` path, giving the runner
         # visibility, timeouts, and error recovery.
         #
-        # In ``bypassPermissions`` mode, pre-approve all MCP tools so
-        # the agent can act autonomously without any per-call gate.
+        # In ``auto`` and ``bypassPermissions`` modes, pre-approve all
+        # MCP tools so the agent can act autonomously without a per-call
+        # human-consent gate.  ``auto`` still runs background safety
+        # checks; ``bypassPermissions`` skips all gates entirely.
         # In any other mode (``default``, ``acceptEdits``, etc.), leave
         # ``allowed_tools`` empty so every tool call goes through the
         # SDK's ``can_use_tool`` callback — which routes to the AP
@@ -1842,8 +1901,8 @@ class ClaudeSDKExecutor(Executor):
         # When ``allowed_tools`` is empty the SDK omits ``--allowedTools``
         # entirely, letting Claude's normal permission flow apply.
         allowed_tools: list[str] = []
-        if self._permission_mode == "bypassPermissions":
-            # Allow all Omnigent MCP tools (no per-call gate needed)
+        if self._permission_mode in ("auto", "bypassPermissions"):
+            # Allow all Omnigent MCP tools (no per-call human gate needed)
             for schema in tools:
                 raw_tname = schema.get("name")
                 # Claude SDK's ``allowed_tools`` requires concrete strings;

@@ -14,9 +14,10 @@ Each case asserts what the server+UI can guarantee WITHOUT a host or a real
 native CLI: the fork is created on the TARGET agent, the copied transcript
 renders, and the fork's labels route the runner correctly —
 
-  - native targets stamp ``omnigent.fork.carry_history`` (the runner must
-    rebuild the native transcript; absent → the clone would launch fresh
-    and lose history) and the TARGET ``omnigent.wrapper`` (so the clone
+  - native targets that can replay fork history stamp
+    ``omnigent.fork.carry_history`` (the runner must rebuild the native
+    transcript; absent → the clone would launch fresh and lose history) and
+    every native target stamps the TARGET ``omnigent.wrapper`` (so the clone
     opens in the right UI mode, not the source's chat mode);
   - the SDK target stamps neither (an SDK target replays the transcript as
     context, and plain chat has no wrapper).
@@ -81,11 +82,9 @@ def _agent_id_by_name(base_url: str, name: str) -> str:
         # SDK → Codex: SAME-family native target. Same carry-history rebuild
         # path; the wrapper flips to the codex-native terminal UI.
         pytest.param("codex-native-ui", "codex-native-ui", True, id="sdk-to-codex"),
-        # SDK → Pi: native, but multi-family (its harness family is null), so
-        # the picker would drop it unless gated on isNativeHarness too. This is
-        # the case #230 fixes — the option must be offerable, and the fork must
-        # flip to the Pi terminal UI with carry-history stamped.
-        pytest.param("pi-native-ui", "pi-native-ui", True, id="sdk-to-pi"),
+        # SDK → Pi: native, but it cannot replay fork history, so the fork
+        # must flip to the Pi terminal UI without carry-history stamped.
+        pytest.param("pi-native-ui", "pi-native-ui", False, id="sdk-to-pi"),
     ],
 )
 def test_fork_switch_agent_carries_history(
@@ -104,7 +103,8 @@ def test_fork_switch_agent_carries_history(
     :param expected_wrapper: TARGET ``omnigent.wrapper`` value, or ``None``
         when the target runs as plain chat (SDK).
     :param expect_carry_history: Whether the fork must stamp the
-        carry-history label (true only for native targets).
+        carry-history label (true only for native targets that can replay
+        fork history, currently claude/codex native).
     """
     base_url, session_id = seeded_session
     target_agent_id = _agent_id_by_name(base_url, target_name)
@@ -171,15 +171,87 @@ def test_fork_switch_agent_carries_history(
     )
     if expect_carry_history:
         assert labels.get(_CARRY_HISTORY_LABEL_KEY) == "1", (
-            f"native-target fork must stamp carry-history, got {labels!r}"
-        )
-        assert labels.get(_WRAPPER_LABEL_KEY) == expected_wrapper, (
-            f"native-target fork must present as {expected_wrapper!r}, got {labels!r}"
+            f"history-capable native target must stamp carry-history, got {labels!r}"
         )
     else:
         assert _CARRY_HISTORY_LABEL_KEY not in labels, (
-            f"SDK-target fork must not stamp carry-history, got {labels!r}"
+            f"target must not stamp carry-history, got {labels!r}"
         )
+    if expected_wrapper is None:
         assert _WRAPPER_LABEL_KEY not in labels, (
             f"SDK-target fork must stay in chat mode (no wrapper), got {labels!r}"
         )
+    else:
+        assert labels.get(_WRAPPER_LABEL_KEY) == expected_wrapper, (
+            f"native-target fork must present as {expected_wrapper!r}, got {labels!r}"
+        )
+
+
+def test_fork_into_pi_labels_model_picker_pi(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Forking SDK → Pi labels the in-session model picker "Pi", not the slug.
+
+    The fork/switch routes clone the bound agent with a ``" (fork <id>)"``
+    suffix, so the fork binds an agent named ``pi-native-ui (fork <id>)``.
+    The composer's model-picker pill resolves that name through
+    ``agentDisplayLabel``, which must strip the clone suffix AND map the
+    native wrapper slug to its display name ("Pi") — not fall through to the
+    capitalized raw slug ("Pi-native-ui (fork …)"). This guards that mapping
+    on the user-visible surface; the unit cases live in ``AgentInfo.test.tsx``.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` for a runner-bound
+        ``hello_world`` (openai-agents SDK) source session.
+    """
+    base_url, session_id = seeded_session
+    pi_agent_id = _agent_id_by_name(base_url, "pi-native-ui")
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    # One turn so the fork has an assistant bubble to anchor "Fork from here".
+    composer = page.get_by_placeholder("Ask the agent anything…")
+    expect(composer).to_be_visible()
+    composer.fill(f"Reply with one short word. Marker: {_MARKER}")
+    page.get_by_role("button", name="Send", exact=True).click()
+    assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
+    expect(assistant).to_be_visible(timeout=60_000)
+
+    # Fork from the response, switching the agent to Pi.
+    assistant.hover()
+    page.get_by_test_id("fork-from-response").first.click()
+    dialog = page.get_by_test_id("fork-session-dialog")
+    expect(dialog).to_be_visible()
+    page.get_by_test_id("fork-session-agent-select").click()
+    option = page.get_by_test_id(f"fork-session-agent-option-{pi_agent_id}")
+    expect(option).to_be_visible()
+    option.click()
+    page.get_by_test_id("fork-session-submit").click()
+
+    # Land on the new Pi-bound fork (a distinct session id).
+    expect(page).to_have_url(
+        re.compile(rf"/c/(?!{re.escape(session_id)})conv_[0-9a-f]+"),
+        timeout=30_000,
+    )
+    fork_id = page.url.rsplit("/c/", 1)[1].split("?", 1)[0]
+    assert fork_id != session_id
+
+    # Sanity-check the precondition this test exists for: the clone really
+    # binds a SUFFIXED name, so the picker assertion exercises the strip
+    # rather than passing trivially on a bare ``pi-native-ui``.
+    agent_resp = httpx.get(f"{base_url}/v1/sessions/{fork_id}/agent", timeout=30.0)
+    agent_resp.raise_for_status()
+    bound_name = agent_resp.json()["name"]
+    assert bound_name.startswith("pi-native-ui") and bound_name != "pi-native-ui", (
+        f"expected a clone-suffixed pi agent name to exercise the strip, got {bound_name!r}"
+    )
+
+    # The model-picker pill shows the friendly "Pi" — the clone suffix and
+    # the raw wrapper slug ("native-ui") must both be gone. Pre-fix this read
+    # "Pi-native-ui (fork conv_…)".
+    trigger = page.get_by_test_id("agent-picker-trigger")
+    expect(trigger).to_be_visible(timeout=30_000)
+    expect(trigger).to_contain_text("Pi")
+    expect(trigger).not_to_contain_text("native-ui")
+    expect(trigger).not_to_contain_text("fork")

@@ -36,7 +36,12 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
-vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
+vi.mock("@/hooks/useHostFilesystem", () => ({
+  useHostFilesystem: vi.fn(),
+  // WorkspacePicker (rendered by the file browser) reads this on mount;
+  // an idle mutation keeps it inert for these tests.
+  useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+}));
 vi.mock("@/hooks/useDirectorySessions", () => ({
   useDirectorySessions: vi.fn(),
 }));
@@ -606,6 +611,48 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByText("No agents")).toBeTruthy();
   });
 
+  it("orders Cursor above Pi in the built-in agent picker", () => {
+    mockAgents([
+      {
+        id: "a_pi",
+        name: "pi-native-ui",
+        display_name: "Pi",
+        description: null,
+        harness: "pi-native",
+        skills: [],
+      },
+      {
+        id: "a_cursor",
+        name: "cursor-native-ui",
+        display_name: "Cursor",
+        description: null,
+        harness: "cursor-native",
+        skills: [],
+      },
+      {
+        id: "a_codex",
+        name: "codex-native-ui",
+        display_name: "Codex",
+        description: null,
+        harness: "codex-native",
+        skills: [],
+      },
+      {
+        id: "a_claude",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const cursor = screen.getByTestId("new-chat-landing-agent-a_cursor");
+    const pi = screen.getByTestId("new-chat-landing-agent-a_pi");
+    expect(cursor.compareDocumentPosition(pi) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("seeds the working directory from the host's most-recent path", async () => {
     renderLanding();
     // host_1's recent ("/Users/corey/repo") seeds the field; the chip shows
@@ -685,13 +732,14 @@ describe("NewChatLandingScreen", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
-    const neverOption = screen.getByTestId("new-chat-landing-approval-never");
-    expect(neverOption.textContent).toContain("Never");
+    const fullAccessOption = screen.getByTestId("new-chat-landing-approval-full-access");
+    expect(fullAccessOption.textContent).toContain("Full access");
     // The footer line explains the SELECTED mode until a row is hovered.
     const detail = screen.getByTestId("new-chat-landing-approval-detail");
-    expect(detail.textContent).toContain("Model decides when to ask for approval");
-    fireEvent.pointerEnter(neverOption);
-    expect(detail.textContent).toContain("Never asks for approval");
+    // Default is selected initially.
+    expect(detail.textContent).toContain("Read/edit/run in workspace");
+    fireEvent.pointerEnter(fullAccessOption);
+    expect(detail.textContent).toContain("Edit any file and access the internet");
   });
 
   it("shows a conflict banner in the file browser for an occupied directory", async () => {
