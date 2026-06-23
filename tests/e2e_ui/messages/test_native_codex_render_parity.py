@@ -1,4 +1,4 @@
-r"""UI journey: a native Codex session renders parity with its TUI.
+r"""UI journey: a native Codex session renders parity with its TUI (mock LLM).
 
 The native ``codex-native`` ("Codex") wrapper is terminal-first: a real
 ``codex`` CLI runs in the session terminal, the SPA's **Terminal** view
@@ -6,37 +6,16 @@ attaches to that live TUI over a WebSocket, and the SPA's **Chat** view renders
 the SAME canonical transcript (``GET /v1/sessions/{id}/items``) the TUI prints.
 A native bridge forwards web-composer messages INTO the Codex app-server thread
 and forwards Codex's transcript back OUT as conversation items. This suite
-asserts that round-trips both ways and renders exactly once — the three
-properties the native forwarder has historically regressed on:
+asserts that round-trips both ways and renders exactly once — the same three
+properties the claude native forwarder is pinned against.
 
-1. **Render parity with the TUI.** Composer turns are sent through the web SPA;
-   each per-turn user marker and assistant token the SPA shows in a bubble must
-   also appear in the canonical transcript, in the same order, exactly once. The
-   transcript is what the TUI prints, so transcript parity == "renders the same
-   as the TUI".
-
-2. **A TUI-originated message surfaces in the web UI.** A turn is typed directly
-   into the Codex TUI (the embedded xterm in the Terminal view) — never through
-   the composer. The native bridge must forward it back out as a user item +
-   assistant reply, so switching to Chat shows both as bubbles and the
-   transcript carries them. This is the OUT direction the composer turns don't
-   exercise.
-
-3. **No duplicate rendering.** Every marker/token — composer- and TUI-originated
-   alike — must land in EXACTLY ONE bubble and one transcript entry. The classic
-   native-forwarder bug double-rendered a reply as both a streaming live preview
-   and the committed bubble; per-turn unique tokens make that count unambiguous.
-
-Per-turn unique markers/tokens are load-bearing for the same reasons as the
-custom-agent suite: they keep the dedup count and order checks unambiguous even
-though Codex is far chattier than the ``echo_probe`` agent (it may emit
-reasoning, tool calls, and prose around the echoed token). Every assertion
-counts *bubbles/entries containing the token*, never bubbles, so chattiness is
-fine.
-
-Requires the native-harness gateway auth the runner derives from its own
-credentials (the same gateway ``hello_world`` uses); CI exchanges Databricks
-OAuth before pytest. See ``native_codex_session`` in ``conftest.py``.
+The LLM calls are served by the in-process mock LLM server rather than a real
+OpenAI endpoint. Before each test run a mock ``openai`` provider config is
+written to ``~/.omnigent/config.yaml`` (see ``native_codex_mock_session`` in
+``conftest.py``), redirecting the runner's ``OPENAI_BASE_URL`` to the mock
+server. Tokens are pre-generated and queued via content-based routing so the
+mock returns the expected assistant token for each turn regardless of how many
+extra LLM calls Codex makes internally.
 """
 
 from __future__ import annotations
@@ -46,6 +25,8 @@ import uuid
 
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm, set_fallback_mock_llm
 
 # Reuse the custom-agent suite's helpers — both surfaces render from the same
 # canonical transcript, so parity / dedup / ordering are asserted identically.
@@ -67,12 +48,15 @@ _TERMINAL_VIEW = '[data-testid="terminal-view"]'
 # and typing is how a user (and Playwright) drives the embedded TUI.
 _XTERM_INPUT = ".xterm-helper-textarea"
 
-# A native Codex turn is a full agent loop (real LLM, possible tool use),
-# so it is far slower than a single custom-agent LLM call.
-_NATIVE_TURN_TIMEOUT_MS = 180_000
+# Mock LLM responds instantly; budget covers native CLI boot + terminal attach.
+_MOCK_TURN_TIMEOUT_MS = 60_000
 # Codex boots in the terminal on bind; the auto-launch + first-run
 # pre-accept + WS attach can take a while on a cold CI runner.
 _TERMINAL_READY_TIMEOUT_MS = 120_000
+
+# Must match the model set in the mock openai provider config written by the
+# native_codex_mock_session fixture (conftest._CODEX_MOCK_MODEL).
+_CODEX_MOCK_MODEL = "gpt-4o"
 
 # Two composer turns (the IN direction) + one TUI turn (the OUT direction).
 _COMPOSER_TURNS = 2
@@ -104,79 +88,73 @@ def _wait_terminal_connected(page: Page) -> None:
 def _type_into_tui(page: Page, text: str) -> None:
     """Type *text* into the embedded Codex TUI and submit with Enter.
 
-    Drives the real TUI exactly as a user would: focus the xterm input,
-    type the prompt, press Enter. This is the OUT direction — the message
-    originates in the terminal, not the web composer.
-
     :param page: The Playwright page, on the connected Terminal view.
     :param text: The single-line prompt to type into the TUI.
     """
-    # Scope to the active terminal-view (not page-level) so the lookup can't
-    # focus a stray textarea from another terminal widget — matches the shell
-    # E2E test pattern.
     xterm_input = page.locator(_TERMINAL_VIEW).last.locator(_XTERM_INPUT)
     expect(xterm_input).to_be_attached(timeout=30_000)
     xterm_input.focus()
-    # Type at a human-ish cadence: Codex's TUI composer can drop or
-    # reorder characters injected faster than it repaints.
     page.keyboard.type(text, delay=15)
     page.keyboard.press("Enter")
 
 
-@pytest.mark.timeout(900)
+@pytest.mark.timeout(300)
 def test_native_codex_message_render_parity(
     page: Page,
-    native_codex_session: tuple[str, str],
+    native_codex_mock_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
-    """Native Codex renders parity with its TUI, both ways, with no dupes.
-
-    Covers all three properties on a single (expensive to spin up) native
-    session: composer parity (IN), a TUI-originated turn surfacing in the web UI
-    (OUT), and no duplicate rendering across every turn.
-    """
-    base_url, session_id = native_codex_session
-    _log.info("native-codex session ready: base_url=%s session_id=%s", base_url, session_id)
+    """Native Codex renders parity with its TUI, both ways, with no dupes (mock LLM)."""
+    base_url, session_id = native_codex_mock_session
+    _log.info("native-codex mock session ready: base_url=%s session_id=%s", base_url, session_id)
 
     page.goto(f"{base_url}/c/{session_id}")
-
-    # The Terminal view proves Codex actually booted in the session terminal
-    # (the runner's codex-native auto-launch) before we send anything.
     _open_terminal_view(page)
     _wait_terminal_connected(page)
     _log.info("Codex TUI attached (terminal-view connected)")
+    _ensure_chat_view(page)
+
+    # Pre-generate tokens for all turns so they can be queued in the mock
+    # before any message is sent. Content-based routing (match=user_marker)
+    # ensures the right token is returned regardless of extra internal calls.
+    nonces = [uuid.uuid4().hex[:8] for _ in range(_COMPOSER_TURNS + 1)]
+    turns = [
+        (f"usr-{i + 1}-{nonces[i]}", f"ast-{i + 1}-{nonces[i]}")
+        for i in range(_COMPOSER_TURNS + 1)
+    ]
+    reset_mock_llm(mock_llm_server_url)
+    for user_marker, assistant_token in turns:
+        configure_mock_llm(
+            mock_llm_server_url,
+            [{"text": assistant_token}],
+            key=user_marker,
+            match=user_marker,
+        )
+    set_fallback_mock_llm(mock_llm_server_url, _CODEX_MOCK_MODEL, "")
 
     user_markers: list[str] = []
     assistant_tokens: list[str] = []
 
-    def _new_turn(index: int) -> tuple[str, str]:
-        nonce = uuid.uuid4().hex[:8]
-        user_marker = f"usr-{index}-{nonce}"
-        assistant_token = f"ast-{index}-{nonce}"
+    # --- Property 1 & 3: composer turns (IN) render parity, no dupes. ---
+    for index, (user_marker, assistant_token) in enumerate(turns[:_COMPOSER_TURNS], start=1):
         user_markers.append(user_marker)
         assistant_tokens.append(assistant_token)
-        return user_marker, assistant_token
-
-    # --- Property 1 & 3: composer turns (IN) render parity, no dupes. ---
-    _ensure_chat_view(page)
-    for index in range(1, _COMPOSER_TURNS + 1):
-        user_marker, assistant_token = _new_turn(index)
         _log.info(
             "composer turn %d: sending (marker=%s token=%s)", index, user_marker, assistant_token
         )
         _send(page, _turn_prompt(index, user_marker, assistant_token))
-        # The echoed token in an assistant bubble = this turn produced its reply.
         expect(page.locator(_ASSISTANT, has_text=assistant_token).first).to_be_visible(
-            timeout=_NATIVE_TURN_TIMEOUT_MS
+            timeout=_MOCK_TURN_TIMEOUT_MS
         )
-        # Fully settle (working shimmer gone) before the next send, so any
-        # transient native live-preview has collapsed into the committed bubble.
-        expect(page.locator(_WORKING)).to_have_count(0, timeout=_NATIVE_TURN_TIMEOUT_MS)
+        expect(page.locator(_WORKING)).to_have_count(0, timeout=_MOCK_TURN_TIMEOUT_MS)
         expect(page.locator(_USER)).to_have_count(index, timeout=30_000)
         _log.info("composer turn %d: settled", index)
 
     # --- Property 2 & 3: a TUI-originated turn (OUT) surfaces in the web UI. ---
     tui_index = _COMPOSER_TURNS + 1
-    tui_marker, tui_token = _new_turn(tui_index)
+    tui_marker, tui_token = turns[_COMPOSER_TURNS]
+    user_markers.append(tui_marker)
+    assistant_tokens.append(tui_token)
     _open_terminal_view(page)
     _wait_terminal_connected(page)
     _log.info(
@@ -184,14 +162,12 @@ def test_native_codex_message_render_parity(
     )
     _type_into_tui(page, _turn_prompt(tui_index, tui_marker, tui_token))
 
-    # Back in Chat, the bridge must have forwarded the TUI turn OUT as a user
-    # item + assistant reply — both render as bubbles, exactly once.
     _ensure_chat_view(page)
     expect(page.locator(_ASSISTANT, has_text=tui_token).first).to_be_visible(
-        timeout=_NATIVE_TURN_TIMEOUT_MS
+        timeout=_MOCK_TURN_TIMEOUT_MS
     )
     expect(page.locator(_USER, has_text=tui_marker).first).to_be_visible(timeout=30_000)
-    expect(page.locator(_WORKING)).to_have_count(0, timeout=_NATIVE_TURN_TIMEOUT_MS)
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=_MOCK_TURN_TIMEOUT_MS)
     expect(page.locator(_USER)).to_have_count(len(user_markers), timeout=30_000)
     _log.info("TUI turn %d: surfaced in web UI (user + assistant bubbles present)", tui_index)
 

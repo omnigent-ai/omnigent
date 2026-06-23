@@ -32,6 +32,7 @@ pytest tmp dir so the test never touches the user's default
 
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import signal
@@ -39,8 +40,9 @@ import socket
 import subprocess
 import sys
 import tarfile
+import textwrap
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -477,13 +479,15 @@ def configure_mock_llm(
     responses: list[dict[str, Any]],
     *,
     key: str = "default",
+    match: str | None = None,
 ) -> None:
     """Configure a keyed response queue on the mock LLM server.
 
     Each dict in *responses* maps to a ``QueuedResponse`` on the mock
     server. The *key* determines which queue the responses are stored in
     — the mock server routes each request to the queue whose key matches
-    the request's ``model`` field.
+    the request's ``model`` field. When *match* is set, the queue fires
+    whenever the user text contains that substring, regardless of model.
 
     :param mock_url: Mock server base URL.
     :param responses: List of response configs. Keys:
@@ -492,10 +496,15 @@ def configure_mock_llm(
     :param key: Queue key — typically the model name baked into the
         agent spec. Defaults to ``"default"`` (matches any model
         not assigned to a more specific queue).
+    :param match: Optional substring to match against the user text for
+        content-based routing (in addition to model-name routing).
     """
+    body: dict[str, Any] = {"key": key, "responses": responses}
+    if match is not None:
+        body["match"] = match
     resp = httpx.post(
         f"{mock_url}/mock/configure",
-        json={"key": key, "responses": responses},
+        json=body,
         timeout=5.0,
     )
     resp.raise_for_status()
@@ -1666,6 +1675,8 @@ def server_pid(live_server: str) -> int:
 # 1 + executor.config.harness routes through the strict parser; arcname
 # config.yaml keeps it on that path.
 _CUSTOM_AGENT_NAME = "echo_probe"
+_CLAUDE_MOCK_MODEL = "claude-3-5-sonnet-20241022"
+_CODEX_MOCK_MODEL = "gpt-4o"
 _CUSTOM_AGENT_YAML = f"""\
 spec_version: 1
 name: {_CUSTOM_AGENT_NAME}
@@ -2023,6 +2034,141 @@ def native_codex_session(
             # Escalate to SIGKILL if the runner ignores SIGTERM, so a wedged
             # process can't raise in teardown and leak / fail unrelated tests
             # (matching terminal_session / seeded_session_pair).
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+@contextlib.contextmanager
+def _temp_omnigent_mock_config(
+    mock_llm_server_url: str, harness: str
+) -> Generator[None, None, None]:
+    """Temporarily write a mock provider config to ~/.omnigent/config.yaml.
+
+    The runner reads this at terminal-creation time, so it only needs to be
+    in place between the PATCH that binds a session to the runner (which
+    triggers auto-boot) and the terminal connecting. Restores the original
+    file (or removes it) on exit.
+
+    :param mock_llm_server_url: Base URL of the mock LLM server, e.g.
+        ``"http://127.0.0.1:51235"``. No /v1 suffix — each SDK appends it.
+    :param harness: ``"claude"`` or ``"codex"``.
+    """
+    config_dir = Path.home() / ".omnigent"
+    config_path = config_dir / "config.yaml"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    original = config_path.read_text() if config_path.exists() else None
+
+    if harness == "claude":
+        mock_config = textwrap.dedent(f"""\
+            providers:
+              mock-claude:
+                kind: key
+                default: [anthropic]
+                anthropic:
+                  base_url: "{mock_llm_server_url}"
+                  api_key: "mock-key"
+                  models:
+                    default: {_CLAUDE_MOCK_MODEL}
+            """)
+    else:  # codex
+        mock_config = textwrap.dedent(f"""\
+            providers:
+              mock-codex:
+                kind: key
+                default: [openai]
+                openai:
+                  base_url: "{mock_llm_server_url}"
+                  api_key: "mock-key"
+                  wire_api: responses
+                  models:
+                    default: {_CODEX_MOCK_MODEL}
+            """)
+
+    config_path.write_text(mock_config)
+    try:
+        yield
+    finally:
+        if original is not None:
+            config_path.write_text(original)
+        else:
+            config_path.unlink(missing_ok=True)
+
+
+@pytest.fixture
+def native_claude_mock_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound claude-native session whose LLM backend depends on env.
+
+    When ``LLM_API_KEY`` is set in the environment (local dev / CI with real
+    credentials), the existing ``~/.omnigent/config.yaml`` is left untouched so
+    the runner boots Claude Code against the real gateway. When ``LLM_API_KEY``
+    is absent, a mock anthropic provider config is written to
+    ``~/.omnigent/config.yaml`` and restored on teardown.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param mock_llm_server_url: Session-scoped mock LLM server base URL.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    use_mock = not os.environ.get("LLM_API_KEY")
+    if use_mock:
+        ctx: Any = _temp_omnigent_mock_config(mock_llm_server_url, "claude")
+    else:
+        ctx = contextlib.nullcontext()
+    with ctx:
+        session_id = _create_native_claude_session(live_server, runner_id)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def native_codex_mock_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound codex-native session whose LLM backend depends on env.
+
+    Mirrors :func:`native_claude_mock_session` for the Codex wrapper: uses
+    mock LLM when ``LLM_API_KEY`` is absent, real gateway when it is set.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param mock_llm_server_url: Session-scoped mock LLM server base URL.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    use_mock = not os.environ.get("LLM_API_KEY")
+    if use_mock:
+        ctx: Any = _temp_omnigent_mock_config(mock_llm_server_url, "codex")
+    else:
+        ctx = contextlib.nullcontext()
+    with ctx:
+        session_id = _create_native_codex_session(live_server, runner_id)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
             try:
                 respawned.wait(timeout=5)
             except subprocess.TimeoutExpired:

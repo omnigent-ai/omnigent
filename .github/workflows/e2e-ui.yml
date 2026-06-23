@@ -44,10 +44,10 @@ env:
   # dedicated step, so the setup.py build would be a redundant npm hit.
   OMNIGENT_SKIP_WEB_UI: "true"
   # Scrub harness credentials the test server must not pick up.
-  # OPENAI_API_KEY / OPENAI_BASE_URL are NOT scrubbed here -- the "Run UI
-  # e2e tests" step sets them to the Databricks bearer + serving-endpoints
-  # URL so the spawned openai-agents hello_world agent can authenticate
-  # (the ~/.databrickscfg fallback didn't resolve our OAuth M2M in CI).
+  # OPENAI_API_KEY / OPENAI_BASE_URL are NOT scrubbed here — the
+  # conftest's live_server fixture overrides them to mock values
+  # (OPENAI_BASE_URL=<mock>/v1, OPENAI_API_KEY=mock-key) inside the
+  # spawned server subprocess, so ambient real credentials are a no-op.
   ANTHROPIC_API_KEY: ""
   DATABRICKS_TOKEN: ""
   CODEX: ""
@@ -132,9 +132,6 @@ jobs:
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
-      - name: Set LLM credentials
-        run: echo "LLM_API_KEY=${{ secrets.LLM_API_KEY }}" >> "$GITHUB_ENV"
-
       - name: Install project + dev extras
         run: uv sync --locked --extra all --extra dev
 
@@ -204,10 +201,14 @@ jobs:
           echo "${GITHUB_WORKSPACE}/.codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Configure native-claude/codex gateway provider
+        # Required only by the native render-parity tests (claude, codex).
+        # The approval tests (test_exit_plan_mode, test_ask_user_question)
+        # were migrated to mock LLM and no longer need it.
         # The native CLIs derive their gateway auth from omnigent provider
         # config. Register the Databricks gateway as the default for both
         # anthropic (Claude Code) and openai (Codex); the token reaches each
-        # CLI via an env:LLM_API_KEY ref, so no literal secret hits disk.
+        # CLI and the openai-agents harness via an env:LLM_API_KEY ref, so
+        # no literal secret hits disk.
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
@@ -258,17 +259,21 @@ jobs:
         # --ui-skip-build: the SPA was built in the previous step.
         # --tracing/--screenshot/--video default to off; retain-on-failure
         # keeps green runs cheap while capturing artifacts on failures.
-        # OPENAI_API_KEY / OPENAI_BASE_URL are set by the conftest's
-        # live_server fixture to point at the in-process mock LLM server —
-        # no real gateway credentials needed for the openai-agents harness.
-        # Native render-parity tests (claude-sdk/codex) still use the
-        # ~/.omnigent/config.yaml written in the step above.
+        # The conftest's live_server fixture points the server subprocess at
+        # the in-process mock LLM server (OPENAI_BASE_URL / ANTHROPIC_BASE_URL),
+        # so the policy classifier needs no real credentials. The openai-agents
+        # harness and native render-parity tests use the ~/.omnigent/config.yaml
+        # gateway written above; LLM_API_KEY resolves the api_key_ref there.
         env:
           # Scheduled / manually dispatched runs are the full pass;
           # PR and push runs exclude @pytest.mark.nightly tests.
           NIGHTLY_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
           SHARD_ID: ${{ matrix.shard_id }}
           NUM_SHARDS: ${{ matrix.num_shards }}
+          # The runner subprocess inherits this via os.environ so the
+          # openai-agents harness and native CLIs can resolve
+          # api_key_ref: "env:LLM_API_KEY" from ~/.omnigent/config.yaml.
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
           # Always exclude @visual: the UI diff snapshot runs in its own
           # pinned-runner gate (ui-snapshot.yml) so its baseline matches the
