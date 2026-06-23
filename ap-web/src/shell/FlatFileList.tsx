@@ -7,7 +7,9 @@ import { formatBytes, gitStatusLabel, gitStatusLetter } from "./fileStatusUtils"
 import { FileDownloadButton } from "./FileDownloadButton";
 import { useCursorTooltip } from "./useCursorTooltip";
 
-export type ChangedSort = "alpha" | "recent";
+export type ChangedSort = "alpha" | "recent" | "size" | "type";
+
+const VALID_SORTS = new Set<ChangedSort>(["alpha", "recent", "size", "type"]);
 
 /**
  * Comparator for the changed-files list. Shared between the displayed list
@@ -15,17 +17,39 @@ export type ChangedSort = "alpha" | "recent";
  * orderings never diverge — a file shown 1st in the list must also be 1st
  * when stepping through with the arrows.
  */
+function fileExtension(name: string): string {
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+}
+
+export function isValidSort(value: string): value is ChangedSort {
+  return VALID_SORTS.has(value as ChangedSort);
+}
+
 export function compareChangedFiles(sort: ChangedSort) {
   return (a: WorkspaceChangedFile, b: WorkspaceChangedFile): number => {
     if (sort === "recent") {
-      // Most recently edited first. Files without a timestamp sink to
-      // the bottom; ties fall back to alphabetical for stable order.
       const am = a.modified_at;
       const bm = b.modified_at;
       if (am === null && bm === null) return a.path.localeCompare(b.path);
       if (am === null) return 1;
       if (bm === null) return -1;
       if (am !== bm) return bm - am;
+      return a.path.localeCompare(b.path);
+    }
+    if (sort === "size") {
+      const ab = a.bytes;
+      const bb = b.bytes;
+      if (ab === null && bb === null) return a.path.localeCompare(b.path);
+      if (ab === null) return 1;
+      if (bb === null) return -1;
+      if (ab !== bb) return bb - ab;
+      return a.path.localeCompare(b.path);
+    }
+    if (sort === "type") {
+      const ae = fileExtension(a.name);
+      const be = fileExtension(b.name);
+      if (ae !== be) return ae.localeCompare(be);
       return a.path.localeCompare(b.path);
     }
     return a.path.localeCompare(b.path);

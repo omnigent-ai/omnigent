@@ -166,7 +166,9 @@ export function AppShell() {
   // Lifted so the Changes list order and the FileViewer prev/next order
   // share one source of truth (otherwise the "X/N" index won't match the
   // list position). Default "recent" mirrors the prior FilesPanel default.
-  const [filesPanelSort, setFilesPanelSort] = useState<ChangedSort>("recent");
+  const [filesPanelSort, setFilesPanelSort] = useState<ChangedSort>(
+    () => readFilesPanelPreferences().sort,
+  );
   const [panelInitialKey, setPanelInitialKeyState] = useState<string | null>(null);
   const [executionLogsKey, setExecutionLogsKey] = useState<string | null>(null);
   const [filesPanelOpen, setFilesPanelOpen] = useState(false);
@@ -602,7 +604,12 @@ export function AppShell() {
   const handleFilesFlatViewChange = useCallback((v: boolean) => {
     filesPanelScopePrefRef.current = v;
     setFilesPanelFlatView(v);
-    writeFilesPanelPreferences({ changedOnly: v });
+    writeFilesPanelPreferences({ ...readFilesPanelPreferences(), changedOnly: v });
+  }, []);
+
+  const handleFilesSortChange = useCallback((s: ChangedSort) => {
+    setFilesPanelSort(s);
+    writeFilesPanelPreferences({ ...readFilesPanelPreferences(), sort: s });
   }, []);
 
   const openFileViewer = useCallback(
@@ -1094,7 +1101,7 @@ export function AppShell() {
                       openTerminalsPanel={openTerminalsPanel}
                       permissionLevel={permissionLevel}
                       filesPanelSort={filesPanelSort}
-                      onSortChange={setFilesPanelSort}
+                      onSortChange={handleFilesSortChange}
                       filesPanelFlatView={filesPanelFlatView}
                       onFlatViewChange={handleFilesFlatViewChange}
                       filesPanelShowHidden={filesPanelShowHidden}
@@ -1138,7 +1145,7 @@ export function AppShell() {
                   showHidden={filesPanelShowHidden}
                   onShowHiddenChange={setFilesPanelShowHidden}
                   sort={filesPanelSort}
-                  onSortChange={setFilesPanelSort}
+                  onSortChange={handleFilesSortChange}
                 />
               )}
               {/* Mobile-only full-screen drawers for the rail tabs that have no

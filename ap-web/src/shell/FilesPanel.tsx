@@ -1,9 +1,11 @@
 import {
   ArrowDownAZIcon,
+  ArrowDownWideNarrowIcon,
   ChevronDownIcon,
   EyeIcon,
   EyeOffIcon,
   FileClockIcon,
+  FileTypeIcon,
   FolderTreeIcon,
   ListIcon,
   SearchIcon,
@@ -122,6 +124,8 @@ function HiddenFilesToggle({
 const SORT_OPTIONS: { value: ChangedSort; label: string; Icon: typeof ArrowDownAZIcon }[] = [
   { value: "alpha", label: "Filename", Icon: ArrowDownAZIcon },
   { value: "recent", label: "Last edited", Icon: FileClockIcon },
+  { value: "size", label: "Size", Icon: ArrowDownWideNarrowIcon },
+  { value: "type", label: "Type", Icon: FileTypeIcon },
 ];
 
 function SortSelector({
