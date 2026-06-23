@@ -96,3 +96,31 @@ Onboarding/auth, Gemini provider config, harness registration/aliases, runner-ow
 - Port discovery timing (agy must be up + bound) — reuse the existing discovery + retry.
 - The timeout gotcha (§2.1) is the main correctness-sensitive area — covered by the tight detect→deliver loop + tests.
 - Terminal-first UX: agy still runs in the tmux terminal, so the TUI and RPC both drive the same cascade (verified compatible — TUI and RPC interaction delivery coexist).
+
+## 10. Phase 2 — Full RPC parity with codex/claude (live-verified, agy 1.0.10)
+
+Spikes (`/tmp/agy-turnsend-spike.md`, `/tmp/agy-parity-feasibility.md`; memory `agy-rpc-interaction-bridge`, `agy-rpc-parity-streaming`) confirmed agy exposes everything needed to reach full codex/claude parity over RPC. This resolves §7 open question 1 (turn-send) and adds streaming + telemetry. **All shapes version-volatile — resolve model enums at runtime, never hardcode.**
+
+### 10.1 Turn-send (resolves §7-Q1; replaces tmux send-keys)
+`SendUserCascadeMessage {cascadeId, items:[{text:<turn>}], cascadeConfig:{plannerConfig:{planModel:<MODEL enum>}}}` → `200 {}`; records `CORTEX_STEP_TYPE_USER_INPUT` + `metadata.source==CORTEX_STEP_SOURCE_USER_EXPLICIT` + `userInput.userResponse==<text>` (byte-for-byte what the reader keys on). Gotchas: text in `items[].text` (NOT flat `message`); model REQUIRED per-turn in `cascadeConfig.plannerConfig` (omit → ERROR "neither PlanModel nor RequestedModel specified"). Resolve `planModel` at runtime via `GetAvailableModels {}` or by echoing the read-side `userInput.userConfig.plannerConfig.requestedModel.model`. `SendAgentMessage`=SYSTEM_MESSAGE (wrong); queue methods retired.
+
+### 10.2 Streaming deltas (live typing — output_text_delta parity)
+`StreamAgentStateUpdates` connect server-stream. Request body MUST be connect-enveloped: `[flag=0x00][BE-uint32 len][{"conversationId":<conv>}]`, header `Content-Type: application/connect+json`. Response frames `[flag][BE-len][json]`: flag 0=data, flag 2=trailer.
+- Partial text path: `update.mainTrajectoryUpdate.stepsUpdate.steps[]` where `type==PLANNER_RESPONSE`, at **`plannerResponse.modifiedResponse`** — GROWS across frames while `status==CORTEX_STEP_STATUS_GENERATING`. `plannerResponse.thinking` streams first (reasoning). **Trap:** `plannerResponse.response` is ABSENT during generation, populated only on the DONE commit (where `response==modifiedResponse`). (This validates Task 4's `modifiedResponse` preference.)
+- Discriminator = step `status`: GENERATING ⇒ partial (emit `output_text_delta` = `modifiedResponse` minus last forwarded prefix, keyed by `metadata.sourceTrajectoryStepInfo.stepIndex`); DONE ⇒ final committed `message` (from `response`; `metadata.modelUsage` set). Frames are CUMULATIVE snapshots → harness owns prefix-diffing. On connect, a snapshot of prior steps replays (DONE) → dedup against already-forwarded committed steps.
+- Reconciler: deltas precede the committed item (flush-barrier style, like codex) so the SPA retires the live preview rather than double-rendering. Keep the unary `GetCascadeTrajectorySteps` poll as snapshot/reconnect fallback (same `plannerResponse` shape).
+
+### 10.3 Token usage (external_session_usage parity)
+Per model call: `step.metadata.modelUsage = {model, inputTokens, outputTokens, thinkingOutputTokens, responseOutputTokens, cacheReadTokens}` (string ints; output=thinking+response). Cumulative context estimate (monotonic): `trajectory.generatorMetadata[].chatModel.chatStartMetadata.contextWindowMetadata.estimatedTokensUsed`. No top-level usage RPC. Per-turn = sum `modelUsage` over the turn's steps; emit as each PLANNER step hits DONE.
+
+### 10.4 Model / effort (external_model_change parity)
+Current model per-turn: `step.userInput.userConfig.plannerConfig.requestedModel.model` (+ `step.metadata.{generatorModel, modelUsage.model}`). Enum→displayName via `GetAvailableModels {}` → `response.models[key].{model, displayName, recommended, supportsThinking, thinkingBudget}`. Effort is NOT separate — it's encoded in the model enum (Gemini: M20/M132/M187 = Medium/High/Low) or a Thinking variant (Claude: M26 = Opus 4.6 Thinking). Detect change by diffing the per-turn enum vs previous (no "model-changed" step). LIVE-CONFIRMED: TUI /model switch flips the next turn's `requestedModel`/`generatorModel`.
+
+### 10.5 New-conversation rotation (/clear → session rotation parity)
+TUI `/clear` creates a NEW cascadeId/brain-dir UUID immediately; old conv retained (still reachable), not deleted. Detect via `GetAllCascadeTrajectories {}` → `trajectorySummaries{<conv>:{status, stepCount, trajectoryId, lastUserInputTime, lastModifiedTime, lastUserInputStepIndex}}` (a new convId key, or the bound conv going stale while a sibling advances); each stream frame's `update.conversationId` also names the active conv. On rotation, re-discover the active conv (max `lastUserInputTime`) and rotate the omnigent session (mirrors codex `thread/started`). `StartCascade` is the programmatic cold-start (not needed for human /clear).
+
+### 10.6 Phase-2 task plan
+- **T-A** RPC client: `send_user_cascade_message` + model resolution (`get_available_models`, resolve current enum). **T-B** executor `run_turn` → RPC turn-send (drop send-keys).
+- **T-C** RPC client: `stream_agent_state_updates` (connect-stream framing). **T-D** reader streaming mode: deltas (modifiedResponse prefix-diff + thinking) + DONE commit + snapshot dedup + poll fallback.
+- **T-E** usage events, **T-F** model-change events, **T-G** /clear rotation — reader additions (read from step.metadata / GetAllCascadeTrajectories).
+- Integrates with Task 10 (interrupt+T-B), Task 11 (runner wiring of streaming reader+bridge+rotation), Task 13 (e2e parity: streaming single-render, usage, model-change, rotation, turn-send).
