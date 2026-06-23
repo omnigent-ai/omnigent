@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Literal, TypedDict
 
 from omnigent.antigravity_native_forwarder import (
     _AGENT_NAME,
@@ -74,6 +75,113 @@ def _step_index(step: dict[str, object]) -> int | None:
         return None
     idx = traj_info.get("stepIndex")
     return int(idx) if isinstance(idx, int) else None
+
+
+class PendingInteraction(TypedDict):
+    """
+    A step that is WAITING for user interaction.
+
+    Produced by :func:`pending_interaction` for CORTEX_STEP_STATUS_WAITING steps
+    that carry a ``requestedInteraction`` block.  Downstream Tasks 7/8 consume
+    this to drive the elicitation bridge.
+
+    :param kind: Interaction type — ``"ask_question"`` or ``"permission"``.
+    :param trajectory_id: agy trajectory id from ``sourceTrajectoryStepInfo``.
+    :param step_index: Step index from ``sourceTrajectoryStepInfo`` (0 when absent).
+    :param spec: The raw ``requestedInteraction.askQuestion`` or
+        ``requestedInteraction.permission`` block.
+    """
+
+    kind: Literal["ask_question", "permission"]
+    trajectory_id: str
+    step_index: int
+    spec: dict[str, object]
+
+
+def _trajectory_id(step: dict[str, object]) -> str | None:
+    """
+    Extract the trajectory id from a RPC step dict.
+
+    The id lives at ``metadata.sourceTrajectoryStepInfo.trajectoryId``; it is
+    absent for USER_INPUT steps (which have no trajectory slot of their own).
+
+    :param step: One step dict from ``GetCascadeTrajectorySteps``.
+    :returns: The trajectory id string, or ``None`` when absent.
+    """
+    metadata = step.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    traj_info = metadata.get("sourceTrajectoryStepInfo")
+    if not isinstance(traj_info, dict):
+        return None
+    tid = traj_info.get("trajectoryId")
+    return tid if isinstance(tid, str) else None
+
+
+def pending_interaction(step: dict[str, object]) -> PendingInteraction | None:
+    """
+    Extract a pending interaction from a WAITING step.
+
+    Returns ``None`` unless ``step["status"] == CORTEX_STEP_STATUS_WAITING``.
+    This is the crux: DONE steps may still carry ``requestedInteraction`` (they
+    do in the recorded fixtures), so the implementation keys on *status*, not on
+    the presence of the interaction block.
+
+    For a WAITING step, the ``requestedInteraction`` block is inspected:
+
+    * ``requestedInteraction.askQuestion`` present → ``kind="ask_question"``,
+      ``spec`` = the ``askQuestion`` block (exposes
+      ``questions[].{question, options[].{id, text}}``).
+    * ``requestedInteraction.permission`` present → ``kind="permission"``,
+      ``spec`` = the ``permission`` block (exposes
+      ``resource.{action, target}`` and ``actionDescription``).
+
+    ``trajectory_id`` and ``step_index`` come from
+    ``metadata.sourceTrajectoryStepInfo``; ``step_index`` defaults to ``0``
+    when the proto omits it (mirrors :func:`_step_index` behaviour).
+
+    :param step: One step dict from ``GetCascadeTrajectorySteps``.
+    :returns: A :class:`PendingInteraction` dict, or ``None`` when the step is
+        not WAITING or the interaction block cannot be resolved.
+    """
+    if step.get("status") != _STATUS_WAITING:
+        return None
+
+    requested = step.get("requestedInteraction")
+    if not isinstance(requested, dict):
+        return None
+
+    trajectory_id = _trajectory_id(step)
+    if trajectory_id is None:
+        _logger.warning("agy RPC WAITING step missing trajectoryId")
+        return None
+
+    raw_idx = _step_index(step)
+    step_idx = raw_idx if raw_idx is not None else 0
+
+    ask = requested.get("askQuestion")
+    if isinstance(ask, dict):
+        return PendingInteraction(
+            kind="ask_question",
+            trajectory_id=trajectory_id,
+            step_index=step_idx,
+            spec=ask,
+        )
+
+    permission = requested.get("permission")
+    if isinstance(permission, dict):
+        return PendingInteraction(
+            kind="permission",
+            trajectory_id=trajectory_id,
+            step_index=step_idx,
+            spec=permission,
+        )
+
+    _logger.warning(
+        "agy RPC WAITING step has unrecognized requestedInteraction keys: %s",
+        list(requested.keys()),
+    )
+    return None
 
 
 def _response_id(conversation_id: str, step_idx: int) -> str:

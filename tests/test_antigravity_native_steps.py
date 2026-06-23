@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from omnigent.antigravity_native_forwarder import OutboundEvent, _ToolCallIdAllocator
-from omnigent.antigravity_native_steps import map_step_to_events
+from omnigent.antigravity_native_steps import map_step_to_events, pending_interaction
 
 # ---------------------------------------------------------------------------
 # Fixture helpers
@@ -501,3 +501,200 @@ class TestAllocatorFifoOrdering:
         result_item = result_events[0].data["item_data"]
         assert isinstance(result_item, dict)
         assert result_item["call_id"] == emitted_call_id
+
+
+# ---------------------------------------------------------------------------
+# Task 5: pending_interaction extractor
+# ---------------------------------------------------------------------------
+
+
+class TestPendingInteractionAskQuestionWaiting:
+    """
+    ASK_QUESTION WAITING step → PendingInteraction with kind="ask_question".
+
+    The spec comes from requestedInteraction.askQuestion (NOT from the top-level
+    askQuestion field).  trajectory_id and step_index come from
+    metadata.sourceTrajectoryStepInfo.
+    """
+
+    def test_returns_not_none(self) -> None:
+        """A WAITING ask_question step returns a PendingInteraction, not None."""
+        step = _load("ask_question_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+
+    def test_kind_is_ask_question(self) -> None:
+        """kind is 'ask_question'."""
+        step = _load("ask_question_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        assert result["kind"] == "ask_question"
+
+    def test_trajectory_id(self) -> None:
+        """trajectory_id matches metadata.sourceTrajectoryStepInfo.trajectoryId."""
+        step = _load("ask_question_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        assert result["trajectory_id"] == "efb134b2-d69f-43de-bb54-c9ece346d8a3"
+
+    def test_step_index(self) -> None:
+        """step_index matches metadata.sourceTrajectoryStepInfo.stepIndex (12)."""
+        step = _load("ask_question_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        assert result["step_index"] == 12
+
+    def test_spec_is_ask_question_block(self) -> None:
+        """spec equals the requestedInteraction.askQuestion block."""
+        step = _load("ask_question_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        spec = result["spec"]
+        assert isinstance(spec, dict)
+        assert "questions" in spec
+
+    def test_spec_questions_list(self) -> None:
+        """spec.questions is a non-empty list."""
+        step = _load("ask_question_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        questions = result["spec"].get("questions")
+        assert isinstance(questions, list)
+        assert len(questions) == 1
+
+    def test_spec_question_text(self) -> None:
+        """spec.questions[0].question contains the question text."""
+        step = _load("ask_question_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        questions = result["spec"].get("questions")
+        assert isinstance(questions, list)
+        q = questions[0]
+        assert isinstance(q, dict)
+        assert q["question"] == "What type of project or improvement would you like to focus on?"
+
+    def test_spec_options_list(self) -> None:
+        """spec.questions[0].options is a list of 4 option dicts."""
+        step = _load("ask_question_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        questions = result["spec"].get("questions")
+        assert isinstance(questions, list)
+        first_q = questions[0]
+        assert isinstance(first_q, dict)
+        options = first_q.get("options")
+        assert isinstance(options, list)
+        assert len(options) == 4
+
+    def test_spec_option_id_and_text(self) -> None:
+        """Each option has 'id' and 'text' keys."""
+        step = _load("ask_question_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        questions = result["spec"].get("questions")
+        assert isinstance(questions, list)
+        first_q = questions[0]
+        assert isinstance(first_q, dict)
+        options = first_q.get("options")
+        assert isinstance(options, list)
+        first_option = options[0]
+        assert isinstance(first_option, dict)
+        assert first_option["id"] == "1"
+        assert "(Recommended)" in str(first_option["text"])
+
+
+class TestPendingInteractionRunCommandWaiting:
+    """
+    RUN_COMMAND WAITING step → PendingInteraction with kind="permission".
+
+    The spec comes from requestedInteraction.permission; resource.action and
+    resource.target are the authoritative fields.
+    """
+
+    def test_returns_not_none(self) -> None:
+        """A WAITING run_command step returns a PendingInteraction, not None."""
+        step = _load("run_command_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+
+    def test_kind_is_permission(self) -> None:
+        """kind is 'permission'."""
+        step = _load("run_command_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        assert result["kind"] == "permission"
+
+    def test_trajectory_id(self) -> None:
+        """trajectory_id from metadata.sourceTrajectoryStepInfo.trajectoryId."""
+        step = _load("run_command_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        assert result["trajectory_id"] == "efb134b2-d69f-43de-bb54-c9ece346d8a3"
+
+    def test_step_index(self) -> None:
+        """step_index matches stepIndex=6."""
+        step = _load("run_command_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        assert result["step_index"] == 6
+
+    def test_spec_is_permission_block(self) -> None:
+        """spec equals the requestedInteraction.permission block."""
+        step = _load("run_command_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        spec = result["spec"]
+        assert isinstance(spec, dict)
+        assert "resource" in spec
+
+    def test_spec_resource_action(self) -> None:
+        """spec.resource.action is 'command'."""
+        step = _load("run_command_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        resource = result["spec"]["resource"]
+        assert isinstance(resource, dict)
+        assert resource["action"] == "command"
+
+    def test_spec_resource_target(self) -> None:
+        """spec.resource.target is 'pwd'."""
+        step = _load("run_command_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        resource = result["spec"].get("resource")
+        assert isinstance(resource, dict)
+        assert resource["target"] == "pwd"
+
+    def test_spec_action_description(self) -> None:
+        """spec.actionDescription is present when the fixture has it."""
+        step = _load("run_command_waiting")
+        result = pending_interaction(step)
+        assert result is not None
+        assert result["spec"].get("actionDescription") == "Running pwd command"
+
+
+class TestPendingInteractionDoneReturnsNone:
+    """
+    DONE steps with requestedInteraction MUST return None.
+
+    This is the adversarial trap (Task1-M2): both DONE fixtures contain
+    requestedInteraction, but status == CORTEX_STEP_STATUS_DONE.  The
+    implementation must key on status, not on the presence of
+    requestedInteraction.
+    """
+
+    def test_ask_question_done_returns_none(self) -> None:
+        """
+        ask_question_done.json has status=DONE and still contains
+        requestedInteraction.askQuestion — must return None.
+        """
+        step = _load("ask_question_done")
+        assert pending_interaction(step) is None
+
+    def test_run_command_done_returns_none(self) -> None:
+        """
+        run_command_done.json has status=DONE and still contains
+        requestedInteraction.permission — must return None.
+        """
+        step = _load("run_command_done")
+        assert pending_interaction(step) is None
