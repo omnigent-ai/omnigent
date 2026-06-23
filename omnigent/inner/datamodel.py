@@ -114,15 +114,37 @@ class History:
         text = msg.content if isinstance(msg.content, str) else str(msg.content)
         return max(1, len(text) // 4)
 
+    @staticmethod
+    def _tool_call_pair_size(messages: list[Message], idx: int) -> int:
+        """Return 2 if ``messages[idx]`` starts a tool_call/tool_result pair, else 1."""
+        if (
+            idx + 1 < len(messages)
+            and messages[idx].role == "tool_call"
+            and messages[idx + 1].role == "tool_result"
+        ):
+            return 2
+        return 1
+
     def get_context_window(self, max_tokens: int | None = None) -> list[Message]:
         """Return messages that fit in the context window.
 
+        This is a lightweight, dependency-free fallback for callers
+        that use :class:`History` directly.  The primary context
+        management path is the layered compaction system in
+        :mod:`omnigent.runtime.compaction`, which uses tiktoken-based
+        counting and LLM summarization on the executor-facing message
+        format.
+
         When *max_tokens* is ``None``, all messages are returned.
-        Otherwise, messages are selected to stay within the budget:
-        system messages are always kept, then the most recent
-        non-system messages are included newest-first until the
-        budget is exhausted.  Older messages beyond the budget are
-        dropped.
+        Otherwise, context selection mirrors the compaction module's
+        approach:
+
+        1. System messages are always kept.
+        2. Tool call / tool result pairs are kept or dropped
+           together (never orphaned).
+        3. The most recent non-system messages are included
+           newest-first until the budget is exhausted; older
+           messages are dropped.
         """
         if max_tokens is None:
             return list(self.messages)
@@ -136,24 +158,44 @@ class History:
                 non_system_msgs.append(msg)
 
         budget = max_tokens
-        result: list[Message] = []
 
         for msg in system_msgs:
-            cost = self._estimate_tokens(msg)
-            if cost <= budget:
-                result.append(msg)
-                budget -= cost
+            budget -= self._estimate_tokens(msg)
 
-        kept: list[Message] = []
-        for msg in reversed(non_system_msgs):
-            cost = self._estimate_tokens(msg)
-            if cost <= budget:
-                kept.append(msg)
-                budget -= cost
+        if budget <= 0:
+            return list(system_msgs)
+
+        # Walk non-system messages from newest to oldest, keeping
+        # tool_call/tool_result pairs atomic.
+        kept_indices: list[int] = []
+        i = len(non_system_msgs) - 1
+        while i >= 0:
+            pair = self._tool_call_pair_size(non_system_msgs, i - 1) if i >= 1 else 1
+            if pair == 2:
+                cost = (
+                    self._estimate_tokens(non_system_msgs[i - 1])
+                    + self._estimate_tokens(non_system_msgs[i])
+                )
+                if cost <= budget:
+                    kept_indices.append(i - 1)
+                    kept_indices.append(i)
+                    budget -= cost
+                    i -= 2
+                    continue
+                else:
+                    break
             else:
-                break
-        kept.reverse()
-        result.extend(kept)
+                cost = self._estimate_tokens(non_system_msgs[i])
+                if cost <= budget:
+                    kept_indices.append(i)
+                    budget -= cost
+                    i -= 1
+                else:
+                    break
+        kept_indices.sort()
+        result = list(system_msgs)
+        for idx in kept_indices:
+            result.append(non_system_msgs[idx])
         return result
 
     def search(self, query: str) -> list[Message]:
