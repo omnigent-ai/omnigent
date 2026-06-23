@@ -955,7 +955,7 @@ function ConversationRow({
           !selectionMode &&
             (sessionState?.kind === "awaiting" ? "pr-44 md:pr-28" : "pr-28 md:pr-16"),
           selectionMode && "pr-10",
-          isActive && "bg-muted font-semibold",
+          isActive && "bg-muted",
           selectionMode && isSelected && "bg-primary/5",
         )}
         onClick={(e) => {
@@ -981,7 +981,7 @@ function ConversationRow({
             shared) were removed to keep rows text-clean; pinned rows still
             group under "Pinned". */}
         <div className="flex w-full items-center gap-1.5">
-          <span className={cn("relative min-w-0 truncate", hasUnseenMessages && "font-semibold")}>
+          <span className="relative min-w-0 truncate">
             {label}
             {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
           </span>
