@@ -39,9 +39,12 @@ import httpx
 
 _logger = logging.getLogger(__name__)
 
-#: Seconds between store polls. Goose turns run for many seconds in the TUI, so a
-#: sub-second cadence adds load without improving perceived latency.
-_DEFAULT_POLL_INTERVAL_S = 0.7
+#: Seconds between store polls. Goose flushes a ``messages`` row per agentic
+#: *step* (each assistant-text / tool-call cycle) as a turn progresses — not just
+#: once at turn end — so a snappier sub-second cadence makes the mirrored chat
+#: track the terminal step-by-step on coding turns (many short tool-call steps)
+#: rather than lagging a beat behind each one. 0.4s balances liveness vs. load.
+_DEFAULT_POLL_INTERVAL_S = 0.4
 _POST_TIMEOUT_S = 30.0
 
 # Supervisor backoff (mirrors cursor_native_forwarder.supervise_cursor_forwarder).

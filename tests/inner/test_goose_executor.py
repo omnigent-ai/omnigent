@@ -10,12 +10,13 @@ verified Goose 1.38 ``goose acp`` session.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from omnigent.inner.executor import TextChunk, TurnComplete
+from omnigent.inner.executor import ExecutorError, TextChunk, TurnComplete
 from omnigent.inner.goose_executor import GooseExecutor
 
 # ---------------------------------------------------------------------------
@@ -139,7 +140,10 @@ def test_permission_outcome_cancels_when_no_matching_option() -> None:
 
 
 def test_usage_from_result_maps_goose_keys() -> None:
-    result = {"stopReason": "end_turn", "usage": {"totalTokens": 100, "inputTokens": 80, "outputTokens": 20}}
+    result = {
+        "stopReason": "end_turn",
+        "usage": {"totalTokens": 100, "inputTokens": 80, "outputTokens": 20},
+    }
     assert GooseExecutor._usage_from_result(result) == {
         "input_tokens": 80,
         "output_tokens": 20,
@@ -161,7 +165,11 @@ def test_text_from_blocks_text_and_file() -> None:
     blocks = [
         {"type": "input_text", "text": "do the thing"},
         {"type": "input_file", "filename": "a.txt", "file_data": "data:text/plain;base64,aGk="},
-        {"type": "input_file", "filename": "b.pdf", "file_data": "data:application/pdf;base64,AAA="},
+        {
+            "type": "input_file",
+            "filename": "b.pdf",
+            "file_data": "data:application/pdf;base64,AAA=",
+        },
     ]
     text = GooseExecutor._text_from_blocks(blocks)
     assert "do the thing" in text
@@ -229,7 +237,9 @@ async def test_respond_to_permission_elicitation_allow_and_deny() -> None:
     allow_exec._send = AsyncMock(side_effect=lambda m: sent_a.append(m))  # type: ignore[method-assign]
     await allow_exec._respond_to_agent_request(_perm_request())
     assert sent_a[0]["result"]["outcome"] == {"outcome": "selected", "optionId": "allow_once"}
-    allow_exec._elicitation_handler.assert_awaited_once_with("shell", {"command": "rm -f victim.txt"})
+    allow_exec._elicitation_handler.assert_awaited_once_with(
+        "shell", {"command": "rm -f victim.txt"}
+    )
 
     # Deny → reject_once.
     deny_exec = GooseExecutor()
@@ -301,7 +311,9 @@ async def test_run_turn_streams_text_and_usage() -> None:
 
     executor._send = fake_send  # type: ignore[method-assign]
 
-    events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "be nice")]
+    events = [
+        e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "be nice")
+    ]
     text_chunks = [e for e in events if isinstance(e, TextChunk)]
     completes = [e for e in events if isinstance(e, TurnComplete)]
 
@@ -314,3 +326,353 @@ async def test_run_turn_streams_text_and_usage() -> None:
 @pytest.mark.asyncio
 async def test_close_with_no_process_is_a_noop() -> None:
     await GooseExecutor().close()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# close() / process lifecycle
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_close_terminates_process() -> None:
+    executor = GooseExecutor()
+    mock_proc = MagicMock()
+    mock_proc.stdin = MagicMock()
+    mock_proc.returncode = None
+
+    async def fake_wait() -> int:
+        return 0
+
+    mock_proc.wait = fake_wait
+    executor._proc = mock_proc
+    await executor.close()
+    mock_proc.terminate.assert_called_once()
+    assert executor._proc is None
+
+
+@pytest.mark.asyncio
+async def test_close_kills_when_terminate_raises() -> None:
+    executor = GooseExecutor()
+    mock_proc = MagicMock()
+    mock_proc.stdin = MagicMock()
+    mock_proc.terminate.side_effect = OSError("gone")
+    mock_proc.returncode = None
+    executor._proc = mock_proc
+    await executor.close()  # must not propagate
+    mock_proc.kill.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# ACP transport: _rpc / _read_stdout / _read_stderr
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rpc_id_increments_monotonically() -> None:
+    executor = GooseExecutor()
+    sent: list[dict] = []
+
+    async def fake_send(msg: dict) -> None:
+        sent.append(msg)
+        fut = executor._pending.get(msg["id"])
+        if fut and not fut.done():
+            fut.set_result({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+
+    executor._send = fake_send  # type: ignore[method-assign]
+    await executor._rpc("initialize", {"protocolVersion": 1})
+    await executor._rpc("session/new", {"cwd": "/", "mcpServers": []})
+    assert [m["id"] for m in sent] == [1, 2]
+
+
+def _stdout_proc(*lines: str) -> MagicMock:
+    """A fake proc whose stdout yields *lines* then EOF."""
+    mock_stdout = AsyncMock()
+    mock_stdout.readline = AsyncMock(
+        side_effect=[(line + "\n").encode() for line in lines] + [b""]
+    )
+    proc = MagicMock()
+    proc.stdout = mock_stdout
+    return proc
+
+
+@pytest.mark.asyncio
+async def test_read_stdout_resolves_pending_future() -> None:
+    executor = GooseExecutor()
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+    executor._pending[42] = fut
+    executor._proc = _stdout_proc(json.dumps({"jsonrpc": "2.0", "id": 42, "result": {"ok": True}}))
+    await executor._read_stdout()
+    assert fut.done() and fut.result()["result"]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_read_stdout_puts_notifications_on_queue() -> None:
+    executor = GooseExecutor()
+    executor._proc = _stdout_proc(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {"update": {"sessionUpdate": "agent_message_chunk"}},
+            }
+        )
+    )
+    await executor._read_stdout()
+    assert executor._queue.get_nowait()["method"] == "session/update"
+
+
+@pytest.mark.asyncio
+async def test_read_stdout_colliding_request_is_queued_not_resolved() -> None:
+    """A server request (has ``method``) whose id collides with a pending _rpc
+    routes to the queue, never resolving our future with a result."""
+    executor = GooseExecutor()
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+    executor._pending[2] = fut
+    executor._proc = _stdout_proc(
+        json.dumps(
+            {"jsonrpc": "2.0", "id": 2, "method": "session/request_permission", "params": {}}
+        )
+    )
+    await executor._read_stdout()
+    # EOF wakes the still-pending future with EOFError (never a result).
+    assert isinstance(fut.exception(), EOFError)
+    assert executor._queue.get_nowait()["method"] == "session/request_permission"
+
+
+@pytest.mark.asyncio
+async def test_read_stdout_wakes_pending_futures_on_eof() -> None:
+    executor = GooseExecutor()
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+    executor._pending[7] = fut
+    executor._proc = _stdout_proc()  # immediate EOF
+    await executor._read_stdout()
+    assert isinstance(fut.exception(), EOFError)
+
+
+@pytest.mark.asyncio
+async def test_read_stderr_drains_without_raising() -> None:
+    executor = GooseExecutor()
+    mock_stderr = AsyncMock()
+    mock_stderr.readline = AsyncMock(side_effect=[b"goose: warming up\n", b""])
+    proc = MagicMock()
+    proc.stderr = mock_stderr
+    executor._proc = proc
+    await executor._read_stderr()  # must drain to EOF without raising
+
+
+# ---------------------------------------------------------------------------
+# Handshake / session lifecycle
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ensure_initialized_learns_image_capability() -> None:
+    executor = GooseExecutor()
+    executor._rpc = AsyncMock(  # type: ignore[method-assign]
+        return_value={"result": {"agentCapabilities": {"promptCapabilities": {"image": True}}}}
+    )
+    await executor._ensure_initialized()
+    assert executor._initialized is True
+    assert executor._image_supported is True
+    # Second call is a no-op (latched).
+    executor._rpc.reset_mock()
+    await executor._ensure_initialized()
+    executor._rpc.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_uses_server_assigned_id_and_caches() -> None:
+    executor = GooseExecutor()
+    executor._rpc = AsyncMock(return_value={"result": {"sessionId": "20260623_7"}})  # type: ignore[method-assign]
+    sid = await executor._ensure_session()
+    assert sid == "20260623_7" and executor._session_id == "20260623_7"
+    executor._rpc.reset_mock()
+    assert await executor._ensure_session() == "20260623_7"
+    executor._rpc.assert_not_called()  # cached
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_raises_on_missing_session_id() -> None:
+    executor = GooseExecutor()
+    executor._rpc = AsyncMock(return_value={"result": {}})  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="session/new"):
+        await executor._ensure_session()
+
+
+# ---------------------------------------------------------------------------
+# Spawn / sandbox
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_launch_path_bare_when_no_sandbox() -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    # os_env=None → bare binary.
+    assert GooseExecutor(goose_path="goose")._sandbox_launch_path(()) == "goose"
+    # os_env present but sandbox explicitly disabled → bare binary.
+    disabled = GooseExecutor(
+        goose_path="/usr/bin/goose", os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert disabled._sandbox_launch_path(("PATH",)) == "/usr/bin/goose"
+
+
+def test_sandbox_launch_path_wraps_active_policy(monkeypatch, tmp_path) -> None:
+    """An active sandbox wraps goose in a launcher with its config/state dirs as
+    write roots and our spawn env names allowlisted."""
+    from omnigent.inner import sandbox as sandbox_mod
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    captured: dict = {}
+
+    def _fake_resolve(_os_env, cwd) -> SandboxPolicy:
+        return SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=[cwd.resolve(strict=False)],
+            write_roots=[cwd.resolve(strict=False)],
+            write_files=[],
+            allow_network=True,
+        )
+
+    def _fake_launcher(target: str, sandbox: SandboxPolicy) -> str:
+        captured["target"] = target
+        captured["policy"] = sandbox
+        return "/fake/launcher"
+
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve)
+    monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_launcher)
+
+    executor = GooseExecutor(
+        cwd=str(tmp_path),
+        goose_path="/usr/bin/goose",
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+    path = executor._sandbox_launch_path(("PATH", "GOOSE_PROVIDER"))
+
+    assert path == "/fake/launcher"
+    assert captured["target"] == "/usr/bin/goose"
+    policy = captured["policy"]
+    # goose's config dir is a write root so it can start inside the jail.
+    assert any(str(p).endswith(".config/goose") for p in policy.write_roots)
+    assert policy.spawn_env_allowlist is not None
+    assert "PATH" in policy.spawn_env_allowlist
+    assert "GOOSE_PROVIDER" in policy.spawn_env_allowlist
+
+
+def test_sandbox_launch_path_falls_back_when_backend_unavailable(monkeypatch, tmp_path) -> None:
+    """A backend failure degrades to the bare binary, never blocks startup."""
+    from omnigent.inner import sandbox as sandbox_mod
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    def _boom(_os_env, _cwd) -> None:
+        raise NotImplementedError("no bwrap here")
+
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _boom)
+    executor = GooseExecutor(
+        cwd=str(tmp_path),
+        goose_path="/usr/bin/goose",
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+    assert executor._sandbox_launch_path(("PATH",)) == "/usr/bin/goose"
+
+
+@pytest.mark.asyncio
+async def test_start_process_resets_handshake_state(monkeypatch) -> None:
+    """A (re)start clears the one-way handshake latch and spawns goose acp."""
+    executor = GooseExecutor(goose_path="goose", builtins=("developer",))
+    executor._initialized = True
+    executor._image_supported = True
+
+    captured: dict = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["argv"] = args
+        return _stdout_proc()  # stdout EOF immediately so the reader exits fast
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await executor._start_process()
+    try:
+        assert executor._initialized is False  # latch reset
+        assert executor._image_supported is False
+        assert captured["argv"][1:] == ("acp", "--with-builtin", "developer")
+    finally:
+        await executor.close()
+
+
+# ---------------------------------------------------------------------------
+# run_turn error + usage paths
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_turn_boot_failure_yields_error(monkeypatch) -> None:
+    executor = GooseExecutor()
+
+    async def boom() -> None:
+        raise FileNotFoundError("goose not found")
+
+    monkeypatch.setattr(executor, "_start_process", boom)
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].retryable is False
+
+
+@pytest.mark.asyncio
+async def test_run_turn_acp_error_resets_session(monkeypatch) -> None:
+    """An ACP ``Session not found`` error resets the session and yields a
+    retryable error (next turn re-creates the session + re-sends system prompt)."""
+    executor = GooseExecutor()
+    executor._initialized = True
+    executor._session_id = "stale"
+    executor._system_prompt_sent = True
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    loop = asyncio.get_event_loop()
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            rid = msg["id"]
+            loop.call_soon(
+                lambda: executor._pending[rid].set_result(
+                    {"id": rid, "error": {"message": "Session not found: stale"}}
+                )
+            )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "sys")]
+    assert any(isinstance(e, ExecutorError) and e.retryable for e in events)
+    assert executor._session_id is None  # reset
+    assert executor._system_prompt_sent is False
+
+
+@pytest.mark.asyncio
+async def test_run_turn_tracks_context_window_from_usage_update() -> None:
+    executor = GooseExecutor()
+    executor._initialized = True
+    executor._session_id = "s"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    loop = asyncio.get_event_loop()
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            rid = msg["id"]
+            await executor._queue.put(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "update": {"sessionUpdate": "usage_update", "used": 5, "size": 200000}
+                    },
+                }
+            )
+            loop.call_soon(
+                lambda: executor._pending[rid].set_result(
+                    {"id": rid, "result": {"stopReason": "end_turn"}}
+                )
+            )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+    [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+    assert executor.max_context_tokens() == 200000

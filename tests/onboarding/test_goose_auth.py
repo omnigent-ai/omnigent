@@ -39,7 +39,9 @@ goose Configuration:
 
 def _fake_run(stdout: str, returncode: int = 0):
     def _run(*_args, **_kwargs):
-        return subprocess.CompletedProcess(args=["goose"], returncode=returncode, stdout=stdout, stderr="")
+        return subprocess.CompletedProcess(
+            args=["goose"], returncode=returncode, stdout=stdout, stderr=""
+        )
 
     return _run
 
@@ -85,7 +87,9 @@ def test_summary_prefers_goose_info_over_config_file(tmp_path: Path, monkeypatch
     cfg_dir = tmp_path / "goose"
     cfg_dir.mkdir()
     # A config file that our naive parser can't read a provider from.
-    (cfg_dir / "config.yaml").write_text("extensions:\n  developer:\n    enabled: true\n", encoding="utf-8")
+    (cfg_dir / "config.yaml").write_text(
+        "extensions:\n  developer:\n    enabled: true\n", encoding="utf-8"
+    )
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     monkeypatch.delenv("GOOSE_PROVIDER", raising=False)
     monkeypatch.delenv("GOOSE_MODEL", raising=False)

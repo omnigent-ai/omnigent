@@ -156,9 +156,7 @@ def goose_config_summary() -> GooseConfigSummary:
         or info_provider
         or _config_value("GOOSE_PROVIDER")
     )
-    model = (
-        os.environ.get("GOOSE_MODEL", "").strip() or info_model or _config_value("GOOSE_MODEL")
-    )
+    model = os.environ.get("GOOSE_MODEL", "").strip() or info_model or _config_value("GOOSE_MODEL")
     return GooseConfigSummary(
         installed=goose_cli_installed(),
         provider=provider,

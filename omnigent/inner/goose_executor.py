@@ -376,9 +376,7 @@ class GooseExecutor(Executor):
         fut: asyncio.Future[dict[str, Any]] = loop.create_future()  # type: ignore[explicit-any]
         self._pending[req_id] = fut
 
-        await self._send(
-            {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
-        )
+        await self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
@@ -794,7 +792,9 @@ class GooseExecutor(Executor):
                 return
 
             try:
-                notification = await asyncio.wait_for(self._queue.get(), timeout=min(remaining, 2.0))
+                notification = await asyncio.wait_for(
+                    self._queue.get(), timeout=min(remaining, 2.0)
+                )
             except asyncio.TimeoutError:
                 continue
 

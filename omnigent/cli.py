@@ -9246,11 +9246,7 @@ def _manage_goose_harness() -> None:
     # auto-install — show the hint and return.
     if not harness_cli_installed(GOOSE_KEY):
         spec = harness_install_spec(GOOSE_KEY)
-        hint = (
-            spec.install_hint
-            if spec and spec.install_hint
-            else "brew install block-goose-cli"
-        )
+        hint = spec.install_hint if spec and spec.install_hint else "brew install block-goose-cli"
         console.print(
             f"  Goose's CLI isn't installed. Install it with:\n    [bold]{hint}[/bold]\n"
             "  then re-open this menu."
