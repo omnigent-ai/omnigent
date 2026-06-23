@@ -1,0 +1,74 @@
+default_platform(:ios)
+
+# Builds are signed with the team's distribution cert via Xcode automatic
+# signing (-allowProvisioningUpdates). Upload + provisioning use an App Store
+# Connect API key supplied through env vars — see fastlane/.env.example.
+
+platform :ios do
+  desc "Run the OmnigentTests unit tests"
+  lane :tests do
+    run_tests(scheme: "Omnigent")
+  end
+
+  desc "Build a signed Release .ipa and upload it to TestFlight"
+  lane :beta do
+    load_asc_api_key
+    build(build_number: next_build_number)
+    upload_to_testflight(skip_waiting_for_build_processing: true)
+  end
+
+  desc "Build a signed Release .ipa and upload it to App Store Connect (no submission)"
+  lane :release do
+    # NB: this uploads a fresh, uniquely-numbered binary. The more common App
+    # Store flow is to *promote* an already-tested TestFlight build instead of
+    # uploading a new one — if you adopt that, replace the build/upload below
+    # with a submission of the chosen TestFlight build. App Store metadata and
+    # screenshots are still a follow-up; this lane uploads but does not submit.
+    load_asc_api_key
+    build(build_number: next_build_number)
+    upload_to_app_store(
+      submit_for_review: false,
+      skip_metadata: true,
+      skip_screenshots: true,
+      precheck_include_in_app_purchases: false
+    )
+  end
+
+  # --- helpers ---
+
+  desc "Archive the Release configuration into ./build"
+  private_lane :build do |options|
+    # Inject the build number as an xcodebuild setting override rather than
+    # mutating tracked files. CFBundleVersion is $(CURRENT_PROJECT_VERSION) in
+    # the Info.plists, so overriding CURRENT_PROJECT_VERSION here flows into the
+    # archived binary — and nothing in the repo changes (no agvtool, no churn).
+    xcargs = ["-allowProvisioningUpdates"]
+    xcargs << "CURRENT_PROJECT_VERSION=#{options[:build_number]}" if options[:build_number]
+    build_app(
+      scheme: "Omnigent",
+      configuration: "Release",
+      export_method: "app-store",
+      xcargs: xcargs.join(" "),
+      output_directory: "./build",
+      clean: true
+    )
+  end
+
+  desc "Next build number: one past the highest already on App Store Connect"
+  private_lane :next_build_number do
+    # TestFlight sees every build (App Store builds pass through it too), so the
+    # latest TestFlight build number is a monotonic counter for the whole app.
+    # Requires the ASC API key to be loaded first.
+    latest_testflight_build_number(initial_build_number: 0) + 1
+  end
+
+  desc "Load the App Store Connect API key from env vars into the session"
+  private_lane :load_asc_api_key do
+    app_store_connect_api_key(
+      key_id: ENV.fetch("ASC_KEY_ID"),
+      issuer_id: ENV.fetch("ASC_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_PATH"),
+      in_house: false
+    )
+  end
+end

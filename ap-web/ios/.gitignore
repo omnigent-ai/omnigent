@@ -1,0 +1,23 @@
+# Xcode per-user state (window layout, open files, scheme selection, etc.)
+xcuserdata/
+
+# Build artifacts
+build/
+*.ipa
+*.dSYM.zip
+
+# Bundler (local gem install)
+.bundle/
+vendor/
+
+# Signing secrets — never commit
+fastlane/AuthKey_*.p8
+fastlane/.env
+
+# fastlane run output
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/test_output/
+
+# Auto-generated lane docs (regenerated on every fastlane run; see RELEASE.md)
+fastlane/README.md

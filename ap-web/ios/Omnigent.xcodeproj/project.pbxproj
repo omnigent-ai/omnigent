@@ -401,6 +401,7 @@
 				DEVELOPMENT_TEAM = 8RMX4WU6F8;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "Omnigent/Info-Debug.plist";
+				VERSIONING_SYSTEM = "apple-generic";
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -430,6 +431,7 @@
 				DEVELOPMENT_TEAM = 8RMX4WU6F8;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "Omnigent/Info-Release.plist";
+				VERSIONING_SYSTEM = "apple-generic";
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
