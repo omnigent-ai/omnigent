@@ -72,6 +72,7 @@ import { cn } from "@/lib/utils";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
+import { useSessionSearchHotkey } from "@/hooks/useSessionSearchHotkey";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { ThemeModeMenu } from "@/components/theme/ThemeModeMenu";
 import { AccountMenu } from "./AccountMenu";
@@ -96,6 +97,7 @@ const TIME_MARKER_SLOT_CLASS =
 
 interface SidebarProps {
   open: boolean;
+  onOpen?: () => void;
   onClose: () => void;
   /**
    * Live open fraction (0 = closed, 1 = open) while the iOS shell's left-edge
@@ -143,12 +145,13 @@ function useActiveNavItem(): { isNewChatPage: boolean; isInboxPage: boolean } {
  *     scrollback is fine; users typically want the conversations list
  *     to stay visible while they switch around.
  */
-export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
+export function Sidebar({ open, onOpen, onClose, dragProgress = null }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
   const [pinnedConversationIds, setPinnedConversationIds] = useState(readPinnedConversationIds);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   const toggleSelected = useCallback((id: string) => {
     setSelectedIds((prev) => {
@@ -239,6 +242,20 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   // visually open so it isn't `inert`/`aria-hidden` mid-gesture.
   const dragging = dragProgress != null;
   const effectiveOpen = open || dragging;
+  const focusSessionSearch = useCallback(() => {
+    setSelectionMode(false);
+    window.setTimeout(() => {
+      const input = searchInputRef.current;
+      if (!input) return;
+      input.focus();
+      input.select();
+    }, 0);
+  }, []);
+  useSessionSearchHotkey({
+    sidebarOpen: effectiveOpen,
+    onOpenSidebar: onOpen ?? (() => {}),
+    onFocusSearch: focusSessionSearch,
+  });
 
   return (
     <aside
@@ -401,6 +418,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
             <div className="relative flex-1">
               <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
               <input
+                ref={searchInputRef}
                 type="search"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}

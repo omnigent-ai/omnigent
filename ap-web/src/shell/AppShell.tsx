@@ -983,6 +983,7 @@ export function AppShell() {
             <Sidebar
               open={sidebarOpen}
               dragProgress={sidebarDragProgress}
+              onOpen={() => setSidebarOpen(true)}
               onClose={() => setSidebarOpen(false)}
             />
 

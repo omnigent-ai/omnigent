@@ -34,6 +34,7 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
+    expect(screen.getByText("Search sessions")).toBeTruthy();
     expect(screen.getByText("Previous session")).toBeTruthy();
     expect(screen.getByText("Navigate suggestions")).toBeTruthy();
   });
