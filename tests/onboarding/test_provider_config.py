@@ -283,6 +283,11 @@ def test_set_default_provider_pi_scope_round_trips_and_moves() -> None:
             True,
         ),
         ({"kind": "databricks", "profile": "my-ws"}, True),
+        # Bedrock mode is native-`omnigent claude` only — pi cannot use it.
+        (
+            {"kind": "bedrock", "anthropic": {"base_url": "https://x", "api_key_ref": "env:K"}},
+            False,
+        ),
         # A CLI login is unusable outside its own CLI — never pi-capable.
         ({"kind": "subscription", "cli": "claude"}, False),
     ],
@@ -427,3 +432,90 @@ def test_describe_active_credential_cli_config() -> None:
     # No inline endpoint/model: both live in the CLI's own config.
     assert cred.base_url is None
     assert cred.model is None
+
+
+def test_bedrock_kind_rejected_for_non_native_harnesses() -> None:
+    """`kind: bedrock` is native-`omnigent claude` only; in-process harnesses fail loud.
+
+    ``configure_agent_harness_with_provider`` has no Bedrock path — emitting the
+    generic ``HARNESS_*_GATEWAY_*`` vars would silently point claude-sdk / pi at
+    the Bedrock endpoint as if it were the Anthropic Messages API. Each non-native
+    harness must raise rather than mis-configure.
+    """
+    from omnigent.errors import ErrorCode
+    from omnigent.runtime.workflow import configure_agent_harness_with_provider
+
+    entry = load_providers(
+        {
+            "providers": {
+                "b": {
+                    "kind": "bedrock",
+                    "anthropic": {
+                        "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+                        "api_key": "k",
+                        "models": {"default": "us.anthropic.claude-haiku-4-5-20251001-v1:0"},
+                    },
+                }
+            }
+        }
+    )["b"]
+    for harness in ("claude-sdk", "pi"):
+        env: dict[str, str] = {}
+        with pytest.raises(OmnigentError) as exc:
+            configure_agent_harness_with_provider(env, entry, harness_type=harness)
+        assert exc.value.code == ErrorCode.INVALID_INPUT
+        assert env == {}  # nothing written before the raise
+
+
+def test_default_provider_for_pi_skips_bedrock_default() -> None:
+    """A bedrock Claude default is not handed to pi (native-claude only).
+
+    pi can't drive Bedrock mode (configure_agent_harness_with_provider raises),
+    so the unmapped-harness fallback must skip a kind: bedrock default and fall
+    through to the next family — otherwise adding a Bedrock Claude default would
+    turn a previously-working pi run (its own login) into a hard INVALID_INPUT
+    error. The mapped claude-sdk harness still takes the bedrock default (its
+    family); the fail-loud there is by design.
+    """
+    config = {
+        "providers": {
+            "bedrock": {
+                "kind": "bedrock",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+                    "api_key": "k",
+                    "models": {"default": "us.anthropic.claude-haiku-4-5-20251001-v1:0"},
+                },
+            },
+            "oai": {
+                "kind": "key",
+                "default": True,
+                "openai": {"base_url": "https://api.openai.com/v1", "api_key": "k"},
+            },
+        }
+    }
+    assert default_provider_for_harness(config, "pi").name == "oai"
+    assert default_provider_for_harness(config, "claude-sdk").name == "bedrock"
+
+
+def test_default_provider_for_pi_none_when_only_bedrock_default() -> None:
+    """A bedrock-only Claude default leaves pi with no provider (own login).
+
+    With nothing pi can consume, the fallback returns None so pi uses its own
+    auth, rather than handing it a bedrock provider that would fail loud.
+    """
+    config = {
+        "providers": {
+            "bedrock": {
+                "kind": "bedrock",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+                    "api_key": "k",
+                    "models": {"default": "us.anthropic.claude-haiku-4-5-20251001-v1:0"},
+                },
+            }
+        }
+    }
+    assert default_provider_for_harness(config, "pi") is None
