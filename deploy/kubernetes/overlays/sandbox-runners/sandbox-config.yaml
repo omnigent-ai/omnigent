@@ -1,20 +1,13 @@
 ---
-# config.yaml for the server, supplying the `sandbox:` section that turns on the
-# kubernetes sandbox provider. The base deployment configures the server purely
-# through env vars (the omnigent-config ConfigMap); the managed-sandbox backend,
-# however, is read from the config FILE that `OMNIGENT_CONFIG` points at
-# (parse_sandbox_config(cfg.get("sandbox")) in omnigent/cli.py). This overlay's
-# deployment-patch.yaml mounts this ConfigMap at /etc/omnigent and sets
-# OMNIGENT_CONFIG=/etc/omnigent/config.yaml.
-#
-# Only the `sandbox:` section is needed here — auth and the rest stay in the
-# env-based omnigent-config ConfigMap (the two layers are independent).
+# ConfigMap supplying the server's `sandbox:` section. The managed-sandbox backend
+# is read from the OMNIGENT_CONFIG file (not the env-based omnigent-config
+# ConfigMap); deployment-patch.yaml mounts this at /etc/omnigent and points
+# OMNIGENT_CONFIG at it.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: omnigent-sandbox-config
-  # Mounted by the server Pod, so this ConfigMap lives in the SERVER namespace.
-  namespace: omnigent
+  namespace: omnigent # mounted by the server Pod
   labels:
     app.kubernetes.io/name: omnigent
     app.kubernetes.io/component: server
@@ -22,32 +15,25 @@ data:
   config.yaml: |
     sandbox:
       provider: kubernetes
-      # Public/in-cluster URL the runner Pod's `omnigent host` entrypoint dials
-      # back to. In-cluster service DNS is simplest (no ingress hop); http
-      # upgrades to ws for the tunnel. Use your external ingress URL instead if
-      # runner Pods must reach the server through it.
-      # In-cluster `service.namespace.svc.cluster.local` DNS form; the base
-      # Service listens on port 80 (targetPort http=8000), so no port suffix.
-      # (The Service is in `omnigent`; runner Pods in `omnigent-sandboxes` reach
-      # it across namespaces via this fully-qualified cluster DNS name.)
+      # URL the runner Pod's host dials back to. In-cluster service DNS (the base
+      # Service listens on port 80) is simplest; use your ingress URL if runner
+      # Pods must reach the server through it.
       server_url: http://omnigent.omnigent.svc.cluster.local
       kubernetes:
-        # Namespace the runner Pods are created in — the DEDICATED runner
-        # namespace (separate from the server's `omnigent`), where the server SA
-        # holds its scoped pods + secrets rights. secret_name / service_account
-        # below resolve in THIS namespace.
+        # Runner-Pod namespace (secret_name / service_account resolve here).
         namespace: omnigent-sandboxes
-        # K8s Secret whose keys are projected into every runner Pod via envFrom
-        # (the harness LLM/git credentials). See runner-credentials.yaml. This is
-        # separate from the per-Pod launch-token Secret the launcher manages.
+        # Harness LLM/git creds projected into every Pod via envFrom
+        # (runner-credentials.yaml) — separate from the per-Pod launch-token Secret.
         secret_name: omnigent-creds
         # ServiceAccount the runner Pods run as (deliberately powerless).
         service_account: omnigent-runner
-        # Optional: override the runner image (defaults to the official prebaked
-        # host image ghcr.io/omnigent-ai/omnigent-host:latest — amd64-only).
-        # image: ghcr.io/your-org/omnigent-host:latest
-        # Optional: extra node selector labels, merged with the always-present
-        # kubernetes.io/arch: amd64 (the host image has no aarch64 wheel). Use it
-        # to pin runner Pods to a node pool (GPU, disk class, dedicated nodes):
-        # node_selector:
+        # ── all optional below ──
+        # image: ghcr.io/your-org/omnigent-host:latest  # default: official amd64 host image
+        # env: [PROXY_URL]           # SERVER env vars injected as literal Pod env (prefer secret_name for creds)
+        # node_selector:             # extra node labels, merged with the mandatory kubernetes.io/arch: amd64
         #   disktype: ssd
+        # resources:                 # runner Pod sizing (defaults: 0.5-2 cpu / 1-4Gi)
+        #   requests: {cpu: "500m", memory: "1Gi"}
+        #   limits: {cpu: "2", memory: "4Gi"}
+        # in_cluster: true           # config source: true=in-cluster SA only, false=kubeconfig only, omit=try both
+        # kubeconfig: /path/to/config  # out-of-cluster kubeconfig (env: OMNIGENT_KUBERNETES_KUBECONFIG)

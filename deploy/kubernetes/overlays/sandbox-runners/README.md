@@ -70,8 +70,11 @@ mounted.
 | `secret_name` | Harness-creds Secret projected into every Pod via `envFrom`. |
 | `service_account` | ServiceAccount the runner Pods run as (powerless). |
 | `image` | Optional runner image override (defaults to the official amd64 host image). |
+| `env` | Optional list of SERVER env-var names to inject as literal Pod env (prefer `secret_name` for credentials). |
 | `node_selector` | Optional extra node labels, merged with the mandatory `kubernetes.io/arch: amd64`. |
 | `resources` | Optional `requests` / `limits` (`cpu` / `memory`) override. |
+| `in_cluster` | Optional cluster-config source: `true` (in-cluster SA only), `false` (kubeconfig only), omit (try in-cluster, then kubeconfig). |
+| `kubeconfig` | Optional kubeconfig path for the out-of-cluster fallback (env: `OMNIGENT_KUBERNETES_KUBECONFIG`). |
 
 ## Troubleshooting
 
@@ -84,3 +87,6 @@ mounted.
   for the clone step).
 - **403 on launch:** the server SA is missing the Role — re-apply this overlay
   and confirm the cross-namespace RoleBinding subject namespace is `omnigent`.
+- **401 / "could not load Kubernetes configuration":** out of cluster, the server
+  can't find a kubeconfig — set `kubeconfig` (or `OMNIGENT_KUBERNETES_KUBECONFIG`),
+  or unset `in_cluster: true` if it isn't actually running in the cluster.
