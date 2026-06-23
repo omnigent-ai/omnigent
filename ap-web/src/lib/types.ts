@@ -248,6 +248,13 @@ export interface Session {
    * older recorded fixtures may omit it (treated as `null`).
    */
   hostId?: string | null;
+  /**
+   * Whether this session's host is a dormant resumable managed host the
+   * server can wake on the next message. Carried on the snapshot so the open
+   * view shows a wakeable "asleep" state instead of the terminal host_offline
+   * dead-end. `false`/absent otherwise.
+   */
+  hostResumable?: boolean;
   status: SessionStatus;
   createdAt: number;
   /**

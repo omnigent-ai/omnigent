@@ -159,6 +159,7 @@ from omnigent.server.managed_hosts import (
     ManagedLaunchTracker,
     ManagedSandboxConfig,
     RepoWorkspace,
+    host_resume_supported,
 )
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.permissions import check_session_access
@@ -2154,6 +2155,7 @@ def _build_session_response(
     skills: list[SkillSummary] | None = None,
     runner_online: bool | None = None,
     host_online: bool | None = None,
+    host_resumable: bool = False,
     pending_elicitation_events: list[dict[str, Any]] | None = None,
     subtree_usage: dict[str, Any] | None = None,
     model_options: list[dict[str, Any]] | None = None,
@@ -2244,6 +2246,7 @@ def _build_session_response(
         host_id=conv.host_id,
         runner_online=runner_online,
         host_online=host_online,
+        host_resumable=host_resumable,
         reasoning_effort=conv.reasoning_effort,
         items=items,
         permission_level=permission_level,
@@ -5875,16 +5878,33 @@ async def _maybe_relaunch_managed_sandbox(
         return False
     launch = tracker.get(session_id)
     if launch is None or launch.settled.is_set():
-        _kick_managed_relaunch(
-            session_id=session_id,
-            conv=conv,
-            host=host,
-            sandbox_config=sandbox_config,
-            tracker=tracker,
-            conversation_store=conversation_store,
-            host_store=host_store,
-            app_state=app_state,
-        )
+        # A resumable managed host whose sandbox merely idle-stopped is WOKEN
+        # in place (resume: same sandbox + workspace volume) rather than
+        # relaunched onto a fresh empty sandbox — same gate the wake itself
+        # uses (host_resume_supported). Both run in the background through this
+        # same tracker, so the message parks on the rendezvous either way; only
+        # the provision step differs.
+        if host_resume_supported(host, sandbox_config):
+            _kick_managed_wake(
+                session_id=session_id,
+                conv=conv,
+                sandbox_config=sandbox_config,
+                tracker=tracker,
+                conversation_store=conversation_store,
+                host_store=host_store,
+                app_state=app_state,
+            )
+        else:
+            _kick_managed_relaunch(
+                session_id=session_id,
+                conv=conv,
+                host=host,
+                sandbox_config=sandbox_config,
+                tracker=tracker,
+                conversation_store=conversation_store,
+                host_store=host_store,
+                app_state=app_state,
+            )
         launch = tracker.get(session_id)
     if launch is not None:
         await _await_settled_managed_launch(launch)
@@ -5964,6 +5984,148 @@ def _kick_managed_relaunch(
     )
     _managed_launch_tasks.add(relaunch_task)
     relaunch_task.add_done_callback(_managed_launch_tasks.discard)
+
+
+def _kick_managed_wake(
+    *,
+    session_id: str,
+    conv: Conversation,
+    sandbox_config: ManagedSandboxConfig,
+    tracker: ManagedLaunchTracker,
+    conversation_store: ConversationStore,
+    host_store: HostStore,
+    app_state: Any,
+) -> None:
+    """
+    Register and spawn the background WAKE for a dormant resumable host.
+
+    Unlike :func:`_kick_managed_relaunch` (which provisions a NEW sandbox and
+    re-clones the repo), this resumes the SAME stopped sandbox in place
+    (reattaching its persistent volume) — so it does NOT re-bind the session's
+    host/workspace. Reuses the launch tracker so a racing message POST parks on
+    the rendezvous instead of forwarding into a half-woken host or triggering a
+    workspace-destroying relaunch.
+
+    :param session_id: Session/conversation identifier.
+    :param conv: The session row bound to the dormant host.
+    :param sandbox_config: The deployment's sandbox config.
+    :param tracker: The app's launch tracker.
+    :param conversation_store: Store holding the session row.
+    :param host_store: Persistent host registrations.
+    :param app_state: ``request.app.state`` — supplies the registries.
+    """
+    _logger.info(
+        "Managed host %s (session %s) is dormant but resumable; waking in background",
+        conv.host_id,
+        session_id,
+    )
+    tracker.begin(session_id)
+    # Seed the progress indicator immediately — the user is watching the
+    # session page when the wake fires (the composer let them send into a
+    # host_asleep session).
+    _publish_sandbox_status(session_id, "provisioning")
+    wake_task = asyncio.create_task(
+        _run_managed_wake(
+            session_id=session_id,
+            conv=conv,
+            sandbox_config=sandbox_config,
+            tracker=tracker,
+            conversation_store=conversation_store,
+            host_store=host_store,
+            host_registry=getattr(app_state, "host_registry", None),
+            tunnel_registry=getattr(app_state, "tunnel_registry", None),
+        )
+    )
+    _managed_launch_tasks.add(wake_task)
+    wake_task.add_done_callback(_managed_launch_tasks.discard)
+
+
+async def _run_managed_wake(
+    *,
+    session_id: str,
+    conv: Conversation,
+    sandbox_config: ManagedSandboxConfig,
+    tracker: ManagedLaunchTracker,
+    conversation_store: ConversationStore,
+    host_store: HostStore,
+    host_registry: HostRegistry | None,
+    tunnel_registry: TunnelRegistry | None,
+) -> None:
+    """
+    Wake a dormant resumable managed host in the background, settling the
+    tracker so a parked message POST forwards once the host is back.
+
+    Resumes the stopped sandbox in place (:func:`resume_managed_host`: resume +
+    re-arm token + re-exec host, preserving the workspace volume — no re-bind),
+    then launches a runner on the woken host and waits for its tunnel so a
+    rendezvoused message resolves on the first try. The parked send runs the
+    session-init handshake (transcript forwarder attach) before forwarding, so
+    the first post-wake turn is mirrored + persisted.
+
+    Mirrors :func:`_bind_and_launch_managed_runner` (launch runner + wait
+    tunnel + settle) but with a resume instead of a fresh provision + bind.
+    Every exit settles the tracker — a failed wake does NOT tear the sandbox
+    down (the volume is the user's), it just surfaces the reason to the waiter.
+
+    :param session_id: Session/conversation identifier.
+    :param conv: The session row bound to the dormant host.
+    :param sandbox_config: The deployment's sandbox config.
+    :param tracker: The app's launch tracker (this session's entry was begun
+        by the caller).
+    :param conversation_store: Store holding the session row.
+    :param host_store: Persistent host registrations.
+    :param host_registry: Live host tunnels, used to send the launch-runner
+        frame. ``None`` in minimal test wirings.
+    :param tunnel_registry: Runner-tunnel registry used to await the launched
+        runner's connection. ``None`` in minimal test wirings.
+    """
+    from omnigent.server.managed_hosts import resume_managed_host
+
+    try:
+        # Wake the same sandbox in place; resume_managed_host is single-flight
+        # per host and a no-op if it's already online.
+        await resume_managed_host(conv.host_id, host_store, sandbox_config)
+        _publish_sandbox_status(session_id, "connecting")
+        refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if refreshed is None:
+            tracker.fail(session_id, "session not found after wake")
+            return
+        runner_id: str | None = None
+        host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
+        if host_conn is not None:
+            launch_attempt = await _launch_runner_on_host(
+                refreshed,
+                conversation_store,
+                host_registry,
+                host_conn,
+            )
+            if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
+                reason = launch_attempt.error or "harness not configured on the sandbox host"
+                tracker.fail(session_id, reason)
+                _publish_sandbox_status(session_id, "failed", reason)
+                return
+            runner_id = launch_attempt.runner_id
+        if runner_id is not None and tunnel_registry is not None:
+            # Wait for the runner tunnel before settling so a rendezvoused
+            # message resolves its runner client on the first try (the
+            # post-settle session-init handshake then attaches the forwarder
+            # before the message is forwarded).
+            await tunnel_registry.wait_for_runner(
+                runner_id,
+                timeout_s=_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+            )
+        tracker.finish(session_id)
+        _publish_sandbox_status(session_id, "ready")
+    except HTTPException as exc:
+        tracker.fail(session_id, str(exc.detail))
+        _publish_sandbox_status(session_id, "failed", str(exc.detail))
+    except Exception:
+        # Fire-and-forget task — settle the tracker (else a waiting message
+        # POST hangs to its timeout) and never escape as an unhandled-task
+        # traceback. A failed wake leaves the sandbox intact for a retry.
+        _logger.exception("Managed host wake crashed for session %s", session_id)
+        tracker.fail(session_id, "internal error during managed host wake")
+        _publish_sandbox_status(session_id, "failed", "internal error during managed host wake")
 
 
 # Matches the create / PATCH handshake timeout — POST /v1/sessions caches
@@ -12696,6 +12858,8 @@ def create_sessions_router(
             include_items=include_items,
             runner_exit_reports=runner_exit_reports,
             refresh_state=refresh_state,
+            host_store=getattr(request.app.state, "host_store", None),
+            sandbox_config=getattr(request.app.state, "sandbox_config", None),
         )
 
     @router.get(
@@ -18294,6 +18458,8 @@ async def _get_session_snapshot(
     include_items: bool = True,
     runner_exit_reports: RunnerExitReports | None = None,
     refresh_state: bool = False,
+    host_store: HostStore | None = None,
+    sandbox_config: ManagedSandboxConfig | None = None,
 ) -> SessionResponse:
     """
     Read a full session snapshot from the store.
@@ -18518,6 +18684,17 @@ async def _get_session_snapshot(
     # parent's own session_usage would under-report. Off the event loop
     # because it pages the conversation tree from the store.
     subtree_usage = await asyncio.to_thread(load_session_usage, conv.id, conv_store)
+    # Static signal telling the open view a host-bound, host-down session is a
+    # resumable managed host it can wake by sending a message, vs a terminal
+    # host_offline dead-end. Computed independently of liveness_lookup (the web
+    # chat passes include_liveness=False, so host_online is None here and
+    # liveness arrives via the poll/stream). One indexed host read, gated to
+    # host-bound sessions.
+    host_resumable = False
+    if host_store is not None and sandbox_config is not None and conv.host_id is not None:
+        host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
+        if host_for_resume is not None:
+            host_resumable = host_resume_supported(host_for_resume, sandbox_config)
     return _build_session_response(
         conv,
         items,
@@ -18532,6 +18709,7 @@ async def _get_session_snapshot(
         model_options=model_options,
         runner_online=runner_online,
         host_online=host_online,
+        host_resumable=host_resumable,
         pending_elicitation_events=await asyncio.to_thread(
             _pending_elicitation_snapshot_for_session,
             conv_store,

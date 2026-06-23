@@ -184,6 +184,16 @@ class SandboxLauncher(ABC):
     # ``host_type="managed"`` instead of a mid-flow capability error.
     supports_cli_bootstrap: ClassVar[bool] = True
 
+    # Whether this provider can resume a stopped sandbox IN PLACE
+    # (reattaching its persistent volume) rather than only provisioning a
+    # fresh one. The server's managed-host wake path checks this BEFORE
+    # attempting a resume: providers with a stop/resume lifecycle + a
+    # persistent volume override it to ``True``; providers whose sandboxes
+    # are ephemeral (Modal — no volume to reattach) leave it ``False``, so a
+    # dormant host there stays gone (the user starts a new session) instead
+    # of being silently revived onto an empty workspace.
+    can_resume: ClassVar[bool] = False
+
     @abstractmethod
     def prepare(self) -> None:
         """
@@ -376,6 +386,27 @@ class SandboxLauncher(ABC):
             "sandbox termination — delete the sandbox with the provider's "
             "own tooling."
         )
+
+    def resume(self, sandbox_id: str) -> None:
+        """
+        Resume a stopped sandbox in place, reattaching its persistent
+        volume, so a dormant managed host can be revived under the SAME
+        sandbox id.
+
+        Optional capability: the default implementation raises
+        :class:`SandboxCapabilityError`. Providers whose backend has a
+        stop/resume lifecycle with a persistent volume override it AND set
+        :attr:`can_resume` to ``True``. Used by the server's managed-host
+        wake path; the host process itself is restarted separately (resume
+        only brings the compute + volume back).
+
+        :param sandbox_id: The stopped sandbox to resume, e.g.
+            ``"sb-a1b2c3"``.
+        :raises SandboxCapabilityError: When the provider cannot resume a
+            stopped sandbox (ephemeral sandboxes / no persistent volume).
+        :raises click.ClickException: If the resume fails.
+        """
+        raise self._capability_error("resume a stopped sandbox")
 
     def exec_foreground(self, sandbox_id: str, command: str) -> int:
         """

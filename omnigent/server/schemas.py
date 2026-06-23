@@ -1425,6 +1425,14 @@ class SessionResponse(BaseModel):
         ``runner_online`` is ``False`` — host alive ⇒ "send a
         message to wake the runner"; host dead ⇒ "reconnect /
         fork". Never participates in the reachability decision.
+    :param host_resumable: Whether this session is bound to a dormant
+        managed host the server can wake in place (its provider sets
+        :attr:`SandboxLauncher.can_resume`). The open view reads it only
+        when ``host_online`` is ``False``, to split a confirmed host-down
+        into a recoverable "asleep" state (send a message — the relaunch
+        path resumes the sandbox) versus the terminal ``host_offline``
+        dead-end (reconnect from your machine / fork). ``False`` for
+        non-managed or non-resumable hosts.
     :param reasoning_effort: Per-session reasoning-effort hint.
         Accepted metadata values are ``"none"``, ``"minimal"``,
         ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, and
@@ -1601,6 +1609,7 @@ class SessionResponse(BaseModel):
     host_id: str | None = None
     runner_online: bool | None = None
     host_online: bool | None = None
+    host_resumable: bool = False
     reasoning_effort: str | None = None
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None
