@@ -57,6 +57,7 @@ from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     CURSOR_NATIVE_TERMINAL_ROLE,
+    GOOSE_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
@@ -76,6 +77,62 @@ from omnigent.tools.builtins.load_skill import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+# ── session.status "waiting" backwards-compat (new runner ↔ old server) ──
+# The runner emits ``session.status: "waiting"`` when a turn ends with sub-agents
+# still running (PR #930, for the headless ``-p`` fast-exit). Servers older than
+# 0.3.0 don't model "waiting" — their ``SessionResponse.status`` is
+# ``Literal["idle","running","failed"]`` — and 500 on ``GET /v1/sessions`` when
+# they try to serialize the cached value. So we resolve the server version once
+# (``_get_server_version``) and, when publishing status, downgrade
+# "waiting"→"running" unless that version supports it
+# (``_version_supports_waiting_status``). An unknown version — unprobed or a
+# probe failure — downgrades too, so an old server is never 500'd.
+_WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
+# Cached server version from the /api/version probe; ``None`` until a probe
+# succeeds. A failed probe stays ``None`` and is retried on the next
+# session-create — the GET is cheap and self-heals a transient failure.
+_server_version: str | None = None
+
+
+def _version_supports_waiting_status(server_version: str) -> bool:
+    """
+    Whether *server_version* can serialize ``session.status: "waiting"``.
+
+    :param server_version: The server's reported version, e.g. ``"0.2.0"`` or
+        ``"0.3.0.dev0"``.
+    :returns: ``True`` iff the server's PEP 440 release tuple is ``>= 0.3.0``
+        (the release that added "waiting" to the session-status model).
+    """
+    from packaging.version import Version
+
+    return Version(server_version).release >= Version(_WAITING_STATUS_MIN_SERVER_VERSION).release
+
+
+async def _get_server_version(server_client: httpx.AsyncClient) -> str | None:
+    """
+    Resolve the server's version via a one-time ``GET /api/version`` probe.
+
+    Memoized once it succeeds: later calls return the cached version. A failed
+    probe returns ``None`` and is retried on the next call, so callers fail safe
+    (treat an unknown version as not supporting newer behavior).
+
+    :param server_client: The runner's httpx client pointed at the server.
+    :returns: The server's reported version (e.g. ``"0.2.0"``), or ``None`` when
+        the probe has not yet succeeded.
+    """
+    global _server_version
+    if _server_version is not None:
+        return _server_version
+    try:
+        resp = await server_client.get("/api/version")
+        resp.raise_for_status()
+        _server_version = resp.json()["version"]
+        _logger.info("resolved server version: %s", _server_version)
+    except Exception as exc:  # noqa: BLE001 — degrade gracefully; never 500 an old server
+        _logger.warning("could not probe server /api/version (%s); treating as unknown", exc)
+    return _server_version
 
 
 def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
@@ -1033,6 +1090,142 @@ async def _auto_create_cursor_terminal(
     _register_auto_forwarder_task(session_id, _forwarder_task)
     _logger.info(
         "Auto-created cursor terminal + forwarder/approval-mirror for session %s; task=%s",
+        session_id,
+        _forwarder_task.get_name(),
+    )
+    return terminal_view
+
+
+async def _auto_create_goose_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, Any]], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+) -> SessionResourceView:
+    """
+    Auto-create the Goose TUI terminal for a goose-native session.
+
+    Launches ``goose session --name <session_id>`` in a runner-owned tmux pane.
+    Auth is Goose's own configuration (``goose configure`` → keyring /
+    ``~/.config/goose/config.yaml``), so HOME is inherited and Omnigent writes no
+    vendor config (Goose owns its own tool surface / MCP extensions). The
+    ``--name`` lets the forwarder discover *this* session's row deterministically.
+    Mirrors :func:`_auto_create_cursor_terminal`, minus the MCP machinery.
+
+    :param session_id: Session/conversation identifier (also the goose ``--name``).
+    :param resource_registry: Session resource registry for launching the terminal.
+    :param publish_event: Runner session event publisher.
+    :param server_client: Runner Omnigent server client.
+    :returns: Created terminal resource view.
+    """
+    from omnigent.goose_native import resolve_goose_executable
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+
+    # Tear down any forwarder left from a prior terminal for this session before
+    # re-creating, so old and new tasks can't both mirror (double-posting), and
+    # drop the prior terminal's stale forward cursor.
+    await _cancel_auto_forwarder_task(session_id)
+    from omnigent.goose_native_bridge import bridge_dir_for_session_id, write_tmux_target
+    from omnigent.goose_native_forwarder import clear_goose_bridge_state
+
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    clear_goose_bridge_state(bridge_dir)
+
+    # ``_pi_native_launch_config`` is a generic session-snapshot reader
+    # (workspace + terminal_launch_args); reused here, not Pi-specific.
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = os.path.realpath(str(launch_config.workspace))
+    goose_command = resolve_goose_executable()
+    # Launch-unique Goose session name. `goose session --name X` (without
+    # --resume) creates a NEW sessions row each launch (verified, Goose 1.38),
+    # so a per-launch-unique name lets the forwarder bind to EXACTLY this
+    # launch's row — never an older same-conversation row left by a prior
+    # cold-resume. This closes the "replay the whole transcript on restart"
+    # risk: discovery resolves one session, and the wiped bridge cursor
+    # (clear_goose_bridge_state above) starts it at the new row's first message.
+    goose_session_name = f"{session_id}-{int(time.time() * 1000)}"
+    goose_args = [
+        "session",
+        "--name",
+        goose_session_name,
+        *(launch_config.terminal_launch_args or []),
+    ]
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="goose",
+        session_key="main",
+        resource_role=GOOSE_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            command=goose_command,
+            args=goose_args,
+            # ANSI theme keeps the pane cheap to scrape; GOOSE_TELEMETRY_OFF
+            # suppresses Goose's first-run "share usage data?" prompt, which
+            # would otherwise block the headless pane on a fresh install. Goose's
+            # provider/model come from the user's own `goose configure` (KTD4).
+            env={"GOOSE_CLI_THEME": "ansi", "GOOSE_TELEMETRY_OFF": "1"},
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    # Advertise the tmux socket+target so the goose-native harness executor can
+    # inject web-UI messages into this same pane (tmux paste).
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "goose", "main")
+        if instance is not None and instance.running:
+            write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+
+    # Mirror the Goose TUI's conversation back into the Omnigent session so the
+    # chat view tracks the embedded terminal. Host-spawned sessions have no CLI
+    # client to start this, so the runner owns it — reusing the runner's own
+    # server URL + refresh-capable auth.
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
+    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+
+    from omnigent.goose_native_forwarder import supervise_goose_forwarder
+
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
+
+    _forwarder_task = asyncio.create_task(
+        supervise_goose_forwarder(
+            base_url=server_url,
+            headers={},
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            agent_name="goose-native-ui",
+            goose_session_name=goose_session_name,
+            auth=_runner_auth,
+        ),
+        name=f"goose-forwarder-{session_id}",
+    )
+    _register_auto_forwarder_task(session_id, _forwarder_task)
+    _logger.info(
+        "Auto-created goose terminal + forwarder for session %s; forwarder_task=%s",
         session_id,
         _forwarder_task.get_name(),
     )
@@ -4624,6 +4817,7 @@ def create_runner_app(
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _cursor_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _goose_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     # Per-session lock guarding the claude-native terminal auto-create in
     # ``create_session``. Two ``POST /v1/sessions`` calls can land
     # concurrently on a host-launched runner — ``_on_runner_connect``
@@ -5376,6 +5570,12 @@ def create_runner_app(
                 },
             )
 
+        # Resolve the server version once so _publish_turn_status can downgrade
+        # session.status "waiting"->"running" for servers too old to accept it
+        # (< 0.3.0) — they'd otherwise 500 on GET /v1/sessions. Memoized; only
+        # the first session-create on this runner pays the cheap GET.
+        await _get_server_version(server_client)
+
         # Resolve the spec once — derive harness config from it and
         # cache it for resource endpoints (filesystem, terminals)
         # that may fire before the first turn dispatches.
@@ -5480,6 +5680,10 @@ def create_runner_app(
                 from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
 
                 spawn_env = build_cursor_native_spawn_env(session_id)
+            if harness_name == "goose-native" and spawn_env is None:
+                from omnigent.goose_native_bridge import build_goose_native_spawn_env
+
+                spawn_env = build_goose_native_spawn_env(session_id)
             _session_spec_cache[session_id] = spec_entry
             from omnigent.llms.context_window import get_model_context_window
             from omnigent.runtime.workflow import _resolve_spec_model
@@ -5837,6 +6041,39 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        if harness_name == "goose-native":
+            _goose_ensure_lock = _goose_terminal_ensure_locks.setdefault(
+                session_id, asyncio.Lock()
+            )
+            async with _goose_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_goose_terminal = (
+                    _tr is not None and _tr.get(session_id, "goose", "main") is not None
+                )
+                if not _has_goose_terminal:
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        await _auto_create_goose_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create goose terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "Goose",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+
         # Auto-bootstrap the Omnigent REPL terminal for non-native
         # (SDK-harness) top-level sessions: host the framework's own TUI
         # (``omnigent attach``) in a tmux pane so the web UI can embed it
@@ -6105,8 +6342,14 @@ def create_runner_app(
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
+        _goose_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
+        # Stop any TUI→web transcript forwarder (cursor-/goose-native) for this
+        # session: on teardown the embedded terminal is gone, so a still-running
+        # supervisor would poll a dead store and POST to a deleted session
+        # forever. Idempotent when no forwarder was registered.
+        await _cancel_auto_forwarder_task(session_id)
 
         if process_manager is not None:
             await process_manager.forward_cancel(session_id)
@@ -6826,13 +7069,26 @@ def create_runner_app(
             ``None`` for ``running`` / ``idle``.
         :returns: None.
         """
+        # Backwards-compat: servers older than 0.3.0 can't serialize "waiting"
+        # and 500 on GET /v1/sessions. Downgrade it to "running" unless the
+        # resolved server version supports it; an unknown version (unprobed or
+        # probe failure) downgrades too (safe default). See _get_server_version.
+        if status == "waiting" and not (
+            _server_version is not None and _version_supports_waiting_status(_server_version)
+        ):
+            status = "running"
         # An unresolved spec (``_session_harness_name`` → ``None``) means the
         # session hasn't resolved a terminal-backed harness yet, so no native
         # observer is known and the turn lifecycle is still the only status
         # source — fall through and publish. Suppress only once we positively
         # know the harness/edge is terminal-owned.
         harness = _session_harness_name(conv_id)
-        if status != "failed" and harness in {"claude-native", "pi-native", "cursor-native"}:
+        if status != "failed" and harness in {
+            "claude-native",
+            "pi-native",
+            "cursor-native",
+            "goose-native",
+        }:
             return
         if status == "idle" and harness == "codex-native":
             return
@@ -7538,6 +7794,76 @@ def create_runner_app(
         ):
             _logger.warning(
                 "Cursor-native stop succeeded but sub-agent delivery was "
+                "not confirmed; session=%s reason=%s",
+                conv_id,
+                delivery_ack.reason,
+            )
+        return Response(status_code=204)
+
+    async def _handle_goose_native_interrupt(conv_id: str) -> Response:
+        """Cancel the in-flight goose turn by sending ``Escape`` to its TUI pane.
+
+        goose-native turns run inside the ``goose session`` TUI; the runner
+        harness task returns right after the tmux paste, so the in-process cancel
+        floor has nothing to cancel. Mirrors the cursor-native interrupt.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 when Escape was sent; 503 if the tmux target is unavailable.
+        """
+        from omnigent.goose_native_bridge import bridge_dir_for_session_id, inject_interrupt
+
+        try:
+            await asyncio.to_thread(
+                inject_interrupt, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "goose_native_interrupt_failed",
+                    "detail": _client_safe_error_detail(exc, context="goose-native interrupt"),
+                },
+            )
+        _wake_parent_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _handle_goose_native_stop(conv_id: str) -> Response:
+        """Hard-stop a goose-native session by killing its tmux session.
+
+        Mirrors :func:`_handle_cursor_native_stop`: kill the pane (ends
+        ``goose``), tear the terminal resource down, cancel the forwarder,
+        publish ``idle``, and reclaim any sub-agent work entry.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 on success; 503 if the tmux target is unavailable.
+        """
+        from omnigent.goose_native_bridge import bridge_dir_for_session_id, kill_session
+
+        try:
+            await asyncio.to_thread(
+                kill_session, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "goose_native_stop_failed",
+                    "detail": _client_safe_error_detail(exc, context="goose-native stop"),
+                },
+            )
+        await _teardown_session_terminals(conv_id)
+        await _cancel_auto_forwarder_task(conv_id)
+        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        delivery_ack = _mark_subagent_terminal_and_wake(
+            conv_id,
+            status="cancelled",
+            output="[System: sub-agent stopped]",
+        )
+        if not delivery_ack.delivered and (
+            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
+        ):
+            _logger.warning(
+                "Goose-native stop succeeded but sub-agent delivery was "
                 "not confirmed; session=%s reason=%s",
                 conv_id,
                 delivery_ack.reason,
@@ -9570,6 +9896,10 @@ def create_runner_app(
             from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
 
             spawn_env = build_cursor_native_spawn_env(conv_id)
+        if harness_name == "goose-native" and spawn_env is None:
+            from omnigent.goose_native_bridge import build_goose_native_spawn_env
+
+            spawn_env = build_goose_native_spawn_env(conv_id)
 
         agent_version = dispatch.agent_version if dispatch else body.get("agent_version")
         if agent_version is not None and conv_id in _version_cache:
@@ -10486,6 +10816,9 @@ def create_runner_app(
             if _harness == "cursor-native":
                 # cursor turn lives in the cursor-agent TUI; send Escape to stop it.
                 return await _handle_cursor_native_interrupt(conversation_id)
+            if _harness == "goose-native":
+                # goose turn lives in the goose session TUI; send Escape to stop it.
+                return await _handle_goose_native_interrupt(conversation_id)
             # In-process harness: mark interrupted, forward an interrupt to the
             # harness, and force-cancel the runner turn task so the turn ends
             # promptly even if the harness can't honor the interrupt in time.
@@ -10556,6 +10889,9 @@ def create_runner_app(
             if _harness == "cursor-native":
                 # Hard-kill the cursor-agent tmux pane (the TUI is the runtime).
                 return await _handle_cursor_native_stop(conversation_id)
+            if _harness == "goose-native":
+                # Hard-kill the goose session tmux pane (the TUI is the runtime).
+                return await _handle_goose_native_stop(conversation_id)
             await _cancel_inprocess_turn(conversation_id)
             return Response(status_code=204)
 
@@ -11186,6 +11522,41 @@ def create_runner_app(
                         session_id,
                     )
                     return _native_terminal_start_error_response(exc, "Cursor")
+            return JSONResponse(
+                status_code=200,
+                content=session_resource_view_to_dict(terminal_view),
+            )
+
+        if (
+            body.get("ensure_native_terminal")
+            and terminal_name == "goose"
+            and session_key == "main"
+        ):
+            goose_terminal_id = terminal_resource_id("goose", "main")
+            ensure_lock = _goose_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with ensure_lock:
+                existing = await resource_registry.get_terminal_resource(
+                    session_id, goose_terminal_id
+                )
+                if existing is not None:
+                    return JSONResponse(
+                        status_code=200,
+                        content=session_resource_view_to_dict(existing),
+                    )
+                try:
+                    terminal_view = await _auto_create_goose_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        server_client=server_client,
+                        ensure_comment_relay=_ensure_comment_relay_started,
+                    )
+                except Exception as exc:
+                    _logger.exception(
+                        "Goose terminal ensure failed for session=%s",
+                        session_id,
+                    )
+                    return _native_terminal_start_error_response(exc, "Goose")
             return JSONResponse(
                 status_code=200,
                 content=session_resource_view_to_dict(terminal_view),
@@ -12666,6 +13037,7 @@ def create_runner_app(
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
+        _goose_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
         return JSONResponse(
@@ -12719,6 +13091,7 @@ def create_runner_app(
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
+        _goose_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         # Close terminals with ``session.resource.deleted`` events BEFORE
         # cleanup_session — cleanup_conversation would silently pop them
@@ -13489,6 +13862,7 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     # ``--model`` arg in _auto_create_cursor_terminal, not via an env var.
     "antigravity": "HARNESS_ANTIGRAVITY_MODEL",
     "qwen": "HARNESS_QWEN_MODEL",
+    "goose": "HARNESS_GOOSE_MODEL",
 }
 
 
@@ -13520,6 +13894,7 @@ def _build_spawn_env_from_spec(
             _build_claude_sdk_spawn_env,
             _build_codex_spawn_env,
             _build_cursor_spawn_env,
+            _build_goose_spawn_env,
             _build_openai_agents_sdk_spawn_env,
             _build_pi_spawn_env,
             _build_qwen_spawn_env,
@@ -13539,6 +13914,8 @@ def _build_spawn_env_from_spec(
             env = _build_antigravity_spawn_env(spec)
         elif harness == "qwen":
             env = _build_qwen_spawn_env(spec, workdir=workdir)
+        elif harness == "goose":
+            env = _build_goose_spawn_env(spec, workdir=workdir)
         else:
             # Native terminal harnesses and unknown harnesses build env elsewhere.
             return None

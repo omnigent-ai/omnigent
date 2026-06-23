@@ -88,6 +88,8 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "pi",
         "cursor-native",
         "native-cursor",
+        "goose-native",
+        "native-goose",
     ],
 )
 def test_cli_harness_configured_only_when_binary_installed(
@@ -138,6 +140,11 @@ def test_configured_harness_map_covers_all_spellings(
         # Native Cursor (``omni cursor``) — gates on the cursor-agent CLI.
         "cursor-native",
         "native-cursor",
+        # Goose — native TUI (``omni goose``) + headless ACP harness; both gate
+        # on the goose CLI.
+        "goose",
+        "goose-native",
+        "native-goose",
         # Antigravity SDK harness + its user-facing aliases.
         "antigravity",
         "agy",
@@ -186,6 +193,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "pi",
         "cursor-native",
         "native-cursor",
+        "goose-native",
+        "native-goose",
         "qwen",
     ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"

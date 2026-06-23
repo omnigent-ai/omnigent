@@ -46,7 +46,8 @@ struct ChatTerminalBar: View {
           .font(.system(size: 13, weight: .medium))
       }
       .foregroundStyle(
-        isSelected ? DesignTokens.foreground(colorScheme) : DesignTokens.mutedForeground(colorScheme)
+        isSelected
+          ? DesignTokens.foreground(colorScheme) : DesignTokens.mutedForeground(colorScheme)
       )
       .padding(.horizontal, 14)
       .frame(height: 34)

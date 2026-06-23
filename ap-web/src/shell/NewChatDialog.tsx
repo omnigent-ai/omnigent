@@ -82,6 +82,7 @@ const BUILTIN_AGENTS = new Set([
   "codex-native-ui", // Codex
   "pi-native-ui", // Pi
   "cursor-native-ui", // Cursor
+  "goose-native-ui", // Goose
   "polly",
   "debby",
 ]);
