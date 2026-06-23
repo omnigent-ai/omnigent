@@ -78,10 +78,20 @@ jobs:
     # drive the promote-nightly / reconcile-floating jobs.
     if: github.repository == 'omnigent-ai/omnigent' && github.event_name != 'schedule' && !inputs.force_nightly && !inputs.reconcile_floating
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Multi-arch: the linux/arm64 leg cross-builds under QEMU emulation on this
+    # amd64 runner, which roughly doubles the host-image build time (emulated
+    # npm/pip native steps). 30m was tight for two native amd64 builds; give the
+    # four-variant (server+host × amd64+arm64) build headroom.
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      # Register binfmt handlers so Buildx can cross-build the linux/arm64
+      # variant on this amd64 runner (emulated). Without it the arm64 leg of
+      # the multi-arch builds below fails with "exec format error".
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3  # v4.1.0
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
@@ -163,6 +173,10 @@ jobs:
           echo "host_tags=${HOST_TAGS}" >> "$GITHUB_OUTPUT"
 
       # No build-args: the Dockerfile ARGs default to public registries.
+      # Multi-arch: each tag publishes as a manifest list spanning amd64 + arm64,
+      # so the image runs natively on Apple Silicon / arm64 clusters. Amd64-only
+      # consumers (Modal, Daytona, CoreWeave) keep pulling the amd64 variant —
+      # the list is a superset, so nothing changes for them.
       - name: Build and push
         id: build-server
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
@@ -170,15 +184,18 @@ jobs:
           context: .
           file: deploy/docker/Dockerfile
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
           sbom: true
 
-      # Host image: same Dockerfile, `host` target. Runs after the server build
-      # so it reuses the shared builder-stage layers from the gha cache.
+      # Host image: same Dockerfile, `host` target, also multi-arch (amd64 +
+      # arm64). The harness CLIs it bakes in all ship arm64 — claude-code and
+      # codex publish linux-arm64 npm binaries, pi is pure-JS. Runs after the
+      # server build so it reuses the shared builder-stage layers from the gha
+      # cache (cached per platform).
       - name: Build and push host image
         id: build-host
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
@@ -187,7 +204,7 @@ jobs:
           file: deploy/docker/Dockerfile
           target: host
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.host_tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
