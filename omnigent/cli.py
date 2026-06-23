@@ -10221,6 +10221,29 @@ def _databricks_workspace_token(workspace_host: str) -> str | None:
         return None
 
 
+def _remember_default_server(server: str) -> None:
+    """
+    Persist *server* as the user-level default after a successful login.
+
+    A bare ``omnigent`` (and ``omnigent host``) fall back to the
+    configured ``server`` key when no ``--server`` is passed (see
+    :func:`run` and :func:`host`). Without this, a user who runs
+    ``omnigent login <server>`` and then bare ``omnigent`` is still routed
+    at whatever default ``setup`` baked in — the confusing "I just logged
+    in, yet I'm asked to log in again to a different server" path.
+    Recording the just-logged-in server as the default closes that gap.
+
+    Any existing default is overwritten: targeting more than one server is
+    rare, and the server the user most recently logged in to is the best
+    available signal of intent.
+
+    :param server: Normalized server URL the login succeeded against, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``.
+    """
+    _save_global_config({"server": server})
+    click.echo(f"Set {server} as your default server (a bare `omnigent` now targets it).")
+
+
 @cli.command("login")
 @click.argument("server_url")
 def login(server_url: str) -> None:
@@ -10244,12 +10267,16 @@ def login(server_url: str) -> None:
       the ``databricks`` extra.
 
     Subsequent ``omnigent run --server <url>`` commands then
-    use the stored token via the runner / host-tunnel auth chain.
+    use the stored token via the runner / host-tunnel auth chain. A
+    successful login also records the server as the user-level default
+    (the ``server`` key in ``~/.omnigent/config.yaml``), so a bare
+    ``omnigent`` afterwards targets it instead of whatever default
+    ``setup`` baked in.
 
     \b
     Example:
       omnigent login http://localhost:6767
-      omnigent run --server http://localhost:6767
+      omnigent          # connects to the server just logged in to
 
     :param server_url: The remote server URL, e.g.
         ``"http://localhost:6767"``.
@@ -10276,6 +10303,7 @@ def login(server_url: str) -> None:
     databricks_workspace = _databricks_workspace_login_target(server, probe)
     if databricks_workspace is not None:
         _databricks_login(server, databricks_workspace)
+        _remember_default_server(server)
         return
 
     detected_login_url: str | None = None
@@ -10295,10 +10323,12 @@ def login(server_url: str) -> None:
             "The proxy in front of it injects your identity on every "
             "request."
         )
+        _remember_default_server(server)
         return
 
     if detected_login_url == "/login":
         _accounts_login(server)
+        _remember_default_server(server)
         return
 
     # Fall through: OIDC mode (or unknown — let the ticket endpoint's
@@ -10353,6 +10383,7 @@ def login(server_url: str) -> None:
                 expires_at=_time.time() + expires_in,
             )
             click.echo(f"Logged in as {user_id}")
+            _remember_default_server(server)
             return
         # 410 or other error — ticket expired.
         raise click.ClickException("Login ticket expired or was rejected. Please try again.")
