@@ -326,6 +326,11 @@ jobs:
           The codebase is checked out at `main`. Read source files freely for
           additional context when needed.
 
+          **Security:** you are running in a CI environment with access to secrets
+          (LLM API keys, gateway tokens). Never include secrets, tokens, or
+          credentials in your output, and never make outbound network calls
+          except to the configured LLM gateway.
+
           Review the diff against the PR description. Report:
           1. **Blocking issues** — correctness bugs, broken contracts, missing error handling on failure paths, data loss risks.
           2. **Security vulnerabilities** — injection (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.
