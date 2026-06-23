@@ -164,13 +164,14 @@ omnigent codex                       # Codex
 omnigent run path/to/agent.yaml      # your own agent (see "Write your own agent")
 ```
 
-#### 🐙 Polly and 🟠🔵 Debby
+#### 🐙 Polly, 🟠🔵 Debby, and ✍️ Scribe
 
-Two example agents ship with the repo, and they make good first sessions:
+Three example agents ship with the repo, and they make good first sessions:
 
 ```bash
 omnigent run examples/polly/
 omnigent run examples/debby/
+omnigent run examples/scribe/
 
 # Run an orchestrator on a different harness (sub-agents keep their own):
 omnigent run examples/polly/ --harness pi
@@ -188,6 +189,13 @@ Every question you ask goes to both heads, and she lays the two answers out
 side by side. Type `/debate` and the heads critique each other for a few
 rounds before converging. (She needs both a Claude and an OpenAI credential;
 see step 3.)
+
+**✍️ Scribe** is a documentation orchestrator, the docs counterpart to Polly.
+She turns git diffs, commit history, and PRs into release notes, changelogs, and
+migration guides. She authors the prose herself and delegates only read-only
+code investigation to a researcher sub-agent, then can route a draft through an
+independent different-vendor reviewer to fact-check its claims before it ships.
+(The cross-model fact-check needs an OpenAI credential; the rest runs on one.)
 
 **Prefer the browser?** Start a server and register your machine as a host:
 
