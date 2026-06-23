@@ -1,0 +1,26 @@
+spec_version: 1
+name: decorator-tools
+description: >
+  Fixture agent for the @tool-decorator e2e tests. Its function tools ship as
+  Python source under tools/python/ (auto-discovered, like the archer fixture),
+  so the server loads them by file path from the unpacked bundle — they resolve
+  on any server version without the server importing the repo's tests/ tree.
+
+# executor.model and an executor.auth api-key block are stamped per-test by
+# register_dir_agent_with_mock_llm so the openai-agents harness hits the mock
+# LLM server. config.harness is required: without it the runner computes
+# harness="omnigent" and produces no output (see compaction-test fixture).
+executor:
+  type: omnigent
+  model: mock-model
+  config:
+    harness: openai-agents
+
+prompt: |
+  You have these tools: word_count, greet, format_record, compute. When the
+  user asks you to call one of these tools, call the tool instead of answering
+  from memory, then report the tool's literal output.
+
+os_env:
+  type: caller_process
+  cwd: .

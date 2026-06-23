@@ -134,6 +134,13 @@ _ALT_COVERED: frozenset[str] = frozenset(
         #   test.
         "supervisor-terminal-test",
         "sys-terminal-test",
+        # Bundled @tool-source fixtures (config.yaml + tools/python/) loaded by
+        # register_dir_agent_with_mock_llm — covered by the shared tests
+        # test_decorated_tools_e2e.py / test_async_tools_e2e.py /
+        # test_tool_call_policy_e2e.py, not test_example_<name>.py files.
+        "decorator-tools",
+        "async-tools",
+        "tool-call-policy",
         # Skills-filter test fixtures under tests/resources/agents/.
         # Loaded by tests/e2e/test_codex_skills_filter_e2e.py,
         # test_pi_skills_filter_e2e.py, and

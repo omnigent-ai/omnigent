@@ -1,0 +1,150 @@
+name: "Run integration suite"
+description: >
+  Run the tests/integration journey suite exactly as the integration.yml gate
+  does (mock LLM, one wrapped harness per invocation). When `server_version`
+  is set, the omnigent SERVER subprocess is pinned to that released tag while
+  the client, runner, and tests stay on the checked-out ref — the
+  server-version backwards-compat configuration. Shared verbatim by
+  integration.yml (normal gate) and server-compat.yml (backcompat jobs) so the
+  two never drift. The caller owns the preceding `actions/checkout` (backcompat
+  needs fetch-depth 0 for tags).
+
+inputs:
+  harness:
+    description: "Wrapped harness (claude-sdk | openai-agents | codex)"
+    required: true
+  model:
+    description: "Model name passed to --model"
+    required: true
+  workers:
+    description: "pytest workers (-n)"
+    required: true
+  server_version:
+    description: >
+      Empty = run the checked-out server (normal gate). Set to a release tag
+      = build that old server into a venv and redirect the server subprocess
+      to it (backwards-compat run).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Configure environment
+      shell: bash
+      run: |
+        {
+          echo "OMNIGENT_SKIP_WEB_UI=true"
+          echo "ANTHROPIC_API_KEY="
+          echo "OPENAI_API_KEY="
+          echo "CODEX="
+          echo "CLAUDE_CODE="
+        } >> "$GITHUB_ENV"
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+      with:
+        python-version-file: ".python-version"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+      with:
+        enable-cache: true
+
+    - name: Cache virtualenv
+      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+
+    - name: Install project and dev dependencies
+      shell: bash
+      run: uv sync --extra all --extra dev
+
+    - name: Install binary dependencies
+      # Mirrors e2e.yml. --ignore-scripts blocks npm postinstall hooks; we run
+      # claude-code's install.cjs explicitly (audited, no network). bubblewrap
+      # backs the linux_bwrap sandbox in tests/inner/*.
+      working-directory: .github/ci-deps
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y tmux ripgrep bubblewrap
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        npm install --ignore-scripts
+        node node_modules/@anthropic-ai/claude-code/install.cjs
+        echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
+
+    - name: Build pinned old server (backwards-compat only)
+      # See e2e-run for the full rationale. Requires fetch-depth 0 in the caller.
+      if: ${{ inputs.server_version != '' }}
+      shell: bash
+      env:
+        SERVER_VERSION_INPUT: ${{ inputs.server_version }}
+      run: |
+        tag="$SERVER_VERSION_INPUT"
+        if ! [[ "$tag" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([a-z0-9.]*)?$ ]]; then
+          echo "Invalid server_version: '$tag'" >&2; exit 1
+        fi
+        src="$RUNNER_TEMP/server-src"
+        venv="$RUNNER_TEMP/server-env"
+        git worktree add --detach "$src" "$tag"
+        uv venv --python 3.12 "$venv"
+        uv pip install --python "$venv/bin/python" \
+          -e "$src" -e "$src/sdks/python-client" -e "$src/sdks/ui"
+        "$venv/bin/omnigent" --version
+        echo "OMNIGENT_COMPAT_SERVER_PYTHON=$venv/bin/python" >> "$GITHUB_ENV"
+        echo "OMNIGENT_COMPAT_SERVER_VERSION=${tag#v}" >> "$GITHUB_ENV"
+
+    - name: Run integration tests
+      shell: bash
+      env:
+        HARNESS: ${{ inputs.harness }}
+        MODEL: ${{ inputs.model }}
+        WORKERS: ${{ inputs.workers }}
+        INTEGRATION_TMP_BASE: /tmp/omnigent-integration-${{ github.run_id }}-${{ inputs.harness }}
+        CLAUDE_CODE_STREAM_CLOSE_TIMEOUT: "60000"
+        OMNIGENT_CLAUDE_SDK_NO_SANDBOX: ${{ inputs.harness == 'claude-sdk' && '1' || '' }}
+        PYTEST_PROGRESS_LOG_DIR: ${{ github.workspace }}/artifacts/progress-${{ inputs.harness }}
+        OMNIGENT_TOKEN_USAGE_JSON: ${{ github.workspace }}/artifacts/tokens-${{ inputs.harness }}.json
+        OMNIGENT_TEST_MODEL_SPREAD: "1"
+        OMNIGENT_TEST_MODEL_POOL_GPT: "databricks-gpt-5-5,databricks-gpt-5-4-mini"
+      run: |
+        set -euo pipefail
+        mkdir -p artifacts "$INTEGRATION_TMP_BASE"
+        # --capture=no + --log-cli-level=INFO stream live so progress shows
+        # even if the step hits its timeout before buffered output renders.
+        # --timeout=180 caps a single hung test (see e2e.yml).
+        env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \
+          uv run pytest tests/integration/ \
+            --model "$MODEL" \
+            --harness "$HARNESS" \
+            -n "$WORKERS" \
+            --dist=loadscope \
+            --timeout=180 \
+            --timeout-method=thread \
+            --basetemp="$INTEGRATION_TMP_BASE" \
+            --junitxml="artifacts/integration-${HARNESS}.xml" \
+            --capture=no --log-cli-level=INFO \
+            -v --tb=long --showlocals --log-level=INFO -r a
+
+    - name: Upload server/runner logs on failure
+      if: ${{ failure() || cancelled() }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      with:
+        name: integration-server-logs-${{ inputs.harness }}-${{ github.run_id }}
+        path: |
+          /tmp/omnigent-integration-${{ github.run_id }}-${{ inputs.harness }}/**/server.log
+          /tmp/omnigent-integration-${{ github.run_id }}-${{ inputs.harness }}/**/runner.log
+        retention-days: 7
+        if-no-files-found: warn
+
+    - name: Upload junit + logs
+      if: ${{ always() }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      with:
+        name: integration-${{ inputs.harness }}-${{ github.run_id }}
+        path: artifacts/
+        retention-days: 14
+        if-no-files-found: ignore
