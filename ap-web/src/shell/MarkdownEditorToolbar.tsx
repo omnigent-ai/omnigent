@@ -36,8 +36,10 @@ import "@tiptap/markdown";
 // Type-only import: activates @tiptap/extension-table's TypeScript module
 // augmentation so editor.chain() includes table commands (insertTable, etc.)
 // without pulling the full extension into the runtime bundle.
+// eslint-disable-next-line import/no-empty-named-blocks -- deliberate type-only augmentation trigger, not a stray empty import
 import type {} from "@tiptap/extension-table";
 // Same trick for the list package's command augmentation (toggleTaskList).
+// eslint-disable-next-line import/no-empty-named-blocks -- deliberate type-only augmentation trigger, not a stray empty import
 import type {} from "@tiptap/extension-list";
 import { TableMap, cellAround, colCount, findTable, isInTable } from "@tiptap/pm/tables";
 import { cn } from "@/lib/utils";
