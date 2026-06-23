@@ -195,6 +195,8 @@ from omnigent.server.schemas import (
     ChildSessionSummary,
     CompletedEvent,
     ConversationDeleted,
+    CopyFilesRequest,
+    CopyFilesResponse,
     CreatedSessionResponse,
     ElicitationRequestEvent,
     ElicitationRequestParams,
@@ -15666,6 +15668,86 @@ def create_sessions_router(
             "object": "session.resource.deleted",
             "deleted": True,
         }
+
+    @router.post(
+        "/sessions/{session_id}/resources/files:copy",
+        response_model=None,
+    )
+    async def copy_session_files(
+        request: Request,
+        session_id: str,
+        body: CopyFilesRequest,
+    ) -> dict[str, Any]:
+        """
+        Copy lineage-owned files into this (destination) session.
+
+        Authorizes by spawn lineage: ``body.source_session_id`` must be
+        the destination itself or one of its ``parent_conversation_id``
+        ancestors. Each source file is read and re-stored as a new
+        child-scoped row owned by ``session_id`` — this preserves the
+        session-scoping invariant (the child reads its OWN copy; no
+        cross-session read grant is created). Validation is all-or-
+        nothing: an unauthorized source or a missing file copies nothing.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Destination (child) session/conversation id.
+        :param body: Source session id plus the file ids to copy.
+        :returns: A ``session.files.copied`` object carrying the
+            ``{source_file_id: new_file_id}`` mapping.
+        """
+        await _validate_session(session_id, request, LEVEL_EDIT)
+        if file_store is None or artifact_store is None:
+            raise HTTPException(
+                status_code=501,
+                detail="file store not configured",
+            )
+
+        # Lineage authorization: the source must be the destination
+        # itself or any ancestor up the parent_conversation_id chain.
+        authorized = {session_id, *_ancestor_session_ids(conversation_store, session_id)}
+        if body.source_session_id not in authorized:
+            raise OmnigentError(
+                "Source session is not in this session's lineage",
+                code=ErrorCode.FORBIDDEN,
+            )
+
+        # Validate every source file before copying anything so a
+        # missing id fails the whole request without partial writes.
+        sources: list[StoredFile] = []
+        for file_id in body.file_ids:
+            stored = file_store.get(file_id, session_id=body.source_session_id)
+            if stored is None:
+                raise OmnigentError(
+                    f"File '{file_id}' not found in source session",
+                    code=ErrorCode.NOT_FOUND,
+                )
+            sources.append(stored)
+
+        mapping: dict[str, str] = {}
+        for stored in sources:
+            content = artifact_store.get(stored.id)
+            new = file_store.create(
+                session_id=session_id,
+                filename=stored.filename,
+                bytes=stored.bytes,
+                content_type=stored.content_type,
+            )
+            artifact_store.put(new.id, content)
+            mapping[stored.id] = new.id
+            resource = _stored_file_to_resource(session_id, new)
+            _publish_and_persist_resource_event(
+                session_id,
+                "session.resource.created",
+                resource_id=new.id,
+                resource_type="file",
+                conversation_store=conversation_store,
+                resource=resource,
+            )
+
+        return CopyFilesResponse(
+            session_id=session_id,
+            mapping=mapping,
+        ).model_dump()
 
     # ── Phase 3: environment filesystem proxy endpoints ──────────
 

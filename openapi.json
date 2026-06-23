@@ -377,6 +377,28 @@
         "title": "ConversationRef",
         "type": "object"
       },
+      "CopyFilesRequest": {
+        "description": "Request to copy files from a lineage ancestor into a session.\n\nThe destination session is the path parameter; ``source_session_id``\nmust be the destination itself or one of its ``parent_conversation_id``\nancestors (spawn lineage). The copy creates new child-scoped rows \u2014\nit does not grant cross-session read access.\n\n:param source_session_id: Session that owns the source files, e.g.\n    ``\"conv_parent\"``. Must be in the destination's lineage.\n:param file_ids: Ids of the source-owned files to copy, e.g.\n    ``[\"file_abc123\"]``.",
+        "properties": {
+          "file_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "File Ids",
+            "type": "array"
+          },
+          "source_session_id": {
+            "title": "Source Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_session_id",
+          "file_ids"
+        ],
+        "title": "CopyFilesRequest",
+        "type": "object"
+      },
       "CreateDefaultPolicyRequest": {
         "description": "Request body for ``POST /v1/policies``.\n\n:param name: Human-readable policy name. Must be globally\n    unique, e.g. ``\"block_non_feature_branch_push\"``.\n:param type: Handler discriminator: ``\"python\"``, ``\"url\"``,\n:param handler: Dotted import path (python) or HTTPS URL\n    (url), e.g.\n    ``\"github_mcp_policy.block_non_misc_push\"``\n    or ``\"https://example.com/policies/eval\"``.\n:param factory_params: Optional dict of kwargs passed to the\n    handler when it is a factory function. Only valid for\n    ``type=\"python\"``, e.g. ``{\"limit\": 10}``.",
         "properties": {
@@ -7533,6 +7555,57 @@
           }
         },
         "summary": "Get Session File Content",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/files:copy": {
+      "post": {
+        "description": "Copy lineage-owned files into this (destination) session.\n\nAuthorizes by spawn lineage: ``body.source_session_id`` must be\nthe destination itself or one of its ``parent_conversation_id``\nancestors. Each source file is read and re-stored as a new\nchild-scoped row owned by ``session_id`` \u2014 this preserves the\nsession-scoping invariant (the child reads its OWN copy; no\ncross-session read grant is created). Validation is all-or-\nnothing: an unauthorized source or a missing file copies nothing.\n\n:param request: The incoming FastAPI request (for auth).\n:param session_id: Destination (child) session/conversation id.\n:param body: Source session id plus the file ids to copy.\n:returns: A ``session.files.copied`` object carrying the\n    ``{source_file_id: new_file_id}`` mapping.",
+        "operationId": "copy_session_files_v1_sessions__session_id__resources_files_copy_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CopyFilesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Copy Session Files",
         "tags": [
           "sessions"
         ]

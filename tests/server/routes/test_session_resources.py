@@ -75,6 +75,33 @@ class _ConversationStore:
                     "omnigent.wrapper": "claude-code-native-ui",
                 },
             ),
+            # A three-level spawn lineage for the file-copy tests:
+            # conv_gp (root) -> conv_p (child) -> conv_c (grandchild).
+            "conv_gp": Conversation(
+                id="conv_gp",
+                created_at=1,
+                updated_at=1,
+                root_conversation_id="conv_gp",
+                agent_id="ag_test",
+            ),
+            "conv_p": Conversation(
+                id="conv_p",
+                created_at=1,
+                updated_at=1,
+                root_conversation_id="conv_gp",
+                kind="sub_agent",
+                parent_conversation_id="conv_gp",
+                agent_id="ag_test",
+            ),
+            "conv_c": Conversation(
+                id="conv_c",
+                created_at=1,
+                updated_at=1,
+                root_conversation_id="conv_gp",
+                kind="sub_agent",
+                parent_conversation_id="conv_p",
+                agent_id="ag_test",
+            ),
         }
         self.appended_items: list[Any] = []
 
@@ -1635,6 +1662,189 @@ async def test_delete_session_file(
         f"/v1/sessions/conv_proxy/resources/files/{file_id}",
     )
     assert get_resp.status_code == 404
+
+
+# ── files:copy — lineage-scoped file copy tests ─────────────────
+
+
+async def _upload_file(
+    client: httpx.AsyncClient,
+    session_id: str,
+    name: str,
+    content: bytes,
+) -> str:
+    """Upload a file to a session and return its id.
+
+    :param client: The file-capable test client.
+    :param session_id: Owning session id.
+    :param name: Filename to upload.
+    :param content: Raw file bytes.
+    :returns: The new file id.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": (name, content, "text/plain")},
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_copy_files_from_direct_parent(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+) -> None:
+    """A child copies one parent-owned file into its own namespace."""
+    parent_file = await _upload_file(file_client, "conv_p", "doc.txt", b"parent bytes")
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [parent_file]},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["object"] == "session.files.copied"
+    assert body["session_id"] == "conv_c"
+    new_id = body["mapping"][parent_file]
+    # A copy, not an alias: the new row is distinct from the source.
+    assert new_id != parent_file
+
+    # The new row is child-scoped and readable by the child only.
+    copied = file_store.get(new_id, session_id="conv_c")
+    assert copied is not None
+    assert copied.filename == "doc.txt"
+    # The source row is unchanged and still owned by the parent.
+    assert file_store.get(parent_file, session_id="conv_p") is not None
+
+    # The bytes match the source.
+    content = await file_client.get(
+        f"/v1/sessions/conv_c/resources/files/{new_id}/content",
+    )
+    assert content.status_code == 200
+    assert content.content == b"parent bytes"
+
+
+@pytest.mark.asyncio
+async def test_copy_files_multi_file_mapping(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+) -> None:
+    """A multi-file copy returns a complete source→new mapping."""
+    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aaa")
+    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bbb")
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+    )
+    assert resp.status_code == 200, resp.text
+    mapping = resp.json()["mapping"]
+    assert set(mapping.keys()) == {f1, f2}
+    assert len(set(mapping.values())) == 2
+    for src, new_id in mapping.items():
+        del src
+        assert file_store.get(new_id, session_id="conv_c") is not None
+
+
+@pytest.mark.asyncio
+async def test_copy_files_from_grandparent_in_chain(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+) -> None:
+    """Copying from a grandparent (two levels up) is authorized."""
+    gp_file = await _upload_file(file_client, "conv_gp", "root.txt", b"grandparent")
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_gp", "file_ids": [gp_file]},
+    )
+    assert resp.status_code == 200, resp.text
+    new_id = resp.json()["mapping"][gp_file]
+    assert file_store.get(new_id, session_id="conv_c") is not None
+
+
+@pytest.mark.asyncio
+async def test_copy_files_rejects_source_outside_lineage(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+) -> None:
+    """A source session not in the destination's lineage is forbidden."""
+    # conv_proxy is a top-level session with no link to conv_c's chain.
+    foreign_file = await _upload_file(file_client, "conv_proxy", "x.txt", b"foreign")
+
+    before = file_store.list(session_id="conv_c").data
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_proxy", "file_ids": [foreign_file]},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "forbidden"
+
+    # Nothing was copied into the destination.
+    after = file_store.list(session_id="conv_c").data
+    assert len(after) == len(before)
+
+
+@pytest.mark.asyncio
+async def test_copy_files_missing_source_file_is_all_or_nothing(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+) -> None:
+    """A missing source file fails the whole request with no partial copy."""
+    good = await _upload_file(file_client, "conv_p", "good.txt", b"ok")
+
+    before = file_store.list(session_id="conv_c").data
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [good, "file_does_not_exist"]},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "not_found"
+
+    # The valid file in the batch must NOT have been committed: validation
+    # is all-or-nothing, so the destination is unchanged.
+    after = file_store.list(session_id="conv_c").data
+    assert len(after) == len(before)
+
+
+@pytest.mark.asyncio
+async def test_copy_files_self_source_is_authorized(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+) -> None:
+    """The destination may name itself as the source (lineage includes self)."""
+    own = await _upload_file(file_client, "conv_c", "self.txt", b"mine")
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_c", "file_ids": [own]},
+    )
+    assert resp.status_code == 200, resp.text
+    new_id = resp.json()["mapping"][own]
+    assert new_id != own
+    assert file_store.get(new_id, session_id="conv_c") is not None
+
+
+@pytest.mark.asyncio
+async def test_copy_files_then_download_returns_bytes(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """After copy, the child can download the copied content."""
+    parent_file = await _upload_file(file_client, "conv_p", "payload.bin", b"\x00\x01\x02data")
+
+    copy_resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [parent_file]},
+    )
+    new_id = copy_resp.json()["mapping"][parent_file]
+
+    resp = await file_client.get(
+        f"/v1/sessions/conv_c/resources/files/{new_id}/content",
+    )
+    assert resp.status_code == 200
+    assert resp.content == b"\x00\x01\x02data"
 
 
 # ── Phase 1d: integration hardening tests ────────────────────────
