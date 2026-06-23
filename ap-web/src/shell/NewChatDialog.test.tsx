@@ -21,6 +21,7 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+import { useClaudeProfiles } from "@/hooks/useClaudeProfiles";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -36,6 +37,7 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+vi.mock("@/hooks/useClaudeProfiles", () => ({ useClaudeProfiles: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
   // WorkspacePicker (rendered by the file browser) reads this on mount;
@@ -52,6 +54,7 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 const authenticatedFetchMock = vi.mocked(authenticatedFetch);
 const useHostsMock = vi.mocked(useHosts);
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
+const useClaudeProfilesMock = vi.mocked(useClaudeProfiles);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const useDirectorySessionsMock = vi.mocked(useDirectorySessions);
 const useRunnerHealthMock = vi.mocked(useRunnerHealthRegistration);
@@ -497,6 +500,7 @@ function setupLandingMocks() {
   useHostFilesystemMock.mockReset();
   useDirectorySessionsMock.mockReset();
   useRunnerHealthMock.mockReset();
+  useClaudeProfilesMock.mockReset();
   setOmnigentHostConfig({});
   localStorage.clear();
   // host_1's most-recent workspace seeds the field (so submit can enable
@@ -506,6 +510,10 @@ function setupLandingMocks() {
     data: [],
   } as unknown as ReturnType<typeof useDirectorySessions>);
   useRunnerHealthMock.mockReturnValue(new Map<string, boolean>());
+  // No operator-configured claude_profiles by default → picker hidden.
+  useClaudeProfilesMock.mockReturnValue({
+    data: [],
+  } as unknown as ReturnType<typeof useClaudeProfiles>);
   useHostFilesystemMock.mockReturnValue({
     data: undefined,
     isLoading: false,

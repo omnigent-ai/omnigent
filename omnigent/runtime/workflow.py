@@ -1115,6 +1115,25 @@ def _build_claude_sdk_spawn_env(
     permission_mode = spec.executor.config.get("permission_mode")
     if permission_mode is not None:
         env["HARNESS_CLAUDE_SDK_PERMISSION_MODE"] = str(permission_mode)
+    # Per-agent Claude Code profile (issue #503): a profile NAME declared
+    # in the agent spec via ``executor.config.claude_profile``. Resolved to
+    # a config_dir here (against the runner host's ~/.omnigent/config.yaml)
+    # and threaded into the harness as ``HARNESS_CLAUDE_SDK_CONFIG_DIR``,
+    # which the executor injects as ``CLAUDE_CONFIG_DIR`` on the spawned
+    # Claude CLI subprocess — isolating credentials/settings/session state
+    # per profile. ``None`` (no profile declared) leaves it unset so the
+    # CLI uses its default ``~/.claude``. A per-session create-time override
+    # (when set) takes precedence and is applied by the runner after this
+    # builder returns (mirroring the model_override precedence pattern).
+    claude_profile = spec.executor.config.get("claude_profile")
+    if isinstance(claude_profile, str) and claude_profile:
+        from omnigent.onboarding.claude_profiles import (
+            resolve_claude_profile_config_dir,
+        )
+
+        config_dir = resolve_claude_profile_config_dir(claude_profile)
+        if config_dir is not None:
+            env["HARNESS_CLAUDE_SDK_CONFIG_DIR"] = config_dir
     return env
 
 

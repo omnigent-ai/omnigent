@@ -4267,6 +4267,11 @@ class _ChildParentMeta:
     :param last_error: Last child failure detail fanned out, used to emit a
         new parent update when only the error changes, and to clear stale
         errors on a later running/waiting edge.
+    :param claude_profile: The Claude Code account profile this child was
+        assigned by the fan-out pool (issue #692), or ``None`` when fan-out
+        is off. Surfaced in the live ``session.child_session.updated`` event
+        so the operator can see which budget each in-flight sub-agent
+        consumes. ``None`` for a reused/continued child (no fresh spawn).
     """
 
     parent_id: str
@@ -4276,6 +4281,7 @@ class _ChildParentMeta:
     last_busy: bool | None = None
     last_task_status: str | None = None
     last_error: tuple[str, str] | None = None
+    claude_profile: str | None = None
 
 
 # child_session_id -> :class:`_ChildParentMeta`. Populated at spawn (see
@@ -4290,6 +4296,7 @@ def register_child_session(
     title: str,
     tool: str,
     session_name: str,
+    claude_profile: str | None = None,
 ) -> None:
     """
     Record a child→parent mapping for SSE status/preview fan-out.
@@ -4300,12 +4307,16 @@ def register_child_session(
     :param title: Child title, ``"{tool}:{session_name}"``.
     :param tool: Sub-agent type, e.g. ``"researcher"``.
     :param session_name: Sub-agent instance name, e.g. ``"auth"``.
+    :param claude_profile: The fan-out-assigned profile name (issue #692),
+        or ``None`` when fan-out is off / this is a reused child. Threaded
+        onto the meta for live-event telemetry.
     """
     _child_session_parents[child_session_id] = _ChildParentMeta(
         parent_id=parent_session_id,
         title=title,
         tool=tool,
         session_name=session_name,
+        claude_profile=claude_profile,
     )
 
 
@@ -4773,6 +4784,11 @@ def create_runner_app(
             "busy": busy,
             "current_task_status": _session_status_to_task_status(status),
         }
+        # Surface the fan-out-assigned profile (issue #692) so the operator
+        # can see which budget each in-flight sub-agent consumes. Omitted
+        # when fan-out is off / this is a reused child (no fresh spawn).
+        if meta.claude_profile is not None:
+            child["claude_profile"] = meta.claude_profile
         if include_error:
             child["last_task_error"] = error
         return child
@@ -6122,6 +6138,13 @@ def create_runner_app(
         # spawned sub-agent child (no-op otherwise).
         unregister_child_session(session_id)
         unregister_subagent_work_for_session(session_id)
+        # Drop the per-parent round-robin claude-profile fan-out index so the
+        # module-global map cannot outlive the session tree (issue #692).
+        from omnigent.runner.tool_dispatch import (
+            unregister_fanout_rr_index_for_session,
+        )
+
+        unregister_fanout_rr_index_for_session(session_id)
         if filesystem_registry is not None:
             filesystem_registry.unregister_conversation(session_id)
         for _task, evt in _session_async_tasks.pop(session_id, {}).values():
@@ -9496,6 +9519,7 @@ def create_runner_app(
                     model_override=body.get("model_override"),
                     harness_override=body.get("harness_override"),
                     sub_agent_name=_sub_agent_name,
+                    claude_profile=body.get("claude_profile"),
                 )
             except (httpx.HTTPError, RuntimeError) as exc:
                 return JSONResponse(
@@ -13373,6 +13397,7 @@ async def _resolve_harness_config(
     model_override: str | None = None,
     harness_override: str | None = None,
     sub_agent_name: str | None = None,
+    claude_profile: str | None = None,
 ) -> tuple[str, dict[str, str] | None]:
     """Resolve harness type + spawn-env from the agent spec.
 
@@ -13393,6 +13418,11 @@ async def _resolve_harness_config(
         the parent spec is swapped to the matching sub-spec via
         :func:`_find_spec_by_name` before harness derivation. ``None`` for
         top-level sessions.
+    :param claude_profile: Per-session Claude Code account profile name
+        (issue #503), forwarded by the server in the message body. The
+        runner resolves it to a config_dir and injects it as
+        ``HARNESS_CLAUDE_SDK_CONFIG_DIR`` so the claude-sdk harness runs
+        the Claude CLI under an isolated ``CLAUDE_CONFIG_DIR``.
     :returns: ``(harness, spawn_env)``; a default for unresolved specs.
     """
     if agent_id and spec_resolver:
@@ -13414,7 +13444,11 @@ async def _resolve_harness_config(
             harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
             harness = canonicalize_harness(harness) or harness
             spawn_env = _build_spawn_env_from_spec(
-                spec, harness, workdir=workdir, model_override=model_override
+                spec,
+                harness,
+                workdir=workdir,
+                model_override=model_override,
+                claude_profile=claude_profile,
             )
             return harness, spawn_env
 
@@ -13445,6 +13479,7 @@ def _build_spawn_env_from_spec(
     *,
     workdir: Path | None = None,
     model_override: str | None = None,
+    claude_profile: str | None = None,
 ) -> dict[str, str] | None:
     """Build spawn-env from spec — mirrors workflow.py's helpers.
 
@@ -13459,6 +13494,16 @@ def _build_spawn_env_from_spec(
         via ``--model`` in :func:`_build_claude_native_base_args`; the
         SDK harnesses have no such arg, so the override must land in the
         env var here.)
+    :param claude_profile: Per-session Claude Code account profile name
+        (issue #503), e.g. ``"work"``, or ``None``. When set on a
+        ``claude-sdk`` harness, the runner resolves the name to a
+        ``config_dir`` against its local ``~/.omnigent/config.yaml``
+        ``claude_profiles:`` block and overrides
+        ``HARNESS_CLAUDE_SDK_CONFIG_DIR`` so the override takes
+        precedence over the spec's declared profile. The executor
+        injects it as ``CLAUDE_CONFIG_DIR`` on the spawned Claude CLI
+        subprocess, isolating credentials/settings/session state per
+        profile.
     :returns: The spawn-env dict, or ``None`` for native / unknown harnesses.
     """
     try:
@@ -13496,6 +13541,36 @@ def _build_spawn_env_from_spec(
         model_key = _HARNESS_MODEL_ENV_KEY.get(harness)
         if model_key is not None:
             env[model_key] = model_override
+
+    # Per-session Claude Code account profile (issue #503) — create-time
+    # override that takes precedence over the spec's declared profile
+    # (which ``_build_claude_sdk_spawn_env`` already baked into
+    # ``HARNESS_CLAUDE_SDK_CONFIG_DIR``). The runner resolves the name to a
+    # config_dir against its local ``~/.omnigent/config.yaml``
+    # ``claude_profiles:`` block; the executor injects it as
+    # ``CLAUDE_CONFIG_DIR`` on the spawned Claude CLI subprocess. Only
+    # meaningful for the claude-sdk harness (native CLIs get their config dir
+    # via the bridge path, not this spawn env).
+    if claude_profile and harness == "claude-sdk":
+        from omnigent.onboarding.claude_profiles import (
+            resolve_claude_profile_config_dir,
+        )
+
+        config_dir = resolve_claude_profile_config_dir(claude_profile)
+        if config_dir is not None:
+            env["HARNESS_CLAUDE_SDK_CONFIG_DIR"] = config_dir
+        else:
+            # Unknown per-session profile name: the operator typed/picked a
+            # name that isn't in this runner's ``claude_profiles:`` block.
+            # Silently falling back to the spec's dir (or ``~/.claude``) would
+            # hide a misconfiguration — log it so the wrong-account session is
+            # traceable. The env var is left untouched (keeps the spec value,
+            # or unset → CLI default).
+            _logger.warning(
+                "claude_profile %r not found in runner claude_profiles "
+                "config; leaving CLAUDE_CONFIG_DIR at its prior default",
+                claude_profile,
+            )
 
     # Routing visibility: log the resolved gateway target so operators can
     # confirm which provider a turn actually hits (api.anthropic.com /

@@ -460,13 +460,19 @@ class SysSessionListTool(Tool):
             if is_session_closed(child.labels, child.title):
                 continue
             sa_agent, _, sa_title = child.title.partition(":")
-            result.append(
-                {
-                    "agent": sa_agent,
-                    "title": sa_title,
-                    "conversation_id": child.id,
-                }
-            )
+            entry: dict[str, str] = {
+                "agent": sa_agent,
+                "title": sa_title,
+                "conversation_id": child.id,
+            }
+            # Surface the fan-out-assigned profile (issue #692) so the
+            # orchestrator can see which budget each in-flight sub-agent
+            # consumes. Read off the persisted conversation row (set by
+            # #583); ``None`` (fan-out off / default) is omitted to keep
+            # the payload lean and backward-compatible.
+            if child.claude_profile is not None:
+                entry["claude_profile"] = child.claude_profile
+            result.append(entry)
         # ``sessions`` (the global, permission-bounded view) is empty on
         # the in-process path — it has no caller identity to scope by.
         # The runner (REST) path populates it via GET /v1/sessions.
@@ -681,6 +687,21 @@ class SysSessionCreateTool(Tool):
                                 "for the child. Omit to create an idle "
                                 "session and drive it later via "
                                 "sys_session_send."
+                            ),
+                        },
+                        "claude_profile": {
+                            "type": "string",
+                            "description": (
+                                "Optional: pin this child to a specific "
+                                "Claude Code account profile (one of the "
+                                "names in the runner's claude_profiles "
+                                "config). Overrides the round-robin "
+                                "fan-out pool pick for this one spawn "
+                                "(issue #692). Only meaningful with "
+                                "agent_id and the claude-sdk harness; an "
+                                "unknown name is ignored with a warning and "
+                                "falls back to the pool. Omit to let the "
+                                "runner assign the next pool profile."
                             ),
                         },
                     },

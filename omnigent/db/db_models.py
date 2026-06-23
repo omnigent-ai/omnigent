@@ -356,6 +356,13 @@ class SqlConversation(Base):
     # Per-session brain-harness override, e.g. "pi". Nullable; None
     # means use the spec's executor.config.harness (see entities.Conversation).
     harness_override: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Per-session Claude Code account profile name (issue #503), e.g.
+    # "work". Nullable; None means use the agent spec's claude_profile, else
+    # the CLI's default ~/.claude. Set once at create; the runner bakes it
+    # into the harness spawn env (CLAUDE_CONFIG_DIR) on the first turn.
+    # Stores only the profile name (never a path/credential); the runner
+    # resolves name -> config_dir against its local claude_profiles block.
+    claude_profile: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Sub-agent type name within the parent's spec tree, e.g.
     # "summarizer". The runner uses this to load the sub-agent's
     # AgentSpec instead of the parent's. Replaces task.agent_name

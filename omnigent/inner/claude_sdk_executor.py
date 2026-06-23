@@ -1111,6 +1111,7 @@ class ClaudeSDKExecutor(Executor):
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
         api_key_helper: str | None = None,
+        config_dir: str | None = None,
     ) -> None:
         """Create a ClaudeSDKExecutor.
 
@@ -1184,6 +1185,18 @@ class ClaudeSDKExecutor(Executor):
                 Injected into ``_extra_env`` as
                 :data:`_CLAUDE_API_KEY_HELPER_ENV_KEY` so it reaches
                 the SDK's ``settings.apiKeyHelper`` option at turn time.
+            config_dir: Per-session Claude Code config directory, used as
+                the spawned Claude CLI's ``CLAUDE_CONFIG_DIR`` so each
+                Omnigent session can run under an isolated Claude Code
+                subscription login (credentials, settings, and session
+                state all live under this dir instead of the shared
+                ``~/.claude``). ``None`` falls back to the CLI's default
+                (``~/.claude``), preserving the legacy single-account
+                behavior. Threaded from ``HARNESS_CLAUDE_SDK_CONFIG_DIR``
+                (set by the workflow layer from the spec's
+                ``claude_profile``). Injected into ``_extra_env`` so the
+                SDK merges it into the CLI subprocess env via
+                ``ClaudeAgentOptions(env=...)``.
         """
         # Fail loud: a ``databricks-*`` model requires the gateway transport.
         if not gateway and model is not None and model.startswith("databricks-"):
@@ -1312,6 +1325,20 @@ class ClaudeSDKExecutor(Executor):
         # ``_CLAUDE_API_KEY_HELPER_ENV_KEY`` from ``_extra_env`` only.
         if api_key_helper:
             self._extra_env[_CLAUDE_API_KEY_HELPER_ENV_KEY] = api_key_helper
+
+        # config_dir: per-session Claude Code config directory. Setting
+        # ``CLAUDE_CONFIG_DIR`` on the spawned CLI subprocess isolates
+        # credentials, settings, and session state under a per-profile dir
+        # instead of the shared ``~/.claude`` — the core of issue #503
+        # (per-session Claude account switching). Threaded through
+        # ``_extra_env`` so the SDK merges it into the CLI subprocess env
+        # via ``ClaudeAgentOptions(env=...)`` (the same channel
+        # ``ANTHROPIC_*`` gateway vars and the retry-policy env use).
+        # ``None`` leaves the env untouched so the CLI uses its default
+        # (``~/.claude``), preserving legacy single-account behavior.
+        self._config_dir = config_dir
+        if config_dir:
+            self._extra_env["CLAUDE_CONFIG_DIR"] = str(config_dir)
 
     def __del__(self) -> None:
         if getattr(self, "_cli_wrapper_path", None):

@@ -36,7 +36,7 @@ import json
 import logging
 import os
 import tempfile
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -1357,6 +1357,103 @@ def test_build_spawn_env_applies_model_override(
     assert base["HARNESS_CLAUDE_SDK_MODEL"] != "claude-sonnet-4-6"
     # … and the override wins, landing in the model env var the SDK reads.
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+
+
+def test_build_spawn_env_per_session_claude_profile_overrides_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A per-session ``claude_profile`` override wins over the spec's
+    declared profile (issue #503).
+
+    This is the core precedence contract of the PR: the spec bakes its own
+    ``claude_profile`` into ``HARNESS_CLAUDE_SDK_CONFIG_DIR`` via
+    ``_build_claude_sdk_spawn_env`` (workflow.py), and the runner's
+    ``_build_spawn_env_from_spec`` then overrides it when the caller passes a
+    per-session ``claude_profile``. Without this, the new-chat account
+    picker's pick would be silently dropped in favor of the agent's default.
+
+    :param tmp_path: Pytest temp dir for an isolated provider + profile config.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  anthropic:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    anthropic:\n"
+        "      base_url: https://api.anthropic.com\n"
+        "      api_key: $ANTHROPIC_API_KEY\n"
+        "claude_profiles:\n"
+        "  profiles:\n"
+        "    - name: work\n"
+        "      config_dir: /tmp/claude-work\n"
+        "    - name: personal\n"
+        "      config_dir: /tmp/claude-personal\n"
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "claude-sdk", "claude_profile": "work"},
+        ),
+    )
+
+    base = _build_spawn_env_from_spec(spec, "claude-sdk")
+    overridden = _build_spawn_env_from_spec(spec, "claude-sdk", claude_profile="personal")
+    assert base is not None and overridden is not None
+    # Baseline resolves the spec's declared profile ("work").
+    assert base["HARNESS_CLAUDE_SDK_CONFIG_DIR"] == "/tmp/claude-work"
+    # Per-session override ("personal") wins over the spec's "work".
+    assert overridden["HARNESS_CLAUDE_SDK_CONFIG_DIR"] == "/tmp/claude-personal"
+
+
+def test_build_spawn_env_unknown_claude_profile_warns_and_leaves_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unknown per-session profile name logs a warning and leaves
+    ``HARNESS_CLAUDE_SDK_CONFIG_DIR`` at its prior default (issue #503).
+
+    The runner owns the profile registry, so a name unknown to it must not
+    crash the turn and must not silently spawn against a bogus dir — it
+    falls back to the spec's dir (or ``~/.claude``) *and* logs so a
+    misconfigured wrong-account session is traceable.
+
+    :param tmp_path: Pytest temp dir for an isolated provider + profile config.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Pytest log capture fixture.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  anthropic:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    anthropic:\n"
+        "      base_url: https://api.anthropic.com\n"
+        "      api_key: $ANTHROPIC_API_KEY\n"
+        "claude_profiles:\n"
+        "  profiles:\n"
+        "    - name: work\n"
+        "      config_dir: /tmp/claude-work\n"
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        env = _build_spawn_env_from_spec(spec, "claude-sdk", claude_profile="ghost")
+    assert env is not None
+    # Unknown name → no config_dir baked in (CLI falls back to ~/.claude).
+    assert "HARNESS_CLAUDE_SDK_CONFIG_DIR" not in env
+    assert any("claude_profile" in rec.getMessage() for rec in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -6618,3 +6715,348 @@ async def test_create_session_reinit_preserves_existing_inbox() -> None:
             )
     finally:
         runner_app._session_inboxes_ref.pop(session_id, None)
+
+
+# ── claude-profile fan-out (issue #692) ──────────────────────────────
+#
+# Round-robin assignment + injection into the child create body, the
+# explicit per-spawn override, and the register_child_session telemetry
+# threading. All mocked — no real LLM, no real creds (mirrors #583's
+# test posture). The pool is injected by patching the lazy-imported
+# loaders ``_assign_fanout_profile`` resolves at call time, so the test
+# never touches the developer's real ``~/.omnigent/config.yaml``.
+
+
+def _patch_fanout_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    pool: list[str],
+) -> None:
+    """Patch the lazy-imported pool/profile loaders used by ``_assign_fanout_profile``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param pool: The profile names the runner should fan out across.
+    """
+    import omnigent.onboarding.claude_profiles as cp
+
+    monkeypatch.setattr(cp, "load_claude_fanout_pool", lambda config=None: list(pool))
+    monkeypatch.setattr(
+        cp,
+        "claude_profile_by_name",
+        lambda name, config=None: name if name in pool else None,
+    )
+
+
+@pytest.fixture()
+def _reset_fanout_rr_index() -> Iterator[None]:
+    """Clear the module-global round-robin index before/after each fan-out test.
+
+    :yields: Nothing — the teardown clears the index so test order never
+        bleeds round-robin state across tests.
+    """
+    from omnigent.runner.tool_dispatch import _FANOUT_RR_INDEX
+
+    _FANOUT_RR_INDEX.clear()
+    yield
+    _FANOUT_RR_INDEX.clear()
+
+
+def test_assign_fanout_profile_round_robin_deterministic(
+    monkeypatch: pytest.MonkeyPatch, _reset_fanout_rr_index: None
+) -> None:
+    """N spawns for one parent cycle the pool in declared order, then wrap."""
+    from omnigent.runner.tool_dispatch import _assign_fanout_profile
+
+    _patch_fanout_pool(monkeypatch, ["work", "personal", "clientb"])
+    picked = [_assign_fanout_profile("conv_parent") for _ in range(7)]
+    # Declared order, then wraps: work, personal, clientb, work, personal, clientb, work
+    assert picked == ["work", "personal", "clientb", "work", "personal", "clientb", "work"]
+
+
+def test_assign_fanout_profile_per_parent_isolation(
+    monkeypatch: pytest.MonkeyPatch, _reset_fanout_rr_index: None
+) -> None:
+    """Each parent's round-robin index is independent (two parents, two cycles)."""
+    from omnigent.runner.tool_dispatch import _assign_fanout_profile
+
+    _patch_fanout_pool(monkeypatch, ["work", "personal"])
+    # Parent A takes work, parent B takes work, then A takes personal, B takes personal.
+    assert _assign_fanout_profile("conv_a") == "work"
+    assert _assign_fanout_profile("conv_b") == "work"
+    assert _assign_fanout_profile("conv_a") == "personal"
+    assert _assign_fanout_profile("conv_b") == "personal"
+
+
+def test_assign_fanout_profile_explicit_known_wins(
+    monkeypatch: pytest.MonkeyPatch, _reset_fanout_rr_index: None
+) -> None:
+    """An explicit *known* profile name overrides the round-robin pick."""
+    from omnigent.runner.tool_dispatch import _assign_fanout_profile
+
+    _patch_fanout_pool(monkeypatch, ["work", "personal"])
+    assert _assign_fanout_profile("conv_parent", explicit="personal") == "personal"
+    # The round-robin index is NOT advanced on an explicit win — the next
+    # round-robin spawn still gets the first pool slot.
+    assert _assign_fanout_profile("conv_parent") == "work"
+
+
+def test_assign_fanout_profile_explicit_unknown_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+    _reset_fanout_rr_index: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An explicit *unknown* name warns and falls through to round-robin (fail-closed)."""
+    from omnigent.runner.tool_dispatch import _assign_fanout_profile
+
+    _patch_fanout_pool(monkeypatch, ["work", "personal"])
+    with caplog.at_level(logging.WARNING):
+        assert _assign_fanout_profile("conv_parent", explicit="ghost") == "work"
+    assert any("ghost" in rec.getMessage() for rec in caplog.records)
+
+
+def test_assign_fanout_profile_empty_pool_returns_none(
+    monkeypatch: pytest.MonkeyPatch, _reset_fanout_rr_index: None
+) -> None:
+    """An empty/absent pool → ``None`` (today's single-account behavior preserved)."""
+    from omnigent.runner.tool_dispatch import _assign_fanout_profile
+
+    _patch_fanout_pool(monkeypatch, [])
+    assert _assign_fanout_profile("conv_parent") is None
+    # An explicit name against an empty pool also resolves to None (unknown).
+    assert _assign_fanout_profile("conv_parent", explicit="work") is None
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_round_robin_injects_profile_into_create_body(
+    monkeypatch: pytest.MonkeyPatch, _reset_fanout_rr_index: None
+) -> None:
+    """Two named sends for one parent get distinct ``claude_profile`` values
+    in the child create body, round-robin across the pool — the core fan-out
+    behavior. Without injection every child would share ``active_default``."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    _patch_fanout_pool(monkeypatch, ["work", "personal"])
+    create_bodies: list[dict[str, Any]] = []
+    registered: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+
+    def _capture_register(*a: Any, **k: Any) -> None:
+        registered.append(k)
+
+    monkeypatch.setattr(runner_app, "register_child_session", _capture_register)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.startswith(
+            "/v1/sessions/conv_parent_rr/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            child_id = f"conv_child_rr{len(create_bodies)}"
+            return httpx.Response(201, json={"id": child_id})
+        if (
+            request.method == "POST"
+            and request.url.path.startswith("/v1/sessions/conv_child_rr")
+            and request.url.path.endswith("/events")
+        ):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            for _ in range(2):
+                await execute_tool(
+                    tool_name="sys_session_send",
+                    arguments=json.dumps(
+                        {
+                            "agent": "worker",
+                            "title": "fanout",
+                            "args": {"input": "do work"},
+                        }
+                    ),
+                    server_client=server_client,
+                    conversation_id="conv_parent_rr",
+                    agent_spec=_spec_with_subagent_harness("claude-sdk"),
+                    session_inbox=session_inbox,
+                )
+        finally:
+            for i in (1, 2):
+                runner_app.unregister_subagent_work(f"conv_child_rr{i}")
+            runner_app._session_inboxes_ref.pop("conv_parent_rr", None)
+
+    assert len(create_bodies) == 2, "two sends must create two children"
+    assert create_bodies[0]["claude_profile"] == "work"
+    assert create_bodies[1]["claude_profile"] == "personal"
+    # The same profile is threaded onto register_child_session (3d telemetry input).
+    assert [r.get("claude_profile") for r in registered] == ["work", "personal"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_no_pool_leaves_create_body_unmodified(
+    monkeypatch: pytest.MonkeyPatch, _reset_fanout_rr_index: None
+) -> None:
+    """An empty pool → no ``claude_profile`` in the create body (backward-compatible)."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    _patch_fanout_pool(monkeypatch, [])
+    create_bodies: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.startswith(
+            "/v1/sessions/conv_parent_nopool/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child_nopool"})
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_child_nopool/events"
+        ):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {"agent": "worker", "title": "nopool", "args": {"input": "do work"}}
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_nopool",
+                agent_spec=_spec_with_subagent_harness("claude-sdk"),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child_nopool")
+            runner_app._session_inboxes_ref.pop("conv_parent_nopool", None)
+
+    assert len(create_bodies) == 1
+    assert "claude_profile" not in create_bodies[0], "empty pool must not inject the field"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_explicit_profile_wins_over_round_robin(
+    monkeypatch: pytest.MonkeyPatch, _reset_fanout_rr_index: None
+) -> None:
+    """``sys_session_create`` with ``claude_profile`` pins the child to that
+    profile (explicit wins), and the value lands in the create body."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    _patch_fanout_pool(monkeypatch, ["work", "personal"])
+    create_bodies: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={"id": "conv_child_explicit", "agent_name": "worker", "status": "created"},
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {"agent_id": "ag_worker", "claude_profile": "personal", "title": "pinned"}
+            ),
+            server_client=server_client,
+            conversation_id="conv_parent_explicit",
+            agent_spec=None,
+        )
+
+    assert len(create_bodies) == 1
+    # Explicit known name wins over the round-robin pick (which would be "work").
+    assert create_bodies[0]["claude_profile"] == "personal"
+
+
+def test_register_child_session_threads_claude_profile_onto_meta() -> None:
+    """``register_child_session`` stores ``claude_profile`` on the
+    child→parent meta (issue #692), the input the runtime status fan-out
+    (``_child_status_body``) reads to emit ``claude_profile`` in the live
+    ``session.child_session.updated`` event (3d telemetry)."""
+    from omnigent.runner.app import (
+        _child_session_parents,
+        register_child_session,
+        unregister_child_session,
+    )
+
+    child_id = "conv_child_fanout_meta_unique"
+    try:
+        register_child_session(
+            child_id,
+            parent_session_id="conv_parent_fanout_meta_unique",
+            title="researcher:auth",
+            tool="researcher",
+            session_name="auth",
+            claude_profile="work",
+        )
+        meta = _child_session_parents.get(child_id)
+        assert meta is not None
+        assert meta.claude_profile == "work"
+    finally:
+        unregister_child_session(child_id)
+
+    # Default (no profile) keeps the field None — backward-compatible.
+    other = "conv_child_fanout_meta_none_unique"
+    try:
+        register_child_session(
+            other,
+            parent_session_id="conv_parent_fanout_meta_none_unique",
+            title="researcher:auth",
+            tool="researcher",
+            session_name="auth",
+        )
+        assert _child_session_parents[other].claude_profile is None
+    finally:
+        unregister_child_session(other)
+
+
+def test_unregister_fanout_rr_index_for_session_drops_entry(
+    monkeypatch: pytest.MonkeyPatch, _reset_fanout_rr_index: None
+) -> None:
+    """``unregister_fanout_rr_index_for_session`` drops the per-parent
+    round-robin index at teardown (issue #692) so the module-global map
+    cannot grow unbounded across deleted sessions — sibling cleanup to
+    ``unregister_subagent_work_for_session``."""
+    from omnigent.runner.tool_dispatch import (
+        _FANOUT_RR_INDEX,
+        _assign_fanout_profile,
+        unregister_fanout_rr_index_for_session,
+    )
+
+    _patch_fanout_pool(monkeypatch, ["work", "personal"])
+    parent = "conv_parent_rr_teardown_unique"
+    # Advance the index so an entry exists for this parent.
+    _assign_fanout_profile(parent)
+    assert parent in _FANOUT_RR_INDEX
+
+    # No-op for a session with no entry.
+    unregister_fanout_rr_index_for_session("conv_orphan_unique")
+    assert parent in _FANOUT_RR_INDEX
+
+    # Drops the parent's entry.
+    unregister_fanout_rr_index_for_session(parent)
+    assert parent not in _FANOUT_RR_INDEX

@@ -141,6 +141,55 @@ def test_executor_factory_reads_env_vars(
     assert os_env_value.sandbox.type == "none"
 
 
+def test_executor_factory_threads_config_dir_env_into_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``HARNESS_CLAUDE_SDK_CONFIG_DIR`` threads through to the
+    ``config_dir`` constructor kwarg (issue #503).
+
+    The spawn-env builder sets this env var from the resolved
+    ``claude_profile``; the harness wrap reads it and hands it to
+    :class:`ClaudeSDKExecutor`, which injects it as
+    ``CLAUDE_CONFIG_DIR`` on the spawned CLI subprocess. Unset →
+    ``None`` (the CLI uses its default ``~/.claude``).
+    """
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_CONFIG_DIR", "/tmp/claude-personal")
+
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, *, config_dir: str | None, **_kwargs: Any) -> None:
+        captured["config_dir"] = config_dir
+
+    with patch(
+        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        _fake_init,
+    ):
+        claude_sdk_harness._build_claude_sdk_executor()
+
+    assert captured["config_dir"] == "/tmp/claude-personal"
+
+
+def test_executor_factory_config_dir_none_when_env_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ``HARNESS_CLAUDE_SDK_CONFIG_DIR`` → ``config_dir=None`` (legacy
+    single-account behavior preserved)."""
+    monkeypatch.delenv("HARNESS_CLAUDE_SDK_CONFIG_DIR", raising=False)
+
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, *, config_dir: str | None, **_kwargs: Any) -> None:
+        captured["config_dir"] = config_dir
+
+    with patch(
+        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        _fake_init,
+    ):
+        claude_sdk_harness._build_claude_sdk_executor()
+
+    assert captured["config_dir"] is None
+
+
 def test_executor_factory_decodes_os_env_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

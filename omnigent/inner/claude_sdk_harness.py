@@ -124,6 +124,14 @@ _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH
 # executor strips ANTHROPIC_API_KEY before connecting to avoid subscription
 # auth being bypassed).
 _ENV_API_KEY_HELPER = "HARNESS_CLAUDE_SDK_API_KEY_HELPER"
+# Per-session Claude Code config directory. When set, the inner executor
+# injects it as ``CLAUDE_CONFIG_DIR`` on the spawned Claude CLI subprocess
+# so the session runs under an isolated Claude Code subscription login
+# (credentials / settings / session state under a per-profile dir instead
+# of the shared ``~/.claude``). The workflow layer resolves the spec's
+# ``claude_profile`` name to a config_dir and sets this env var. Unset →
+# the CLI uses its default ``~/.claude`` (legacy single-account behavior).
+_ENV_CONFIG_DIR = "HARNESS_CLAUDE_SDK_CONFIG_DIR"
 
 # Default permission mode for the Claude SDK. ``"auto"`` auto-approves
 # tool calls with background safety checks that verify actions align
@@ -288,6 +296,7 @@ def _build_claude_sdk_executor() -> Executor:
         agent_name=agent_name,
         skills_filter=_resolve_skills_filter(),
         api_key_helper=os.environ.get(_ENV_API_KEY_HELPER) or None,
+        config_dir=os.environ.get(_ENV_CONFIG_DIR) or None,
     )
 
 

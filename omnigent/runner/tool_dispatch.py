@@ -1020,6 +1020,10 @@ async def _execute_subagent_tool(
         return existing
     created_child = False
     child_wrapper_label: str | None = None
+    # The claude-profile the runner fans this spawn out onto (issue #692).
+    # Only assigned on the create branch; threaded onto register_child_session
+    # for live-event telemetry.
+    child_claude_profile: str | None = None
     if existing is not None:
         child_session_id = existing.get("id")
         if not isinstance(child_session_id, str) or not child_session_id:
@@ -1089,6 +1093,13 @@ async def _execute_subagent_tool(
             "title": f"{sub_agent_name}:{session_name}",
             "sub_agent_name": sub_agent_name,
         }
+        # Fan out across the configured claude-profile pool (issue #692):
+        # round-robin per parent so N sub-agents run across N budgets in
+        # parallel instead of all on active_default. ``None`` (empty/absent
+        # pool) leaves the body unchanged — today's single-account behavior.
+        child_claude_profile = _assign_fanout_profile(conversation_id)
+        if child_claude_profile is not None:
+            create_body["claude_profile"] = child_claude_profile
         if model is not None:
             # Reject up front when the child harness would silently
             # ignore the persisted override — no silent drops.
@@ -1167,6 +1178,7 @@ async def _execute_subagent_tool(
         title=f"{sub_agent_name}:{session_name}",
         tool=sub_agent_name,
         session_name=session_name,
+        claude_profile=child_claude_profile,
     )
     _runner_app.register_subagent_work(
         parent_session_id=conversation_id,
@@ -1380,6 +1392,74 @@ async def _send_to_existing_session(
     )
 
 
+# ponytail: GIL-safe per-parent round-robin index for claude-profile
+# fan-out (issue #692). Mirrors the plain un-locked module-global style of
+# _subagent_work_by_parent in app.py — the int read-modify-write happens
+# inside a single sync helper with no await gap, so no lock is needed.
+_FANOUT_RR_INDEX: dict[str, int] = {}
+
+
+def _assign_fanout_profile(
+    parent_session_id: str,
+    explicit: str | None = None,
+) -> str | None:
+    """Pick the ``claude_profile`` for a sub-agent spawn (issue #692).
+
+    Resolution order:
+
+    1. ``explicit`` — when the caller names a *known* profile, it wins
+       (per-spawn binding). An unknown name is ignored with a warning and
+       falls through to round-robin (fail-closed, mirroring the runner's
+       existing claude_profile handling in app.py).
+    2. round-robin across :func:`load_claude_fanout_pool`, keyed by the
+       parent session so each parent's spawns cycle independently and
+       deterministically.
+    3. ``None`` when the pool is empty/absent — the child keeps today's
+       behavior (the server falls back to ``active_default``).
+
+    Single sync function: the round-robin index read-modify-write has no
+    ``await`` gap, so it is atomic w.r.t. other coroutines (asyncio is
+    single-threaded) and GIL-safe under concurrent spawns.
+
+    :param parent_session_id: The caller's session id — the round-robin key.
+    :param explicit: Optional explicit profile name from the tool call.
+    :returns: The chosen profile name, or ``None`` to leave the child on the
+        default.
+    """
+    from omnigent.onboarding.claude_profiles import (
+        claude_profile_by_name,
+        load_claude_fanout_pool,
+    )
+
+    if isinstance(explicit, str) and explicit:
+        if claude_profile_by_name(explicit) is not None:
+            return explicit
+        _logger.warning(
+            "sys_session fan-out: explicit claude_profile %r is not a "
+            "configured profile; falling back to round-robin pool",
+            explicit,
+        )
+    pool = load_claude_fanout_pool()
+    if not pool:
+        return None
+    idx = _FANOUT_RR_INDEX.get(parent_session_id, 0)
+    chosen = pool[idx % len(pool)]
+    _FANOUT_RR_INDEX[parent_session_id] = (idx + 1) % len(pool)
+    return chosen
+
+
+def unregister_fanout_rr_index_for_session(session_id: str) -> None:
+    """Drop the per-parent round-robin index when a session is torn down.
+
+    Sibling cleanup to :func:`unregister_subagent_work_for_session` — without
+    this the ``_FANOUT_RR_INDEX`` map would grow unbounded across deleted
+    sessions (one int per parent, but never pruned). No-op when absent.
+
+    :param session_id: Session id being deleted (parent or child).
+    """
+    _FANOUT_RR_INDEX.pop(session_id, None)
+
+
 def _build_session_create_body(
     agent_id: str,
     conversation_id: str,
@@ -1425,6 +1505,7 @@ def _finalize_created_session(
     conversation_id: str,
     agent_id: str,
     title: Any,
+    claude_profile: str | None = None,
     publish_event: Callable[[str, dict[str, Any]], None] | None,
 ) -> str:
     """
@@ -1440,6 +1521,10 @@ def _finalize_created_session(
     :param conversation_id: The caller (parent) session id.
     :param agent_id: The launched agent id, e.g. ``"ag_abc123"``.
     :param title: The caller-supplied title (or non-str when absent).
+    :param claude_profile: The claude-profile name assigned to this child
+        by the fan-out pool (issue #692), or ``None`` when fan-out is off.
+        Threaded onto the child→parent meta so the live
+        ``session.child_session.updated`` event carries it (telemetry).
     :param publish_event: Callback that enqueues an SSE event on the
         caller's outbound queue; ``None`` for in-process callers.
     :returns: JSON handle ``{conversation_id, kind, agent_id,
@@ -1456,6 +1541,7 @@ def _finalize_created_session(
         title=label,
         tool=data.get("agent_name") or "agent",
         session_name=label,
+        claude_profile=claude_profile,
     )
     evt = SessionCreatedEvent(
         type="session.created",
@@ -1556,6 +1642,14 @@ async def _execute_session_create(
     body = _build_session_create_body(
         str(agent_id), conversation_id, args.get("title"), args.get("message")
     )
+    # Fan out across the configured claude-profile pool (issue #692): pick
+    # one profile per spawn (explicit arg wins, else round-robin per parent)
+    # and inject it so N sub-agents run across N budgets in parallel instead
+    # of all on active_default. ``None`` (empty/absent pool) leaves the body
+    # unchanged — today's single-account behavior.
+    chosen_profile = _assign_fanout_profile(conversation_id, args.get("claude_profile"))
+    if chosen_profile is not None:
+        body["claude_profile"] = chosen_profile
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
@@ -1576,6 +1670,7 @@ async def _execute_session_create(
         conversation_id=conversation_id,
         agent_id=str(agent_id),
         title=args.get("title"),
+        claude_profile=chosen_profile,
         publish_event=publish_event,
     )
 

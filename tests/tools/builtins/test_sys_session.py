@@ -712,6 +712,36 @@ def test_session_list_skips_label_closed_child_with_original_title(
     assert payload["sub_agents"] == []
 
 
+def test_session_list_surfaces_child_claude_profile(
+    session_fixture: _Fixture,
+) -> None:
+    """``sys_session_list`` includes the child's ``claude_profile`` when the
+    persisted conversation row carries one (issue #692 fan-out telemetry),
+    and omits the key when it doesn't (fan-out off / default — backward
+    compatible). The profile is read off the persisted row set by #583, so
+    the orchestrator can see which budget each in-flight sub-agent consumes.
+    """
+    # Pin the child to a profile and confirm the list surfaces it.
+    session_fixture.conv_store.update_conversation(
+        session_fixture.child_conv_id, claude_profile="work"
+    )
+    raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
+    payload = json.loads(raw)
+    assert len(payload["sub_agents"]) == 1
+    assert payload["sub_agents"][0]["claude_profile"] == "work"
+
+
+def test_session_list_omits_claude_profile_when_unset(
+    session_fixture: _Fixture,
+) -> None:
+    """A child with no pinned profile omits ``claude_profile`` entirely (no
+    ``None`` noise, backward-compatible payload)."""
+    raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
+    payload = json.loads(raw)
+    assert len(payload["sub_agents"]) == 1
+    assert "claude_profile" not in payload["sub_agents"][0]
+
+
 def test_close_unknown_conversation_id_returns_not_found(
     session_fixture: _Fixture,
 ) -> None:
