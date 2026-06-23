@@ -59,17 +59,17 @@ export function normalizeResolvedTheme(value: string | undefined): ResolvedTheme
  * light instead of offering "Switch to Dark".
  *
  * @param mode Current selectable theme mode, e.g. `"dark"`.
- * @param resolvedTheme The actual rendered palette, e.g. `"dark"`.
+ * @param systemTheme The system theme, e.g. `"dark"`.
  * @returns The mode to apply on the next click, e.g. `"light"`.
  */
-export function nextThemeMode(mode: ThemeMode, resolvedTheme?: string): ThemeMode {
+export function nextThemeMode(mode: ThemeMode, systemTheme?: string): ThemeMode {
   const cycle: Record<ThemeMode, ThemeMode> = {
     system: "dark",
     dark: "light",
     light: "system",
   };
   const next = cycle[mode];
-  if (resolvedTheme && next !== "system" && next === resolvedTheme) {
+  if (systemTheme && next !== "system" && next === systemTheme) {
     return cycle[next];
   }
   return next;
