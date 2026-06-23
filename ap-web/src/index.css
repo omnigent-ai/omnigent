@@ -463,6 +463,19 @@
     padding-bottom: calc(0.35rem + env(safe-area-inset-bottom, 0px));
   }
 
+  /* Reserve room for the native Liquid Glass switcher that floats over the web
+     view (the in-page pill is suppressed in the iOS shell). Fixed height: the
+     bar's footprint above the home-indicator inset (env). Chat sits 1rem
+     tighter — its composer status line already cushions the gap to the bar. */
+  [data-ios-native] .omnigent-native-bottom-spacer {
+    height: calc(3rem + env(safe-area-inset-bottom, 0px));
+    flex: none;
+  }
+
+  [data-ios-native] .omnigent-native-bottom-spacer--chat {
+    height: calc(2rem + env(safe-area-inset-bottom, 0px));
+  }
+
   [data-ios-native] .terminal-first-switcher {
     min-height: 46px;
     gap: 0.25rem;

@@ -1,32 +1,27 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 import { isIOSShell, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
 
 /**
- * Drive the iOS shell's native server switcher overlay so it shows only while
- * `surface` is the frontmost element on screen and `active` is true. The
- * switcher is a native chrome element the web app toggles via the bridge; it
- * must hide whenever the sidebar (or any other overlay) covers the main
- * surface, and whenever the surface is unmounted.
- *
- * No-ops outside the iOS shell. Used by both the in-session main surface
- * (ChatPage) and the new-session landing screen (NewChatDialog).
+ * Tracks whether `surface` is the frontmost element at its own centre — i.e.
+ * not covered by a drawer / sidebar / sheet. Returns false when inactive,
+ * outside the iOS shell, or while obscured. Re-checks on the layout signals a
+ * drawer transition emits (mutations, transitions, viewport changes). Both the
+ * native server switcher and the native Chat/Terminal bar hide off this signal
+ * so neither floats over an opened panel.
  */
-export function useNativeServerSwitcherForMainSurface(
-  surface: HTMLElement | null,
-  active: boolean,
-) {
+export function useSurfaceFrontmost(surface: HTMLElement | null, active: boolean): boolean {
+  const [frontmost, setFrontmost] = useState(false);
   useEffect(() => {
-    if (!isIOSShell()) return;
-    if (!active) {
-      setNativeServerSwitcherHidden(true);
+    if (!isIOSShell() || !active) {
+      setFrontmost(false);
       return;
     }
 
     let frame = 0;
     const sync = () => {
       frame = 0;
-      setNativeServerSwitcherHidden(!isSurfaceFrontmost(surface));
+      setFrontmost(isSurfaceFrontmost(surface));
     };
     const schedule = () => {
       if (frame !== 0) cancelAnimationFrame(frame);
@@ -66,9 +61,35 @@ export function useNativeServerSwitcherForMainSurface(
       window.removeEventListener("focusout", schedule, true);
       window.visualViewport?.removeEventListener("resize", schedule);
       window.visualViewport?.removeEventListener("scroll", schedule);
-      setNativeServerSwitcherHidden(true);
+      setFrontmost(false);
     };
   }, [active, surface]);
+  return frontmost;
+}
+
+/**
+ * Drive the iOS shell's native server switcher overlay so it shows only while
+ * `surface` is the frontmost element on screen and `active` is true. The
+ * switcher is a native chrome element the web app toggles via the bridge; it
+ * must hide whenever the sidebar (or any other overlay) covers the main
+ * surface, and whenever the surface is unmounted.
+ *
+ * No-ops outside the iOS shell. Used by both the in-session main surface
+ * (ChatPage) and the new-session landing screen (NewChatDialog).
+ */
+export function useNativeServerSwitcherForMainSurface(
+  surface: HTMLElement | null,
+  active: boolean,
+) {
+  const frontmost = useSurfaceFrontmost(surface, active);
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    setNativeServerSwitcherHidden(!frontmost);
+  }, [frontmost]);
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    return () => setNativeServerSwitcherHidden(true);
+  }, []);
 }
 
 function isSurfaceFrontmost(surface: HTMLElement | null): boolean {
@@ -81,7 +102,25 @@ function isSurfaceFrontmost(surface: HTMLElement | null): boolean {
   const x = clamp(window.innerWidth / 2, rect.left + xInset, rect.right - xInset);
   const y = clamp(rect.top + rect.height * 0.38, rect.top + yInset, rect.bottom - yInset);
   const topElement = document.elementFromPoint(x, y);
-  return topElement !== null && surface.contains(topElement);
+
+  // A Radix dropdown / select / popover sets `pointer-events: none` on the body
+  // while open WITHOUT covering the surface, so elementFromPoint falls through
+  // to the document root (or null). That's a transient layer, not a panel —
+  // keep the surface "frontmost" so the native overlays don't blink out.
+  if (!topElement || topElement === document.documentElement || topElement === document.body) {
+    return true;
+  }
+  // Likewise if a popover/menu/listbox actually covers the probe point: those
+  // are transient, unlike a persistent drawer/sidebar/sheet.
+  if (
+    topElement.closest(
+      '[data-radix-popper-content-wrapper], [role="menu"], [role="listbox"], [role="tooltip"]',
+    )
+  ) {
+    return true;
+  }
+
+  return surface.contains(topElement);
 }
 
 function clamp(value: number, min: number, max: number): number {
