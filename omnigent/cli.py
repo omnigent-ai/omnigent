@@ -1168,6 +1168,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "debby",
         "debug",
         "host",
+        "import",
         "lakebox",
         "login",
         "pane-picker",
@@ -9693,6 +9694,137 @@ if _sandbox_providers():
 #
 # ``migrate-accounts-to-oidc`` remaps user identities when switching the
 # built-in accounts provider to OIDC.
+
+
+@cli.command("import")
+@click.argument("harness", metavar="HARNESS")
+@click.option(
+    "--file",
+    "file_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Import a single transcript file by path.",
+)
+@click.option(
+    "--session",
+    "session_id",
+    default=None,
+    help="Import the transcript for one harness-native session id.",
+)
+@click.option(
+    "--all",
+    "import_all_flag",
+    is_flag=True,
+    default=False,
+    help="Import every discovered transcript under the root.",
+)
+@click.option(
+    "--root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Transcript root directory (default: the harness's standard location).",
+)
+@click.option(
+    "--database-uri",
+    default=None,
+    help="Database URI for the conversation store.  [default: sqlite at <data-dir>/chat.db]",
+)
+@click.option(
+    "-c",
+    "--config",
+    "config_path",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to a config file (its database_uri is used when --database-uri is omitted).",
+)
+def import_chats(
+    harness: str,
+    file_path: Path | None,
+    session_id: str | None,
+    import_all_flag: bool,
+    root: Path | None,
+    database_uri: str | None,
+    config_path: str | None,
+) -> None:
+    """Import existing chats from an external harness into an Omnigent store.
+
+    HARNESS is the source harness, e.g. ``claude_code`` or ``codex``.
+
+    Specify exactly one of ``--file``, ``--session``, or ``--all`` to select
+    what to import. Each imported chat becomes an (agentless) conversation
+    labeled ``imported_from=<harness>``; the new conversation ids are printed.
+
+    \b
+    Examples:
+      omnigent import claude_code --all
+      omnigent import codex --session 019e9906-05c5-7a50-910b-cc518d8a4c67
+      omnigent import claude_code --file ~/.claude/projects/foo/<id>.jsonl
+    """
+    import datetime
+
+    from omnigent.importers import available_harnesses, get_adapter, persist_transcript
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    try:
+        adapter = get_adapter(harness)
+    except KeyError:
+        raise click.ClickException(
+            f"unknown harness {harness!r}; available: {', '.join(available_harnesses())}"
+        ) from None
+
+    selectors = [bool(file_path), bool(session_id), import_all_flag]
+    if sum(selectors) != 1:
+        raise click.ClickException("Specify exactly one of --file, --session, or --all.")
+
+    discovery_root = root if root is not None else adapter.default_root()
+
+    paths: list[Path]
+    if file_path is not None:
+        paths = [file_path]
+    elif session_id is not None:
+        matches = [ref for ref in adapter.discover(discovery_root) if ref.session_id == session_id]
+        if not matches:
+            raise click.ClickException(
+                f"no {harness} transcript with session id {session_id!r} found under "
+                f"{discovery_root}"
+            )
+        paths = [ref.path for ref in matches]
+    else:
+        paths = [ref.path for ref in adapter.discover(discovery_root)]
+        if not paths:
+            click.echo(f"No {harness} transcripts found under {discovery_root}.")
+            return
+
+    cfg = _load_config(config_path)
+    db_uri = database_uri or cfg.get("database_uri", _default_db_uri())
+    _ensure_sqlite_parent_dir(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+
+    imported = 0
+    skipped = 0
+    for path in paths:
+        parsed = adapter.parse(path)
+        if not parsed.items:
+            skipped += 1
+            click.echo(f"Skipped {path}: no importable conversation items.", err=True)
+            continue
+        conversation_id = persist_transcript(store, adapter.harness_name, parsed)
+        imported += 1
+        when = (
+            datetime.datetime.fromtimestamp(parsed.created_at, tz=datetime.timezone.utc)
+            .date()
+            .isoformat()
+            if parsed.created_at is not None
+            else "unknown date"
+        )
+        click.echo(f"{conversation_id}  [{when}]  {parsed.title or '(untitled)'}")
+
+    summary = f"Imported {imported} {harness} conversation(s) into {db_uri}."
+    if skipped:
+        summary += f" Skipped {skipped} empty transcript(s)."
+    click.echo(summary)
 
 
 @cli.group("debug")

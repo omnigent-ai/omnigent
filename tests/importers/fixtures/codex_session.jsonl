@@ -1,0 +1,11 @@
+{"timestamp": "2026-05-20T01:14:44.054Z", "type": "session_meta", "payload": {"id": "019e42f3-07d6-7c83-b04d-caee8078cf51", "cwd": "/home/me/project", "model_provider": "ucode-databricks", "timestamp": "2026-05-20T01:14:44.054Z", "git": {"branch": "main", "commit_hash": "abc123", "repository_url": "git@example.com:me/project.git"}}}
+{"timestamp": "2026-05-20T01:14:44.100Z", "type": "turn_context", "payload": {"model": "gpt-5.5", "effort": "high", "cwd": "/home/me/project"}}
+{"timestamp": "2026-05-20T01:14:44.200Z", "type": "response_item", "payload": {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are operating in a sandbox. Follow the rules."}]}}
+{"timestamp": "2026-05-20T01:14:44.300Z", "type": "event_msg", "payload": {"type": "task_started"}}
+{"timestamp": "2026-05-20T01:14:45.000Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Refactor the parser"}]}}
+{"timestamp": "2026-05-20T01:14:46.000Z", "type": "response_item", "payload": {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Plan: locate the parser, then refactor."}], "encrypted_content": "enc-xyz"}}
+{"timestamp": "2026-05-20T01:14:47.000Z", "type": "response_item", "payload": {"type": "function_call", "name": "shell", "arguments": "{\"command\":\"ls\"}", "call_id": "call_1"}}
+{"timestamp": "2026-05-20T01:14:48.000Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "call_1", "output": "parser.py\nmain.py"}}
+{"timestamp": "2026-05-20T01:14:49.000Z", "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "I'll edit parser.py now."}]}}
+{"timestamp": "2026-05-20T01:14:50.000Z", "type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": "*** Begin Patch\n*** End Patch", "status": "completed", "call_id": "call_2"}}
+{"timestamp": "2026-05-20T01:14:51.000Z", "type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": "call_2", "output": "patch applied"}}
