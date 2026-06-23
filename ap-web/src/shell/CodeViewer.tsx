@@ -22,12 +22,15 @@ import {
   type RefObject,
 } from "react";
 import {
+  AtSignIcon,
   ChevronDownIcon,
   ChevronUpIcon,
   MessageSquarePlusIcon,
   SearchIcon,
   XIcon,
 } from "lucide-react";
+import { useChatStore } from "@/store/chatStore";
+import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { highlightCode } from "@/components/ai-elements/code-block";
 import ReactMarkdown from "react-markdown";
@@ -247,6 +250,15 @@ export function CodeViewer({
   // Only the Shiki DOM path needs the per-line split; skip it in Monaco mode.
   const rawLines = useMemo(() => (showMonaco ? [] : content.split("\n")), [content, showMonaco]);
 
+  // "Attach to agent" delivers a "[Attached: path:start-end]" marker the
+  // composer reads — only the native coding-agent harnesses act on it, so
+  // gate the button to them (same set as the "@"-mention feature).
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  // ``!!path`` mirrors the Monaco hook's guard: without it an empty path would
+  // emit a malformed ``[Attached: :start-end]`` marker. ``path`` is typed
+  // non-optional here, but the guard keeps the two surfaces in lockstep.
+  const canAttachToAgent = !!path && nativeCodingAgentForHarness(sessionHarness) !== undefined;
+
   // Kick off Shiki highlighting whenever content or language changes.
   useEffect(() => {
     if (showMonaco) return; // Monaco does its own highlighting.
@@ -387,16 +399,38 @@ export function CodeViewer({
     return () => container.removeEventListener("mouseup", handleMouseUp);
   }, [rawLines]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Dismiss the floating button on any mousedown outside of it.
+  // Dismiss the floating buttons on any mousedown outside of them, or on any
+  // scroll. Both the "Add comment" and "Attach to agent" buttons must be
+  // exempted from the mousedown dismiss — otherwise a click on "Attach to
+  // agent" clears the anchor and unmounts the portal before its own onClick
+  // runs. The buttons are ``position: fixed`` at captured viewport coords, so
+  // a scroll leaves them hovering over unrelated lines while the anchor's
+  // char offsets still point at the original selection; clear on scroll
+  // (capture phase, since scroll doesn't bubble) so a stale span can't be
+  // attached. Monaco does the equivalent via ``onDidScrollChange``.
   useEffect(() => {
     const handleMouseDown = (e: MouseEvent) => {
-      if (!(e.target as HTMLElement).closest("[data-add-comment-btn]")) {
+      if (
+        !(e.target as HTMLElement).closest("[data-add-comment-btn], [data-attach-agent-btn]")
+      ) {
         setSelectionAnchor(null);
       }
     };
+    const handleScroll = () => setSelectionAnchor(null);
     document.addEventListener("mousedown", handleMouseDown);
-    return () => document.removeEventListener("mousedown", handleMouseDown);
+    window.addEventListener("scroll", handleScroll, true);
+    return () => {
+      document.removeEventListener("mousedown", handleMouseDown);
+      window.removeEventListener("scroll", handleScroll, true);
+    };
   }, []);
+
+  // Switching renderer (Shiki↔Monaco), view mode (preview↔editor), or file
+  // invalidates the captured viewport coords + char offsets, so drop the
+  // floating buttons rather than re-render them at a stale position.
+  useEffect(() => {
+    setSelectionAnchor(null);
+  }, [showMonaco, viewMode, path]);
 
   // When Cmd/Ctrl+A selected the entire container, intercept the copy event
   // and write the raw file content so line numbers and flex-layout artifacts
@@ -736,32 +770,71 @@ export function CodeViewer({
         })}
       </div>
 
-      {/* Floating "Add Comment" button — rendered into document.body so that
+      {/* Floating selection actions — rendered into document.body so that
           CSS transforms on ancestor elements don't break fixed positioning. */}
       {selectionAnchor &&
         createPortal(
-          <button
-            data-add-comment-btn
-            type="button"
-            className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+          <div
+            className="fixed z-50 flex items-center gap-1"
             style={{
-              left: selectionAnchor.x,
+              // Clamp so the (one- or two-) button group can't clip off the
+              // right edge near the viewport boundary. Width is an estimate of
+              // the rendered buttons ("Add comment" ≈ 130px, + "Attach to
+              // agent" ≈ 150px).
+              left: Math.min(
+                selectionAnchor.x,
+                Math.max(8, window.innerWidth - (canAttachToAgent ? 288 : 138)),
+              ),
               top: selectionAnchor.y,
               transform: "translateY(-100%)",
             }}
-            onClick={() => {
-              onSetActiveSelection({
-                start_index: selectionAnchor.start_index,
-                end_index: selectionAnchor.end_index,
-                anchor_content: selectionAnchor.anchor_content,
-              });
-              setSelectionAnchor(null);
-              window.getSelection()?.removeAllRanges();
-            }}
           >
-            <MessageSquarePlusIcon className="size-3.5" />
-            Add comment
-          </button>,
+            <button
+              data-add-comment-btn
+              type="button"
+              className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+              onClick={() => {
+                onSetActiveSelection({
+                  start_index: selectionAnchor.start_index,
+                  end_index: selectionAnchor.end_index,
+                  anchor_content: selectionAnchor.anchor_content,
+                });
+                setSelectionAnchor(null);
+                window.getSelection()?.removeAllRanges();
+              }}
+            >
+              <MessageSquarePlusIcon className="size-3.5" />
+              Add comment
+            </button>
+            {canAttachToAgent && (
+              <button
+                data-attach-agent-btn
+                type="button"
+                className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+                onClick={() => {
+                  // Convert the selection's char offsets to a 1-based inclusive
+                  // line span. ``end_index`` is exclusive, so step back one char
+                  // (clamped) before mapping so a trailing newline doesn't bleed
+                  // into the next line.
+                  const startLine = indexToLine(selectionAnchor.start_index, rawLines);
+                  const endLine = indexToLine(
+                    Math.max(selectionAnchor.start_index, selectionAnchor.end_index - 1),
+                    rawLines,
+                  );
+                  useChatStore.getState().addComposerAttachment({
+                    path,
+                    isDir: false,
+                    lineRange: { start: startLine, end: endLine },
+                  });
+                  setSelectionAnchor(null);
+                  window.getSelection()?.removeAllRanges();
+                }}
+              >
+                <AtSignIcon className="size-3.5" />
+                Attach to agent
+              </button>
+            )}
+          </div>,
           getEmbedRoot() ?? document.body,
         )}
     </>

@@ -114,3 +114,32 @@ describe("AssistantBubble lifecycle rendering", () => {
     expect(screen.queryByTestId("assistant-interrupted-indicator")).toBeNull();
   });
 });
+
+describe("UserBubble @-mention attachment chips", () => {
+  it("shows file and folder chips from [Attached: …] markers and hides the markers", () => {
+    renderBubble(
+      userBubble(
+        "[Attached: src/server.ts]\n[Attached: docs/]\n\nsummarize these",
+      ),
+    );
+
+    // The marker paths surface as chips (folder keeps its trailing slash)...
+    expect(screen.getByText("@src/server.ts")).toBeInTheDocument();
+    expect(screen.getByText("@docs/")).toBeInTheDocument();
+    // ...while the raw "[Attached: …]" marker text is stripped from the body.
+    expect(screen.queryByText(/\[Attached:/)).toBeNull();
+    expect(screen.getByText("summarize these")).toBeInTheDocument();
+  });
+
+  it("renders chips for the codex 'Attached file:' wording too", () => {
+    renderBubble(userBubble("[Attached file: src/a.ts]\n\ncheck this"));
+    expect(screen.getByText("@src/a.ts")).toBeInTheDocument();
+    expect(screen.queryByText(/\[Attached/)).toBeNull();
+  });
+
+  it("shows the line span of a partial-file attach in its own (non-truncating) node", () => {
+    renderBubble(userBubble("[Attached: bob-max-gain/docker-compose.yml:2-9]\n\nreview"));
+    expect(screen.getByText("@bob-max-gain/docker-compose.yml")).toBeInTheDocument();
+    expect(screen.getByText(":2-9")).toBeInTheDocument();
+  });
+});
