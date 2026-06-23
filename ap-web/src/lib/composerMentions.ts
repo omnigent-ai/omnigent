@@ -90,3 +90,49 @@ export function mentionMarkerFor(harness: string | null, path: string): string {
   const isCodex = nativeCodingAgentForHarness(harness)?.key === "codex";
   return isCodex ? `[Attached file: ${path}]` : `[Attached: ${path}]`;
 }
+
+/** Default cap on how many mention rows the menu renders for one directory. */
+export const MENTION_MATCH_CAP = 50;
+
+/**
+ * Split a mention query into the directory being browsed and the filter typed
+ * within it. ``"src/fo"`` → browse ``"src"``, filter ``"fo"``; ``"src/"`` →
+ * browse ``"src"``, no filter; ``"fo"`` → browse root (``""``), filter ``"fo"``.
+ */
+export function parseMentionToken(query: string): { dir: string; filter: string } {
+  const slash = query.lastIndexOf("/");
+  return slash >= 0
+    ? { dir: query.slice(0, slash), filter: query.slice(slash + 1) }
+    : { dir: "", filter: query };
+}
+
+/**
+ * Filter a directory's entries by the typed segment, sort folders-first then
+ * alphabetically, and cap the list. Generic over any ``{ name, type }`` row so
+ * both the workspace-API and host-filesystem sources share one ranking. The cap
+ * trims only the rendered *list*, never what gets delivered.
+ */
+export function rankMentionEntries<T extends { name: string; type: string }>(
+  entries: T[],
+  filter: string,
+  cap: number = MENTION_MATCH_CAP,
+): T[] {
+  const needle = filter.toLowerCase();
+  return entries
+    .filter((e) => e.name.toLowerCase().includes(needle))
+    .sort((a, b) => {
+      if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    })
+    .slice(0, cap);
+}
+
+/**
+ * Assemble the attachment preamble prepended to an outgoing message: one
+ * harness-aware marker per tagged item, on its own line, terminated by a blank
+ * line. Returns ``""`` when nothing is tagged.
+ */
+export function buildMentionPreamble(items: MentionItem[], harness: string | null): string {
+  if (items.length === 0) return "";
+  return items.map((it) => mentionMarkerFor(harness, mentionItemPath(it))).join("\n") + "\n\n";
+}
