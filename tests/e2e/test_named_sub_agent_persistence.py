@@ -74,7 +74,21 @@ from tests.e2e.helpers import POLL_INTERVAL_S
 # thread default protects, because these tests block only in
 # main-thread httpx polls, so the worker survives and fixtures tear
 # down on a genuine timeout.
-pytestmark = pytest.mark.timeout(600, method="signal")
+# These sub-agent tests drive each child agent through per-sub-agent mock-LLM
+# routing — every child runs on its own mock model and auth.base_url. A server
+# < 0.3.0 does not propagate the sub-agent executor's mock base_url (fixed in
+# #779, which added auth to the inner ExecutorSpec; it landed ~2h after v0.2.0
+# was tagged, so v0.2.0 just missed it), so the child harness reaches the real
+# gateway and its mock-only model name is rejected (HTTP 400); the child returns
+# nothing, so the parent's auto-wake has nothing to surface. Verified against a
+# v0.2.0 server: the child 400s on the real gateway while auto-wake itself works
+# (waiting downgraded, no 500). This is a mock-LLM test-infrastructure gap, not
+# a product regression. The backwards-compat matrix skips these against servers
+# < 0.3.0 via min_server_version; they run unchanged on main and in the gate.
+pytestmark = [
+    pytest.mark.timeout(600, method="signal"),
+    pytest.mark.min_server_version("0.3.0"),
+]
 
 _FIXTURES_DIR = Path(__file__).resolve().parents[1] / "_fixtures" / "agents"
 _NAMED_FIXTURE = _FIXTURES_DIR / "named-sub-agent-test"

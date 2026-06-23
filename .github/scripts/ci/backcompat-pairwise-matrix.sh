@@ -3,7 +3,9 @@
 # $GITHUB_OUTPUT as `e2e_matrix` and `integration_matrix`.
 #
 # The version universe is `main` (the checked-out code = client + tests, always)
-# plus every non-rc release tag. We cross every server version with every runner
+# plus every non-rc release tag AT OR ABOVE the backcompat floor (MIN_VERSION,
+# default 0.2.0 — the first release with the mock-LLM e2e infra; see below).
+# We cross every server version with every runner
 # version — each cell pins the server and/or runner subprocess to that build
 # (an empty/"main" value leaves that component on the checked-out code). The
 # (main, main) cell is omitted: it pins nothing and is exactly the normal e2e
@@ -27,6 +29,30 @@ _valid_version() {
   [ "$1" = "main" ] || [[ "$1" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([a-z0-9.]*)?$ ]]
 }
 
+# Minimum release the backcompat matrix tests against. v0.2.0 is the first
+# release with the mock-LLM e2e infrastructure (tests/e2e/conftest.py has 0
+# mock-LLM refs at v0.1.x, 31 at v0.2.0) AND the runner-side harness mock
+# routing — empirically, main's mock-based e2e suite 401s ("Incorrect API key
+# provided: mock-key") against v0.1.0/v0.1.1 server+runner builds, so those
+# pairs are guaranteed-red infrastructure mismatch, not a compat signal.
+# `main` is the dev tip and always sorts above any release, so it is never
+# floored. Override with BACKCOMPAT_MIN_VERSION (e.g. "0.0.0" to disable).
+# Strip a leading "v" so a "v0.2.0"-style override compares cleanly against the
+# v-stripped tags in _below_floor (without this, the floor version itself would
+# be dropped).
+MIN_VERSION="${BACKCOMPAT_MIN_VERSION:-0.2.0}"
+MIN_VERSION="${MIN_VERSION#v}"
+
+# True (0) when release tag $1 is older than MIN_VERSION (by PEP-440-ish release
+# order). "main" is never below the floor. Compares the numeric tuple via
+# `sort -V` after stripping the leading "v".
+_below_floor() {
+  [ "$1" = "main" ] && return 1
+  local v="${1#v}"
+  [ "$v" = "$MIN_VERSION" ] && return 1
+  [ "$(printf '%s\n%s\n' "$v" "$MIN_VERSION" | sort -V | head -1)" = "$v" ]
+}
+
 raw=()
 if [ -n "${VERSIONS:-}" ]; then
   IFS=',' read -ra raw <<<"$VERSIONS"
@@ -37,7 +63,7 @@ else
   while IFS= read -r tag; do raw+=("$tag"); done < <(git tag --sort=-v:refname | grep -viE '(^|[^a-z])rc[0-9]')
 fi
 
-# Trim whitespace, drop blanks, reject invalid tokens.
+# Trim whitespace, drop blanks, reject invalid tokens, drop below-floor releases.
 V=()
 for v in "${raw[@]}"; do
   v="${v#"${v%%[![:space:]]*}"}"
@@ -45,6 +71,10 @@ for v in "${raw[@]}"; do
   [ -z "$v" ] && continue
   if ! _valid_version "$v"; then
     echo "skipping invalid version token: '$v'" >&2
+    continue
+  fi
+  if _below_floor "$v"; then
+    echo "skipping '$v': below backcompat floor $MIN_VERSION (predates the mock-LLM e2e infra)" >&2
     continue
   fi
   V+=("$v")
