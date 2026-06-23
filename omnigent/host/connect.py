@@ -282,6 +282,12 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Testing knob: override the context window size for compaction
         # trigger threshold. Not a secret — a plain integer.
         "AP_CONTEXT_WINDOW_OVERRIDE",
+        # Host-level Claude Code wrapper command (e.g. Databricks' ``isaac``,
+        # ``dbexec repo run isaac``). The native runner launches this instead
+        # of bare ``claude`` when set; see runner.app._resolve_claude_native_command.
+        # A command string naming a host-local executable, not a secret —
+        # must reach the host-spawned runner or the override has no effect.
+        "OMNIGENT_CLAUDE_NATIVE_COMMAND",
     }
 )
 # Locale family (``LC_ALL``, ``LC_CTYPE``, …) — allowed by prefix.

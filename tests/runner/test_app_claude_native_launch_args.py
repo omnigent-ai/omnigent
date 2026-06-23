@@ -14,7 +14,12 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.runner.app import _build_claude_native_base_args
+from omnigent.runner.app import (
+    _CLAUDE_NATIVE_COMMAND_ENV_VAR,
+    _build_claude_native_base_args,
+    _compose_native_launch,
+    _resolve_claude_native_command,
+)
 
 
 @pytest.mark.parametrize(
@@ -139,3 +144,73 @@ def test_build_claude_native_base_args_resume_prefix(
         )
         == expected
     )
+
+
+class TestResolveClaudeNativeCommand:
+    """Host-level Claude Code wrapper resolution for the native runner.
+
+    ``_resolve_claude_native_command`` reads ``OMNIGENT_CLAUDE_NATIVE_COMMAND``
+    and decides what the host-spawned runner launches: the configured wrapper
+    (so e.g. Databricks' ``isaac`` layers its config/auth on top of Claude
+    Code), or bare ``claude`` when the var is unset/empty/malformed or its
+    executable is missing on the runner host. The fallback must be silent-safe
+    (never raise) so a misconfigured host still launches Claude.
+    """
+
+    def test_unset_falls_back_to_claude(self, monkeypatch):
+        monkeypatch.delenv(_CLAUDE_NATIVE_COMMAND_ENV_VAR, raising=False)
+        assert _resolve_claude_native_command() == ["claude"]
+
+    def test_blank_falls_back_to_claude(self, monkeypatch):
+        monkeypatch.setenv(_CLAUDE_NATIVE_COMMAND_ENV_VAR, "   ")
+        assert _resolve_claude_native_command() == ["claude"]
+
+    def test_multi_token_wrapper_split_into_argv(self, monkeypatch):
+        # The Databricks case: a multi-token launcher. Only argv[0] is
+        # checked against PATH; the trailing tokens are the wrapper's fixed
+        # leading args, preserved in order for the caller to prepend.
+        monkeypatch.setenv(_CLAUDE_NATIVE_COMMAND_ENV_VAR, "dbexec repo run isaac")
+        monkeypatch.setattr(
+            "omnigent.runner.app.shutil.which",
+            lambda exe: "/usr/local/bin/dbexec" if exe == "dbexec" else None,
+        )
+        assert _resolve_claude_native_command() == ["dbexec", "repo", "run", "isaac"]
+
+    def test_missing_executable_falls_back_to_claude(self, monkeypatch):
+        monkeypatch.setenv(_CLAUDE_NATIVE_COMMAND_ENV_VAR, "isaac")
+        monkeypatch.setattr("omnigent.runner.app.shutil.which", lambda exe: None)
+        assert _resolve_claude_native_command() == ["claude"]
+
+    def test_malformed_quoting_falls_back_to_claude(self, monkeypatch):
+        # Unbalanced quotes make shlex.split raise; the resolver must
+        # swallow it and fall back rather than crash the launch.
+        monkeypatch.setenv(_CLAUDE_NATIVE_COMMAND_ENV_VAR, 'isaac "unterminated')
+        assert _resolve_claude_native_command() == ["claude"]
+
+
+class TestComposeNativeLaunch:
+    """Terminal (command, args) assembly for a (wrapper, claude-args) pair.
+
+    The wrapper argv must lead and the Claude args must follow intact — that
+    ordering is what keeps Omnigent's appended args (bundle --plugin-dir,
+    permission hooks, the session bridge) reaching Claude so the session binds.
+    A silent reorder or drop here would break the integration without failing
+    the resolver's own tests.
+    """
+
+    def test_no_override_runs_claude_with_args_unchanged(self):
+        assert _compose_native_launch(["claude"], ["--foo", "--bar"]) == (
+            "claude",
+            ["--foo", "--bar"],
+        )
+
+    def test_wrapper_leads_and_claude_args_follow_in_order(self):
+        assert _compose_native_launch(
+            ["dbexec", "repo", "run", "isaac"], ["--plugin-dir", "/b", "--resume", "x"]
+        ) == ("dbexec", ["repo", "run", "isaac", "--plugin-dir", "/b", "--resume", "x"])
+
+    def test_no_claude_args(self):
+        assert _compose_native_launch(["dbexec", "repo", "run", "isaac"], []) == (
+            "dbexec",
+            ["repo", "run", "isaac"],
+        )

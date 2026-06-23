@@ -15,6 +15,8 @@ import json
 import logging
 import mimetypes
 import os
+import shlex
+import shutil
 import sys
 import tempfile
 import time
@@ -76,6 +78,103 @@ from omnigent.tools.builtins.load_skill import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+# Host-level override for the Claude Code executable the native runner
+# launches. Set it to a transparent wrapper that preserves Claude Code's CLI
+# interface (forwards the args + env it is given, then exec's ``claude``) —
+# e.g. Databricks' ``isaac`` launcher, invoked as ``dbexec repo run isaac``,
+# which layers managed settings, MCP client config, model/account routing,
+# and plugin management on top of upstream Claude Code. Auth and that config
+# are the wrapper's responsibility, not Omnigent's, so this is the only way a
+# host-spawned (``--server``) session can run through such a wrapper: the
+# remote path resolves credentials from provider config and otherwise launches
+# bare ``claude``.
+#
+# The value is a shell token string (shlex-split into argv); ``argv[0]`` is the
+# executable — a bare name resolved on the runner host's PATH, or an absolute /
+# relative path. The wrapper must forward the trailing ``claude`` args/env
+# Omnigent appends (bundle ``--plugin-dir``, permission hooks, the session
+# bridge), or the session won't bind to the web UI. Propagated host -> runner
+# via ``_RUNNER_ENV_ALLOWLIST``.
+#
+# Resolution is a best-effort *pre-check* against the runner process's PATH. For
+# the host-spawned terminal it launches (``os_env.type == "caller_process"``)
+# the launch shares that PATH, so the check is accurate. It is NOT a guarantee
+# across every launch environment: if a sandboxed launch (e.g. ``linux_bwrap``)
+# can't see an executable the runner PATH resolved, the override is still used
+# and terminal creation fails there rather than falling back to ``claude``. The
+# fallback covers misconfiguration the runner can observe (unset / malformed /
+# not on its own PATH), not sandbox-visibility mismatches.
+_CLAUDE_NATIVE_COMMAND_ENV_VAR = "OMNIGENT_CLAUDE_NATIVE_COMMAND"
+
+
+def _resolve_claude_native_command() -> list[str]:
+    """Resolve the Claude Code launch command for the host-spawned runner.
+
+    Reads :data:`_CLAUDE_NATIVE_COMMAND_ENV_VAR`. When it names a wrapper
+    resolvable on the runner process's PATH (a best-effort pre-check — see the
+    module-level note on sandbox-visibility limits), returns its argv so the
+    runner launches the wrapper instead of bare ``claude``. Falls back to
+    ``["claude"]`` when the var is unset/empty (the normal default, no warning),
+    or — with a warning — when it is malformed or its executable is not found on
+    the runner PATH.
+
+    :returns: argv whose head is the executable and whose tail is the
+        wrapper's fixed leading args (e.g. ``["dbexec", "repo", "run",
+        "isaac"]``). The caller appends the resolved ``claude`` args.
+    """
+    raw = os.environ.get(_CLAUDE_NATIVE_COMMAND_ENV_VAR, "").strip()
+    if not raw:
+        return ["claude"]
+    try:
+        argv = shlex.split(raw)
+    except ValueError as exc:
+        _logger.warning(
+            "%s=%r could not be parsed as a command (%s); launching 'claude' directly.",
+            _CLAUDE_NATIVE_COMMAND_ENV_VAR,
+            raw,
+            exc,
+        )
+        return ["claude"]
+    if not argv:
+        _logger.warning(
+            "%s=%r is empty after parsing; launching 'claude' directly.",
+            _CLAUDE_NATIVE_COMMAND_ENV_VAR,
+            raw,
+        )
+        return ["claude"]
+    if shutil.which(argv[0]) is None:
+        _logger.warning(
+            "%s=%r: %r not found on the runner host PATH; launching 'claude' directly.",
+            _CLAUDE_NATIVE_COMMAND_ENV_VAR,
+            raw,
+            argv[0],
+        )
+        return ["claude"]
+    _logger.info("Claude native command override active: launching via %s", argv)
+    return argv
+
+
+def _compose_native_launch(
+    native_command: list[str], claude_args: list[str]
+) -> tuple[str, list[str]]:
+    """Assemble the terminal ``(command, args)`` for a (wrapper, claude) pair.
+
+    The wrapper argv leads and the ``claude`` args follow, so a wrapper like
+    ``["dbexec", "repo", "run", "isaac"]`` runs as
+    ``dbexec repo run isaac <claude args>``. Ordering matters: Omnigent's
+    appended args (bundle ``--plugin-dir``, permission hooks, the session
+    bridge) must reach Claude intact for the session to bind, and the wrapper
+    must come first so it, not Claude, is the process the runner launches. With
+    the no-override default (``["claude"]``) this yields ``("claude", claude_args)``.
+
+    :param native_command: Resolved wrapper argv (head is the executable);
+        ``["claude"]`` when no override is configured.
+    :param claude_args: The fully-resolved ``claude`` CLI args to forward.
+    :returns: ``(command, args)`` for the terminal launch.
+    """
+    return native_command[0], [*native_command[1:], *claude_args]
 
 
 def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
@@ -2532,14 +2631,22 @@ async def _auto_create_claude_terminal(
     # and ``parent_os_env`` below, launch_terminal falls back to
     # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
     agent_os_env = _agent_os_env_from_spec(agent_spec)
+    # Optional host-level wrapper (e.g. Databricks' ``isaac``). When set, the
+    # runner launches ``<wrapper argv> <claude args>`` so the wrapper layers
+    # its config/auth on top while still forwarding the ``claude`` args
+    # Omnigent appends; unset/unresolvable falls back to bare ``claude``.
+    native_command = _resolve_claude_native_command()
+    native_terminal_command, native_terminal_args = _compose_native_launch(
+        native_command, list(claude_args)
+    )
     env_spec = TerminalEnvSpec(
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=workspace,
             sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
         ),
-        command="claude",
-        args=list(claude_args),
+        command=native_terminal_command,
+        args=native_terminal_args,
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
