@@ -78,6 +78,63 @@ from omnigent.tools.builtins.load_skill import (
 _logger = logging.getLogger(__name__)
 
 
+# ── session.status "waiting" backwards-compat (new runner ↔ old server) ──
+# The runner emits ``session.status: "waiting"`` when a turn ends with sub-agents
+# still running (PR #930, for the headless ``-p`` fast-exit). Servers older than
+# 0.3.0 don't model "waiting" — their ``SessionResponse.status`` is
+# ``Literal["idle","running","failed"]`` — and 500 on ``GET /v1/sessions`` when
+# they try to serialize the cached value. So the runner probes the server's
+# version once and downgrades "waiting"→"running" for older servers. ``None``
+# until probed; any probe failure leaves it falsey → downgrade (never 500s).
+_WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
+_server_supports_waiting_status: bool | None = None
+
+
+def _version_supports_waiting_status(server_version: str) -> bool:
+    """
+    Whether *server_version* can serialize ``session.status: "waiting"``.
+
+    :param server_version: The server's reported version, e.g. ``"0.2.0"`` or
+        ``"0.3.0.dev0"``.
+    :returns: ``True`` iff the server's PEP 440 release tuple is ``>= 0.3.0``
+        (the release that added "waiting" to the session-status model).
+    """
+    from packaging.version import Version
+
+    return Version(server_version).release >= Version(_WAITING_STATUS_MIN_SERVER_VERSION).release
+
+
+async def _ensure_server_waiting_support(server_client: httpx.AsyncClient) -> None:
+    """
+    Probe ``GET /api/version`` once; cache whether the server accepts "waiting".
+
+    Memoized — returns immediately once probed. Degrades to "unsupported" on any
+    error so the runner never emits a status an older server would 500 on.
+
+    :param server_client: The runner's httpx client pointed at the server.
+    """
+    global _server_supports_waiting_status
+    if _server_supports_waiting_status is not None:
+        return
+    try:
+        resp = await server_client.get("/api/version")
+        resp.raise_for_status()
+        version = resp.json()["version"]
+        _server_supports_waiting_status = _version_supports_waiting_status(version)
+        _logger.info(
+            "server version %s: session.status 'waiting' %s",
+            version,
+            "supported" if _server_supports_waiting_status else "downgraded to 'running'",
+        )
+    except Exception as exc:  # noqa: BLE001 — degrade gracefully; never 500 an old server
+        _server_supports_waiting_status = False
+        _logger.warning(
+            "could not probe server /api/version (%s); downgrading session.status "
+            "'waiting'->'running' for safety",
+            exc,
+        )
+
+
 def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     """
     Log *exc* in full and return a generic detail string safe for clients.
@@ -5351,6 +5408,12 @@ def create_runner_app(
                 },
             )
 
+        # Probe the server's version once so _publish_turn_status can downgrade
+        # session.status "waiting"->"running" for servers too old to accept it
+        # (< 0.3.0) — they'd otherwise 500 on GET /v1/sessions. Memoized; only
+        # the first session-create on this runner pays the cheap GET.
+        await _ensure_server_waiting_support(server_client)
+
         # Resolve the spec once — derive harness config from it and
         # cache it for resource endpoints (filesystem, terminals)
         # that may fire before the first turn dispatches.
@@ -6800,6 +6863,12 @@ def create_runner_app(
             ``None`` for ``running`` / ``idle``.
         :returns: None.
         """
+        # Backwards-compat: servers older than 0.3.0 can't serialize "waiting"
+        # and 500 on GET /v1/sessions, so downgrade it to "running" unless the
+        # server was positively probed as supporting it (see
+        # _ensure_server_waiting_support). None/False → downgrade (safe default).
+        if status == "waiting" and _server_supports_waiting_status is not True:
+            status = "running"
         # An unresolved spec (``_session_harness_name`` → ``None``) means the
         # session hasn't resolved a terminal-backed harness yet, so no native
         # observer is known and the turn lifecycle is still the only status
