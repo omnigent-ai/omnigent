@@ -732,6 +732,72 @@ def test_subscription_listing_is_static_and_unverified(
     assert "CLI login" in listing.note
 
 
+def test_cursor_native_listing_is_static_without_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """cursor-native yields a curated static list, not ``source="none"``.
+
+    Regression: cursor-native was absent from the provider-resolution map, so
+    ``sys_list_models`` reported ``source="none"`` even though the worker runs
+    fine. Its model set is config/SDK-determined (not auth-gated), so the row
+    must resolve to the curated static listing with NO cursor key configured —
+    here the isolated config has no ``providers:`` / cursor block at all.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+
+    spec = _worker_spec("cursor-native", model="gpt-5.5")
+    provider = resolve_model_provider(spec, "cursor-native")
+    assert provider.kind == "subscription"
+    assert provider.cli == "cursor"
+
+    listing = list_models_for_worker(spec, "cursor-native")
+    assert listing.source == "static"
+    assert listing.verified is False
+    ids = [m.id for m in listing.models]
+    # The pinned default survives the (multi-model) cursor family filter; the
+    # exact curated set is owned by _SUBSCRIPTION_STATIC_MODELS["cursor"].
+    assert "gpt-5.5" in ids
+
+
+def test_catalog_reports_cursor_subagent_as_static(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A polly-style parent with a cursor-native sub-agent gets a static row.
+
+    Exercises the full ``catalog_for_spec`` path the ``sys_list_models`` tool
+    dispatches, proving the cursor worker row is no longer ``"none"``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    parent = AgentSpec(
+        spec_version=1,
+        name="orchestrator",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        sub_agents=[
+            AgentSpec(
+                spec_version=1,
+                name="cursor",
+                executor=ExecutorSpec(
+                    type="omnigent",
+                    model="gpt-5.5",
+                    config={"harness": "cursor-native"},
+                ),
+            )
+        ],
+    )
+
+    catalog = catalog_for_spec(parent)
+
+    assert catalog["cursor"]["source"] == "static"
+    assert "gpt-5.5" in {m["id"] for m in catalog["cursor"]["models"]}
+
+
 def test_none_listing_explains_dead_worker(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
