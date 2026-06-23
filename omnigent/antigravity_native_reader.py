@@ -775,14 +775,19 @@ async def supervise_reader(
     and swallowed so a transient fault never kills the loop; the next poll
     recovers.
 
-    Task T-G ``/clear`` rotation: ALONGSIDE the stream/poll reader body, a
-    :func:`_watch_for_rotation` background task polls ``GetAllCascadeTrajectories``
-    every ``detect_rotation_interval_s`` (the stream is bound to one cascade and
-    cannot see a sibling). When it detects a newer-active root cascade (a TUI
-    ``/clear`` mints one), this function tears the reader body down cleanly and
-    RETURNS the new cascade id so :func:`run_reader_with_bridge` can rotate the
-    Omnigent session and rebind. When the body ends on its own (the ``stop``
-    predicate fired, or the stream+poll both exited), it returns ``None``.
+    Task T-G ``/clear`` rotation: the stream/poll reader body runs as a CANCELLABLE
+    task and, ALONGSIDE it, a :func:`_watch_for_rotation` background task polls
+    ``GetAllCascadeTrajectories`` every ``detect_rotation_interval_s`` (the stream
+    is bound to one cascade and cannot see a sibling). When it detects a
+    newer-active root cascade (a TUI ``/clear`` mints one) it records the new id and
+    CANCELS the body task — necessary because after a ``/clear`` the bound cascade
+    goes idle and the stream blocks inside a deadline-less ``aiter_bytes`` read,
+    where the cooperative ``stop`` checkpoint is never reached; cancellation
+    interrupts that wedged read. This function then RETURNS the new cascade id so
+    :func:`run_reader_with_bridge` can rotate the Omnigent session and rebind. When
+    the body ends on its own (the ``stop`` predicate fired, or the stream+poll both
+    exited) it returns ``None``; an EXTERNAL cancellation of this coroutine (no
+    rotation recorded) propagates rather than being mistaken for a rotation.
 
     :param bridge_dir: Native Antigravity bridge directory (identifies the
         session whose agy conversation to mirror).
@@ -828,39 +833,50 @@ async def supervise_reader(
 
     # Task T-G: the rotation detector records the new cascade id here and the
     # ``stop`` predicate the reader body consults flips to True so the body exits
-    # cleanly at its next checkpoint (between stream re-entries / poll iterations);
-    # a still-blocked stream is then cancelled below. One-shot per supervise_reader
-    # run — the caller rebinds with a fresh detector.
+    # cleanly at its next checkpoint (between stream re-entries / poll iterations).
+    # That checkpoint, however, is never reached while the stream is wedged on a
+    # deadline-less idle read (after a ``/clear`` the bound cascade goes IDLE and
+    # ``aiter_bytes`` blocks with no frame and no trailer), so the detector ALSO
+    # cancels the body task below — cancellation interrupts the wedged read where a
+    # cooperative ``stop`` re-check cannot. One-shot per supervise_reader run; the
+    # caller rebinds with a fresh detector.
     rotation_holder: list[str] = []
+
+    # The reader body runs as a cancellable task (created below) so a detected
+    # rotation can interrupt a stream blocked inside ``aiter_bytes`` — a plain
+    # ``await`` of the body would never return, since neither ``_stream_loop``'s
+    # outer ``while`` nor its post-``async for`` ``stop`` checkpoint is reached
+    # while the read is wedged. ``_on_rotation`` references the task through this
+    # holder so it is safe even though the task is created AFTER the detector's
+    # callback is defined (the detector cannot fire before its task is scheduled
+    # and runs its first ``await``, by which point ``body_holder`` is populated).
+    body_holder: list[asyncio.Task[None]] = []
 
     def _on_rotation(new_cascade_id: str) -> None:
         if not rotation_holder:
             rotation_holder.append(new_cascade_id)
+            # Interrupt a stream wedged on a deadline-less idle read; a cooperative
+            # ``_body_should_stop`` re-check would never run while it blocks.
+            if body_holder:
+                body_holder[0].cancel()
 
     def _body_should_stop() -> bool:
         # The reader body stops either on the caller's stop OR once a rotation was
-        # detected (so it does not keep mirroring the now-dead conversation).
+        # detected (so it does not keep mirroring the now-dead conversation). This
+        # covers the cooperative exits (between stream re-entries / poll iterations);
+        # a stream blocked mid-read is interrupted by ``_on_rotation``'s cancel.
         return should_stop() or bool(rotation_holder)
 
-    rotation_task = asyncio.create_task(
-        _watch_for_rotation(
-            port=port,
-            bound_cascade_id=cascade_id,
-            interval_s=detect_rotation_interval_s,
-            skip_cascade_ids=skip_cascade_ids,
-            on_rotation=_on_rotation,
-        ),
-        name="antigravity-rotation-detector",
-    )
-
-    # STREAM-primary (Task T-D): consume the connect server-stream for live
-    # ``output_text_delta`` typing parity. On a stream error (transport
-    # ``httpx.HTTPError`` or a connect-trailer ``AntigravityRpcError``) fall back
-    # to the committed-only poll loop — graceful degradation to Phase-1 behaviour
-    # — rather than letting the error kill the reader. The shared ``state`` makes
-    # the fallback idempotent against whatever the stream already delivered. Both
-    # paths consult ``_body_should_stop`` so a detected rotation ends them.
-    try:
+    async def _run_body() -> None:
+        # STREAM-primary (Task T-D): consume the connect server-stream for live
+        # ``output_text_delta`` typing parity. On a stream error (transport
+        # ``httpx.HTTPError`` or a connect-trailer ``AntigravityRpcError``) fall
+        # back to the committed-only poll loop — graceful degradation to Phase-1
+        # behaviour — rather than letting the error kill the reader. The shared
+        # ``state`` makes the fallback idempotent against whatever the stream
+        # already delivered. Both paths consult ``_body_should_stop`` so a detected
+        # rotation ends them cooperatively; a rotation that lands while the stream
+        # is blocked instead cancels this task.
         try:
             await _stream_loop(
                 port=port,
@@ -889,6 +905,33 @@ async def supervise_reader(
                 poll_interval_s=poll_interval_s,
                 stop=_body_should_stop,
             )
+
+    body_task = asyncio.create_task(_run_body(), name="antigravity-reader-body")
+    body_holder.append(body_task)
+
+    # Started AFTER ``body_task`` exists so ``_on_rotation`` can never fire before
+    # the task is available to cancel (the holder is already populated).
+    rotation_task = asyncio.create_task(
+        _watch_for_rotation(
+            port=port,
+            bound_cascade_id=cascade_id,
+            interval_s=detect_rotation_interval_s,
+            skip_cascade_ids=skip_cascade_ids,
+            on_rotation=_on_rotation,
+        ),
+        name="antigravity-rotation-detector",
+    )
+
+    try:
+        await body_task
+    except asyncio.CancelledError:
+        # A rotation cancels the body on purpose (``_on_rotation`` set
+        # ``rotation_holder`` before cancelling), so fall through to return the new
+        # cascade id. An EXTERNAL cancellation of ``supervise_reader`` (shutdown)
+        # arrives with NO rotation recorded — re-raise so it propagates rather than
+        # being swallowed as a phantom rotation.
+        if not rotation_holder:
+            raise
     finally:
         # Stop the rotation detector (it may still be sleeping between ticks) and
         # the off-loop interaction bridge before returning, so a cancelled/stopped
@@ -897,6 +940,14 @@ async def supervise_reader(
         rotation_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await rotation_task
+        # Ensure the body task is finalized on EVERY exit path (notably an external
+        # cancel, where ``await body_task`` re-raised above before it could be
+        # awaited to completion) so no task leaks. A rotation/normal exit leaves it
+        # already done, making this a no-op.
+        if not body_task.done():
+            body_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await body_task
         active = state.interaction_task
         if active is not None and not active.done():
             active.cancel()

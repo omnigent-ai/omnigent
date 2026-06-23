@@ -2140,6 +2140,13 @@ async def test_stream_reentry_backoff_between_clean_immediate_returns(
     to how many times ``stop`` is consulted per loop turn). Each backoff is gated
     on ``not stop()`` AFTER the stream returns, so the run records exactly one
     backoff per re-entry that is followed by another entry.
+
+    The reader body runs as a cancellable task alongside the rotation detector
+    (both share the ``_sleep`` seam), so the detector's own coarse interval sleep
+    can also be recorded before it is cancelled. That sleep is unrelated to the
+    busy-spin this test guards, so the recorded sleeps are filtered to the stream
+    re-entry backoff: the invariant is "no zero-delay re-POST", i.e. every re-entry
+    that precedes another entry paid exactly one backoff.
     """
     empty_stream = _FrameScript([])  # each entry yields no frames, returns at once
     backoff_sleeps: list[float] = []
@@ -2171,11 +2178,20 @@ async def test_stream_reentry_backoff_between_clean_immediate_returns(
     )
 
     # The stream was re-entered exactly target_entries times (no crash, no
-    # fallback to the poll loop), and every backoff recorded was the re-entry
-    # backoff — proving the loop did NOT busy-spin re-POSTing at zero delay, and
-    # that only the re-entry backoff (not the poll-interval sleep) ran.
+    # fallback to the poll loop). Filtering out the rotation detector's coarse
+    # interval sleep (it shares the ``_sleep`` seam), the re-entry backoffs are
+    # exactly the documented value — proving the loop did NOT busy-spin re-POSTing
+    # at zero delay, and that no poll-interval sleep ran. There is one backoff per
+    # re-entry that precedes another entry: target_entries - 1.
     assert empty_stream.calls == target_entries
-    assert backoff_sleeps and all(s == reader._STREAM_REENTRY_BACKOFF_S for s in backoff_sleeps)
+    reentry_backoffs = [s for s in backoff_sleeps if s == reader._STREAM_REENTRY_BACKOFF_S]
+    assert reentry_backoffs == [reader._STREAM_REENTRY_BACKOFF_S] * (target_entries - 1)
+    # No zero-delay re-POST and no unexpected poll-interval sleep crept in: every
+    # non-backoff sleep recorded is the rotation detector's coarse interval.
+    assert all(
+        s in (reader._STREAM_REENTRY_BACKOFF_S, reader._DEFAULT_ROTATION_INTERVAL_S)
+        for s in backoff_sleeps
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2704,3 +2720,138 @@ async def test_run_reader_with_bridge_keeps_old_binding_when_rotation_fails(
     assert len(supervise_calls) == 2
     assert supervise_calls[0] == (_SESSION_ID, frozenset())
     assert supervise_calls[1] == (_SESSION_ID, frozenset({failed_cascade}))
+
+
+class _BlockingStream:
+    """A ``stream_agent_state_updates`` that blocks forever after one frame.
+
+    Models the live deadlock shape: the connect stream long-polls inside a
+    deadline-less ``aiter_bytes`` read with no further frame and no trailer (after
+    a ``/clear`` the bound cascade goes idle). The generator awaits an
+    ``asyncio.Event`` that never fires, so the cooperative ``stop`` re-check the
+    body would do between stream re-entries / poll iterations is NEVER reached —
+    only cancellation can unwedge it. ``await``-ing the event (rather than a true
+    busy-hang) keeps the generator cancellable so the test can't actually hang.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.cancelled = False
+
+    def __call__(self, port: int, conversation_id: str) -> AsyncIterator[dict[str, object]]:
+        self.calls += 1
+
+        async def _gen() -> AsyncIterator[dict[str, object]]:
+            never = asyncio.Event()
+            try:
+                await never.wait()  # blocks until cancelled — never set
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            yield {}  # pragma: no cover  (unreachable; marks this an async gen)
+
+        return _gen()
+
+
+@pytest.mark.asyncio
+async def test_supervise_reader_actuates_rotation_when_stream_is_wedged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A rotation detected while the stream is BLOCKED still returns the new id.
+
+    Regression test for the T-G actuation deadlock: the stream blocks forever on a
+    deadline-less idle read (the live ``/clear``-then-idle shape), so the body's
+    cooperative ``_body_should_stop`` checkpoint is never reached. The rotation
+    detector must therefore CANCEL the wedged body task — not merely flip ``stop``
+    — so ``supervise_reader`` returns the new cascade id instead of hanging.
+
+    Before the fix this would hang (the body ``await``-ed the wedged stream
+    directly); the tight :func:`asyncio.wait_for` budget makes a regression fail
+    loudly as a timeout rather than wedging the suite. The poll fallback is never
+    reached (the stream never raises), so its step source is asserted untouched.
+    """
+    new_cascade = "deadlock-1111-2222-3333-444444444444"
+    blocking = _BlockingStream()
+    poll = _StepScript([[]])
+    monkeypatch.setattr(
+        reader, "get_all_cascade_trajectories", lambda port: _rotation_body(new_cascade)
+    )
+    monkeypatch.setattr(reader, "stream_agent_state_updates", blocking)
+    monkeypatch.setattr(reader, "get_trajectory_steps", poll)
+    monkeypatch.setattr(reader, "post_session_event_with_retry", _PostSink())
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    async def _noop_pending(_cid: str, _port: int, _pending: PendingInteraction) -> None:
+        return None
+
+    # No bounded ``stop``: the ONLY thing that can end this run is the rotation
+    # cancelling the wedged body. A tight timeout turns a regression (hang) into a
+    # loud failure instead of a stuck suite.
+    result = await asyncio.wait_for(
+        reader.supervise_reader(
+            _bridge_dir(tmp_path),
+            _SESSION_ID,
+            client=cast(httpx.AsyncClient, object()),
+            on_pending_interaction=cast(Any, _noop_pending),
+            poll_interval_s=0.0,
+            detect_rotation_interval_s=0.0,
+        ),
+        timeout=5,
+    )
+
+    assert result == new_cascade
+    # The wedged stream was interrupted by cancellation (the actuation path), and
+    # the poll fallback was never reached (the stream never errored).
+    assert blocking.cancelled is True
+    assert poll.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_supervise_reader_external_cancel_propagates_not_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """An external cancel of a wedged reader propagates — never a phantom rotation.
+
+    With NO rotation pending, cancelling the ``supervise_reader`` task (a shutdown)
+    must raise :class:`asyncio.CancelledError` out of it rather than being mistaken
+    for a rotation and returning a (non-existent) new cascade id. The autouse
+    ``no_rotation`` fixture keeps the detector quiet, so the only way the run ends
+    is the external cancel.
+    """
+    blocking = _BlockingStream()
+    monkeypatch.setattr(reader, "stream_agent_state_updates", blocking)
+    monkeypatch.setattr(reader, "get_trajectory_steps", _StepScript([[]]))
+    monkeypatch.setattr(reader, "post_session_event_with_retry", _PostSink())
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    async def _noop_pending(_cid: str, _port: int, _pending: PendingInteraction) -> None:
+        return None
+
+    task = asyncio.create_task(
+        reader.supervise_reader(
+            _bridge_dir(tmp_path),
+            _SESSION_ID,
+            client=cast(httpx.AsyncClient, object()),
+            on_pending_interaction=cast(Any, _noop_pending),
+            poll_interval_s=0.0,
+            detect_rotation_interval_s=0.0,
+        )
+    )
+    # Let the reader discover + start the body and wedge on the blocking stream.
+    while blocking.calls == 0:
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
