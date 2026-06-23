@@ -6371,3 +6371,48 @@ async def test_compaction_in_progress_does_not_persist(tmp_path: Path) -> None:
     assert request["body"]["data"]["status"] == "in_progress"
     # _persist_native_compaction_item must NOT be called for in_progress.
     persist_mock.assert_not_called()
+# _PostRetryTracker: bounded subagent_delivery_not_confirmed retries (L2)
+# ---------------------------------------------------------------------------
+
+
+def _http_status_error(status_code: int, body: object) -> httpx.HTTPStatusError:
+    """Build an httpx.HTTPStatusError whose response.json() returns `body`."""
+    request = httpx.Request("POST", "http://omnigent/v1/sessions/conv_x/events")
+    content = json.dumps(body).encode() if body is not None else b""
+    response = httpx.Response(status_code, request=request, content=content)
+    return httpx.HTTPStatusError("rejected", request=request, response=response)
+
+
+def test_subagent_delivery_not_confirmed_503_exhausts_after_budget() -> None:
+    tracker = forwarder._PostRetryTracker(max_not_confirmed_attempts=3)
+    exc = _http_status_error(503, {"error": "subagent_delivery_not_confirmed", "reason": "missing_work_entry"})
+    # Attempts 1 and 2 keep retrying...
+    assert tracker.record_failure("k", exc).exhausted is False
+    assert tracker.record_failure("k", exc).exhausted is False
+    # ...attempt 3 hits the not-confirmed budget and gives up.
+    assert tracker.record_failure("k", exc).exhausted is True
+
+
+def test_generic_503_without_not_confirmed_body_never_exhausts() -> None:
+    tracker = forwarder._PostRetryTracker(max_not_confirmed_attempts=3)
+    exc = _http_status_error(503, {"error": "internal_error"})
+    for _ in range(10):
+        assert tracker.record_failure("k", exc).exhausted is False
+
+
+def test_permanent_4xx_still_exhausts_at_three() -> None:
+    tracker = forwarder._PostRetryTracker(max_permanent_attempts=3)
+    exc = _http_status_error(400, {"error": "bad_request"})
+    assert tracker.record_failure("k", exc).exhausted is False
+    assert tracker.record_failure("k", exc).exhausted is False
+    assert tracker.record_failure("k", exc).exhausted is True
+
+
+def test_is_subagent_delivery_not_confirmed_classifier() -> None:
+    yes = _http_status_error(503, {"error": "subagent_delivery_not_confirmed"})
+    no_status = _http_status_error(500, {"error": "subagent_delivery_not_confirmed"})
+    no_body = _http_status_error(503, {"error": "something_else"})
+    assert forwarder._is_subagent_delivery_not_confirmed(yes) is True
+    assert forwarder._is_subagent_delivery_not_confirmed(no_status) is False
+    assert forwarder._is_subagent_delivery_not_confirmed(no_body) is False
+    assert forwarder._is_subagent_delivery_not_confirmed(httpx.ConnectError("boom")) is False
