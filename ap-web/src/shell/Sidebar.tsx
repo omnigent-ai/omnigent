@@ -81,6 +81,7 @@ import {
   computeNextActiveOverride,
   conversationDisplayLabel,
   normalizePinnedConversationIds,
+  orderByPinnedSequence,
   PINNED_CONVERSATION_IDS_STORAGE_KEY,
   sortByUpdatedAtDesc,
   togglePinnedConversationId,
@@ -507,9 +508,12 @@ function ConversationList({
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const sections = useMemo(() => {
     const allWithBackfill = [...allConversations, ...pinnedBackfill];
-    const pinned = sortByUpdatedAtDesc(
+    // Pinned rows are ordered strictly by when they were pinned (newest pin
+    // at the bottom), not by `updated_at` — a pinned session shouldn't jump
+    // when it gets a new message.
+    const pinned = orderByPinnedSequence(
       allWithBackfill.filter((c) => pinnedSet.has(c.id) && c.archived !== true),
-      activeOverride,
+      pinnedConversationIds,
     );
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
     const active = allConversations.filter((c) => !pinnedIdSet.has(c.id) && c.archived !== true);
@@ -523,7 +527,7 @@ function ConversationList({
       activeOverride,
     );
     return { pinned, sessions, shared, archived };
-  }, [allConversations, pinnedBackfill, pinnedSet, activeOverride]);
+  }, [allConversations, pinnedBackfill, pinnedSet, pinnedConversationIds, activeOverride]);
 
   // Collapsed section titles — persisted like pins so the preference
   // survives reloads. Lifted here (not per-section state) because the
@@ -951,7 +955,7 @@ function ConversationRow({
           !selectionMode &&
             (sessionState?.kind === "awaiting" ? "pr-44 md:pr-28" : "pr-28 md:pr-16"),
           selectionMode && "pr-10",
-          isActive && "bg-muted font-semibold",
+          isActive && "bg-muted",
           selectionMode && isSelected && "bg-primary/5",
         )}
         onClick={(e) => {
@@ -977,7 +981,7 @@ function ConversationRow({
             shared) were removed to keep rows text-clean; pinned rows still
             group under "Pinned". */}
         <div className="flex w-full items-center gap-1.5">
-          <span className={cn("relative min-w-0 truncate", hasUnseenMessages && "font-semibold")}>
+          <span className="relative min-w-0 truncate">
             {label}
             {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
           </span>

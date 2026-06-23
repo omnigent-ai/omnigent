@@ -6,7 +6,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
-import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, CopyIcon } from "lucide-react";
+import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, CopyIcon, WrapTextIcon } from "lucide-react";
 import type { ComponentProps, HTMLAttributes, ReactElement, ReactNode } from "react";
 import {
   cloneElement,
@@ -325,6 +325,13 @@ function extractCodeText(children: ReactNode): string {
   return "";
 }
 
+// Shared visual style for the buttons overlaid on a chat code block (copy,
+// wrap toggle). The frosted/ghost look matches the rest of the chat surface;
+// positioning lives on the container in ChatCodeBlockPre, not here, so the
+// buttons stay layout-agnostic.
+const CODE_BLOCK_OVERLAY_BUTTON_CLASS =
+  "size-8 bg-sidebar/80 text-muted-foreground hover:text-foreground supports-[backdrop-filter]:bg-sidebar/70 supports-[backdrop-filter]:backdrop-blur";
+
 function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
   const [isCopied, setIsCopied] = useState(false);
   const timeoutRef = useRef<number>(0);
@@ -360,7 +367,7 @@ function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
   return (
     <Button
       aria-label="Copy Code"
-      className="absolute top-2 right-12 z-10 size-8 bg-sidebar/80 text-muted-foreground hover:text-foreground supports-[backdrop-filter]:bg-sidebar/70 supports-[backdrop-filter]:backdrop-blur"
+      className={CODE_BLOCK_OVERLAY_BUTTON_CLASS}
       onClick={handleClick}
       size="icon-sm"
       title="Copy Code"
@@ -372,17 +379,46 @@ function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
   );
 }
 
+function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: () => void }) {
+  return (
+    <Button
+      aria-label="Toggle word wrap"
+      aria-pressed={wrap}
+      // Brighten when active so the pressed state reads at a glance.
+      className={cn(CODE_BLOCK_OVERLAY_BUTTON_CLASS, wrap && "text-foreground")}
+      onClick={onToggle}
+      size="icon-sm"
+      title={wrap ? "Disable word wrap" : "Enable word wrap"}
+      type="button"
+      variant="ghost"
+    >
+      <WrapTextIcon size={14} />
+    </Button>
+  );
+}
+
 function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const code = extractCodeText(children);
   const getCode = useCallback(() => code, [code]);
+  // Soft-wrap long lines by default so users don't have to scroll horizontally
+  // to read code blocks. The toggle restores Streamdown's native
+  // horizontal-scroll view for when column alignment matters.
+  const [wrap, setWrap] = useState(true);
+  const toggleWrap = useCallback(() => setWrap((w) => !w), []);
   const block = isValidElement(children)
     ? cloneElement(children, { "data-block": "true" } as Record<string, unknown>)
     : children;
 
   return (
-    <div className="relative">
+    <div className={cn("relative", wrap && "chat-code-wrap")}>
       {block}
-      <ChatCodeBlockCopyButton getCode={getCode} />
+      {/* Overlay actions, anchored left of Streamdown's own download button
+          (which sits at the header's right edge). A flex row lets the buttons
+          self-arrange, so neither needs a hardcoded horizontal offset. */}
+      <div className="absolute top-2 right-12 z-10 flex items-center gap-1">
+        <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
+        <ChatCodeBlockCopyButton getCode={getCode} />
+      </div>
     </div>
   );
 }

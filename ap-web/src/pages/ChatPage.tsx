@@ -104,6 +104,7 @@ import { useSession } from "@/hooks/useSession";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
+  type LivenessRow,
   type SessionLiveness,
   livenessRowFromSession,
   useSessionLiveness,
@@ -734,7 +735,15 @@ export function ChatPage() {
   // so `host_id` still reaches the hook — otherwise a host-bound, host-down
   // session misclassifies as `local_stranded` and shows the wrong reconnect
   // path. See `livenessRowFromSession`.
-  const livenessRow = activeConv ?? livenessRowFromSession(activeSession);
+  //
+  // Always source `host_resumable` from the session snapshot — the sidebar
+  // `Conversation` row doesn't carry it. activeSession is loaded for the open
+  // session, so a host-bound, host-down session whose host is a resumable
+  // managed host classifies as `host_asleep` (composer open, send wakes it)
+  // instead of dead-ending on `host_offline`.
+  const livenessRow: LivenessRow | null = activeConv
+    ? { ...activeConv, host_resumable: activeSession?.hostResumable ?? false }
+    : livenessRowFromSession(activeSession);
   const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
     turnActive: status === "streaming",
   });
@@ -1490,7 +1499,8 @@ function MainAgentSurface({
         showCodexPlanMode={showCodexPlanMode}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
-        reconnectHint={liveness.kind === "runner_asleep"}
+        reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
+        sandboxAsleepHint={liveness.kind === "host_asleep"}
         unreachable={
           !sandboxLaunching &&
           (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
@@ -2068,7 +2078,8 @@ export function ConnectionIndicator({
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   // Genuinely-unreachable states get the reconnect banner, for
   // both terminal-first and regular sessions. `runner_asleep` (host up,
-  // runner relaunches on the next message) and `unknown` (pre-poll) are
+  // runner relaunches on the next message), `host_asleep` (resumable managed
+  // host the server wakes on the next message), and `unknown` (pre-poll) are
   // NOT unreachable — they're handled below.
   const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
 
@@ -2172,8 +2183,8 @@ export function ConnectionIndicator({
   }
 
   // `online`/`unknown` for a non-terminal-first session and
-  // `runner_asleep` for any session: status lives in the sidebar / the
-  // composer stays open, so render nothing here.
+  // `runner_asleep`/`host_asleep` for any session: status lives in the
+  // sidebar / the composer stays open, so render nothing here.
   return null;
 }
 
@@ -2697,6 +2708,14 @@ interface ComposerProps {
    */
   reconnectHint?: boolean;
   /**
+   * The session is host-bound to a dormant resumable managed host that is
+   * offline (`host_asleep`): the composer stays enabled, and the placeholder
+   * tells the user their next message will resume the sandbox host (which can
+   * take a few minutes) so the wake latency is expected, not surprising.
+   * Ignored once a turn is streaming.
+   */
+  sandboxAsleepHint?: boolean;
+  /**
    * The session is unreachable (`host_offline` / `local_stranded`): a message
    * can't wake it. The composer is blocked (disabled) and the reconnect
    * banner below is the only affordance.
@@ -3063,6 +3082,7 @@ export function Composer({
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
+  sandboxAsleepHint = false,
   unreachable = false,
   costRoutingVerdict = null,
   costRoutingEligible = false,
@@ -3770,9 +3790,11 @@ export function Composer({
                         ? "Waiting for agents…"
                         : isStreaming
                           ? "Send a follow-up (queued) — Esc to stop"
-                          : reconnectHint
-                            ? "Send a message to reconnect this session"
-                            : "Ask the agent anything…"
+                          : sandboxAsleepHint
+                            ? "Current session's host is offline. Next message will resume the sandbox host which can take minutes"
+                            : reconnectHint
+                              ? "Send a message to reconnect this session"
+                              : "Ask the agent anything…"
             }
             rows={1}
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
