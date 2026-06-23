@@ -1254,11 +1254,58 @@ async def test_stream_agent_state_updates_trailer_ends_stream(
     """
     chunks = [
         _data_frame({"n": "first"}),
-        _frame(0x02, b'{"someTrailer": true}'),  # trailer (payload ignored)
+        _frame(0x02, b'{"someTrailer": true}'),  # clean trailer (no error → stop)
         _data_frame({"n": "after-trailer-must-be-ignored"}),
     ]
     monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", _stream_transport(chunks, {}))
     assert await _collect(52548, _CONVERSATION_ID) == [{"n": "first"}]
+
+
+async def test_stream_agent_state_updates_raises_on_trailer_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A trailer carrying a connect ``error`` object raises ``AntigravityRpcError``.
+
+    In connect streaming a mid-stream server failure is reported in the TRAILER
+    PAYLOAD as ``{"error": {...}}`` — NOT via HTTP status (200 + headers were
+    already flushed). Treating that trailer as a clean stop would silently
+    truncate the turn for the reader, so the framing layer must surface it: the
+    generator yields the data frames that DID arrive, then raises with the error
+    message in the exception text.
+    """
+    chunks = [
+        _data_frame({"n": "first"}),
+        _data_frame({"n": "second"}),
+        _frame(0x02, b'{"error": {"code": "internal", "message": "cascade exploded"}}'),
+    ]
+    monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", _stream_transport(chunks, {}))
+    collected: list[dict[str, object]] = []
+    with pytest.raises(rpc.AntigravityRpcError, match="cascade exploded"):
+        async for update in rpc.stream_agent_state_updates(52548, _CONVERSATION_ID):
+            collected.append(update)
+    # The data frames before the error trailer were still delivered in order.
+    assert collected == [{"n": "first"}, {"n": "second"}]
+
+
+async def test_stream_agent_state_updates_empty_trailer_is_clean_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An empty trailer payload (``b""``) — and a ``{}`` trailer — end the stream
+    cleanly.
+
+    Only a non-empty ``error`` object is an error; the common case is a trailer
+    with no payload (or an empty object), which is a normal end-of-stream and
+    must NOT raise.
+    """
+    chunks = [_data_frame({"n": "only"}), _frame(0x02, b"")]
+    monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", _stream_transport(chunks, {}))
+    assert await _collect(52548, _CONVERSATION_ID) == [{"n": "only"}]
+
+    chunks_empty_obj = [_data_frame({"n": "only"}), _frame(0x02, b"{}")]
+    monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", _stream_transport(chunks_empty_obj, {}))
+    assert await _collect(52548, _CONVERSATION_ID) == [{"n": "only"}]
 
 
 async def test_stream_agent_state_updates_raises_on_compressed_frame(

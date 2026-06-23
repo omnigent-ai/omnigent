@@ -668,6 +668,36 @@ def _encode_connect_envelope(payload: dict[str, object]) -> bytes:
     return bytes([0x00]) + struct.pack(">I", len(raw)) + raw
 
 
+def _connect_trailer_error(payload: bytes) -> object | None:
+    """
+    Return the connect end-of-stream trailer's error, or ``None`` for a clean EOS.
+
+    A connect server-stream reports a mid-stream failure in the TRAILER PAYLOAD
+    as ``{"error": {...}}`` (the HTTP 200 + headers were already flushed, so the
+    status cannot carry it). This extracts that error so the stream client can
+    raise instead of silently truncating the turn.
+
+    Fails SAFE toward a clean stop: an empty payload (the common normal EOS), a
+    payload that is not valid JSON, a non-object body, or one whose ``error`` is
+    absent/empty/falsy all return ``None`` (no error). Only a non-empty ``error``
+    value is returned.
+
+    :param payload: The raw trailer frame payload bytes (may be ``b""``).
+    :returns: The trailer's ``error`` value when present and non-empty; otherwise
+        ``None`` (treat as a clean end-of-stream).
+    """
+    if not payload:
+        return None
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    error = parsed.get("error")
+    return error if error else None
+
+
 async def stream_agent_state_updates(
     port: int, conversation_id: str
 ) -> AsyncIterator[dict[str, object]]:
@@ -689,8 +719,10 @@ async def stream_agent_state_updates(
 
     * ``flag == 0x00`` — DATA: ``payload`` is the JSON ``update`` object (yielded).
     * ``flag & 0x02`` (:data:`_FRAME_FLAG_TRAILER`) — end-of-stream trailer:
-      iteration stops; the payload may carry trailer metadata or an error and is
-      NOT yielded.
+      iteration stops; the payload is NOT yielded. A trailer carrying a connect
+      ``{"error": {...}}`` (how a mid-stream failure is reported once the 200 +
+      headers have been flushed) raises :class:`AntigravityRpcError`; an empty /
+      non-error / unparseable trailer is a clean stop.
     * ``flag & 0x01`` (:data:`_FRAME_FLAG_COMPRESSED`) — compressed payload: agy
       sends uncompressed, so a set bit means a decode mismatch — raises
       :class:`AntigravityRpcError` rather than feeding compressed bytes to the
@@ -711,9 +743,10 @@ async def stream_agent_state_updates(
         stream updates for.
     :returns: An async iterator over DATA frames' parsed JSON dicts, in arrival
         order, ending when the trailer frame is seen or the stream closes.
-    :raises AntigravityRpcError: On a compressed frame (unexpected from agy). The
-        Task T-D reader is responsible for reconnect/poll-fallback on transport
-        errors, which propagate as ``httpx.HTTPError`` from the underlying stream.
+    :raises AntigravityRpcError: On a compressed frame (unexpected from agy) or a
+        connect end-of-stream trailer error (``{"error": ...}``). The Task T-D
+        reader is responsible for reconnect/poll-fallback on transport errors,
+        which propagate as ``httpx.HTTPError`` from the underlying stream.
     """
     url = _rpc_url(port, _METHOD_STREAM_AGENT_STATE_UPDATES)
     _assert_loopback_url(url)
@@ -744,7 +777,16 @@ async def stream_agent_state_updates(
                         "compression is unsupported"
                     )
                 if flag & _FRAME_FLAG_TRAILER:
-                    return  # end-of-stream trailer: stop (payload not yielded)
+                    # End-of-stream trailer. In connect streaming a mid-stream
+                    # failure is reported HERE as ``{"error": {...}}`` (not via
+                    # HTTP status — the 200 + headers were already flushed), so a
+                    # trailer error must be raised rather than treated as a clean
+                    # stop (which would silently truncate the turn). An empty /
+                    # non-error / unparseable trailer is a normal end-of-stream.
+                    error = _connect_trailer_error(payload)
+                    if error is not None:
+                        raise AntigravityRpcError(f"agy connect-stream error: {error}")
+                    return
                 parsed = json.loads(payload)
                 if isinstance(parsed, dict):
                     yield parsed
