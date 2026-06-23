@@ -390,15 +390,24 @@ jobs:
           workspace = _os.environ.get('GITHUB_WORKSPACE', '')
           home = str(pathlib.Path.home())
 
-          # read_paths: grant the workspace (CLIs, venv, repo) and home
-          # (gh config, omnigent config, .databrickscfg) so bwrap's
-          # restricted filesystem view doesn't break Polly's shell tools.
-          read_paths = [workspace, home] if workspace else [home]
+          # Specific home dotpaths Polly needs — avoid adding the entire HOME
+          # as a read_path because the dotfile masker would walk it, find
+          # dirs like ~/.ghcup, and try to --tmpfs-mask them, which fails
+          # when bwrap can't create the mount point in the new root.
+          home_paths = [
+              f'{home}/.omnigent',        # omnigent provider config
+              f'{home}/.databrickscfg',   # gateway auth token
+              f'{home}/.config/gh',       # gh CLI auth
+          ]
+
+          read_paths = ([workspace] if workspace else []) + home_paths
 
           sandbox = {
               'type': 'linux_bwrap',
               'egress_rules': rules,
               'read_paths': read_paths,
+              # Allow dotdirs under workspace that Polly needs (CLIs, venv).
+              'cwd_allow_hidden': ['.venv', '.cc-cli', '.codex-cli', '.omnigent'],
               'write_paths': ['/tmp'],
           }
           cfg['os_env']['sandbox'] = sandbox
