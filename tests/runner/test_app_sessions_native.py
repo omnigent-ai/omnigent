@@ -17878,3 +17878,91 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
         f"No session.status: idle should be enqueued when kill_session failed; "
         f"got {status_idle!r}."
     )
+
+
+# ── #1026 P1.7: desync recovery (single ordered entry + desync flag) ─────────
+
+
+@pytest.mark.asyncio
+async def test_desynced_session_releases_and_recovers() -> None:
+    """A desync with a buffered message releases the wedged turn promptly.
+
+    Simulates a turn parked on the 24h policy-evaluation future (its verdict-
+    delivery channel died). ``_resync_turn_state`` must release it in
+    milliseconds — NOT wait ``_POLICY_EVAL_TIMEOUT_S`` — flag the conversation
+    desynced, and let the buffered continuation bind a fresh turn (which clears
+    the flag). With a continuation queued it stays silent: no user-visible
+    ``runner_turn_context_desync`` ``failed`` edge is published.
+    """
+    conv = "conv_desync_recover"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    forever = asyncio.Event()
+
+    async def _wedged_turn() -> None:
+        # Stand in for a turn parked on the 24h policy-evaluation future.
+        await forever.wait()
+
+    async with _runner_client(app) as http:
+        # Bind a live (wedged) turn into the single active-turn slot.
+        task = asyncio.create_task(_wedged_turn())
+        app.state.active_turns[conv] = task
+        try:
+            # A message arriving mid-turn buffers (single-active-turn gate).
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "follow up"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+            elapsed = loop.time() - t0
+
+            # Released in ms — nowhere near the 24h policy-eval timeout.
+            assert elapsed < 2.0, elapsed
+            # The wedged turn was cancelled, not left parked.
+            assert task.cancelled() or task.done()
+            # Flagged desynced; the buffered continuation has not bound yet.
+            assert conv in app.state.desynced_sessions
+
+            # The buffered continuation binds a fresh turn, which clears the
+            # desynced flag at turn start (recovery).
+            deadline = loop.time() + 3.0
+            while loop.time() < deadline and conv in app.state.desynced_sessions:
+                await asyncio.sleep(0.02)
+            assert conv not in app.state.desynced_sessions
+        finally:
+            forever.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    # Silent recovery: no user-visible desync `failed` edge was published while
+    # a continuation was queued (that surfaces only when nothing will continue).
+    from omnigent.runner.app import _session_event_queues_ref
+
+    queue = _session_event_queues_ref.get(conv)
+    desync_failed = []
+    while queue is not None and not queue.empty():
+        event = queue.get_nowait()
+        if (
+            isinstance(event, dict)
+            and event.get("type") == "session.status"
+            and event.get("status") == "failed"
+            and isinstance(event.get("error"), dict)
+            and event["error"].get("code") == "runner_turn_context_desync"
+        ):
+            desync_failed.append(event)
+    assert desync_failed == []
