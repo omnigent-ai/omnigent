@@ -1470,7 +1470,9 @@ async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
             executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
         )
 
-    def _raising_build(spec: object, *, workdir: object = None, **_kwargs: object) -> dict[str, str]:
+    def _raising_build(
+        spec: object, *, workdir: object = None, **_kwargs: object
+    ) -> dict[str, str]:
         """
         Stand in for ``_build_claude_sdk_spawn_env`` and fail the way the
         no-model generic-provider path does.
@@ -1566,7 +1568,9 @@ async def test_runner_failed_status_carries_setup_error_message(
             executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
         )
 
-    def _raising_build(spec: object, *, workdir: object = None, **_kwargs: object) -> dict[str, str]:
+    def _raising_build(
+        spec: object, *, workdir: object = None, **_kwargs: object
+    ) -> dict[str, str]:
         """
         Fail the spawn-env build the way the no-model provider path does.
 

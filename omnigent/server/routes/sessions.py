@@ -11550,6 +11550,7 @@ async def _notify_runner_of_bundled_child(
     session_id: str,
     agent_id: str,
     runner_router: RunnerRouter | None,
+    conversation_store: ConversationStore,
 ) -> None:
     """
     Notify the inherited runner that a bundled child session exists.
@@ -11564,6 +11565,8 @@ async def _notify_runner_of_bundled_child(
         e.g. ``"ag_abc123"``.
     :param runner_router: Router used to resolve the bound runner's
         client; ``None`` falls back to the in-process runner.
+    :param conversation_store: Store used to read the persisted
+        ``model_override`` for the init body (issue #1128).
     :returns: None.
     """
     runner_client = await _get_runner_client(session_id, runner_router)
@@ -12944,6 +12947,7 @@ def create_sessions_router(
                 result.session_id,
                 result.agent_id,
                 runner_router,
+                conversation_store,
             )
         return result
 
