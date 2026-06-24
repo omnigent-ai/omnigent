@@ -192,6 +192,11 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``omni kiro`` (tmux pane + bridge dir), not ``omnigent run --harness
     kiro-native``. Its coverage is the dedicated kiro-native bridge/executor/
     forwarder unit tests plus the ``test_native_kiro_render_parity`` e2e_ui suite.
+
+    ``hermes`` is excluded because it requires the ``hermes`` CLI binary
+    (installed separately via Nous Research's install script) and authenticates
+    through its own provider config, not the shared gateway/profile probe
+    wiring this matrix drives.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
@@ -207,5 +212,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "goose",
         "goose-native",
         "kiro-native",
+        "hermes",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

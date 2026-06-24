@@ -90,6 +90,7 @@ OMNIGENT_HARNESSES = frozenset(
         "kiro-native",
         "goose",
         "goose-native",
+        "hermes",
         "openai-agents",
         "open-responses",
         "opencode-native",

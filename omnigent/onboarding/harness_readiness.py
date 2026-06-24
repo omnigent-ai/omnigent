@@ -31,6 +31,7 @@ from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
     CURSOR_KEY,
     GOOSE_KEY,
+    HERMES_KEY,
     KIRO_KEY,
     OPENCODE_KEY,
     PI_KEY,
@@ -161,6 +162,11 @@ def harness_is_configured(harness: str) -> bool:
         # Auth/provider state surfaces at run time via Goose's own config; the
         # daemon gates only on binary presence.
         return harness_cli_installed(GOOSE_KEY)
+    if canonical == HERMES_KEY:
+        # Hermes wraps the ``hermes`` CLI (installed via a curl script from
+        # Nous Research). Auth/provider config surfaces at run time via
+        # Hermes' own ``hermes model`` flow; gate only on binary presence.
+        return harness_cli_installed(HERMES_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -231,5 +237,6 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
+    spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
     spellings.add(COPILOT_KEY)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}
