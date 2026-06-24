@@ -302,7 +302,14 @@ export function FilesPanel({
   // Full-screen drawer mode: forced-open content, no rounded card,
   // section grows to fill the parent rather than capping at max-h.
   const fullScreen = onClose !== undefined || frameless === true;
-  const contentVisible = !collapsed || fullScreen;
+  // Drawer mode (mobile ``onClose``) owns its own header — a static title
+  // plus an X close — and is always-open, so the collapse toggle does not
+  // apply there. The inline/rail variants (no ``onClose``) render the
+  // collapsible "Working folder" header and honor ``collapsed`` so the
+  // desktop rail can collapse the panel and persist that choice. ``fullScreen``
+  // stays a pure layout flag (fill height, no card) shared by both.
+  const drawerMode = onClose !== undefined;
+  const contentVisible = !collapsed || drawerMode;
   const changedQuery = useWorkspaceChangedFiles(conversationId, {
     enabled: contentVisible,
   });
@@ -362,7 +369,7 @@ export function FilesPanel({
     >
       {/* Header — single row: [title · workingDir] [eye] [chevron / close] */}
       <div className="flex shrink-0 items-center gap-2 px-3 py-2">
-        {fullScreen ? (
+        {drawerMode ? (
           <>
             <span className="shrink-0 font-medium text-sm">Working folder</span>
             {workingDir && <WorkingDirLabel dir={workingDir} />}
