@@ -6662,18 +6662,22 @@ def create_runner_app(
         if event.lifecycle != TerminalLifecycle.REQUIRED:
             return
 
-        # qwen-native: the user drives the qwen TUI directly, so quitting it
-        # (Ctrl+C / /quit) is a normal end-of-session, not a crash. The
-        # ``session_was_idle`` guard below is meant to catch a clean exit, but
-        # qwen's "powering down" redraw on quit trips the PTY-activity watcher
-        # and flips the status to ``running`` in the instant before the process
-        # exits — so the quit is misclassified as a crash and the scary
-        # ``required_terminal_exited`` card renders. Treat the qwen terminal's
-        # exit as a clean shutdown: genuine *boot* failures never reach here
-        # (they surface via ``_auto_create_qwen_terminal``'s error handler →
-        # ``_publish_native_terminal_start_error``), so a qwen required-terminal
-        # exit is always post-boot, i.e. user-initiated.
-        if event.terminal_name == "qwen" and event.session_key == "main":
+        # qwen-native / antigravity-native: the user drives the TUI directly, so
+        # quitting it (Ctrl+C / /quit) is a normal end-of-session, not a crash.
+        # The ``session_was_idle`` guard below is meant to catch a clean exit,
+        # but the exit-classification memo is never flipped to ``idle`` for these
+        # harnesses: qwen's "powering down" redraw on quit trips the PTY-activity
+        # watcher and flips the status to ``running`` in the instant before the
+        # process exits, and antigravity-native is deliberately excluded from the
+        # PTY ``emit_status`` role set (the RPC reader owns working-status, not
+        # PTY activity), so its memo stays ``running``. Either way the quit is
+        # misclassified as a crash and the scary ``required_terminal_exited`` card
+        # renders. Treat these terminals' exit as a clean shutdown: genuine *boot*
+        # failures never reach here (they surface via the respective
+        # ``_auto_create_*_terminal`` error handler →
+        # ``_publish_native_terminal_start_error``), so a qwen/antigravity
+        # required-terminal exit is always post-boot, i.e. user-initiated.
+        if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
             # Publish a final ``idle`` to clear the web "Working…" spinner: the
             # powering-down redraw may have left the PTY watcher's last edge on
             # ``running``, and the watcher is gone once the pane dies, so without
