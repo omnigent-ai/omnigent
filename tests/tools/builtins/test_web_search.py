@@ -292,6 +292,25 @@ def test_nimble_spec_config_used_in_http_call(tool_ctx: ToolContext) -> None:
     assert body["search_depth"] == "lite"
 
 
+def test_nimble_sends_x_client_source_header(tool_ctx: ToolContext) -> None:
+    """Every request carries the ``X-Client-Source`` header identifying Omnigent."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"results": []}
+
+    tool = WebSearchTool(
+        config={"search_provider": "nimble", "api_key": "spec-nimble"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_nimble.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    headers = mock_post.call_args.kwargs["headers"]
+    assert headers["X-Client-Source"] == "omnigent", (
+        f"Expected X-Client-Source 'omnigent', got {headers.get('X-Client-Source')!r}"
+    )
+
+
 def test_nimble_http_error_returns_error_string(tool_ctx: ToolContext) -> None:
     """An HTTP error (e.g. 401) is returned as a string, never raised."""
     fake_response = MagicMock()
