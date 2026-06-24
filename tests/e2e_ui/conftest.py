@@ -2301,7 +2301,9 @@ def native_codex_mock_session(
 # ---------------------------------------------------------------------------
 
 
-def _create_native_cursor_session(base_url: str, runner_id: str) -> str:
+def _create_native_cursor_session(
+    base_url: str, runner_id: str, *, launch_args: tuple[str, ...] = ("-f",)
+) -> str:
     """Register the ``cursor-native`` wrapper agent and bind its session.
 
     Reuses the exact terminal-first spec ``omnigent cursor`` ships
@@ -2361,7 +2363,11 @@ def _create_native_cursor_session(base_url: str, runner_id: str) -> str:
     metadata = {
         "labels": labels,
         "workspace": str(_REPO_ROOT),
-        "terminal_launch_args": ["-f"],
+        # ``-f`` (the default) trusts the dir + auto-approves tools so the
+        # unattended pane never hangs. The approval-mirror test passes
+        # ``launch_args=()`` so cursor's per-tool prompts fire and surface as
+        # web elicitation cards.
+        "terminal_launch_args": list(launch_args),
     }
     create = httpx.post(
         f"{base_url}/v1/sessions",
@@ -2494,6 +2500,40 @@ def native_cursor_session(
             # Escalate to SIGKILL if the runner ignores SIGTERM, so a wedged
             # process can't raise in teardown and leak / fail unrelated tests
             # (matching terminal_session / seeded_session_pair).
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def native_cursor_approval_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A ``cursor-native`` session launched WITHOUT ``-f`` (prompts fire).
+
+    Identical to :func:`native_cursor_session` but omits the force/trust flag,
+    so ``cursor-agent`` raises its real per-tool approval prompts. The runner-
+    side mirror (:mod:`omnigent.cursor_native_permissions`) surfaces those as
+    web ``response.elicitation_request`` cards — what the approval-ordering test
+    drives. The first-run workspace-trust modal is dismissed by the executor's
+    inject path on the first composer turn.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_cursor_session(live_server, runner_id, launch_args=())
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
             try:
                 respawned.wait(timeout=5)
             except subprocess.TimeoutExpired:
