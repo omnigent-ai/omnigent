@@ -250,8 +250,7 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
         )
         if not proc_handle:
             _LOGGER.warning(
-                "windows_jobobject: OpenProcess(pid=%d) failed (err=%d); "
-                "continuing uncontained.",
+                "windows_jobobject: OpenProcess(pid=%d) failed (err=%d); continuing uncontained.",
                 pid,
                 ctypes.get_last_error(),
             )
