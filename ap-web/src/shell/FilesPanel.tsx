@@ -22,6 +22,7 @@ import {
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
+import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   DropdownMenu,
@@ -62,10 +63,11 @@ interface FilesPanelProps {
   onClose?: () => void;
   /**
    * Frameless mode: drops the rounded card chrome and fills the parent
-   * container's height, just like `onClose` (fullScreen) mode — but
-   * without rendering a close button. Used by the inline right panel
-   * where the panel is embedded in a split layout rather than a drawer.
-   * The collapse chevron is also hidden in this mode.
+   * container's height (like the `onClose` drawer) — but without a close
+   * button. Used by the inline right panel where the panel is embedded in a
+   * split layout rather than a drawer. Unlike the drawer, it keeps the
+   * collapsible "Working folder" button header (with its chevron and
+   * `aria-expanded`), so the header stays a focusable, toggleable control.
    */
   frameless?: boolean;
 }
@@ -291,7 +293,7 @@ export function FilesPanel({
   const runnerWentOffline = useChatStore(
     (s) => s.conversationId === conversationId && s.sessionStatus === "failed",
   );
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => readFilesPanelPreferences().collapsed);
   const [changedSearch, setChangedSearch] = useState("");
   const [treeSearch, setTreeSearch] = useState("");
   const [debouncedTreeSearch, setDebouncedTreeSearch] = useState("");
@@ -302,10 +304,17 @@ export function FilesPanel({
   const [treeExclude, setTreeExclude] = useState("");
   const [debouncedTreeExclude, setDebouncedTreeExclude] = useState("");
   const [showSearchFilters, setShowSearchFilters] = useState(false);
-  // Full-screen drawer mode: forced-open content, no rounded card,
-  // section grows to fill the parent rather than capping at max-h.
-  const fullScreen = onClose !== undefined || frameless === true;
-  const contentVisible = !collapsed || fullScreen;
+  // The drawer (onClose) owns the full viewport, so it gets a static,
+  // always-open header with its own X close button — a collapse chevron there
+  // would be a no-op. The inline rail (frameless) and the standalone card keep
+  // the collapsible "Working folder" *button* header (accessible name +
+  // aria-expanded), which is what lets it be focused/toggled and asserted on.
+  const isDrawer = onClose !== undefined;
+  // Both the drawer and the inline rail fill their parent's height and drop the
+  // rounded card chrome; only the standalone card caps content at max-h.
+  const fillHeight = isDrawer || frameless === true;
+  // The drawer is always open; everywhere else the header chevron toggles it.
+  const contentVisible = isDrawer || !collapsed;
   const changedQuery = useWorkspaceChangedFiles(conversationId, {
     enabled: contentVisible,
   });
@@ -360,12 +369,12 @@ export function FilesPanel({
     <div
       className={cn(
         "@container/filespanel overflow-hidden bg-card",
-        fullScreen ? "flex h-full min-h-0 flex-col" : "flex min-h-0 flex-col",
+        fillHeight ? "flex h-full min-h-0 flex-col" : "flex min-h-0 flex-col",
       )}
     >
       {/* Header — single row: [title · workingDir] [eye] [chevron / close] */}
       <div className="flex shrink-0 items-center gap-2 px-3 py-2">
-        {fullScreen ? (
+        {isDrawer ? (
           <>
             <span className="shrink-0 font-medium text-sm">Working folder</span>
             {workingDir && <WorkingDirLabel dir={workingDir} />}
@@ -393,7 +402,13 @@ export function FilesPanel({
             <button
               type="button"
               className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
-              onClick={() => setCollapsed((v) => !v)}
+              onClick={() =>
+                setCollapsed((v) => {
+                  const next = !v;
+                  writeFilesPanelPreferences({ ...readFilesPanelPreferences(), collapsed: next });
+                  return next;
+                })
+              }
               aria-expanded={!collapsed}
             >
               <span className="shrink-0 font-medium text-sm">Working folder</span>
@@ -514,7 +529,7 @@ export function FilesPanel({
             className={cn(
               "overflow-y-auto px-2 pb-2",
               flatView ? "pt-1" : "pt-2",
-              fullScreen ? "min-h-0 flex-1" : "max-h-72",
+              fillHeight ? "min-h-0 flex-1" : "max-h-72",
             )}
           >
             {flatView ? (

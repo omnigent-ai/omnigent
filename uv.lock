@@ -1341,6 +1341,23 @@ wheels = [
 ]
 
 [[package]]
+name = "github-copilot-sdk"
+version = "1.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "python-dateutil" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/89/22/d4d576becff84146501e043831bdd2ca5aee57fcfdfface4ee7db7883655/github_copilot_sdk-1.0.1-py3-none-macosx_10_9_x86_64.whl", hash = "sha256:d1ca7fff62b69f8c9aa24eb2d1f615195730d6b7297050e8e240aa38fbae5eba", size = 94824679, upload-time = "2026-06-10T16:54:17.004Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/5f/f3d935b81f11930539cdf47a7e0dbd4d5ccaadba1f4daf0c64892421a81d/github_copilot_sdk-1.0.1-py3-none-macosx_11_0_arm64.whl", hash = "sha256:dc4b59dfe034bec6a031b291dbe49de8a8558e42d28aee25213c680ab771d54e", size = 88837334, upload-time = "2026-06-10T16:54:23.056Z" },
+    { url = "https://files.pythonhosted.org/packages/6b/94/225ec0258e1630a81e13b193a9258d8c4550b552b6197f903b75002abf75/github_copilot_sdk-1.0.1-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:bedb442ee4dd40d43870719f91a9fb6e117ca5d76bbbf1807af80cc77ff64257", size = 97255205, upload-time = "2026-06-10T16:54:29.828Z" },
+    { url = "https://files.pythonhosted.org/packages/0f/34/72fb3936e7e8a425f1498bd6693a4e7db678e43fc3912dc5ce9cecccfe23/github_copilot_sdk-1.0.1-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:a498fffba3d8a521eb73f31d08fef9f534e7c57ae6d0a76fa1848beebb3fb6a9", size = 94572477, upload-time = "2026-06-10T16:54:37.253Z" },
+    { url = "https://files.pythonhosted.org/packages/df/95/34aa49c08033acabbe129acf83a2d71a382bd2977ce92f5114a299508a4e/github_copilot_sdk-1.0.1-py3-none-win_amd64.whl", hash = "sha256:29d850cf5cf2b85c0513b68cba112d4a7aba0a9a447893fc7cc69136dd4e6ac1", size = 91387201, upload-time = "2026-06-10T16:54:45.164Z" },
+    { url = "https://files.pythonhosted.org/packages/ea/b1/900b278e519442d4a5fc9dd070b9100f6f1e6b3c6af3b8642b0b3a65d2f5/github_copilot_sdk-1.0.1-py3-none-win_arm64.whl", hash = "sha256:5f69245b1cb2fc1054e78543ee5c10464b53ebbba11e749c7a42002b02ce6b13", size = 90455774, upload-time = "2026-06-10T16:54:53.093Z" },
+]
+
+[[package]]
 name = "gitpython"
 version = "3.1.50"
 source = { registry = "https://pypi.org/simple" }
@@ -2773,6 +2790,9 @@ bedrock = [
 boxlite = [
     { name = "boxlite" },
 ]
+copilot = [
+    { name = "github-copilot-sdk" },
+]
 cursor = [
     { name = "cursor-sdk" },
 ]
@@ -2856,6 +2876,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.100,<1" },
     { name = "filelock", marker = "extra == 'dev'", specifier = ">=3.0" },
     { name = "ftfy", specifier = ">=6.0" },
+    { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1,<2" },
     { name = "google-antigravity", marker = "extra == 'antigravity'", specifier = ">=0.1,<1" },
     { name = "google-auth", marker = "extra == 'vertex'", specifier = ">=2.0,<3" },
     { name = "httpx", specifier = ">=0.27,<1" },
@@ -2910,7 +2931,7 @@ requires-dist = [
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "openshell", "tracing", "agents-sdk", "antigravity", "cursor", "databricks", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "openshell", "tracing", "agents-sdk", "antigravity", "copilot", "cursor", "databricks", "dev"]
 
 [[package]]
 name = "omnigent-client"

@@ -21,8 +21,7 @@ concurrency:
 jobs:
   record:
     # Approvals flip the check green; dismissals and changes-requested flip
-    # it red and revoke the fork-e2e mirror. Skip COMMENTED reviews (they
-    # don't change review state).
+    # it red. Skip COMMENTED reviews (they don't change review state).
     if: github.event.review.state != 'commented'
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -51,6 +51,7 @@ import {
   MessageContent,
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
+import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
 import { CompactionMarker } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
@@ -58,7 +59,14 @@ import { parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
-import { isIOSShell, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+import { validateAttachments } from "@/lib/attachments";
+import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
+import {
+  isIOSShell,
+  onNativeViewModeChanged,
+  setNativeServerSwitcherHidden,
+  setNativeViewMode,
+} from "@/lib/nativeBridge";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -98,6 +106,7 @@ import { useSession } from "@/hooks/useSession";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
+  type LivenessRow,
   type SessionLiveness,
   livenessRowFromSession,
   useSessionLiveness,
@@ -239,11 +248,22 @@ export function buildPendingBubbles(
 // bubble. Used by `mergePendingBubbles` and
 // `reorderCommittedRequestElicitations` to keep the prompt above the card
 // that asks about it, both before and after approval.
-function isRequestElicitationBubble(bubble: Bubble): boolean {
+function isStandaloneElicitationBubble(bubble: Bubble): boolean {
+  // A committed assistant bubble that is ENTIRELY an elicitation card with no
+  // turn to anchor to, so it must sit BELOW the user message it gated:
+  //   • REQUEST-phase policy ASKs (gate the prompt before any turn), and
+  //   • terminal-driven harness gates such as cursor-native `pre_tool_use`,
+  //     which never emit `response_created` (blockStream stamps these with
+  //     their own `elicit_*` id, so they land as standalone bubbles).
+  // A `tool_call` card inside an active SDK turn renders inline — it is grouped
+  // WITH the turn, so it is never an all-elicitation standalone bubble — and is
+  // intentionally excluded here.
   return (
     bubble.kind === "assistant" &&
     bubble.items.length > 0 &&
-    bubble.items.every((it) => it.kind === "elicitation" && it.phase === "request")
+    bubble.items.every(
+      (it) => it.kind === "elicitation" && (it.phase === "request" || it.phase === "pre_tool_use"),
+    )
   );
 }
 
@@ -263,7 +283,7 @@ function isRequestElicitationBubble(bubble: Bubble): boolean {
 export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble[] {
   let result: Bubble[] | null = null;
   for (let i = 0; i < committed.length - 1; i += 1) {
-    if (isRequestElicitationBubble(committed[i]!) && committed[i + 1]!.kind === "user") {
+    if (isStandaloneElicitationBubble(committed[i]!) && committed[i + 1]!.kind === "user") {
       if (result === null) result = [...committed];
       const card = result[i]!;
       result[i] = result[i + 1]!;
@@ -287,11 +307,56 @@ export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble
 export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
   if (pending.length === 0) return committed;
   let insertAt = committed.length;
-  while (insertAt > 0 && isRequestElicitationBubble(committed[insertAt - 1]!)) {
+  while (insertAt > 0 && isStandaloneElicitationBubble(committed[insertAt - 1]!)) {
     insertAt -= 1;
   }
   if (insertAt === committed.length) return [...committed, ...pending];
   return [...committed.slice(0, insertAt), ...pending, ...committed.slice(insertAt)];
+}
+
+type ElicitationItem = Extract<RenderItem, { kind: "elicitation" }>;
+
+// A pending elicitation is unanswered — only these float to the bottom.
+function isPendingElicitation(item: RenderItem): item is ElicitationItem {
+  return item.kind === "elicitation" && item.status === "pending";
+}
+
+// Pending elicitation cards float to the bottom of the chat: lifted out of
+// their inline position and re-rendered as the last items in the scroll flow,
+// so stick-to-bottom keeps an outstanding question in view no matter how much
+// text the agent streams after it (otherwise the card scrolls up off the top
+// of the viewport). Collect them in document order — oldest first, so the
+// newest sits last, closest to the composer. Once answered, a card drops out
+// of this list (status flips to "responded") and stays inline at its natural
+// spot (it is no longer removed by `stripPendingElicitations`).
+export function collectPendingElicitations(bubbles: Bubble[]): ElicitationItem[] {
+  const pending: ElicitationItem[] = [];
+  for (const bubble of bubbles) {
+    if (bubble.kind !== "assistant") continue;
+    for (const item of bubble.items) {
+      if (isPendingElicitation(item)) pending.push(item);
+    }
+  }
+  return pending;
+}
+
+// Drop the pending elicitation cards from the transcript bubbles so they
+// don't render twice — once at the bottom, once inline. Only clones the
+// assistant bubbles that actually carry a pending card; every other bubble
+// keeps its reference so `BubbleView`'s memo holds. An assistant bubble left
+// with no items renders nothing (`AssistantBubble` returns null), so a
+// standalone elicitation bubble collapses cleanly while its gating user
+// message stays put. Returns the input array unchanged when nothing is
+// pending, so the memo stays stable.
+export function stripPendingElicitations(bubbles: Bubble[]): Bubble[] {
+  let result: Bubble[] | null = null;
+  for (let i = 0; i < bubbles.length; i += 1) {
+    const bubble = bubbles[i]!;
+    if (bubble.kind !== "assistant" || !bubble.items.some(isPendingElicitation)) continue;
+    if (result === null) result = [...bubbles];
+    result[i] = { ...bubble, items: bubble.items.filter((it) => !isPendingElicitation(it)) };
+  }
+  return result ?? bubbles;
 }
 
 // Whether a user bubble should carry the author's avatar badge (and the
@@ -728,7 +793,15 @@ export function ChatPage() {
   // so `host_id` still reaches the hook — otherwise a host-bound, host-down
   // session misclassifies as `local_stranded` and shows the wrong reconnect
   // path. See `livenessRowFromSession`.
-  const livenessRow = activeConv ?? livenessRowFromSession(activeSession);
+  //
+  // Always source `host_resumable` from the session snapshot — the sidebar
+  // `Conversation` row doesn't carry it. activeSession is loaded for the open
+  // session, so a host-bound, host-down session whose host is a resumable
+  // managed host classifies as `host_asleep` (composer open, send wakes it)
+  // instead of dead-ending on `host_offline`.
+  const livenessRow: LivenessRow | null = activeConv
+    ? { ...activeConv, host_resumable: activeSession?.hostResumable ?? false }
+    : livenessRowFromSession(activeSession);
   const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
     turnActive: status === "streaming",
   });
@@ -1164,80 +1237,6 @@ export function shouldShowTerminalSurface(
   );
 }
 
-function useNativeServerSwitcherForMainSurface(surface: HTMLElement | null, active: boolean) {
-  useEffect(() => {
-    if (!isIOSShell()) return;
-    if (!active) {
-      setNativeServerSwitcherHidden(true);
-      return;
-    }
-
-    let frame = 0;
-    const sync = () => {
-      frame = 0;
-      setNativeServerSwitcherHidden(!isSurfaceFrontmost(surface));
-    };
-    const schedule = () => {
-      if (frame !== 0) cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(sync);
-    };
-
-    schedule();
-
-    const observer =
-      typeof MutationObserver !== "undefined" ? new MutationObserver(schedule) : null;
-    observer?.observe(document.body, {
-      subtree: true,
-      childList: true,
-      attributes: true,
-      attributeFilter: ["class", "style", "aria-hidden", "data-state", "data-collapsed", "open"],
-    });
-
-    window.addEventListener("resize", schedule);
-    window.addEventListener("orientationchange", schedule);
-    window.addEventListener("scroll", schedule, true);
-    window.addEventListener("transitionend", schedule, true);
-    window.addEventListener("animationend", schedule, true);
-    window.addEventListener("focusin", schedule, true);
-    window.addEventListener("focusout", schedule, true);
-    window.visualViewport?.addEventListener("resize", schedule);
-    window.visualViewport?.addEventListener("scroll", schedule);
-
-    return () => {
-      if (frame !== 0) cancelAnimationFrame(frame);
-      observer?.disconnect();
-      window.removeEventListener("resize", schedule);
-      window.removeEventListener("orientationchange", schedule);
-      window.removeEventListener("scroll", schedule, true);
-      window.removeEventListener("transitionend", schedule, true);
-      window.removeEventListener("animationend", schedule, true);
-      window.removeEventListener("focusin", schedule, true);
-      window.removeEventListener("focusout", schedule, true);
-      window.visualViewport?.removeEventListener("resize", schedule);
-      window.visualViewport?.removeEventListener("scroll", schedule);
-      setNativeServerSwitcherHidden(true);
-    };
-  }, [active, surface]);
-}
-
-function isSurfaceFrontmost(surface: HTMLElement | null): boolean {
-  if (!surface) return false;
-  const rect = surface.getBoundingClientRect();
-  if (rect.width <= 0 || rect.height <= 0) return false;
-
-  const xInset = Math.min(24, Math.max(1, rect.width / 4));
-  const yInset = Math.min(24, Math.max(1, rect.height / 4));
-  const x = clamp(window.innerWidth / 2, rect.left + xInset, rect.right - xInset);
-  const y = clamp(rect.top + rect.height * 0.38, rect.top + yInset, rect.bottom - yInset);
-  const topElement = document.elementFromPoint(x, y);
-  return topElement !== null && surface.contains(topElement);
-}
-
-function clamp(value: number, min: number, max: number): number {
-  if (max < min) return min;
-  return Math.min(Math.max(value, min), max);
-}
-
 /**
  * The conversation scroll surface + composer — the content of the
  * "Main Agent" tab (and also the standalone view on `/`).
@@ -1311,6 +1310,19 @@ function MainAgentSurface({
   );
   const nav = useUserMessageNav(userMessageIds);
 
+  // Pending elicitation cards float to the bottom of the chat: rendered as the
+  // last items in the scroll flow and removed from their inline position so
+  // they don't render twice. Stick-to-bottom then keeps an outstanding
+  // question in view instead of letting trailing text scroll it off the top.
+  // Answered cards stay inline at their natural spot. `streamBubbles` keeps
+  // `bubbles`' reference when nothing is pending, so the common case allocates
+  // nothing.
+  const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
+  const streamBubbles = useMemo(
+    () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
+    [bubbles, pendingElicitations.length],
+  );
+
   // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — guarded so the composer's
   // own unmodified ArrowUp/Down history-recall still works.
   useEffect(() => {
@@ -1349,10 +1361,20 @@ function MainAgentSurface({
     setContainerEl(el);
   }, []);
   const [terminalSurfaceEl, setTerminalSurfaceEl] = useState<HTMLElement | null>(null);
-  useNativeServerSwitcherForMainSurface(
+  // True only while the chat/terminal surface is the frontmost thing on screen.
+  // Drives both native overlays so neither floats over an opened drawer.
+  const surfaceFrontmost = useSurfaceFrontmost(
     showTerminal ? terminalSurfaceEl : containerEl,
     !!conversationId,
   );
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    setNativeServerSwitcherHidden(!surfaceFrontmost);
+  }, [surfaceFrontmost]);
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    return () => setNativeServerSwitcherHidden(true);
+  }, []);
   // The conversation's scroll container + the StickToBottom controls needed to
   // override its bottom-lock, lifted out of the context by
   // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
@@ -1405,7 +1427,11 @@ function MainAgentSurface({
           // agent via the composer instead. Server enforces this too.
           readOnly={!isOwnerLevel(permissionLevel)}
         />
-        <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
+        <ConnectionIndicator
+          liveness={liveness}
+          onShowReconnectHelp={onShowReconnectHelp}
+          surfaceFrontmost={surfaceFrontmost}
+        />
       </>
     );
   }
@@ -1460,8 +1486,29 @@ function MainAgentSurface({
               )
             ) : (
               <>
-                {bubbles.map((bubble) => (
+                {streamBubbles.map((bubble) => (
                   <BubbleView key={bubbleKey(bubble)} bubble={bubble} />
+                ))}
+                {/* Pending elicitation cards, floated to the bottom of the
+                    chat so an outstanding question stays in view (stick-to-
+                    bottom) no matter how much text the agent streamed after
+                    it. Wrapped in an assistant Message so each matches an
+                    inline card's look; removed from their inline slot by
+                    `stripPendingElicitations`. Newest renders last, nearest
+                    the composer. Rendered ABOVE the Working… indicator so the
+                    card sits closest to the prompt and the shimmer stays the
+                    last thing in the flow. */}
+                {pendingElicitations.map((item) => (
+                  <Message
+                    key={item.elicitationId}
+                    from="assistant"
+                    className="max-w-full"
+                    data-testid="bottom-elicitation"
+                  >
+                    <MessageContent className="w-full">
+                      <ElicitationCard item={item} />
+                    </MessageContent>
+                  </Message>
                 ))}
                 {/* Working… shimmer between send and first rendered block.
                     Suppressed when the last bubble is a compaction spinner —
@@ -1544,7 +1591,8 @@ function MainAgentSurface({
         showCodexPlanMode={showCodexPlanMode}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
-        reconnectHint={liveness.kind === "runner_asleep"}
+        reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
+        sandboxAsleepHint={liveness.kind === "host_asleep"}
         unreachable={
           !sandboxLaunching &&
           (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
@@ -1557,7 +1605,11 @@ function MainAgentSurface({
       {/* Chat/Terminal toggle for terminal-first sessions, reconnect-or-
           fork banner when unreachable, nothing otherwise. Sits below the
           composer so its position is consistent with the terminal view. */}
-      <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
+      <ConnectionIndicator
+        liveness={liveness}
+        onShowReconnectHelp={onShowReconnectHelp}
+        surfaceFrontmost={surfaceFrontmost}
+      />
     </>
   );
 }
@@ -2102,9 +2154,13 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
 export function ConnectionIndicator({
   liveness,
   onShowReconnectHelp,
+  surfaceFrontmost = true,
 }: {
   liveness: SessionLiveness;
   onShowReconnectHelp: () => void;
+  // Whether the chat/terminal surface is frontmost (not under a drawer). Gates
+  // the native iOS bar so it doesn't float over an opened sidebar/panel.
+  surfaceFrontmost?: boolean;
 }) {
   const terminalFirst = useTerminalFirst();
   const keyboardVisible = useIOSNativeKeyboardVisible(
@@ -2112,6 +2168,28 @@ export function ConnectionIndicator({
     terminalFirst?.view === "chat",
   );
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
+  // Genuinely-unreachable states get the reconnect banner, for
+  // both terminal-first and regular sessions. `runner_asleep` (host up,
+  // runner relaunches on the next message), `host_asleep` (resumable managed
+  // host the server wakes on the next message), and `unknown` (pre-poll) are
+  // NOT unreachable — they're handled below.
+  const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
+
+  // In the iOS shell the Chat/Terminal toggle is the native Liquid Glass bar,
+  // not the in-page pill. Drive it from here (always mounted) with the SAME
+  // visibility the pill would have, expressed as a stable boolean so switching
+  // views never flickers the bar. Hook is called unconditionally (before any
+  // early return) to satisfy the rules of hooks.
+  const nativeBarVisible =
+    isIOSShell() &&
+    terminalFirst?.isTerminalFirst === true &&
+    !terminalFirst.isShellView &&
+    sandboxStatus?.stage !== "failed" &&
+    !unreachable &&
+    !keyboardVisible &&
+    surfaceFrontmost;
+  useNativeChatTerminalBar(terminalFirst, nativeBarVisible);
+
   if (sandboxStatus !== null) {
     // A failed launch owns this band with its reason. An IN-FLIGHT
     // launch renders in the chat thread (RunnerStartingIndicator)
@@ -2122,11 +2200,6 @@ export function ConnectionIndicator({
     }
     return null;
   }
-  // Genuinely-unreachable states get the reconnect banner, for
-  // both terminal-first and regular sessions. `runner_asleep` (host up,
-  // runner relaunches on the next message) and `unknown` (pre-poll) are
-  // NOT unreachable — they're handled below.
-  const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
   if (unreachable) {
     return (
       <button
@@ -2158,6 +2231,22 @@ export function ConnectionIndicator({
   // as the runner comes back. The strict `runner_online` still gates the
   // inline PTY *view* (it needs a live tunnel) — but not the toggle.
   if (terminalFirst?.isTerminalFirst) {
+    // In the iOS shell the toggle is the native bar (driven above). Render only
+    // a spacer reserving its fixed footprint so the composer clears it — and
+    // nothing when the bar is hidden.
+    if (isIOSShell()) {
+      // Chat reserves a touch less than terminal: the composer's own bottom
+      // content (the status line) already cushions the gap to the bar.
+      return nativeBarVisible ? (
+        <div
+          aria-hidden
+          className={cn(
+            "omnigent-native-bottom-spacer",
+            terminalFirst.view === "chat" && "omnigent-native-bottom-spacer--chat",
+          )}
+        />
+      ) : null;
+    }
     // A rail-opened shell owns the main view chrome-free — no pill: a
     // "Chat" option under someone else's shell misreads as the shell
     // being the agent. The shell view carries its own close affordance
@@ -2186,8 +2275,8 @@ export function ConnectionIndicator({
   }
 
   // `online`/`unknown` for a non-terminal-first session and
-  // `runner_asleep` for any session: status lives in the sidebar / the
-  // composer stays open, so render nothing here.
+  // `runner_asleep`/`host_asleep` for any session: status lives in the
+  // sidebar / the composer stays open, so render nothing here.
   return null;
 }
 
@@ -2267,8 +2356,63 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
 }
 
 /**
+ * Mirrors the Chat/Terminal state onto the iOS shell's native Liquid Glass
+ * switcher and routes its taps back into `setView`. Driven by a stable
+ * `visible` boolean (not this hook's mount/unmount), so toggling Chat/Terminal
+ * updates the bar in place instead of flickering it hidden→shown. A no-op
+ * outside the iOS shell; the caller renders its own in-page pill there.
+ */
+function useNativeChatTerminalBar(
+  ctx: ReturnType<typeof useTerminalFirst> | null,
+  visible: boolean,
+): void {
+  const native = isIOSShell();
+  const view = ctx?.view ?? "chat";
+  const terminalsAvailable = ctx?.terminalsAvailable ?? false;
+  const terminalStartingUp = ctx?.terminalStartingUp ?? false;
+
+  // Keep `setView` reachable from the subscribe-once effect without
+  // resubscribing whenever the callback identity changes.
+  const setViewRef = useRef(ctx?.setView);
+  setViewRef.current = ctx?.setView;
+
+  // Push current state + visibility down whenever any of it changes.
+  useEffect(() => {
+    if (!native) return;
+    setNativeViewMode({
+      mode: view,
+      terminalEnabled: terminalsAvailable,
+      terminalStartingUp,
+      visible,
+    });
+  }, [native, view, terminalsAvailable, terminalStartingUp, visible]);
+
+  // Belt-and-suspenders: hide the bar if the host component ever unmounts.
+  useEffect(() => {
+    if (!native) return;
+    return () => {
+      setNativeViewMode({
+        mode: "chat",
+        terminalEnabled: false,
+        terminalStartingUp: false,
+        visible: false,
+      });
+    };
+  }, [native]);
+
+  // Route native taps back into the web layer.
+  useEffect(() => {
+    if (!native) return;
+    return onNativeViewModeChanged((mode) => setViewRef.current?.(mode));
+  }, [native]);
+}
+
+/**
  * Chat/Terminal segmented control for terminal-first sessions. Status
  * lives in the sidebar — this band is purely a view toggle.
+ *
+ * Only rendered outside the iOS shell; inside it the switcher is drawn natively
+ * (Liquid Glass) over the web view — see {@link useNativeChatTerminalBar}.
  */
 function ConnectedTerminalFirstPill({
   ctx,
@@ -2281,6 +2425,7 @@ function ConnectedTerminalFirstPill({
   // reachable: greyed-and-spinning reads as "loading", greyed-and-static as
   // "no terminal / stopped".
   const { view, setView, terminalsAvailable, terminalStartingUp } = ctx;
+
   return (
     <div
       className={cn(
@@ -2655,6 +2800,14 @@ interface ComposerProps {
    */
   reconnectHint?: boolean;
   /**
+   * The session is host-bound to a dormant resumable managed host that is
+   * offline (`host_asleep`): the composer stays enabled, and the placeholder
+   * tells the user their next message will resume the sandbox host (which can
+   * take a few minutes) so the wake latency is expected, not surprising.
+   * Ignored once a turn is streaming.
+   */
+  sandboxAsleepHint?: boolean;
+  /**
    * The session is unreachable (`host_offline` / `local_stranded`): a message
    * can't wake it. The composer is blocked (disabled) and the reconnect
    * banner below is the only affordance.
@@ -2692,11 +2845,13 @@ export function buildSlashCommandMap(
   skills: ReadonlyArray<{ name: string; description: string }>,
   showEffort: boolean,
   showModel: boolean,
+  showCompact: boolean = true,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
     if (name === "/effort" && !showEffort) continue;
     if (name === "/model" && !showModel) continue;
+    if (name === "/compact" && !showCompact) continue;
     m[name] = description;
   }
   for (const skill of skills) {
@@ -2855,11 +3010,17 @@ function ComposerStatusLine() {
   // alongside contextWindow — so the branch reads from the same store as
   // the other status-line values rather than a separate fetch.
   const gitBranch = useChatStore((s) => s.gitBranch);
+  // qwen/goose/cursor/pi/opencode native sessions pick their model inside the
+  // vendor TUI, so Omnigent's bound `llmModel` is just an unused default
+  // (it would read e.g. "claude-sonnet-4-6" on a Qwen session). Hide the
+  // model/effort label for them; claude-/codex-native keep it (real picker).
+  const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
 
   const showBranch = !!conversationId && !!gitBranch;
-  const modelEffortLabel = conversationId
-    ? formatModelEffortStatusLabel(selectedModel ?? llmModel, selectedEffort, codexModelOptions)
-    : null;
+  const modelEffortLabel =
+    conversationId && !nativeVendorOwnsModel
+      ? formatModelEffortStatusLabel(selectedModel ?? llmModel, selectedEffort, codexModelOptions)
+      : null;
   const showPlanMode = !!conversationId && codexPlanMode;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
@@ -3021,6 +3182,7 @@ export function Composer({
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
+  sandboxAsleepHint = false,
   unreachable = false,
   costRoutingVerdict = null,
   costRoutingEligible = false,
@@ -3028,6 +3190,7 @@ export function Composer({
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<File[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
   // Index of the highlighted item in the slash-command suggestions menu.
@@ -3139,9 +3302,13 @@ export function Composer({
   // it each turn; native wrappers expose it only when they have a picker
   // path that the runner can propagate without blocking the vendor TUI.
   const showModel = !isNativeWrapper || showModels;
+  // /compact is only functional for native wrappers (claude-native,
+  // codex-native) which inject the slash command into the terminal.
+  // SDK harnesses (openai-agents-sdk, claude-sdk) don't support it yet.
+  const showCompact = isNativeWrapper;
   const slashCommands = useMemo(
-    () => buildSlashCommandMap(skills, showEffort, showModel),
-    [skills, showEffort, showModel],
+    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact),
+    [skills, showEffort, showModel, showCompact],
   );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
@@ -3210,6 +3377,10 @@ export function Composer({
   const executeSlashCommand = (cmd: string, arg: string): boolean => {
     switch (cmd) {
       case "/compact":
+        if (!showCompact) {
+          setCommandError("/compact is not supported for this agent type");
+          return true;
+        }
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -3344,8 +3515,15 @@ export function Composer({
   const [isDragActive, setIsDragActive] = useState(false);
 
   const addFiles = (incoming: File[]) => {
-    setFiles((prev) => [...prev, ...incoming]);
-    dirtyRef.current = true;
+    // Reject unsupported types (only images, PDF, and text/code) and
+    // oversized files up front — before the upload — with a friendly
+    // message. The server enforces the same limits authoritatively.
+    const { accepted, errors } = validateAttachments(incoming);
+    if (accepted.length > 0) {
+      setFiles((prev) => [...prev, ...accepted]);
+      dirtyRef.current = true;
+    }
+    setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   };
 
   const handleDrop = (e: DragEvent<HTMLDivElement>) => {
@@ -3378,6 +3556,7 @@ export function Composer({
 
   const removeFile = (index: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
+    setAttachmentError(null);
     dirtyRef.current = true;
   };
 
@@ -3460,6 +3639,7 @@ export function Composer({
     dirtyRef.current = true;
     setValue("");
     setFiles([]);
+    setAttachmentError(null);
     onClearAllQuotes();
   };
 
@@ -3728,9 +3908,11 @@ export function Composer({
                         ? "Waiting for agents…"
                         : isStreaming
                           ? "Send a follow-up (queued) — Esc to stop"
-                          : reconnectHint
-                            ? "Send a message to reconnect this session"
-                            : "Ask the agent anything…"
+                          : sandboxAsleepHint
+                            ? "Current session's host is offline. Next message will resume the sandbox host which can take minutes"
+                            : reconnectHint
+                              ? "Send a message to reconnect this session"
+                              : "Ask the agent anything…"
             }
             rows={1}
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
@@ -3767,6 +3949,12 @@ export function Composer({
                 </button>
               </span>
             ))}
+          </div>
+        )}
+        {/* Rejected-attachment feedback: unsupported type or too large */}
+        {attachmentError !== null && (
+          <div className="px-4 pb-2 text-xs text-destructive whitespace-pre-wrap">
+            {attachmentError}
           </div>
         )}
         {/* Inline slash-command feedback: errors and /help output */}

@@ -8,7 +8,10 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
+    GOOSE_NATIVE_WRAPPER_VALUE,
+    OPENCODE_NATIVE_WRAPPER_VALUE,
     PI_NATIVE_WRAPPER_VALUE,
+    QWEN_NATIVE_WRAPPER_VALUE,
     UI_MODE_LABEL_KEY,
     UI_MODE_TERMINAL_VALUE,
     WRAPPER_LABEL_KEY,
@@ -66,6 +69,16 @@ PI_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="pi",
 )
 
+OPENCODE_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="opencode",
+    display_name="OpenCode",
+    agent_name="opencode-native-ui",
+    harness="opencode-native",
+    wrapper_label=OPENCODE_NATIVE_WRAPPER_VALUE,
+    terminal_name="opencode",
+    subagent_wrapper_label="opencode-native-ui-subagent",
+)
+
 CURSOR_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="cursor",
     display_name="Cursor",
@@ -75,11 +88,32 @@ CURSOR_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="cursor",
 )
 
+GOOSE_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="goose",
+    display_name="Goose",
+    agent_name="goose-native-ui",
+    harness="goose-native",
+    wrapper_label=GOOSE_NATIVE_WRAPPER_VALUE,
+    terminal_name="goose",
+)
+
+QWEN_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="qwen",
+    display_name="Qwen Code",
+    agent_name="qwen-native-ui",
+    harness="qwen-native",
+    wrapper_label=QWEN_NATIVE_WRAPPER_VALUE,
+    terminal_name="qwen",
+)
+
 NATIVE_CODING_AGENTS: tuple[NativeCodingAgent, ...] = (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
+    OPENCODE_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    GOOSE_NATIVE_CODING_AGENT,
+    QWEN_NATIVE_CODING_AGENT,
 )
 
 _BY_AGENT_NAME = {agent.agent_name: agent for agent in NATIVE_CODING_AGENTS}

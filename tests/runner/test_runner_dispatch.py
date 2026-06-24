@@ -56,7 +56,7 @@ from omnigent.runner.app import (
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
-from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy
 from tests.runner.helpers import NullServerClient
 
 _TEST_HARNESS_NAME = "runner-test-default"
@@ -6217,6 +6217,312 @@ async def test_sys_session_get_info_maps_error_statuses(
 
 
 @pytest.mark.asyncio
+async def test_sys_session_share_defaults_to_caller_and_puts_grant() -> None:
+    """
+    Omitting ``session_id`` shares the caller's own session: the runner
+    PUTs to ``/v1/sessions/{conversation_id}/permissions`` with the
+    grantee and the numeric level mapped from the friendly name. If the
+    default-to-caller logic or the name->level mapping regressed, the
+    request path or body would be wrong (and an agent's "share this
+    session" would silently hit the wrong session or wrong level).
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={"user_id": "alice@example.com", "conversation_id": "conv_caller", "level": 2},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "level": "edit"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            # Sharing a named user only needs the non-public tier enabled.
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
+        )
+
+    # Exactly one PUT to the caller's own permissions sub-resource, with
+    # level "edit" mapped to the server's numeric 2 (1=read/2=edit/3=manage).
+    assert requests == [
+        (
+            "PUT",
+            "/v1/sessions/conv_caller/permissions",
+            {"user_id": "alice@example.com", "level": 2},
+        )
+    ]
+    result = json.loads(output)
+    assert result == {
+        "shared": True,
+        "session_id": "conv_caller",
+        "user_id": "alice@example.com",
+        "level": "edit",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status_code,expected_error",
+    [
+        pytest.param(404, "session_not_found", id="not-found"),
+        pytest.param(403, "access_denied", id="forbidden"),
+        pytest.param(401, "access_denied", id="unauthorized"),
+    ],
+)
+async def test_sys_session_share_maps_error_statuses(
+    status_code: int,
+    expected_error: str,
+) -> None:
+    """
+    A 404 maps to ``session_not_found``; 401/403 map to ``access_denied``
+    — a typed reason instead of a raw status, matching the sibling
+    session tools so the LLM can distinguish "no such session" from
+    "you can't manage it".
+
+    :param status_code: HTTP status the mocked Omnigent server returns.
+    :param expected_error: The typed error string the tool should emit.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"detail": "x"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "session_id": "conv_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
+        )
+
+    result = json.loads(output)
+    assert result["error"] == expected_error
+    assert result["session_id"] == "conv_x"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_rejects_bad_level_without_calling_server() -> None:
+    """
+    An unknown ``level`` is rejected client-side before any PUT — so a
+    typo can't fall through to the server or silently skip the grant. A
+    request reaching the handler would mean the level validation
+    regressed.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    called = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "level": "admin"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            # Share enabled (non-public) so the call reaches level validation.
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
+        )
+
+    assert called is False  # validation must short-circuit before the PUT
+    assert "level must be one of" in json.loads(output)["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_surfaces_server_message_on_4xx() -> None:
+    """
+    A 4xx the typed branches don't claim (here the server's 400 for a
+    ``__public__`` grant above read level) surfaces the server's own
+    ``{"error": {"message": ...}}`` text rather than a bare "returned
+    400". If the detail-extraction regressed, the agent would see only
+    the status code and couldn't tell that public is read-only — the
+    exact actionable reason the server gave.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    # Mirrors the OmnigentError envelope the server's exception handler
+    # emits (omnigent/server/app.py) for the public + level>read guard.
+    server_message = "Public access is limited to read-only (level 1)"
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"error": {"code": "INVALID_INPUT", "message": server_message}}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps(
+                {"user_id": "__public__", "level": "edit", "session_id": "conv_x"}
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            # agent_session_sharing: public lets __public__ pass the runner
+            # gate and reach the server, which rejects level>read for public.
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.PUBLIC),
+        )
+
+    result = json.loads(output)
+    # The server's verbatim message is surfaced, not flattened to a status.
+    assert result["error"] == server_message
+    assert result["status_code"] == 400
+    assert result["session_id"] == "conv_x"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "share_policy",
+    [
+        pytest.param(None, id="no-spec"),
+        pytest.param(SharePolicy.NONE, id="share-none"),
+    ],
+)
+async def test_sys_session_share_disabled_without_share_flag(
+    share_policy: SharePolicy | None,
+) -> None:
+    """
+    With no spec (``None``) or ``agent_session_sharing: none``, the
+    runner refuses the grant client-side and never PUTs — the
+    ``agent_session_sharing`` flag is the real gate, not just tool
+    advertisement, so a prompt-injected call naming the tool can't
+    escalate. A PUT reaching the handler would mean the runner-side
+    policy gate regressed.
+
+    :param share_policy: The spec's ``agent_session_sharing`` policy
+        under test (or ``None`` for a missing spec).
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    called = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    spec = (
+        None
+        if share_policy is None
+        else AgentSpec(spec_version=1, agent_session_sharing=share_policy)
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "session_id": "conv_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=spec,
+        )
+
+    assert called is False  # the gate must short-circuit before the PUT
+    assert "not enabled" in json.loads(output)["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_non_public_rejects_public_grant() -> None:
+    """
+    Under ``agent_session_sharing: non-public`` a grant to a named user
+    is allowed, but a ``__public__`` grant is refused client-side before
+    any PUT — the
+    non-public tier must not be able to expose the transcript anonymously
+    even if the model (or an injection) asks for it. A PUT here would
+    mean the public sub-gate regressed.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    called = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "__public__", "session_id": "conv_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
+        )
+
+    assert called is False  # public sub-gate must short-circuit before the PUT
+    assert "public" in json.loads(output)["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_public_allows_public_grant() -> None:
+    """
+    Under ``agent_session_sharing: public`` a ``__public__`` read grant
+    passes the runner gate and PUTs to the permissions endpoint — the
+    positive case the
+    non-public/none gates exclude. If the gate wrongly blocked it, public
+    sharing would be impossible even when the spec explicitly opts in.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={"user_id": "__public__", "conversation_id": "conv_caller", "level": 1},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "__public__"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.PUBLIC),
+        )
+
+    # __public__ reached the server as a level-1 (read) grant on the caller.
+    assert requests == [
+        ("PUT", "/v1/sessions/conv_caller/permissions", {"user_id": "__public__", "level": 1})
+    ]
+    result = json.loads(output)
+    assert result == {
+        "shared": True,
+        "session_id": "conv_caller",
+        "user_id": "__public__",
+        "level": "read",
+    }
+
+
+@pytest.mark.asyncio
 async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() -> None:
     """
     ``sys_session_get_info`` projects ``GET /v1/sessions/{id}`` metadata
@@ -6618,3 +6924,90 @@ async def test_create_session_reinit_preserves_existing_inbox() -> None:
             )
     finally:
         runner_app._session_inboxes_ref.pop(session_id, None)
+
+
+# ── approval-event flattening (elicitation-approval hang regression) ──────
+
+
+@pytest.mark.asyncio
+async def test_approval_event_flattened_for_harness_scaffold() -> None:
+    """A nested approval envelope is flattened to the scaffold's ApprovalEvent.
+
+    Regression for the elicitation-approval hang: the server forwards the
+    verdict as ``{"type": "approval", "data": {...}}``, but the harness
+    scaffold's ``ApprovalEvent`` requires ``elicitation_id`` / ``action`` /
+    ``content`` at the TOP level. If the runner forwards the envelope verbatim
+    the harness 422s and the parked ``ctx.elicit`` Future never resolves (the
+    turn hangs after a human approves). The runner must translate the envelope
+    into the flat event the scaffold validates — for every scaffold harness.
+    """
+    from omnigent.runtime.harnesses._scaffold import ApprovalEvent
+
+    captured: dict[str, Any] = {}
+
+    class _CapturingHarnessClient:
+        async def post(
+            self, url: str, *, json: dict[str, Any], timeout: float | None = None
+        ) -> httpx.Response:
+            captured["url"] = url
+            captured["body"] = json
+            return httpx.Response(204)
+
+    mgr = _FakeProcessManager(harness_client=cast(Any, _CapturingHarnessClient()))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, mgr),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            "/v1/sessions/conv_x/events",
+            json={
+                "type": "approval",
+                "data": {
+                    "elicitation_id": "elicit_x",
+                    "action": "accept",
+                    "content": {"note": "ok"},
+                },
+            },
+        )
+
+    assert resp.status_code == 204
+    # Forwarded body is FLAT — no ``data`` envelope.
+    assert captured["body"] == {
+        "type": "approval",
+        "elicitation_id": "elicit_x",
+        "action": "accept",
+        "content": {"note": "ok"},
+    }
+    # And it validates as the scaffold's ApprovalEvent (i.e. no 422).
+    ApprovalEvent.model_validate(captured["body"])
+
+
+@pytest.mark.asyncio
+async def test_approval_event_without_content_flattened() -> None:
+    """A decline verdict with no form content flattens without a ``content`` key."""
+    from omnigent.runtime.harnesses._scaffold import ApprovalEvent
+
+    captured: dict[str, Any] = {}
+
+    class _CapturingHarnessClient:
+        async def post(
+            self, url: str, *, json: dict[str, Any], timeout: float | None = None
+        ) -> httpx.Response:
+            captured["body"] = json
+            return httpx.Response(204)
+
+    mgr = _FakeProcessManager(harness_client=cast(Any, _CapturingHarnessClient()))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, mgr),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            "/v1/sessions/conv_y/events",
+            json={"type": "approval", "data": {"elicitation_id": "e2", "action": "decline"}},
+        )
+
+    assert resp.status_code == 204
+    assert captured["body"] == {"type": "approval", "elicitation_id": "e2", "action": "decline"}
+    ApprovalEvent.model_validate(captured["body"])

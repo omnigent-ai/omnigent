@@ -2084,7 +2084,7 @@ describe("Files scope default and persistence", () => {
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
     // The choice was written to localStorage — that's what makes it sticky.
     expect(localStorage.getItem(PREF_KEY)).toBe(
-      JSON.stringify({ changedOnly: true, sort: "recent" }),
+      JSON.stringify({ changedOnly: true, sort: "recent", collapsed: false }),
     );
 
     // Re-enter a *different* session fresh: it must open on the remembered
@@ -2189,7 +2189,7 @@ describe("Files scope default and persistence", () => {
     // preference. If this flips to changedOnly:false, a shared ?view=explore
     // link would silently clobber the recipient's remembered choice.
     expect(localStorage.getItem(PREF_KEY)).toBe(
-      JSON.stringify({ changedOnly: true, sort: "recent" }),
+      JSON.stringify({ changedOnly: true, sort: "recent", collapsed: false }),
     );
   });
 });

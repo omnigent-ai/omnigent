@@ -1,18 +1,25 @@
 """
-Helpers for the server-version backwards-compatibility harness.
+Helpers for the version backwards-compatibility harness.
 
-See ``docs/SERVER_VERSION_COMPAT_CI.md``. Two concerns:
+See ``docs/SERVER_VERSION_COMPAT_CI.md``. Two independent redirect knobs and
+their version skips:
 
-1. **Server redirect** — in compat mode the ``omnigent.cli server``
-   subprocess is launched from a *different* venv (one holding a pinned,
-   older ``omnigent`` build) than the test process. Driven by
-   ``OMNIGENT_COMPAT_SERVER_PYTHON``.
-2. **Version skip** — resolve the running server's version and enforce
-   ``@pytest.mark.min_server_version(...)`` so tests for features newer
-   than the server-under-test are skipped rather than failing.
+1. **Server redirect (Config 1)** — pin the ``omnigent.cli server`` subprocess
+   to an older build (``OMNIGENT_COMPAT_SERVER_PYTHON``) while the client,
+   runner, host, and tests stay on main. Skip newer-than-server features with
+   ``@pytest.mark.min_server_version(...)``.
+2. **Runner/host redirect (Config 2)** — pin the ``omnigent.runner._entry`` and
+   ``omnigent.host._daemon_entry`` subprocesses to an older build
+   (``OMNIGENT_COMPAT_RUNNER_PYTHON``) while the server, client, and tests stay
+   on main. Runner and host are colocated (one install, one version), so a
+   single knob governs both. Skip newer-than-runner features with
+   ``@pytest.mark.min_runner_version(...)``.
 
-Outside compat mode (neither env var set) every function here is inert and
-the test harness behaves exactly as before.
+The two knobs are orthogonal: each spawn site consults its own knob, so a run
+pins the server OR the runner/host (or neither), never shadowing the other.
+
+Outside compat mode (no env var set) every function here is inert and the test
+harness behaves exactly as before.
 """
 
 from __future__ import annotations
@@ -24,19 +31,72 @@ import tempfile
 import httpx
 from packaging.version import Version
 
-# Stable empty directory used as the server subprocess CWD in compat mode
-# (created lazily; see :func:`compat_server_cwd`).
-_compat_cwd: str | None = None
+# CWD caches keyed by component label ("server" / "runner"), created lazily.
+_compat_cwds: dict[str, str] = {}
 
 # Interpreter for the SERVER subprocess. Set to a venv python holding the
 # pinned older build; unset in normal runs (use the test process's python).
 COMPAT_SERVER_PYTHON_ENV = "OMNIGENT_COMPAT_SERVER_PYTHON"
 # Version string the workflow pinned (e.g. "0.1.1"). Backstop / cross-check
-# for the skip logic — never used to launch anything.
+# for the server skip logic — never used to launch anything.
 COMPAT_SERVER_VERSION_ENV = "OMNIGENT_COMPAT_SERVER_VERSION"
+# Interpreter for the RUNNER and HOST subprocesses (colocated → one knob).
+COMPAT_RUNNER_PYTHON_ENV = "OMNIGENT_COMPAT_RUNNER_PYTHON"
+# Version string the workflow pinned for the runner/host. The runner and host
+# expose no ``/api/version`` endpoint, so this env var is the *only* source for
+# the ``min_runner_version`` skip (no live cross-check).
+COMPAT_RUNNER_VERSION_ENV = "OMNIGENT_COMPAT_RUNNER_VERSION"
 
 
-# ── Server redirect ────────────────────────────────────────────────────
+# ── Redirect core (shared by server + runner/host) ─────────────────────
+
+
+def _compat_python(env_var: str) -> str | None:
+    """
+    The pinned-build interpreter named by *env_var*, or ``None``.
+
+    :param env_var: The redirect env var, e.g.
+        ``"OMNIGENT_COMPAT_SERVER_PYTHON"``.
+    :returns: The venv python path (e.g. ``"/tmp/old-env/bin/python"``) when
+        that component's compat mode is active, else ``None``.
+    """
+    return os.environ.get(env_var) or None
+
+
+def _compat_executable(env_var: str) -> str:
+    """
+    Interpreter to launch a component's subprocess with.
+
+    :param env_var: The component's redirect env var.
+    :returns: The pinned interpreter in compat mode, else ``sys.executable``.
+    """
+    return _compat_python(env_var) or sys.executable
+
+
+def _compat_cwd(env_var: str, label: str) -> str | None:
+    """
+    A neutral working directory for a redirected subprocess, or ``None``.
+
+    ``python -m omnigent...`` puts the CWD on ``sys.path[0]``, so a subprocess
+    launched from the repo checkout would import the worktree's ``omnigent/``
+    package — shadowing the pinned older install exactly like a ``PYTHONPATH``
+    prepend would. A stable empty directory forces the pinned venv's installed
+    ``omnigent`` to resolve.
+
+    :param env_var: The component's redirect env var.
+    :param label: Component label for the cache + temp-dir prefix, e.g.
+        ``"server"`` or ``"runner"``.
+    :returns: A stable empty directory path in compat mode; ``None`` otherwise
+        (inherit the parent's CWD — today's behavior).
+    """
+    if _compat_python(env_var) is None:
+        return None
+    if label not in _compat_cwds:
+        _compat_cwds[label] = tempfile.mkdtemp(prefix=f"omnigent-compat-{label}-cwd-")
+    return _compat_cwds[label]
+
+
+# ── Server redirect (Config 1) ─────────────────────────────────────────
 
 
 def compat_server_python() -> str | None:
@@ -47,7 +107,7 @@ def compat_server_python() -> str | None:
         path, e.g. ``"/tmp/server-env/bin/python"``) when compat mode is
         active, else ``None``.
     """
-    return os.environ.get(COMPAT_SERVER_PYTHON_ENV) or None
+    return _compat_python(COMPAT_SERVER_PYTHON_ENV)
 
 
 def server_executable() -> str:
@@ -57,7 +117,7 @@ def server_executable() -> str:
     :returns: The compat interpreter in compat mode, else ``sys.executable``
         (the test process's own python).
     """
-    return compat_server_python() or sys.executable
+    return _compat_executable(COMPAT_SERVER_PYTHON_ENV)
 
 
 def server_pythonpath(repo_root: str | os.PathLike[str]) -> str | None:
@@ -86,22 +146,14 @@ def compat_server_cwd() -> str | None:
     """
     Working directory for the server subprocess, or ``None`` to inherit.
 
-    In compat mode the subprocess must **not** run with the worktree as its
-    CWD: ``python -m omnigent.cli`` puts the CWD on ``sys.path[0]``, so the
-    worktree's ``omnigent/`` package would shadow the pinned older install
-    exactly like the ``PYTHONPATH`` prepend would — and CI runs from the repo
-    checkout root, which contains ``omnigent/``. Returning a stable empty
-    directory forces the compat venv's installed ``omnigent`` to resolve.
+    See :func:`_compat_cwd`. In compat mode the server runs from a stable
+    empty directory so the worktree's ``omnigent/`` doesn't shadow the pinned
+    older install via ``sys.path[0]``.
 
     :returns: A stable empty directory path in compat mode; ``None`` outside
         compat mode (inherit the parent's CWD — today's behavior).
     """
-    global _compat_cwd
-    if compat_server_python() is None:
-        return None
-    if _compat_cwd is None:
-        _compat_cwd = tempfile.mkdtemp(prefix="omnigent-compat-cwd-")
-    return _compat_cwd
+    return _compat_cwd(COMPAT_SERVER_PYTHON_ENV, "server")
 
 
 def apply_server_env(env: dict[str, str], repo_root: str | os.PathLike[str]) -> dict[str, str]:
@@ -124,6 +176,65 @@ def apply_server_env(env: dict[str, str], repo_root: str | os.PathLike[str]) -> 
     return env
 
 
+# ── Runner / host redirect (Config 2) ──────────────────────────────────
+
+
+def compat_runner_python() -> str | None:
+    """
+    Interpreter the runner and host subprocesses should run under, or ``None``.
+
+    :returns: The value of ``OMNIGENT_COMPAT_RUNNER_PYTHON`` (a venv python
+        path) when runner/host compat mode is active, else ``None``.
+    """
+    return _compat_python(COMPAT_RUNNER_PYTHON_ENV)
+
+
+def runner_executable() -> str:
+    """
+    Interpreter to launch ``omnigent.runner._entry`` / ``omnigent.host._daemon_entry``.
+
+    :returns: The pinned-old interpreter in runner compat mode, else
+        ``sys.executable`` (the test process's own python = main).
+    """
+    return _compat_executable(COMPAT_RUNNER_PYTHON_ENV)
+
+
+def compat_runner_cwd() -> str | None:
+    """
+    Working directory for the runner/host subprocess, or ``None`` to inherit.
+
+    See :func:`_compat_cwd` — neutral dir in runner compat mode so the worktree
+    doesn't shadow the pinned old runner/host install.
+
+    :returns: A stable empty directory path in runner compat mode; ``None``
+        otherwise.
+    """
+    return _compat_cwd(COMPAT_RUNNER_PYTHON_ENV, "runner")
+
+
+def apply_runner_env(env: dict[str, str]) -> dict[str, str]:
+    """
+    Neutralize ``PYTHONPATH`` on a runner/host-subprocess env dict in compat mode.
+
+    Unlike :func:`apply_server_env`, this is **neutralize-only**: in runner
+    compat mode it drops any inherited ``PYTHONPATH`` (so the pinned old build
+    in the compat venv resolves instead of being shadowed by the worktree);
+    outside compat mode it leaves *env* untouched. It never *adds* a prepend,
+    because the runner inherits its base env from the server fixture and the
+    host tests each set their own ``PYTHONPATH`` convention — forcing a prepend
+    here would change normal-mode behavior.
+
+    Mutates *env* in place (and returns it).
+
+    :param env: The runner/host subprocess environment being assembled.
+    :returns: The same dict, with ``PYTHONPATH`` removed in runner compat mode
+        and unchanged otherwise.
+    """
+    if compat_runner_python() is not None:
+        env.pop("PYTHONPATH", None)
+    return env
+
+
 # ── Version resolution + skip ──────────────────────────────────────────
 
 
@@ -142,6 +253,20 @@ def release_tuple(version: str) -> tuple[int, ...]:
     return Version(version).release
 
 
+def meets_min_version(actual: str, required: str) -> bool:
+    """
+    Whether *actual* is new enough to run a *required*-gated test.
+
+    Component-agnostic release-tuple comparison shared by the server and
+    runner skips.
+
+    :param actual: The running component's version, e.g. ``"0.1.1"``.
+    :param required: The marker's minimum version, e.g. ``"0.1.2"``.
+    :returns: ``True`` iff *actual*'s release tuple is ``>=`` *required*'s.
+    """
+    return release_tuple(actual) >= release_tuple(required)
+
+
 def meets_min_server_version(server_version: str, required: str) -> bool:
     """
     Whether *server_version* is new enough to run a *required*-gated test.
@@ -152,7 +277,36 @@ def meets_min_server_version(server_version: str, required: str) -> bool:
     :returns: ``True`` iff the server's release tuple is ``>=`` the
         required release tuple.
     """
-    return release_tuple(server_version) >= release_tuple(required)
+    return meets_min_version(server_version, required)
+
+
+def meets_min_runner_version(runner_version: str, required: str) -> bool:
+    """
+    Whether *runner_version* is new enough to run a *required*-gated test.
+
+    :param runner_version: The pinned runner/host version, e.g. ``"0.2.0"``.
+    :param required: The ``min_runner_version`` marker argument, e.g.
+        ``"0.2.1"``.
+    :returns: ``True`` iff the runner's release tuple is ``>=`` the required
+        release tuple.
+    """
+    return meets_min_version(runner_version, required)
+
+
+def pinned_runner_version() -> str | None:
+    """
+    The pinned runner/host version from the env backstop, or ``None``.
+
+    The runner and host have no ``/api/version`` endpoint to query, so unlike
+    :func:`resolve_server_version` there is no live source to reconcile — the
+    workflow-set ``OMNIGENT_COMPAT_RUNNER_VERSION`` is authoritative. ``None``
+    (normal runs) means "newest / unbounded", so no ``min_runner_version`` test
+    is skipped.
+
+    :returns: The pinned version string (e.g. ``"0.2.0"``), or ``None`` outside
+        runner compat mode.
+    """
+    return os.environ.get(COMPAT_RUNNER_VERSION_ENV) or None
 
 
 def reconcile_server_version(

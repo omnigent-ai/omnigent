@@ -374,6 +374,9 @@ def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
     :param tool_name: Tool Claude wants to call, e.g. ``"Bash"``.
     :returns: JSON-serializable payload mirroring Claude Code's
         published wire shape for the ``PermissionRequest`` event.
+        Deliberately carries no ``tool_use_id``: the real
+        PermissionRequest payload has no per-call id (it is minted only
+        when the tool call is emitted, after this permission check).
     """
     return {
         "session_id": "claude_sess_abc",
@@ -383,7 +386,6 @@ def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
         "hook_event_name": "PermissionRequest",
         "tool_name": tool_name,
         "tool_input": {"command": "ls -la"},
-        "tool_use_id": "tool_use_xyz",
     }
 
 
@@ -420,7 +422,6 @@ def _claude_ask_user_question_payload() -> dict[str, Any]:
                 },
             ],
         },
-        "tool_use_id": "tool_use_ask",
     }
 
 

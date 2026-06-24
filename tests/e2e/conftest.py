@@ -43,10 +43,15 @@ import yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._helpers.compat import (
+    apply_runner_env,
     apply_server_env,
+    compat_runner_cwd,
     compat_server_cwd,
+    meets_min_runner_version,
     meets_min_server_version,
+    pinned_runner_version,
     resolve_server_version,
+    runner_executable,
     server_executable,
 )
 from tests._model_pools import current_attempt, resolve_model
@@ -120,6 +125,36 @@ def _enforce_min_server_version(request: pytest.FixtureRequest) -> None:
     required = marker.args[0]
     if not meets_min_server_version(server_ver, required):
         pytest.skip(f"requires server >= {required}; running {server_ver}")
+
+
+@pytest.fixture(autouse=True)
+def _enforce_min_runner_version(request: pytest.FixtureRequest) -> None:
+    """Skip tests marked ``@pytest.mark.min_runner_version(X)`` on older runners/hosts.
+
+    The runner/host backwards-compat run (Config 2) pins the
+    ``omnigent.runner._entry`` / ``omnigent.host._daemon_entry`` subprocesses to
+    an older build and sets ``OMNIGENT_COMPAT_RUNNER_VERSION``. The runner/host
+    expose no ``/api/version`` endpoint, so — unlike the server skip — the
+    version comes purely from that env backstop
+    (:func:`tests._helpers.compat.pinned_runner_version`); ``None`` (normal
+    runs) means "newest", so unmarked / non-compat runs skip nothing.
+
+    Comparison is on the PEP 440 release tuple, so a ``.devN`` of ``X``
+    satisfies ``min_runner_version("X")``.
+
+    :param request: The pytest request, used to read the marker.
+    """
+    marker = request.node.get_closest_marker("min_runner_version")
+    if marker is None:
+        return
+    if not marker.args:
+        raise pytest.UsageError("min_runner_version marker requires a version argument")
+    pinned = pinned_runner_version()
+    if pinned is None:
+        return
+    required = marker.args[0]
+    if not meets_min_runner_version(pinned, required):
+        pytest.skip(f"requires runner >= {required}; running {pinned}")
 
 
 # Agent bundle directories relative to repo root.
@@ -704,17 +739,25 @@ def live_server(
     base_url = f"http://localhost:{port}"
 
     # ── Spawn runner as sibling subprocess ───────────────
+    # Compat-aware: the test process's python normally, the pinned OLD runner's
+    # venv python in runner compat mode (Config 2). apply_runner_env drops the
+    # inherited worktree PYTHONPATH in that mode so the old build resolves; the
+    # server above is independently main or old per its own knob.
     runner_log = tmp_path_factory.mktemp("e2e_logs") / "runner.log"
     runner_log_handle = open(runner_log, "w")  # noqa: SIM115
-    runner_proc = subprocess.Popen(
-        [sys.executable, "-m", "omnigent.runner._entry"],
-        env={
+    runner_env = apply_runner_env(
+        {
             **env,
             "OMNIGENT_RUNNER_ID": runner_id,
             "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
             "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
             "RUNNER_SERVER_URL": base_url,
-        },
+        }
+    )
+    runner_proc = subprocess.Popen(
+        [runner_executable(), "-m", "omnigent.runner._entry"],
+        env=runner_env,
+        cwd=compat_runner_cwd(),
         stdout=runner_log_handle,
         stderr=subprocess.STDOUT,
     )

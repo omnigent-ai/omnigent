@@ -33,7 +33,9 @@ import { Badge } from "@/components/ui/badge";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
+import { GooseIcon } from "@/components/icons/GooseIcon";
 import { NessieIcon } from "@/components/icons/NessieIcon";
+import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
 import { RunningDot } from "@/components/RunningDot";
@@ -52,6 +54,7 @@ import { AddAgentDialog } from "./AddAgentDialog";
 // global and must be preserved across navigation.
 const SESSION_SCOPED_PARAMS = ["file", "diff", "comment", "view"] as const;
 const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
+const OPENCODE_NATIVE_SUBAGENT_WRAPPER = "opencode-native-ui-subagent";
 // Pi children are scaffold (no wrapper label); the spawn title's agent-type head (``tool``) is the signal.
 const PI_AGENT_NAME = "pi";
 type AgentRowIcon = ComponentType<SVGProps<SVGSVGElement>>;
@@ -304,8 +307,10 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
   if (nativeAgent?.iconKind === "claude") return ClaudeIcon;
   if (nativeAgent?.iconKind === "codex") return CodexIcon;
+  if (nativeAgent?.iconKind === "opencode") return OpenCodeIcon;
   if (nativeAgent?.iconKind === "pi") return PiIcon;
   if (nativeAgent?.iconKind === "cursor") return CursorIcon;
+  if (nativeAgent?.iconKind === "goose") return GooseIcon;
   // Exact match — substring checks would false-match names like "pipeline".
   if (child.tool === PI_AGENT_NAME) return PiIcon;
   return null;
@@ -383,8 +388,11 @@ function childPrimaryLabel(child: ChildSessionInfo): string {
   // LLM-spawned titles cannot start with "ui:" because the spec validator
   // rejects "ui" as a sub-agent name.
   const isUserAdded = child.title?.startsWith("ui:") ?? false;
-  const isCodexNativeSubagent = child.labels?.[WRAPPER_LABEL_KEY] === CODEX_NATIVE_SUBAGENT_WRAPPER;
-  if (isCodexNativeSubagent && !isUserAdded) {
+  const childWrapper = child.labels?.[WRAPPER_LABEL_KEY];
+  const isNativeSubagent =
+    childWrapper === CODEX_NATIVE_SUBAGENT_WRAPPER ||
+    childWrapper === OPENCODE_NATIVE_SUBAGENT_WRAPPER;
+  if (isNativeSubagent && !isUserAdded) {
     return child.tool ?? child.title ?? child.id;
   }
   let titleTask: string | null = null;
@@ -462,13 +470,17 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
       ? ClaudeIcon
       : nativeAgent?.iconKind === "codex"
         ? CodexIcon
-        : nativeAgent?.iconKind === "pi"
-          ? PiIcon
-          : nativeAgent?.iconKind === "cursor"
-            ? CursorIcon
-            : isNessie
-              ? NessieIcon
-              : BotIcon;
+        : nativeAgent?.iconKind === "opencode"
+          ? OpenCodeIcon
+          : nativeAgent?.iconKind === "pi"
+            ? PiIcon
+            : nativeAgent?.iconKind === "cursor"
+              ? CursorIcon
+              : nativeAgent?.iconKind === "goose"
+                ? GooseIcon
+                : isNessie
+                  ? NessieIcon
+                  : BotIcon;
   // Native wrappers show the product name (mirroring the sidebar) instead
   // of the spec's YAML name (e.g. "claude-native-ui"); other agents show
   // their agent name, with "main" only while the session loads or when it

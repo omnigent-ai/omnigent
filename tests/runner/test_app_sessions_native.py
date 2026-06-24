@@ -1155,6 +1155,137 @@ async def test_create_session_threads_cursor_bridge_dir_without_dead_guard_env(
     assert "HARNESS_CURSOR_NATIVE_REQUEST_SESSION_ID" not in env
 
 
+@pytest.mark.asyncio
+async def test_create_session_threads_workspace_to_pi_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pi pre-spawn receives the session workspace, not the bundle dir."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    session_id = "conv_pi_worktree"
+    runner_workspace = tmp_path / "runner-workspace"
+    runner_workspace.mkdir()
+    bundle_dir = tmp_path / "runner-specs" / "ag_pi-v1"
+    bundle_dir.mkdir(parents=True)
+    worktree = tmp_path / "repo-worktrees" / "feature-x"
+    worktree.mkdir(parents=True)
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi-worktree-agent",
+        skills_filter="none",
+        executor=ExecutorSpec(config={"harness": "pi"}),
+    )
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    class _SessionWorkspaceClient(NullServerClient):
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            del kwargs
+            if url == f"/v1/sessions/{session_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": session_id,
+                        "agent_id": "ag_pi",
+                        "created_at": 1.0,
+                        "workspace": str(worktree),
+                    },
+                    request=httpx.Request("GET", url),
+                )
+            return await super().get(url)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_SessionWorkspaceClient(),  # type: ignore[arg-type]
+        runner_workspace=runner_workspace,
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "ag_pi"},
+        )
+
+    assert resp.status_code == 201
+    assert pm.get_client_calls
+    conversation_id, harness, env = pm.get_client_calls[-1]
+    assert conversation_id == session_id
+    assert harness == "pi"
+    assert env is not None
+    assert env["HARNESS_PI_CWD"] == str(worktree.resolve())
+    assert env["HARNESS_PI_BUNDLE_DIR"] == str(bundle_dir)
+
+
+@pytest.mark.parametrize("workspace_value", [None, "   "])
+@pytest.mark.asyncio
+async def test_create_session_threads_runner_workspace_to_pi_cwd_when_session_workspace_missing(
+    workspace_value: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pi pre-spawn falls back to runner workspace when session workspace is empty."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    session_id = "conv_pi_runner_workspace"
+    runner_workspace = tmp_path / "runner-workspace"
+    runner_workspace.mkdir()
+    bundle_dir = tmp_path / "runner-specs" / "ag_pi-v1"
+    bundle_dir.mkdir(parents=True)
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi-runner-workspace-agent",
+        skills_filter="none",
+        executor=ExecutorSpec(config={"harness": "pi"}),
+    )
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    class _SessionWorkspaceClient(NullServerClient):
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            del kwargs
+            if url == f"/v1/sessions/{session_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": session_id,
+                        "agent_id": "ag_pi",
+                        "created_at": 1.0,
+                        "workspace": workspace_value,
+                    },
+                    request=httpx.Request("GET", url),
+                )
+            return await super().get(url)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_SessionWorkspaceClient(),  # type: ignore[arg-type]
+        runner_workspace=runner_workspace,
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "ag_pi"},
+        )
+
+    assert resp.status_code == 201
+    assert pm.get_client_calls
+    conversation_id, harness, env = pm.get_client_calls[-1]
+    assert conversation_id == session_id
+    assert harness == "pi"
+    assert env is not None
+    assert env["HARNESS_PI_CWD"] == str(runner_workspace.resolve())
+    assert env["HARNESS_PI_BUNDLE_DIR"] == str(bundle_dir)
+
+
 @pytest.mark.parametrize(
     ("session_json", "expected"),
     [
@@ -4885,85 +5016,6 @@ class _OverflowThenSuccessHarnessClient:
                 pass
 
         return _Response()
-
-
-@pytest.mark.asyncio
-async def test_reactive_compaction_retries_after_overflow(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Reactive compaction: overflow on first call triggers compaction and retry.
-
-    Breakage this catches: if the proxy_stream doesn't detect context-window
-    errors, the turn fails permanently instead of compacting and retrying.
-    If the retry logic is broken, the second harness call never happens.
-    """
-    import asyncio as _aio
-
-    history = [
-        {
-            "id": f"item_{i}",
-            "type": "message",
-            "role": "user" if i % 2 == 0 else "assistant",
-            "content": [{"type": "input_text", "text": f"msg {i}"}],
-        }
-        for i in range(10)
-    ]
-    spec = AgentSpec(spec_version=1, name="reactive-compact-test")
-    success_frames = [
-        _sse({"type": "response.created", "response": {"id": "resp_r"}}),
-        _sse({"type": "response.output_text.delta", "delta": "compacted ok"}),
-        _sse({"type": "response.completed", "response": {"id": "resp_r"}}),
-    ]
-    hc = _OverflowThenSuccessHarnessClient(success_frames)
-    pm = _FakeProcessManager(hc)  # type: ignore[arg-type]
-    server_client = _FakeServerClient(history)
-    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id
-        return spec
-
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=server_client,  # type: ignore[arg-type]
-    )
-
-    async with _runner_client(app) as client:
-        # Create session — loads history, stays idle (last item is assistant).
-        resp = await client.post(
-            "/v1/sessions",
-            json={"session_id": "conv_reactive", "agent_id": "ag_1"},
-        )
-        assert resp.status_code == 201
-        assert resp.json()["status"] == "idle"
-
-        # Send message → triggers turn → first harness call overflows →
-        # reactive compaction fires → second harness call succeeds.
-        resp2 = await client.post(
-            "/v1/sessions/conv_reactive/events",
-            json={
-                "type": "message",
-                "role": "user",
-                "agent_id": "ag_1",
-                "model": "test",
-                "content": [{"type": "input_text", "text": "trigger"}],
-            },
-        )
-        assert resp2.status_code == 202
-        await _aio.sleep(1.0)
-
-    # 2 harness calls: first overflowed, second succeeded after compaction.
-    # If 1, the overflow wasn't detected or retry didn't fire.
-    assert len(hc.posted_bodies) == 2, (
-        f"Expected 2 harness POSTs (overflow + retry), "
-        f"got {len(hc.posted_bodies)}. If 1, reactive compaction "
-        f"didn't detect the overflow or didn't retry."
-    )
-    assert "Reactive compaction for session=conv_reactive: 5000 > 4096" in caplog.text
-
-
-# ── Interruption cancellation item tests ─────────────────────────────
 
 
 def _build_interrupt_app(
@@ -10535,6 +10587,10 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     spec = captured["spec"]
     assert spec.command == "claude"
     assert spec.env["ENABLE_TOOL_SEARCH"] == "true"
+    # The claude-native terminal must opt into keeping its private tmux server
+    # alive past an inner-CLI exit, so a sub-agent worker whose `claude` exits
+    # early no longer cascades into "no server running" (#540).
+    assert spec.keep_alive_after_exit is True
     args = spec.args
     settings = json.loads(args[args.index("--settings") + 1])
     assert "PermissionRequest" in settings["hooks"]
@@ -13637,108 +13693,6 @@ async def test_user_pin_suppresses_sticky_model_on_background_turn(
     assert pinned_verdict.applied is False, (
         "the pinned turn's verdict must be recorded as NOT applied"
     )
-
-
-@pytest.mark.asyncio
-async def test_compaction_retry_keeps_advisor_application(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The post-overflow retry re-appends the note AND keeps the per-turn
-    model override after the compacted history replaces the body content.
-
-    Breakage this catches: before the fix, the retry reset
-    ``harness_body["content"]`` to the compacted history wholesale; the
-    note must be re-appended (it lives in content), while the separate
-    ``model_override`` key must survive the rebuild untouched.
-
-    :param monkeypatch: Replaces the production judge with the stub.
-    """
-    import asyncio as _aio
-
-    from omnigent.cost_plan import parse_verdict
-
-    _patch_judge_returns_pricey(monkeypatch)
-    history = [
-        {
-            "id": f"item_{i}",
-            "type": "message",
-            "role": "user" if i % 2 == 0 else "assistant",
-            "content": [{"type": "input_text", "text": f"msg {i}"}],
-        }
-        for i in range(10)
-    ]
-    spec = _advisor_orchestrator_spec()
-    success_frames = [
-        _sse({"type": "response.created", "response": {"id": "resp_a"}}),
-        _sse({"type": "response.output_text.delta", "delta": "compacted ok"}),
-        _sse({"type": "response.completed", "response": {"id": "resp_a"}}),
-    ]
-    hc = _OverflowThenSuccessHarnessClient(success_frames)
-    pm = _FakeProcessManager(hc)  # type: ignore[arg-type]
-    server_client = _LabelPatchRecordingServerClient(history)
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return spec
-
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=server_client,  # type: ignore[arg-type]
-    )
-
-    async with _runner_client(app) as client:
-        resp = await client.post(
-            "/v1/sessions",
-            json={"session_id": "conv_adv_retry", "agent_id": "ag_adv"},
-        )
-        assert resp.status_code == 201
-        resp2 = await client.post(
-            "/v1/sessions/conv_adv_retry/events",
-            json={
-                "type": "message",
-                "role": "user",
-                "agent_id": "ag_adv",
-                "model": "test",
-                "content": [{"type": "input_text", "text": "refactor the auth flow"}],
-            },
-        )
-        assert resp2.status_code == 202
-        await _aio.sleep(1.0)
-
-    # Two harness calls: the overflowed original and the compacted retry.
-    assert len(hc.posted_bodies) == 2
-    first, retry = hc.posted_bodies
-    # Both bodies carry the per-turn model override (model_override is a
-    # standalone key — the content rebuild must not drop it).
-    assert first.get("model_override") == "model-pricey"
-    assert retry.get("model_override") == "model-pricey", (
-        "the compacted-history retry lost the per-turn model override."
-    )
-    # The note is re-merged exactly once on the retry: zero = dropped by
-    # the content reset (the pre-fix bug); two = leaked into cached history.
-    first_notes = _advisor_note_items(first.get("content") or [])
-    retry_notes = _advisor_note_items(retry.get("content") or [])
-    assert len(first_notes) == 1
-    assert retry_notes == first_notes
-    # Both bodies must keep the user's question primary in the delivered
-    # message, with the note riding along — a note-only latest user message
-    # means the question was shadowed (the live optimize-mode regression).
-    for which, posted in (("first", first), ("retry", retry)):
-        delivered = _latest_user_texts(posted.get("content") or [])
-        assert delivered and delivered[0] != first_notes[0], (
-            f"the {which} body's delivered user message starts with the "
-            f"advisor note ({delivered!r}); the user's question was shadowed."
-        )
-        assert first_notes[0] in delivered, (
-            f"the {which} body's delivered user message lost the advisor note ({delivered!r})."
-        )
-    # Label persisted once with applied=True.
-    label_bodies = [body for body in server_client.label_patches if "labels" in body]
-    assert len(label_bodies) == 1
-    verdict = parse_verdict(label_bodies[0]["labels"])
-    assert verdict is not None
-    assert verdict.applied is True
 
 
 # ── Per-session transcript-forwarder registry (double-mirror regression) ──

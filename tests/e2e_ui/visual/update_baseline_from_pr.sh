@@ -13,7 +13,7 @@
 # Requires: gh (authenticated), git. The artifact is kept for 7 days.
 set -euo pipefail
 
-BASELINE="tests/e2e_ui/visual/snapshots/test_landing_snapshot/test_empty_landing_matches_baseline/test_empty_landing_matches_baseline[chromium][linux].png"
+SNAP_ROOT="tests/e2e_ui/visual/snapshots"
 
 PR=""
 REPO="${REPO:-}"
@@ -58,20 +58,28 @@ if ! gh run download "$RUN_ID" --repo "$REPO" -n "ui-snapshot-$RUN_ID" -D "$TMP"
   gh run download "$RUN_ID" --repo "$REPO" -D "$TMP"  # fall back to all artifacts
 fi
 
-# On a mismatch the runner-rendered image is snapshot_failures/.../actual_*.png.
-# On an --update-snapshots run it's the regenerated file under snapshots/.
-SRC=$(find "$TMP" -type f -name 'actual_*.png' | head -n1)
-[ -z "$SRC" ] && SRC=$(find "$TMP" -type f -path '*/snapshots/*' -name 'test_empty_landing_matches_baseline*.png' | head -n1)
-if [ -z "$SRC" ]; then
-  echo "No rendered image in the artifact -- the gate likely PASSED, so the baseline already matches. Nothing to update." >&2
+# The gate runs under GitHub Actions, where the plugin rewrites a mismatching
+# baseline IN PLACE under snapshots/ (and creates a missing one there); passing
+# baselines are left untouched. The artifact carries that whole snapshots/ tree,
+# so just restore it over the committed one -- git add then stages exactly the
+# baselines that drifted. (Reconstructing paths from snapshot_failures/ instead
+# is fragile: that tree keys subdirs by <test>[browser][platform], not the
+# baseline's <test>, so it would write a parallel, never-read duplicate.)
+src_root=$(find "$TMP" -type d -name snapshots | head -1)
+if [ -z "$src_root" ]; then
+  echo "error: artifact has no snapshots/ tree -- nothing to restore." >&2
+  exit 1
+fi
+cp -R "$src_root/." "$SNAP_ROOT/"
+
+if git diff --quiet -- "$SNAP_ROOT"; then
+  echo "No baseline drift in the artifact -- the gate render already matches the committed baselines. Nothing to update." >&2
   exit 0
 fi
-echo "  rendered image: ${SRC#"$TMP"/}"
 
-cp "$SRC" "$BASELINE"
 echo
-echo "Updated baseline: $BASELINE"
-git --no-pager diff --stat -- "$BASELINE" || true
+echo "Updated baseline(s) from the gate render:"
+git --no-pager diff --stat -- "$SNAP_ROOT" || true
 echo
-echo "Next: review the image, then commit + push:"
-echo "  git add \"$BASELINE\" && git commit -m 'test(ui-snapshot): update landing baseline' && git push"
+echo "Next: review the image(s), then commit + push:"
+echo "  git add \"$SNAP_ROOT\" && git commit -m 'test(ui-snapshot): update visual baselines' && git push"

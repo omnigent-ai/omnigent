@@ -568,9 +568,11 @@ def test_repl_two_turns_fires_one_approval_per_turn(
         child.expect("approval required", timeout=30)
         child.send("y" + "\r")
         child.expect("approved", timeout=5)
-        # Wait for the turn to fully land — the stream-done
-        # elapsed-time label is the cleanest signal.
-        _wait_for_turn_complete(child, timeout=30)
+        # Wait for the turn to fully land by syncing on the
+        # scripted reply text (deterministic content) rather than
+        # the cosmetic `· ready` idle-settle, which can race /
+        # not-render under CI load (the observed flake).
+        child.expect("Nice to meet you", timeout=30)
 
         # Drain anything queued so the next expect starts
         # from a clean slate. Generous wait because the REPL
@@ -612,7 +614,9 @@ def test_repl_two_turns_fires_one_approval_per_turn(
         # Approve and confirm one-and-done.
         child.send("y" + "\r")
         child.expect("approved", timeout=5)
-        _wait_for_turn_complete(child, timeout=30)
+        # Sync on the scripted turn-2 reply (deterministic content)
+        # instead of the racy `· ready` idle-settle marker.
+        child.expect("Sure thing", timeout=30)
 
         # Final sweep: no extra approval banners after the
         # two we expected.

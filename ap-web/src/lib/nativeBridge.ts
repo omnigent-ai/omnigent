@@ -21,6 +21,13 @@
 //     notifications in the browser path.
 
 /**
+ * Phase of a native sidebar-drag gesture (see `onSidebarDrag`). `begin` and
+ * `move` are live drag frames carrying an open fraction; `open` and `close`
+ * are the settle decision the shell made on release.
+ */
+export type SidebarDragPhase = "begin" | "move" | "open" | "close";
+
+/**
  * Minimal API surface exposed by native shells. Electron exposes the legacy
  * `window.omnigentDesktop`; newer shells expose `window.omnigentNative`.
  * Kept intentionally tiny and string/number only so it survives bridge
@@ -42,6 +49,15 @@ interface NativeShellApi {
    */
   onNotificationActivated?: (callback: (path: string) => void) => () => void;
   /**
+   * Subscribe to native sidebar-drag events. The iOS shell streams a left-edge
+   * swipe here (the gesture it repurposed from back-navigation) so the renderer
+   * can drive its sidebar as an interactive drawer: `begin`/`move` carry a 0→1
+   * open fraction the sidebar should track live (no transition), and
+   * `open`/`close` are the settle decision on release (animate to that resting
+   * state). Returns an unsubscribe.
+   */
+  onSidebarDrag?: (callback: (phase: SidebarDragPhase, progress: number) => void) => () => void;
+  /**
    * Let native chrome react to web UI state. The iOS shell uses this to show
    * its floating server switcher only when the chat transcript is visible.
    */
@@ -51,6 +67,28 @@ interface NativeShellApi {
    * fallback so a newer SPA can still ask an older shell to hide the switcher.
    */
   setSidebarOpen?: (open: boolean) => void;
+  /**
+   * Drive the native Chat/Terminal switcher (iOS). The web app owns the truth
+   * and pushes the current mode, whether the terminal is reachable / booting,
+   * and whether the switcher should be shown at all. Absent on older shells,
+   * in which case the web renders its own in-page pill instead.
+   */
+  setViewMode?: (params: NativeViewModeParams) => void;
+  /** Subscribe to taps on the native switcher; returns an unsubscribe. */
+  onViewModeChanged?: (callback: (mode: NativeViewMode) => void) => () => void;
+}
+
+export type NativeViewMode = "chat" | "terminal";
+
+export interface NativeViewModeParams {
+  /** Currently selected view. */
+  mode: NativeViewMode;
+  /** Whether the Terminal option is selectable (a reachable PTY exists). */
+  terminalEnabled: boolean;
+  /** Terminal is booting but not yet openable — drives a spinner. */
+  terminalStartingUp?: boolean;
+  /** Whether the switcher should be shown at all right now. */
+  visible: boolean;
 }
 
 /**
@@ -186,6 +224,29 @@ export function onNativeNotificationActivated(callback: (path: string) => void):
 }
 
 /**
+ * Subscribe to native sidebar-drag events from the iOS shell's left-edge swipe
+ * (the gesture it repurposed from back-navigation), so the renderer can drive
+ * its sidebar as an interactive drawer — tracking the finger on `begin`/`move`
+ * and animating to the settled state on `open`/`close`.
+ *
+ * Returns an unsubscribe function. A no-op (returning a no-op unsubscribe)
+ * outside a native shell or under a shell too old to support the gesture, so
+ * callers can register it unconditionally.
+ */
+export function onNativeSidebarDrag(
+  callback: (phase: SidebarDragPhase, progress: number) => void,
+): () => void {
+  const native = nativeApi();
+  if (!native?.onSidebarDrag) return () => {};
+  try {
+    return native.onSidebarDrag(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onSidebarDrag failed:", err);
+    return () => {};
+  }
+}
+
+/**
  * Paint the dock / taskbar badge with a count (macOS dock badge, Linux Unity
  * launcher count). Pass `0` (or omit) to clear it.
  *
@@ -221,6 +282,39 @@ export function setNativeServerSwitcherHidden(hidden: boolean): void {
 /** @deprecated Use setNativeServerSwitcherHidden. */
 export function setNativeSidebarOpen(open: boolean): void {
   setNativeServerSwitcherHidden(open);
+}
+
+/**
+ * Push the current Chat/Terminal state to the native switcher (iOS). The web
+ * app owns this state; the native bar is a thin control surface that renders it
+ * and reports taps back via {@link onNativeViewModeChanged}. No-op on shells
+ * without the native switcher (older iOS shells, Electron, plain browser) — the
+ * caller renders its own in-page pill there.
+ */
+export function setNativeViewMode(params: NativeViewModeParams): void {
+  const native = nativeApi();
+  if (!native?.setViewMode) return;
+  try {
+    native.setViewMode(params);
+  } catch (err) {
+    console.warn("[nativeBridge] native setViewMode failed:", err);
+  }
+}
+
+/**
+ * Subscribe to taps on the native Chat/Terminal switcher. The shell sends the
+ * mode the user selected; route it into the web view's own state. Returns an
+ * unsubscribe; a no-op outside a shell that exposes the native switcher.
+ */
+export function onNativeViewModeChanged(callback: (mode: NativeViewMode) => void): () => void {
+  const native = nativeApi();
+  if (!native?.onViewModeChanged) return () => {};
+  try {
+    return native.onViewModeChanged(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onViewModeChanged failed:", err);
+    return () => {};
+  }
 }
 
 /**

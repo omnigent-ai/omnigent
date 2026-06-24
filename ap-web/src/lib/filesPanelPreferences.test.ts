@@ -20,10 +20,12 @@ describe("filesPanelPreferences", () => {
   });
 
   it("round-trips a written preference", () => {
-    writeFilesPanelPreferences({ changedOnly: true, sort: "alpha" });
-    // The written value must come back — proves the write serialized and the
-    // read parsed/validated the field.
-    expect(readFilesPanelPreferences()).toEqual({ changedOnly: true, sort: "alpha" });
+    writeFilesPanelPreferences({ changedOnly: true, sort: "alpha", collapsed: false });
+    expect(readFilesPanelPreferences()).toEqual({
+      changedOnly: true,
+      sort: "alpha",
+      collapsed: false,
+    });
   });
 
   it("falls back to defaults on malformed JSON", () => {
@@ -43,11 +45,19 @@ describe("filesPanelPreferences", () => {
     // A record present but with a non-boolean changedOnly must default the
     // field rather than pass a garbage value through to the panel.
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ changedOnly: "yes" }));
-    expect(readFilesPanelPreferences()).toEqual({ changedOnly: false, sort: "recent" });
+    expect(readFilesPanelPreferences()).toEqual({
+      changedOnly: false,
+      sort: "recent",
+      collapsed: false,
+    });
   });
 
   it("defaults sort when the stored value is invalid", () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ changedOnly: true, sort: "bogus" }));
-    expect(readFilesPanelPreferences()).toEqual({ changedOnly: true, sort: "recent" });
+    expect(readFilesPanelPreferences()).toEqual({
+      changedOnly: true,
+      sort: "recent",
+      collapsed: false,
+    });
   });
 });

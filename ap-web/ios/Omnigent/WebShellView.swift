@@ -31,8 +31,7 @@ struct WebShellView: View {
           maxWidth: ServerSwitcherMetrics.maxWidth(for: geometry.size.width),
           switchServer: switchServer,
           connectToNewServer: connectToNewServer,
-          reload: model.reload,
-          find: model.showFind
+          reload: model.reload
         )
         .padding(.top, 8)
         .opacity(model.serverSwitcherHidden ? 0 : 1)
@@ -43,6 +42,27 @@ struct WebShellView: View {
       .animation(.easeInOut(duration: 0.16), value: model.serverSwitcherHidden)
       .ignoresSafeArea(.keyboard)
       .background(DesignTokens.background(colorScheme).ignoresSafeArea())
+      .overlay(alignment: .bottom) {
+        // Always present, shown/hidden by opacity rather than insert/remove, so
+        // a transient visibility flip never slides the bar in and out. The web
+        // layer reserves a fixed footprint for it (`.omnigent-native-bottom-
+        // spacer` in index.css), so there's no size round-trip to coordinate.
+        ChatTerminalBar(
+          mode: $model.viewMode,
+          terminalEnabled: model.terminalEnabled,
+          terminalStartingUp: model.terminalStartingUp,
+          onSelect: { newMode in
+            model.viewMode = newMode
+            model.emitViewModeChanged(newMode)
+          }
+        )
+        .padding(.bottom, 6)
+        .opacity(model.bottomBarVisible ? 1 : 0)
+        .allowsHitTesting(model.bottomBarVisible)
+        .accessibilityHidden(!model.bottomBarVisible)
+        .animation(.easeInOut(duration: 0.2), value: model.bottomBarVisible)
+      }
+      .ignoresSafeArea(.keyboard)
     }
     .onChange(of: router.pendingNotificationPath) { _, _ in
       if let path = router.consumeNotificationPath() {
@@ -65,7 +85,6 @@ private struct ServerSwitcher: View {
   let switchServer: (String) -> Void
   let connectToNewServer: () -> Void
   let reload: () -> Void
-  let find: () -> Void
 
   @Environment(\.colorScheme) private var colorScheme
 
@@ -77,7 +96,9 @@ private struct ServerSwitcher: View {
       }
       .disabled(true)
 
-      let otherServers = recents.filter { URL(string: $0)?.omnigentOrigin != currentURL.omnigentOrigin }
+      let otherServers = recents.filter {
+        URL(string: $0)?.omnigentOrigin != currentURL.omnigentOrigin
+      }
       if !otherServers.isEmpty {
         Divider()
         ForEach(otherServers, id: \.self) { recent in
@@ -93,10 +114,6 @@ private struct ServerSwitcher: View {
 
       Button(action: reload) {
         Label("Reload", systemImage: "arrow.clockwise")
-      }
-
-      Button(action: find) {
-        Label("Find in Page", systemImage: "magnifyingglass")
       }
 
       Divider()
@@ -126,15 +143,20 @@ private struct ServerSwitcher: View {
       .padding(.horizontal, 10)
       .frame(height: 28)
       .frame(maxWidth: maxWidth)
-      .background(.ultraThinMaterial)
-      .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-      .overlay {
-        RoundedRectangle(cornerRadius: 9, style: .continuous)
-          .stroke(Color.primary.opacity(colorScheme == .dark ? 0.16 : 0.10), lineWidth: 0.5)
-      }
-      .shadow(color: .black.opacity(colorScheme == .dark ? 0.22 : 0.08), radius: 10, y: 4)
+      .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
     }
     .buttonStyle(.plain)
+    // The material/border/shadow live OUTSIDE the `label:` closure, on the
+    // Menu's persistent host view. Applied inside the closure, UIKit's menu
+    // presentation snapshots the styled label for its open/dismiss morph and
+    // drops the shadow layer — leaving the pill flat (no shadow) for a beat
+    // after dismissal. Keeping the chrome on the Menu sidesteps that snapshot.
+    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+    .overlay {
+      RoundedRectangle(cornerRadius: 9, style: .continuous)
+        .stroke(Color.primary.opacity(colorScheme == .dark ? 0.16 : 0.10), lineWidth: 0.5)
+    }
+    .shadow(color: .black.opacity(colorScheme == .dark ? 0.22 : 0.08), radius: 10, y: 4)
     .accessibilityLabel("Switch server")
   }
 }
