@@ -130,6 +130,17 @@ class _PostSink:
                 out.append(role if isinstance(role, str) else "<none>")
         return out
 
+    def response_ids(self) -> list[str]:
+        """Return the ``response_id`` of every committed conversation item, in order."""
+        out: list[str] = []
+        for event_type, data in self.posts:
+            if event_type != "external_conversation_item":
+                continue
+            rid = data.get("response_id")
+            if isinstance(rid, str):
+                out.append(rid)
+        return out
+
     def deltas(self) -> list[dict[str, object]]:
         """Return the ``data`` payload of every ``external_output_text_delta``."""
         return [
@@ -2117,6 +2128,100 @@ async def test_two_real_wire_turns_each_emit_running_then_idle(
     # message — user-before-assistant ordering, per turn (#1155).
     assert sink.item_types() == ["message", "message", "message", "message"]
     assert sink.message_roles() == ["user", "assistant", "user", "assistant"]
+
+
+# ---------------------------------------------------------------------------
+# Turn-scoped response_id: one bubble per turn, distinct across turns (#9)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_multi_step_turn_items_share_one_response_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A narrate→tool-call→answer turn commits items under ONE response_id (#9).
+
+    The turn is: USER_INPUT (opens it) → a tool-call PLANNER_RESPONSE
+    (``function_call``) → its RUN_COMMAND result (``function_call_output``) → a
+    text PLANNER_RESPONSE answer (``message``). These planner/result steps carry
+    DIFFERENT ``stepIndex`` values, so the old stepIndex-keyed id fragmented the
+    turn into several bubbles. With the turn-scoped id every committed assistant
+    item shares the SINGLE ``agy_<cascade>_<executionId>`` id (the user message
+    carries none — it is not an assistant response).
+    """
+    user = _user_input_real_wire(execution_id="exec-turn-1")
+    tool_call = _load("planner_response_tool_call_run_command")  # function_call, stepIndex 5
+    result = _load("run_command_done")  # function_call_output
+    answer = _done_planner("All done.", step_index=8)  # message
+    frames = [
+        _frame([user]),
+        _frame([user, tool_call]),
+        _frame([user, tool_call, result]),
+        _frame([user, tool_call, result, answer]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    # function_call + function_call_output + assistant message, each once.
+    assert sink.item_types() == [
+        "message",  # user (no response_id)
+        "function_call",
+        "function_call_output",
+        "message",  # assistant answer
+    ]
+    # The three assistant-side items all carry the ONE turn-scoped id.
+    expected = f"agy_{_CASCADE_ID}_exec-turn-1"
+    assert sink.response_ids() == [expected, expected, expected]
+
+
+@pytest.mark.asyncio
+async def test_distinct_turns_get_distinct_response_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Two turns (distinct ``executionId``) commit under DISTINCT response_ids (#9).
+
+    The complement of the single-turn grouping: a new USER_INPUT rebinds the
+    turn-scoped id, so turn 2's answer must NOT share turn 1's id (else the two
+    turns' replies would collapse into one bubble).
+    """
+    user1 = _user_input_real_wire(execution_id="exec-turn-1")
+    done1 = _done_planner("First answer.", step_index=2)
+    user2 = _user_input_real_wire(execution_id="exec-turn-2")
+    done2 = _done_planner("Second answer.", step_index=6)
+    frames = [
+        _frame([user1]),
+        _frame([user1, done1]),
+        _frame([user1, done1, user2]),
+        _frame([user1, done1, user2, done2]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    # Only the two assistant answers carry a response_id (user messages do not).
+    id1 = f"agy_{_CASCADE_ID}_exec-turn-1"
+    id2 = f"agy_{_CASCADE_ID}_exec-turn-2"
+    assert sink.response_ids() == [id1, id2]
+    assert id1 != id2
 
 
 # ---------------------------------------------------------------------------

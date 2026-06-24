@@ -382,18 +382,25 @@ def pending_interaction(step: dict[str, object]) -> PendingInteraction | None:
     return None
 
 
-def _response_id(conversation_id: str, step_idx: int) -> str:
+def _response_id(conversation_id: str, turn_execution_id: str) -> str:
     """
-    Build a stable Omnigent response id for a RPC step.
+    Build a stable Omnigent response id scoped to one agy TURN.
 
-    Mirrors the forwarder's ``_response_id`` format so ids are consistent
-    across the transcript and RPC paths.
+    Keyed on the per-turn ``executionId`` (the USER_INPUT step's uuid) rather
+    than the conversation-monotonic ``stepIndex``, so every committed item
+    between two USER_INPUT boundaries — the narration ``message``, each
+    ``function_call``, the answer ``message`` — shares ONE response id and the
+    SPA renders them as a single assistant bubble. A per-``stepIndex`` id
+    instead fragmented a text→tool-call→answer turn into separate bubbles
+    (#9). This mirrors codex (``codex_<turnId>`` — one id per turn) and claude
+    (one ``current_response_id`` held across the turn).
 
     :param conversation_id: agy conversation id.
-    :param step_idx: Step index from ``sourceTrajectoryStepInfo.stepIndex``.
-    :returns: Response id, e.g. ``"agy_8ca97c49_2"``.
+    :param turn_execution_id: The turn's ``executionId`` (the USER_INPUT step's
+        per-turn uuid); see :func:`_execution_discriminator`.
+    :returns: Turn-scoped response id, e.g. ``"agy_8ca97c49_1df76a5f-..."``.
     """
-    return f"agy_{conversation_id}_{step_idx}"
+    return f"agy_{conversation_id}_{turn_execution_id}"
 
 
 def _json_string(value: dict[str, object]) -> str | None:
@@ -564,6 +571,7 @@ def _message_event(
     *,
     conversation_id: str,
     step_idx: int,
+    turn_execution_id: str,
     text: str,
 ) -> OutboundEvent:
     """
@@ -573,7 +581,10 @@ def _message_event(
     function; user turns are skipped by the caller.
 
     :param conversation_id: agy conversation id.
-    :param step_idx: Step index.
+    :param step_idx: Step index (carried on the envelope for ordering/debug).
+    :param turn_execution_id: The owning turn's ``executionId`` — the
+        response_id is scoped to it so all of a turn's items group into one
+        bubble (#9).
     :param text: Assistant text (``plannerResponse.modifiedResponse`` or
         ``plannerResponse.response``).
     :returns: One ``external_conversation_item`` event.
@@ -587,7 +598,7 @@ def _message_event(
                 "agent": _AGENT_NAME,
                 "content": [{"type": "output_text", "text": text}],
             },
-            "response_id": _response_id(conversation_id, step_idx),
+            "response_id": _response_id(conversation_id, turn_execution_id),
         },
         step_index=step_idx,
     )
@@ -655,6 +666,7 @@ def _function_call_events(
     *,
     conversation_id: str,
     step_idx: int,
+    turn_execution_id: str,
     tool_calls: list[object],
     allocator: _ToolCallIdAllocator,
 ) -> list[OutboundEvent]:
@@ -672,11 +684,14 @@ def _function_call_events(
 
     :param conversation_id: agy conversation id.
     :param step_idx: Owning step index.
+    :param turn_execution_id: The owning turn's ``executionId`` — every
+        function_call shares the turn-scoped response_id so it groups with the
+        surrounding narration/answer in one bubble (#9).
     :param tool_calls: ``plannerResponse.toolCalls`` list.
     :param allocator: Fallback call-id allocator when real id is absent.
     :returns: One ``external_conversation_item`` event per valid tool call.
     """
-    response_id = _response_id(conversation_id, step_idx)
+    response_id = _response_id(conversation_id, turn_execution_id)
     events: list[OutboundEvent] = []
     for entry in tool_calls:
         if not isinstance(entry, dict):
@@ -734,6 +749,7 @@ def _function_call_output_event(
     *,
     conversation_id: str,
     step_idx: int,
+    turn_execution_id: str,
     output: str,
     real_id: str | None,
     allocator: _ToolCallIdAllocator,
@@ -746,6 +762,9 @@ def _function_call_output_event(
 
     :param conversation_id: agy conversation id.
     :param step_idx: Tool-result step index.
+    :param turn_execution_id: The owning turn's ``executionId`` — the
+        response_id is scoped to it so the output groups with its invocation in
+        the same bubble (#9).
     :param output: Human-readable tool result text.
     :param real_id: agy-assigned call id from ``metadata.toolCall.id``, or
         ``None`` when absent.
@@ -758,7 +777,7 @@ def _function_call_output_event(
         data={
             "item_type": "function_call_output",
             "item_data": {"call_id": call_id, "output": output},
-            "response_id": _response_id(conversation_id, step_idx),
+            "response_id": _response_id(conversation_id, turn_execution_id),
         },
         step_index=step_idx,
     )
@@ -834,6 +853,7 @@ def map_step_to_events(
     step: dict[str, object],
     *,
     conversation_id: str,
+    turn_execution_id: str,
     allocator: _ToolCallIdAllocator,
 ) -> list[OutboundEvent]:
     """
@@ -883,6 +903,13 @@ def map_step_to_events(
     :param step: One step dict from ``GetCascadeTrajectorySteps``.
     :param conversation_id: agy conversation id (namespaces response ids and
         call ids).
+    :param turn_execution_id: The CURRENT turn's ``executionId`` (the open
+        turn's USER_INPUT step uuid). Every committed item this step emits is
+        stamped with the turn-scoped response_id ``agy_<conversation_id>_<turn
+        _execution_id>`` so a narrate→call-tool→answer turn renders as ONE
+        assistant bubble instead of one bubble per step (#9). The caller (the
+        reader) tracks it across the turn; USER_INPUT itself emits a user
+        ``message`` (no response_id) and does not consume this.
     :param allocator: Fallback tool-call id allocator, used only when a step
         lacks the real agy ``id`` field (resume-mid-turn case).
     :returns: Ordered events to POST for this step (possibly empty).
@@ -942,6 +969,7 @@ def map_step_to_events(
                     _message_event(
                         conversation_id=conversation_id,
                         step_idx=step_idx,
+                        turn_execution_id=turn_execution_id,
                         text=text,
                     )
                 )
@@ -951,6 +979,7 @@ def map_step_to_events(
                     _function_call_events(
                         conversation_id=conversation_id,
                         step_idx=step_idx,
+                        turn_execution_id=turn_execution_id,
                         tool_calls=tool_calls,
                         allocator=allocator,
                     )
@@ -1011,6 +1040,7 @@ def map_step_to_events(
             _function_call_output_event(
                 conversation_id=conversation_id,
                 step_idx=step_idx,
+                turn_execution_id=turn_execution_id,
                 output=output,
                 real_id=result_call_id,
                 allocator=allocator,
