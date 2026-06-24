@@ -516,6 +516,193 @@ async def test_run_turn_yields_text_chunks_and_turn_complete() -> None:
     assert turn_completes[0].response == "Hello!"
 
 
+# ---------------------------------------------------------------------------
+# Token usage — parsed from qwen's _meta.usage and emitted on TurnComplete
+# ---------------------------------------------------------------------------
+
+
+def test_accumulate_usage_maps_and_splits_cached() -> None:
+    """_meta.usage maps to wire keys; cached tokens split out of input_tokens.
+
+    qwen's inputTokens (Gemini promptTokenCount) is inclusive of cached tokens,
+    but compute_llm_cost wants the non-cached portion in input_tokens.
+    """
+    acc: dict[str, int] = {}
+    QwenExecutor._accumulate_usage(
+        acc,
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": ""},
+            "_meta": {
+                "usage": {
+                    "inputTokens": 1000,
+                    "outputTokens": 200,
+                    "totalTokens": 1200,
+                    "cachedReadTokens": 300,
+                    "thoughtTokens": 50,
+                }
+            },
+        },
+    )
+    assert acc == {
+        "input_tokens": 700,  # 1000 - 300 cached
+        "output_tokens": 200,
+        "total_tokens": 1200,
+        "cache_read_input_tokens": 300,
+    }
+
+
+def test_accumulate_usage_sums_across_calls_and_ignores_non_usage() -> None:
+    """Multiple emissions sum; updates without _meta.usage are ignored."""
+    acc: dict[str, int] = {}
+    # A plain text chunk carries no usage — must not perturb the accumulator.
+    QwenExecutor._accumulate_usage(acc, {"content": {"type": "text", "text": "hi"}})
+    assert acc == {}
+    for _ in range(2):
+        QwenExecutor._accumulate_usage(
+            acc,
+            {"_meta": {"usage": {"inputTokens": 100, "outputTokens": 10, "totalTokens": 110}}},
+        )
+    # Summed across the two calls; no cached key when cachedReadTokens absent.
+    assert acc == {"input_tokens": 200, "output_tokens": 20, "total_tokens": 220}
+
+
+def test_accumulate_usage_clamps_negative_input() -> None:
+    """A malformed cached > input never drives input_tokens negative."""
+    acc: dict[str, int] = {}
+    QwenExecutor._accumulate_usage(
+        acc,
+        {"_meta": {"usage": {"inputTokens": 100, "cachedReadTokens": 500, "totalTokens": 100}}},
+    )
+    assert acc["input_tokens"] == 0
+    assert acc["cache_read_input_tokens"] == 500
+
+
+@pytest.mark.asyncio
+async def test_run_turn_emits_usage_on_turn_complete(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A usage-bearing chunk surfaces as TurnComplete.usage and notifies cost."""
+    notified: list[dict] = []
+    monkeypatch.setattr(
+        "omnigent.inner.qwen_executor._notify_usage_from_dict",
+        lambda model, usage: notified.append({"model": model, "usage": usage}),
+    )
+
+    executor = QwenExecutor(model="qwen/qwen3-coder")
+    executor._initialized = True
+    executor._session_id = "sess-usage"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    session_id = executor._session_id
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            base = {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {"sessionId": session_id},
+            }
+            # 1. Real text chunk.
+            await executor._queue.put(
+                {
+                    **base,
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "done"},
+                        },
+                    },
+                }
+            )
+            # 2. Usage-bearing chunk (empty text + _meta.usage).
+            await executor._queue.put(
+                {
+                    **base,
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": ""},
+                            "_meta": {
+                                "usage": {
+                                    "inputTokens": 500,
+                                    "outputTokens": 80,
+                                    "totalTokens": 580,
+                                    "cachedReadTokens": 100,
+                                }
+                            },
+                        },
+                    },
+                }
+            )
+            fut = executor._pending.get(msg["id"])
+            if fut and not fut.done():
+                fut.set_result(
+                    {"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}}
+                )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completes) == 1
+    assert completes[0].response == "done"
+    assert completes[0].usage == {
+        "input_tokens": 400,  # 500 - 100 cached
+        "output_tokens": 80,
+        "total_tokens": 580,
+        "cache_read_input_tokens": 100,
+    }
+    # Cost observer was notified with the same usage + the configured model.
+    assert notified == [{"model": "qwen/qwen3-coder", "usage": completes[0].usage}]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_usage_none_when_unreported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No usage chunk → TurnComplete.usage is None and the observer isn't called."""
+    notified: list[dict] = []
+    monkeypatch.setattr(
+        "omnigent.inner.qwen_executor._notify_usage_from_dict",
+        lambda model, usage: notified.append({"model": model, "usage": usage}),
+    )
+
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-no-usage"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    session_id = executor._session_id
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            await executor._queue.put(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "hi"},
+                        },
+                    },
+                }
+            )
+            fut = executor._pending.get(msg["id"])
+            if fut and not fut.done():
+                fut.set_result(
+                    {"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}}
+                )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completes) == 1
+    assert completes[0].usage is None
+    assert notified == []
+
+
 @pytest.mark.asyncio
 async def test_run_turn_drains_all_chunks_before_completing() -> None:
     """All buffered chunks are yielded even if the future resolves first.

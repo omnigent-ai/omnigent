@@ -42,6 +42,7 @@ from omnigent.inner.executor import (
     TextChunk,
     TurnComplete,
 )
+from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 
 logger = logging.getLogger(__name__)
 
@@ -724,6 +725,51 @@ class QwenExecutor(Executor):
         return {"outcome": "selected", "optionId": chosen.get("optionId")}
 
     @staticmethod
+    def _accumulate_usage(  # type: ignore[explicit-any]
+        acc: dict[str, int], update: dict[str, Any]
+    ) -> None:
+        """Fold a ``session/update``'s ``_meta.usage`` into the turn accumulator.
+
+        qwen reports token usage out-of-band on an ``agent_message_chunk`` update
+        whose text is empty and whose ``_meta`` carries
+        ``{"usage": {"inputTokens", "outputTokens", "totalTokens",
+        "thoughtTokens", "cachedReadTokens"}}`` (see qwen-code
+        ``MessageEmitter.emitUsageMetadata``). A single Omnigent turn can drive
+        several internal model calls (tool loops), each emitting its own usage —
+        so we **sum** across the turn rather than keep only the last; each API
+        call bills its own full input, so summing matches actual cost.
+
+        qwen's ``inputTokens`` (Gemini ``promptTokenCount``) is **inclusive of
+        cached tokens**, but :func:`compute_llm_cost` expects ``input_tokens`` to
+        be the *non-cached* portion (cached tokens bill at a lower rate). So we
+        split ``cachedReadTokens`` out into ``cache_read_input_tokens`` and keep
+        only the remainder in ``input_tokens`` — mirroring the codex executor.
+
+        :param acc: The running per-turn accumulator (wire-shape keys), mutated
+            in place. Absent of any usage update it stays empty.
+        :param update: The ``session/update`` ``update`` object.
+        """
+        meta = update.get("_meta")
+        if not isinstance(meta, dict):
+            return
+        usage = meta.get("usage")
+        if not isinstance(usage, dict):
+            return
+
+        def _int(value: Any) -> int:  # type: ignore[explicit-any]
+            return int(value) if isinstance(value, (int, float)) else 0
+
+        cached = _int(usage.get("cachedReadTokens"))
+        # Non-cached input = prompt tokens minus the cached portion; clamp so a
+        # malformed cached > input never drives the running total negative.
+        non_cached = max(0, _int(usage.get("inputTokens")) - cached)
+        acc["input_tokens"] = acc.get("input_tokens", 0) + non_cached
+        acc["output_tokens"] = acc.get("output_tokens", 0) + _int(usage.get("outputTokens"))
+        acc["total_tokens"] = acc.get("total_tokens", 0) + _int(usage.get("totalTokens"))
+        if cached:
+            acc["cache_read_input_tokens"] = acc.get("cache_read_input_tokens", 0) + cached
+
+    @staticmethod
     def _image_blocks_from_content(content: Any) -> list[dict[str, Any]]:  # type: ignore[explicit-any]
         """Build ACP ``image`` prompt blocks from a message's ``input_image`` blocks.
 
@@ -926,6 +972,9 @@ class QwenExecutor(Executor):
         # human approval or slow stream won't trip a spurious timeout.
         deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
         accumulated_text: list[str] = []
+        # Per-turn token usage, summed across qwen's per-call usage emissions
+        # (see _accumulate_usage). Stays empty when qwen reports none.
+        turn_usage: dict[str, int] = {}
 
         while True:
             remaining = deadline - loop.time()
@@ -957,12 +1006,14 @@ class QwenExecutor(Executor):
                         self._system_prompt_sent = False
                     yield ExecutorError(message=error_msg, retryable=True)
                     return
-                # Successful completion.
+                # Successful completion. Attach the per-turn token usage qwen
+                # reported over the stream (None when it reported none) and feed
+                # the cost observer, mirroring the codex executor.
+                usage = turn_usage or None
+                if usage is not None:
+                    _notify_usage_from_dict(model=self._model, usage=usage)
                 final_text = "".join(accumulated_text)
-                if final_text:
-                    yield TurnComplete(response=final_text)
-                else:
-                    yield TurnComplete(response="")
+                yield TurnComplete(response=final_text if final_text else "", usage=usage)
                 return
 
             # Otherwise consume queued notifications.
@@ -981,6 +1032,10 @@ class QwenExecutor(Executor):
                 update_type = update.get("sessionUpdate", "")
 
                 if update_type == _UPDATE_AGENT_MESSAGE_CHUNK:
+                    # qwen rides per-call token usage on an agent_message_chunk
+                    # with empty text + a populated _meta.usage, so fold usage
+                    # before the text check (the usage-bearing chunk has none).
+                    self._accumulate_usage(turn_usage, update)
                     content = update.get("content", {})
                     if isinstance(content, dict):
                         text = content.get("text", "")
