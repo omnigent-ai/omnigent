@@ -593,6 +593,64 @@ def _message_event(
     )
 
 
+def _user_input_text(user_input: object) -> str:
+    """
+    Extract the user's turn text from a USER_INPUT step's ``userInput``.
+
+    The live wire (agy 1.0.10/1.0.11) carries the turn text both as a single
+    ``userResponse`` string and as ``items[].text`` (the same ``items`` list
+    :func:`omnigent.antigravity_native_rpc.send_user_cascade_message` sends).
+    Prefer ``userResponse``; fall back to joining the item texts.
+
+    :param user_input: The step's ``userInput`` value (expected ``dict``).
+    :returns: The user's text, or ``""`` when absent/unparseable.
+    """
+    if not isinstance(user_input, dict):
+        return ""
+    response = user_input.get("userResponse")
+    if isinstance(response, str) and response.strip():
+        return response
+    items = user_input.get("items")
+    if isinstance(items, list):
+        parts = [
+            item.get("text")
+            for item in items
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        ]
+        joined = "\n".join(part for part in parts if part)
+        if joined.strip():
+            return joined
+    return ""
+
+
+def _user_message_event(*, text: str) -> OutboundEvent:
+    """
+    Build a committed user ``message`` conversation item for a USER_INPUT step.
+
+    Mirrors :func:`_message_event` but for the user's turn (role ``"user"``,
+    ``input_text`` content, no ``response_id``/``agent``). The web UI reconciles
+    its optimistic input bubble against this committed item via
+    ``session.input.consumed``; without it the bubble has no committed
+    counterpart and renders below the assistant reply (#1155). USER_INPUT steps
+    carry no trajectory ``stepIndex`` (the reader dedups them by per-turn
+    ``executionId``), so ``step_index`` is unused here.
+
+    :param text: The user's turn text (from :func:`_user_input_text`).
+    :returns: One ``external_conversation_item`` event.
+    """
+    return OutboundEvent(
+        event_type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        },
+        step_index=0,
+    )
+
+
 def _function_call_events(
     *,
     conversation_id: str,
@@ -833,9 +891,24 @@ def map_step_to_events(
     if not isinstance(step_type, str):
         return []
 
-    # USER_INPUT: skip entirely — user turn already persisted by direct POST.
+    # USER_INPUT: commit the user's turn as a ``message`` item so the web UI
+    # reconciles its optimistic bubble against a committed item (parity with
+    # claude/codex/cursor native, which all mirror the user turn from their read
+    # path). The turn OPENS on this step — before the planner response — so the
+    # user message commits first and renders above the reply.
+    #
+    # This replaces the earlier "skip; the user turn is already persisted by a
+    # direct POST /events hook" assumption, which never held for the production
+    # web/mobile flow: the pure-RPC ``SendUserCascadeMessage`` write path fires
+    # no such POST, so the user message was NEVER committed — the optimistic
+    # bubble had no committed counterpart and dropped below the streamed reply
+    # (#1155). The reader dedups USER_INPUT by its per-turn ``executionId``, so
+    # this emits exactly once per turn.
     if step_type == _TYPE_USER_INPUT:
-        return []
+        text = _user_input_text(step.get("userInput"))
+        if not text:
+            return []
+        return [_user_message_event(text=text)]
 
     status = step.get("status")
 

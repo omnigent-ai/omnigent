@@ -120,6 +120,16 @@ class _PostSink:
                 out.append(status if isinstance(status, str) else "<none>")
         return out
 
+    def message_roles(self) -> list[str]:
+        """Return the ``role`` of every committed ``message`` item, in order."""
+        out: list[str] = []
+        for event_type, data in self.posts:
+            if event_type == "external_conversation_item" and data.get("item_type") == "message":
+                item_data = data.get("item_data")
+                role = item_data.get("role") if isinstance(item_data, dict) else None
+                out.append(role if isinstance(role, str) else "<none>")
+        return out
+
     def deltas(self) -> list[dict[str, object]]:
         """Return the ``data`` payload of every ``external_output_text_delta``."""
         return [
@@ -528,17 +538,22 @@ async def test_poll_planner_generating_then_done_posts_one_final_message(
 
 
 # ---------------------------------------------------------------------------
-# USER_INPUT posts nothing
+# USER_INPUT commits the user message exactly once (#1155)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_user_input_posts_nothing(
+async def test_user_input_commits_user_message_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     patched_discovery: None,
 ) -> None:
-    """A USER_INPUT step maps to [] — no conversation item is posted for it."""
+    """A USER_INPUT step posts one user ``message`` item, deduped across reads.
+
+    Regression guard for #1155: the user turn must be committed (so the web UI
+    reconciles its optimistic bubble) and committed only ONCE — the reader
+    dedups the step by its per-turn ``executionId`` across repeated polls.
+    """
     user = _load("user_input")
     script = _StepScript([[user], [user]])
     sink = _PostSink()
@@ -551,7 +566,7 @@ async def test_user_input_posts_nothing(
         iterations=2,
     )
 
-    assert sink.item_types() == []
+    assert sink.item_types() == ["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -1449,8 +1464,10 @@ async def test_stream_status_running_then_idle(
     )
 
     assert sink.statuses() == ["running", "idle"]
-    # USER_INPUT still posts no conversation item; the assistant message commits.
-    assert sink.item_types() == ["message"]
+    # USER_INPUT commits the user message first, then the assistant message —
+    # so the web UI renders the user turn ABOVE the reply (#1155).
+    assert sink.item_types() == ["message", "message"]
+    assert sink.message_roles() == ["user", "assistant"]
 
 
 # ---------------------------------------------------------------------------
@@ -2096,8 +2113,10 @@ async def test_two_real_wire_turns_each_emit_running_then_idle(
     )
 
     assert sink.statuses() == ["running", "idle", "running", "idle"]
-    # Each turn commits exactly one assistant message; USER_INPUT commits none.
-    assert sink.item_types() == ["message", "message"]
+    # Each turn commits a user message (from USER_INPUT) then an assistant
+    # message — user-before-assistant ordering, per turn (#1155).
+    assert sink.item_types() == ["message", "message", "message", "message"]
+    assert sink.message_roles() == ["user", "assistant", "user", "assistant"]
 
 
 # ---------------------------------------------------------------------------
