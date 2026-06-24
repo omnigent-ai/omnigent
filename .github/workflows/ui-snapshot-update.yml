@@ -113,36 +113,16 @@ jobs:
       - name: Compare the baselines (no --update-snapshots)
         # Deliberately NOT --update-snapshots: that rewrites EVERY PNG, churning
         # baselines that already pass (a sub-threshold re-render still changes the
-        # bytes). In plain compare mode the plugin instead leaves passing
-        # baselines untouched and surfaces only the drift -- a mismatching
-        # baseline's fresh render lands in snapshot_failures/.../actual_*.png (the
-        # committed PNG is left in place), and a MISSING baseline is created
-        # directly under snapshots/. The run "fails" by design on any drift, so
-        # don't gate on its exit code.
+        # bytes). In plain compare mode the plugin leaves passing baselines
+        # untouched and rewrites only the drift: under GitHub Actions it updates a
+        # mismatching baseline IN PLACE (and creates a MISSING one) under
+        # snapshots/, so the tree below already holds exactly the changed PNGs.
+        # The run "fails" by design on any drift, so don't gate on its exit code.
         run: |
           uv run pytest tests/e2e_ui/visual -m visual \
             -v --tb=long --log-level=INFO -r a \
             -p no:rerunfailures \
             --ui-skip-build || true
-
-      - name: Adopt only the changed renders over their baselines
-        # Copy each mismatching test's actual_<name>.png over its committed
-        # baseline; previously-missing baselines were already written under
-        # snapshots/ by the compare above. Baselines that passed are not in
-        # snapshot_failures, so they stay byte-for-byte unchanged.
-        run: |
-          fail_dir=tests/e2e_ui/visual/snapshot_failures
-          if [ -d "$fail_dir" ]; then
-            while IFS= read -r src; do
-              rel=${src#"$fail_dir"/}                  # <module>/<test>/actual_<name>.png
-              dest="tests/e2e_ui/visual/snapshots/$(dirname "$rel")/$(basename "$rel" | sed 's/^actual_//')"
-              mkdir -p "$(dirname "$dest")"
-              cp "$src" "$dest"
-              echo "adopted: $dest"
-            done < <(find "$fail_dir" -type f -name 'actual_*.png')
-          else
-            echo "No snapshot_failures dir -- no existing baseline drifted (only new baselines, if any, were created)."
-          fi
 
       # Tar the snapshots tree (paths intact) so the commit job can restore it
       # wholesale. Only genuinely-changed/created PNGs differ from the committed

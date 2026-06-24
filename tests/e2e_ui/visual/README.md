@@ -99,18 +99,19 @@ build.
 
 ### Fork PR without Docker — adopt the run's render
 
-The failing compare run already rendered your change in the pinned image, so pull
-that image into the baseline:
+The failing compare run already rendered your change in the pinned image, and
+because it runs under GitHub Actions the plugin rewrote each drifting baseline
+**in place** under `snapshots/`. Pull that tree in:
 
 ```bash
 tests/e2e_ui/visual/update_baseline_from_pr.sh <pr-number>
 ```
 
-It finds the PR's UI Snapshot run, downloads the artifact, and copies the
-runner-rendered `actual_` PNG over the committed baseline. **Review the image**,
-then commit and push. (Manual equivalent: download the `ui-snapshot-<run_id>`
-artifact, take `snapshot_failures/.../actual_*.png`, and commit it over the
-baseline path above.)
+It finds the PR's UI Snapshot run, downloads the artifact, and restores its
+runner-rendered `snapshots/` tree over the committed baselines — only the
+drifting ones differ. **Review the image(s)**, then commit and push. (Manual
+equivalent: download the `ui-snapshot-<run_id>` artifact and commit its
+`snapshots/` tree over `tests/e2e_ui/visual/snapshots/`.)
 
 ### Workflow dispatch (non-PR branches)
 

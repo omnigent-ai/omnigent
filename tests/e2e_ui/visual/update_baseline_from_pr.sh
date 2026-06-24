@@ -58,27 +58,27 @@ if ! gh run download "$RUN_ID" --repo "$REPO" -n "ui-snapshot-$RUN_ID" -D "$TMP"
   gh run download "$RUN_ID" --repo "$REPO" -D "$TMP"  # fall back to all artifacts
 fi
 
-# On a mismatch each failing snapshot's runner render is
-# snapshot_failures/<module>/<test>/actual_<name>.png; its committed baseline is
-# snapshots/<module>/<test>/<name>.png. Adopt every actual_ over its baseline so
-# a multi-snapshot failure is fixed in one pass.
-updated=0
-while IFS= read -r src; do
-  rel=${src##*/snapshot_failures/}                       # <module>/<test>/actual_<name>.png
-  dest="$SNAP_ROOT/$(dirname "$rel")/$(basename "$rel" | sed 's/^actual_//')"
-  mkdir -p "$(dirname "$dest")"
-  cp "$src" "$dest"
-  echo "  updated: $dest"
-  updated=$((updated + 1))
-done < <(find "$TMP" -type f -path '*/snapshot_failures/*' -name 'actual_*.png')
+# The gate runs under GitHub Actions, where the plugin rewrites a mismatching
+# baseline IN PLACE under snapshots/ (and creates a missing one there); passing
+# baselines are left untouched. The artifact carries that whole snapshots/ tree,
+# so just restore it over the committed one -- git add then stages exactly the
+# baselines that drifted. (Reconstructing paths from snapshot_failures/ instead
+# is fragile: that tree keys subdirs by <test>[browser][platform], not the
+# baseline's <test>, so it would write a parallel, never-read duplicate.)
+src_root=$(find "$TMP" -type d -name snapshots | head -1)
+if [ -z "$src_root" ]; then
+  echo "error: artifact has no snapshots/ tree -- nothing to restore." >&2
+  exit 1
+fi
+cp -R "$src_root/." "$SNAP_ROOT/"
 
-if [ "$updated" -eq 0 ]; then
-  echo "No rendered diffs in the artifact -- the gate likely PASSED, so the baselines already match. Nothing to update." >&2
+if git diff --quiet -- "$SNAP_ROOT"; then
+  echo "No baseline drift in the artifact -- the gate render already matches the committed baselines. Nothing to update." >&2
   exit 0
 fi
 
 echo
-echo "Updated $updated baseline(s)."
+echo "Updated baseline(s) from the gate render:"
 git --no-pager diff --stat -- "$SNAP_ROOT" || true
 echo
 echo "Next: review the image(s), then commit + push:"

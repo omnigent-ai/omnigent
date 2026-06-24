@@ -65,13 +65,15 @@ fi
 echo "Rendering + comparing the baselines in the pinned Playwright image ..."
 # Deliberately NOT --update-snapshots: that rewrites every PNG, churning
 # baselines that still pass (a sub-threshold re-render changes the bytes). Plain
-# compare leaves passing baselines alone and writes only the drift to
-# snapshot_failures/.../actual_*.png (a missing baseline is created directly in
-# snapshots/). The run "fails" by design on any drift, so `|| true` is expected --
-# the adopt step + git diff below are the real signal. UV_PROJECT_ENVIRONMENT
-# lives in the container (not the mounted repo) so no root-owned .venv leaks out.
+# compare leaves passing baselines alone and rewrites only the drift. GITHUB_ACTIONS
+# is set so the plugin behaves exactly as the CI gate does: it updates a mismatching
+# baseline IN PLACE (and creates a missing one) under snapshots/, so the git diff
+# below is the real signal. The run "fails" by design on any drift, so `|| true` is
+# expected. UV_PROJECT_ENVIRONMENT lives in the container (not the mounted repo) so
+# no root-owned .venv leaks out.
 docker run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work \
   -e CI=1 \
+  -e GITHUB_ACTIONS=true \
   -e OMNIGENT_PW_NO_SANDBOX=1 \
   -e OMNIGENT_SKIP_WEB_UI=true \
   -e UV_PYTHON_PREFERENCE=only-system \
@@ -83,24 +85,10 @@ docker run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work \
       -p no:rerunfailures --ui-skip-build
   ' || true
 
-# Files Docker wrote are root-owned; hand them back so the adopt + git add work
-# unprivileged. Includes ap-web (node_modules + build intermediates the Node
-# container wrote).
+# Files Docker wrote are root-owned; hand them back so git add works unprivileged.
+# Includes ap-web (node_modules + build intermediates the Node container wrote).
 docker run --rm --platform "$PLATFORM" -v "$PWD":/work "$PW_IMAGE" \
   chown -R "$(id -u):$(id -g)" /work/tests/e2e_ui/visual /work/"$BUILD_OUTPUT" /work/ap-web 2>/dev/null || true
-
-# Adopt only the changed renders: copy each mismatching test's actual_ PNG over
-# its committed baseline (missing baselines were already created in snapshots/).
-# Passing baselines are not in snapshot_failures, so they stay untouched.
-FAIL_DIR="tests/e2e_ui/visual/snapshot_failures"
-if [ -d "$FAIL_DIR" ]; then
-  while IFS= read -r src; do
-    rel=${src#"$FAIL_DIR"/}
-    dest="$SNAP_ROOT/$(dirname "$rel")/$(basename "$rel" | sed 's/^actual_//')"
-    mkdir -p "$(dirname "$dest")"
-    cp "$src" "$dest"
-  done < <(find "$FAIL_DIR" -type f -name 'actual_*.png')
-fi
 
 echo
 if git diff --quiet -- "$SNAP_ROOT"; then
