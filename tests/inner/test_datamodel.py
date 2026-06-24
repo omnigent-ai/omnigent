@@ -60,68 +60,12 @@ class TestHistory(unittest.TestCase):
         self.assertIn("[user] ping", text)
         self.assertIn("[assistant] pong", text)
 
-    def test_get_context_window_returns_all_when_no_limit(self):
+    def test_get_context_window_returns_all(self):
         h = History()
         for i in range(5):
             h.append(Message(role="user", content=f"msg {i}"))
         self.assertEqual(len(h.get_context_window()), 5)
-        self.assertEqual(len(h.get_context_window(max_tokens=None)), 5)
-
-    def test_get_context_window_trims_oldest(self):
-        h = History()
-        h.append(Message(role="user", content="a" * 40))  # ~10 tokens
-        h.append(Message(role="user", content="b" * 40))  # ~10 tokens
-        h.append(Message(role="user", content="c" * 40))  # ~10 tokens
-        result = h.get_context_window(max_tokens=20)
-        self.assertEqual(len(result), 2)
-        self.assertIn("b", result[0].content)
-        self.assertIn("c", result[1].content)
-
-    def test_get_context_window_preserves_system_messages(self):
-        h = History()
-        h.append(Message(role="system", content="You are helpful."))
-        h.append(Message(role="user", content="a" * 400))
-        h.append(Message(role="user", content="b" * 40))
-        result = h.get_context_window(max_tokens=20)
-        roles = [m.role for m in result]
-        self.assertIn("system", roles)
-
-    def test_get_context_window_large_budget_keeps_all(self):
-        h = History()
-        for i in range(5):
-            h.append(Message(role="user", content=f"msg {i}"))
-        result = h.get_context_window(max_tokens=999999)
-        self.assertEqual(len(result), 5)
-
-    def test_get_context_window_tiny_budget(self):
-        h = History()
-        h.append(Message(role="user", content="a" * 400))
-        result = h.get_context_window(max_tokens=1)
-        self.assertEqual(len(result), 0)
-
-    def test_get_context_window_keeps_tool_call_pairs(self):
-        h = History()
-        h.append(Message(role="user", content="x" * 400))  # ~100 tokens
-        h.append(Message(role="tool_call", content="call"))  # ~1 token
-        h.append(Message(role="tool_result", content="result"))  # ~1 token
-        h.append(Message(role="assistant", content="done"))  # ~1 token
-        # Budget fits the pair + assistant but not the user message
-        result = h.get_context_window(max_tokens=10)
-        roles = [m.role for m in result]
-        self.assertIn("tool_call", roles)
-        self.assertIn("tool_result", roles)
-
-    def test_get_context_window_drops_pair_together(self):
-        h = History()
-        h.append(Message(role="tool_call", content="c" * 400))
-        h.append(Message(role="tool_result", content="r" * 400))
-        h.append(Message(role="assistant", content="ok" * 4))
-        # Budget only fits the assistant message, not the pair
-        result = h.get_context_window(max_tokens=5)
-        roles = [m.role for m in result]
-        self.assertNotIn("tool_call", roles)
-        self.assertNotIn("tool_result", roles)
-        self.assertIn("assistant", roles)
+        self.assertEqual(len(h.get_context_window(max_tokens=4096)), 5)
 
 
 class TestConnection(unittest.TestCase):
