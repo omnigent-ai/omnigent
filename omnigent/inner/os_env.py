@@ -33,6 +33,7 @@ from .credential_proxy import (
 )
 from .datamodel import CredentialProxySpec, OSEnvSpec
 from .sandbox import (
+    ContainmentHandle,
     SandboxPolicy,
     activate_sandbox,
     cleanup_private_tmpdir,
@@ -336,6 +337,10 @@ class _HelperProcessClient:
         # helper itself. Cleared in :meth:`_stop_egress_proxy_locked`.
         self._egress_relay_port: int | None = None
         self._proc: subprocess.Popen[str] | None = None
+        # Parent-held containment handle from the sandbox backend's
+        # post_spawn hook (e.g. a Windows Job Object). Closed in
+        # ``_stop_locked`` to tear down the helper's process tree.
+        self._sandbox_handle: ContainmentHandle | None = None
         self._tmpdir: Path | None = None
         self._egress_proxy: Any | None = None  # EgressProxy when active
         self._egress_loop: Any | None = None  # asyncio event loop for proxy
@@ -538,6 +543,15 @@ class _HelperProcessClient:
             with contextlib.suppress(OSError):
                 os.close(r_fd)
 
+        # Post-spawn containment (parent side). A no-op for the POSIX
+        # launcher backends (they isolate via wrap_launcher_argv before
+        # exec); on Windows this assigns the helper to a kill-on-close
+        # Job Object so the whole tree is torn down in ``_stop_locked``.
+        if sandbox.active and self._proc.pid is not None:
+            self._sandbox_handle = get_backend(sandbox.backend_type).post_spawn(
+                sandbox, self._proc.pid
+            )
+
     def _helper_exit_detail_locked(self) -> str:
         if self._proc is None:
             return "OS environment helper exited unexpectedly"
@@ -581,6 +595,13 @@ class _HelperProcessClient:
                     with contextlib.suppress(Exception):
                         proc.kill()
         finally:
+            # Release the containment handle (Windows Job Object): with
+            # kill-on-close this also reaps any helper descendants that
+            # outlived ``proc.terminate()`` above.
+            if self._sandbox_handle is not None:
+                with contextlib.suppress(Exception):
+                    self._sandbox_handle.close()
+                self._sandbox_handle = None
             self._stop_egress_proxy_locked()
             cleanup_private_tmpdir(self._tmpdir)
             self._tmpdir = None
