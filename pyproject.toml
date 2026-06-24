@@ -311,6 +311,7 @@ markers = [
     "min_runner_version(version): skip this test when the pinned runner/host under test is older than `version` (PEP 440 release-tuple comparison, so a `.devN` of X satisfies X). Used by the runner/host backwards-compat CI (Config 2); inert in normal runs (no OMNIGENT_COMPAT_RUNNER_VERSION set).",
     "mock_only: tests/integration test that only works in mock-LLM mode (no --llm-api-key). Skipped by tests/integration/conftest.py when a real --llm-api-key is supplied (the real-LLM Integration jobs). Use for tests whose mock LLM is scripted with a fixed tool-call sequence — a real LLM cannot reproduce the scripted markers.",
     "visual: UI diff visual-regression snapshot (pytest-playwright-visual-snapshot). Runs only in the pinned-runner gate (.github/workflows/ui-snapshot.yml); the main e2e_ui suite excludes it via -m 'not visual' since it runs on the unpinned ubuntu-latest.",
+    "e2e: end-to-end test that spins up real infrastructure (HTTP receivers, subprocesses). Excluded from the default pytest run by addopts=--ignore=tests/e2e; opt in via `pytest tests/e2e -m e2e --override-ini='addopts='`.",
 ]
 # Visual snapshot baselines are committed here, keyed per-OS by the plugin
 # (e.g. test_empty_landing_matches_baseline[linux].png). Failure artifacts
