@@ -2890,6 +2890,30 @@ async def test_auto_create_antigravity_cold_starts_real_conversation(
 
 
 @pytest.mark.asyncio
+async def test_auto_create_antigravity_rejects_invalid_model_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A persisted ``model_override`` that fails validation raises at spawn.
+
+    Defense-in-depth re-validation at the runner boundary (mirrors the Codex
+    spawn-boundary check): a human displayName ("Gemini 2.5 Flash") has spaces,
+    which ``validate_model_override`` rejects, so it can never reach the agy
+    ``--model`` argv as a value agy cannot faithfully resume. Fails loud rather
+    than launching agy with a poisoned model id.
+    """
+    with pytest.raises(RuntimeError, match="Invalid model_override for Antigravity"):
+        await _run_antigravity_auto_create(
+            tmp_path,
+            monkeypatch,
+            session_id="conv_agy_badmodel",
+            snapshot={"model_override": "Gemini 2.5 Flash"},
+            candidate_ports=[52548],
+        )
+
+
+@pytest.mark.asyncio
 async def test_auto_create_antigravity_cold_start_scopes_to_pane_agy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

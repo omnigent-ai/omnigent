@@ -56,6 +56,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -324,6 +325,73 @@ def _resolve_display_name(model_enum: str, catalog: dict[str, object]) -> str:
             if isinstance(display, str) and display:
                 return display
     return model_enum
+
+
+# Gemini ids the Databricks model catalog prices (``databricks.json`` /
+# the MLflow ``databricks`` catalog). These are the ONLY pricing-resolvable
+# Gemini spellings: ``fetch_model_pricing`` infers provider ``google`` from a
+# bare ``gemini-`` id, but MLflow publishes no ``google`` catalog (404), so
+# only the gateway-prefixed ``databricks-gemini-*`` aliases resolve to non-None
+# pricing. Posting one of these (instead of the human displayName) is what lets
+# the server price the session and key the per-model TOKEN USAGE view. Keep in
+# sync with the ``databricks-gemini-*`` entries in
+# ``omnigent/onboarding/providers/model_catalog/databricks.json``.
+_PRICEABLE_GEMINI_IDS: frozenset[str] = frozenset(
+    {
+        "databricks-gemini-2-5-flash",
+        "databricks-gemini-2-5-pro",
+        "databricks-gemini-3-flash",
+        "databricks-gemini-3-pro",
+        "databricks-gemini-3-1-flash-lite",
+        "databricks-gemini-3-1-pro",
+        "databricks-gemini-3-5-flash",
+    }
+)
+
+
+def _resolve_pricing_id(model_enum: str, catalog: dict[str, object]) -> str:
+    """
+    Resolve a model enum to a PRICING-RESOLVABLE id (the dropdown / pricing key).
+
+    The server uses the ``model`` field on ``external_session_usage`` /
+    ``external_model_change`` for TWO things: as the :func:`fetch_model_pricing`
+    key (so the Session-cost badge and per-model TOKEN USAGE view get a cost) AND
+    as the per-model attribution bucket / web model dropdown value — exactly like
+    codex posts its raw pricing-valid model id (codex_native_forwarder.py). The
+    human ``displayName`` (``"Gemini 2.5 Flash"``) prices to ``None`` (its
+    capital-G/spaces shape fails ``_infer_provider``), so posting it left the
+    session unpriced and poisoned ``model_override`` with a non-slug label.
+
+    This resolves the (version-volatile) agy enum to its stable ``displayName``
+    via the catalog (:func:`_resolve_display_name`), then normalizes a Gemini
+    label (``"Gemini 3.5 Flash"`` → ``"databricks-gemini-3-5-flash"``) to the
+    matching priceable id in :data:`_PRICEABLE_GEMINI_IDS`. A trailing effort
+    parenthetical (``"Gemini 3.5 Flash (Medium)"``) is dropped first so the
+    effort-suffixed ``agy models`` spelling still maps.
+
+    Falls back to the resolved displayName (the human label) when the model is
+    not a recognized priceable Gemini — a non-Gemini model the agy catalog may
+    surface (Claude / GPT-OSS), or a future Gemini not yet in databricks.json.
+    Pricing won't resolve for that fallback, but the dropdown still shows a
+    sensible label and the value stays slug-shaped (no spaces only when the
+    enum itself resolved to a slug), mirroring the displayName-as-label contract
+    the UI already relied on.
+
+    :param model_enum: agy model enum string, e.g. ``"gemini-2.5-pro"`` or
+        ``"MODEL_PLACEHOLDER_M20"``.
+    :param catalog: Parsed response from ``GetAvailableModels``.
+    :returns: A priceable ``databricks-gemini-*`` id when the model maps to one,
+        else the resolved displayName (human label) as a fallback.
+    """
+    display = _resolve_display_name(model_enum, catalog)
+    # Drop a trailing effort parenthetical, e.g. "Gemini 3.5 Flash (Medium)".
+    label = re.sub(r"\s*\([^)]*\)\s*$", "", display).strip().lower()
+    if label.startswith("gemini"):
+        slug = re.sub(r"[^a-z0-9]+", "-", label.replace(".", "-")).strip("-")
+        candidate = f"databricks-{slug}"
+        if candidate in _PRICEABLE_GEMINI_IDS:
+            return candidate
+    return display
 
 
 def _parse_activity_timestamp(value: object) -> datetime | None:
@@ -1758,12 +1826,17 @@ async def _maybe_emit_session_usage(
     state.cumulative_cache_read_input_tokens += _int_field(
         per_call, "cumulative_cache_read_input_tokens"
     )
-    # Resolve the raw model enum to a displayName if the catalog is available.
+    # Resolve the raw model enum to a PRICING-RESOLVABLE id (a priceable
+    # ``databricks-gemini-*`` when the model maps to one, else the human
+    # displayName) if the catalog is available. The server keys
+    # ``fetch_model_pricing`` AND the per-model TOKEN USAGE bucket on this field,
+    # so posting the bare displayName left the session unpriced — see
+    # :func:`_resolve_pricing_id`.
     model_enum = per_call.get("model")
-    display_name: str | None = None
+    pricing_id: str | None = None
     if isinstance(model_enum, str) and model_enum:
         catalog = await _ensure_catalog(state)
-        display_name = _resolve_display_name(model_enum, catalog)
+        pricing_id = _resolve_pricing_id(model_enum, catalog)
     # Build the cumulative payload (SET-semantics running totals).
     payload: dict[str, object] = {}
     if state.cumulative_input_tokens > 0:
@@ -1772,8 +1845,8 @@ async def _maybe_emit_session_usage(
         payload["cumulative_output_tokens"] = state.cumulative_output_tokens
     if state.cumulative_cache_read_input_tokens > 0:
         payload["cumulative_cache_read_input_tokens"] = state.cumulative_cache_read_input_tokens
-    if display_name is not None:
-        payload["model"] = display_name
+    if pricing_id is not None:
+        payload["model"] = pricing_id
     if not payload:
         return
     step_idx = _step_index(step) or 0
@@ -1819,14 +1892,20 @@ async def _maybe_emit_model_change(
     if model_enum == state.posted_model_enum:
         return
     catalog = await _ensure_catalog(state)
-    display_name = _resolve_display_name(model_enum, catalog)
+    # Post a PRICING-RESOLVABLE id (priceable ``databricks-gemini-*`` when the
+    # model maps to one, else the human displayName) — never the raw human
+    # displayName. The server persists this into ``conv.model_override``, which
+    # is re-validated and passed to ``agy --model`` on resume; a non-slug label
+    # ("Gemini 2.5 Flash") is unfaithfully resumed and fails
+    # ``validate_model_override``. See :func:`_resolve_pricing_id`.
+    pricing_id = _resolve_pricing_id(model_enum, catalog)
     step_idx = _step_index(step) or 0
     await _post_event(
         client,
         session_id,
         OutboundEvent(
             event_type=_EXTERNAL_MODEL_CHANGE,
-            data={"model": display_name},
+            data={"model": pricing_id},
             step_index=step_idx,
         ),
     )
