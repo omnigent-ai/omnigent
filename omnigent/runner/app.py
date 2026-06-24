@@ -1043,6 +1043,7 @@ async def _auto_create_cursor_terminal(
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
     from omnigent.cursor_native_forwarder import supervise_cursor_forwarder
+    from omnigent.cursor_native_permissions import supervise_cursor_approval_mirror
 
     if server_client is not None and ensure_comment_relay is not None:
         await ensure_comment_relay(
@@ -1052,22 +1053,43 @@ async def _auto_create_cursor_terminal(
         )
     approve_mcp_server_for_workspace(Path(workspace))
 
+    async def _supervise_cursor_native_bridges() -> None:
+        """Run the transcript forwarder and the approval mirror together.
+
+        Both are per-session, runner-owned, and restart-on-failure; gathering
+        them under one task keeps a single registration/cancellation handle
+        (:func:`_register_auto_forwarder_task`) for session teardown. The
+        forwarder mirrors cursor-agent's replies onto the conversation; the
+        approval mirror surfaces cursor's native tool-approval prompts as web
+        elicitations (see :mod:`omnigent.cursor_native_permissions`).
+        """
+        await asyncio.gather(
+            supervise_cursor_forwarder(
+                base_url=server_url,
+                headers={},
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                agent_name="cursor-native-ui",
+                workspace=workspace,
+                launch_epoch_ms=launch_epoch_ms,
+                auth=_runner_auth,
+            ),
+            supervise_cursor_approval_mirror(
+                base_url=server_url,
+                headers={},
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                auth=_runner_auth,
+            ),
+        )
+
     _forwarder_task = asyncio.create_task(
-        supervise_cursor_forwarder(
-            base_url=server_url,
-            headers={},
-            session_id=session_id,
-            bridge_dir=bridge_dir,
-            agent_name="cursor-native-ui",
-            workspace=workspace,
-            launch_epoch_ms=launch_epoch_ms,
-            auth=_runner_auth,
-        ),
-        name=f"cursor-forwarder-{session_id}",
+        _supervise_cursor_native_bridges(),
+        name=f"cursor-bridges-{session_id}",
     )
     _register_auto_forwarder_task(session_id, _forwarder_task)
     _logger.info(
-        "Auto-created cursor terminal + forwarder for session %s; forwarder_task=%s",
+        "Auto-created cursor terminal + forwarder/approval-mirror for session %s; task=%s",
         session_id,
         _forwarder_task.get_name(),
     )

@@ -5737,6 +5737,47 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/hooks/cursor-permission-request": {
+      "post": {
+        "description": "Cursor-native tool-approval hook (TUI \u2192 web elicitation).\n\nReceives a tool-approval prompt detected on the ``cursor-agent`` TUI\npane by the runner-side mirror\n(:mod:`omnigent.cursor_native_permissions`), publishes the standard\n``response.elicitation_request`` event for the web UI, then parks for\nthe session ``approval`` verdict \u2014 the same registry / publish /\ncleanup path as the Codex- and Claude-native hooks, so pending badges\nand disconnect handling stay consistent across native harnesses. An\nempty ``200`` (no web verdict \u2014 the prompt was answered in the TUI, or\nthe wait timed out) leaves cursor's native prompt authoritative.\n\n:param request: FastAPI request carrying the detected prompt\n    (``elicitation_id`` plus the ``message`` / ``content_preview`` /\n    ``operation_type`` to render).\n:param session_id: Omnigent conversation id from the URL path.\n:returns: An ``ElicitationResult`` (``{\"action\": \u2026}``) on a web\n    verdict, or ``200`` with empty body on TUI-resolution / timeout /\n    disconnect.\n:raises OmnigentError: 404 if the session does not exist, 400 if the\n    body is malformed.",
+        "operationId": "cursor_permission_request_hook_v1_sessions__session_id__hooks_cursor_permission_request_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cursor Permission Request Hook",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/hooks/permission-request": {
       "post": {
         "description": "Claude Code ``PermissionRequest`` HTTP hook endpoint.\n\nReceives Claude Code's PermissionRequest hook payload (tool\nname + input the user would otherwise see a TUI prompt for),\npublishes a ``response.elicitation_request`` SSE event on the\nsession stream so the web UI's :file:`ApprovalCard` renders\ninline, and long-polls until the verdict arrives via the\nsession ``approval`` event path.\n\nResponse shape follows Claude Code's PermissionRequest hook\ncontract: ``hookSpecificOutput.decision.behavior`` is\n``\"allow\"`` or ``\"deny\"``. On timeout the endpoint returns\n``200`` with an empty body \u2014 Claude Code treats that as\n\"defer to the TUI prompt\", which matches the wrapper's\nfail-ask contract (UI unreachable / unattended \u2192 fall back\nto terminal-side approval).\n\nAuth: standard session ACL \u2014 the wrapper's outbound headers\n(``ap_auth_headers`` in :func:`build_hook_settings`) carry\nthe same Bearer token used for every other Omnigent request. For\nlocal-server mode (no auth provider), unauth'd calls are\nallowed.\n\n:param request: FastAPI request \u2014 body is Claude Code's\n    PermissionRequest payload as JSON.\n:param session_id: Omnigent conversation id from the URL path.\n:returns: Claude PermissionRequest hookSpecificOutput JSON,\n    or ``200`` with empty body on timeout (fail-ask).\n:raises OmnigentError: 404 if the session doesn't exist,\n    400 if the body fails JSON parse or is missing\n    ``tool_name``.",

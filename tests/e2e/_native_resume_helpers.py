@@ -492,6 +492,95 @@ def poll_external_session_id(client: httpx.Client, *, conversation_id: str, time
     )
 
 
+def poll_for_pending_elicitation(
+    client: httpx.Client,
+    *,
+    conversation_id: str,
+    timeout: float,
+    needle: str | None = None,
+) -> dict[str, object]:
+    """
+    Poll ``GET /v1/sessions/{id}`` until a pending elicitation is published.
+
+    The server mirrors harness-originated approval prompts to the web UI as
+    ``response.elicitation_request`` events, listed in
+    ``SessionResponse.pending_elicitations``. This polls until one appears
+    (optionally one whose rendered message/preview contains *needle*) and
+    returns it, so a test can read its ``elicitation_id`` and resolve it via
+    :func:`resolve_elicitation`.
+
+    :param client: HTTP client pointed at the test server.
+    :param conversation_id: Session id, e.g. ``"conv_abc"``.
+    :param timeout: Max seconds to wait for the prompt to surface.
+    :param needle: Optional substring required in the elicitation's
+        ``params.message`` or ``params.content_preview`` (to pin a specific
+        prompt). ``None`` accepts the first pending elicitation.
+    :returns: The pending elicitation event dict (carries ``elicitation_id``).
+    :raises AssertionError: If no matching elicitation appears within *timeout*.
+    """
+    deadline = time.monotonic() + timeout
+    last: list[object] = []
+    while time.monotonic() < deadline:
+        resp = client.get(f"/v1/sessions/{conversation_id}")
+        if resp.status_code == 200:
+            pending = resp.json().get("pending_elicitations", [])
+            if isinstance(pending, list):
+                last = pending
+                for event in pending:
+                    if isinstance(event, dict) and (
+                        needle is None or _elicitation_matches(event, needle)
+                    ):
+                        return event
+        time.sleep(POLL_INTERVAL_S)
+    suffix = f" containing {needle!r}" if needle else ""
+    raise AssertionError(
+        f"no pending elicitation{suffix} for {conversation_id} within "
+        f"{timeout}s; last pending_elicitations seen: {last!r}"
+    )
+
+
+def _elicitation_matches(event: dict[str, object], needle: str) -> bool:
+    """Return whether an elicitation event's message/preview contains *needle*."""
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return False
+    return any(
+        isinstance(params.get(key), str) and needle in params[key]
+        for key in ("message", "content_preview")
+    )
+
+
+def resolve_elicitation(
+    client: httpx.Client,
+    *,
+    conversation_id: str,
+    elicitation_id: str,
+    action: str = "accept",
+) -> None:
+    """
+    Resolve a pending elicitation via the web-UI approval path.
+
+    POSTs ``type == "approval"`` to ``/v1/sessions/{id}/events`` exactly as the
+    web UI does when a user clicks Approve/Decline on an ``ApprovalCard``.
+
+    :param client: HTTP client pointed at the test server.
+    :param conversation_id: Session id, e.g. ``"conv_abc"``.
+    :param elicitation_id: Correlation id from the pending elicitation event.
+    :param action: ``"accept"``, ``"decline"``, or ``"cancel"``.
+    :returns: None.
+    :raises httpx.HTTPStatusError: If the server rejects the event.
+    """
+    resp = client.post(
+        f"/v1/sessions/{conversation_id}/events",
+        json={
+            "type": "approval",
+            "data": {"elicitation_id": elicitation_id, "action": action},
+        },
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+
+
 def _delete_local_native_transcript(external_session_id: str) -> int:
     """
     Delete any local Claude Code transcript for *external_session_id*.

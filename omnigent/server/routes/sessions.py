@@ -683,6 +683,12 @@ def _claude_native_remember_host(tool_name: str, tool_input: Any) -> str | None:
 # any prompt a headless sub-agent left unanswered for >5 minutes.
 _CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S = 86400.0
 
+# Same one-day park budget for cursor-native tool-approval prompts mirrored
+# from the TUI: a terminal-side answer ends the wait early via
+# ``external_elicitation_resolved`` (posted by the runner-side approval mirror),
+# so the long park never blocks the cursor pane.
+_CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
+
 # ``external_elicitation_resolved`` can arrive just before the matching
 # Codex hook registers, and a web verdict can land between a severed
 # long-poll and its retry. Pinned, NOT the hook wait budget: Codex ids
@@ -14856,6 +14862,98 @@ def create_sessions_router(
         body = codex_request.build_response(result)
         return Response(
             content=json.dumps(body),
+            media_type="application/json",
+        )
+
+    # ── POST /sessions/{session_id}/hooks/cursor-permission-request ─
+
+    @router.post(
+        "/sessions/{session_id}/hooks/cursor-permission-request",
+        response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def cursor_permission_request_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Cursor-native tool-approval hook (TUI → web elicitation).
+
+        Receives a tool-approval prompt detected on the ``cursor-agent`` TUI
+        pane by the runner-side mirror
+        (:mod:`omnigent.cursor_native_permissions`), publishes the standard
+        ``response.elicitation_request`` event for the web UI, then parks for
+        the session ``approval`` verdict — the same registry / publish /
+        cleanup path as the Codex- and Claude-native hooks, so pending badges
+        and disconnect handling stay consistent across native harnesses. An
+        empty ``200`` (no web verdict — the prompt was answered in the TUI, or
+        the wait timed out) leaves cursor's native prompt authoritative.
+
+        :param request: FastAPI request carrying the detected prompt
+            (``elicitation_id`` plus the ``message`` / ``content_preview`` /
+            ``operation_type`` to render).
+        :param session_id: Omnigent conversation id from the URL path.
+        :returns: An ``ElicitationResult`` (``{"action": …}``) on a web
+            verdict, or ``200`` with empty body on TUI-resolution / timeout /
+            disconnect.
+        :raises OmnigentError: 404 if the session does not exist, 400 if the
+            body is malformed.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in cursor permission hook body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "Cursor permission hook body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        elicitation_id = payload.get("elicitation_id")
+        if not isinstance(elicitation_id, str) or not elicitation_id:
+            raise OmnigentError(
+                "Cursor permission hook body must include 'elicitation_id'.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        message = payload.get("message")
+        if not isinstance(message, str) or not message:
+            message = "Cursor wants approval to run a tool"
+        content_preview = payload.get("content_preview")
+        if not isinstance(content_preview, str):
+            content_preview = None
+        operation_type = payload.get("operation_type")
+        if not isinstance(operation_type, str) or not operation_type:
+            operation_type = "tool"
+        params = ElicitationRequestParams(
+            mode="form",
+            message=message,
+            requestedSchema=None,
+            url=None,
+            phase="pre_tool_use",
+            policy_name="cursor_native_permission",
+            content_preview=content_preview,
+        )
+        result = await _publish_and_wait_for_harness_elicitation(
+            request,
+            session_id=session_id,
+            params=params,
+            timeout_s=_CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
+            conversation_store=conversation_store,
+            elicitation_id=elicitation_id,
+            tool_name=f"Cursor({operation_type})",
+        )
+        if result is None:
+            return Response(status_code=status.HTTP_200_OK)
+        return Response(
+            content=json.dumps(result.model_dump(exclude_none=True)),
             media_type="application/json",
         )
 

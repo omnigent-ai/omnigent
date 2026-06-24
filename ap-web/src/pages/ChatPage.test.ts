@@ -444,6 +444,14 @@ describe("reorderCommittedRequestElicitations", () => {
     expect(bubbleIds(reorderCommittedRequestElicitations(committed))).toEqual(["u1", "e1"]);
   });
 
+  it("swaps a cursor-native pre_tool_use card below the user message it gated", () => {
+    // cursor-native's standalone approval card arrives in the live stream
+    // before the forwarder mirrors the triggering user message, giving
+    // [card, message]. It must drop below the prompt, exactly like REQUEST.
+    const committed = [elicitationBubble("e1", "pre_tool_use"), userBubble("u1")];
+    expect(bubbleIds(reorderCommittedRequestElicitations(committed))).toEqual(["u1", "e1"]);
+  });
+
   it("keeps the card between the prompt and the assistant response", () => {
     const committed = [
       assistantText("a0"),

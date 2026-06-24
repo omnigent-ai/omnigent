@@ -252,6 +252,70 @@ class TestStateRoundTrip:
         fwd.clear_cursor_bridge_state(tmp_path)
 
 
+class TestChatClaim:
+    """``_chat_claimed_by_other`` keeps one cursor chat → one mirroring session.
+
+    cursor keeps one chat per working dir, so two cursor-native sessions in the
+    same cwd discover the same store; this guard stops both from mirroring it
+    into two conversations (the duplicate-session bug).
+    """
+
+    def test_yields_to_earlier_live_session(self, tmp_path: Path) -> None:
+        root = tmp_path / "cursor-native"
+        earlier = root / "sessA"
+        later = root / "sessB"
+        earlier.mkdir(parents=True)
+        later.mkdir(parents=True)
+        store = "/cursor/chats/h/c/store.db"
+        # The earlier-launched session claims the chat (fresh heartbeat on write).
+        fwd._write_state(
+            earlier, fwd._ForwardState(store_path=store, last_rowid=3, launch_epoch_ms=1_000)
+        )
+        # The later session must yield to the established one.
+        assert fwd._chat_claimed_by_other(later, Path(store), my_launch_ms=2_000) is True
+        # The earlier session does NOT yield, even once the later one has also
+        # recorded a claim on the same chat.
+        fwd._write_state(
+            later, fwd._ForwardState(store_path=store, last_rowid=0, launch_epoch_ms=2_000)
+        )
+        assert fwd._chat_claimed_by_other(earlier, Path(store), my_launch_ms=1_000) is False
+
+    def test_unrelated_store_is_not_claimed(self, tmp_path: Path) -> None:
+        root = tmp_path / "cursor-native"
+        (root / "sessA").mkdir(parents=True)
+        (root / "sessB").mkdir(parents=True)
+        fwd._write_state(
+            root / "sessA",
+            fwd._ForwardState(
+                store_path="/cursor/chats/h/c1/store.db", last_rowid=1, launch_epoch_ms=1_000
+            ),
+        )
+        # A session mirroring a DIFFERENT chat is not blocked.
+        assert (
+            fwd._chat_claimed_by_other(
+                root / "sessB", Path("/cursor/chats/h/c2/store.db"), my_launch_ms=2_000
+            )
+            is False
+        )
+
+    def test_stale_sibling_claim_is_ignored(self, tmp_path: Path) -> None:
+        root = tmp_path / "cursor-native"
+        dead = root / "sessDead"
+        live = root / "sessLive"
+        dead.mkdir(parents=True)
+        live.mkdir(parents=True)
+        store = "/cursor/chats/h/c/store.db"
+        # An ancient heartbeat marks a dead session; write the file directly so
+        # _write_state does not refresh the heartbeat to "now".
+        (dead / fwd._STATE_FILE).write_text(
+            json.dumps(
+                {"store_path": store, "last_rowid": 9, "launch_epoch_ms": 1_000, "heartbeat_ms": 1}
+            ),
+            encoding="utf-8",
+        )
+        assert fwd._chat_claimed_by_other(live, Path(store), my_launch_ms=2_000) is False
+
+
 class _RecordingClient:
     """Async httpx-client stub that records POSTs and returns HTTP 200."""
 
