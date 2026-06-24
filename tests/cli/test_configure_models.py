@@ -54,6 +54,7 @@ from omnigent.onboarding.configure_models import (
 )
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
+    GEMINI_FAMILY,
     OPENAI_FAMILY,
     get_default_provider,
     load_config,
@@ -525,12 +526,13 @@ def test_add_menu_options_ordering() -> None:
     and Databricks sits just above the catch-all "Other". A regression to
     the old interleaved order (or Other above Databricks) fails here.
     """
-    # Full menu: keys, then subscriptions, then Gateway, OpenRouter,
-    # Databricks, Other.
+    # Full menu: first-party keys (OpenAI, Anthropic, Gemini), then
+    # subscriptions, then Gateway, OpenRouter, Databricks, Other.
     full = [o.label.split(None, 1)[1] for o in add_menu_options()]
     assert full == [
         "OpenAI — API key",
         "Anthropic — API key",
+        "Gemini — API key",
         "ChatGPT — subscription",
         "Claude — subscription (Pro/Max)",
         "Gateway — custom base URL + key (e.g. OpenRouter)",
@@ -564,6 +566,12 @@ def test_add_menu_options_ordering() -> None:
         "Databricks — workspace",
         "AWS Bedrock — API key",
     ]
+
+    # Gemini (antigravity) scoped: API key only — Gemini is key-only (no
+    # subscription/gateway/Databricks), and it must NOT appear in the
+    # openai-family "Other provider" catch-all (asserted via `codex` above).
+    gemini = [o.label.split(None, 1)[1] for o in add_menu_options_for_family(GEMINI_FAMILY)]
+    assert gemini == ["Gemini — API key"]
 
 
 def test_add_menu_databricks_option_gated_on_extra(monkeypatch) -> None:

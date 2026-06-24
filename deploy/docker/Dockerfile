@@ -144,6 +144,15 @@ RUN test -f ./omnigent/server/static/web-ui/index.html \
 # [databricks] extra in pyproject — so add it explicitly here.
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
 
+# Optional managed-sandbox provider extras for the SERVER (the launcher imports
+# the provider SDK — e.g. the kubernetes client for `sandbox.provider:
+# kubernetes`). Off by default; the runner host image needs none of these. Build
+# with `--build-arg OMNIGENT_EXTRAS=kubernetes` (comma-separate for several).
+ARG OMNIGENT_EXTRAS=
+RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
+        uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e ".[${OMNIGENT_EXTRAS}]"; \
+    fi
+
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
 # image; contributes no layers of its own.
@@ -151,7 +160,12 @@ FROM node:${NODE_VERSION}-slim AS node-runtime
 
 # ── Host runtime (`--target host`) ──────────────────────
 # Prebaked Omnigent host for remote sandboxes: full omnigent install,
-# git + tmux for harness runtime needs, bubblewrap to OS-sandbox the
+# git + tmux for harness runtime needs, procps + lsof so the antigravity-native
+# executor can discover agy's connect-RPC port (antigravity_native_rpc.py uses
+# `pgrep` in _list_agy_pids to find agy processes — with a /proc-scan fallback if
+# pgrep is absent — then `lsof` in resolve_language_server_port to read their
+# loopback ports; lsof has NO fallback, so a missing lsof silently yields "no
+# port" and breaks web-turn injection), bubblewrap to OS-sandbox the
 # native harness terminals (mandatory and fail-loud on Linux), curl + CA
 # certificates for outbound HTTPS and in-sandbox downloads, plus the
 # coding-harness CLIs (claude / codex / pi) so claude-sdk, claude-native,
@@ -185,7 +199,7 @@ ENV PYTHONUNBUFFERED=1 \
     IS_SANDBOX=1
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git tmux bubblewrap curl ca-certificates \
+ && apt-get install -y --no-install-recommends git tmux procps lsof bubblewrap curl ca-certificates \
       iproute2 nftables \
  && rm -rf /var/lib/apt/lists/*
 
@@ -228,6 +242,41 @@ RUN npm install -g --no-audit --no-fund \
       @openai/codex \
       @earendil-works/pi-coding-agent \
  && npm cache clean --force
+
+# Antigravity CLI (`agy`) — the antigravity-native harness shells out to `agy`
+# on the host, launching it in a tmux pane (see omnigent/antigravity_native*.py),
+# so a managed host image must carry it. It is NOT an npm package
+# (harness_install.py lists agy as a non-npm, installer-script harness), so it
+# can't join the `npm install -g` set above: the official bootstrapper fetches
+# the platform-native binary. The bootstrapper's ``--dir`` flag is a no-op in
+# agy 1.0.10 (it always installs to ``$HOME/.local/bin`` regardless — verified),
+# and that dir is NOT on the venv PATH and is per-user (root's, not the uid-1000
+# runtime user's). So install to the default, then move the single self-contained
+# binary onto a system PATH dir every user shares. ``test -x`` fails the build
+# loudly if the layout ever changes again.
+#
+# Version pin: the native harness is behaviorally coupled to a specific agy build
+# (its out-of-order transcript writes, connect-RPC quirks, and TUI injection are
+# all verified against 1.0.10 — grep ``agy 1.0.10`` under omnigent/antigravity_native*).
+# The official bootstrapper has NO version flag — it always fetches the LATEST
+# build from its auto-updater manifest (verified: only ``-d/--dir`` and ``-h`` are
+# accepted; it does SHA512-verify the payload, but only against that latest-pointing
+# manifest). So the DOWNLOAD itself cannot be pinned here. Instead we pin the
+# ACCEPTED version and FAIL THE BUILD if the installer served a different one —
+# turning a future silent harness break (a newer agy whose behavior diverged) into
+# a visible, conscious bump. To adopt a new agy: re-verify the coupled behavior,
+# then bump AGY_EXPECTED_VERSION (override at build with --build-arg if needed).
+ARG AGY_EXPECTED_VERSION=1.0.10
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash \
+ && install -m 0755 "${HOME:-/root}/.local/bin/agy" /usr/local/bin/agy \
+ && test -x /usr/local/bin/agy \
+ && installed_agy_version="$(/usr/local/bin/agy --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)" \
+ && if [ "$installed_agy_version" != "$AGY_EXPECTED_VERSION" ]; then \
+      echo "ERROR: agy installer served version '${installed_agy_version:-<unparseable>}', but the native harness is pinned to '$AGY_EXPECTED_VERSION'." >&2; \
+      echo "       The bootstrapper has no version flag (always latest). Re-verify the harness against the new agy, then bump AGY_EXPECTED_VERSION." >&2; \
+      exit 1; \
+    fi \
+ && echo "agy ${AGY_EXPECTED_VERSION} pinned and verified"
 
 # Preserve /build/ — the venv's editable install .pth files reference
 # /build/omnigent and /build/sdks/* by absolute path. Copying these to

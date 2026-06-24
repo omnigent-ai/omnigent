@@ -100,6 +100,10 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
     "agy": "antigravity",
     "google-antigravity": "antigravity",
     "qwen": "qwen",
+    # The native agy TUI bridge resolves its provider via the SDK sibling,
+    # mirroring the claude-native -> claude-sdk rule above.
+    "antigravity-native": "antigravity",
+    "native-antigravity": "antigravity",
 }
 
 # Preferred inline family per single-family harness (pi consumes both).

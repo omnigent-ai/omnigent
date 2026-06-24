@@ -76,6 +76,22 @@ interface NativeShellApi {
   setViewMode?: (params: NativeViewModeParams) => void;
   /** Subscribe to taps on the native switcher; returns an unsubscribe. */
   onViewModeChanged?: (callback: (mode: NativeViewMode) => void) => () => void;
+  /**
+   * Subscribe to the footprint (CSS px, excluding the OS safe area) of the
+   * native floating bars. The shell pushes this whenever it changes — and
+   * immediately on subscribe, since it caches the last value — so the web
+   * layer can fold the real bar dimensions into its inset variables instead of
+   * hardcoding them. Absent on older shells. Returns an unsubscribe.
+   */
+  onNativeInsets?: (callback: (insets: NativeInsets) => void) => () => void;
+}
+
+/** Footprints (CSS px) of the native floating bars, reported by the shell. */
+export interface NativeInsets {
+  /** Server switcher pill height + its top padding. */
+  topBar: number;
+  /** Chat/Terminal bar capsule height + its bottom padding. */
+  bottomBar: number;
 }
 
 export type NativeViewMode = "chat" | "terminal";
@@ -265,10 +281,24 @@ export async function setBadgeCount(count: number): Promise<void> {
 }
 
 /**
+ * Set one of the inset-system CSS variables on the document root. Visibility of
+ * the native bars is web-owned (the web app is what shows/hides them), so the
+ * setters below fold it into `--omnigent-*-bar-visible`; the bars' size comes
+ * from the native bridge (see {@link onNativeInsets} / nativeInsets.ts). Both
+ * combine in `--omnigent-inset-*` (index.css). Harmless off-shell — the size
+ * vars stay 0 there, so a stray visibility flag contributes nothing.
+ */
+function setInsetVar(name: string, value: string): void {
+  if (typeof document === "undefined") return;
+  document.documentElement.style.setProperty(name, value);
+}
+
+/**
  * Inform a native shell that its server switcher should hide. Older shells
  * simply lack this optional method, so this degrades to a no-op.
  */
 export function setNativeServerSwitcherHidden(hidden: boolean): void {
+  setInsetVar("--omnigent-top-bar-visible", hidden ? "0" : "1");
   const native = nativeApi();
   const setter = native?.setServerSwitcherHidden ?? native?.setSidebarOpen;
   if (!setter) return;
@@ -292,6 +322,7 @@ export function setNativeSidebarOpen(open: boolean): void {
  * caller renders its own in-page pill there.
  */
 export function setNativeViewMode(params: NativeViewModeParams): void {
+  setInsetVar("--omnigent-bottom-bar-visible", params.visible ? "1" : "0");
   const native = nativeApi();
   if (!native?.setViewMode) return;
   try {
@@ -313,6 +344,24 @@ export function onNativeViewModeChanged(callback: (mode: NativeViewMode) => void
     return native.onViewModeChanged(callback);
   } catch (err) {
     console.warn("[nativeBridge] native onViewModeChanged failed:", err);
+    return () => {};
+  }
+}
+
+/**
+ * Subscribe to the native bars' footprint from the shell. The shell pushes the
+ * current value immediately on subscribe (it caches the last emit), then again
+ * on any change. Returns an unsubscribe; a no-op outside a shell that reports
+ * insets (Electron, plain browser, older iOS shells), where the bars don't
+ * exist and the inset CSS vars stay 0.
+ */
+export function onNativeInsets(callback: (insets: NativeInsets) => void): () => void {
+  const native = nativeApi();
+  if (!native?.onNativeInsets) return () => {};
+  try {
+    return native.onNativeInsets(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onNativeInsets failed:", err);
     return () => {};
   }
 }

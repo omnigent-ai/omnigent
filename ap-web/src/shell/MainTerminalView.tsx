@@ -14,11 +14,9 @@
 // shells are enumerated and created in the rail's Shells tab.
 
 import { TerminalIcon, XIcon } from "lucide-react";
-import type { CSSProperties } from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { TerminalView } from "@/components/blocks/TerminalView";
 import { AGENT_TERMINAL_IDS, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
-import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -71,9 +69,10 @@ export function MainTerminalView({
   const [activeKey, setActiveKey] = useState(initialTerminalKey || "");
   const { getStatus, setTerminalConnectionState, markTerminalActive } =
     useTerminalStatuses(terminals);
-  const keyboardInset = useIOSNativeKeyboardInset();
-  const containerStyle: CSSProperties | undefined =
-    keyboardInset > 0 ? { paddingBottom: `calc(0.375rem + ${keyboardInset}px)` } : undefined;
+  // No manual keyboard padding here: this view is flow content inside the
+  // app-shell, which useIOSViewportLock sizes to the visual viewport, so the
+  // terminal already sits above the keyboard. (Fixed overlays like the mobile
+  // TerminalsPanel still pad themselves with useIOSNativeKeyboardInset.)
 
   // Honor a retarget while already open (a rail shell click can point
   // an open view at a different terminal); the validity effect below
@@ -126,7 +125,6 @@ export function MainTerminalView({
       // terminal (not just that the view opened).
       data-active-terminal={activeKey}
       className="main-terminal-view flex min-h-0 flex-1 flex-col px-3 pt-16 pb-1.5"
-      style={containerStyle}
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-sm">
         {terminals.length === 0 ? (

@@ -381,6 +381,7 @@ describe("agentDisplayLabel", () => {
     expect(agentDisplayLabel("pi-native-ui")).toBe("Pi");
     expect(agentDisplayLabel("claude-native-ui")).toBe("Claude");
     expect(agentDisplayLabel("codex-native-ui")).toBe("Codex");
+    expect(agentDisplayLabel("antigravity-native-ui")).toBe("Antigravity");
   });
 
   it("strips the fork/switch clone suffix before resolving the native label", () => {

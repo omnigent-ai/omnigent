@@ -35,8 +35,22 @@ describe("nativeCodingAgentForHarness", () => {
     expect(nativeCodingAgentForHarness("native-pi")).toBe(nativeCodingAgentForHarness("pi-native"));
   });
 
+  it("resolves the canonical antigravity-native harness", () => {
+    expect(nativeCodingAgentForHarness("antigravity-native")?.key).toBe("antigravity");
+  });
+
+  // Same reversed-alias contract as native-pi: `native-antigravity` must
+  // fold to the canonical antigravity-native spec.
+  it("folds the reversed native-antigravity alias to the antigravity-native spec", () => {
+    expect(nativeCodingAgentForHarness("native-antigravity")).toBe(
+      nativeCodingAgentForHarness("antigravity-native"),
+    );
+  });
+
   it("leaves unknown / non-native harnesses unresolved", () => {
     expect(nativeCodingAgentForHarness("claude-sdk")).toBeUndefined();
+    // The in-process Antigravity SDK harness is not a native CLI wrapper.
+    expect(nativeCodingAgentForHarness("antigravity")).toBeUndefined();
     expect(nativeCodingAgentForHarness(null)).toBeUndefined();
     expect(nativeCodingAgentForHarness(undefined)).toBeUndefined();
   });
@@ -47,6 +61,13 @@ describe("nativeWrapperLabelsForAgent", () => {
     expect(nativeWrapperLabelsForAgent({ name: "my-pi", harness: "native-pi" })).toEqual({
       [UI_MODE_LABEL_KEY]: UI_MODE_TERMINAL_VALUE,
       [WRAPPER_LABEL_KEY]: "pi-native-ui",
+    });
+  });
+
+  it("stamps terminal-first labels for a native-antigravity agent", () => {
+    expect(nativeWrapperLabelsForAgent({ name: "my-agy", harness: "native-antigravity" })).toEqual({
+      [UI_MODE_LABEL_KEY]: UI_MODE_TERMINAL_VALUE,
+      [WRAPPER_LABEL_KEY]: "antigravity-native-ui",
     });
   });
 
