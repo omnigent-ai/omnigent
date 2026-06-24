@@ -38,29 +38,39 @@ _logger = logging.getLogger(__name__)
 _STREAM_LIMIT = 16 * 1024 * 1024
 _VIBE_TURN_TIMEOUT_S = 600.0
 
+
 def _resolve_vibe_binary() -> str:
     explicit = os.environ.get("HARNESS_VIBE_PATH", "").strip()
     if explicit:
         return explicit
     return "vibe"
 
-def _latest_user_text(messages: list[Message]) -> str:
-    for message in reversed(messages):
-        if message.get("role") != "user":
-            continue
-        content = message.get("content")
+
+def _format_conversation_history(messages: list[Message]) -> str:
+    """Format full conversation history since Vibe doesn't emit a session id for resume."""
+    parts: list[str] = []
+    for msg in messages:
+        role = msg.get("role", "unknown")
+        content = msg.get("content")
+        text = ""
         if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            text_parts: list[str] = []
+            text = content
+        elif isinstance(content, list):
+            blocks: list[str] = []
             for block in content:
                 if not isinstance(block, dict):
                     continue
                 block_type = block.get("type")
                 if block_type in ("text", "input_text") and isinstance(block.get("text"), str):
-                    text_parts.append(block["text"])
-            return "".join(text_parts)
-    return ""
+                    blocks.append(block["text"])
+            text = "".join(blocks)
+
+        if text.strip():
+            # Format to make roles clear to the underlying model
+            parts.append(f"[{role.upper()}]\n{text.strip()}\n")
+
+    return "\n".join(parts).strip()
+
 
 class VibeExecutor(Executor):
     def __init__(
@@ -121,6 +131,7 @@ class VibeExecutor(Executor):
                 with_additional_write_roots,
                 with_spawn_env_allowlist,
             )
+
             cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             sandbox = resolve_sandbox(os_env, cwd)
             if not sandbox.active:
@@ -167,7 +178,7 @@ class VibeExecutor(Executor):
             content = payload.get("content")
             if isinstance(content, str) and content:
                 events.append(TextChunk(text=content))
-                
+
             tool_calls = payload.get("tool_calls") or []
             if isinstance(tool_calls, list):
                 for call in tool_calls:
@@ -238,7 +249,7 @@ class VibeExecutor(Executor):
             )
             return
 
-        prompt_text = _latest_user_text(messages)
+        prompt_text = _format_conversation_history(messages)
         if not prompt_text:
             yield TurnComplete(response=None)
             return
@@ -346,7 +357,7 @@ class VibeExecutor(Executor):
             response="".join(final_text_parts) if any_text_emitted else None,
         )
 
-    async def close_session(self, session_key: str) -> None:  # noqa: ARG002
+    async def close_session(self, session_key: str) -> None:
         self._session_map.pop(session_key, None)
 
     async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002
@@ -364,6 +375,7 @@ class VibeExecutor(Executor):
         content: EnqueuedContent,  # noqa: ARG002
     ) -> bool:
         return False
+
 
 async def _create_subprocess_exec(  # type: ignore[explicit-any]
     *args: Any,

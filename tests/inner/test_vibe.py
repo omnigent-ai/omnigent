@@ -5,20 +5,19 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
-from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 
-from omnigent.inner import vibe_executor, vibe_harness
+from omnigent.inner import vibe_harness
 from omnigent.inner.executor import (
     ExecutorError,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
 )
-from omnigent.inner.vibe_executor import VibeExecutor
+from omnigent.inner.vibe_executor import VibeExecutor, _format_conversation_history
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.spec._omnigent_compat import OMNIGENT_HARNESS_ALIASES
 
@@ -46,6 +45,17 @@ def test_executor_factory_reads_env_vars(monkeypatch: pytest.MonkeyPatch) -> Non
     assert captured["binary_path"] == "/custom/bin/vibe"
 
 
+def test_format_conversation_history() -> None:
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": [{"type": "text", "text": "how are you?"}]},
+    ]
+    formatted = _format_conversation_history(messages)
+    expected = "[USER]\nhi\n\n[ASSISTANT]\nhello\n\n[USER]\nhow are you?"
+    assert formatted == expected
+
+
 def test_build_argv_first_turn_no_resume() -> None:
     ex = VibeExecutor(binary_path="vibe")
     argv = ex._build_argv(prompt_text="hello")
@@ -71,13 +81,15 @@ def test_translate_event_assistant_text() -> None:
 
 def test_translate_event_tool_call() -> None:
     ex = VibeExecutor(binary_path="vibe")
-    events = ex._translate_event({
-        "role": "assistant",
-        "tool_calls": [{
-            "id": "call_123",
-            "function": {"name": "Bash", "arguments": '{"command": "ls"}'}
-        }]
-    }, "key_1")
+    events = ex._translate_event(
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "call_123", "function": {"name": "Bash", "arguments": '{"command": "ls"}'}}
+            ],
+        },
+        "key_1",
+    )
     assert len(events) == 1
     assert isinstance(events[0], ToolCallRequest)
     assert events[0].name == "Bash"
@@ -87,11 +99,9 @@ def test_translate_event_tool_call() -> None:
 
 def test_translate_event_tool_result() -> None:
     ex = VibeExecutor(binary_path="vibe")
-    events = ex._translate_event({
-        "role": "tool",
-        "tool_call_id": "call_123",
-        "content": "some output"
-    }, "key_1")
+    events = ex._translate_event(
+        {"role": "tool", "tool_call_id": "call_123", "content": "some output"}, "key_1"
+    )
     assert len(events) == 1
     assert isinstance(events[0], ToolCallComplete)
     assert events[0].result == "some output"
@@ -101,11 +111,9 @@ def test_translate_event_tool_result() -> None:
 
 def test_translate_event_session_id_capture() -> None:
     ex = VibeExecutor(binary_path="vibe")
-    events = ex._translate_event({
-        "role": "assistant",
-        "content": "Hi",
-        "session_id": "session_abc"
-    }, "key_1")
+    events = ex._translate_event(
+        {"role": "assistant", "content": "Hi", "session_id": "session_abc"}, "key_1"
+    )
     assert len(events) == 1
     assert ex._session_map["key_1"] == "session_abc"
 
@@ -113,8 +121,10 @@ def test_translate_event_session_id_capture() -> None:
 class _FakeStdout:
     def __init__(self, lines: list[str]) -> None:
         self._lines = [line.encode("utf-8") + b"\n" for line in lines]
+
     def __aiter__(self) -> _FakeStdout:
         return self
+
     async def readline(self) -> bytes:
         if not self._lines:
             return b""
@@ -125,6 +135,7 @@ class _FakeStderr:
     def __init__(self, blob: bytes) -> None:
         self._blob = blob
         self._done = False
+
     async def read(self, _n: int) -> bytes:
         if self._done:
             return b""
@@ -137,13 +148,17 @@ class _FakeProcess:
         self.stdout = _FakeStdout(stdout_lines)
         self.stderr = _FakeStderr(stderr_blob)
         self._returncode = returncode
+
     @property
     def returncode(self) -> int | None:
         return self._returncode
+
     async def wait(self) -> int:
         return self._returncode
+
     def terminate(self) -> None:
         pass
+
     def kill(self) -> None:
         pass
 
@@ -184,8 +199,10 @@ def test_run_turn_streams_text_and_emits_turn_complete(monkeypatch: pytest.Monke
 
 def test_run_turn_nonzero_exit_yields_executor_error(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeProcess([], b"boom\n", returncode=2)
+
     async def _fake_spawn(*_args: Any, **_kwargs: Any) -> _FakeProcess:
         return fake
+
     monkeypatch.setattr("omnigent.inner.vibe_executor._create_subprocess_exec", _fake_spawn)
     monkeypatch.setattr(shutil, "which", lambda _binary: "/usr/local/bin/vibe")
     monkeypatch.setattr("omnigent.inner.vibe_executor.Path.exists", lambda _self: True)
