@@ -58,7 +58,7 @@ the generated runner Pod is already restricted-compliant (non-root uid 1000, dro
 kubectl apply -k deploy/kubernetes/overlays/sandbox-runners
 
 # 2. The harness-credentials Secret the runners read — created out of band, like
-#    the OIDC secret in ../README.md. Add only the keys your agents use.
+#    the OIDC secret in ../../README.md. Add only the keys your agents use.
 kubectl create secret generic omnigent-creds -n omnigent-sandboxes \
   --from-literal=ANTHROPIC_API_KEY=sk-ant-... \
   --from-literal=OPENAI_API_KEY=sk-...
@@ -66,11 +66,56 @@ kubectl create secret generic omnigent-creds -n omnigent-sandboxes \
 
 Step 1 creates the runner namespace, both ServiceAccounts, the scoped Role +
 RoleBinding, and the server `sandbox:` config, and patches the server Deployment
-to run as `omnigent-server` with the config mounted. Step 2 supplies the LLM / git
-credentials: use `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) for a Claude
-subscription, `GIT_TOKEN` for private clones, `GEMINI_API_KEY` / `CODEX_ACCESS_TOKEN`
-as needed. For production prefer a sealed-secret / external-secrets operator over an
-imperative `kubectl create secret`.
+to run as `omnigent-server` with the config mounted. Step 2 supplies the model /
+git credentials — see [Model credentials](#model-credentials-llm-keys) and
+[Git credentials](#git-credentials-private-repositories) below for which keys to
+set (and a sealed-secret / external-secrets operator for production).
+
+## Server auth (managed hosts)
+
+There are two kinds of credential here: the **server-connection** auth below, and
+the **model** keys in the next section — keep them separate.
+
+A managed sandbox opens two connections back to the server. The **host tunnel** is
+authenticated by the per-launch token directly — the per-Pod token Secret, always
+works. But each session's **runner tunnel**, opened by the runner the host spawns,
+authenticates with whatever *server* credential it can resolve — **not** the host
+token. So how you front the server matters:
+
+- **Header / OIDC-proxy auth, or single-user (no-auth) servers** — the runner
+  tunnel needs no extra identity; managed hosts work out of the box. (Verified
+  end-to-end on a header-auth server: a `host_type: managed` session launched a
+  runner Pod and ran a Claude turn on an injected `CLAUDE_CODE_OAUTH_TOKEN`.)
+- **The built-in `accounts` provider (`OMNIGENT_AUTH_ENABLED=1`)** — the runner
+  tunnel additionally requires a *user* identity, which the per-launch host token
+  does not carry, so the runner dial-back is refused (`403`) even though the host
+  tunnel connects. This is a framework-level managed-host interaction shared by
+  **all** sandbox providers (Modal / Daytona / Islo / …), not specific to Kubernetes.
+
+So front the server with **header or OIDC auth** — a reverse proxy / IdP injects
+the user identity on every request, including the runner WebSocket (see
+[`deploy/README.md`](../../../README.md#auth)) — or run it single-user.
+
+## Model credentials (LLM keys)
+
+A fresh runner Pod has no model keys. They ride the **`omnigent-creds` Secret**
+(`secret_name`, projected into every Pod via `envFrom`) created in [Apply](#apply);
+the in-sandbox host forwards the standard harness credential vars to its runners.
+Which variables to inject — first-party APIs, gateways (`*_BASE_URL`),
+subscriptions — is identical to Modal; see the [variable table and per-plan
+recipes](../../../modal/README.md#llm-credentials-for-managed-sandboxes). For a
+Claude **subscription**, run `claude setup-token` on your own machine (one-time
+browser auth) and inject the long-lived token as `CLAUDE_CODE_OAUTH_TOKEN`. For
+env vars beyond the standard harness set, also set
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH=NAME1,NAME2`.
+
+## Git credentials (private repositories)
+
+Inject an HTTPS token as `GIT_TOKEN` (GitLab: add `GIT_USERNAME=oauth2`) into the
+`omnigent-creds` Secret. The host image's git credential helper answers HTTPS auth
+from it for both the launch-time clone and the agent's later `fetch` / `push`,
+writing nothing to disk — use HTTPS repository URLs. Details by provider match the
+[Modal git guide](../../../modal/README.md#git-credentials-private-repositories).
 
 ## Configuration (`sandbox-config.yaml`)
 
@@ -98,6 +143,10 @@ imperative `kubectl create secret`.
   for the clone step).
 - **403 on launch:** the server SA is missing the Role — re-apply this overlay
   and confirm the cross-namespace RoleBinding subject namespace is `omnigent`.
+- **Host comes online but the session hangs / 403s on the first message:** the
+  server is using the built-in `accounts` provider, which doesn't support the
+  managed runner dial-back — see [Server auth](#server-auth-managed-hosts) (use
+  header/OIDC auth, or run single-user).
 - **401 / "could not load Kubernetes configuration":** out of cluster, the server
   can't find a kubeconfig — set `kubeconfig` (or `OMNIGENT_KUBERNETES_KUBECONFIG`),
   or unset `in_cluster: true` if it isn't actually running in the cluster.
