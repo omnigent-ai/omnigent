@@ -172,7 +172,7 @@ def _agy_permission_params(
 
     message = "Antigravity wants to run a command"
     if command:
-        message = f"Antigravity wants to run **{command}**"
+        message = f"Antigravity wants to run: {command}"
 
     extras: dict[str, Any] = {
         "permission_spec": spec,
