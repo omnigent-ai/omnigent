@@ -15,8 +15,10 @@ import pytest
 from omnigent.llms import context_window
 from omnigent.llms.context_window import (
     ModelPricing,
+    _qwen_context_window,
     compute_llm_cost,
     fetch_model_pricing,
+    get_model_context_window,
     resolve_effective_context_window,
 )
 
@@ -351,3 +353,32 @@ def test_provider_catalog_caches_fetch_failure(
     assert first == 128_000  # _DEFAULT_CONTEXT_WINDOW fallback
     assert second == 128_000
     assert calls == ["anthropic"]
+
+
+# ---------------------------------------------------------------------------
+# Qwen context-window fallback (models absent from litellm + MLflow catalog)
+# ---------------------------------------------------------------------------
+
+
+def test_qwen_context_window_normalizes_id() -> None:
+    """The lookup strips provider prefixes and ``:tag`` suffixes before matching."""
+    assert _qwen_context_window("qwen3-coder-plus") == 1_048_576
+    assert _qwen_context_window("qwen/qwen3-coder") == 262_144
+    assert _qwen_context_window("qwen3-coder:free") == 262_144
+    assert _qwen_context_window("openrouter/qwen/qwen3-coder:free") == 262_144
+    assert _qwen_context_window("QWEN3-CODER-PLUS") == 1_048_576  # case-insensitive
+    # Unknown qwen variant → None (caller falls back to the default).
+    assert _qwen_context_window("qwen-nonexistent-xyz") is None
+
+
+def test_get_model_context_window_uses_qwen_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A known qwen model resolves to its curated window, not the 128K default.
+
+    Catalog lookup is disabled so the resolution is hermetic (no network):
+    litellm has no qwen entry, MLflow is skipped, so the qwen table answers.
+    """
+    monkeypatch.setenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", "1")
+    monkeypatch.delenv("AP_CONTEXT_WINDOW_OVERRIDE", raising=False)
+    assert get_model_context_window("qwen3-coder-plus") == 1_048_576
+    # An unrecognized qwen model still falls back to the conservative default.
+    assert get_model_context_window("qwen-nonexistent-xyz") == 128_000
