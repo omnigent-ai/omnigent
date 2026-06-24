@@ -672,7 +672,8 @@ export function NewChatLandingScreen() {
   const { data: directorySessions } = useDirectorySessions(true);
 
   const agentList = useMemo(
-    () => sortAgentsForDisplay((agents ?? []).filter((a) => !NEW_SESSION_HIDDEN_AGENTS.has(a.name))),
+    () =>
+      sortAgentsForDisplay((agents ?? []).filter((a) => !NEW_SESSION_HIDDEN_AGENTS.has(a.name))),
     [agents],
   );
 
