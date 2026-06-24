@@ -906,7 +906,8 @@ export function NewChatLandingScreen() {
   const effectiveAgentId =
     pickedAgentId === PENDING_AGENT_ID
       ? PENDING_AGENT_ID
-      : (agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ?? null;
+      : ((agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ??
+        null);
   const selectedAgent =
     effectiveAgentId === PENDING_AGENT_ID && pendingAgent
       ? ({
@@ -1242,7 +1243,8 @@ export function NewChatLandingScreen() {
             // Permission / approval mode → CLI flag pair, persisted as
             // terminal_launch_args. Omitted for the default and non-native agents.
             terminal_launch_args:
-              agentSupportsPermissionMode && permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
+              agentSupportsPermissionMode &&
+              permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
                 ? ["--permission-mode", permissionMode]
                 : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
                   ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])

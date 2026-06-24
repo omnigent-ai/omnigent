@@ -42,7 +42,16 @@ interface MCPFormEntry {
 }
 
 function emptyMCPEntry(key: number): MCPFormEntry {
-  return { key, name: "", transport: "stdio", url: "", headers: "", command: "", args: "", env: "" };
+  return {
+    key,
+    name: "",
+    transport: "stdio",
+    url: "",
+    headers: "",
+    command: "",
+    args: "",
+    env: "",
+  };
 }
 
 /** Parse "KEY=VAL" lines into a Record. */
@@ -179,7 +188,10 @@ export function CreateAgentDialog({
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
           {/* Name */}
           <div className="flex flex-col gap-1.5">
-            <label htmlFor="create-agent-name" className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="create-agent-name"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Name <span className="text-destructive">*</span>
             </label>
             <Input
@@ -230,7 +242,10 @@ export function CreateAgentDialog({
 
           {/* Model */}
           <div className="flex flex-col gap-1.5">
-            <label htmlFor="create-agent-model" className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="create-agent-model"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Model <span className="text-destructive">*</span>
             </label>
             <Input

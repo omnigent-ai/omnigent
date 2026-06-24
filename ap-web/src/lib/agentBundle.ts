@@ -99,14 +99,16 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
   const configYaml = lines.join("\n");
 
   // Build tar archive
-  const files: TarEntry[] = [{ name: "config.yaml", content: new TextEncoder().encode(configYaml) }];
+  const files: TarEntry[] = [
+    { name: "config.yaml", content: new TextEncoder().encode(configYaml) },
+  ];
   if (input.instructions) {
     files.push({ name: "AGENTS.md", content: new TextEncoder().encode(input.instructions) });
   }
 
   const tarBytes = createTar(files);
   const gzipped = await gzip(tarBytes);
-  return new File([gzipped], "agent.tar.gz", { type: "application/gzip" });
+  return new File([new Blob([gzipped])], "agent.tar.gz", { type: "application/gzip" });
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -200,7 +202,7 @@ function writeOctal(header: Uint8Array, offset: number, length: number, value: n
 async function gzip(data: Uint8Array): Promise<Uint8Array> {
   const cs = new CompressionStream("gzip");
   const writer = cs.writable.getWriter();
-  writer.write(data);
+  writer.write(data as unknown as BufferSource);
   writer.close();
 
   const reader = cs.readable.getReader();
