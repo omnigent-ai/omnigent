@@ -487,3 +487,49 @@ def test_api_key_auth_without_base_url_omits_base_url_env_var() -> None:
 
     assert env["HARNESS_OPENAI_AGENTS_API_KEY"] == "sk-test-000"
     assert "HARNESS_OPENAI_AGENTS_GATEWAY_BASE_URL" not in env
+
+
+def test_telemetry_env_injected_when_configured_and_span_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Issue #1051: with OTLP configured and an active omnigent span,
+    the openai-agents builder injects ``TRACEPARENT`` plus the OTLP
+    exporter knobs so the SDK's provider spans nest under the
+    omnigent agent span. The Claude SDK-specific flags must NOT be
+    set — the openai-agents SDK doesn't read them.
+    """
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+
+    import mlflow
+    from mlflow.entities import SpanType
+
+    from omnigent.runtime import telemetry
+
+    with telemetry.trace_context_for_response(response_id="resp_" + "a" * 32):
+        with mlflow.start_span("agent", span_type=SpanType.AGENT):
+            env = _build_openai_agents_sdk_spawn_env(
+                _make_spec(model="gpt-4o", auth=ApiKeyAuth(api_key="sk-test"))
+            )
+
+    assert "TRACEPARENT" in env
+    assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://localhost:4317"
+    assert "CLAUDE_CODE_ENABLE_TELEMETRY" not in env
+    assert "OTEL_TRACES_EXPORTER" not in env
+
+
+def test_no_telemetry_env_leaks_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Without ``OTEL_EXPORTER_OTLP_ENDPOINT``, no OTel keys leak into
+    the openai-agents spawn env.
+    """
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+
+    env = _build_openai_agents_sdk_spawn_env(
+        _make_spec(model="gpt-4o", auth=ApiKeyAuth(api_key="sk-test"))
+    )
+
+    for key in ("TRACEPARENT", "OTEL_EXPORTER_OTLP_ENDPOINT"):
+        assert key not in env, f"unexpected {key!r} in spawn env: {env!r}"
