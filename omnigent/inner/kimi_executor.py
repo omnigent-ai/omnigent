@@ -224,12 +224,6 @@ class KimiExecutor(Executor):
     def handles_tools_internally(self) -> bool:
         return True
 
-    def forwards_observed_tool_results(self) -> bool:
-        # Kimi runs a fully self-contained tool loop; its tool results never
-        # round-trip through the scaffold's dispatch_tool, so the adapter must
-        # forward the ToolCallComplete events rather than suppress them.
-        return True
-
     def supports_streaming(self) -> bool:
         return True
 

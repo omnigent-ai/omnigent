@@ -411,9 +411,6 @@ def test_kimi_executor_capabilities() -> None:
     assert ex.handles_tools_internally() is True
     assert ex.supports_streaming() is True
     assert ex.supports_tool_calling() is True
-    # Kimi's tool results never round-trip through the scaffold's dispatch_tool,
-    # so the adapter must forward its ToolCallComplete events (not suppress).
-    assert ex.forwards_observed_tool_results() is True
 
 
 # ---------------------------------------------------------------------------

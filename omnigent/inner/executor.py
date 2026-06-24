@@ -554,21 +554,6 @@ class Executor:
         """
         return False
 
-    def forwards_observed_tool_results(self) -> bool:
-        """Whether ``ToolCallComplete`` events carry output the scaffold won't emit.
-
-        Most internally-handling executors (claude-sdk, cursor, …) bridge
-        their tools through the runtime adapter's ``dispatch_tool`` path,
-        which emits the ``function_call_output`` itself — so the adapter
-        suppresses the executor's own ``ToolCallComplete`` to avoid a
-        duplicate. Executors that run a fully self-contained tool loop with
-        **no** scaffold round-trip (e.g. the kimi CLI harness) have no such
-        scaffold-emitted output to dedupe against; their ``ToolCallComplete``
-        is the only carrier of the tool result. Return True so the adapter
-        forwards those results instead of dropping them.
-        """
-        return False
-
     def max_context_tokens(self) -> int | None:
         return None
 

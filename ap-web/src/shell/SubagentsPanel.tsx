@@ -30,6 +30,7 @@ import {
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Badge } from "@/components/ui/badge";
+import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
@@ -311,6 +312,7 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
   if (nativeAgent?.iconKind === "opencode") return OpenCodeIcon;
   if (nativeAgent?.iconKind === "pi") return PiIcon;
   if (nativeAgent?.iconKind === "cursor") return CursorIcon;
+  if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
   if (nativeAgent?.iconKind === "goose") return GooseIcon;
   if (nativeAgent?.iconKind === "kimi") return KimiIcon;
   // Exact match — substring checks would false-match names like "pipeline".
@@ -478,11 +480,13 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
             ? PiIcon
             : nativeAgent?.iconKind === "cursor"
               ? CursorIcon
-              : nativeAgent?.iconKind === "goose"
-                ? GooseIcon
-                : nativeAgent?.iconKind === "kimi"
-                  ? KimiIcon
-                  : isNessie
+              : nativeAgent?.iconKind === "antigravity"
+                ? AntigravityIcon
+                : nativeAgent?.iconKind === "goose"
+                  ? GooseIcon
+                  : nativeAgent?.iconKind === "kimi"
+                    ? KimiIcon
+                    : isNessie
                     ? NessieIcon
                     : BotIcon;
   // Native wrappers show the product name (mirroring the sidebar) instead

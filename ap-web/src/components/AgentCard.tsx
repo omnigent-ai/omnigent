@@ -1,4 +1,5 @@
 import { BotIcon } from "lucide-react";
+import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
@@ -35,6 +36,7 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   if (nativeAgent?.iconKind === "cursor") return CursorIcon;
   if (nativeAgent?.iconKind === "goose") return GooseIcon;
   if (nativeAgent?.iconKind === "kimi") return KimiIcon;
+  if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
   // A null harness (spec couldn't load) flows through to the bot fallback.
   if (agent.harness?.includes("codex")) return CodexIcon;
   if (agent.harness?.includes("claude")) return ClaudeIcon;
@@ -46,6 +48,9 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   // qwen falls back to generic BotIcon for now; see docs/QWEN_FOLLOWUPS.md
   // Exact match — a substring check would false-match e.g. "openapi".
   if (agent.harness === "pi") return PiIcon;
+  // Both the native (`antigravity-native`) and SDK (`antigravity`) harnesses
+  // share the Antigravity glyph.
+  if (agent.harness?.includes("antigravity")) return AntigravityIcon;
   return BotIcon;
 }
 

@@ -28,13 +28,18 @@ family-based provider shape with:
   the secret value itself.
 
 Each inline-credential provider (``key`` / ``gateway`` / ``local``) groups
-up to two *families*:
+one or more *families*:
 
 - ``anthropic`` — the Anthropic Messages API surface, consumed by the
   Claude SDK harness and native Claude Code.
 - ``openai`` — the OpenAI Responses/Chat surface, consumed by the Codex
-  harness, native Codex, and the OpenAI-Agents SDK harness. The ``pi``
-  harness consumes both.
+  harness, native Codex, and the OpenAI-Agents SDK harness.
+- ``gemini`` — the Google Gemini surface, the credential the native
+  Antigravity (``agy``) onboarding adopts as a ``key``-kind ``gemini:``
+  provider from a detected ``GEMINI_API_KEY``.
+
+The ``pi`` harness consumes the ``anthropic`` / ``openai`` families only —
+never ``gemini``.
 """
 
 from __future__ import annotations
@@ -49,10 +54,27 @@ from omnigent.spec.parser import check_unresolved_env_vars
 
 # Family keys. ``anthropic`` is the Messages-API surface (Claude SDK,
 # native Claude); ``openai`` is the Responses/Chat surface (Codex,
-# native Codex, OpenAI-Agents SDK). ``pi`` consumes both.
+# native Codex, OpenAI-Agents SDK). ``pi`` consumes both. ``gemini`` is the
+# Google Gemini surface — the credential the native Antigravity (``agy``)
+# onboarding adopts as a ``key``-kind provider with a ``gemini:`` block from a
+# detected ``GEMINI_API_KEY``. It is key-only: a gateway/local proxy cannot
+# drive it, and the ``antigravity-native`` (``agy``) OAuth flavor consumes no
+# provider credential at all (its readiness is the file-based OAuth check in
+# :mod:`omnigent.onboarding.gemini_auth`, not a ``gemini:`` family here).
 ANTHROPIC_FAMILY = "anthropic"
 OPENAI_FAMILY = "openai"
-_VALID_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
+GEMINI_FAMILY = "gemini"
+# ``gemini`` joins the inline-credential families so a ``providers: gemini:``
+# block (the detected GEMINI_API_KEY path) parses and validates like the
+# anthropic / openai families.
+_VALID_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY)
+
+# Families the unmapped ``pi`` surface can actually consume, in fallback
+# preference order. Gemini is EXCLUDED: a gemini key serves ONLY the Gemini
+# surface, never pi. The cross-family pi fallbacks below must walk THIS list,
+# not ``_VALID_FAMILIES`` — else a machine whose only credential is a gemini
+# key resolves pi to a credential pi cannot use.
+_PI_FALLBACK_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
 
 # The pi harness's *default scope*. pi is not a model family — a provider
 # entry never carries a ``pi:`` block — but defaults are scoped per harness
@@ -142,6 +164,13 @@ _HARNESS_FAMILY: dict[str, str] = {
     # and is managed out-of-band via ``kimi provider add``.
     # Qwen Code uses an OpenAI-compatible provider.
     "qwen": OPENAI_FAMILY,
+    # The native agy TUI bridge authenticates via the Gemini OAuth credential
+    # (file-based, checked in :mod:`omnigent.onboarding.gemini_auth`) and the
+    # detected GEMINI_API_KEY is adopted as a ``gemini``-family key, so the
+    # native harness consumes the ``gemini`` family for onboarding / readiness.
+    # Both spellings are accepted, mirroring claude-native / native-claude.
+    "antigravity-native": GEMINI_FAMILY,
+    "native-antigravity": GEMINI_FAMILY,
 }
 
 # Executor-type spellings that ``AgentSpec.harness_kind`` returns for SDK
@@ -566,6 +595,22 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
             code=ErrorCode.INVALID_INPUT,
         )
 
+    # The ``gemini`` family is consumed by the antigravity harness, which drives
+    # the google SDK with a STATIC GEMINI_API_KEY. ``auth_command`` mints a
+    # bearer token — useless as a GEMINI_API_KEY — so an ``auth_command`` gemini
+    # block is nonsensical. Reject it HERE (parse) so it never reaches
+    # provider_families / default-resolution / the display+readiness layer /
+    # spawn / ``/models``: every layer then agrees by construction. ``auth_command``
+    # stays valid for anthropic/openai families (gateways / dynamic tokens).
+    if family_name == GEMINI_FAMILY and isinstance(auth_command_raw, str) and auth_command_raw:
+        raise OmnigentError(
+            f"{prefix}.auth_command is not allowed on a 'gemini' family: the "
+            "antigravity harness drives Gemini with a static GEMINI_API_KEY, and "
+            "an auth_command mints a bearer token the google SDK cannot use as one. "
+            "Use a static key source ('api_key' or 'api_key_ref') instead.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
     api_key = api_key_raw if isinstance(api_key_raw, str) and api_key_raw else None
     api_key_ref = api_key_ref_raw if isinstance(api_key_ref_raw, str) and api_key_ref_raw else None
     # auth_command is a user-controlled shell command, not a secret value,
@@ -648,7 +693,15 @@ def _parse_default_families(
             f"or a list of family names, got {default_raw!r}.",
             code=ErrorCode.INVALID_INPUT,
         )
-    allowed = served | {PI_SURFACE} if pi_capable else served
+    # pi is a valid default scope only when the provider is a pi-capable KIND
+    # (``pi_capable``) AND serves a pi-capable FAMILY (anthropic/openai). A
+    # gemini-only key is an inline kind (``pi_capable=True``) but serves only
+    # the Gemini surface, so it must NOT accept a pi scope — this mirrors
+    # ``provider_families`` and rejects a hand-edited ``default: ["gemini",
+    # "pi"]`` at parse time (parity with how a subscription's pi scope is
+    # rejected), rather than failing loudly only at pi launch.
+    pi_ok = pi_capable and bool(served & frozenset(_PI_FALLBACK_FAMILIES))
+    allowed = served | {PI_SURFACE} if pi_ok else served
     invalid = requested - allowed
     if invalid:
         raise OmnigentError(
@@ -781,13 +834,16 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
                 f"provider {name!r}: a 'profile' is required when kind is 'databricks'.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        # Databricks (ucode) routes both surfaces.
+        # Databricks (ucode) routes the anthropic/openai surfaces + pi, but NOT
+        # gemini: the antigravity harness drives Gemini via the dedicated google
+        # SDK + GEMINI_API_KEY, not an OpenAI-compatible gateway, so a databricks
+        # profile cannot serve (or default) the Gemini surface.
         return ProviderEntry(
             name=name,
             kind=kind,
             profile=profile_raw,
             default_families=_parse_default_families(
-                name, default_raw, set(_VALID_FAMILIES), pi_capable=True
+                name, default_raw, set(_VALID_FAMILIES) - {GEMINI_FAMILY}, pi_capable=True
             ),
         )
 
@@ -799,15 +855,36 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             families[family_name] = _parse_family(name, family_name, family_raw)
     if not families:
         raise OmnigentError(
-            f"provider {name!r} (kind {kind!r}) configures no 'anthropic' or 'openai' family.",
+            f"provider {name!r} (kind {kind!r}) configures no "
+            "'anthropic', 'openai', or 'gemini' family.",
             code=ErrorCode.INVALID_INPUT,
         )
+    # The Gemini surface is key-ONLY (the antigravity flavors need either a raw
+    # GEMINI_API_KEY or OAuth — never a proxy). A ``gateway`` / ``local`` may
+    # *carry* a gemini block alongside a real family (we ignore it for the Gemini
+    # surface — see :func:`provider_families`), but one whose ONLY family is
+    # gemini configures nothing it can actually serve: reject it loudly here.
+    if kind != KEY_KIND and set(families) == {GEMINI_FAMILY}:
+        raise OmnigentError(
+            f"provider {name!r} (kind {kind!r}) declares only a 'gemini' family, "
+            "but the Gemini surface is served only by a 'key' provider with a real "
+            "GEMINI_API_KEY (a gateway/local proxy cannot drive the antigravity "
+            "harness). Use kind: 'key', or add an 'anthropic'/'openai' family.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # Scope the parseable default to the families this kind can actually serve:
+    # a gateway/local's gemini block never grants the Gemini surface, so a
+    # hand-edited ``default: gemini`` on a gateway must fail at parse (parity
+    # with how a databricks profile cannot name the gemini scope).
+    served_for_default = set(families)
+    if kind != KEY_KIND:
+        served_for_default -= {GEMINI_FAMILY}
     return ProviderEntry(
         name=name,
         kind=kind,
         families=families,
         default_families=_parse_default_families(
-            name, default_raw, set(families), pi_capable=True
+            name, default_raw, served_for_default, pi_capable=True
         ),
     )
 
@@ -898,7 +975,26 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
         # family (anthropic), never the pi scope.
         return frozenset(entry.families)
     if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
-        return frozenset(entry.families) | {PI_SURFACE}
+        served = frozenset(entry.families)
+        # The Gemini surface is key-ONLY: it is consumed by the antigravity
+        # flavors (the SDK harness via a raw GEMINI_API_KEY, antigravity-native
+        # via OAuth), neither driveable by a gateway / local proxy. So a
+        # ``gateway`` / ``local`` declaring a ``gemini:`` block must NOT claim
+        # the Gemini surface — only a ``key`` may. Stripping it here (rather than
+        # at parse) keeps a multi-family gateway usable for its anthropic /
+        # openai surfaces; a gateway whose ONLY family is gemini is rejected at
+        # parse (see :func:`_parse_provider`).
+        if entry.kind != KEY_KIND:
+            served = served - {GEMINI_FAMILY}
+        # pi consumes the anthropic / openai families only — a gemini-only key
+        # serves just the Gemini surface, never pi (see ``_PI_FALLBACK_FAMILIES``).
+        # Granting pi here would let the add flow auto-default pi to a gemini key
+        # and let set_default_provider accept a pi scope for it, both of which
+        # break pi launch. A multi-family key keeps pi via its anthropic/openai
+        # family.
+        if served & frozenset(_PI_FALLBACK_FAMILIES):
+            return served | {PI_SURFACE}
+        return served
     if entry.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND):
         if entry.cli == "claude":
             return frozenset({ANTHROPIC_FAMILY})
@@ -906,7 +1002,9 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
             return frozenset({OPENAI_FAMILY})
         return frozenset()
     if entry.kind == DATABRICKS_KIND:
-        return frozenset(_VALID_FAMILIES) | {PI_SURFACE}
+        # ucode routes anthropic/openai + pi, never the Gemini surface (which
+        # needs the antigravity SDK + GEMINI_API_KEY, not a gateway).
+        return (frozenset(_VALID_FAMILIES) - {GEMINI_FAMILY}) | {PI_SURFACE}
     return frozenset()
 
 
@@ -971,9 +1069,10 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
     explicit = get_default_provider(config, PI_SURFACE)
     if explicit is not None:
         return explicit
-    # Fall back across both surfaces — prefer anthropic's default, and skip
-    # the CLI-bound kinds (unusable outside their own CLI).
-    for fam in _VALID_FAMILIES:
+    # Fall back across the pi-capable surfaces — prefer anthropic's default,
+    # and skip the CLI-bound kinds (unusable outside their own CLI). Gemini is
+    # excluded (a gemini key serves only the Gemini surface, never pi).
+    for fam in _PI_FALLBACK_FAMILIES:
         provider = get_default_provider(config, fam)
         # Subscription logins and cli-config provider pins live in the
         # claude/codex CLI's own files, which an unmapped harness doesn't
@@ -1030,7 +1129,7 @@ def surface_default_model(entry: ProviderEntry, surface: str) -> str | None:
     """
     if surface != PI_SURFACE:
         return entry.family_default_model(surface)
-    for family_name in _VALID_FAMILIES:
+    for family_name in _PI_FALLBACK_FAMILIES:
         if family_name in entry.families:
             return entry.family_default_model(family_name)
     return None
@@ -1056,7 +1155,8 @@ def _family_for_harness(provider: ProviderEntry, harness: str) -> str | None:
         # Harness wants a specific family the provider does not configure.
         return None
     # Unmapped harness (e.g. "pi"): use anthropic if present, else openai.
-    for family_name in _VALID_FAMILIES:
+    # Gemini is excluded (it never drives pi).
+    for family_name in _PI_FALLBACK_FAMILIES:
         if family_name in provider.families:
             return family_name
     return None

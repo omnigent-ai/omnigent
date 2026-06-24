@@ -35,6 +35,17 @@ final class WebViewModel: ObservableObject {
     webView?.evaluateJavaScript(script)
   }
 
+  /// Push the footprint (in CSS px, excluding the OS safe area which the web
+  /// layer adds via `env()`) of the native floating bars to the web app. The
+  /// web side folds these into its `--omnigent-inset-*` variables so page
+  /// content reserves the right amount of space — making native bar dimensions
+  /// the single source of truth instead of magic numbers duplicated in CSS.
+  func emitInsets(topBar: CGFloat, bottomBar: CGFloat) {
+    let script =
+      "window.__omnigentNativeEmitInsets?.(\(jsNumber(topBar)), \(jsNumber(bottomBar)));"
+    webView?.evaluateJavaScript(script)
+  }
+
   /// Tell the web app the user tapped a segment in the native switcher.
   func emitViewModeChanged(_ mode: WebViewMode) {
     let script =
@@ -47,6 +58,12 @@ final class WebViewModel: ObservableObject {
     let script =
       "window.__omnigentNativeEmitSidebarDrag?.(\(Self.javascriptString(phase)), \(clamped));"
     webView?.evaluateJavaScript(script)
+  }
+
+  /// Format a CGFloat as a bare JS number literal (no units, finite-guarded).
+  private func jsNumber(_ value: CGFloat) -> String {
+    guard value.isFinite else { return "0" }
+    return String(format: "%g", Double(value))
   }
 
   static func javascriptString(_ value: String) -> String {

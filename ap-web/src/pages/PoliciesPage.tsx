@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "@/lib/routing";
 import { PlusIcon, RefreshCwIcon, ShieldCheckIcon, TrashIcon } from "lucide-react";
+import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -414,7 +415,7 @@ export function PoliciesPage() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-3xl px-6 py-8 pt-14">
+    <PageScroll contentClassName="px-6">
       <div className="mb-6 flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold">Global Policies</h1>
@@ -567,6 +568,6 @@ export function PoliciesPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </PageScroll>
   );
 }

@@ -108,6 +108,10 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
     # Native Kimi TUI harness shares the multi-provider kimi resolution path.
     "kimi-native": "kimi",
     "qwen": "qwen",
+    # The native agy TUI bridge resolves its provider via the SDK sibling,
+    # mirroring the claude-native -> claude-sdk rule above.
+    "antigravity-native": "antigravity",
+    "native-antigravity": "antigravity",
 }
 
 # Preferred inline family per single-family harness (pi consumes both).
