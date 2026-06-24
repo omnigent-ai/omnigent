@@ -230,6 +230,9 @@ class TestToElicitationParamsPermission:
     def test_message_contains_command(self) -> None:
         params = to_elicitation_params(_PERMISSION_PENDING)
         assert "pwd" in params.message
+        # The web ApprovalCard renders this message in a plain (non-markdown)
+        # span, so it must not carry literal markdown asterisks.
+        assert "**" not in params.message
 
     def test_phase_is_agy_permission(self) -> None:
         params = to_elicitation_params(_PERMISSION_PENDING)
