@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm
@@ -112,6 +113,14 @@ def test_clone_session_copies_transcript_and_navigates(
     expect(copied_user.first).to_be_visible(timeout=30_000)
 
 
+# Forking needs a real assistant bubble to anchor "Fork from here", so
+# this sends a turn and waits on the reply. The in-process harness
+# occasionally produces no assistant output on the first turn (the
+# runner goes idle after dispatch — a nondeterministic harness
+# scheduling stall, not a real-LLM artifact since this drives the mock
+# LLM). Rerun on failure rather than widen the already-generous 60s
+# wait, which a stalled turn would never satisfy.
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_clone_dialog_offers_cross_family_native_target_and_forks(
     page: Page,
     seeded_session: tuple[str, str],

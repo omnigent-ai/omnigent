@@ -29,6 +29,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from omnigent._platform import IS_WINDOWS, resolve_repo_symlink
 from omnigent._startup_profile import StartupProfiler
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
@@ -43,7 +44,7 @@ from omnigent.host.local_server import (
     stop_local_omnigent_server,
     stop_untracked_local_server,
 )
-from omnigent.inner import ui
+from omnigent.inner import _proc, ui
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
 from omnigent.onboarding.ucode_setup import (
     build_ucode_configure_command,
@@ -454,7 +455,10 @@ def _bundled_example_path(name: str) -> str:
     """
     import importlib.resources
 
-    return str(importlib.resources.files("omnigent.resources.examples").joinpath(name))
+    resource = importlib.resources.files("omnigent.resources.examples").joinpath(name)
+    # On a no-symlink Windows checkout the packaged symlink is a stub text file;
+    # dereference it to the real examples/<name> directory.
+    return str(resolve_repo_symlink(Path(str(resource))))
 
 
 def _pick_first_run_harness() -> _FirstRunPlan | None:
@@ -2048,7 +2052,7 @@ def _spawn_host_daemon_process(
             env=env,
             stdout=log_fh,
             stderr=log_fh,
-            start_new_session=True,
+            **_proc.spawn_kwargs(),
         )
     except OSError:
         return None
@@ -2643,7 +2647,7 @@ def _start_cli_runner_process(
             env=env,
             stdout=log_fh,
             stderr=log_fh,
-            start_new_session=True,
+            **_proc.spawn_kwargs(),
         )
     finally:
         if log_fh is not None:
@@ -4029,6 +4033,24 @@ def _expand_builtin_env_vars(  # type: ignore[explicit-any]  # entries are parse
 _RESUME_PICKER_SENTINEL = "__resume_picker__"
 
 
+def _reject_native_on_windows(harness: str) -> None:
+    """Fail a native (tmux/PTY) harness command with an actionable message.
+
+    The ``omnigent claude`` / ``codex`` / ``cursor`` native wrappers drive a
+    private tmux server and PTY, which don't exist on Windows. Point users at
+    the SDK harnesses / web UI instead of letting them hit a tmux crash.
+
+    :param harness: The native command name, e.g. ``"claude"``.
+    :raises click.ClickException: Always, when running on Windows.
+    """
+    if IS_WINDOWS:
+        raise click.ClickException(
+            f"`omnigent {harness}` (native tmux/PTY terminal) is not supported on "
+            "Windows. Use an SDK-based harness via `omnigent run <agent.yaml>` "
+            "or the web UI."
+        )
+
+
 @cli.command(
     context_settings={
         "ignore_unknown_options": True,
@@ -4137,6 +4159,7 @@ def claude(
       omnigent claude --resume                  # interactive picker
       omnigent claude --server https://<app>.databricksapps.com
     """
+    _reject_native_on_windows("claude")
     startup_profiler = StartupProfiler.from_env(
         name="omnigent claude",
         env_var=_CLAUDE_STARTUP_PROFILE_ENV_VAR,
@@ -4263,6 +4286,7 @@ def codex(
       omnigent codex --resume                  # interactive picker
       omnigent codex --server https://<app>.databricksapps.com
     """
+    _reject_native_on_windows("codex")
     choice = _split_resume_value(resume)
     if session_id is not None and (choice.picker or choice.conversation_id is not None):
         raise click.UsageError(
@@ -4651,6 +4675,7 @@ def cursor(
       omnigent cursor --resume conv_abc123
       omnigent cursor --resume                 # interactive picker
     """
+    _reject_native_on_windows("cursor")
     choice = _split_resume_value(resume)
     if session_id is not None and (choice.picker or choice.conversation_id is not None):
         raise click.UsageError(
@@ -6974,7 +6999,7 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
         time.sleep(0.1)
     if force:
         with contextlib.suppress(ProcessLookupError):
-            os.kill(record.pid, signal.SIGKILL)
+            os.kill(record.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             if not _pid_alive(record.pid):
@@ -9384,6 +9409,62 @@ def _manage_goose_harness() -> None:
             status = None
 
 
+def _prompt_install_copilot() -> str | None:
+    """Offer to install the missing ``copilot`` extra; return a status line.
+
+    Shown atop the Copilot drill-in when the optional-extra ``github-copilot-sdk``
+    is absent. Three-choice ``select`` like :func:`_prompt_install_cursor` /
+    :func:`_prompt_install_antigravity` (install now / set token anyway / show
+    command), and like them does NOT gate token management on the SDK: the
+    ``copilot:`` token is stored independently and is useful once the SDK lands,
+    so declining falls through to the token menu. Install is portable and
+    index-free — see
+    :func:`omnigent.onboarding.copilot_auth.copilot_install_command`.
+
+    :returns: Status string for the drill-in's transient status line, or
+        ``None`` (set-token-anyway / Esc / printed-command, no actionable result).
+    """
+    from rich.markup import escape as _rich_escape
+
+    from omnigent.onboarding.copilot_auth import (
+        COPILOT_EXTRA_INSTALL_COMMAND,
+        install_copilot_sdk,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    cmd = COPILOT_EXTRA_INSTALL_COMMAND
+    # ``select`` renders text through Rich markup; escape the literal
+    # ``[copilot]`` so it renders verbatim.
+    cmd_markup = _rich_escape(cmd)
+    choice = select(
+        "Copilot's SDK (github-copilot-sdk) isn't installed. Install it now?",
+        [
+            f"Install it now ({cmd_markup})",
+            "Set the GitHub token anyway",
+            "I'll run it myself (show the command)",
+        ],
+        descriptions=[
+            f"Runs `{cmd_markup}` (uses uv when available), then continues.",
+            "Skip the install — store the token now; the SDK can be added later.",
+            "Print the command so you can install it yourself, then continue.",
+        ],
+        default=0,
+        clear_on_exit=True,
+    )
+    if choice == 0:
+        console.print(f"  [dim]Installing the copilot extra — running `{cmd_markup}`…[/dim]")
+        if install_copilot_sdk():
+            console.print("  [green]✓ github-copilot-sdk installed[/green]")
+            return "✓ github-copilot-sdk installed"
+        console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
+        return "✗ Install failed — set the token anyway, or install by hand"
+    if choice == 2:  # run it yourself
+        console.print(f"  Install the copilot extra with:\n    [bold]{cmd_markup}[/bold]")
+        return None
+    # choice == 1 (set token anyway) or Esc: fall through to the token menu silently.
+    return None
+
+
 def _manage_copilot_harness() -> None:
     """Run the level-2 loop for Copilot: manage its GitHub token.
 
@@ -9394,8 +9475,15 @@ def _manage_copilot_harness() -> None:
     how cursor / antigravity persist theirs (the secret in the store, a
     ``keychain:``/``env:`` reference in ``~/.omnigent/config.yaml``).
 
-    :returns: None. Side effects: may write the ``copilot:`` block of
-        ``~/.omnigent/config.yaml`` and the secret store.
+    When the optional ``github-copilot-sdk`` is missing, the drill-in first
+    offers to install it (:func:`_prompt_install_copilot`). Unlike the CLI-backed
+    harnesses (which gate on the CLI), declining still drops into the token
+    menu — the ``copilot:`` token is independently storable. Mirrors cursor /
+    antigravity.
+
+    :returns: None. Side effects: may install the ``copilot`` extra, and may
+        write the ``copilot:`` block of ``~/.omnigent/config.yaml`` and the
+        secret store.
     """
     from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.copilot_auth import (
@@ -9403,10 +9491,16 @@ def _manage_copilot_harness() -> None:
         COPILOT_SECRET_NAME,
         copilot_github_token_configured,
         copilot_github_token_ref,
+        copilot_sdk_installed,
     )
     from omnigent.onboarding.interactive import select
 
+    # Offer the install once on entry (not per loop iteration) when the SDK is
+    # absent; the result seeds the menu's status line. Declining falls through
+    # to token management, since the token is SDK-independent.
     status: str | None = None
+    if not copilot_sdk_installed():
+        status = _prompt_install_copilot()
     while True:
         config = _load_global_config()
         token_set = copilot_github_token_configured(config)
@@ -10018,8 +10112,10 @@ def _run_configure_harnesses_interactive() -> None:
     )
     from omnigent.onboarding.configure_models import family_label
     from omnigent.onboarding.copilot_auth import (
+        COPILOT_EXTRA_INSTALL_COMMAND,
         COPILOT_TOKEN_ENV_VARS,
         copilot_github_token_configured,
+        copilot_sdk_installed,
     )
     from omnigent.onboarding.cursor_auth import (
         CURSOR_EXTRA_INSTALL_COMMAND,
@@ -10285,14 +10381,28 @@ def _run_configure_harnesses_interactive() -> None:
         options.append(f"{'  ' if copilot_token_set else '[red]✗[/] '}Copilot")
         selectable.append(True)
         row_target.append(COPILOT_KEY)
-        copilot_sub = (
+        # ``github-copilot-sdk`` ships in an OPTIONAL extra, so the token can be
+        # set with no SDK present. When the extra is missing, lead with that gap
+        # and the install command (parallel to Cursor / Antigravity), then still
+        # report token status. ``[copilot]`` is escaped — sub-lines render through
+        # Rich markup, where bare brackets parse as a tag.
+        copilot_sub_lines: list[str] = []
+        if not copilot_sdk_installed():
+            from rich.markup import escape as _rich_escape
+
+            copilot_sub_lines.append(
+                f"[dim]not installed — open to install "
+                f"({_rich_escape(COPILOT_EXTRA_INSTALL_COMMAND)})[/]"
+            )
+        copilot_sub_lines.append(
             "[green]✓[/] GitHub token configured"
             if copilot_token_set
             else "[dim]no GitHub token yet — open to add one[/]"
         )
-        options.append(f"  {copilot_sub}")
-        selectable.append(False)
-        row_target.append(None)
+        for copilot_sub in copilot_sub_lines:
+            options.append(f"  {copilot_sub}")
+            selectable.append(False)
+            row_target.append(None)
         options.append("Quit")
         selectable.append(True)
         row_target.append(_QUIT)

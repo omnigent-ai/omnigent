@@ -61,6 +61,7 @@ import { TerminalsPanel } from "./TerminalsPanel";
 import { TodoPanel } from "./TodoPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
+import { Toaster } from "@/components/ui/toast";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { WorkspacePanel } from "./WorkspacePanel";
@@ -623,7 +624,7 @@ export function AppShell() {
   const handleFilesFlatViewChange = useCallback((v: boolean) => {
     filesPanelScopePrefRef.current = v;
     setFilesPanelFlatView(v);
-    writeFilesPanelPreferences({ changedOnly: v });
+    writeFilesPanelPreferences({ ...readFilesPanelPreferences(), changedOnly: v });
   }, []);
 
   const openFileViewer = useCallback(
@@ -1251,6 +1252,9 @@ export function AppShell() {
           {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
               ⌘/Ctrl+/ opener); ungated so it works on every route. */}
           <KeyboardShortcutsDialog />
+          {/* Transient toasts (e.g. "session archived"). Mounted once here so
+              any surface can fire one via showToast(). */}
+          <Toaster />
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>
     </FileViewerContext.Provider>

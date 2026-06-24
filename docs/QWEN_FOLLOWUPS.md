@@ -32,11 +32,46 @@ Tracks pending work and known limitations for the Qwen Code harness
   `cachedReadTokens` out of `input_tokens` (qwen's `inputTokens` is cache-
   inclusive; cost wants the non-cached portion) — see `_accumulate_usage`.
   Verified end-to-end against a live `qwen --acp` turn.
+- **Context status.** The UI context meter shows used/total for qwen. The
+  numerator (per-turn context consumed) comes from `_meta.usage.totalTokens`
+  via cost/token tracking above; the denominator (the model's context-window
+  *limit*) comes from a curated Qwen lookup in `get_model_context_window`
+  (`_QWEN_CONTEXT_WINDOWS`) — qwen models are absent from litellm and the MLflow
+  catalog, so without it they fell back to the wrong 128K default
+  (qwen3-coder-plus is 1M). A spec's `executor.context_window` still overrides;
+  unrecognized qwen models keep the 128K fallback.
+- **In-session model selection (`/model`).** Switching models mid-session
+  works. The model is fixed in the `qwen --acp` subprocess env
+  (`HARNESS_QWEN_MODEL`) at spawn, so on a `/model` change the runner's
+  `HarnessProcessManager` respawns the harness with the new value — a fresh
+  `QwenExecutor` then opens a new `session/new` carrying the new model. Context
+  survives the respawn because the first turn of the new session replays the
+  prior conversation (see History replay below).
+- **History replay on a fresh ACP session.** When the `qwen --acp` subprocess
+  is (re)spawned — first turn, a `/model` switch, or a `Session not found`
+  reset — qwen holds none of the earlier conversation (it lived in the dead
+  process). `run_turn` normally sends only the latest user turn, so the first
+  turn of any fresh session folds the prior transcript into the prompt as a
+  labeled `Conversation so far:` block (`_history_prefix`), mirroring
+  `ClaudeSDKExecutor._build_prompt`. Keeps a mid-conversation model switch from
+  dropping the thread. (Same fix applied to the goose ACP harness.)
 - **OS sandbox.** When the spec's `os_env.sandbox` is not `none`, the whole
   `qwen` process tree is wrapped in the platform sandbox (bwrap / seatbelt) at
   spawn (`_sandbox_launch_path`), confining qwen's own file/shell tools to the
   spec's read/write roots — an OS-level guarantee independent of the per-tool
   permission gate.
+- **File I/O delegation (`fs/*`).** When an `os_env` is configured, the executor
+  advertises `clientCapabilities.fs` in `initialize`, so qwen routes its file
+  reads/writes back to us as `fs/read_text_file` / `fs/write_text_file` requests
+  (qwen's `AcpFileSystemService` swaps in only when the capability is set). The
+  handlers execute the I/O through the Omnigent `OSEnvironment`, so the spec's
+  sandbox read/write roots are enforced at the Python layer — and the bytes flow
+  through Omnigent rather than qwen touching disk directly. Disabled (qwen uses
+  its own tools) when there's no `os_env` or it's a `fork` env (a forked tree's
+  path would diverge from the qwen subprocess cwd). Binary/non-UTF-8 reads are
+  refused; missing-file reads map to qwen's ENOENT code. (Same fix applied to
+  the goose ACP harness.) See the Pending item below for what's still out of
+  scope (event recording / TOOL_RESULT-phase content policy).
 
 ## Pending work
 
@@ -45,16 +80,6 @@ comments; this is the *what*, not the *how*.)
 
 ### High
 
-- [ ] **In-session model selection.** The model is fixed at `session/new` and
-  the session is reused across turns, so switching models mid-session (`/model`)
-  has no effect. Supporting it means re-creating the ACP session on a model
-  change (or passing a per-turn model if qwen accepts one).
-- [ ] **Context status.** Per-turn context *consumed* is now available
-  (qwen's `_meta.usage.totalTokens`, surfaced via cost/token tracking — see
-  What works today), but the executor still overrides no `max_context_tokens`,
-  so the UI's context meter has the numerator without the denominator. Report
-  the model's context-window *limit* (a model-capability lookup, not in the ACP
-  stream) so the meter can show used/total.
 - [ ] **Native TUI variant (`native-qwen`).** Attach to the live `qwen` terminal
   (like `pi-native`) for a fully interactive experience instead of a piped turn.
 
@@ -87,15 +112,14 @@ comments; this is the *what*, not the *how*.)
 - [ ] **Omnigent tools.** Qwen can only call its own built-in tools; tools
   defined by Omnigent aren't exposed to it (so they can't be invoked or
   recorded). Permission gating on qwen's *own* tool calls already works.
-- [ ] **File I/O execution / content recording.** Qwen performs file reads and
-  writes with its own tools (we don't advertise `clientCapabilities.fs`), so
-  Omnigent never executes the I/O and can't record the file content or run
-  TOOL_RESULT-phase content policy on it. Note the gaps that are *already*
-  closed: the TOOL_CALL request is gated (permission + policy) when qwen asks,
-  and the ops are confined when `os_env.sandbox` is set (see What works today).
-  What's missing is Omnigent-side execution/recording of the I/O itself —
-  advertise `clientCapabilities.fs` + re-add `fs/read_text_file` /
-  `fs/write_text_file` handlers to route it through Omnigent.
+- [ ] **File I/O recording / content policy.** Omnigent now *executes* delegated
+  file reads/writes through the `OSEnvironment` (see "File I/O delegation" in
+  What works today), so the bytes flow through Omnigent and the sandbox roots are
+  enforced. Still missing on top of that: (a) emitting the I/O into Omnigent's
+  event stream (ToolCall-style records) so it shows in history, and (b) running
+  TOOL_RESULT-phase content policy on the read/written content. Both build on the
+  `_handle_fs_read` / `_handle_fs_write` handlers — the byte-level hook now
+  exists; this is wiring the recording/policy layers onto it.
 
 > LLM-phase policy (`PHASE_LLM_REQUEST` / `PHASE_LLM_RESPONSE`) is intentionally
 > out of scope: qwen's model calls happen internally over ACP and are opaque to

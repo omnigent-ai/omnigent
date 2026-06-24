@@ -20,6 +20,7 @@ from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 from omnigent.runtime.harnesses.process_manager import (
     HarnessProcessManager,
     _build_harness_spawn_env,
+    _HarnessEndpoint,
     _model_env_key,
     _SubprocessEntry,
 )
@@ -62,7 +63,7 @@ async def test_get_client_respawns_only_when_model_changes(
         return _SubprocessEntry(
             process=_AliveProc(),  # type: ignore[arg-type]  # stand-in process
             client=httpx.AsyncClient(),
-            socket_path=Path("/tmp/fake.sock"),
+            endpoint=_HarnessEndpoint(socket_path=Path("/tmp/fake.sock")),
             harness=harness,
             model=model,
         )
