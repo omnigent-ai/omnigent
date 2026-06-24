@@ -30,7 +30,7 @@ import {
   useWorkspacePaths,
 } from "@/shell/FileViewerContext";
 import { toWorkspaceRelativePath, useWorkspaceFileExists } from "@/hooks/useWorkspaceChangedFiles";
-import { ApprovalCard } from "./ApprovalCard";
+import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
 import { TerminalCommandCard } from "./TerminalCommandCard";
@@ -467,25 +467,7 @@ function renderItem(item: RenderItem, index: number, isReasoningStreaming: boole
         />
       );
     case "elicitation":
-      return (
-        <ApprovalCard
-          key={key}
-          elicitationId={item.elicitationId}
-          message={item.message}
-          phase={item.phase}
-          policyName={item.policyName}
-          contentPreview={item.contentPreview}
-          requestedSchema={item.requestedSchema}
-          url={item.url}
-          status={item.status}
-          response={item.response}
-          askUserQuestion={item.askUserQuestion}
-          exitPlanMode={item.exitPlanMode}
-          codexCommand={item.codexCommand}
-          allowAllEdits={item.allowAllEdits}
-          rememberScope={item.rememberScope}
-        />
-      );
+      return <ElicitationCard key={key} item={item} />;
   }
 }
 

@@ -418,6 +418,49 @@ export async function createSession(
 }
 
 /**
+ * Create a session with an inline agent bundle via multipart
+ * `POST /v1/sessions`.
+ *
+ * The server creates a session-scoped agent from the uploaded bundle
+ * (a `.tar.gz` containing `config.yaml` and optionally `AGENTS.md`)
+ * and binds it to the new session in one atomic operation. Session
+ * metadata (host, workspace, labels, etc.) is sent as a JSON string
+ * in the `metadata` form part.
+ *
+ * @param bundle - The agent bundle as a `File` (`.tar.gz`).
+ * @param metadata - Session-level metadata (host_id, workspace, labels, etc.).
+ * @returns The created session's id.
+ */
+export async function createBundledSession(
+  bundle: File,
+  metadata: {
+    host_id?: string;
+    host_type?: string;
+    workspace?: string;
+    labels?: Record<string, string>;
+    terminal_launch_args?: string[];
+    git?: { branch_name: string; base_branch?: string };
+  } = {},
+): Promise<{ id: string }> {
+  const form = new FormData();
+  form.append("metadata", JSON.stringify(metadata));
+  form.append("bundle", bundle);
+  const res = await authenticatedFetch("/v1/sessions", {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to create bundled session: ${res.status} ${text}`);
+  }
+  // The multipart response uses `session_id` (CreatedSessionResponse),
+  // while the JSON path uses `id` (SessionResponse). Normalize to `id`
+  // so callers don't need to care which path was taken.
+  const body = (await res.json()) as { session_id: string };
+  return { id: body.session_id };
+}
+
+/**
  * Fork (clone) a session into a new one via
  * POST /v1/sessions/{source_id}/fork.
  *
