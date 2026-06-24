@@ -180,15 +180,16 @@
         <div id="recents-list"></div>
       </div>
     </div>
+    <script src="../src/url.js"></script>
     <script>
+      // Shared URL helpers (electron/src/url.js), exposed as window.omnigentUrl
+      // — the same module the main process uses, so the two never drift.
+      const { isPlainHttpRemote } = window.omnigentUrl;
       // Uses the Electron preload bridge (electron/src/preload.js).
       const setup = window.omnigentSetup;
       const input = document.getElementById("url");
       const button = document.getElementById("connect");
       const err = document.getElementById("err");
-
-      // Hosts where plain http:// is fine (no network path to speak of).
-      const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
 
       // The main process loads this page with ?error=…&url=… when a server
       // navigation fails (server down, DNS, TLS), so the user sees what went
@@ -253,22 +254,6 @@
           recentsSection.hidden = false;
         })
         .catch(() => {});
-
-      // True when the entered URL is unencrypted http:// to a non-local
-      // host. Mirrors the scheme-defaulting of the main process's
-      // normalizeUrl; invalid URLs return false so the real error comes
-      // from normalizeUrl on Connect.
-      function isPlainHttpRemote(raw) {
-        const trimmed = (raw || "").trim();
-        const withScheme = trimmed.includes("://") ? trimmed : "http://" + trimmed;
-        let url;
-        try {
-          url = new URL(withScheme);
-        } catch {
-          return false;
-        }
-        return url.protocol === "http:" && !LOCAL_HOSTS.has(url.hostname);
-      }
 
       // The exact URL value the user has already been warned about — a
       // second Connect click on the same value proceeds; editing the input

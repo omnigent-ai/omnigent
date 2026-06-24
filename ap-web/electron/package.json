@@ -9,6 +9,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
+    "test": "node --test",
     "build": "electron-builder",
     "build:mac": "electron-builder --mac",
     "build:mac:release": "electron-builder --mac -c.mac.notarize=true",
