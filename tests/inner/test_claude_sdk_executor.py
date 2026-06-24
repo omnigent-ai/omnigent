@@ -3564,3 +3564,84 @@ def test_no_precompact_no_compaction_event() -> None:
         assert len(compaction_events) == 0
 
     _run(_t())
+
+
+class TestModelResolution(unittest.TestCase):
+    """``_resolve_turn_model`` precedence + fail-closed (issue #1128)."""
+
+    def _databricks_executor(self, **kwargs):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                return_value=DatabricksCredentials(
+                    host="https://example.cloud.databricks.com",
+                    token="dapi_test_token",
+                ),
+            ),
+        ):
+            return ClaudeSDKExecutor(gateway=True, **kwargs)
+
+    def test_cfg_model_wins(self):
+        executor = self._databricks_executor(model="databricks-claude-opus-4-8")
+        self.assertTrue(executor._gateway_uses_databricks_profile)
+        self.assertEqual(
+            executor._resolve_turn_model("databricks-claude-sonnet-4-6"),
+            "databricks-claude-sonnet-4-6",
+        )
+
+    def test_construction_model_used_when_no_cfg_model(self):
+        executor = self._databricks_executor(
+            model="databricks-claude-sonnet-4-6", model_source="session-override"
+        )
+        self.assertEqual(
+            executor._resolve_turn_model(None), "databricks-claude-sonnet-4-6"
+        )
+
+    def test_unconfigured_keeps_opus_default(self):
+        executor = self._databricks_executor(
+            model=None, model_source="unconfigured-default"
+        )
+        self.assertEqual(
+            executor._resolve_turn_model(None), "databricks-claude-opus-4-8"
+        )
+
+    def test_absent_source_keeps_default_for_backcompat(self):
+        executor = self._databricks_executor(model=None)
+        self.assertEqual(
+            executor._resolve_turn_model(None), "databricks-claude-opus-4-8"
+        )
+
+    def test_lost_selection_fails_closed(self):
+        executor = self._databricks_executor(
+            model=None,
+            model_source="session-override",
+            requested_model="databricks-claude-sonnet-4-6",
+        )
+        with self.assertRaises(ValueError) as ctx:
+            executor._resolve_turn_model(None)
+        self.assertIn("databricks-claude-sonnet-4-6", str(ctx.exception))
+        self.assertNotIn(
+            "Refusing to silently fall back to 'databricks-claude-sonnet",
+            str(ctx.exception),
+        )
+        self.assertIn("databricks-claude-opus-4-8", str(ctx.exception))
+
+    def test_non_databricks_gateway_returns_none(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        with patch.dict("os.environ", {}, clear=True):
+            executor = ClaudeSDKExecutor(
+                gateway=True,
+                base_url_override="https://mock-llm.example/v1",
+                gateway_auth_command="printf token",
+            )
+        self.assertFalse(executor._gateway_uses_databricks_profile)
+        self.assertIsNone(executor._resolve_turn_model(None))
+
+
+if __name__ == "__main__":
+    unittest.main()
