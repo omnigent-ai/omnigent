@@ -330,165 +330,169 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
         <SettingsSidebarBody onNavClick={onNavClick} onClose={onClose} />
       ) : (
         <>
-      <div className="flex items-center justify-between px-4 pt-3">
-        {/* Brand mark doubles as the "home" affordance: clicking it
+          <div className="flex items-center justify-between px-4 pt-3">
+            {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
             session. Reuses onNavClick so a plain primary click closes
             the sidebar on mobile (where it's a full-screen overlay) but
             modifier/middle clicks still open `/` in a new tab. */}
-        <Link
-          to="/"
-          onClick={onNavClick}
-          className="rounded-sm text-[15px] font-semibold tracking-tight text-foreground transition-colors hover:text-foreground/70"
-        >
-          Omnigent
-        </Link>
-        <div className="flex items-center gap-1">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                aria-label="Close sidebar"
-                onClick={onClose}
-                className="rounded-full"
-              >
-                {/* panel-right-open while the sidebar IS open — this button
+            <Link
+              to="/"
+              onClick={onNavClick}
+              className="rounded-sm text-[15px] font-semibold tracking-tight text-foreground transition-colors hover:text-foreground/70"
+            >
+              Omnigent
+            </Link>
+            <div className="flex items-center gap-1">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Close sidebar"
+                    onClick={onClose}
+                    className="rounded-full"
+                  >
+                    {/* panel-right-open while the sidebar IS open — this button
                     only renders in the open state (ChatHeader's PanelLeftIcon
                     covers the collapsed state). */}
-                <PanelRightOpenIcon className="size-4" />
-              </Button>
-            </TooltipTrigger>
-            {/* Bottom placement keeps the tooltip clear of the macOS
+                    <PanelRightOpenIcon className="size-4" />
+                  </Button>
+                </TooltipTrigger>
+                {/* Bottom placement keeps the tooltip clear of the macOS
                 Electron shell's traffic lights at the window's top edge. */}
-            <TooltipContent side="bottom">Collapse sidebar</TooltipContent>
-          </Tooltip>
-        </div>
-      </div>
+                <TooltipContent side="bottom">Collapse sidebar</TooltipContent>
+              </Tooltip>
+            </div>
+          </div>
 
-      <div className="px-3 py-3">
-        {/* "New session" routes to the home composer ("/"), which now owns
+          <div className="px-3 py-3">
+            {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
             tab; onNavClick still closes the sidebar on a plain mobile tap. */}
-        <Button
-          asChild
-          className={cn(
-            "w-full justify-start gap-2 text-sm",
-            isNewChatPage && "bg-muted font-semibold",
-          )}
-          variant="ghost"
-          data-testid="new-chat-button"
-        >
-          <Link to="/" onClick={onNavClick}>
-            <PencilIcon className="size-4 text-muted-foreground" />
-            New session
-          </Link>
-        </Button>
-        <Button
-          asChild
-          className={cn(
-            "w-full justify-start gap-2 text-sm",
-            isInboxPage && "bg-muted font-semibold",
-          )}
-          variant="ghost"
-          data-testid="inbox-button"
-        >
-          <Link to="/inbox" onClick={onNavClick}>
-            <InboxIcon className="size-4" />
-            Inbox
-            {inboxCount > 0 && (
-              <span
-                aria-label={
-                  inboxCount === 1 ? "1 inbox item waiting" : `${inboxCount} inbox items waiting`
+            <Button
+              asChild
+              className={cn(
+                "w-full justify-start gap-2 text-sm",
+                isNewChatPage && "bg-muted font-semibold",
+              )}
+              variant="ghost"
+              data-testid="new-chat-button"
+            >
+              <Link to="/" onClick={onNavClick}>
+                <PencilIcon className="size-4 text-muted-foreground" />
+                New session
+              </Link>
+            </Button>
+            <Button
+              asChild
+              className={cn(
+                "w-full justify-start gap-2 text-sm",
+                isInboxPage && "bg-muted font-semibold",
+              )}
+              variant="ghost"
+              data-testid="inbox-button"
+            >
+              <Link to="/inbox" onClick={onNavClick}>
+                <InboxIcon className="size-4" />
+                Inbox
+                {inboxCount > 0 && (
+                  <span
+                    aria-label={
+                      inboxCount === 1
+                        ? "1 inbox item waiting"
+                        : `${inboxCount} inbox items waiting`
+                    }
+                    className="ml-auto inline-flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full bg-warning/15 px-1.5 text-[11px] font-medium text-warning tabular-nums"
+                  >
+                    {inboxCount}
+                  </span>
+                )}
+              </Link>
+            </Button>
+            {selectionMode ? (
+              <BulkActionBar
+                selectedIds={selectedIds}
+                allConversations={(conversationsQuery.data?.pages ?? []).flatMap(
+                  (page) => page.data,
+                )}
+                onSelectAll={() =>
+                  selectAll((conversationsQuery.data?.pages ?? []).flatMap((page) => page.data))
                 }
-                className="ml-auto inline-flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full bg-warning/15 px-1.5 text-[11px] font-medium text-warning tabular-nums"
-              >
-                {inboxCount}
-              </span>
-            )}
-          </Link>
-        </Button>
-        {selectionMode ? (
-          <BulkActionBar
-            selectedIds={selectedIds}
-            allConversations={(conversationsQuery.data?.pages ?? []).flatMap((page) => page.data)}
-            onSelectAll={() =>
-              selectAll((conversationsQuery.data?.pages ?? []).flatMap((page) => page.data))
-            }
-            onDeselectAll={deselectAll}
-            onClear={deselectAll}
-            onExit={exitSelectionMode}
-          />
-        ) : (
-          <div className="relative mt-3 flex items-center gap-1.5">
-            <div className="relative flex-1">
-              <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
-              <input
-                type="search"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                aria-label="Search sessions"
-                placeholder="Search sessions"
-                className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1"
+                onDeselectAll={deselectAll}
+                onClear={deselectAll}
+                onExit={exitSelectionMode}
               />
-            </div>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label="Select sessions"
-                  data-testid="toggle-selection-mode"
-                  className="shrink-0 rounded-full"
-                  onClick={() => setSelectionMode(true)}
-                >
-                  <ListChecksIcon className="size-3.5" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom">Select sessions</TooltipContent>
-            </Tooltip>
+            ) : (
+              <div className="relative mt-3 flex items-center gap-1.5">
+                <div className="relative flex-1">
+                  <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
+                  <input
+                    type="search"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    aria-label="Search sessions"
+                    placeholder="Search sessions"
+                    className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1"
+                  />
+                </div>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Select sessions"
+                      data-testid="toggle-selection-mode"
+                      className="shrink-0 rounded-full"
+                      onClick={() => setSelectionMode(true)}
+                    >
+                      <ListChecksIcon className="size-3.5" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">Select sessions</TooltipContent>
+                </Tooltip>
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      <nav className="relative flex-1 overflow-y-auto px-3 pb-3 [scrollbar-gutter:stable]">
-        <ConversationList
-          conversationsQuery={conversationsQuery}
-          onRowClick={onNavClick}
-          searchQuery={debouncedSearchQuery}
-          pinnedConversationIds={pinnedConversationIds}
-          onPinnedConversationIdsChange={setPinnedConversationIds}
-          onTogglePinned={togglePinnedConversation}
-          selectionMode={selectionMode}
-          selectedIds={selectedIds}
-          onToggleSelected={toggleSelected}
-        />
-      </nav>
+          <nav className="relative flex-1 overflow-y-auto px-3 pb-3 [scrollbar-gutter:stable]">
+            <ConversationList
+              conversationsQuery={conversationsQuery}
+              onRowClick={onNavClick}
+              searchQuery={debouncedSearchQuery}
+              pinnedConversationIds={pinnedConversationIds}
+              onPinnedConversationIdsChange={setPinnedConversationIds}
+              onTogglePinned={togglePinnedConversation}
+              selectionMode={selectionMode}
+              selectedIds={selectedIds}
+              onToggleSelected={toggleSelected}
+            />
+          </nav>
 
-      {/* Settings footer. Sibling *after* the flex-1 nav so it pins to the
+          {/* Settings footer. Sibling *after* the flex-1 nav so it pins to the
           bottom of the sidebar column. Always present (every deploy): the
           full settings surface — appearance, keyboard shortcuts, archived
           chats, and the account/sign-out controls when accounts auth is on —
           lives behind this row on the /settings page. */}
-      <div className="shrink-0 px-3 pb-3">
-        {/* Match the New session / Inbox buttons (default size, no extra
+          <div className="shrink-0 px-3 pb-3">
+            {/* Match the New session / Inbox buttons (default size, no extra
             padding) so the gear icon lines up with their leading icons. */}
-        <Button
-          asChild
-          variant="ghost"
-          className="w-full justify-start gap-2 text-sm"
-          data-testid="settings-button"
-        >
-          <Link to="/settings" onClick={onNavClick}>
-            <SettingsIcon className="size-4 text-muted-foreground" />
-            Settings
-          </Link>
-        </Button>
-      </div>
+            <Button
+              asChild
+              variant="ghost"
+              className="w-full justify-start gap-2 text-sm"
+              data-testid="settings-button"
+            >
+              <Link to="/settings" onClick={onNavClick}>
+                <SettingsIcon className="size-4 text-muted-foreground" />
+                Settings
+              </Link>
+            </Button>
+          </div>
         </>
       )}
     </aside>
@@ -670,8 +674,7 @@ function ConversationList({
 
   // Archived sessions are surfaced on the Settings page, not here, so they
   // don't count toward the sidebar's empty-state threshold.
-  const totalVisible =
-    sections.pinned.length + sections.sessions.length + sections.shared.length;
+  const totalVisible = sections.pinned.length + sections.sessions.length + sections.shared.length;
 
   // Section structure comes from the muted micro-headers + whitespace
   // alone (Linear-style) — no divider rules between groups.
