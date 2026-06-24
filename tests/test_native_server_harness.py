@@ -7,11 +7,17 @@ pinning, and the error branches) independent of any concrete harness.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
 from omnigent.native_server_harness import NativeServerHarness
 from omnigent.native_server_transport import NativePrompt
+from omnigent.runtime.harness_descriptors import HARNESS_DESCRIPTORS
+
+# Base a fake descriptor on the real opencode-native one; tests flip
+# ``supports_enqueue`` / ``id`` via ``dataclasses.replace`` as needed.
+_BASE_DESCRIPTOR = dataclasses.replace(HARNESS_DESCRIPTORS["opencode-native"], id="fake-native")
 
 
 class _FakeTransport:
@@ -49,8 +55,7 @@ def _harness(
 ) -> NativeServerHarness:
     resolve = resolver if resolver is not None else _const_resolver(session_id)
     return NativeServerHarness(
-        harness_id="fake-native",
-        supports_enqueue=supports_enqueue,
+        descriptor=dataclasses.replace(_BASE_DESCRIPTOR, supports_enqueue=supports_enqueue),
         transport=transport,  # type: ignore[arg-type]
         resolve_session_id=resolve,
         build_prompt=_build_prompt,

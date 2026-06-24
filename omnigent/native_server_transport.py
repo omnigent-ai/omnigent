@@ -1,12 +1,18 @@
 """Transport abstraction for native-server harnesses.
 
-A *native-server* harness drives a per-conversation server process the
-runner owns: the runner starts the server + an event forwarder, and the
-harness injects web turns over this transport. OpenCode speaks HTTP + SSE
-(:class:`omnigent.opencode_http_transport.OpenCodeHttpTransport`);
-:class:`NativeServerTransport` is the seam so the orchestration in
-:class:`omnigent.native_server_harness.NativeServerHarness` stays
-protocol-agnostic.
+A *native-server* harness (codex-native, opencode-native) drives a
+per-conversation server process the runner owns: the runner starts the
+server + an event forwarder, and the harness injects web turns. The two
+families differ only in transport — Codex speaks WebSocket JSON-RPC,
+OpenCode speaks HTTP + SSE. :class:`NativeServerTransport` is the seam:
+the same protocol with two concrete implementations
+(:class:`omnigent.codex_ws_transport.CodexWsTransport` and
+:class:`omnigent.opencode_http_transport.OpenCodeHttpTransport`).
+
+:class:`omnigent.native_server_harness.NativeServerHarness` orchestrates a
+turn over any conformant transport; the conformance suite
+(``tests/harness_conformance``) exercises both implementations against the
+same contract, which is the design's correctness check for the abstraction.
 """
 
 from __future__ import annotations

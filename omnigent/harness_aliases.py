@@ -6,49 +6,25 @@ Omnigent continues to use canonical harness identifiers internally.
 
 from __future__ import annotations
 
-HARNESS_ALIASES: dict[str, str] = {
-    "claude": "claude-sdk",
-    "native-pi": "pi-native",
-    # The SDK package / runtime dispatch spelling; specs use "openai-agents".
-    "openai-agents-sdk": "openai-agents",
-    # User-facing spellings for the Google Antigravity SDK harness; the
-    # canonical id is "antigravity" (matches the registry / workflow type).
-    "agy": "antigravity",
-    "google-antigravity": "antigravity",
-    # User-facing reversed spelling for the Goose native-CLI harness; canonical
-    # id is "goose-native".
-    "native-goose": "goose-native",
-    # Qwen Code harness alias.
-    "qwen-code": "qwen",
-    # OpenCode native-server harness: the bare ``opencode`` name and the
-    # reversed ``native-opencode`` spelling both fold to ``opencode-native``
-    # (there is no separate SDK ``opencode`` harness, so the bare name is free).
-    "opencode": "opencode-native",
-    "native-opencode": "opencode-native",
-}
+from omnigent.runtime.harness_descriptors import harness_alias_map, native_harness_ids
 
-# Canonical native-CLI harness spellings. These harnesses type messages into
-# a resident terminal process and mirror their transcript back to Omnigent, so
-# the runner must not replay Omnigent history or treat a completed queue call
-# as a full in-process model turn. ``AgentSpec.harness_kind`` returns these
-# canonical spellings for native agents, so no executor-type aliasing is needed
-# here.
-NATIVE_HARNESSES: frozenset[str] = frozenset(
-    {
-        "claude-native",
-        "native-claude",
-        "codex-native",
-        "native-codex",
-        "pi-native",
-        "native-pi",
-        "cursor-native",
-        "native-cursor",
-        "goose-native",
-        "native-goose",
-        "opencode-native",
-        "native-opencode",
-    }
-)
+# User-facing shorthand → canonical harness id. Derived from the single
+# :data:`~omnigent.runtime.harness_descriptors.HARNESS_DESCRIPTORS`
+# registration so it can never drift from the other harness views (the
+# conformance suite asserts the parity). Spellings include ``claude`` →
+# ``claude-sdk``, ``native-pi`` → ``pi-native``, ``openai-agents-sdk`` →
+# ``openai-agents``, the Antigravity aliases, and ``native-opencode`` →
+# ``opencode-native``.
+HARNESS_ALIASES: dict[str, str] = harness_alias_map()
+
+# Canonical native-CLI harness spellings (plus reversed ``native-<x>``
+# aliases, e.g. ``native-claude`` / ``native-codex`` / ``native-cursor``).
+# These harnesses type messages into a resident terminal process and mirror
+# their transcript back to Omnigent, so the runner must not replay Omnigent
+# history or treat a completed queue call as a full in-process model turn.
+# Derived from the descriptor registry (claude/codex/pi/cursor-native plus
+# opencode-native).
+NATIVE_HARNESSES: frozenset[str] = native_harness_ids()
 
 
 def canonicalize_harness(harness: str | None) -> str | None:

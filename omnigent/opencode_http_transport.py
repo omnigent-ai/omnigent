@@ -1,8 +1,10 @@
 """OpenCode HTTP + SSE implementation of :class:`NativeServerTransport`.
 
-All OpenCode wire details live here;
-:class:`omnigent.native_server_harness.NativeServerHarness` drives it through
-the transport protocol only.
+One of the two concrete transports that prove the native-server
+abstraction (the other is
+:class:`omnigent.codex_ws_transport.CodexWsTransport`). All OpenCode wire
+details live here; :class:`omnigent.native_server_harness.NativeServerHarness`
+and the conformance suite drive it through the protocol only.
 
 The transport can build its client from three sources, in priority order:
 an injected ``client_factory`` (tests), a running

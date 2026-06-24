@@ -24,80 +24,22 @@ sibling modules; this ``__init__.py`` is just the registry.
 
 from __future__ import annotations
 
+from omnigent.runtime.harness_descriptors import runtime_module_map
+
 # Harness-name → fully-qualified module path. Each module must
 # export ``create_app() -> FastAPI``; the runner imports the module,
 # calls the factory, and serves the result over a Unix socket.
 #
-# Populated as per-harness wraps land in Phase 1 step 4. The test
-# suite injects fixture entries at test time (via direct dict
+# Derived from the single
+# :data:`~omnigent.runtime.harness_descriptors.HARNESS_DESCRIPTORS`
+# registration (runtime-registered descriptors plus their runtime aliases,
+# e.g. ``claude`` → claude-sdk). ``open-responses`` is intentionally absent
+# (it is spec-valid but routed through the openai-agents adapter, so its
+# descriptor sets ``runtime_registered=False``). The conformance suite
+# (``tests/harness_conformance``) asserts this map equals the descriptors.
+#
+# The test suite injects fixture entries at test time (via direct dict
 # mutation in conftest fixtures).
-_HARNESS_MODULES: dict[str, str] = {
-    # Step 4b: claude-sdk harness wrap. See
-    # omnigent/inner/claude_sdk_harness.py.
-    "claude-sdk": "omnigent.inner.claude_sdk_harness",
-    # User-facing alias accepted in specs / Omnigent harness dispatch.
-    "claude": "omnigent.inner.claude_sdk_harness",
-    # Native Claude Code terminal bridge used by ``omnigent claude``.
-    "claude-native": "omnigent.inner.claude_native_harness",
-    # Native Codex TUI terminal bridge used by ``omnigent codex``.
-    "codex-native": "omnigent.inner.codex_native_harness",
-    # Step 4c: codex harness wrap. See
-    # omnigent/inner/codex_harness.py.
-    "codex": "omnigent.inner.codex_harness",
-    # Step 4d: pi harness wrap. See
-    # omnigent/inner/pi_harness.py.
-    "pi": "omnigent.inner.pi_harness",
-    # Native Pi TUI bridge used by ``omnigent pi``.
-    "pi-native": "omnigent.inner.pi_native_harness",
-    # Step 4e: openai-agents harness wrap. See
-    # omnigent/inner/openai_agents_sdk_harness.py. Registry
-    # key is the Omnigent-side spelling (``openai-agents``,
-    # no ``-sdk`` suffix) to match
-    # ``OmnigentExecutor``'s harness allowlist and the
-    # ``executor.harness`` field used in Omnigent YAML; the
-    # backing Python module retains the ``_sdk`` suffix because
-    # the underlying SDK package is ``openai-agents`` and the
-    # executor class is :class:`OpenAIAgentsSDKExecutor`.
-    "openai-agents": "omnigent.inner.openai_agents_sdk_harness",
-    # cursor harness wrap (Cursor's ``cursor-agent`` CLI, headless). See
-    # omnigent/inner/cursor_harness.py.
-    "cursor": "omnigent.inner.cursor_harness",
-    # cursor-native harness wrap. Drives the resident ``cursor-agent`` TUI by
-    # injecting each web-UI turn into its tmux pane and mirroring the transcript
-    # back — a native-CLI harness like claude/codex/pi-native, so it IS in
-    # ``NATIVE_HARNESSES``. See omnigent/inner/cursor_native_harness.py.
-    "cursor-native": "omnigent.inner.cursor_native_harness",
-    # goose-native harness wrap. Drives the resident ``goose session`` TUI by
-    # injecting each web-UI turn into its tmux pane and mirroring the transcript
-    # back from Goose's SQLite session store — a native-CLI harness like
-    # cursor-native, so it IS in ``NATIVE_HARNESSES``. See
-    # omnigent/inner/goose_native_harness.py.
-    "goose-native": "omnigent.inner.goose_native_harness",
-    # Google Antigravity SDK harness wrap. See
-    # omnigent/inner/antigravity_harness.py. In-process SDK harness
-    # (``google-antigravity``), like openai-agents — Omnigent spawns no CLI
-    # binary or sandbox subprocess (the SDK itself launches a native
-    # localharness binary; needs glibc >=~2.36). Drives Gemini 3.5 Flash by
-    # default (also Claude / GPT-OSS), with Gemini API-key or Vertex AI auth.
-    "antigravity": "omnigent.inner.antigravity_harness",
-    # Qwen Code harness wrap. See omnigent/inner/qwen_harness.py.
-    # Drives the ``qwen`` CLI in ACP mode (``qwen --acp``) for agent execution.
-    "qwen": "omnigent.inner.qwen_harness",
-    # Headless Goose harness wrap. See omnigent/inner/goose_harness.py.
-    # Drives Block's ``goose`` CLI in ACP mode (``goose acp``) — the chat-first
-    # counterpart to the terminal-first ``goose-native`` TUI harness. Tool
-    # approvals surface as web elicitation cards via session/request_permission.
-    "goose": "omnigent.inner.goose_harness",
-    # Native OpenCode server bridge used by ``omnigent opencode``. The runner
-    # owns ``opencode serve`` + an SSE forwarder and this harness injects each
-    # web-UI turn over loopback HTTP — a native-server harness like
-    # codex-native, so both ``opencode-native`` and its ``native-opencode``
-    # alias are in ``NATIVE_HARNESSES``. See
-    # omnigent/inner/opencode_native_harness.py.
-    "opencode-native": "omnigent.inner.opencode_native_harness",
-    # ``opencode`` is accepted as a friendly alias for the canonical
-    # ``opencode-native`` (there is no separate SDK ``opencode`` harness).
-    "opencode": "omnigent.inner.opencode_native_harness",
-}
+_HARNESS_MODULES: dict[str, str] = runtime_module_map()
 
 __all__ = ["_HARNESS_MODULES"]

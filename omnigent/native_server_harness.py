@@ -33,6 +33,7 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.native_server_transport import NativePrompt, NativeServerTransport
+from omnigent.runtime.harness_descriptors import HarnessDescriptor
 
 _logger = logging.getLogger(__name__)
 
@@ -46,10 +47,7 @@ class NativeServerHarness(Executor):
     """
     Transport-driven executor for native-server harnesses.
 
-    :param harness_id: Canonical harness id, e.g. ``"opencode-native"`` (used
-        in harness error messages).
-    :param supports_enqueue: Whether the harness supports mid-turn enqueue
-        (steer-or-queue); drives :meth:`supports_live_message_queue`.
+    :param descriptor: The harness descriptor (capabilities).
     :param transport: The transport to inject turns over.
     :param resolve_session_id: Async callable returning the native session
         id (or ``None`` until the runner has booted the server).
@@ -63,16 +61,14 @@ class NativeServerHarness(Executor):
     def __init__(
         self,
         *,
-        harness_id: str,
-        supports_enqueue: bool,
+        descriptor: HarnessDescriptor,
         transport: NativeServerTransport,
         resolve_session_id: SessionResolver,
         build_prompt: PromptBuilder,
         boot_poll_attempts: int = 60,
         boot_poll_delay: float = 1.0,
     ) -> None:
-        self._harness_id = harness_id
-        self._supports_enqueue = supports_enqueue
+        self.descriptor = descriptor
         self.transport = transport
         self._resolve_session_id = resolve_session_id
         self._build_prompt = build_prompt
@@ -92,7 +88,7 @@ class NativeServerHarness(Executor):
 
     def supports_live_message_queue(self) -> bool:
         """:returns: Whether the harness supports mid-turn enqueue."""
-        return self._supports_enqueue
+        return self.descriptor.supports_enqueue
 
     async def _await_session_id(self) -> str | None:
         """
@@ -131,7 +127,7 @@ class NativeServerHarness(Executor):
         del tools, system_prompt
         prompt = _latest_user_prompt(messages, self._build_prompt)
         if prompt is None or prompt.is_empty():
-            yield ExecutorError(message=f"{self._harness_id} turn had no user input to send")
+            yield ExecutorError(message=f"{self.descriptor.id} turn had no user input to send")
             return
         if config is not None and config.model and not prompt.model:
             prompt = _with_model(prompt, config.model)
@@ -139,12 +135,12 @@ class NativeServerHarness(Executor):
         async with self._inject_lock:
             session_id = await self._await_session_id()
             if session_id is None:
-                error_msg = f"{self._harness_id} bridge state is missing"
+                error_msg = f"{self.descriptor.id} bridge state is missing"
             else:
                 try:
                     await self.transport.send_prompt(session_id, prompt)
                 except Exception as exc:  # noqa: BLE001 - converted to a harness error event.
-                    error_msg = f"{self._harness_id} executor error: {exc}"
+                    error_msg = f"{self.descriptor.id} executor error: {exc}"
         if error_msg is not None:
             yield ExecutorError(message=error_msg)
         else:
@@ -165,7 +161,7 @@ class NativeServerHarness(Executor):
         try:
             return await self.transport.abort(session_id)
         except Exception:  # noqa: BLE001 - interruption is best effort.
-            _logger.warning("%s abort failed", self._harness_id, exc_info=True)
+            _logger.warning("%s abort failed", self.descriptor.id, exc_info=True)
             return False
 
     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
@@ -191,7 +187,7 @@ class NativeServerHarness(Executor):
             try:
                 await self.transport.send_prompt(session_id, prompt)
             except Exception:  # noqa: BLE001 - enqueue is best effort.
-                _logger.warning("%s enqueue failed", self._harness_id, exc_info=True)
+                _logger.warning("%s enqueue failed", self.descriptor.id, exc_info=True)
                 return False
         return True
 
