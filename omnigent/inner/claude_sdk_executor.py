@@ -2003,6 +2003,7 @@ class ClaudeSDKExecutor(Executor):
             "settings": settings_payload,
             "stderr": _on_stderr,
             "include_partial_messages": True,
+            "include_hook_events": True,
             "skills": resolved.skills,
             "plugins": bundle_plugins,
             "extra_args": {"no-session-persistence": None},
@@ -2098,6 +2099,9 @@ class ClaudeSDKExecutor(Executor):
         observed_model: str | None = None
         system_diagnostics: list[str] = []
         terminal_error: str | None = None
+        compaction_occurred: bool = False
+        claude_session_id: str | None = None
+
         # Track in-flight tool calls so we can emit ToolCallComplete
         # with the tool name and duration when results arrive.
         pending_tools: dict[str, tuple[str, float]] = {}  # id → (name, start_mono)
@@ -2384,6 +2388,7 @@ class ClaudeSDKExecutor(Executor):
 
                     elif isinstance(message, sdk.ResultMessage):
                         result_msg = cast(_ResultMessageObj, message)
+                        claude_session_id = getattr(result_msg, "session_id", None)
                         if not response_text and result_msg.result:
                             response_text = result_msg.result
                         raw_usage = getattr(result_msg, "usage", None)
@@ -2467,6 +2472,9 @@ class ClaudeSDKExecutor(Executor):
                                     "Check ANTHROPIC_BASE_URL / Databricks endpoint configuration."
                                 )
                                 break
+                        elif getattr(system_msg, "hook_event_name", None) == "PreCompact":
+                            compaction_occurred = True
+                            logger.info("Claude SDK compaction detected (PreCompact hook)")
                         else:
                             logger.info("Claude CLI system message: %s", data)
             finally:
@@ -2522,6 +2530,38 @@ class ClaudeSDKExecutor(Executor):
                 return
 
         _notify_usage_from_dict(model=model, usage=turn_usage)
+
+        if compaction_occurred and claude_session_id:
+            from omnigent.inner.executor import CompactionComplete
+
+            _compaction_tokens = 0
+            if turn_usage is not None:
+                _compaction_tokens = turn_usage.get("context_tokens", 0) or 0
+            # Read the post-compaction session messages so the runner
+            # can persist them for session resume in ephemeral
+            # environments where the CLI's own transcript is lost.
+            _compacted: list[dict[str, Any]] | None = None
+            try:
+                from claude_agent_sdk import get_session_messages
+
+                _msgs = get_session_messages(claude_session_id, directory=self._cwd)
+                _compacted = [
+                    {"type": "message", "role": m.type, "content": m.message.get("content", [])}
+                    for m in _msgs
+                    if isinstance(m.message, dict)
+                ]
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "Failed to read Claude session messages for compaction persist",
+                    exc_info=True,
+                )
+            yield CompactionComplete(
+                summary="[Claude Code compaction — context was automatically compacted]",
+                token_count=_compaction_tokens,
+                model=observed_model or model,
+                compacted_messages=_compacted,
+            )
+
         yield TurnComplete(response=response_text, usage=turn_usage)
 
     @staticmethod

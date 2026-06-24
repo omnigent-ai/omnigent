@@ -211,6 +211,29 @@ class ToolCallComplete(ExecutorEvent):
 
 
 @dataclass
+class CompactionComplete(ExecutorEvent):
+    """The harness compacted its internal context.
+
+    The runner persists this as a compaction item so resumed sessions
+    receive pre-compacted history.
+
+    :param summary: Text summary of the compacted conversation.
+    :param token_count: Estimated token count of the summary.
+    :param model: Model used for summarization, or None if truncation-based.
+    :param compacted_messages: The compacted message list that replaces
+        the pre-compaction history, stored by the runner so a resumed
+        session replays these instead of the full original history.
+        ``None`` when the harness cannot export its compacted state
+        (e.g. claude-sdk where compaction is internal to the CLI).
+    """
+
+    summary: str
+    token_count: int
+    model: str | None = None
+    compacted_messages: list[dict[str, Any]] | None = None
+
+
+@dataclass
 class TurnCancelled(ExecutorEvent):
     """The current assistant turn was cancelled before completion."""
 
