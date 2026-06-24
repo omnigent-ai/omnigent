@@ -29,6 +29,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from omnigent._platform import IS_WINDOWS
 from omnigent._startup_profile import StartupProfiler
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
@@ -4029,6 +4030,24 @@ def _expand_builtin_env_vars(  # type: ignore[explicit-any]  # entries are parse
 _RESUME_PICKER_SENTINEL = "__resume_picker__"
 
 
+def _reject_native_on_windows(harness: str) -> None:
+    """Fail a native (tmux/PTY) harness command with an actionable message.
+
+    The ``omnigent claude`` / ``codex`` / ``cursor`` native wrappers drive a
+    private tmux server and PTY, which don't exist on Windows. Point users at
+    the SDK harnesses / web UI instead of letting them hit a tmux crash.
+
+    :param harness: The native command name, e.g. ``"claude"``.
+    :raises click.ClickException: Always, when running on Windows.
+    """
+    if IS_WINDOWS:
+        raise click.ClickException(
+            f"`omnigent {harness}` (native tmux/PTY terminal) is not supported on "
+            "Windows. Use an SDK-based harness via `omnigent run <agent.yaml>` "
+            "or the web UI."
+        )
+
+
 @cli.command(
     context_settings={
         "ignore_unknown_options": True,
@@ -4137,6 +4156,7 @@ def claude(
       omnigent claude --resume                  # interactive picker
       omnigent claude --server https://<app>.databricksapps.com
     """
+    _reject_native_on_windows("claude")
     startup_profiler = StartupProfiler.from_env(
         name="omnigent claude",
         env_var=_CLAUDE_STARTUP_PROFILE_ENV_VAR,
@@ -4263,6 +4283,7 @@ def codex(
       omnigent codex --resume                  # interactive picker
       omnigent codex --server https://<app>.databricksapps.com
     """
+    _reject_native_on_windows("codex")
     choice = _split_resume_value(resume)
     if session_id is not None and (choice.picker or choice.conversation_id is not None):
         raise click.UsageError(
@@ -4651,6 +4672,7 @@ def cursor(
       omnigent cursor --resume conv_abc123
       omnigent cursor --resume                 # interactive picker
     """
+    _reject_native_on_windows("cursor")
     choice = _split_resume_value(resume)
     if session_id is not None and (choice.picker or choice.conversation_id is not None):
         raise click.UsageError(

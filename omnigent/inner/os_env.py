@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, TypeAlias, cast
 from urllib.parse import urlparse, urlunparse
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
@@ -874,7 +875,11 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
             "os_env.start_in_scratch requires an active sandbox; "
             f"resolved sandbox type {sandbox.backend_type!r} is inactive"
         )
-    shell_path = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+    shell_path = shutil.which("bash") or shutil.which("sh")
+    if shell_path is None:
+        # No POSIX shell on PATH. On Windows fall back to cmd.exe; elsewhere
+        # keep the historical /bin/sh default.
+        shell_path = os.environ.get("COMSPEC", "cmd.exe") if IS_WINDOWS else "/bin/sh"
     egress_rules = spec.sandbox.egress_rules if spec.sandbox else None
     egress_allow_private = (
         spec.sandbox.egress_allow_private_destinations if spec.sandbox else False
@@ -1378,8 +1383,12 @@ def _is_within(path: Path, root: Path) -> bool:
 
 
 def _shell_argv(shell_path: str, command: str) -> list[str]:
-    shell_name = Path(shell_path).name
-    if shell_name == "bash":
+    shell_name = Path(shell_path).name.lower()
+    if shell_name in ("cmd.exe", "cmd"):
+        return [shell_path, "/c", command]
+    if shell_name in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
+        return [shell_path, "-NoProfile", "-Command", command]
+    if shell_name in ("bash", "bash.exe"):
         return [shell_path, "--noprofile", "--norc", "-c", command]
     return [shell_path, "-c", command]
 
