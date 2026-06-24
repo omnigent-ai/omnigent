@@ -13,9 +13,9 @@ The LLM calls are served by the in-process mock LLM server rather than a real
 Anthropic endpoint. Before each test run a mock ``anthropic`` provider config is
 written to ``~/.omnigent/config.yaml`` (see ``native_claude_mock_session`` in
 ``conftest.py``), redirecting the runner's ``ANTHROPIC_BASE_URL`` to the mock
-server. Tokens are pre-generated and queued via content-based routing so the
-mock returns the expected assistant token for each turn regardless of how many
-extra LLM calls Claude Code makes internally.
+server. Before each turn, a per-turn fallback is set via
+``set_fallback_mock_llm`` so the mock returns the expected assistant token
+regardless of how many extra LLM calls Claude Code makes internally.
 """
 
 from __future__ import annotations
@@ -113,21 +113,15 @@ def test_native_claude_message_render_parity(
     _log.info("Claude Code TUI attached (terminal-view connected)")
     _ensure_chat_view(page)
 
-    # Pre-generate tokens for all turns so they can be queued in the mock
-    # before any message is sent. Content-based routing (match=user_marker)
-    # ensures the right token is returned regardless of extra internal calls.
+    # Pre-generate tokens for all turns.  Each turn sets a per-turn fallback
+    # via set_fallback_mock_llm right before sending, so the mock returns the
+    # expected assistant token regardless of extra internal LLM calls.
     nonces = [uuid.uuid4().hex[:8] for _ in range(_COMPOSER_TURNS + 1)]
     turns = [
         (f"usr-{i + 1}-{nonces[i]}", f"ast-{i + 1}-{nonces[i]}")
         for i in range(_COMPOSER_TURNS + 1)
     ]
-    # Set the model fallback to the current turn's token right before
-    # sending — updated per turn. Content-routing and FIFO both fail for
-    # native CLIs: they send the full conversation history on every request
-    # (polluting content matches) and make internal pre-turn LLM calls
-    # (consuming FIFO entries). The fallback is infinite and non-exhaustible.
     reset_mock_llm(mock_llm_server_url)
-    set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, "")
 
     user_markers: list[str] = []
     assistant_tokens: list[str] = []
@@ -136,10 +130,10 @@ def test_native_claude_message_render_parity(
     for index, (user_marker, assistant_token) in enumerate(turns[:_COMPOSER_TURNS], start=1):
         user_markers.append(user_marker)
         assistant_tokens.append(assistant_token)
-        set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, assistant_token)
         _log.info(
             "composer turn %d: sending (marker=%s token=%s)", index, user_marker, assistant_token
         )
+        set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, assistant_token)
         _send(page, _turn_prompt(index, user_marker, assistant_token))
         expect(page.locator(_ASSISTANT, has_text=assistant_token).first).to_be_visible(
             timeout=_MOCK_TURN_TIMEOUT_MS
@@ -153,12 +147,12 @@ def test_native_claude_message_render_parity(
     tui_marker, tui_token = turns[_COMPOSER_TURNS]
     user_markers.append(tui_marker)
     assistant_tokens.append(tui_token)
-    set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, tui_token)
     _open_terminal_view(page)
     _wait_terminal_connected(page)
     _log.info(
         "TUI turn %d: typing into xterm (marker=%s token=%s)", tui_index, tui_marker, tui_token
     )
+    set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, tui_token)
     _type_into_tui(page, _turn_prompt(tui_index, tui_marker, tui_token))
 
     _ensure_chat_view(page)

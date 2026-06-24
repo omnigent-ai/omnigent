@@ -902,6 +902,7 @@ def live_server(
     _server_state["binding_token"] = binding_token
     _server_state["server_url"] = base_url
     _server_state["mock_llm_url"] = mock_url
+    _server_state["_runner_proc"] = runner_proc
 
     # Set a non-resettable fallback for the policy-classifier LLM queue so
     # every per-test reset leaves the server's guardrails path functional.
@@ -962,7 +963,7 @@ def seeded_session(
     """
     import json as _json
 
-    _ensure_runner_online(live_server, tmp_path_factory)
+    respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     # Create a session with the hello_world bundle inline. The server
     # pre-registered the agent via --agent, but since /api/agents is
@@ -988,13 +989,15 @@ def seeded_session(
         yield (live_server, session_id)
     finally:
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        # Do NOT terminate the respawned runner here — the next test's
-        # seeded_session will reuse it via _ensure_runner_online (which sees
-        # it as "online" and skips respawn). Terminating it created a race:
-        # the WS tunnel deregistered asynchronously, so the next test's
-        # _ensure_runner_online sometimes saw the dying runner as "online",
-        # bound a session to it, and then the runner died — leaving the
-        # session with no runner to dispatch turns.
+        # Restore the "found" state: if we respawned the runner (a prior
+        # test had killed it), tear our copy down so it doesn't outlive us.
+        if respawned_runner is not None:
+            respawned_runner.terminate()
+            try:
+                respawned_runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned_runner.kill()
+                respawned_runner.wait(timeout=5)
 
 
 def _create_runner_bound_session(base_url: str, runner_id: str) -> str:
@@ -1064,41 +1067,21 @@ def _ensure_runner_online(
             return False
         return resp.status_code == 200 and resp.json().get("online") is True
 
-    # Don't trust _online() if the runner process we know about is dead —
-    # the WS tunnel deregisters asynchronously, so a just-killed runner can
-    # appear "online" for a few seconds after its process exited
-    # (test_stale_stream SIGKILLs the runner and the WS lingers).
     def _runner_process_alive() -> bool:
         respawned = _server_state.get("_respawned_runner")
         if isinstance(respawned, subprocess.Popen):
             return respawned.poll() is None
-        # No respawned runner — check the original runner PID.
-        original_pid = _server_state.get("pid")
-        if isinstance(original_pid, int):
-            try:
-                os.kill(original_pid, 0)  # signal 0 = existence check
-                return True
-            except OSError:
-                return False
-        return True  # no PID info — trust _online()
+        # Check the original runner process (stored by live_server).
+        original = _server_state.get("_runner_proc")
+        if isinstance(original, subprocess.Popen):
+            return original.poll() is None
+        return True  # no process info — trust _online()
 
     if _online() and _runner_process_alive():
         return None
 
-    # Reuse a previously respawned runner if it is still alive.
-    existing = _server_state.get("_respawned_runner")
-    if isinstance(existing, subprocess.Popen) and existing.poll() is None:
-        # The previous respawn's WS tunnel may be deregistering — wait for
-        # it to come back online rather than spawning a duplicate.
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            if _online():
-                return None  # caller must NOT terminate — it's shared
-            time.sleep(_HEALTH_POLL_INTERVAL_S)
-
     binding_token = str(_server_state["binding_token"])
-    mock_url = str(_server_state.get("mock_llm_url") or "")
-    assert mock_url, "mock_llm_url missing from _server_state — live_server did not set it"
+    mock_url = str(_server_state.get("mock_llm_url", ""))
     runner_tmp = tmp_path_factory.mktemp("e2e_ui_respawn_runner")
     log_path = runner_tmp / "runner.log"
     log_handle = open(log_path, "w")  # noqa: SIM115 — fd dup'd into child; closed below
@@ -1122,9 +1105,6 @@ def _ensure_runner_online(
         stderr=subprocess.STDOUT,
     )
     log_handle.close()  # child holds its own dup of the fd
-    # Store so subsequent callers reuse rather than respawn (avoiding the
-    # terminate-then-immediately-check race that created zombie runners).
-    _server_state["_respawned_runner"] = proc
 
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -1134,11 +1114,11 @@ def _ensure_runner_online(
                 f"log:\n{log_path.read_text()[-3000:]}"
             )
         if _online():
-            return None  # stored in _server_state; caller must NOT terminate
+            _server_state["_respawned_runner"] = proc
+            return proc
         time.sleep(_HEALTH_POLL_INTERVAL_S)
 
     proc.terminate()
-    _server_state.pop("_respawned_runner", None)
     raise RuntimeError(f"respawned runner did not register within {timeout_s:.0f}s")
 
 
@@ -2185,10 +2165,7 @@ def _temp_omnigent_mock_config(
         ``"http://127.0.0.1:51235"``. No /v1 suffix — each SDK appends it.
     :param harness: ``"claude"`` or ``"codex"``.
     """
-    # Respect OMNIGENT_CONFIG_HOME (same logic as provider_config._config_path)
-    # so the mock config lands where the runner actually reads it.
-    config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
-    config_dir = Path(config_home) if config_home else Path.home() / ".omnigent"
+    config_dir = Path.home() / ".omnigent"
     config_path = config_dir / "config.yaml"
     config_dir.mkdir(parents=True, exist_ok=True)
     original = config_path.read_text() if config_path.exists() else None
@@ -2206,17 +2183,13 @@ def _temp_omnigent_mock_config(
                     default: {_CLAUDE_MOCK_MODEL}
             """)
     else:  # codex
-        # The Codex CLI uses base_url as the full API prefix (it sends
-        # requests to {base_url}/responses, NOT {base_url}/v1/responses),
-        # so we need the /v1 suffix. (The Anthropic SDK above auto-appends
-        # /v1/messages to its base_url, so it does NOT need the suffix.)
         mock_config = textwrap.dedent(f"""\
             providers:
               mock-codex:
                 kind: key
                 default: [openai]
                 openai:
-                  base_url: "{mock_llm_server_url}/v1"
+                  base_url: "{mock_llm_server_url}"
                   api_key: "mock-key"
                   wire_api: responses
                   models:
@@ -2261,17 +2234,17 @@ def native_claude_mock_session(
         ctx = contextlib.nullcontext()
     with ctx:
         session_id = _create_native_claude_session(live_server, runner_id)
-        try:
-            yield (live_server, session_id)
-        finally:
-            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-            if respawned is not None:
-                respawned.terminate()
-                try:
-                    respawned.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    respawned.kill()
-                    respawned.wait(timeout=5)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
 
 
 @pytest.fixture
@@ -2299,16 +2272,16 @@ def native_codex_mock_session(
         ctx = contextlib.nullcontext()
     with ctx:
         session_id = _create_native_codex_session(live_server, runner_id)
-        try:
-            yield (live_server, session_id)
-        finally:
-            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-            if respawned is not None:
-                respawned.terminate()
-                try:
-                    respawned.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    respawned.kill()
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
                 respawned.wait(timeout=5)
 
 
@@ -2340,7 +2313,9 @@ def native_codex_mock_session(
 # ---------------------------------------------------------------------------
 
 
-def _create_native_cursor_session(base_url: str, runner_id: str) -> str:
+def _create_native_cursor_session(
+    base_url: str, runner_id: str, *, launch_args: tuple[str, ...] = ("-f",)
+) -> str:
     """Register the ``cursor-native`` wrapper agent and bind its session.
 
     Reuses the exact terminal-first spec ``omnigent cursor`` ships
@@ -2400,7 +2375,11 @@ def _create_native_cursor_session(base_url: str, runner_id: str) -> str:
     metadata = {
         "labels": labels,
         "workspace": str(_REPO_ROOT),
-        "terminal_launch_args": ["-f"],
+        # ``-f`` (the default) trusts the dir + auto-approves tools so the
+        # unattended pane never hangs. The approval-mirror test passes
+        # ``launch_args=()`` so cursor's per-tool prompts fire and surface as
+        # web elicitation cards.
+        "terminal_launch_args": list(launch_args),
     }
     create = httpx.post(
         f"{base_url}/v1/sessions",
@@ -2412,6 +2391,96 @@ def _create_native_cursor_session(base_url: str, runner_id: str) -> str:
     session_id = str(create.json()["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
     return session_id
+
+
+def _create_native_goose_session(base_url: str, runner_id: str) -> str:
+    """Register the ``goose-native`` wrapper agent and bind its session.
+
+    Mirrors :func:`_create_native_cursor_session`: reuses the exact terminal-first
+    spec ``omnigent goose`` ships
+    (:func:`omnigent.goose_native._materialize_goose_agent_spec`) and stamps the
+    same wrapper / terminal-first labels. Binding triggers the runner's
+    goose-native auto-bootstrap
+    (:func:`omnigent.runner.app._auto_create_goose_terminal`), which launches
+    ``goose session`` in the session terminal and starts the forwarder that
+    mirrors the TUI transcript back as conversation items. Goose's tool-approval
+    gating is its own ``GOOSE_MODE`` (no ``-f`` equivalent), so no launch args.
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :returns: The new session/conversation id.
+    """
+    import json as _json
+    import tempfile
+
+    from omnigent._wrapper_labels import (
+        GOOSE_NATIVE_WRAPPER_VALUE,
+        UI_MODE_LABEL_KEY,
+        UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY,
+    )
+    from omnigent.goose_native import _materialize_goose_agent_spec
+
+    with tempfile.TemporaryDirectory() as _tmp:
+        spec_path = _materialize_goose_agent_spec(Path(_tmp))
+        yaml_text = spec_path.read_text()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = yaml_text.encode()
+        info = tarfile.TarInfo("goose-native-ui.yaml")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    labels = {
+        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY: GOOSE_NATIVE_WRAPPER_VALUE,
+    }
+    metadata = {
+        "labels": labels,
+        "workspace": str(_REPO_ROOT),
+    }
+    create = httpx.post(
+        f"{base_url}/v1/sessions",
+        data={"metadata": _json.dumps(metadata)},
+        files={"bundle": ("goose-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
+        timeout=30.0,
+    )
+    create.raise_for_status()
+    session_id = str(create.json()["session_id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+@pytest.fixture
+def native_goose_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the real ``goose-native`` ("Goose") wrapper.
+
+    The runner auto-launches ``goose session`` in the session terminal on bind,
+    so the SPA's Terminal view attaches to a live Goose TUI and its Chat view
+    renders the same canonical transcript. Drives the goose render-parity suite.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_goose_session(live_server, runner_id)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
 
 
 @pytest.fixture
@@ -2443,6 +2512,40 @@ def native_cursor_session(
             # Escalate to SIGKILL if the runner ignores SIGTERM, so a wedged
             # process can't raise in teardown and leak / fail unrelated tests
             # (matching terminal_session / seeded_session_pair).
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def native_cursor_approval_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A ``cursor-native`` session launched WITHOUT ``-f`` (prompts fire).
+
+    Identical to :func:`native_cursor_session` but omits the force/trust flag,
+    so ``cursor-agent`` raises its real per-tool approval prompts. The runner-
+    side mirror (:mod:`omnigent.cursor_native_permissions`) surfaces those as
+    web ``response.elicitation_request`` cards — what the approval-ordering test
+    drives. The first-run workspace-trust modal is dismissed by the executor's
+    inject path on the first composer turn.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_cursor_session(live_server, runner_id, launch_args=())
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
             try:
                 respawned.wait(timeout=5)
             except subprocess.TimeoutExpired:
