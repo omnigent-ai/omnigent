@@ -40,9 +40,23 @@ export function coercePolicyParams(
     if (raw === undefined || raw === "") continue;
     const type = properties[key]?.type;
     if (type === "integer") {
-      params[key] = parseInt(raw, 10);
+      const value = Number(raw);
+      if (!Number.isFinite(value) || !Number.isInteger(value)) {
+        return {
+          ok: false,
+          error: `${key} must be an integer, e.g. 20`,
+        };
+      }
+      params[key] = value;
     } else if (type === "number") {
-      params[key] = parseFloat(raw);
+      const value = Number(raw);
+      if (!Number.isFinite(value)) {
+        return {
+          ok: false,
+          error: `${key} must be a number, e.g. 0.5`,
+        };
+      }
+      params[key] = value;
     } else if (type === "boolean") {
       params[key] = raw === "true";
     } else if (type === "array") {
