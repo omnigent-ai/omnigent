@@ -49,7 +49,7 @@ resolved from the YAML file's directory.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, pi, antigravity, qwen, copilot, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, pi, antigravity, qwen, copilot, hermes, ...
   model: databricks-claude-opus-4-7
   auth:
     type: databricks

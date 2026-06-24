@@ -74,6 +74,11 @@ GOOSE_KEY = "goose"
 # is kept here purely as the canonical harness id the readiness layer shares.
 COPILOT_KEY = "copilot"
 
+# Hermes Agent is installed via a curl installer from Nous Research and
+# authenticates through its own ``hermes model`` interactive flow (no
+# Omnigent-managed credentials). The ``hermes`` binary must be on PATH.
+HERMES_KEY = "hermes"
+
 
 @dataclass(frozen=True)
 class HarnessInstallSpec:
@@ -170,6 +175,12 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         package=None,
         install_hint="brew install block-goose-cli",
     ),
+    HERMES_KEY: HarnessInstallSpec(
+        "Hermes",
+        "hermes",
+        package=None,
+        install_hint="curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
+    ),
 }
 
 
@@ -209,6 +220,8 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # ``native-opencode`` reversed spelling gates on the same binary.
     "opencode-native": OPENCODE_KEY,
     "native-opencode": OPENCODE_KEY,
+    # Hermes Agent (``harness: hermes``) wraps the ``hermes`` CLI.
+    HERMES_KEY: HERMES_KEY,
 }
 
 
