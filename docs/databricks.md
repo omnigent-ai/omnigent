@@ -363,6 +363,37 @@ guardrails, audit, and rate limits enforce automatically. Rotating the
 underlying OpenAI key is a Gateway config update with zero agent
 restart.
 
+### Verified end-to-end
+
+Created a real External Model endpoint on e2-dogfood that proxies
+through `databricks-model-serving` to `databricks-claude-sonnet-4`,
+then called it via the same OpenAI SDK pattern omnigent uses. The
+Gateway config included `usage_tracking_config.enabled=true` and a
+`60 calls/minute/user` rate limit.
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url=f'{DATABRICKS_HOST}/serving-endpoints', api_key=DATABRICKS_TOKEN)
+resp = client.chat.completions.create(
+    model='omnigent-docs-test-gateway',   # the Gateway endpoint, not the backing model
+    messages=[{'role':'user','content':'Reply with exactly two words: PROXY OK'}],
+    max_tokens=10,
+)
+```
+
+Output:
+
+```
+Response: 'PROXY OK'
+Usage:    input=16 output=6 total=22
+Model:    global.anthropic.claude-sonnet-4-20250514-v1:0
+```
+
+The `model` in the response is the backing model the Gateway forwarded
+to (Anthropic Claude Sonnet 4 via Bedrock). The Gateway endpoint name
+(`omnigent-docs-test-gateway`) is what omnigent calls. Swapping the
+backing model is a Gateway config update, zero change in the agent.
+
 ### What you get on Databricks vs raw provider calls
 
 | Capability | Raw provider call from omnigent | Through AI Gateway |
@@ -462,6 +493,16 @@ Total traces found: 1
 The trace is queryable via `mlflow.search_traces()` and shows up in
 the workspace MLflow Traces UI at
 `/ml/experiments/<experiment_id>/traces/<trace_id>` per UC RBAC.
+
+Workspace MLflow Traces UI (e2-dogfood) showing the verification trace
+in the experiment table:
+
+![MLflow Traces list](images/databricks/mlflow-trace-list.png)
+
+Trace detail view with the `llm_call` and `tool:calculator` child spans
+expanded:
+
+![MLflow Trace detail](images/databricks/mlflow-trace-detail.png)
 
 ### Content capture and privacy
 
@@ -582,8 +623,15 @@ Verified end-to-end against the e2-dogfood Databricks workspace
 - Foundation Model call output (`databricks-claude-sonnet-4`,
   18 tokens in / 5 tokens out via CLI and 16 / 6 via OpenAI SDK)
 - OpenAI SDK pattern against `/serving-endpoints` with PAT auth
-- External Model (Gateway) endpoint shape from the live list of 21
-  Gateway endpoints on the workspace
+- External Model (Gateway) endpoint created, called, and torn down:
+  `omnigent-docs-test-gateway` proxied to `databricks-claude-sonnet-4`
+  via `provider=databricks-model-serving`, with
+  `ai_gateway.usage_tracking_config.enabled=true` and a
+  `60 calls/minute/user` rate limit. CLI call returned `PROXY OK`,
+  20 tokens. OpenAI SDK call returned `PROXY OK`, 22 tokens, model
+  resolved to `global.anthropic.claude-sonnet-4-20250514-v1:0`.
+  Endpoint and the supporting workspace secret were deleted after
+  verification.
 - MLflow OTLP receiver pattern via a real synthetic-trace round-trip:
   experiment id `3163592711242134`, trace id
   `tr-f13c03f61e44a0442c8865ab2c79e5a4`, 3 spans with the expected
