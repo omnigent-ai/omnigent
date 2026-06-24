@@ -16793,13 +16793,12 @@ async def test_desync_drains_buffer_when_turn_pops_active_slot() -> None:
 
 @pytest.mark.asyncio
 async def test_desync_stream_mode_forwards_interrupt() -> None:
-    """Review-4: stream-mode (None-sentinel) desync forwards a harness interrupt.
+    """Review-4: stream-mode (None-sentinel) desync clears the gate + forwards interrupt.
 
     A ``stream=true`` turn parks ``_active_turns[conv] = None`` (no runner Task
-    — the AP request drives ``proxy_stream``). The old ``_cancel_inprocess_turn``
-    returned immediately for a non-Task slot, so a dead verdict channel left the
-    proxy stream parked on the harness policy future and the active-turn gate
-    stuck. Recovery must still forward the interrupt so the harness unwinds.
+    — the AP request drives ``proxy_stream``). Recovery must GUARANTEE the
+    sentinel is cleared (so the active-turn gate cannot stay stuck) and forward
+    a best-effort interrupt so the harness unwinds.
     """
     conv = "conv_desync_streammode"
     harness = _ScriptedHarnessClient([])
@@ -16814,7 +16813,67 @@ async def test_desync_stream_mode_forwards_interrupt() -> None:
         app.state.active_turns[conv] = None
         await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
 
-    # The interrupt was forwarded to the harness (releasing its parked future),
-    # and the session was flagged interrupted — neither happened before the fix.
+    # The sentinel was popped deterministically (gate cleared) and the interrupt
+    # was forwarded — neither happened before the fix.
+    assert conv not in app.state.active_turns
     assert {"type": "interrupt"} in harness.patched_events
-    assert conv in app.state.interrupted_sessions
+
+
+class _DeadInterruptHarnessClient(_ScriptedHarnessClient):
+    """Scripted harness whose interrupt POST always raises (wedged/dead harness)."""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        # Model a dead/wedged harness: the interrupt forward never lands and
+        # never ends proxy_stream.
+        raise httpx.ConnectError("harness gone")
+
+
+@pytest.mark.asyncio
+async def test_desync_stream_mode_clears_gate_even_when_interrupt_fails() -> None:
+    """Review-4 (blocking): stream-mode sentinel clears + buffer drains on dead interrupt.
+
+    The pathological wedge: ``stream=true`` (None sentinel) + dead verdict
+    channel + a failing/no-op interrupt that never ends ``proxy_stream``.
+    Recovery must STILL pop the sentinel (gate cleared, not contingent on the
+    interrupt or proxy_stream) and drain a buffered follow-up — otherwise the
+    session is stuck idle in the active-turn gate forever (the #1026 wedge in
+    stream mode).
+    """
+    conv = "conv_desync_streammode_dead"
+    harness = _DeadInterruptHarnessClient([])
+    pm = _FakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as http:
+        # Stream-mode active turn parked as the None sentinel.
+        app.state.active_turns[conv] = None
+        # A follow-up arrives mid-turn and buffers behind the active-turn gate.
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag",
+                "model": "x",
+                "content": [{"role": "user", "content": "follow up"}],
+            },
+        )
+        assert resp.status_code == 202, resp.text
+
+        loop = asyncio.get_running_loop()
+        # Recovery runs even though the interrupt forward raises (dead harness).
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+        # The buffered follow-up drained: the sentinel was popped
+        # deterministically (gate cleared, NOT contingent on the failed
+        # interrupt or on proxy_stream ending) and the continuation kick bound a
+        # fresh turn, which clears the desynced flag at ``_run_turn_bg`` start.
+        # Without the deterministic pop, the gate stays stuck on the None
+        # sentinel, no continuation ever runs, and the flag never clears.
+        deadline = loop.time() + 3.0
+        while loop.time() < deadline and conv in app.state.desynced_sessions:
+            await asyncio.sleep(0.02)
+        assert conv not in app.state.desynced_sessions

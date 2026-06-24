@@ -12363,6 +12363,31 @@ def create_runner_app(
             )
         return True
 
+    async def _forward_harness_interrupt(conv_id: str) -> None:
+        """Best-effort POST ``{"type":"interrupt"}`` to a conversation's harness.
+
+        Releases the harness's parked policy/tool future so its ``run_turn``
+        unwinds. Best-effort: a dead/wedged harness logs and is swallowed —
+        the runner-side floor (Task cancel or sentinel pop) does not depend on
+        this succeeding.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        """
+        try:
+            harness_client = await process_manager.get_client(conv_id, "any")
+            await harness_client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "interrupt"},
+                # Bounded under the Omnigent server's 5s stop deadline.
+                timeout=3.0,
+            )
+        except Exception:  # noqa: BLE001 — best-effort: harness may have exited
+            _logger.warning(
+                "Interrupt forward to harness failed for %s",
+                conv_id,
+                exc_info=True,
+            )
+
     async def _cancel_inprocess_turn(conv_id: str) -> None:
         """Stop an in-process (non-native) harness's in-flight turn.
 
@@ -12390,28 +12415,12 @@ def create_runner_app(
         if isinstance(target, asyncio.Task) and target.done():
             return
         _interrupted_sessions.add(conv_id)
-        try:
-            harness_client = await process_manager.get_client(conv_id, "any")
-            await harness_client.post(
-                f"/v1/sessions/{conv_id}/events",
-                json={"type": "interrupt"},
-                # Bounded under the Omnigent server's 5s stop deadline.
-                timeout=3.0,
-            )
-        except Exception:  # noqa: BLE001 — best-effort: harness may have exited
-            _logger.warning(
-                "Interrupt forward to harness failed for %s",
-                conv_id,
-                exc_info=True,
-            )
+        await _forward_harness_interrupt(conv_id)
         # Floor: force-cancel the runner Task when we own one (background turn).
-        # In stream-mode (None sentinel) there is no Task to cancel — the
-        # forwarded interrupt unwinds the harness ``run_turn`` (releasing the
-        # parked policy future), which ends ``proxy_stream`` → its
-        # ``_on_proxy_stream_end`` clears ``_active_turns`` and drains the
-        # buffer. If the harness is already dead, the open ``proxy_stream`` read
-        # errors out to the same terminal cleanup. Either way the active-turn
-        # gate clears instead of staying stuck.
+        # In stream-mode (None sentinel) there is no Task to cancel here — the
+        # desync-recovery path (``_resync_turn_state``) owns the deterministic
+        # sentinel pop; direct interrupt/stop callers rely on the forwarded
+        # interrupt ending ``proxy_stream`` → ``_on_proxy_stream_end``.
         if isinstance(target, asyncio.Task):
             await _cancel_active_turn(conv_id, expected_task=target)
 
@@ -12444,7 +12453,36 @@ def create_runner_app(
         # Clear the live-response marker up front so any concurrent mid-turn
         # forward sees no live turn and 204s instead of racing the cancel.
         _live_response_id.pop(conv_id, None)
-        await _cancel_inprocess_turn(conv_id)
+        # Stream-mode floor (SYNCHRONOUS — no await before the pop). A
+        # ``stream=true`` turn parks the ``None`` sentinel in ``_active_turns``
+        # with no runner Task; ``_cancel_inprocess_turn`` can only forward the
+        # interrupt for it and otherwise relies on ``proxy_stream`` ending to
+        # pop the slot. If the harness is wedged and the interrupt never ends
+        # the stream, that sentinel would stay forever and the active-turn gate
+        # would stay stuck — the exact #1026 wedge, in stream mode. GUARANTEE
+        # the pop here, NOT contingent on the interrupt or on proxy_stream.
+        #
+        # Popping synchronously at entry is unambiguous: the single-active-turn
+        # invariant means a present non-Task slot is THIS wedged turn's own
+        # sentinel, never a fresh continuation (continuations only bind once a
+        # turn ends, and this turn has not). Membership-guarded so it is
+        # idempotent with a racing ``proxy_stream`` ``_on_proxy_stream_end``
+        # (``pop`` with a default is a no-op the second time). A real Task is
+        # left for ``_cancel_inprocess_turn``'s cancel floor below.
+        stream_sentinel = conv_id in _active_turns and not isinstance(
+            _active_turns.get(conv_id), asyncio.Task
+        )
+        if stream_sentinel:
+            _active_turns.pop(conv_id, None)
+            # Best-effort unwedge of the harness (releases its parked future so
+            # ``proxy_stream`` ends); the gate is already cleared above, so
+            # recovery does not depend on this succeeding. Deliberately NOT
+            # added to ``_interrupted_sessions``: nothing here consumes that
+            # token (no Task cancel, no immediate ``_on_proxy_stream_end``), so
+            # leaving it set would taint the buffered continuation's own end.
+            await _forward_harness_interrupt(conv_id)
+        else:
+            await _cancel_inprocess_turn(conv_id)
         # P2.11: surface the desync to the user when no continuation will run.
         # A buffered message starts a clean continuation turn instead (P1.7),
         # so stay silent there. ``runner_turn_context_desync`` is absent from
