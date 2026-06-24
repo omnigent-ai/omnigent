@@ -201,6 +201,10 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     GOOSE_KEY: GOOSE_KEY,
     QWEN_KEY: QWEN_KEY,
     "qwen-code": QWEN_KEY,
+    # Native qwen TUI (``qwen-native``) wraps the same ``qwen`` CLI as the ACP
+    # harness; the ``native-qwen`` reversed spelling gates on the same binary.
+    "qwen-native": QWEN_KEY,
+    "native-qwen": QWEN_KEY,
     # Native OpenCode (``opencode-native``) wraps the ``opencode`` CLI; its
     # ``native-opencode`` reversed spelling gates on the same binary.
     "opencode-native": OPENCODE_KEY,

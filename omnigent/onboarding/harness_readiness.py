@@ -77,11 +77,12 @@ _CURSOR_NATIVE_HARNESSES: frozenset[str] = frozenset({"cursor-native", "native-c
 # there is no SDK variant or key to gate on.
 _GOOSE_NATIVE_HARNESSES: frozenset[str] = frozenset({"goose-native", "native-goose"})
 
-# CLI-wrapping qwen harnesses. Both ``qwen`` and ``qwen-code`` resolve to the
-# same ``qwen`` binary (canonicalize_harness folds ``qwen-code`` → ``qwen``).
-# Unlike claude/codex they have no ``_HARNESS_FAMILY`` entry, so they must
-# be gated explicitly or they fail open.
-_QWEN_HARNESSES: frozenset[str] = frozenset({QWEN_KEY, "qwen-code"})
+# CLI-wrapping qwen harnesses. ``qwen`` / ``qwen-code`` (the ACP harness) and
+# ``qwen-native`` / ``native-qwen`` (the native TUI via ``omni qwen``) all resolve
+# to the same ``qwen`` binary (canonicalize_harness folds ``qwen-code`` → ``qwen``
+# and ``native-qwen`` → ``qwen-native``). Unlike claude/codex they have no
+# ``_HARNESS_FAMILY`` entry, so they must be gated explicitly or they fail open.
+_QWEN_HARNESSES: frozenset[str] = frozenset({QWEN_KEY, "qwen-code", "qwen-native", "native-qwen"})
 
 
 def _canonical_harness(harness: str) -> str:
