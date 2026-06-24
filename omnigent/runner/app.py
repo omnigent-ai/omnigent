@@ -7278,13 +7278,16 @@ def create_runner_app(
             )
             return
 
-        compaction_event = {
+        compacted_messages = event.get("compacted_messages")
+        compaction_event: dict[str, Any] = {
             "type": "compaction",
             "summary": summary,
             "last_item_id": last_item_id,
             "model": model,
             "token_count": token_count,
         }
+        if compacted_messages:
+            compaction_event["compacted_messages"] = compacted_messages
         try:
             await server_client.post(
                 f"/v1/sessions/{conv}/events",
@@ -7305,7 +7308,6 @@ def create_runner_app(
         # its compacted messages, use those directly — they carry the
         # full compacted state (including opaque compaction tokens for
         # OpenAI). Otherwise fall back to a synthetic summary pair.
-        compacted_messages = event.get("compacted_messages")
         if compacted_messages:
             _session_histories[conv] = compacted_messages
         else:
