@@ -20,6 +20,8 @@ import {
   useDeletePolicy,
   type PolicyRegistryEntry,
 } from "@/hooks/usePolicies";
+import { useSessionOwner } from "@/hooks/usePermissions";
+import { getCurrentUserId } from "@/lib/identity";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -630,6 +632,12 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
   // popover renders it directly — the frontend derives any aggregate view
   // from this map rather than receiving flat token fields.
   const usageByModel = useChatStore((s) => s.sessionUsageByModel);
+  // Session owner (the user_id granted LEVEL_OWNER), so a viewer can see whose
+  // session this is — e.g. a chat shared into a workspace group. ``null`` /
+  // undefined when permissions are off (single-user) or still loading, in
+  // which case the row is omitted rather than showing a placeholder.
+  const { data: owner } = useSessionOwner(sessionId ?? null);
+  const viewerId = getCurrentUserId();
 
   useEffect(() => {
     return () => {
@@ -658,6 +666,19 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
           {agent?.description && (
             <span className="text-xs text-muted-foreground">{agent.description}</span>
           )}
+        </div>
+      )}
+      {sessionId && owner && (
+        <div className="flex flex-col gap-1.5">
+          <SectionLabel>Owner</SectionLabel>
+          <span
+            className="truncate font-mono text-xs text-muted-foreground"
+            data-testid="agent-info-session-owner"
+            title={owner}
+          >
+            {owner}
+            {owner === viewerId && <span className="ml-1 text-muted-foreground/60">(you)</span>}
+          </span>
         </div>
       )}
       {sessionId && (

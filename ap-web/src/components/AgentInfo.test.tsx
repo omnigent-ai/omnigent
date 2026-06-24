@@ -15,11 +15,24 @@ const { addMutate, deleteMutate, copyTextMock } = vi.hoisted(() => ({
 }));
 const policiesData = { current: [] as unknown[] };
 const registryData = { current: [] as unknown[] };
+// Session owner + viewer identity, controllable per test. Dereferenced lazily
+// inside the mock hooks (same pattern as policiesData) so the closures are safe
+// despite vi.mock hoisting. Default null → no owner row, keeping the pre-existing
+// cost/id/usage tests untouched.
+const ownerData = { current: null as string | null | undefined };
+const viewerData = { current: null as string | null };
 vi.mock("@/hooks/usePolicies", () => ({
   usePolicies: () => ({ data: policiesData.current }),
   usePolicyRegistry: () => ({ data: registryData.current }),
   useAddPolicy: () => ({ mutate: addMutate, isPending: false, isError: false, error: null }),
   useDeletePolicy: () => ({ mutate: deleteMutate }),
+}));
+vi.mock("@/hooks/usePermissions", () => ({
+  useSessionOwner: () => ({ data: ownerData.current }),
+}));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/identity")>()),
+  getCurrentUserId: () => viewerData.current,
 }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 
@@ -28,6 +41,8 @@ import { AgentInfoButton, AgentInfoContent, agentDisplayLabel } from "./AgentInf
 afterEach(() => {
   cleanup();
   copyTextMock.mockClear();
+  ownerData.current = null;
+  viewerData.current = null;
 });
 
 function renderButton(agent: Agent | undefined) {
@@ -170,6 +185,54 @@ describe("AgentInfoButton session id row", () => {
     expect(copyTextMock).toHaveBeenCalledTimes(1);
     expect(copyTextMock).toHaveBeenCalledWith("conv_info123");
     expect(await screen.findByRole("button", { name: "Copied session ID" })).toBeInTheDocument();
+  });
+});
+
+describe("AgentInfoButton session owner row", () => {
+  // The owner row lets a viewer see whose session a shared chat is. It reads
+  // the owner via useSessionOwner (mocked) and the viewer via getCurrentUserId
+  // (mocked); both reset to null in afterEach.
+
+  it("shows the session owner in the popover when one is known", () => {
+    ownerData.current = "alice@example.com";
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
+    // Closed popover: the owner row is not mounted yet.
+    expect(screen.queryByTestId("agent-info-session-owner")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    expect(screen.getByTestId("agent-info-session-owner")).toHaveTextContent("alice@example.com");
+  });
+
+  it("appends (you) when the viewer owns the session", () => {
+    ownerData.current = "alice@example.com";
+    viewerData.current = "alice@example.com";
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    const row = screen.getByTestId("agent-info-session-owner");
+    expect(row).toHaveTextContent("alice@example.com");
+    expect(row).toHaveTextContent("(you)");
+  });
+
+  it("omits (you) when someone else owns the session", () => {
+    ownerData.current = "alice@example.com";
+    viewerData.current = "bob@example.com";
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    const row = screen.getByTestId("agent-info-session-owner");
+    expect(row).toHaveTextContent("alice@example.com");
+    expect(row).not.toHaveTextContent("(you)");
+  });
+
+  it("omits the owner row when no owner is known (permissions off / loading)", () => {
+    // owner null → no row at all, rather than an empty placeholder. The rest of
+    // the popover still renders (agent name proves it opened).
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-info-session-owner")).toBeNull();
   });
 });
 
