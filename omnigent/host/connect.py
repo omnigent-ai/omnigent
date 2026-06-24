@@ -289,6 +289,14 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # live in HARNESS_CREDENTIAL_ENV_VARS, mirroring ANTHROPIC_API_KEY /
         # ANTHROPIC_BASE_URL. Safe to propagate: not a secret.
         "CLAUDE_CODE_USE_BEDROCK",
+        # Kubernetes config path. A filesystem path (typically
+        # ``~/.kube/config``), not a bearer secret — the file *contains*
+        # cluster certs/tokens but the env var is just a path string,
+        # analogous to ``HOME``. Without it, ``kubectl`` / helm / k9s
+        # inside the agent's shell fall back to the default path which may
+        # not match what the host owner configured (e.g. a non-standard
+        # kubeconfig location or a colon-separated multi-file list).
+        "KUBECONFIG",
     }
 )
 # Locale family (``LC_ALL``, ``LC_CTYPE``, …) — allowed by prefix.
