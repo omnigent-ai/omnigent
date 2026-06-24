@@ -419,6 +419,63 @@ async def test_context_window_uses_effective_model(
     )
 
 
+async def test_context_window_override_bypasses_declared_window(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spec-declared ``executor.context_window`` is bypassed by an override.
+
+    Anti-drift guarantee for the shared resolver: the ring and the runner's
+    compaction budget are now computed by the SAME
+    ``resolve_effective_context_window``, so a declared 1M window can't mask a
+    small override model. With no override the declared window wins (no catalog
+    lookup); with an override active the ring sizes against the override
+    model's real window instead. Before the shared resolver these two paths
+    drifted (PR #769).
+    """
+    from omnigent.llms import context_window as context_window_mod
+
+    lookup_calls: list[str] = []
+
+    def _stub(model: str) -> int:
+        lookup_calls.append(model)
+        return 200_000
+
+    monkeypatch.setattr(context_window_mod, "get_model_context_window", _stub)
+
+    agent = await create_test_agent(
+        client,
+        name="declared-window-agent",
+        executor={"type": "omnigent", "context_window": 1_000_000},
+    )
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+
+    # No override: the declared 1M window wins and short-circuits the catalog.
+    lookup_calls.clear()
+    baseline = await client.get(f"/v1/sessions/{sid}")
+    assert baseline.status_code == 200
+    assert baseline.json()["context_window"] == 1_000_000
+    assert lookup_calls == [], (
+        f"A declared window must short-circuit the catalog lookup; got {lookup_calls!r}."
+    )
+
+    # Override active: the declared 1M is bypassed; the ring sizes against the
+    # override model's real (stubbed 200K) window.
+    await client.patch(
+        f"/v1/sessions/{sid}",
+        json={"model_override": "claude-opus-4-7"},
+    )
+    lookup_calls.clear()
+    after = await client.get(f"/v1/sessions/{sid}")
+    assert after.status_code == 200
+    assert after.json()["context_window"] == 200_000, (
+        "An active override must bypass the declared 1M window and size the "
+        "ring against the override model's real window."
+    )
+    assert "claude-opus-4-7" in lookup_calls
+
+
 async def test_silent_patch_skips_claude_native_forward(
     client: httpx.AsyncClient,
 ) -> None:

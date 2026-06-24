@@ -268,6 +268,48 @@ def get_model_context_window(model: str) -> int:
     return _fetch_context_window_from_mlflow(model) or _DEFAULT_CONTEXT_WINDOW
 
 
+def resolve_effective_context_window(
+    spec_context_window: int | None,
+    model: str | None,
+    *,
+    model_override: str | None = None,
+) -> int | None:
+    """
+    Resolve the context window to use for compaction budgeting.
+
+    Prefers an explicit, spec-declared window (``executor.context_window``)
+    over the model-catalog lookup. An agent author who declares a window is
+    stating the size the model actually serves for this agent (e.g. a 1M
+    Claude window); the catalog lookup falls back to a conservative 128K
+    default for models it can't resolve, which would otherwise compact far
+    too early.
+
+    Mirrors the server's display ring (``server/routes/sessions.py``):
+    ``executor.context_window`` describes only the *spec* model, so an active
+    ``model_override`` bypasses the declared window and sizes against the
+    override model's real catalog window instead. Without this, overriding a
+    1M-window agent down to a small-window model would budget compaction
+    against 1M and under-compact past the real model's limit.
+
+    :param spec_context_window: ``executor.context_window`` from the spec,
+        or ``None`` when the author declared no explicit window.
+    :param model: The spec-declared / default model identifier, or ``None``.
+    :param model_override: The active per-session model override, or ``None``.
+        When set, the declared window is ignored and the override model's
+        catalog window is used (matching the server ring).
+    :returns: The declared window when set and no override is active;
+        otherwise the effective model's catalog window via
+        :func:`get_model_context_window`; ``None`` when neither a usable
+        window nor a model is available.
+    """
+    effective_model = model_override if model_override is not None else model
+    if spec_context_window is not None and model_override is None:
+        return spec_context_window
+    if effective_model:
+        return get_model_context_window(effective_model)
+    return None
+
+
 @dataclass(frozen=True)
 class ModelPricing:
     """
