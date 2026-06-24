@@ -140,7 +140,9 @@ _logger = logging.getLogger(__name__)
 # (hyphen), e.g. ``"claude_sdk"`` → ``"claude-sdk"`` used by ``_HARNESS_MODULES``.
 
 
-AgentHarnessType = Literal["claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "qwen"]
+AgentHarnessType = Literal[
+    "claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "qwen", "goose"
+]
 
 
 @dataclass(frozen=True)
@@ -1225,6 +1227,7 @@ def _build_codex_spawn_env(
 def _build_pi_spawn_env(
     spec: AgentSpec,
     *,
+    cwd: Path | None = None,
     workdir: Path | None = None,
 ) -> dict[str, str]:
     """
@@ -1237,6 +1240,8 @@ def _build_pi_spawn_env(
     pattern from §Step 5a.
 
     :param spec: The agent spec.
+    :param cwd: Runtime working directory for the Pi CLI. This is the
+        session workspace, not the agent bundle workdir.
     :param workdir: The bundle's on-disk path (extracted by the
         agent cache). Threaded through as ``HARNESS_PI_BUNDLE_DIR``
         so the harness wrap's executor can source bundled skills
@@ -1279,6 +1284,8 @@ def _build_pi_spawn_env(
     env["HARNESS_PI_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
     if spec.name:
         env["HARNESS_PI_AGENT_NAME"] = spec.name
+    if cwd is not None:
+        env["HARNESS_PI_CWD"] = str(cwd)
     if workdir is not None:
         env["HARNESS_PI_BUNDLE_DIR"] = str(workdir)
     os_env_payload = _serialize_os_env(spec.os_env)
@@ -1345,6 +1352,38 @@ def _build_qwen_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_QWEN_OS_ENV"] = os_env_payload
+    return env
+
+
+def _build_goose_spawn_env(
+    spec: AgentSpec,
+    *,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """
+    Build the env-var dict the headless goose harness wrap reads.
+
+    Maps spec.executor fields → the ``HARNESS_GOOSE_*`` env vars defined in
+    ``omnigent/inner/goose_harness.py``. Unlike the SDK harnesses, Goose owns its
+    own auth via ``goose configure`` (keyring / ``~/.config/goose/config.yaml``),
+    so this builder wires **no** provider/gateway credential — it forwards only an
+    optional model override and the os_env/sandbox spec. A ``databricks-*`` model
+    is dropped (not a valid Goose model id; the provider/model then come from the
+    user's Goose config), mirroring how the native CLIs handle gateway ids.
+
+    :param spec: The agent spec.
+    :param workdir: The bundle's on-disk path. Accepted for signature parity with
+        the other ``_build_*_spawn_env`` builders; the goose wrap consumes no
+        bundle dir yet (no skills bridge).
+    :returns: A dict of env-var overrides for the harness process spawn.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None and not model.startswith(("databricks-", "databricks/")):
+        env["HARNESS_GOOSE_MODEL"] = model
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_GOOSE_OS_ENV"] = os_env_payload
     return env
 
 
@@ -1663,6 +1702,79 @@ def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
         if location:
             env["HARNESS_ANTIGRAVITY_LOCATION"] = str(location)
 
+    return env
+
+
+def _build_copilot_spawn_env(
+    spec: AgentSpec,
+    *,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """
+    Build the ``HARNESS_COPILOT_*`` env-var dict the copilot harness wrap reads.
+
+    Maps spec.executor fields → the ``HARNESS_COPILOT_*`` env vars defined in
+    ``omnigent/inner/copilot_harness.py``. Like the cursor / antigravity
+    builders there is NO gateway or Databricks-profile resolution: the GitHub
+    Copilot SDK talks only to GitHub's Copilot backend (a GitHub token) and has
+    no custom API base-URL override, so it never routes through the Databricks
+    AI gateway. That is also why copilot is intentionally absent from
+    :data:`AgentHarnessType` and the gateway/ucode dicts above.
+
+    Auth: an explicit ``executor.auth: {type: api_key, api_key: ...}`` carries
+    the GitHub token, forwarded as ``HARNESS_COPILOT_GITHUB_TOKEN`` (the copilot
+    harness passes it to the SDK as its ``github_token``). When the spec declares
+    no auth at all, a GitHub token registered once via ``omnigent setup`` (the
+    dedicated ``copilot:`` config block — see
+    :mod:`omnigent.onboarding.copilot_auth`) is used instead, so a user need not
+    export it in every shell. With neither, the harness falls back to an
+    inherited ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` / ``GITHUB_TOKEN`` — a
+    ``DatabricksAuth`` profile does not apply to copilot and is ignored.
+
+    :param spec: The agent spec.
+    :param workdir: The bundle's on-disk path, threaded as
+        ``HARNESS_COPILOT_BUNDLE_DIR``.
+    :returns: A dict of env-var overrides for
+        :meth:`HarnessProcessManager.get_client(env=...)`.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_COPILOT_MODEL"] = model
+    # Auth precedence: an explicit api-key auth on the spec wins (its ``api_key``
+    # is the GitHub token); with NO spec auth at all, fall back to a token
+    # registered once via ``omnigent setup`` (the dedicated ``copilot:`` config
+    # block), else an ambient ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` /
+    # ``GITHUB_TOKEN``. A Databricks / provider auth has no copilot equivalent
+    # and never silently adopts a stored or ambient copilot token.
+    if isinstance(spec.executor.auth, ApiKeyAuth):
+        env["HARNESS_COPILOT_GITHUB_TOKEN"] = spec.executor.auth.api_key
+    elif spec.executor.auth is None:
+        # Imported lazily — the onboarding layer pulls in the secret store /
+        # keyring, which the hot spawn-env path shouldn't import eagerly.
+        from omnigent.onboarding.copilot_auth import (
+            COPILOT_TOKEN_ENV_VARS,
+            resolve_copilot_github_token,
+        )
+
+        stored_token = resolve_copilot_github_token()
+        if stored_token is not None:
+            env["HARNESS_COPILOT_GITHUB_TOKEN"] = stored_token
+        else:
+            for _env_var in COPILOT_TOKEN_ENV_VARS:
+                if os.environ.get(_env_var):
+                    env["HARNESS_COPILOT_GITHUB_TOKEN"] = os.environ[_env_var]
+                    break
+    # Always set so the wrap doesn't fall back to ``"all"`` and override an
+    # explicit ``skills: none`` from the spec (parity with the peer builders).
+    env["HARNESS_COPILOT_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
+    if spec.name:
+        env["HARNESS_COPILOT_AGENT_NAME"] = spec.name
+    if workdir is not None:
+        env["HARNESS_COPILOT_BUNDLE_DIR"] = str(workdir)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_COPILOT_OS_ENV"] = os_env_payload
     return env
 
 

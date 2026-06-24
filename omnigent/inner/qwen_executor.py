@@ -42,6 +42,7 @@ from omnigent.inner.executor import (
     TextChunk,
     TurnComplete,
 )
+from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 
 logger = logging.getLogger(__name__)
 
@@ -724,6 +725,51 @@ class QwenExecutor(Executor):
         return {"outcome": "selected", "optionId": chosen.get("optionId")}
 
     @staticmethod
+    def _accumulate_usage(  # type: ignore[explicit-any]
+        acc: dict[str, int], update: dict[str, Any]
+    ) -> None:
+        """Fold a ``session/update``'s ``_meta.usage`` into the turn accumulator.
+
+        qwen reports token usage out-of-band on an ``agent_message_chunk`` update
+        whose text is empty and whose ``_meta`` carries
+        ``{"usage": {"inputTokens", "outputTokens", "totalTokens",
+        "thoughtTokens", "cachedReadTokens"}}`` (see qwen-code
+        ``MessageEmitter.emitUsageMetadata``). A single Omnigent turn can drive
+        several internal model calls (tool loops), each emitting its own usage —
+        so we **sum** across the turn rather than keep only the last; each API
+        call bills its own full input, so summing matches actual cost.
+
+        qwen's ``inputTokens`` (Gemini ``promptTokenCount``) is **inclusive of
+        cached tokens**, but :func:`compute_llm_cost` expects ``input_tokens`` to
+        be the *non-cached* portion (cached tokens bill at a lower rate). So we
+        split ``cachedReadTokens`` out into ``cache_read_input_tokens`` and keep
+        only the remainder in ``input_tokens`` — mirroring the codex executor.
+
+        :param acc: The running per-turn accumulator (wire-shape keys), mutated
+            in place. Absent of any usage update it stays empty.
+        :param update: The ``session/update`` ``update`` object.
+        """
+        meta = update.get("_meta")
+        if not isinstance(meta, dict):
+            return
+        usage = meta.get("usage")
+        if not isinstance(usage, dict):
+            return
+
+        def _int(value: Any) -> int:  # type: ignore[explicit-any]
+            return int(value) if isinstance(value, (int, float)) else 0
+
+        cached = _int(usage.get("cachedReadTokens"))
+        # Non-cached input = prompt tokens minus the cached portion; clamp so a
+        # malformed cached > input never drives the running total negative.
+        non_cached = max(0, _int(usage.get("inputTokens")) - cached)
+        acc["input_tokens"] = acc.get("input_tokens", 0) + non_cached
+        acc["output_tokens"] = acc.get("output_tokens", 0) + _int(usage.get("outputTokens"))
+        acc["total_tokens"] = acc.get("total_tokens", 0) + _int(usage.get("totalTokens"))
+        if cached:
+            acc["cache_read_input_tokens"] = acc.get("cache_read_input_tokens", 0) + cached
+
+    @staticmethod
     def _image_blocks_from_content(content: Any) -> list[dict[str, Any]]:  # type: ignore[explicit-any]
         """Build ACP ``image`` prompt blocks from a message's ``input_image`` blocks.
 
@@ -822,6 +868,49 @@ class QwenExecutor(Executor):
             # see docs/QWEN_FOLLOWUPS.md).
         return "\n".join(parts)
 
+    @classmethod
+    def _history_prefix(cls, prior: list[Any]) -> str:  # type: ignore[explicit-any]
+        """Serialize prior conversation turns into a text prefix.
+
+        On a *fresh* ACP session (the first turn of a newly spawned/respawned
+        ``qwen --acp`` process, or after a ``Session not found`` reset) qwen
+        holds none of the earlier conversation — its context lived in the dead
+        subprocess. Since :meth:`run_turn` normally sends only the latest user
+        turn (relying on the persistent session to retain history), we'd lose
+        everything before the switch. Replaying the transcript as a labeled
+        ``role: content`` block restores that context, mirroring
+        ``ClaudeSDKExecutor._build_prompt``. A ``/model`` switch respawns the
+        subprocess (see HarnessProcessManager), so this is what keeps a
+        mid-conversation model change from dropping the thread.
+
+        :param prior: The conversation turns *before* the latest user message
+            (each an inner ``Message`` dict).
+        :returns: A ``"Conversation so far: …"`` text block, or ``""`` when
+            there is nothing to replay.
+        """
+        lines = ["Conversation so far:"]
+        for msg in prior:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "user")).replace("_", " ")
+            raw = msg.get("content")
+            if raw is None:
+                content = ""
+            elif isinstance(raw, str):
+                content = raw
+            elif isinstance(raw, list):
+                # Reuse the block folder so prior file/image turns render the
+                # same way they did when first sent (fenced files, markers).
+                content = cls._text_from_blocks(raw, emit_image_marker=True)
+            else:
+                content = json.dumps(raw, ensure_ascii=True)
+            lines.append(f"{role}: {content}")
+        lines.append("")
+        lines.append(
+            "Respond to the latest user message, using the conversation above as context."
+        )
+        return "\n".join(lines)
+
     # ------------------------------------------------------------------
     # Executor interface
     # ------------------------------------------------------------------
@@ -857,12 +946,20 @@ class QwenExecutor(Executor):
             yield ExecutorError(message=str(exc), retryable=False)
             return
 
+        # A fresh ACP session (first turn of a new/respawned process, or after
+        # a reset) holds no prior context. Captured before we flip the latch
+        # below so we know whether to replay history into this turn.
+        fresh_session = not self._system_prompt_sent
+
         # Build the prompt payload from the most recent user message.
         user_text = ""
         image_blocks: list[dict[str, Any]] = []  # type: ignore[explicit-any]
-        for msg in reversed(messages):
+        latest_user_idx: int | None = None
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
             role = msg.get("role", "") if isinstance(msg, dict) else ""
             if role == "user":
+                latest_user_idx = idx
                 content = msg.get("content", "") if isinstance(msg, dict) else ""
                 if isinstance(content, str):
                     user_text = content
@@ -877,11 +974,23 @@ class QwenExecutor(Executor):
                     )
                 break
 
+        # On a fresh session, replay the prior conversation so a model switch
+        # (which respawns the subprocess) or a session reset doesn't drop the
+        # thread — qwen otherwise only ever sees this turn's latest message.
+        # Skipped when there's nothing before the latest user turn (the genuine
+        # first turn of a brand-new conversation). See :meth:`_history_prefix`.
+        if fresh_session and latest_user_idx is not None and latest_user_idx > 0:
+            history_prefix = self._history_prefix(messages[:latest_user_idx])
+            user_text = f"{history_prefix}\n\nuser: {user_text}" if user_text else history_prefix
+
         # ACP has no system-prompt field, so fold it into the first turn's
         # user text. Without this the agent's persona / instructions (the
-        # spec ``prompt:``) never reach qwen and it runs uninstructed.
-        if not self._system_prompt_sent and system_prompt:
-            user_text = f"{system_prompt}\n\n{user_text}" if user_text else system_prompt
+        # spec ``prompt:``) never reach qwen and it runs uninstructed. The
+        # latch flips on any fresh session — even with an empty system prompt —
+        # so a continuing session never re-replays history or re-folds.
+        if fresh_session:
+            if system_prompt:
+                user_text = f"{system_prompt}\n\n{user_text}" if user_text else system_prompt
             self._system_prompt_sent = True
 
         # Text first, then any image blocks (ACP prompt is an ordered array).
@@ -926,6 +1035,9 @@ class QwenExecutor(Executor):
         # human approval or slow stream won't trip a spurious timeout.
         deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
         accumulated_text: list[str] = []
+        # Per-turn token usage, summed across qwen's per-call usage emissions
+        # (see _accumulate_usage). Stays empty when qwen reports none.
+        turn_usage: dict[str, int] = {}
 
         while True:
             remaining = deadline - loop.time()
@@ -957,12 +1069,14 @@ class QwenExecutor(Executor):
                         self._system_prompt_sent = False
                     yield ExecutorError(message=error_msg, retryable=True)
                     return
-                # Successful completion.
+                # Successful completion. Attach the per-turn token usage qwen
+                # reported over the stream (None when it reported none) and feed
+                # the cost observer, mirroring the codex executor.
+                usage = turn_usage or None
+                if usage is not None:
+                    _notify_usage_from_dict(model=self._model, usage=usage)
                 final_text = "".join(accumulated_text)
-                if final_text:
-                    yield TurnComplete(response=final_text)
-                else:
-                    yield TurnComplete(response="")
+                yield TurnComplete(response=final_text if final_text else "", usage=usage)
                 return
 
             # Otherwise consume queued notifications.
@@ -981,6 +1095,10 @@ class QwenExecutor(Executor):
                 update_type = update.get("sessionUpdate", "")
 
                 if update_type == _UPDATE_AGENT_MESSAGE_CHUNK:
+                    # qwen rides per-call token usage on an agent_message_chunk
+                    # with empty text + a populated _meta.usage, so fold usage
+                    # before the text check (the usage-bearing chunk has none).
+                    self._accumulate_usage(turn_usage, update)
                     content = update.get("content", {})
                     if isinstance(content, dict):
                         text = content.get("text", "")

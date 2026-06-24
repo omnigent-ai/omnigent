@@ -516,6 +516,193 @@ async def test_run_turn_yields_text_chunks_and_turn_complete() -> None:
     assert turn_completes[0].response == "Hello!"
 
 
+# ---------------------------------------------------------------------------
+# Token usage — parsed from qwen's _meta.usage and emitted on TurnComplete
+# ---------------------------------------------------------------------------
+
+
+def test_accumulate_usage_maps_and_splits_cached() -> None:
+    """_meta.usage maps to wire keys; cached tokens split out of input_tokens.
+
+    qwen's inputTokens (Gemini promptTokenCount) is inclusive of cached tokens,
+    but compute_llm_cost wants the non-cached portion in input_tokens.
+    """
+    acc: dict[str, int] = {}
+    QwenExecutor._accumulate_usage(
+        acc,
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": ""},
+            "_meta": {
+                "usage": {
+                    "inputTokens": 1000,
+                    "outputTokens": 200,
+                    "totalTokens": 1200,
+                    "cachedReadTokens": 300,
+                    "thoughtTokens": 50,
+                }
+            },
+        },
+    )
+    assert acc == {
+        "input_tokens": 700,  # 1000 - 300 cached
+        "output_tokens": 200,
+        "total_tokens": 1200,
+        "cache_read_input_tokens": 300,
+    }
+
+
+def test_accumulate_usage_sums_across_calls_and_ignores_non_usage() -> None:
+    """Multiple emissions sum; updates without _meta.usage are ignored."""
+    acc: dict[str, int] = {}
+    # A plain text chunk carries no usage — must not perturb the accumulator.
+    QwenExecutor._accumulate_usage(acc, {"content": {"type": "text", "text": "hi"}})
+    assert acc == {}
+    for _ in range(2):
+        QwenExecutor._accumulate_usage(
+            acc,
+            {"_meta": {"usage": {"inputTokens": 100, "outputTokens": 10, "totalTokens": 110}}},
+        )
+    # Summed across the two calls; no cached key when cachedReadTokens absent.
+    assert acc == {"input_tokens": 200, "output_tokens": 20, "total_tokens": 220}
+
+
+def test_accumulate_usage_clamps_negative_input() -> None:
+    """A malformed cached > input never drives input_tokens negative."""
+    acc: dict[str, int] = {}
+    QwenExecutor._accumulate_usage(
+        acc,
+        {"_meta": {"usage": {"inputTokens": 100, "cachedReadTokens": 500, "totalTokens": 100}}},
+    )
+    assert acc["input_tokens"] == 0
+    assert acc["cache_read_input_tokens"] == 500
+
+
+@pytest.mark.asyncio
+async def test_run_turn_emits_usage_on_turn_complete(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A usage-bearing chunk surfaces as TurnComplete.usage and notifies cost."""
+    notified: list[dict] = []
+    monkeypatch.setattr(
+        "omnigent.inner.qwen_executor._notify_usage_from_dict",
+        lambda model, usage: notified.append({"model": model, "usage": usage}),
+    )
+
+    executor = QwenExecutor(model="qwen/qwen3-coder")
+    executor._initialized = True
+    executor._session_id = "sess-usage"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    session_id = executor._session_id
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            base = {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {"sessionId": session_id},
+            }
+            # 1. Real text chunk.
+            await executor._queue.put(
+                {
+                    **base,
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "done"},
+                        },
+                    },
+                }
+            )
+            # 2. Usage-bearing chunk (empty text + _meta.usage).
+            await executor._queue.put(
+                {
+                    **base,
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": ""},
+                            "_meta": {
+                                "usage": {
+                                    "inputTokens": 500,
+                                    "outputTokens": 80,
+                                    "totalTokens": 580,
+                                    "cachedReadTokens": 100,
+                                }
+                            },
+                        },
+                    },
+                }
+            )
+            fut = executor._pending.get(msg["id"])
+            if fut and not fut.done():
+                fut.set_result(
+                    {"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}}
+                )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completes) == 1
+    assert completes[0].response == "done"
+    assert completes[0].usage == {
+        "input_tokens": 400,  # 500 - 100 cached
+        "output_tokens": 80,
+        "total_tokens": 580,
+        "cache_read_input_tokens": 100,
+    }
+    # Cost observer was notified with the same usage + the configured model.
+    assert notified == [{"model": "qwen/qwen3-coder", "usage": completes[0].usage}]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_usage_none_when_unreported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No usage chunk → TurnComplete.usage is None and the observer isn't called."""
+    notified: list[dict] = []
+    monkeypatch.setattr(
+        "omnigent.inner.qwen_executor._notify_usage_from_dict",
+        lambda model, usage: notified.append({"model": model, "usage": usage}),
+    )
+
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-no-usage"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    session_id = executor._session_id
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            await executor._queue.put(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "hi"},
+                        },
+                    },
+                }
+            )
+            fut = executor._pending.get(msg["id"])
+            if fut and not fut.done():
+                fut.set_result(
+                    {"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}}
+                )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completes) == 1
+    assert completes[0].usage is None
+    assert notified == []
+
+
 @pytest.mark.asyncio
 async def test_run_turn_drains_all_chunks_before_completing() -> None:
     """All buffered chunks are yielded even if the future resolves first.
@@ -887,6 +1074,154 @@ async def test_run_turn_resends_system_prompt_after_session_reset() -> None:
     assert sent_prompts[0] == "SYSTEM\n\nfirst"  # turn 1 folded
     assert sent_prompts[1] == "SYSTEM\n\nsecond"  # re-folded into the new session
     assert executor._session_id == "sess-2"
+
+
+# ---------------------------------------------------------------------------
+# History replay on a fresh session (model switch / reset doesn't drop context)
+# ---------------------------------------------------------------------------
+
+
+def test_history_prefix_serializes_prior_turns() -> None:
+    """_history_prefix renders prior turns as labeled role: content lines."""
+    prior = [
+        {"role": "user", "content": "what is 2+2"},
+        {"role": "assistant", "content": "4"},
+        {"role": "user", "content": [{"type": "input_text", "text": "and 3+3"}]},
+        {"role": "assistant", "content": [{"type": "output_text", "text": "6"}]},
+    ]
+    out = QwenExecutor._history_prefix(prior)
+    assert out.startswith("Conversation so far:")
+    assert "user: what is 2+2" in out
+    assert "assistant: 4" in out
+    assert "user: and 3+3" in out  # list content folded via _text_from_blocks
+    assert "assistant: 6" in out
+    assert out.rstrip().endswith("using the conversation above as context.")
+
+
+@pytest.mark.asyncio
+async def test_run_turn_replays_history_on_fresh_session() -> None:
+    """A fresh session folds prior turns into the prompt (e.g. after /model respawn).
+
+    qwen normally only sees the latest user turn; on a brand-new subprocess
+    (a ``/model`` switch respawns it) that would drop everything before the
+    switch. The first turn must replay the transcript so context survives.
+    """
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-fresh"  # session exists, but no prior turns sent
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    loop = asyncio.get_event_loop()
+
+    sent_prompts: list[str] = []
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            sent_prompts.append(msg["params"]["prompt"][0]["text"])
+            req_id = msg["id"]
+
+            def _resolve() -> None:
+                fut = executor._pending.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(
+                        {"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}}
+                    )
+
+            loop.call_soon(_resolve)
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    messages = [
+        {"role": "user", "content": "remember the number 42"},
+        {"role": "assistant", "content": "Got it, 42."},
+        {"role": "user", "content": "what number did I say?"},
+    ]
+    async for _ in executor.run_turn(messages, [], "SYS"):
+        pass
+
+    prompt = sent_prompts[0]
+    # System prompt first, then replayed history, then the latest turn.
+    assert prompt.startswith("SYS\n\n")
+    assert "Conversation so far:" in prompt
+    assert "user: remember the number 42" in prompt
+    assert "assistant: Got it, 42." in prompt
+    assert prompt.rstrip().endswith("user: what number did I say?")
+
+
+@pytest.mark.asyncio
+async def test_run_turn_no_replay_on_continuing_session() -> None:
+    """A continuing session sends only the latest turn (qwen retains context)."""
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-cont"
+    executor._system_prompt_sent = True  # not a fresh session
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    loop = asyncio.get_event_loop()
+
+    sent_prompts: list[str] = []
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            sent_prompts.append(msg["params"]["prompt"][0]["text"])
+            req_id = msg["id"]
+
+            def _resolve() -> None:
+                fut = executor._pending.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(
+                        {"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}}
+                    )
+
+            loop.call_soon(_resolve)
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    messages = [
+        {"role": "user", "content": "earlier turn"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "latest turn"},
+    ]
+    async for _ in executor.run_turn(messages, [], "SYS"):
+        pass
+
+    # No history prefix, no system-prompt re-fold — just the latest message.
+    assert sent_prompts[0] == "latest turn"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_no_replay_on_genuine_first_turn() -> None:
+    """A brand-new conversation (single user turn) has nothing to replay."""
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-first"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    loop = asyncio.get_event_loop()
+
+    sent_prompts: list[str] = []
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            sent_prompts.append(msg["params"]["prompt"][0]["text"])
+            req_id = msg["id"]
+
+            def _resolve() -> None:
+                fut = executor._pending.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(
+                        {"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}}
+                    )
+
+            loop.call_soon(_resolve)
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    async for _ in executor.run_turn([{"role": "user", "content": "hello"}], [], "SYS"):
+        pass
+
+    assert sent_prompts[0] == "SYS\n\nhello"  # system prompt only, no replay
+    assert "Conversation so far:" not in sent_prompts[0]
 
 
 # ---------------------------------------------------------------------------

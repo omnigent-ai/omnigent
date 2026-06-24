@@ -254,6 +254,13 @@ describe("getConversationIconKind", () => {
     ).toBe("codex");
     expect(
       getConversationIconKind(
+        conversation("conv_opencode", null, new Date(2026, 4, 14, 9), {
+          labels: { "omnigent.wrapper": "opencode-native-ui" },
+        }),
+      ),
+    ).toBe("opencode");
+    expect(
+      getConversationIconKind(
         conversation("conv_pi", null, new Date(2026, 4, 14, 9), {
           labels: { "omnigent.wrapper": "pi-native-ui" },
         }),

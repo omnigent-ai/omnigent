@@ -65,6 +65,46 @@ describe("coercePolicyParams", () => {
     });
   });
 
+  it("parses browser number input notation for integer fields", () => {
+    const result = coercePolicyParams(
+      ["threshold"],
+      { threshold: { type: "integer" } },
+      { threshold: "1e2" },
+    );
+    expect(result).toEqual({
+      ok: true,
+      params: { threshold: 100 },
+    });
+  });
+
+  it("rejects decimal and non-numeric input for integer fields", () => {
+    const decimal = coercePolicyParams(
+      ["threshold"],
+      { threshold: { type: "integer" } },
+      { threshold: "12.9" },
+    );
+    expect(decimal.ok).toBe(false);
+    if (!decimal.ok) expect(decimal.error).toContain("integer");
+
+    const invalid = coercePolicyParams(
+      ["threshold"],
+      { threshold: { type: "integer" } },
+      { threshold: "abc" },
+    );
+    expect(invalid.ok).toBe(false);
+    if (!invalid.ok) expect(invalid.error).toContain("integer");
+  });
+
+  it("rejects partial numeric strings for number fields", () => {
+    const result = coercePolicyParams(
+      ["ratio"],
+      { ratio: { type: "number" } },
+      { ratio: "1.2abc" },
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("number");
+  });
+
   it("passes string and unmapped types through verbatim", () => {
     const result = coercePolicyParams(
       ["state_key"],

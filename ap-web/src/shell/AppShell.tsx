@@ -623,7 +623,7 @@ export function AppShell() {
   const handleFilesFlatViewChange = useCallback((v: boolean) => {
     filesPanelScopePrefRef.current = v;
     setFilesPanelFlatView(v);
-    writeFilesPanelPreferences({ changedOnly: v });
+    writeFilesPanelPreferences({ ...readFilesPanelPreferences(), changedOnly: v });
   }, []);
 
   const openFileViewer = useCallback(
