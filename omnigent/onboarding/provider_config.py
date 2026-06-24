@@ -291,6 +291,7 @@ class ProviderEntry:
     model_provider: str | None = None
     display_name: str | None = None
     default_families: frozenset[str] = frozenset()
+    event_timeout: float | None = None
 
     @property
     def default(self) -> bool:
@@ -798,6 +799,17 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             f"provider {name!r} (kind {kind!r}) configures no 'anthropic' or 'openai' family.",
             code=ErrorCode.INVALID_INPUT,
         )
+    event_timeout_raw = raw.get("event_timeout")
+    event_timeout: float | None = None
+    if event_timeout_raw is not None:
+        try:
+            event_timeout = float(event_timeout_raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise OmnigentError(
+                f"provider {name!r}: 'event_timeout' must be a number (seconds), "
+                f"got {event_timeout_raw!r}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
     return ProviderEntry(
         name=name,
         kind=kind,
@@ -805,6 +817,7 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
         default_families=_parse_default_families(
             name, default_raw, set(families), pi_capable=True
         ),
+        event_timeout=event_timeout,
     )
 
 

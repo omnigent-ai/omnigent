@@ -866,6 +866,8 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
         catalog_default = _catalog_default_model(auth_family)
         if catalog_default is not None:
             env["HARNESS_PI_MODEL"] = catalog_default
+    if entry.event_timeout is not None:
+        env["HARNESS_PI_EVENT_TIMEOUT"] = str(entry.event_timeout)
     if "HARNESS_PI_MODEL" not in env:
         # Fail loud only when the catalog has no default for the chosen family
         # (genuinely unknown — should not happen for a known family).
