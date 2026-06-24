@@ -700,14 +700,15 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
   });
 
-  it("shows permission-mode options in the Advanced menu only for the claude-native agent", () => {
+  it("shows permission-mode options in the Advanced sub-page only for the claude-native agent", () => {
     renderLanding();
-    // The radios live behind the footer tray's Advanced chip — absent
-    // until the menu opens.
+    // The radios live behind the agent picker's "Advanced settings" row —
+    // absent until the menu opens.
     expect(screen.queryByTestId("new-chat-landing-permission-plan")).toBeNull();
-    // a1 (Claude Code, claude-native) is the default agent → the footer
-    // tray surfaces the Advanced chip with the permission-mode radios.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    // a1 (Claude Code, claude-native) is the default agent → the picker
+    // surfaces an "Advanced settings" row that slides to the permission radios.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-advanced-entry"));
     const planOption = screen.getByTestId("new-chat-landing-permission-plan");
     expect(planOption.textContent).toContain("Plan");
     // The footer line explains the SELECTED mode until a row is hovered —
@@ -717,21 +718,20 @@ describe("NewChatLandingScreen", () => {
     expect(detail.textContent).toContain("Prompts before edits and commands");
     fireEvent.pointerEnter(planOption);
     expect(detail.textContent).toContain("Plans only; makes no edits");
-    // Switch to Codex (a2: codex-native) — the Advanced chip stays visible
-    // but now shows approval-mode radios instead of permission-mode radios.
-    // Close the Advanced menu first (Escape), then switch agents.
-    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    // Slide back to the agent list, then switch to Codex (a2: codex-native).
+    // Codex has Advanced settings too, so the picker stays open and its
+    // "Advanced settings" row remains available (now for approval modes).
+    fireEvent.click(screen.getByTestId("new-chat-landing-advanced-back"));
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    expect(screen.queryByTestId("new-chat-landing-advanced-chip")).not.toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-advanced-entry")).not.toBeNull();
   });
 
-  it("shows approval-mode options in the Advanced menu for the codex-native agent", () => {
+  it("shows approval-mode options in the Advanced sub-page for the codex-native agent", () => {
     renderLanding();
-    // Switch to Codex first.
+    // Switch to Codex first; it keeps the menu open (it has Advanced settings).
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-advanced-entry"));
     const fullAccessOption = screen.getByTestId("new-chat-landing-approval-full-access");
     expect(fullAccessOption.textContent).toContain("Full access");
     // The footer line explains the SELECTED mode until a row is hovered.
