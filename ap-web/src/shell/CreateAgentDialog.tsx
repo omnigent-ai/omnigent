@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { PlusIcon, TrashIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -17,7 +18,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
-import type { AgentBundleInput } from "@/lib/agentBundle";
+import type { AgentBundleInput, MCPServerInput } from "@/lib/agentBundle";
 
 /**
  * Harness options for the picker. "default" uses the server's default
@@ -28,13 +29,80 @@ const HARNESS_OPTIONS: { value: string; label: string }[] = [
   ...Object.entries(BRAIN_HARNESS_LABELS).map(([value, label]) => ({ value, label })),
 ];
 
+/** A single MCP server row in the form. */
+interface MCPFormEntry {
+  /** Stable key for React list rendering. */
+  key: number;
+  name: string;
+  transport: "http" | "stdio";
+  url: string;
+  headers: string;
+  command: string;
+  args: string;
+  env: string;
+}
+
+function emptyMCPEntry(key: number): MCPFormEntry {
+  return { key, name: "", transport: "stdio", url: "", headers: "", command: "", args: "", env: "" };
+}
+
+/** Parse "KEY=VAL" lines into a Record. */
+function parseKVLines(text: string): Record<string, string> | undefined {
+  const lines = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return undefined;
+  const result: Record<string, string> = {};
+  for (const line of lines) {
+    const eq = line.indexOf("=");
+    if (eq > 0) {
+      result[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+    }
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+/** Convert form entries to the bundle input shape. */
+function toMCPInputs(entries: MCPFormEntry[]): MCPServerInput[] | undefined {
+  const result: MCPServerInput[] = [];
+  for (const e of entries) {
+    const name = e.name.trim();
+    if (!name) continue;
+    if (e.transport === "stdio") {
+      const command = e.command.trim();
+      if (!command) continue;
+      result.push({
+        name,
+        transport: "stdio",
+        command,
+        args: e.args
+          .split(/\s+/)
+          .map((a) => a.trim())
+          .filter(Boolean),
+        env: parseKVLines(e.env),
+      });
+    } else {
+      const url = e.url.trim();
+      if (!url) continue;
+      result.push({
+        name,
+        transport: "http",
+        url,
+        headers: parseKVLines(e.headers),
+      });
+    }
+  }
+  return result.length > 0 ? result : undefined;
+}
+
 /**
  * Dialog for creating a custom agent from the new-session picker.
  *
  * Collects a name, optional description, optional system instructions,
- * and a harness choice. On submit, passes the agent configuration back
- * to the parent via `onCreate` so it can build a bundle and start a
- * session with it.
+ * a harness choice, and zero or more MCP server declarations. On submit,
+ * passes the agent configuration back to the parent via `onCreate` so it
+ * can build a bundle and start a session with it.
  */
 export function CreateAgentDialog({
   open,
@@ -49,17 +117,34 @@ export function CreateAgentDialog({
   const [description, setDescription] = useState("");
   const [instructions, setInstructions] = useState("");
   const [harness, setHarness] = useState("default");
+  const [mcpEntries, setMcpEntries] = useState<MCPFormEntry[]>([]);
+  const [nextKey, setNextKey] = useState(0);
 
   function reset() {
     setName("");
     setDescription("");
     setInstructions("");
     setHarness("default");
+    setMcpEntries([]);
+    setNextKey(0);
   }
 
   function handleOpenChange(next: boolean) {
     if (!next) reset();
     onOpenChange(next);
+  }
+
+  function addMCPServer() {
+    setMcpEntries((prev) => [...prev, emptyMCPEntry(nextKey)]);
+    setNextKey((k) => k + 1);
+  }
+
+  function removeMCPServer(key: number) {
+    setMcpEntries((prev) => prev.filter((e) => e.key !== key));
+  }
+
+  function updateMCPEntry(key: number, patch: Partial<MCPFormEntry>) {
+    setMcpEntries((prev) => prev.map((e) => (e.key === key ? { ...e, ...patch } : e)));
   }
 
   function handleSubmit() {
@@ -71,6 +156,7 @@ export function CreateAgentDialog({
       description: description.trim() || undefined,
       instructions: instructions.trim() || undefined,
       harness: harness === "default" ? undefined : harness,
+      mcpServers: toMCPInputs(mcpEntries),
     });
     reset();
     onOpenChange(false);
@@ -155,6 +241,32 @@ export function CreateAgentDialog({
               className="min-h-[120px]"
             />
           </div>
+
+          {/* MCP Servers */}
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-muted-foreground">MCP Tools</span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={addMCPServer}
+                data-testid="create-agent-add-mcp"
+                className="h-6 gap-1 px-2 text-xs text-muted-foreground"
+              >
+                <PlusIcon className="size-3" />
+                Add server
+              </Button>
+            </div>
+            {mcpEntries.map((entry) => (
+              <MCPServerRow
+                key={entry.key}
+                entry={entry}
+                onChange={(patch) => updateMCPEntry(entry.key, patch)}
+                onRemove={() => removeMCPServer(entry.key)}
+              />
+            ))}
+          </div>
         </div>
 
         <DialogFooter>
@@ -167,5 +279,95 @@ export function CreateAgentDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** A single MCP server entry in the form. */
+function MCPServerRow({
+  entry,
+  onChange,
+  onRemove,
+}: {
+  entry: MCPFormEntry;
+  onChange: (patch: Partial<MCPFormEntry>) => void;
+  onRemove: () => void;
+}) {
+  return (
+    <div
+      className="flex flex-col gap-2 rounded-md border border-border p-3"
+      data-testid="create-agent-mcp-entry"
+    >
+      <div className="flex items-center gap-2">
+        <Input
+          data-testid="create-agent-mcp-name"
+          value={entry.name}
+          onChange={(e) => onChange({ name: e.target.value })}
+          placeholder="server-name"
+          className="flex-1"
+        />
+        <Select
+          value={entry.transport}
+          onValueChange={(v: "http" | "stdio") => onChange({ transport: v })}
+        >
+          <SelectTrigger data-testid="create-agent-mcp-transport" className="w-24">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="stdio">stdio</SelectItem>
+            <SelectItem value="http">http</SelectItem>
+          </SelectContent>
+        </Select>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          onClick={onRemove}
+          data-testid="create-agent-mcp-remove"
+          className="size-7 text-muted-foreground hover:text-destructive"
+        >
+          <TrashIcon className="size-3.5" />
+        </Button>
+      </div>
+
+      {entry.transport === "stdio" ? (
+        <>
+          <Input
+            data-testid="create-agent-mcp-command"
+            value={entry.command}
+            onChange={(e) => onChange({ command: e.target.value })}
+            placeholder="command (e.g. npx)"
+          />
+          <Input
+            data-testid="create-agent-mcp-args"
+            value={entry.args}
+            onChange={(e) => onChange({ args: e.target.value })}
+            placeholder="args (e.g. -y @modelcontextprotocol/server-github)"
+          />
+          <Textarea
+            data-testid="create-agent-mcp-env"
+            value={entry.env}
+            onChange={(e) => onChange({ env: e.target.value })}
+            placeholder={"Environment variables (KEY=VALUE per line)\ne.g. GITHUB_TOKEN=ghp_..."}
+            className="min-h-[60px] font-mono text-xs"
+          />
+        </>
+      ) : (
+        <>
+          <Input
+            data-testid="create-agent-mcp-url"
+            value={entry.url}
+            onChange={(e) => onChange({ url: e.target.value })}
+            placeholder="https://mcp.example.com/sse"
+          />
+          <Textarea
+            data-testid="create-agent-mcp-headers"
+            value={entry.headers}
+            onChange={(e) => onChange({ headers: e.target.value })}
+            placeholder={"HTTP headers (KEY=VALUE per line)\ne.g. Authorization=Bearer tok_..."}
+            className="min-h-[60px] font-mono text-xs"
+          />
+        </>
+      )}
+    </div>
   );
 }

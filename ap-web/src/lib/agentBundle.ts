@@ -6,12 +6,31 @@
  * `config.yaml` and optionally an `AGENTS.md` instructions file.
  */
 
+/** An MCP server to include in the agent bundle. */
+export interface MCPServerInput {
+  name: string;
+  /** "http" for SSE endpoints, "stdio" for local subprocesses. */
+  transport: "http" | "stdio";
+  /** SSE endpoint URL (http transport only). */
+  url?: string;
+  /** HTTP headers (http transport only), e.g. {"Authorization": "Bearer ..."} */
+  headers?: Record<string, string>;
+  /** Executable to spawn (stdio transport only), e.g. "npx". */
+  command?: string;
+  /** Args for the command (stdio transport only). */
+  args?: string[];
+  /** Env vars for the subprocess (stdio transport only). */
+  env?: Record<string, string>;
+}
+
 export interface AgentBundleInput {
   name: string;
   description?: string;
   instructions?: string;
   /** Harness kind, e.g. "claude-sdk", "openai-agents". Defaults to omitting (server default). */
   harness?: string;
+  /** MCP server declarations to include as inline tools entries. */
+  mcpServers?: MCPServerInput[];
 }
 
 /**
@@ -42,6 +61,33 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
   lines.push("  builtins:");
   lines.push("    - web_search");
   lines.push("    - web_fetch");
+  // Inline MCP server declarations (parsed by _parse_inline_mcp_servers).
+  if (input.mcpServers?.length) {
+    for (const mcp of input.mcpServers) {
+      lines.push(`  ${mcp.name}:`);
+      lines.push("    type: mcp");
+      if (mcp.transport === "stdio") {
+        if (mcp.command) lines.push(`    command: ${yamlQuote(mcp.command)}`);
+        if (mcp.args?.length) {
+          lines.push(`    args: [${mcp.args.map((a) => yamlQuote(a)).join(", ")}]`);
+        }
+        if (mcp.env && Object.keys(mcp.env).length > 0) {
+          lines.push("    env:");
+          for (const [k, v] of Object.entries(mcp.env)) {
+            lines.push(`      ${k}: ${yamlQuote(v)}`);
+          }
+        }
+      } else {
+        if (mcp.url) lines.push(`    url: ${yamlQuote(mcp.url)}`);
+        if (mcp.headers && Object.keys(mcp.headers).length > 0) {
+          lines.push("    headers:");
+          for (const [k, v] of Object.entries(mcp.headers)) {
+            lines.push(`      ${k}: ${yamlQuote(v)}`);
+          }
+        }
+      }
+    }
+  }
   lines.push("");
 
   if (input.instructions) {
