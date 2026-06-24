@@ -417,9 +417,35 @@
     overflow: hidden;
   }
 
+  /* Slide animation for the mobile drawer. Covers BOTH paths that move the
+     panel: the edge-swipe drag settles via an inline `transform`, while the
+     button toggle (and the drag's resting open/closed state) is driven by
+     Tailwind v4's `translate-x` utilities — which animate the `translate`
+     property, not `transform`. Listing only `transform` (as before) left the
+     toggle un-transitioned, so tapping the collapse/expand button snapped the
+     drawer instantly with no animation. Transition both so the toggle slides
+     too. Suppressed inline (`transition: none`) while a drag is live so the
+     overlay tracks the finger 1:1. */
   [data-ios-native] .conversations-sidebar {
-    transition: transform 360ms cubic-bezier(0.32, 0.72, 0, 1);
-    will-change: transform;
+    transition-property: transform, translate;
+    transition-duration: 360ms;
+    transition-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
+    will-change: transform, translate;
+  }
+
+  /* Leading-edge shadow so the drawer reads as a native layer lifted above the
+     chat while it slides, instead of a flat sheet. Scoped to the open/dragging
+     state via `:not([data-collapsed])` (the sidebar sets `data-collapsed` only
+     when closed) so the full-bleed overlay doesn't cast a sliver along the
+     screen's left edge while parked off-screen. It's visible only mid-slide and
+     mid-drag — fully open the drawer covers the viewport, so its right edge (and
+     the shadow) sit past the screen. iOS-only: the web overlay is unchanged. */
+  [data-ios-native] .conversations-sidebar:not([data-collapsed]) {
+    box-shadow: 8px 0 28px -6px rgb(0 0 0 / 0.22);
+  }
+
+  .dark [data-ios-native] .conversations-sidebar:not([data-collapsed]) {
+    box-shadow: 8px 0 30px -4px rgb(0 0 0 / 0.55);
   }
 
   [data-ios-native] :is(input, textarea, select, [contenteditable="true"]) {
