@@ -90,6 +90,12 @@ deploy/
 ├── openshell/         ← NVIDIA OpenShell sandbox-provider guide (self-hosted
 │   └── README.md         gRPC gateway, on-prem/air-gapped); NOT a server target.
 │
+├── databricks/        ← Databricks Apps (Lakebase + UC Volumes)
+│   ├── databricks.yml     bundle declarative config
+│   ├── deploy.py          build + `bundle deploy`/`run` orchestrator
+│   ├── src/app.py         app entrypoint (Lakebase + UC Volumes)
+│   └── README.md
+│
 └── docker/            ← common Docker image + compose stack
     ├── Dockerfile         multi-stage slim image (node web build → python builder → runtime)
     ├── docker-compose.yaml   omnigent + postgres for any Docker host
@@ -113,10 +119,13 @@ deploy/
 | Share a server running on your **laptop**: demo it to teammates, or let remote runners & cloud sandboxes connect back to it (nothing to deploy) | Cloudflare quick tunnel | `cloudflared tunnel --url http://localhost:6767` |
 | Access your server privately from **your phone, tablet, or other personal devices** without exposing it to the internet | Tailscale | [`tailscale/README.md`](tailscale/README.md): `tailscale serve https / http://localhost:8000` |
 | Cloud Run / Kubernetes / other | Docker image | [`docker/README.md`](docker/README.md), then point your platform at the image |
+| Deploy on a Databricks workspace (Lakebase + UC Volumes) | Databricks Apps | [`databricks/README.md`](databricks/README.md): uses Asset Bundles |
 
-All deploy paths share the same image (`docker/Dockerfile`): a slim Python
-container running the FastAPI / WebSocket coordinator, with Postgres or
-SQLite as the datastore.
+All non-Databricks deploy paths share the same image (`docker/Dockerfile`): a
+slim Python container running the FastAPI / WebSocket coordinator, with Postgres
+or SQLite as the datastore. The Databricks Apps path uses a separate entrypoint
+(`databricks/src/app.py`) that swaps Postgres for Lakebase (managed PostgreSQL)
+and the artifact store for UC Volumes.
 
 ## Database: Postgres or SQLite
 
