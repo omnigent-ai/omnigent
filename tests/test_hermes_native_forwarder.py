@@ -9,8 +9,11 @@ idempotent high-water cursor.
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from pathlib import Path
+
+import pytest
 
 from omnigent import hermes_native_forwarder as f
 
@@ -145,3 +148,78 @@ def test_default_state_db_honors_overrides(monkeypatch) -> None:
     assert f.default_state_db() == Path("/opt/hermes-home/state.db")
     monkeypatch.delenv("HERMES_HOME", raising=False)
     assert f.default_state_db().name == "state.db"
+
+
+# --- forwarder loop + POST plumbing -------------------------------------------
+
+
+class _Resp:
+    def __init__(self, status: int = 200) -> None:
+        self.status_code = status
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"status {self.status_code}")
+
+
+class _FakeClient:
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, dict]] = []
+
+    async def post(self, url, json=None, **_kwargs):
+        self.posts.append((url, json or {}))
+        return _Resp()
+
+
+async def test_post_conversation_item_posts_event(tmp_path) -> None:
+    client = _FakeClient()
+    item = f._MirrorItem(
+        msg_id=5,
+        item_type="message",
+        item_data={"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        response_id="hermes:5",
+    )
+    await f._post_conversation_item(client, session_id="conv_q", item=item)
+    url, body = client.posts[0]
+    assert url == "/v1/sessions/conv_q/events"
+    assert body["type"] == "external_conversation_item"
+    assert body["data"]["response_id"] == "hermes:5"
+
+
+async def test_forward_loop_discovers_and_mirrors_new_messages(tmp_path, monkeypatch) -> None:
+    """One forward iteration: discover the session by cwd+floor, mirror user+assistant."""
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    _seed_db(db, cwd=workspace, started_at=1000.0)
+
+    posted: list[f._MirrorItem] = []
+
+    async def _fake_post(_client, *, session_id, item):
+        posted.append(item)
+
+    monkeypatch.setattr(f, "_post_conversation_item", _fake_post)
+
+    calls = {"n": 0}
+
+    async def _sleep(_s):
+        calls["n"] += 1
+        raise asyncio.CancelledError  # stop after the first full iteration
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_hermes_store_to_session(
+            base_url="http://x",
+            headers={},
+            session_id="conv_f",
+            bridge_dir=tmp_path,
+            agent_name="hermes-native-ui",
+            workspace=workspace,
+            launch_epoch_s=1000.0,
+            db_path=db,
+        )
+    # The seeded user + assistant("hello") rows mirrored (tool/empty/inactive skipped).
+    roles = [i.item_data.get("role") for i in posted]
+    assert roles == ["user", "assistant"]
+    # High-water cursor persisted so a restart resumes without re-posting.
+    assert f._read_state(tmp_path).hermes_session_id == "20260620_1"
