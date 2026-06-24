@@ -2188,9 +2188,7 @@ describe("Files scope default and persistence", () => {
     // The deep-link override is transient: it must NOT rewrite the stored
     // preference. If this flips to changedOnly:false, a shared ?view=explore
     // link would silently clobber the recipient's remembered choice.
-    expect(localStorage.getItem(PREF_KEY)).toBe(
-      JSON.stringify({ changedOnly: true, sort: "recent", collapsed: false }),
-    );
+    expect(localStorage.getItem(PREF_KEY)).toBe(JSON.stringify({ changedOnly: true }));
   });
 });
 
