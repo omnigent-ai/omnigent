@@ -5137,6 +5137,13 @@ _session_agent_ids_ref: dict[str, str] = {}
 # create_runner_app; used by tests to inspect in-memory history.
 _session_histories_ref: dict[str, list[dict[str, Any]]] = {}
 
+# Module-level ref to the per-session ``/model`` override (issue #1128).
+# Seeded from the create handshake body and refreshed on every per-turn
+# event that carries one, so background turn paths that have no request body
+# (catch-up scan, crash-recovery) can still spawn with the selected model
+# instead of falling back to the provider/Databricks default.
+_session_model_overrides_ref: dict[str, str] = {}
+
 # Module-level ref to _session_event_queues. Populated inside
 # create_runner_app; used by tests to inspect the queue an SSE
 # subscriber would have read (events published synchronously by
@@ -5275,6 +5282,7 @@ def create_runner_app(
     _session_skills_cache: dict[str, list[SkillSpec]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_agent_ids = _session_agent_ids_ref  # shared with module-level get_session_agent_id
+    _session_model_overrides = _session_model_overrides_ref  # per-session /model (issue #1128)
     # Sub-agent name per session. Set from POST /v1/sessions body
     # for child sessions. _run_turn_bg uses this to resolve the
     # sub-spec from the parent's spec tree.
@@ -6142,6 +6150,10 @@ def create_runner_app(
                 # Opus spawn (and, on recovery/sub-agent paths, a lasting one).
                 model_override=body.get("model_override"),
             )
+            # Cache it so background turn paths with no request body
+            # (catch-up scan, crash-recovery) can still resolve it.
+            if body.get("model_override"):
+                _session_model_overrides[session_id] = body["model_override"]
             if harness_name == "claude-native" and spawn_env is None:
                 from omnigent.claude_native_bridge import (
                     build_claude_native_spawn_env,
@@ -6914,6 +6926,7 @@ def create_runner_app(
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
+        _session_model_overrides.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
         if _relay := _session_comment_relays.pop(session_id, None):
             _relay.close()
@@ -9860,6 +9873,15 @@ def create_runner_app(
                 or cached_spec.executor.type
             )
             harness_name = canonicalize_harness(h) or h
+            # Issue #1128: the per-turn body carries the override on normal
+            # turns; refresh the cache from it, and fall back to the cache on
+            # background paths (catch-up scan, crash-recovery) whose synthetic
+            # body has none — otherwise those respawn against the
+            # provider/Databricks default and silently route to Opus.
+            _turn_override = msg_body.get("model_override")
+            if _turn_override:
+                _session_model_overrides[conv] = _turn_override
+            _eff_override = _turn_override or _session_model_overrides.get(conv)
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
                 harness_name,
@@ -9868,7 +9890,7 @@ def create_runner_app(
                 # Apply the per-session /model override so it actually
                 # changes the model on the SDK harnesses (not just the
                 # readout). Forwarded by the Omnigent server in the message body.
-                model_override=msg_body.get("model_override"),
+                model_override=_eff_override,
             )
             from omnigent.runtime.prompt import (
                 build_instructions,
