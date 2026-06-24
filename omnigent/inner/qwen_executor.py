@@ -868,6 +868,49 @@ class QwenExecutor(Executor):
             # see docs/QWEN_FOLLOWUPS.md).
         return "\n".join(parts)
 
+    @classmethod
+    def _history_prefix(cls, prior: list[Any]) -> str:  # type: ignore[explicit-any]
+        """Serialize prior conversation turns into a text prefix.
+
+        On a *fresh* ACP session (the first turn of a newly spawned/respawned
+        ``qwen --acp`` process, or after a ``Session not found`` reset) qwen
+        holds none of the earlier conversation — its context lived in the dead
+        subprocess. Since :meth:`run_turn` normally sends only the latest user
+        turn (relying on the persistent session to retain history), we'd lose
+        everything before the switch. Replaying the transcript as a labeled
+        ``role: content`` block restores that context, mirroring
+        ``ClaudeSDKExecutor._build_prompt``. A ``/model`` switch respawns the
+        subprocess (see HarnessProcessManager), so this is what keeps a
+        mid-conversation model change from dropping the thread.
+
+        :param prior: The conversation turns *before* the latest user message
+            (each an inner ``Message`` dict).
+        :returns: A ``"Conversation so far: …"`` text block, or ``""`` when
+            there is nothing to replay.
+        """
+        lines = ["Conversation so far:"]
+        for msg in prior:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "user")).replace("_", " ")
+            raw = msg.get("content")
+            if raw is None:
+                content = ""
+            elif isinstance(raw, str):
+                content = raw
+            elif isinstance(raw, list):
+                # Reuse the block folder so prior file/image turns render the
+                # same way they did when first sent (fenced files, markers).
+                content = cls._text_from_blocks(raw, emit_image_marker=True)
+            else:
+                content = json.dumps(raw, ensure_ascii=True)
+            lines.append(f"{role}: {content}")
+        lines.append("")
+        lines.append(
+            "Respond to the latest user message, using the conversation above as context."
+        )
+        return "\n".join(lines)
+
     # ------------------------------------------------------------------
     # Executor interface
     # ------------------------------------------------------------------
@@ -903,12 +946,20 @@ class QwenExecutor(Executor):
             yield ExecutorError(message=str(exc), retryable=False)
             return
 
+        # A fresh ACP session (first turn of a new/respawned process, or after
+        # a reset) holds no prior context. Captured before we flip the latch
+        # below so we know whether to replay history into this turn.
+        fresh_session = not self._system_prompt_sent
+
         # Build the prompt payload from the most recent user message.
         user_text = ""
         image_blocks: list[dict[str, Any]] = []  # type: ignore[explicit-any]
-        for msg in reversed(messages):
+        latest_user_idx: int | None = None
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
             role = msg.get("role", "") if isinstance(msg, dict) else ""
             if role == "user":
+                latest_user_idx = idx
                 content = msg.get("content", "") if isinstance(msg, dict) else ""
                 if isinstance(content, str):
                     user_text = content
@@ -923,11 +974,23 @@ class QwenExecutor(Executor):
                     )
                 break
 
+        # On a fresh session, replay the prior conversation so a model switch
+        # (which respawns the subprocess) or a session reset doesn't drop the
+        # thread — qwen otherwise only ever sees this turn's latest message.
+        # Skipped when there's nothing before the latest user turn (the genuine
+        # first turn of a brand-new conversation). See :meth:`_history_prefix`.
+        if fresh_session and latest_user_idx is not None and latest_user_idx > 0:
+            history_prefix = self._history_prefix(messages[:latest_user_idx])
+            user_text = f"{history_prefix}\n\nuser: {user_text}" if user_text else history_prefix
+
         # ACP has no system-prompt field, so fold it into the first turn's
         # user text. Without this the agent's persona / instructions (the
-        # spec ``prompt:``) never reach qwen and it runs uninstructed.
-        if not self._system_prompt_sent and system_prompt:
-            user_text = f"{system_prompt}\n\n{user_text}" if user_text else system_prompt
+        # spec ``prompt:``) never reach qwen and it runs uninstructed. The
+        # latch flips on any fresh session — even with an empty system prompt —
+        # so a continuing session never re-replays history or re-folds.
+        if fresh_session:
+            if system_prompt:
+                user_text = f"{system_prompt}\n\n{user_text}" if user_text else system_prompt
             self._system_prompt_sent = True
 
         # Text first, then any image blocks (ACP prompt is an ordered array).
