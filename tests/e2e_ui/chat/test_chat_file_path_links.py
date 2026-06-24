@@ -63,7 +63,7 @@ name: {_AGENT_NAME}
 prompt: You are a deterministic test assistant.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   config:
     harness: openai-agents
 

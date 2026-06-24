@@ -713,6 +713,12 @@ class TerminalEnvSpec:
     :param tmux_start_on_attach: Delay the terminal command until the
         first tmux client attaches. Used for TUIs that must query the
         real attached terminal during startup.
+    :param keep_alive_after_exit: Keep the private tmux server alive after
+        the pane's inner process exits (``remain-on-exit`` / ``exit-empty
+        off``), so a single CLI exit no longer reaps the server and cascades
+        into ``no server running``. Opt-in because it changes the
+        ``has-session``-means-alive contract; enabled for the claude-native
+        agent terminal (#540), whose liveness is decided by ``#{pane_dead}``.
     """
 
     command: str | None = None
@@ -727,6 +733,7 @@ class TerminalEnvSpec:
     session_prefix: str = "omni_"
     tmux_allow_passthrough: bool = False
     tmux_start_on_attach: bool = False
+    keep_alive_after_exit: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -773,6 +780,15 @@ class AgentDef:
     # sub-agent types. Session reads are always on. YAML key:
     # ``spawn:``.
     spawn: bool = False
+    # Authority for the agent to share the session it runs in, via
+    # sys_session_share — the SOLE enabler of that tool (independent of
+    # spawn / declared agents, and unrelated to server-API / CLI
+    # sharing). Raw YAML string from ``agent_session_sharing:`` — "none"
+    # (default, tool off), "non-public" (grant named users), or "public"
+    # (also allow __public__ anonymous read). Kept as a str here (inner
+    # datamodel has no spec.types dep); mapped to SharePolicy when
+    # translated to an AgentSpec.
+    agent_session_sharing: str = "none"
     os_env: OSEnvSpec | None = None
     terminals: dict[str, TerminalEnvSpec] = field(default_factory=dict)
     skills: SkillRegistry = field(default_factory=dict)

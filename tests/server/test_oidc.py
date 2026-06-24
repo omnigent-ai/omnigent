@@ -17,6 +17,8 @@ from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
     UnifiedAuthProvider,
     create_auth_provider,
+    resolve_auth_header,
+    resolve_auth_header_strip_prefix,
 )
 from omnigent.server.oidc import (
     OIDCConfig,
@@ -252,6 +254,179 @@ def test_header_source_login_url_is_none() -> None:
     """
     provider = UnifiedAuthProvider(source="header")
     assert provider.login_url is None
+
+
+def test_header_source_reads_custom_header_name() -> None:
+    """An explicit ``header_name`` reads identity from that header.
+
+    Models a deploy behind Cloudflare Access, which authenticates
+    with ``Cf-Access-Authenticated-User-Email`` rather than the
+    ``X-Forwarded-Email`` default (issue #877).
+    """
+    provider = UnifiedAuthProvider(
+        source="header",
+        header_name="Cf-Access-Authenticated-User-Email",
+    )
+    request = _mock_request(
+        headers={"Cf-Access-Authenticated-User-Email": "alice@example.com"},
+    )
+    assert provider.get_user_id(request) == "alice@example.com"
+
+
+def test_header_source_custom_header_ignores_default_header() -> None:
+    """With a custom header set, the default header no longer authenticates.
+
+    This is the security-relevant half of the override: an operator
+    who points the server at the proxy's header must NOT also leave
+    the old ``X-Forwarded-Email`` as a second accepted identity, or a
+    client could spoof identity through the header the proxy doesn't
+    strip.
+    """
+    provider = UnifiedAuthProvider(
+        source="header",
+        header_name="Cf-Access-Authenticated-User-Email",
+        local_single_user=False,
+    )
+    request = _mock_request(headers={"X-Forwarded-Email": "attacker@example.com"})
+    assert provider.get_user_id(request) is None
+
+
+def test_header_source_resolves_header_name_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``header_name=None`` resolves from ``OMNIGENT_AUTH_HEADER``.
+
+    The deploy path configures the header name via env var, not a
+    constructor argument — this pins the env-resolution path.
+    """
+    monkeypatch.setenv("OMNIGENT_AUTH_HEADER", "Cf-Access-Authenticated-User-Email")
+    provider = UnifiedAuthProvider(source="header")
+    request = _mock_request(
+        headers={"Cf-Access-Authenticated-User-Email": "alice@example.com"},
+    )
+    assert provider.get_user_id(request) == "alice@example.com"
+
+
+def test_resolve_auth_header_defaults_to_x_forwarded_email(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset/empty ``OMNIGENT_AUTH_HEADER`` falls back to the default.
+
+    The override must be strictly additive: the overwhelming majority
+    of header-mode deploys (and every existing test) rely on
+    ``X-Forwarded-Email`` being the default.
+    """
+    monkeypatch.delenv("OMNIGENT_AUTH_HEADER", raising=False)
+    assert resolve_auth_header() == "X-Forwarded-Email"
+    monkeypatch.setenv("OMNIGENT_AUTH_HEADER", "   ")
+    assert resolve_auth_header() == "X-Forwarded-Email"
+
+
+# ── UnifiedAuthProvider (header source: Google IAP prefix strip) ──
+
+# Google IAP injects its identity in ``X-Goog-Authenticated-User-Email``
+# namespaced as ``accounts.google.com:<email>``. The configured strip
+# prefix turns that into the bare email used everywhere else.
+_IAP_HEADER = "X-Goog-Authenticated-User-Email"
+_IAP_PREFIX = "accounts.google.com:"
+
+
+def test_header_source_strips_configured_prefix() -> None:
+    """Google IAP: the ``accounts.google.com:`` prefix is stripped.
+
+    IAP forwards ``accounts.google.com:user@example.com``. Without
+    stripping, the identity would carry the namespace prefix and never
+    match the bare email used for ownership/sharing — so a deploy behind
+    IAP could not be addressed by its real identity at all.
+    """
+    provider = UnifiedAuthProvider(
+        source="header",
+        header_name=_IAP_HEADER,
+        header_strip_prefix=_IAP_PREFIX,
+    )
+    request = _mock_request(headers={_IAP_HEADER: f"{_IAP_PREFIX}alice@example.com"})
+    assert provider.get_user_id(request) == "alice@example.com"
+
+
+def test_header_source_strip_prefix_absent_passes_value_through() -> None:
+    """A value lacking the prefix is used unchanged.
+
+    ``str.removeprefix`` is a no-op when the prefix is absent, so a
+    proxy value that is already bare still authenticates — the strip is
+    purely additive and never corrupts a non-namespaced identity.
+    """
+    provider = UnifiedAuthProvider(
+        source="header",
+        header_name=_IAP_HEADER,
+        header_strip_prefix=_IAP_PREFIX,
+    )
+    request = _mock_request(headers={_IAP_HEADER: "alice@example.com"})
+    assert provider.get_user_id(request) == "alice@example.com"
+
+
+def test_header_source_rejects_value_that_is_only_the_prefix() -> None:
+    """A header carrying only the prefix (empty after strip) fails closed.
+
+    ``accounts.google.com:`` with no email is malformed; it must reject
+    (``None`` → 401), never authenticate as an empty-string identity
+    that requests could then share.
+    """
+    provider = UnifiedAuthProvider(
+        source="header",
+        header_name=_IAP_HEADER,
+        header_strip_prefix=_IAP_PREFIX,
+        local_single_user=False,
+    )
+    request = _mock_request(headers={_IAP_HEADER: _IAP_PREFIX})
+    assert provider.get_user_id(request) is None
+
+
+def test_header_source_rejects_reserved_name_behind_prefix() -> None:
+    """Reserved-name rejection applies AFTER stripping.
+
+    Otherwise ``accounts.google.com:local`` would slip past the
+    reserved check (it isn't literally ``"local"``) and then strip down
+    to the reserved ``"local"`` sentinel — letting a client impersonate
+    it through the namespaced header.
+    """
+    provider = UnifiedAuthProvider(
+        source="header",
+        header_name=_IAP_HEADER,
+        header_strip_prefix=_IAP_PREFIX,
+    )
+    request = _mock_request(headers={_IAP_HEADER: f"{_IAP_PREFIX}local"})
+    assert provider.get_user_id(request) is None
+
+
+def test_header_source_resolves_strip_prefix_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``header_strip_prefix=None`` resolves from the env var.
+
+    The deploy path configures the prefix via
+    ``OMNIGENT_AUTH_HEADER_STRIP_PREFIX``, not a constructor argument —
+    this pins the env-resolution path IAP deployments rely on.
+    """
+    monkeypatch.setenv("OMNIGENT_AUTH_HEADER", _IAP_HEADER)
+    monkeypatch.setenv("OMNIGENT_AUTH_HEADER_STRIP_PREFIX", _IAP_PREFIX)
+    provider = UnifiedAuthProvider(source="header")
+    request = _mock_request(headers={_IAP_HEADER: f"{_IAP_PREFIX}alice@example.com"})
+    assert provider.get_user_id(request) == "alice@example.com"
+
+
+def test_resolve_auth_header_strip_prefix_defaults_to_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset/whitespace ``OMNIGENT_AUTH_HEADER_STRIP_PREFIX`` → ``""``.
+
+    The default must strip nothing so every existing header-mode deploy
+    (none of which set this) keeps passing the header value through
+    verbatim.
+    """
+    monkeypatch.delenv("OMNIGENT_AUTH_HEADER_STRIP_PREFIX", raising=False)
+    assert resolve_auth_header_strip_prefix() == ""
+    monkeypatch.setenv("OMNIGENT_AUTH_HEADER_STRIP_PREFIX", "   ")
+    assert resolve_auth_header_strip_prefix() == ""
 
 
 # ── UnifiedAuthProvider (oidc source) ────────────────────────────

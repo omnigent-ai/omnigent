@@ -99,6 +99,14 @@ interface SessionResponseWire {
    * other carrier and it's absent for those.
    */
   host_id?: string | null;
+  /**
+   * Whether this session is bound to a dormant managed host the server can
+   * wake in place (its sandbox provider supports resume). Read only when the
+   * host is offline, to tell a recoverable "asleep" state (send a message —
+   * the server resumes the sandbox) from the terminal host_offline dead-end.
+   * Absent/`false` for non-managed/non-resumable hosts.
+   */
+  host_resumable?: boolean;
   status: SessionStatus;
   created_at: number;
   /**
@@ -250,6 +258,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     agentName: wire.agent_name ?? null,
     runnerId: wire.runner_id,
     hostId: wire.host_id ?? null,
+    hostResumable: wire.host_resumable ?? false,
     status: wire.status,
     createdAt: wire.created_at,
     title: wire.title ?? null,
@@ -406,6 +415,49 @@ export async function createSession(
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+/**
+ * Create a session with an inline agent bundle via multipart
+ * `POST /v1/sessions`.
+ *
+ * The server creates a session-scoped agent from the uploaded bundle
+ * (a `.tar.gz` containing `config.yaml` and optionally `AGENTS.md`)
+ * and binds it to the new session in one atomic operation. Session
+ * metadata (host, workspace, labels, etc.) is sent as a JSON string
+ * in the `metadata` form part.
+ *
+ * @param bundle - The agent bundle as a `File` (`.tar.gz`).
+ * @param metadata - Session-level metadata (host_id, workspace, labels, etc.).
+ * @returns The created session's id.
+ */
+export async function createBundledSession(
+  bundle: File,
+  metadata: {
+    host_id?: string;
+    host_type?: string;
+    workspace?: string;
+    labels?: Record<string, string>;
+    terminal_launch_args?: string[];
+    git?: { branch_name: string; base_branch?: string };
+  } = {},
+): Promise<{ id: string }> {
+  const form = new FormData();
+  form.append("metadata", JSON.stringify(metadata));
+  form.append("bundle", bundle);
+  const res = await authenticatedFetch("/v1/sessions", {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to create bundled session: ${res.status} ${text}`);
+  }
+  // The multipart response uses `session_id` (CreatedSessionResponse),
+  // while the JSON path uses `id` (SessionResponse). Normalize to `id`
+  // so callers don't need to care which path was taken.
+  const body = (await res.json()) as { session_id: string };
+  return { id: body.session_id };
 }
 
 /**

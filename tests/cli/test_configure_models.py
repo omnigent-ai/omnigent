@@ -47,12 +47,14 @@ from omnigent.onboarding import secrets
 from omnigent.onboarding.configure_models import (
     add_menu_options,
     add_menu_options_for_family,
+    build_bedrock_provider_entry,
     credential_label,
     kind_glyph,
     provider_display_name,
 )
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
+    GEMINI_FAMILY,
     OPENAI_FAMILY,
     get_default_provider,
     load_config,
@@ -524,18 +526,21 @@ def test_add_menu_options_ordering() -> None:
     and Databricks sits just above the catch-all "Other". A regression to
     the old interleaved order (or Other above Databricks) fails here.
     """
-    # Full menu: keys, then subscriptions, then Gateway, OpenRouter,
-    # Databricks, Other.
+    # Full menu: first-party keys (OpenAI, Anthropic, Gemini), then
+    # subscriptions, then Gateway, OpenRouter, Databricks, Other.
     full = [o.label.split(None, 1)[1] for o in add_menu_options()]
     assert full == [
         "OpenAI — API key",
         "Anthropic — API key",
+        "Gemini — API key",
         "ChatGPT — subscription",
         "Claude — subscription (Pro/Max)",
         "Gateway — custom base URL + key (e.g. OpenRouter)",
         "OpenRouter — API key",
         "Databricks — workspace",
         "Other provider — API key",
+        # Bedrock is appended last so it never shifts the established order.
+        "AWS Bedrock — API key",
     ]
 
     # Codex (openai) scoped: API key, subscription, Gateway, OpenRouter,
@@ -559,7 +564,14 @@ def test_add_menu_options_ordering() -> None:
         "Claude — subscription (Pro/Max)",
         "Gateway — custom base URL + key (e.g. OpenRouter)",
         "Databricks — workspace",
+        "AWS Bedrock — API key",
     ]
+
+    # Gemini (antigravity) scoped: API key only — Gemini is key-only (no
+    # subscription/gateway/Databricks), and it must NOT appear in the
+    # openai-family "Other provider" catch-all (asserted via `codex` above).
+    gemini = [o.label.split(None, 1)[1] for o in add_menu_options_for_family(GEMINI_FAMILY)]
+    assert gemini == ["Gemini — API key"]
 
 
 def test_add_menu_databricks_option_gated_on_extra(monkeypatch) -> None:
@@ -2469,3 +2481,82 @@ def test_configure_harnesses_add_other_key_no_remaining_providers_aborts_cleanly
     assert result.exit_code == 0, result.output
     assert result.exception is None, result.exception
     assert "No other API-key providers" in result.output
+
+
+def test_build_bedrock_provider_entry_shape() -> None:
+    """`build_bedrock_provider_entry` produces a kind: bedrock / anthropic body."""
+    entry = build_bedrock_provider_entry(
+        base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+        api_key_ref="env:AWS_BEARER_TOKEN_BEDROCK",
+        default_model="us.anthropic.claude-opus-4-5-20251101-v1:0",
+    )
+    assert entry == {
+        "kind": "bedrock",
+        "anthropic": {
+            "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "api_key_ref": "env:AWS_BEARER_TOKEN_BEDROCK",
+            "models": {"default": "us.anthropic.claude-opus-4-5-20251101-v1:0"},
+        },
+    }
+
+
+def test_configure_models_add_bedrock_writes_entry_and_secret(
+    isolated_config, monkeypatch
+) -> None:
+    """Adding 'AWS Bedrock — API key' from the Claude menu writes a kind: bedrock entry.
+
+    Drives the new interactive path: Claude harness → +Add → 'AWS Bedrock —
+    API key' (last in the Claude-scoped menu) → name, base_url, pasted bearer
+    token, Bedrock model id. Asserts the persisted ``kind: bedrock`` body, the
+    keychain secret, and that it auto-becomes the anthropic default. A
+    regression means the setup menu can't create a bedrock provider — the gap
+    this closes.
+    """
+    # No exported token → the paste→keychain path (deterministic prompts).
+    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+    # L1 1=Claude → L2 1=+Add → Claude menu 5='AWS Bedrock — API key'
+    # (1=Anthropic key, 2=Claude sub, 3=Gateway, 4=Databricks, 5=Bedrock) →
+    # name; base_url; pasted key; default model → L2 q=back → L1 q=exit.
+    stdin = (
+        "\n".join(
+            [
+                "1",
+                "1",
+                "5",
+                "mybr",
+                "https://bedrock-runtime.us-east-1.amazonaws.com",
+                "absk-test",
+                "us.anthropic.claude-opus-4-5-20251101-v1:0",
+                "q",
+                "q",
+            ]
+        )
+        + "\n"
+    )
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    entry = cfg["providers"]["mybr"]
+    assert entry["kind"] == "bedrock"
+    assert entry["anthropic"]["base_url"] == "https://bedrock-runtime.us-east-1.amazonaws.com"
+    assert entry["anthropic"]["api_key_ref"] == "keychain:mybr"
+    assert entry["anthropic"]["models"]["default"] == "us.anthropic.claude-opus-4-5-20251101-v1:0"
+    assert secrets.load_secret("mybr") == "absk-test"
+    # A bedrock provider serves the anthropic surface, so it auto-claims the
+    # (previously empty) Claude default.
+    assert get_default_provider(cfg, "anthropic").name == "mybr"
+
+
+def test_credential_label_bedrock_not_duplicated() -> None:
+    """A bedrock credential reads 'AWS Bedrock', never 'Bedrock Bedrock'.
+
+    The entry name is user-chosen (the default is 'bedrock'); naming the
+    credential after the provider id used to render 'Bedrock Bedrock'. The
+    generic default collapses to 'AWS Bedrock'; a custom name is qualified.
+    """
+    from omnigent.onboarding.configure_models import credential_label
+    from omnigent.onboarding.provider_config import BEDROCK_KIND
+
+    assert credential_label(BEDROCK_KIND, "bedrock") == "AWS Bedrock"
+    assert credential_label(BEDROCK_KIND, "nexus") == "AWS Bedrock (nexus)"

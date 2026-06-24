@@ -1788,6 +1788,27 @@ def test_evaluate_policy_non_tool_call_phases_fail_open_on_error(
     assert captured.out == ""
 
 
+def test_build_hook_settings_omits_apikeyhelper_when_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``None`` api_key_helper writes no ``apiKeyHelper`` (the Bedrock path).
+
+    ``ClaudeNativeUcodeConfig.api_key_helper`` is now Optional and the Bedrock
+    config returns ``None`` (Bedrock authenticates from AWS_BEARER_TOKEN_BEDROCK,
+    not an apiKeyHelper). The settings writer must omit the key for ``None`` and
+    never write the string ``"None"`` — a regression to an unconditional
+    assignment would also corrupt the existing key/gateway/local flows.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_test", workspace=tmp_path)
+
+    assert "apiKeyHelper" not in build_hook_settings(bridge_dir, api_key_helper=None)
+    with_helper = build_hook_settings(bridge_dir, api_key_helper="printf tok")
+    assert with_helper["apiKeyHelper"] == "printf tok"
+
+
 def test_evaluate_policy_retries_5xx_and_succeeds(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

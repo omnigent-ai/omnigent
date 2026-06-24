@@ -83,7 +83,7 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
     assert fam["claude_code"] == "claude-native"
     assert fam["codex"] == "codex-native"
     assert fam["pi"] == "pi"
-    # Three distinct vendors → any diff is always reviewable by another.
+    # Three distinct vendors → any implementer's diff is reviewable by another.
     assert len(set(fam.values())) == 3
     for name in ("claude_code", "codex", "pi"):
         prompt = (_POLLY_BUNDLE / "agents" / name / "config.yaml").read_text(encoding="utf-8")
@@ -388,6 +388,6 @@ def test_function_policies_have_nonempty_arguments(polly_spec: AgentSpec) -> Non
             )
             checked += 1
     # orchestrator: blast_radius + spawn_bounds + headless_subagent_purpose_guard
-    # = 3; sub-agents: blast_radius x3 (claude_code, codex, pi) = 3 -> 6 total.
-    # Fewer = a policy dropped.
+    # = 3; sub-agents: blast_radius x3 (claude_code, codex, pi) = 3
+    # -> 6 total. Fewer = a policy dropped.
     assert checked == 6, f"expected 6 function policies in the bundle, inspected {checked}"

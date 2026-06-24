@@ -31,6 +31,8 @@ import pytest
 from tests import _model_pools
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.conftest import (  # noqa: F401  (re-exported pytest fixtures)
+    _enforce_min_runner_version,
+    _enforce_min_server_version,
     create_runner_bound_session,
     databricks_workspace_host,
     http_client,
@@ -40,6 +42,7 @@ from tests.e2e.conftest import (  # noqa: F401  (re-exported pytest fixtures)
     mock_llm_server_url,
     register_inline_agent,
     reset_mock_llm,
+    server_version,
     using_mock_llm,
 )
 from tests.integration.model_selection import resolve_default_model

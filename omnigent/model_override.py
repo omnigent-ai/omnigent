@@ -26,7 +26,17 @@ _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]*$")
 # SDK harnesses whose model override lands in the spawn env — must stay
 # in sync with ``_HARNESS_MODEL_ENV_KEY`` in ``omnigent/runner/app.py``.
 _SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
-    {"claude-sdk", "codex", "pi", "openai-agents", "cursor", "antigravity"}
+    {
+        "claude-sdk",
+        "codex",
+        "pi",
+        "openai-agents",
+        "cursor",
+        "antigravity",
+        "qwen",
+        "goose",
+        "copilot",
+    }
 )
 
 
@@ -81,7 +91,15 @@ _CODEX_FAMILY_HARNESSES: frozenset[str] = frozenset({"codex", "codex-native", "n
 # dispatch gate instead of leaking a ``HARNESS_ANTIGRAVITY_MODEL`` the SDK can
 # never route.
 _ANTIGRAVITY_FAMILY_HARNESSES: frozenset[str] = frozenset(
-    {"antigravity", "agy", "google-antigravity"}
+    {
+        "antigravity",
+        "agy",
+        "google-antigravity",
+        # The native agy TUI bridge is equally Gemini-native (it drives the
+        # same Gemini-backed ``agy`` runtime), so it shares the reject-list.
+        "antigravity-native",
+        "native-antigravity",
+    }
 )
 # A ``databricks-`` gateway prefix marks an id bound to the Databricks gateway,
 # which antigravity never reaches — a definitive mismatch on its own.

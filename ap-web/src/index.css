@@ -99,6 +99,43 @@
  * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
  * describes the older cobalt direction). */
 :root {
+  /* ---- Inset system -------------------------------------------------------
+   * Single source of truth for how far content must stay clear of screen
+   * chrome. The SAME bundle runs in a browser, in Electron, and inside the
+   * iOS WKWebView shell, so these variables are defined universally and the
+   * runtime-specific inputs default to zero — `<PageScroll>` and the scoped
+   * rules below consume them without any `isIOSShell()` branching.
+   *
+   * Three inputs combine:
+   *   1. OS safe area  — `env(safe-area-inset-*)`, nonzero only on notched /
+   *      home-indicator devices (and only when `viewport-fit=cover`).
+   *   2. Native bar footprint — the pixel height of the iOS shell's floating
+   *      server switcher (top) and chat/terminal bar (bottom). The native
+   *      layer owns these dimensions and pushes them over the bridge (see
+   *      src/lib/nativeInsets.ts); they stay 0 off-shell.
+   *   3. Bar visibility — 0|1, owned by the web app (it is what tells the
+   *      shell to show/hide each bar). Folded in via a unitless multiply so a
+   *      hidden bar contributes nothing.
+   *
+   * The bottom chat/terminal bar overlays page content, so it feeds the
+   * content inset. The top server switcher floats within the web header band
+   * (ChatHeader, --omnigent-header-height) and is narrower than it, so content
+   * that already clears the header also clears the switcher — its size is
+   * tracked here for symmetry/introspection but is intentionally NOT added to
+   * the content top inset to avoid double-counting the header band. */
+  --omnigent-header-height: 3.5rem; /* web ChatHeader (h-14) */
+  --omnigent-safe-top: env(safe-area-inset-top, 0px);
+  --omnigent-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --omnigent-native-top-bar: 0px; /* set by native bridge (px) */
+  --omnigent-native-bottom-bar: 0px; /* set by native bridge (px) */
+  --omnigent-top-bar-visible: 0; /* web-owned 0|1 */
+  --omnigent-bottom-bar-visible: 0; /* web-owned 0|1 */
+  --omnigent-inset-top: var(--omnigent-safe-top);
+  --omnigent-inset-bottom: calc(
+    var(--omnigent-safe-bottom) + var(--omnigent-native-bottom-bar) *
+      var(--omnigent-bottom-bar-visible)
+  );
+
   /* Brand palette (light). Hex values are the brand spec, kept verbatim
      * for fidelity. --background is white: the lavender brand canvas is
      * expressed by the .app-shell gradient (see index.css .app-shell), so
@@ -401,6 +438,201 @@
 [data-electron-mac] :is(a, button, input, textarea, [role="button"]) {
   -webkit-app-region: no-drag;
 }
+
+/* iOS native shell (SwiftUI/WKWebView) runs the webview full-screen under the
+ * system status bar and home indicator. Keep the web app visually full-bleed,
+ * but move interactive mobile chrome out of unsafe areas. Scoped to the native
+ * bridge marker so normal iOS Safari keeps its existing browser-safe layout. */
+@media (width < 48rem) {
+  [data-ios-native].app-shell {
+    /* Lock the shell to the live visual viewport so the soft keyboard can never
+       pan the whole document (which hides the header). --omnigent-viewport-
+       height is published by useIOSViewportLock from visualViewport.height; it
+       shrinks when the keyboard opens so inputs stay above it and only inner
+       panes scroll. Falls back to the large viewport before JS runs / on older
+       WebKit. The two-line pattern keeps the lvh fallback for browsers without
+       the var. */
+    height: 100lvh;
+    height: var(--omnigent-viewport-height, 100lvh);
+    min-height: 100lvh;
+    min-height: var(--omnigent-viewport-height, 100lvh);
+    max-height: 100lvh;
+    max-height: var(--omnigent-viewport-height, 100lvh);
+    overflow: hidden;
+  }
+
+  /* Slide animation for the mobile drawer. Covers BOTH paths that move the
+     panel: the edge-swipe drag settles via an inline `transform`, while the
+     button toggle (and the drag's resting open/closed state) is driven by
+     Tailwind v4's `translate-x` utilities — which animate the `translate`
+     property, not `transform`. Listing only `transform` (as before) left the
+     toggle un-transitioned, so tapping the collapse/expand button snapped the
+     drawer instantly with no animation. Transition both so the toggle slides
+     too. Suppressed inline (`transition: none`) while a drag is live so the
+     overlay tracks the finger 1:1. */
+  [data-ios-native] .conversations-sidebar {
+    transition-property: transform, translate;
+    transition-duration: 360ms;
+    transition-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
+    will-change: transform, translate;
+  }
+
+  /* Leading-edge shadow so the drawer reads as a native layer lifted above the
+     chat while it slides, instead of a flat sheet. Scoped to the open/dragging
+     state via `:not([data-collapsed])` (the sidebar sets `data-collapsed` only
+     when closed) so the full-bleed overlay doesn't cast a sliver along the
+     screen's left edge while parked off-screen. It's visible only mid-slide and
+     mid-drag — fully open the drawer covers the viewport, so its right edge (and
+     the shadow) sit past the screen. iOS-only: the web overlay is unchanged. */
+  [data-ios-native] .conversations-sidebar:not([data-collapsed]) {
+    box-shadow: 8px 0 28px -6px rgb(0 0 0 / 0.22);
+  }
+
+  .dark [data-ios-native] .conversations-sidebar:not([data-collapsed]) {
+    box-shadow: 8px 0 30px -4px rgb(0 0 0 / 0.55);
+  }
+
+  [data-ios-native] :is(input, textarea, select, [contenteditable="true"]) {
+    font-size: 16px;
+  }
+
+  [data-ios-native] .chat-header {
+    top: max(0px, calc(env(safe-area-inset-top, 0px) - 0.5rem));
+  }
+
+  [data-ios-native] .chat-conversation-content {
+    /* header band + 1.5rem breathing room + OS safe area, sourced from the
+       shared inset vars (was a hardcoded 5rem). */
+    padding-top: calc(var(--omnigent-header-height) + 1.5rem + var(--omnigent-inset-top));
+  }
+
+  [data-ios-native] .main-terminal-view {
+    padding-top: calc(3.25rem + var(--omnigent-inset-top));
+  }
+
+  [data-ios-native] .chat-scroll-fade {
+    mask-image: linear-gradient(
+      to bottom,
+      transparent calc(48px + var(--omnigent-inset-top)),
+      black calc(80px + var(--omnigent-inset-top))
+    );
+    -webkit-mask-image: linear-gradient(
+      to bottom,
+      transparent calc(48px + var(--omnigent-inset-top)),
+      black calc(80px + var(--omnigent-inset-top))
+    );
+  }
+
+  [data-ios-native] .chat-composer-form {
+    padding-bottom: calc(0.75rem + var(--omnigent-safe-bottom));
+  }
+
+  [data-ios-native] .chat-composer-form.terminal-first-composer-form {
+    padding-bottom: 0.25rem;
+  }
+
+  [data-ios-native] .terminal-first-switcher-container {
+    padding-bottom: calc(0.35rem + var(--omnigent-safe-bottom));
+  }
+
+  /* Reserve room for the native Liquid Glass switcher that floats over the web
+     view (the in-page pill is suppressed in the iOS shell). Height is the
+     shared bottom inset — the native bar footprint (sourced from the shell, see
+     nativeInsets.ts) plus the home-indicator safe area — so it can never drift
+     from the bar's real size. Chat sits 1rem tighter: its composer status line
+     already cushions the gap to the bar. */
+  [data-ios-native] .omnigent-native-bottom-spacer {
+    height: var(--omnigent-inset-bottom);
+    flex: none;
+  }
+
+  [data-ios-native] .omnigent-native-bottom-spacer--chat {
+    height: calc(var(--omnigent-inset-bottom) - 1rem);
+  }
+
+  [data-ios-native] .terminal-first-switcher {
+    min-height: 46px;
+    gap: 0.25rem;
+    padding: 0.25rem;
+    border-color: color-mix(in srgb, var(--border) 72%, transparent);
+    background: color-mix(in srgb, var(--card) 88%, transparent);
+    -webkit-backdrop-filter: saturate(180%) blur(18px);
+    backdrop-filter: saturate(180%) blur(18px);
+    box-shadow:
+      0 12px 28px rgb(0 0 0 / 0.13),
+      0 1px 0 rgb(255 255 255 / 0.55) inset;
+    font-size: 16px;
+    line-height: 1;
+  }
+
+  [data-ios-native] .terminal-first-switcher > div {
+    gap: 0.25rem;
+  }
+
+  [data-ios-native] .terminal-first-switcher-option {
+    min-height: 38px;
+    gap: 0.45rem;
+    padding: 0 0.85rem;
+    font-size: 16px;
+    font-weight: 500;
+    letter-spacing: 0;
+    transition:
+      background-color 160ms ease,
+      color 160ms ease,
+      box-shadow 160ms ease,
+      transform 160ms ease;
+  }
+
+  [data-ios-native] .terminal-first-switcher-option:active:not(:disabled) {
+    transform: scale(0.97);
+  }
+
+  [data-ios-native] .terminal-first-switcher-option[aria-pressed="true"] {
+    background: color-mix(in srgb, var(--background) 82%, white 18%);
+    box-shadow:
+      0 3px 10px rgb(0 0 0 / 0.1),
+      0 1px 0 rgb(255 255 255 / 0.72) inset;
+  }
+
+  [data-ios-native] .terminal-first-switcher-option svg {
+    width: 1.15rem;
+    height: 1.15rem;
+  }
+
+  .dark [data-ios-native] .terminal-first-switcher {
+    border-color: color-mix(in srgb, var(--border) 82%, transparent);
+    background: color-mix(in srgb, var(--card) 78%, transparent);
+    box-shadow:
+      0 14px 30px rgb(0 0 0 / 0.35),
+      0 1px 0 rgb(255 255 255 / 0.1) inset;
+  }
+
+  .dark [data-ios-native] .terminal-first-switcher-option[aria-pressed="true"] {
+    background: color-mix(in srgb, var(--muted) 82%, white 6%);
+    box-shadow:
+      0 3px 12px rgb(0 0 0 / 0.28),
+      0 1px 0 rgb(255 255 255 / 0.12) inset;
+  }
+
+  [data-ios-native]
+    :is(
+      .conversations-sidebar,
+      [data-testid="file-viewer"],
+      [data-testid="files-panel-drawer"],
+      [data-testid="terminals-panel"],
+      [data-testid="subagents-panel-drawer"],
+      [data-testid="todos-panel-drawer"]
+    ) {
+    padding-top: var(--omnigent-safe-top);
+    padding-bottom: var(--omnigent-safe-bottom);
+  }
+}
+
+@media (width < 48rem) and (prefers-reduced-motion: reduce) {
+  [data-ios-native] .conversations-sidebar {
+    transition-duration: 1ms;
+  }
+}
 /* Share button — glassy pink effect (both modes). The vertical
  * gradient alone does the embossed work (lighter top = light catch,
  * darker bottom = shadow, simulating a convex surface lit from above);
@@ -503,6 +735,27 @@
   font-size: 0.875em;
 }
 
+/* Word-wrap toggle for chat code blocks (see ChatCodeBlockPre in message.tsx).
+ * Streamdown renders the body with `overflow-x-auto` and the <code> with
+ * `white-space: pre`, so long lines scroll horizontally. When `.chat-code-wrap`
+ * is set we soft-wrap instead so everything fits the column width. */
+.chat-code-wrap [data-streamdown="code-block-body"] {
+  overflow-x: hidden;
+}
+.chat-code-wrap [data-streamdown="code-block-body"] pre,
+.chat-code-wrap [data-streamdown="code-block-body"] code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Hang-indent wrapped continuation lines past the line-number gutter so they
+ * align with the code, not under the numbers. Gutter = before:w-6 (1.5rem) +
+ * before:mr-4 (1rem) = 2.5rem; the negative text-indent pulls the first line
+ * (and its ::before number) back to the left edge. */
+.chat-code-wrap [data-streamdown="code-block-body"] code > span {
+  padding-left: 2.5rem;
+  text-indent: -2.5rem;
+}
+
 /* Streamdown's <button> link-safety-modal variant and wrap-anywhere reset can
  * leave the default arrow cursor on links — force pointer to signal affordance. */
 [data-streamdown="link"] {
@@ -521,6 +774,22 @@
 }
 [data-streamdown="heading-4"] {
   font-size: 1em;
+}
+
+/* GitHub task lists in chat messages (Streamdown + remark-gfm). remark-gfm tags
+   each task item `task-list-item` with a disabled <input type="checkbox">, but
+   Streamdown also applies Tailwind `list-disc`, so a disc renders right next to
+   the checkbox (bullet + checkbox). Drop the marker per ITEM (not on the whole
+   `.contains-task-list` list) so a list mixing task and plain items only loses
+   the bullet on the task items — matching GitHub. `list-style-type` is
+   inherited, so setting it on the <li> overrides the list's `list-disc`. Space
+   the checkbox from its label. */
+[data-streamdown="list-item"].task-list-item {
+  list-style: none;
+}
+[data-streamdown="list-item"].task-list-item > input[type="checkbox"] {
+  margin-right: 0.4em;
+  vertical-align: -0.075em;
 }
 
 /* Flash highlight on nav jump. Duration must match FLASH_DURATION_MS in chatStore.ts. */

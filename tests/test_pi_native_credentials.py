@@ -183,3 +183,124 @@ def test_provider_launch_returns_env_and_args(tmp_path: Path) -> None:
     assert env == {creds.PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
     assert args == ["--provider", "omnigent", "--model", "claude-sonnet-4-6"]
     assert (agent_dir / "models.json").exists()
+
+
+def test_openai_chat_wire_api_resolves_to_completions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An OpenAI family with wire_api: chat → openai-completions API.
+
+    This tests the fix for the DeepInfra bug where pi-native was ignoring
+    the wire_api setting and always using openai-responses. Providers like
+    DeepInfra implement Chat Completions (/v1/openai/chat/completions) but
+    not the Responses API (/v1/openai/responses returns 404).
+    """
+    # Set a fake API key in the environment for testing
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-deepinfra-key")
+
+    config = {
+        "providers": {
+            "deepinfra": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "https://api.deepinfra.com/v1/openai",
+                    "api_key": "$OPENAI_API_KEY",
+                    "wire_api": "chat",
+                    "models": {"default": "zai-org/GLM-4.7"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    # wire_api: chat should resolve to openai-completions, not openai-responses
+    assert provider.api == "openai-completions", (
+        f"Expected openai-completions but got {provider.api} "
+        f"(wire_api:chat should use chat completions API, not responses)"
+    )
+    assert provider.base_url == "https://api.deepinfra.com/v1/openai"
+    assert provider.model == "zai-org/GLM-4.7"
+    assert provider.api_key == "sk-test-deepinfra-key"  # Resolved from environment
+    assert provider.auth_header is False
+
+
+def test_openai_responses_wire_api_default() -> None:
+    """An OpenAI family without wire_api (or wire_api: responses) → openai-responses API.
+
+    When wire_api is not set or set to "responses", the default behavior
+    should be to use the OpenAI Responses API.
+    """
+    config = {
+        "providers": {
+            "openai-gateway": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "sk-test",
+                    "models": {"default": "gpt-4o"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    # Default (no wire_api) should use openai-responses
+    assert provider.api == "openai-responses"
+    assert provider.base_url == "https://api.openai.com/v1"
+    assert provider.model == "gpt-4o"
+
+
+def test_openai_responses_wire_api_explicit() -> None:
+    """An OpenAI family with wire_api: responses → openai-responses API.
+
+    When wire_api is explicitly set to "responses", it should use the
+    OpenAI Responses API.
+    """
+    config = {
+        "providers": {
+            "openai-gateway": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "responses",
+                    "models": {"default": "gpt-4o"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    # Explicit wire_api: responses should use openai-responses
+    assert provider.api == "openai-responses"
+    assert provider.base_url == "https://api.openai.com/v1"
+    assert provider.model == "gpt-4o"
+
+
+def test_anthropic_family_ignores_wire_api() -> None:
+    """The Anthropic family always uses anthropic-messages, ignoring wire_api.
+
+    The wire_api setting is only meaningful for the OpenAI family.
+    """
+    config = {
+        "providers": {
+            "anthropic": {
+                "kind": "key",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",  # Should be ignored for Anthropic
+                    "models": {"default": "claude-4"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    # Anthropic should always use anthropic-messages, not affected by wire_api
+    assert provider.api == "anthropic-messages"
+    assert provider.base_url == "https://api.anthropic.com"
+    assert provider.model == "claude-4"
+    assert provider.api_key == "sk-test"

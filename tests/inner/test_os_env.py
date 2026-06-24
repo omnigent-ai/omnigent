@@ -8,7 +8,11 @@ from pathlib import Path
 
 from omnigent.inner.os_env import _read_impl, build_helper_env
 from omnigent.inner.sandbox import SandboxPolicy
-from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
+from omnigent.runner.identity import (
+    OMNIGENT_SESSION_ENV_VALUE,
+    OMNIGENT_SESSION_ENV_VAR,
+    RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+)
 
 
 def _inactive_policy() -> SandboxPolicy:
@@ -85,6 +89,26 @@ def test_build_helper_env_active_drops_binding_token() -> None:
     assert RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR not in env
     assert "bug-binding-token-secret" not in env.values()
     assert env["PATH"] == "/usr/bin"  # PATH is in the default allowlist
+
+
+def test_build_helper_env_active_passes_omnigent_session_marker() -> None:
+    """The ``OMNIGENT`` session marker survives the active allowlist.
+
+    The marker (set once on the runner process) must reach an agent's
+    sandboxed shell so code running there can detect it is inside an
+    Omnigent session, the way ``CLAUDE_CODE`` / ``CODEX`` are visible in
+    their own agents' shells.
+
+    :returns: None.
+    """
+    parent = {
+        "PATH": "/usr/bin",
+        OMNIGENT_SESSION_ENV_VAR: OMNIGENT_SESSION_ENV_VALUE,
+    }
+
+    env = build_helper_env(parent, _active_policy())
+
+    assert env[OMNIGENT_SESSION_ENV_VAR] == OMNIGENT_SESSION_ENV_VALUE
 
 
 # ---------------------------------------------------------------------------

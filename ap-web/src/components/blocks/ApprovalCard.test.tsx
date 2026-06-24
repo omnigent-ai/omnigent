@@ -208,6 +208,128 @@ describe("ApprovalCard — accept & allow all edits", () => {
   });
 });
 
+describe("ApprovalCard — approve & don't ask again (persistent allow rule)", () => {
+  beforeEach(() => {
+    useChatStore.setState({ conversationId: "conv_abc", blocks: [] });
+  });
+
+  it("labels the remember button by the WebFetch host and hides it without the hint", () => {
+    // The server stamps ``remember_scope`` only for non-edit tools.
+    // For WebFetch the button names the domain so the user knows the
+    // rule is domain-scoped, not tool-wide.
+    const { rerender } = render(
+      <ApprovalCard
+        elicitationId="elic_wf"
+        message="Claude wants to call **WebFetch**"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview='WebFetch({"url": "https://github.com/a/b"})'
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        rememberScope={{ tool: "WebFetch", host: "github.com" }}
+      />,
+    );
+    const rememberButton = screen.getByRole("button", {
+      name: /don't ask again for github\.com/i,
+    });
+    expect(rememberButton).toBeDefined();
+    // The tooltip spells out the (session-scoped) domain grant.
+    expect(rememberButton.getAttribute("title")).toBe(
+      "Won't ask again for github.com for the rest of this session",
+    );
+    expect(screen.getByRole("button", { name: /^approve$/i })).toBeDefined();
+    expect(screen.getByRole("button", { name: /reject/i })).toBeDefined();
+
+    // No hint (edit tool / ExitPlanMode / AskUserQuestion) → no button.
+    rerender(
+      <ApprovalCard
+        elicitationId="elic_edit"
+        message="Claude wants to call **Edit**"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview="Edit({})"
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
+    );
+    expect(screen.queryByTestId("approval-card-remember")).toBeNull();
+  });
+
+  it("labels the remember button by the tool name for a tool-wide scope", () => {
+    // Non-WebFetch tools get a tool-wide scope (no host), so the
+    // button names the tool instead of a domain.
+    render(
+      <ApprovalCard
+        elicitationId="elic_bash"
+        message="Claude wants to call **Bash**"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview="Bash({})"
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        rememberScope={{ tool: "Bash" }}
+      />,
+    );
+    const rememberButton = screen.getByRole("button", { name: /don't ask again for Bash/i });
+    expect(rememberButton).toBeDefined();
+    // Tool-wide grant is broader than a domain — the tooltip says "any".
+    expect(rememberButton.getAttribute("title")).toBe(
+      "Won't ask again for any Bash call for the rest of this session",
+    );
+  });
+
+  it("submits {action: 'accept', content: {remember: true}} on click", () => {
+    // The server reads ``content.remember`` to emit the ``addRules``
+    // permission update; it re-derives the scope itself, so the client
+    // sends only the flag.
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
+
+    render(
+      <ApprovalCard
+        elicitationId="elic_wf_click"
+        message="Claude wants to call **WebFetch**"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview='WebFetch({"url": "https://github.com/a/b"})'
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        rememberScope={{ tool: "WebFetch", host: "github.com" }}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("approval-card-remember"));
+
+    expect(submitSpy).toHaveBeenCalledWith("elic_wf_click", "accept", {
+      remember: true,
+    });
+  });
+
+  it("renders the won't-ask-again label in the responded state", () => {
+    render(
+      <ApprovalCard
+        elicitationId="elic_wf_done"
+        message="Claude wants to call **WebFetch**"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview='WebFetch({"url": "https://github.com/a/b"})'
+        requestedSchema={{}}
+        status="responded"
+        response={{ action: "accept", content: { remember: true } }}
+        rememberScope={{ tool: "WebFetch", host: "github.com" }}
+      />,
+    );
+
+    expect(screen.getByText(/won't ask again for github\.com/i)).toBeDefined();
+  });
+});
+
 describe("ApprovalCard — multi-choice options", () => {
   beforeEach(() => {
     useChatStore.setState({
@@ -499,6 +621,37 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     );
 
     expect(screen.getByText("Codex needs input")).toBeDefined();
+    expect(screen.queryByText("Claude has questions")).toBeNull();
+  });
+
+  it("labels Antigravity structured input prompts as Antigravity prompts", () => {
+    // Antigravity (agy) reuses the same AskUserQuestion renderer via the
+    // ``ask_user_question`` extra, so the title must reflect the producer
+    // rather than defaulting to "Claude has questions".
+    render(
+      <ApprovalCard
+        elicitationId="elic_agy_label"
+        message="Antigravity needs your input"
+        phase="agy_ask_question"
+        policyName="agy_native_ask_question"
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        askUserQuestion={{
+          questions: [
+            {
+              id: "0",
+              question: "What type of project?",
+              options: [{ label: "Web app" }, { label: "CLI tool" }],
+              multiSelect: false,
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Antigravity needs your input")).toBeDefined();
     expect(screen.queryByText("Claude has questions")).toBeNull();
   });
 

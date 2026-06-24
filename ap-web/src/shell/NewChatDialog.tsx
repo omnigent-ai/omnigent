@@ -44,11 +44,11 @@ import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import { BUILTIN_AGENTS, sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
 import {
   isNativeCodingAgent,
   nativeAgentHasCapability,
-  nativeAgentSortRank,
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
 import { useHosts, type Host } from "@/hooks/useHosts";
@@ -58,6 +58,7 @@ import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
+import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { Conversation } from "@/hooks/useConversations";
 import { OttoEyes } from "@/components/OttoEyes";
 import { SkillPills } from "@/components/SkillPills";
@@ -65,25 +66,9 @@ import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { IntelligentModelControl, type CostControlMode } from "@/components/CostRoutingControl";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
-
-// Preferred display order for the built-in agent picker. The server
-// returns agents newest-registered first (agent_store.list sorts by
-// created_at desc), so pin the order users expect; any agent not listed
-// here falls after, in server order.
-const AGENT_DISPLAY_ORDER = ["Claude Code", "Codex", "Cursor", "Pi", "Polly", "Debby"];
-
-// Built-in agents (by name slug) — the long-lived agents the server
-// ships out of the box. The picker groups these first, then a divider,
-// then custom (user-registered) agents. GET /v1/agents doesn't yet
-// distinguish the two, so this is a frontend allowlist for now.
-const BUILTIN_AGENTS = new Set([
-  "claude-native-ui", // Claude Code
-  "codex-native-ui", // Codex
-  "pi-native-ui", // Pi
-  "cursor-native-ui", // Cursor
-  "polly",
-  "debby",
-]);
+import { CreateAgentDialog } from "./CreateAgentDialog";
+import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
+import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 
 // Hidden on the new-session picker only (superseded by polly; older
 // deployments still carry a seeded nessie row this filter keeps out).
@@ -689,19 +674,11 @@ export function NewChatLandingScreen() {
   // working directory with a live one (see the conflict tooltip below).
   const { data: directorySessions } = useDirectorySessions(true);
 
-  const agentList = useMemo(() => {
-    const displayRank = (name: string) => {
-      const i = AGENT_DISPLAY_ORDER.indexOf(name);
-      return i === -1 ? AGENT_DISPLAY_ORDER.length : i;
-    };
-    return [...(agents ?? [])]
-      .filter((a) => !NEW_SESSION_HIDDEN_AGENTS.has(a.name))
-      .sort(
-        (a, b) =>
-          nativeAgentSortRank(a) - nativeAgentSortRank(b) ||
-          displayRank(a.display_name) - displayRank(b.display_name),
-      );
-  }, [agents]);
+  const agentList = useMemo(
+    () =>
+      sortAgentsForDisplay((agents ?? []).filter((a) => !NEW_SESSION_HIDDEN_AGENTS.has(a.name))),
+    [agents],
+  );
 
   // Split the picker into built-in agents (shipped out of the box) and
   // custom (user-registered) agents so the menu can group them with a
@@ -714,6 +691,22 @@ export function NewChatLandingScreen() {
     () => agentList.filter((a) => !BUILTIN_AGENTS.has(a.name)),
     [agentList],
   );
+
+  // "Create custom agent" dialog state and pending bundle. When the user
+  // creates a custom agent via the dialog, the bundle input is stored
+  // here and the picker switches to a virtual "pending" agent entry. On
+  // form submit, handleCreate detects the pending bundle, builds the
+  // tar.gz, and uses multipart POST instead of the normal JSON path.
+  const [createAgentOpen, setCreateAgentOpen] = useState(false);
+  const [pendingAgent, setPendingAgent] = useState<AgentBundleInput | null>(null);
+  // Sentinel id for the pending custom agent in the picker dropdown.
+  const PENDING_AGENT_ID = "__pending_custom_agent__";
+
+  // Surface element backing the iOS native server switcher overlay, which
+  // the in-session view shows too — the picker stays reachable while starting
+  // a new session. The hook hides it whenever the sidebar covers the surface.
+  const [landingSurface, setLandingSurface] = useState<HTMLElement | null>(null);
+  useNativeServerSwitcherForMainSurface(landingSurface, true);
 
   const [message, setMessage] = useState<string>("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -880,9 +873,23 @@ export function NewChatLandingScreen() {
 
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
+  // The pending custom agent sentinel also wins when set.
   const effectiveAgentId =
-    (agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ?? null;
-  const selectedAgent = agentList.find((a) => a.id === effectiveAgentId);
+    pickedAgentId === PENDING_AGENT_ID
+      ? PENDING_AGENT_ID
+      : ((agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ??
+        null);
+  const selectedAgent =
+    effectiveAgentId === PENDING_AGENT_ID && pendingAgent
+      ? ({
+          id: PENDING_AGENT_ID,
+          name: pendingAgent.name,
+          display_name: pendingAgent.name,
+          description: pendingAgent.description ?? null,
+          harness: pendingAgent.harness ?? null,
+          skills: [],
+        } satisfies AvailableAgent)
+      : agentList.find((a) => a.id === effectiveAgentId);
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   // Native-terminal agents interpret slash commands inside their own CLI
@@ -1154,58 +1161,88 @@ export function NewChatLandingScreen() {
       const nativeLabels = nativeWrapperLabelsForAgent(agent);
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
-      const res = await authenticatedFetch("/v1/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          agent_id: effectiveAgentId,
-          // Managed (cloud sandbox) creates let the server provision the
-          // host: the schema rejects host_id and path workspaces (and git
-          // needs a host_id). The optional repository inputs compose into
-          // the URL-form workspace the server clones; undefined (no repo)
-          // is dropped by JSON.stringify.
-          ...(sandboxSelected
-            ? {
-                host_type: "managed",
-                workspace: composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch),
-              }
-            : {
-                host_id: selectedHostId,
-                workspace: workspaceTrimmed,
-                git: trimmedBranch
-                  ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
+
+      let data: { id: string };
+
+      if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
+        // Custom agent path: build bundle client-side and use multipart POST.
+        // The multipart create only stores the agent + session rows — it does
+        // NOT launch a runner on the host. We must follow up with launchRunner
+        // (POST /v1/hosts/{id}/runners) to bind the session to a runner, the
+        // same way the fork-resume path does.
+        const bundle = await buildAgentBundle(pendingAgent);
+        const metadata: Record<string, unknown> = {};
+        if (workspaceTrimmed) metadata.workspace = workspaceTrimmed;
+        data = await createBundledSession(
+          bundle,
+          metadata as Parameters<typeof createBundledSession>[1],
+        );
+        // Launch the runner on the selected host. The multipart create
+        // only stores DB rows — launchRunner binds + starts the runner.
+        if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
+          const gitOpts = trimmedBranch
+            ? { branchName: trimmedBranch, baseBranch: baseBranch.trim() || undefined }
+            : undefined;
+          await launchRunner(selectedHostId, data.id, workspaceTrimmed, gitOpts);
+        }
+        // Clear pending agent after successful creation.
+        setPendingAgent(null);
+      } else {
+        // Normal path: bind to an existing registered agent.
+        const res = await authenticatedFetch("/v1/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            agent_id: effectiveAgentId,
+            // Managed (cloud sandbox) creates let the server provision the
+            // host: the schema rejects host_id and path workspaces (and git
+            // needs a host_id). The optional repository inputs compose into
+            // the URL-form workspace the server clones; undefined (no repo)
+            // is dropped by JSON.stringify.
+            ...(sandboxSelected
+              ? {
+                  host_type: "managed",
+                  workspace: composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch),
+                }
+              : {
+                  host_id: selectedHostId,
+                  workspace: workspaceTrimmed,
+                  git: trimmedBranch
+                    ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
+                    : undefined,
+                }),
+            // Native terminal agents open terminal-first: `omnigent.ui:
+            // terminal` tells the UI to render the terminal wrapper, and
+            // `omnigent.wrapper` selects which CLI bridge the runner launches.
+            // The values are the registered wrapper ids the runner keys off —
+            // they must match the wrapper registry, not the agent display name.
+            labels: nativeLabels,
+            // Permission / approval mode → CLI flag pair, persisted as
+            // terminal_launch_args. Omitted for the default and non-native agents.
+            terminal_launch_args:
+              agentSupportsPermissionMode &&
+              permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
+                ? ["--permission-mode", permissionMode]
+                : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
+                  ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
                   : undefined,
-              }),
-          // Native terminal agents open terminal-first: `omnigent.ui:
-          // terminal` tells the UI to render the terminal wrapper, and
-          // `omnigent.wrapper` selects which CLI bridge the runner launches.
-          // The values are the registered wrapper ids the runner keys off —
-          // they must match the wrapper registry, not the agent display name.
-          labels: nativeLabels,
-          // Permission / approval mode → CLI flag pair, persisted as
-          // terminal_launch_args. Omitted for the default and non-native agents.
-          terminal_launch_args:
-            agentSupportsPermissionMode && permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
-              ? ["--permission-mode", permissionMode]
-              : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
-                ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
-                : undefined,
-          // Cost-control switch from the "Cost Optimized" pill; polly-only
-          // (cost control is a polly feature) and omitted when unset so the
-          // session defers to the spec default.
-          cost_control_mode_override:
-            agent?.name === "polly" ? (costControlMode ?? undefined) : undefined,
-          // Brain-harness pick from the agent flyout. Omitted when the user
-          // kept the spec default (pickedHarness is null) so the session
-          // tracks the agent's declared harness.
-          harness_override: pickedHarness ?? undefined,
-        }),
-      });
-      if (!res.ok) {
-        setCreateError(await describeCreateError(res));
-        return;
+            // Cost-control switch from the "Cost Optimized" pill; polly-only
+            // (cost control is a polly feature) and omitted when unset so the
+            // session defers to the spec default.
+            cost_control_mode_override:
+              agent?.name === "polly" ? (costControlMode ?? undefined) : undefined,
+            // Brain-harness pick from the agent flyout. Omitted when the user
+            // kept the spec default (pickedHarness is null) so the session
+            // tracks the agent's declared harness.
+            harness_override: pickedHarness ?? undefined,
+          }),
+        });
+        if (!res.ok) {
+          setCreateError(await describeCreateError(res));
+          return;
+        }
+        data = (await res.json()) as { id: string };
       }
-      const data = (await res.json()) as { id: string };
       // Sandbox creates have no user-picked workspace to remember.
       if (!sandboxSelected) addRecent(workspaceTrimmed);
       // Fire-and-forget: don't block navigation on the sidebar list refresh.
@@ -1259,7 +1296,11 @@ export function NewChatLandingScreen() {
   return (
     // pb-12 lifts the content slightly above the geometric center, where
     // the hero reads better optically.
-    <div className="flex flex-1 items-center justify-center" data-testid="new-chat-landing">
+    <div
+      ref={setLandingSurface}
+      className="flex flex-1 items-center justify-center"
+      data-testid="new-chat-landing"
+    >
       {/* Padding lives inside the 840px cap, so the composer renders at
           840 − 80 = 760px max. */}
       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-10 pt-8 pb-16">
@@ -1509,6 +1550,36 @@ export function NewChatLandingScreen() {
                         <DropdownMenuSeparator />
                       )}
                       {customAgents.map((agent) => renderAgentRow(agent))}
+                      {/* Show the pending custom agent if one was created */}
+                      {pendingAgent && (
+                        <DropdownMenuItem
+                          key={PENDING_AGENT_ID}
+                          data-testid="new-chat-landing-agent-pending"
+                          data-active={effectiveAgentId === PENDING_AGENT_ID ? "true" : undefined}
+                          onSelect={() => {
+                            setPickedAgentId(PENDING_AGENT_ID);
+                            setPickedHarness(null);
+                          }}
+                          className="items-start gap-2 rounded-sm px-2 py-1.5 text-sm data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+                        >
+                          <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
+                            <span className="truncate">{pendingAgent.name}</span>
+                            <span className="truncate text-[11px] text-muted-foreground/70">
+                              Custom
+                            </span>
+                          </div>
+                        </DropdownMenuItem>
+                      )}
+                      {/* "Create custom agent" action at the end */}
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        data-testid="new-chat-landing-create-agent"
+                        onSelect={() => setCreateAgentOpen(true)}
+                        className="gap-2 rounded-sm px-2 py-1.5 text-sm text-muted-foreground"
+                      >
+                        <PlusIcon className="size-3.5" />
+                        Create custom agent
+                      </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
                 ) : (
@@ -1933,6 +2004,17 @@ export function NewChatLandingScreen() {
           />
         </DialogContent>
       </Dialog>
+
+      {/* Create custom agent dialog — opened from the agent picker dropdown. */}
+      <CreateAgentDialog
+        open={createAgentOpen}
+        onOpenChange={setCreateAgentOpen}
+        onCreate={(input) => {
+          setPendingAgent(input);
+          setPickedAgentId(PENDING_AGENT_ID);
+          setPickedHarness(null);
+        }}
+      />
     </div>
   );
 }

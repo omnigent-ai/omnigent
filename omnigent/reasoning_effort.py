@@ -14,6 +14,8 @@ ANTHROPIC_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 CLAUDE_EFFORTS = ANTHROPIC_EFFORTS
 CODEX_EFFORTS = OPENAI_EFFORTS
 OPENAI_AGENTS_EFFORTS = OPENAI_EFFORTS
+GEMINI_EFFORTS = frozenset({"low", "medium", "high"})
+ANTIGRAVITY_EFFORTS = GEMINI_EFFORTS
 
 
 def format_supported(values: Iterable[str]) -> str:

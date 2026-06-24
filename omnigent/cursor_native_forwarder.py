@@ -41,6 +41,8 @@ from pathlib import Path
 
 import httpx
 
+from omnigent._native_post_delivery import post_may_have_been_delivered
+
 _logger = logging.getLogger(__name__)
 
 #: Seconds between store polls. Cursor turns run for many seconds/minutes in the
@@ -48,6 +50,29 @@ _logger = logging.getLogger(__name__)
 #: latency; ~0.7s keeps the chat view feeling live.
 _DEFAULT_POLL_INTERVAL_S = 0.7
 _POST_TIMEOUT_S = 30.0
+
+#: Max length of a mirrored item's ``response_id``. The server stores it in
+#: ``conversation_items.response_id``, a ``VARCHAR(64)`` (see
+#: ``omnigent.db.db_models.SqlConversationItem``). cursor's content-address blob
+#: id is itself a 64-char hash, so an un-capped ``cursor:<blob_id>`` is 71 chars
+#: and overflows the column — every mirror POST then 500s and, because the poll
+#: loop only advances its high-water rowid after a successful POST, the forwarder
+#: wedges on that one message and re-posts it forever. Cap at the column width.
+#: ``response_id`` is a non-unique, non-dedup grouping label, so truncation can in
+#: theory alias two blobs onto one id — that only groups two messages under one UI
+#: response, never data loss.
+_RESPONSE_ID_MAX_LEN = 64
+
+#: Consecutive server rejections (a 4xx, or a 5xx such as a failed DB insert) of
+#: a single mirror item the poll loop tolerates before it logs and skips past
+#: that item. Without this bound a rejected POST never advances ``last_rowid``,
+#: so the loop re-POSTs the same item every ``_DEFAULT_POLL_INTERVAL_S`` forever
+#: — mirroring nothing after it and flooding the app. A connection-level failure
+#: (server unreachable) is deliberately NOT counted here: that is not the item's
+#: fault, so it retries indefinitely rather than drop the conversation. At the
+#: ~0.7s poll cadence this is a few seconds of retrying — enough to ride out a
+#: brief transient rejection while staying firmly bounded.
+_MAX_ITEM_POST_ATTEMPTS = 5
 
 # Supervisor backoff (mirrors claude_native_forwarder.supervise_forwarder).
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
@@ -61,6 +86,12 @@ _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
 _DISCOVERY_SKEW_MS = 10_000
 
 _STATE_FILE = "cursor_forwarder.json"
+
+# A sibling session's persisted claim (naming the same ``store_path``) counts as
+# a LIVE owner only if its heartbeat was refreshed within this window; an older
+# claim is treated as a dead session and may be taken over. Generous relative to
+# the ~0.7s poll so a brief supervisor backoff/restart never drops a live claim.
+_CLAIM_FRESH_MS = 30_000
 
 # cursor wraps the real prompt the user typed in ``<user_query>…</user_query>``
 # and prepends a large ``<user_info>…`` context dump as a separate user blob.
@@ -82,10 +113,18 @@ class _ForwardState:
         ``store_path`` (forwarded or deliberately skipped). The store is
         append-only and content-addressed, so rowids only grow — tracking the
         high-water mark is sufficient dedup with O(1) state.
+    :param launch_epoch_ms: This session's launch time, used to break ties when
+        two sessions discover the same chat: the earlier-launched (established)
+        session keeps it. ``0`` for a cold default.
+    :param heartbeat_ms: Wall-clock ms of the last persist. A sibling reads this
+        to tell a live owner from a dead session's leftover claim (see
+        :func:`_chat_claimed_by_other`). Stamped by :func:`_write_state`.
     """
 
     store_path: str | None = None
     last_rowid: int = 0
+    launch_epoch_ms: int = 0
+    heartbeat_ms: int = 0
 
 
 def _read_state(bridge_dir: Path) -> _ForwardState:
@@ -97,9 +136,13 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
         return _ForwardState()
     store_path = data.get("store_path")
     last_rowid = data.get("last_rowid")
+    launch_epoch_ms = data.get("launch_epoch_ms")
+    heartbeat_ms = data.get("heartbeat_ms")
     return _ForwardState(
         store_path=store_path if isinstance(store_path, str) else None,
         last_rowid=last_rowid if isinstance(last_rowid, int) else 0,
+        launch_epoch_ms=launch_epoch_ms if isinstance(launch_epoch_ms, int) else 0,
+        heartbeat_ms=heartbeat_ms if isinstance(heartbeat_ms, int) else 0,
     )
 
 
@@ -115,7 +158,17 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> bool:
         bridge_dir.mkdir(parents=True, exist_ok=True)
         tmp = bridge_dir / (_STATE_FILE + ".tmp")
         tmp.write_text(
-            json.dumps({"store_path": state.store_path, "last_rowid": state.last_rowid}),
+            json.dumps(
+                {
+                    "store_path": state.store_path,
+                    "last_rowid": state.last_rowid,
+                    "launch_epoch_ms": state.launch_epoch_ms,
+                    # Stamp the heartbeat at persist time so every poll refreshes
+                    # the chat claim; a peer treats a claim older than
+                    # ``_CLAIM_FRESH_MS`` as a dead session it may take over.
+                    "heartbeat_ms": int(time.time() * 1000),
+                }
+            ),
             encoding="utf-8",
         )
         os.replace(tmp, bridge_dir / _STATE_FILE)
@@ -137,6 +190,45 @@ def clear_cursor_bridge_state(bridge_dir: Path) -> None:
     """
     with contextlib.suppress(OSError):
         (bridge_dir / _STATE_FILE).unlink()
+
+
+def _chat_claimed_by_other(bridge_dir: Path, store_path: Path, my_launch_ms: int) -> bool:
+    """Whether another LIVE session is already mirroring *store_path*.
+
+    cursor keeps one chat per working directory, so two cursor-native sessions
+    launched in the same cwd discover the SAME store — without this guard both
+    would mirror it into two separate conversations (the duplicate-session bug).
+    A sibling bridge dir under the same root claims the chat when its persisted
+    state names the same store with a heartbeat fresher than ``_CLAIM_FRESH_MS``.
+    Ties resolve toward the EARLIER-launched session (then the lexicographically
+    smaller bridge-dir name, for a deterministic, symmetric verdict), so the
+    established session keeps the chat and a duplicate later launch yields.
+
+    :param bridge_dir: This session's bridge dir (its parent is the shared root).
+    :param store_path: The cursor chat store this session would mirror.
+    :param my_launch_ms: This session's ``launch_epoch_ms``.
+    :returns: ``True`` if a different live session owns the chat (so this session
+        should not mirror it); ``False`` otherwise.
+    """
+    root = bridge_dir.parent
+    if not root.is_dir():
+        return False
+    target = str(store_path)
+    now_ms = int(time.time() * 1000)
+    me = bridge_dir.name
+    for sibling in root.iterdir():
+        if sibling.name == me or not sibling.is_dir():
+            continue
+        other = _read_state(sibling)
+        if other.store_path != target:
+            continue
+        if now_ms - other.heartbeat_ms > _CLAIM_FRESH_MS:
+            continue  # stale claim — the owning session is gone; ignore it
+        if other.launch_epoch_ms < my_launch_ms:
+            return True
+        if other.launch_epoch_ms == my_launch_ms and sibling.name < me:
+            return True
+    return False
 
 
 def _cursor_chats_root() -> Path:
@@ -332,7 +424,7 @@ def _blob_to_item(rowid: int, blob_id: str, data: object, agent_name: str) -> _M
     if not isinstance(obj, dict):
         return None
     role = obj.get("role")
-    response_id = f"cursor:{blob_id}"
+    response_id = f"cursor:{blob_id}"[:_RESPONSE_ID_MAX_LEN]
     if role == "user":
         prompt = _unwrap_user_query(_content_text(obj.get("content")))
         if not prompt:
@@ -399,6 +491,15 @@ async def forward_cursor_store_to_session(
     re-posting; if discovery resolves a *different* store than the persisted one
     (a cold resume relaunched a fresh chat), the cursor resets to that store.
 
+    A failed item POST never silently re-posts forever: a server *rejection* (a
+    4xx, or a 5xx such as a failed DB insert) is retried for up to
+    ``_MAX_ITEM_POST_ATTEMPTS`` polls and then skipped so one poison item can't
+    wedge the mirror — or flood the app — indefinitely; an *ambiguous* failure
+    (request sent, response lost) is skipped at once since external items aren't
+    deduped and a retry could duplicate the bubble; a *connection* failure
+    (server unreachable) is retried indefinitely so an outage never drops the
+    conversation.
+
     :param base_url: Omnigent server base URL.
     :param headers: Static HTTP headers (auth normally via ``auth``).
     :param session_id: Omnigent session/conversation id.
@@ -413,6 +514,11 @@ async def forward_cursor_store_to_session(
     persisted = _read_state(bridge_dir)
     store_path: Path | None = None
     last_rowid = 0
+    # Bounded-retry-then-skip guard (see the post loop below): the rowid whose
+    # POST is currently being rejected and how many consecutive rejections it
+    # has seen. Reset whenever the cursor advances past an item.
+    failed_rowid = 0
+    failed_attempts = 0
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
@@ -421,28 +527,131 @@ async def forward_cursor_store_to_session(
             try:
                 if store_path is None or not store_path.exists():
                     resolved = await asyncio.to_thread(_discover_store, workspace, launch_epoch_ms)
-                    if resolved is not None:
+                    if resolved is not None and not await asyncio.to_thread(
+                        _chat_claimed_by_other, bridge_dir, resolved, launch_epoch_ms
+                    ):
                         store_path = resolved
                         if persisted.store_path == str(resolved):
                             last_rowid = persisted.last_rowid
                         else:
                             last_rowid = 0
-                            _write_state(
-                                bridge_dir,
-                                _ForwardState(store_path=str(resolved), last_rowid=0),
-                            )
-                        persisted = _ForwardState()  # consumed
-                if store_path is not None and store_path.exists():
-                    items = await asyncio.to_thread(
-                        _read_new_items, store_path, last_rowid, agent_name
-                    )
-                    for item in items:
-                        if item.item_type:
-                            await _post_conversation_item(client, session_id=session_id, item=item)
-                        last_rowid = item.rowid
                         _write_state(
                             bridge_dir,
-                            _ForwardState(store_path=str(store_path), last_rowid=last_rowid),
+                            _ForwardState(
+                                store_path=str(resolved),
+                                last_rowid=last_rowid,
+                                launch_epoch_ms=launch_epoch_ms,
+                            ),
+                        )
+                        persisted = _ForwardState()  # consumed
+                if store_path is not None and store_path.exists():
+                    # cursor keeps ONE chat per working dir, so two cursor-native
+                    # sessions launched in the same cwd discover the same store.
+                    # Yield to an earlier-launched live session rather than mirror
+                    # the same chat into a second conversation (the duplicate-
+                    # session bug); the released store is re-evaluated next poll.
+                    if await asyncio.to_thread(
+                        _chat_claimed_by_other, bridge_dir, store_path, launch_epoch_ms
+                    ):
+                        _logger.warning(
+                            "cursor chat %s already mirrored by another session; "
+                            "pausing mirror for session=%s",
+                            store_path,
+                            session_id,
+                        )
+                        store_path = None
+                    else:
+                        items = await asyncio.to_thread(
+                            _read_new_items, store_path, last_rowid, agent_name
+                        )
+                        for item in items:
+                            if item.item_type:
+                                try:
+                                    await _post_conversation_item(
+                                        client, session_id=session_id, item=item
+                                    )
+                                except httpx.HTTPError as exc:
+                                    if post_may_have_been_delivered(exc):
+                                        # Ambiguous: the request was sent but its
+                                        # response was lost, so the server may have
+                                        # already committed this item. External
+                                        # items aren't deduped, so re-posting would
+                                        # duplicate the web bubble — skip past it.
+                                        _logger.warning(
+                                            "cursor forwarder skipping item after an "
+                                            "ambiguous POST failure (may already be "
+                                            "committed); session=%s rowid=%s",
+                                            session_id,
+                                            item.rowid,
+                                            exc_info=True,
+                                        )
+                                    elif isinstance(exc, httpx.HTTPStatusError):
+                                        # The server received and rejected the item
+                                        # (a 4xx, or a 5xx like the response_id
+                                        # truncation that wedged the mirror). Retry
+                                        # a bounded number of polls, then skip so one
+                                        # poison item can't wedge the mirror — and
+                                        # flood the app — forever.
+                                        if item.rowid != failed_rowid:
+                                            failed_rowid, failed_attempts = item.rowid, 0
+                                        failed_attempts += 1
+                                        if failed_attempts < _MAX_ITEM_POST_ATTEMPTS:
+                                            _logger.warning(
+                                                "cursor forwarder POST rejected (HTTP "
+                                                "%s); retrying; session=%s rowid=%s "
+                                                "attempt=%s",
+                                                exc.response.status_code,
+                                                session_id,
+                                                item.rowid,
+                                                failed_attempts,
+                                            )
+                                            break  # retry this item before any after it
+                                        _logger.error(
+                                            "cursor forwarder dropping item after %s "
+                                            "rejected POSTs (HTTP %s); mirror would "
+                                            "otherwise wedge; session=%s rowid=%s",
+                                            failed_attempts,
+                                            exc.response.status_code,
+                                            session_id,
+                                            item.rowid,
+                                        )
+                                    else:
+                                        # Connection-level failure: the server is
+                                        # unreachable, which is not this item's
+                                        # fault. Retry indefinitely so an outage
+                                        # never drops the conversation; the poll
+                                        # cadence and supervisor ride it out.
+                                        _logger.warning(
+                                            "cursor forwarder POST could not reach the "
+                                            "server; retrying; session=%s rowid=%s",
+                                            session_id,
+                                            item.rowid,
+                                            exc_info=True,
+                                        )
+                                        break
+                            # Reached on a successful post, an ambiguous-delivery
+                            # skip, a quarantine, or a non-posted sentinel row:
+                            # advance past this item and reset the failure counter.
+                            failed_rowid = failed_attempts = 0
+                            last_rowid = item.rowid
+                            _write_state(
+                                bridge_dir,
+                                _ForwardState(
+                                    store_path=str(store_path),
+                                    last_rowid=last_rowid,
+                                    launch_epoch_ms=launch_epoch_ms,
+                                ),
+                            )
+                        # Refresh the claim heartbeat every poll (even with no new
+                        # items) so an idle owner keeps its claim and a peer can
+                        # detect a dead session.
+                        _write_state(
+                            bridge_dir,
+                            _ForwardState(
+                                store_path=str(store_path),
+                                last_rowid=last_rowid,
+                                launch_epoch_ms=launch_epoch_ms,
+                            ),
                         )
             except asyncio.CancelledError:
                 raise
