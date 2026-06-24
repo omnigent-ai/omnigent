@@ -696,27 +696,34 @@ function ConversationList({
               onToggleSelected={onToggleSelected}
             />
           )}
-          {/* Pagination extends the Recent list, so the button hides with
-              it — a Load more under a collapsed group reads orphaned. */}
-          {hasMorePages && !effectiveCollapsedSections.includes("Recent") && (
-            <button
-              type="button"
-              disabled={conversationsQuery.isFetchingNextPage}
-              onClick={() => {
-                if (conversationsQuery.hasNextPage) void conversationsQuery.fetchNextPage();
-              }}
-              className="flex cursor-pointer items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-muted-foreground text-xs hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
-            >
-              {conversationsQuery.isFetchingNextPage ? (
-                <>
-                  <Loader2Icon className="size-3 animate-spin" />
-                  Loading…
-                </>
-              ) : (
-                "Load more"
-              )}
-            </button>
-          )}
+          {/* Pagination extends the session list — hide the button when
+              every rendered section is collapsed, leaving no expanded
+              group to display newly loaded rows. */}
+          {hasMorePages &&
+            ((sections.pinned.length > 0 && !effectiveCollapsedSections.includes("Pinned")) ||
+              (sections.sessions.length > 0 && !effectiveCollapsedSections.includes("Recent")) ||
+              (sections.shared.length > 0 &&
+                !effectiveCollapsedSections.includes("Shared with me")) ||
+              (sections.archived.length > 0 &&
+                !effectiveCollapsedSections.includes("Archived"))) && (
+              <button
+                type="button"
+                disabled={conversationsQuery.isFetchingNextPage}
+                onClick={() => {
+                  if (conversationsQuery.hasNextPage) void conversationsQuery.fetchNextPage();
+                }}
+                className="flex cursor-pointer items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-muted-foreground text-xs hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
+              >
+                {conversationsQuery.isFetchingNextPage ? (
+                  <>
+                    <Loader2Icon className="size-3 animate-spin" />
+                    Loading…
+                  </>
+                ) : (
+                  "Load more"
+                )}
+              </button>
+            )}
         </>
       )}
     </div>

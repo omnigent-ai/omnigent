@@ -273,9 +273,10 @@ describe("Sidebar collapsible sections", () => {
   });
 });
 
-// Pagination belongs to the Recent list: collapsing Recent must take the
-// "Load more" button with it, or the button floats under nothing.
-describe("Sidebar load-more vs collapsed Recent", () => {
+// Pagination button must hide when every expanded section is empty —
+// loading more pages adds nothing visible while all receiving groups
+// are collapsed.
+describe("Sidebar load-more vs collapsed sections", () => {
   it("hides Load more while Recent is collapsed and restores it on expand", () => {
     const rows = [conv("conv_mine", "Claude Code")];
     useConvMock.mockImplementation(
@@ -301,6 +302,63 @@ describe("Sidebar load-more vs collapsed Recent", () => {
     expect(screen.queryByText("conv_mine")).toBeNull();
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Recent" }));
+    expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
+  });
+
+  it("hides Load more while Archived is collapsed when no other section has data", () => {
+    const rows = [conv("conv_archived", "Claude Code", { archived: true })];
+    useConvMock.mockImplementation(
+      () =>
+        ({
+          data: {
+            pages: [{ data: rows, first_id: rows[0]!.id, last_id: rows[0]!.id, has_more: true }],
+            pageParams: [undefined],
+          },
+          isLoading: false,
+          isError: false,
+          error: null,
+          fetchNextPage: vi.fn(),
+          hasNextPage: true,
+          isFetchingNextPage: false,
+        }) as unknown as ReturnType<typeof useConversations>,
+    );
+    renderSidebar();
+
+    // Archived starts collapsed by default — Load more must not float
+    // under the collapsed group.
+    expect(screen.getByRole("button", { name: "Archived" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+
+    // Expanding Archived restores the button.
+    fireEvent.click(screen.getByRole("button", { name: "Archived" }));
+    expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
+  });
+
+  it("keeps Load more visible when Archived is collapsed but another section has data", () => {
+    const rows = [
+      conv("conv_recent", "Claude Code"),
+      conv("conv_archived", "Claude Code", { archived: true }),
+    ];
+    useConvMock.mockImplementation(
+      () =>
+        ({
+          data: {
+            pages: [{ data: rows, first_id: rows[0]!.id, last_id: rows[1]!.id, has_more: true }],
+            pageParams: [undefined],
+          },
+          isLoading: false,
+          isError: false,
+          error: null,
+          fetchNextPage: vi.fn(),
+          hasNextPage: true,
+          isFetchingNextPage: false,
+        }) as unknown as ReturnType<typeof useConversations>,
+    );
+    renderSidebar();
+
+    // Archived is collapsed by default, but Recent is expanded with data —
+    // Load more should stay visible because newly loaded rows could land
+    // in the visible Recent section.
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
   });
 });
