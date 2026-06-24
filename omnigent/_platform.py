@@ -30,6 +30,41 @@ IS_LINUX = sys.platform.startswith("linux")
 #: True on macOS specifically (the seatbelt sandbox platform).
 IS_DARWIN = sys.platform == "darwin"
 
+#: Non-sensitive Windows environment variables that a spawned omnigent
+#: subprocess needs to function, for env-passthrough allowlists that otherwise
+#: assume POSIX names. Python uppercases env keys on Windows, so these match
+#: ``os.environ`` as stored; they are absent on POSIX, so including them in an
+#: allowlist is a no-op there (only present vars pass through).
+#:
+#: - ``SYSTEMROOT`` is MANDATORY: Winsock loads its providers from
+#:   ``%SystemRoot%\system32\mswsock.dll``, so a child without it dies at
+#:   ``import asyncio`` with ``WinError 10106`` (WSAEPROVIDERFAILEDINIT).
+#: - ``USERPROFILE`` / ``HOMEDRIVE`` / ``HOMEPATH`` let ``Path.home()`` /
+#:   ``expanduser("~")`` resolve (the Windows analog of POSIX ``HOME``).
+#: - ``APPDATA`` / ``LOCALAPPDATA`` are where Windows apps (keyring, pip, npm,
+#:   …) keep per-user config and cache.
+#: - The rest let a Windows process and shell resolve binaries normally.
+#:
+#: All are path/identity constants, not credentials — consistent with POSIX
+#: ``HOME``/``PATH`` already being allowed.
+WINDOWS_ENV_PASSTHROUGH: tuple[str, ...] = (
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+)
+
 
 def default_shell_argv(command: str) -> list[str]:
     """

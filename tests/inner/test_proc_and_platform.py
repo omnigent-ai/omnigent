@@ -229,3 +229,31 @@ def test_helper_env_keeps_systemroot_so_child_can_import_asyncio() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.windows_only
+def test_host_runner_env_lets_child_import_asyncio_and_resolve_home() -> None:
+    # Regression: the host->runner env allowlist dropped SYSTEMROOT (asyncio /
+    # WinError 10106) and USERPROFILE (Path.home() -> "Could not determine home
+    # directory"). Both must pass through so a spawned runner can boot.
+    import sys
+
+    from omnigent.host.connect import _build_runner_env
+
+    env = _build_runner_env(
+        base_env=os.environ,
+        server_url="http://x",
+        runner_id="r1",
+        binding_token="t",
+        workspace=".",
+        parent_pid=os.getpid(),
+    )
+    assert "SYSTEMROOT" in env
+    assert "USERPROFILE" in env
+    result = subprocess.run(
+        [sys.executable, "-c", "import asyncio; from pathlib import Path; Path.home()"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
