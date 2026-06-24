@@ -7145,3 +7145,52 @@ async def test_sys_session_send_no_inherit_when_parent_unconfigured(
     )
     assert len(bodies) == 1
     assert "model_override" not in bodies[0]
+
+
+def test_resolve_session_model_override_normal_turn_sets_cache() -> None:
+    """A normal turn with an override is authoritative and seeds the cache."""
+    from omnigent.runner.app import _resolve_session_model_override
+
+    cache: dict[str, str] = {}
+    eff = _resolve_session_model_override(
+        {"model_override": "databricks-claude-sonnet-4-6"}, "conv_a", cache
+    )
+    assert eff == "databricks-claude-sonnet-4-6"
+    assert cache["conv_a"] == "databricks-claude-sonnet-4-6"
+
+
+def test_resolve_session_model_override_clear_drops_cache() -> None:
+    """`/model default` (override absent) clears a previously-cached value.
+
+    Regression for codex review P2: a blanket `body or cache` fallback would
+    resurrect the old selection after a clear. A normal turn is authoritative —
+    absence means cleared, so the cache must be dropped and None returned.
+    """
+    from omnigent.runner.app import _resolve_session_model_override
+
+    cache = {"conv_a": "databricks-claude-sonnet-4-6"}
+    eff = _resolve_session_model_override({"agent_id": "ag"}, "conv_a", cache)
+    assert eff is None
+    assert "conv_a" not in cache
+
+
+def test_resolve_session_model_override_catchup_uses_cache() -> None:
+    """A flagged synthetic catch-up turn falls back to the cached selection."""
+    from omnigent.runner.app import _resolve_session_model_override
+
+    cache = {"conv_a": "databricks-claude-sonnet-4-6"}
+    eff = _resolve_session_model_override(
+        {"agent_id": "ag", "_model_override_from_cache": True}, "conv_a", cache
+    )
+    assert eff == "databricks-claude-sonnet-4-6"
+    # Read-only on the synthetic path — does not mutate the cache.
+    assert cache["conv_a"] == "databricks-claude-sonnet-4-6"
+
+
+def test_resolve_session_model_override_catchup_empty_cache_returns_none() -> None:
+    """Catch-up with nothing cached resolves to None (unconfigured, no crash)."""
+    from omnigent.runner.app import _resolve_session_model_override
+
+    cache: dict[str, str] = {}
+    eff = _resolve_session_model_override({"_model_override_from_cache": True}, "conv_a", cache)
+    assert eff is None

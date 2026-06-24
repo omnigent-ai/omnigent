@@ -6387,10 +6387,15 @@ def create_runner_app(
                 # Opus spawn (and, on recovery/sub-agent paths, a lasting one).
                 model_override=body.get("model_override"),
             )
-            # Cache it so background turn paths with no request body
-            # (catch-up scan, crash-recovery) can still resolve it.
+            # Cache it (authoritatively: the create/reconnect handshake carries
+            # the current persisted value — present means a selection, absent
+            # means cleared) so background turn paths with no request body
+            # (catch-up scan) resolve the right model and never resurrect a
+            # stale one.
             if body.get("model_override"):
                 _session_model_overrides[session_id] = body["model_override"]
+            else:
+                _session_model_overrides.pop(session_id, None)
             if harness_name == "claude-native" and spawn_env is None:
                 from omnigent.claude_native_bridge import (
                     build_claude_native_spawn_env,
@@ -10219,15 +10224,19 @@ def create_runner_app(
                 or cached_spec.executor.type
             )
             harness_name = canonicalize_harness(h) or h
-            # Issue #1128: the per-turn body carries the override on normal
-            # turns; refresh the cache from it, and fall back to the cache on
-            # background paths (catch-up scan, crash-recovery) whose synthetic
-            # body has none — otherwise those respawn against the
-            # provider/Databricks default and silently route to Opus.
-            _turn_override = msg_body.get("model_override")
-            if _turn_override:
-                _session_model_overrides[conv] = _turn_override
-            _eff_override = _turn_override or _session_model_overrides.get(conv)
+            # Issue #1128: resolve the per-session /model override for this turn.
+            # Normal turns (and crash-recovery, which is seeded from the
+            # authoritative create body) carry the persisted value: present
+            # means a selection, ABSENT means cleared (`/model default`) — the
+            # server omits the key on clear. So a normal turn is authoritative:
+            # use its value verbatim and keep the runner cache in sync (set on
+            # select, drop on clear) so a stale override can't be resurrected.
+            # Only a synthetic background turn (the reconnect catch-up scan,
+            # flagged below) has no forwarded value and falls back to the cache —
+            # otherwise it would respawn against the Databricks default.
+            _eff_override = _resolve_session_model_override(
+                msg_body, conv, _session_model_overrides
+            )
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
                 harness_name,
@@ -14501,6 +14510,11 @@ def create_runner_app(
                     msg_body = {
                         "agent_id": agent_id,
                         "model": agent_id or "",
+                        # Issue #1128: synthetic background turn with no
+                        # server-forwarded override — let _run_turn_bg fall back
+                        # to the cached per-session /model selection rather than
+                        # spawning against the provider/Databricks default.
+                        "_model_override_from_cache": True,
                     }
                     _turn_task = asyncio.create_task(
                         _run_turn_bg(msg_body, session_id),
@@ -14635,6 +14649,38 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "goose": "HARNESS_GOOSE_MODEL",
     "copilot": "HARNESS_COPILOT_MODEL",
 }
+
+
+def _resolve_session_model_override(
+    msg_body: dict[str, Any],
+    session_id: str,
+    cache: dict[str, str],
+) -> str | None:
+    """Resolve the per-session ``/model`` override for a turn (issue #1128).
+
+    Normal turns — and crash-recovery, seeded from the authoritative create
+    body — carry the persisted value: present means a selection, ABSENT means
+    cleared (``/model default``; the server omits the key on clear). Such a
+    turn is authoritative: its value is used verbatim and the runner cache is
+    kept in sync (set on select, dropped on clear) so a stale override can't be
+    resurrected. A synthetic background turn (the reconnect catch-up scan,
+    flagged ``_model_override_from_cache``) has no forwarded value and falls
+    back to the cache, so it does not respawn against the provider/Databricks
+    default.
+
+    :param msg_body: The turn's message body.
+    :param session_id: Conversation id (cache key).
+    :param cache: The per-session override cache, mutated in place.
+    :returns: The effective override id, or ``None``.
+    """
+    turn_override = msg_body.get("model_override")
+    if msg_body.get("_model_override_from_cache"):
+        return turn_override or cache.get(session_id)
+    if turn_override:
+        cache[session_id] = turn_override
+    else:
+        cache.pop(session_id, None)
+    return turn_override
 
 
 def _build_spawn_env_from_spec(
