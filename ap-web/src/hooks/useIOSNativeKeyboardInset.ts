@@ -85,11 +85,17 @@ function getIOSNativeKeyboardInset(): number {
   const viewport = window.visualViewport;
   if (!viewport) return 0;
 
-  const shellBottom =
-    document.querySelector<HTMLElement>("[data-ios-native].app-shell")?.getBoundingClientRect()
-      .bottom ?? window.innerHeight;
+  // Keyboard height = the layout viewport (the full webview, kept keyboard-
+  // independent by the native shell's `.ignoresSafeArea(.keyboard)`) minus the
+  // visible visual viewport. Measured against `window.innerHeight`, NOT the
+  // app-shell: useIOSViewportLock resizes the shell down to the visual viewport
+  // when the keyboard opens, so an app-shell-relative measurement would always
+  // read ~0. This value is for fixed, full-viewport overlays (e.g. the mobile
+  // TerminalsPanel) that the shell-lock does not resize — flow content inside
+  // the shell is handled by the lock and needs no manual padding.
+  const layoutBottom = window.innerHeight;
   const visibleBottom = viewport.offsetTop + viewport.height;
-  return Math.max(0, Math.round(shellBottom - visibleBottom));
+  return Math.max(0, Math.round(layoutBottom - visibleBottom));
 }
 
 function isEditableElementFocused(): boolean {
