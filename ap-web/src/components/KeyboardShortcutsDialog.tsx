@@ -103,12 +103,21 @@ const PINNED_SESSION_SHORTCUT: Shortcut = {
   keys: [MOD_KEY, "1…0"],
 };
 
+// Desktop-only: Cmd/Ctrl+P is Print in a browser tab, so the chat/terminal
+// view toggle ships only in the Electron shell (see useViewToggleHotkey).
+// Live only on terminal-first sessions, but listed unconditionally when
+// native — same treatment as the pinned-session row above.
+const TERMINAL_VIEW_SHORTCUT: Shortcut = {
+  label: "Toggle chat / terminal view",
+  keys: [MOD_KEY, "P"],
+};
+
 /** Shortcut groups for the current runtime — adds desktop-only rows natively. */
 function shortcutGroupsFor(native: boolean): ShortcutGroup[] {
   if (!native) return SHORTCUT_GROUPS;
   return SHORTCUT_GROUPS.map((group) =>
     group.title === "Navigation"
-      ? { ...group, items: [...group.items, PINNED_SESSION_SHORTCUT] }
+      ? { ...group, items: [...group.items, PINNED_SESSION_SHORTCUT, TERMINAL_VIEW_SHORTCUT] }
       : group,
   );
 }
