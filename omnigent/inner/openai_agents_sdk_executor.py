@@ -1078,10 +1078,10 @@ class OpenAIAgentsSDKExecutor(Executor):
         underlying = _SanitizingSession(agents_sdk.SQLiteSession(session_key))
         sdk_session: Any = underlying  # type: ignore[explicit-any]
         # Wrap with compaction session when the client targets a real
-        # HTTP endpoint. Skip for Databricks (responses.compact not
-        # proxied) and bare object() clients in unit tests.
+        # HTTP endpoint. Skip for bare object() clients in unit tests
+        # that lack base_url.
         _base = str(getattr(self._client, "base_url", ""))
-        if not self._databricks and _base.startswith("http"):
+        if _base.startswith("http"):
             try:
                 from agents.memory import OpenAIResponsesCompactionSession
 

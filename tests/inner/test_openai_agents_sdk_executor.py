@@ -2846,9 +2846,13 @@ def test_empty_turn_retry_rewinds_sdk_session() -> None:
                 )
             )
 
-        # state.sdk_session is a _SanitizingSession wrapping our fake; the
-        # pop bookkeeping lives on the underlying fake.
-        underlying = captured["session"]._underlying
+        # state.sdk_session may be wrapped by OpenAIResponsesCompactionSession
+        # (which has .underlying_session) around _SanitizingSession (which has
+        # ._underlying). Traverse both layers to reach the fake.
+        _session = captured["session"]
+        if hasattr(_session, "underlying_session"):
+            _session = _session.underlying_session
+        underlying = _session._underlying
         # The stray item appended in attempt 1 was popped before attempt 2,
         # so the session is back to its pre-turn (empty) state. pop_calls
         # records the rewind. If 0, the rewind never happened and the
