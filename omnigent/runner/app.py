@@ -4421,6 +4421,38 @@ async def _claude_native_bridge_id_for_session(
     return session_id
 
 
+async def _antigravity_native_bridge_id_for_session(
+    *,
+    server_client: httpx.AsyncClient,
+    session_id: str,
+) -> str:
+    """Resolve the bridge id label for an antigravity-native session.
+
+    Mirrors :func:`_claude_native_bridge_id_for_session`: the runner-owned agy
+    terminal's bridge dir is keyed by the session's bridge-id label (so a
+    ``--resume`` session lands in the right pane), falling back to *session_id*
+    for legacy single-session bridges. Matches the launch-time derivation in
+    ``_auto_create_antigravity_native_terminal``.
+
+    :param server_client: Omnigent server client used to fetch the session
+        snapshot.
+    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    :returns: Opaque bridge id from
+        ``omnigent.antigravity_native.bridge_id`` when present, otherwise
+        *session_id*.
+    """
+    from omnigent.antigravity_native_bridge import ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY
+
+    labels = await _session_labels_for_runner_spawn(
+        server_client=server_client,
+        session_id=session_id,
+    )
+    bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
+    if isinstance(bridge_id, str) and bridge_id:
+        return bridge_id
+    return session_id
+
+
 async def _claude_native_session_wants_rebuild(
     server_client: httpx.AsyncClient | None,
     session_id: str,
@@ -9436,6 +9468,236 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _clear_antigravity_native_pending_elicitation(
+        conv_id: str,
+        *,
+        cascade_id: str,
+        port: int,
+    ) -> None:
+        """Clear a parked agy elicitation card on interrupt/stop, best-effort.
+
+        A WAITING ask-question / permission prompt surfaces as an Omnigent
+        elicitation parked server-side; an interrupt/stop must release it or the
+        card lingers forever (the agy step is gone, but the web card has nothing
+        to resolve it). Computes the deterministic agy elicitation id for the
+        freshest WAITING step and POSTs ``external_elicitation_resolved`` so the
+        server resolves the parked future — the same release path cursor-native
+        uses when its TUI answers a prompt. Never raises.
+
+        :param conv_id: Session/conversation identifier.
+        :param cascade_id: agy cascade id (equal to the conversation id).
+        :param port: Validated agy connect-RPC port.
+        """
+        if server_client is None:
+            return
+        from omnigent.antigravity_native_interactions import (
+            _freshest_pending,
+            agy_elicitation_id,
+        )
+        from omnigent.antigravity_native_rpc import get_trajectory_steps
+
+        try:
+            steps = await asyncio.to_thread(get_trajectory_steps, port, cascade_id)
+        except (httpx.HTTPError, ValueError):
+            # A dead/relaunched pane (transport error) or a non-JSON 200; either
+            # way there's no live WAITING step to clear, so skip best-effort.
+            _logger.debug(
+                "antigravity-native interrupt: could not read steps to clear "
+                "pending elicitation; session=%s",
+                conv_id,
+                exc_info=True,
+            )
+            return
+        pending = _freshest_pending(steps)
+        if pending is None:
+            return
+        eid = agy_elicitation_id(cascade_id, pending["trajectory_id"], pending["step_index"])
+        try:
+            resp = await server_client.post(
+                f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}/events",
+                json={
+                    "type": "external_elicitation_resolved",
+                    "data": {"elicitation_id": eid},
+                },
+                timeout=10.0,
+            )
+            if resp.status_code >= 400:
+                _logger.warning(
+                    "antigravity-native external_elicitation_resolved rejected: "
+                    "status=%s session=%s",
+                    resp.status_code,
+                    conv_id,
+                )
+        except httpx.HTTPError:
+            _logger.warning(
+                "antigravity-native external_elicitation_resolved POST failed; session=%s",
+                conv_id,
+                exc_info=True,
+            )
+
+    async def _handle_antigravity_native_interrupt(conv_id: str) -> Response:
+        """Cancel the in-flight agy turn over connect-RPC (or DENY a WAITING step).
+
+        antigravity-native turns run inside the runner-owned agy TUI; the
+        executor's ``run_turn`` returns the instant the message is typed in, so
+        the in-process cancel floor has nothing to cancel (the turn task is
+        already ``.done()``). Unlike the other TUI harnesses, agy exposes a
+        connect-RPC ``CancelCascadeSteps`` that stops a RUNNING cascade cleanly,
+        so this drives that (the same path the executor's ``interrupt_session``
+        uses) rather than a blind Escape:
+
+        * Resolve the cascade id from bridge state and agy's connect-RPC port.
+        * If the current step is WAITING for a user interaction,
+          ``CancelCascadeSteps`` is a NO-OP (agy 200s but the step does not
+          transition — see the executor docstring), so DENY the WAITING step
+          through the interaction bridge instead and clear the parked card.
+        * Otherwise cancel the running cascade.
+
+        Falls back to a tmux Escape when no RPC port can be resolved (cold pane /
+        not-yet-bound cascade) so Stop is never a silent no-op.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 when an interrupt path ran; 503 if neither RPC nor the tmux
+            Escape fallback could reach the session.
+        """
+        from omnigent.antigravity_native_bridge import (
+            bridge_dir_for_bridge_id,
+            inject_interrupt,
+            is_placeholder_conversation_id,
+            read_bridge_state,
+        )
+        from omnigent.antigravity_native_interactions import deny_pending_interaction
+        from omnigent.antigravity_native_rpc import (
+            cancel_cascade_steps,
+            get_trajectory_steps,
+            resolve_language_server_port,
+        )
+
+        bridge_id = conv_id
+        if server_client is not None:
+            bridge_id = await _antigravity_native_bridge_id_for_session(
+                server_client=server_client,
+                session_id=conv_id,
+            )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+        cascade_id = state.conversation_id if state is not None else None
+        port = None
+        if cascade_id is not None and not is_placeholder_conversation_id(cascade_id):
+            port = await asyncio.to_thread(resolve_language_server_port, cascade_id)
+
+        if cascade_id is not None and port is not None:
+
+            async def _get_steps() -> list[dict[str, object]]:
+                return await asyncio.to_thread(get_trajectory_steps, port, cascade_id)
+
+            # CancelCascadeSteps is a no-op on a WAITING step (ask-question /
+            # permission): refuse it through the interaction bridge instead, then
+            # clear the parked web card. A non-WAITING (generating) cascade is
+            # stopped by CancelCascadeSteps.
+            denied = await deny_pending_interaction(cascade_id, port=port, get_steps=_get_steps)
+            if denied:
+                await _clear_antigravity_native_pending_elicitation(
+                    conv_id, cascade_id=cascade_id, port=port
+                )
+            else:
+                await asyncio.to_thread(cancel_cascade_steps, port, cascade_id)
+            _wake_parent_after_native_interrupt(conv_id)
+            return Response(status_code=204)
+
+        # No live cascade/port (cold pane, placeholder id): fall back to a tmux
+        # Escape so Stop still reaches the agy TUI rather than no-op'ing.
+        try:
+            await asyncio.to_thread(inject_interrupt, bridge_dir, timeout_s=1.0)
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_interrupt_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="antigravity-native interrupt"
+                    ),
+                },
+            )
+        _wake_parent_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _handle_antigravity_native_stop(conv_id: str) -> Response:
+        """Hard-stop an antigravity-native session by killing its tmux session.
+
+        Mirrors :func:`_handle_cursor_native_stop`: kill the pane (ends the
+        ``agy`` process — otherwise the process + runner-owned pane leak until
+        host SIGTERM / session delete), tear the terminal resource down so the
+        web UI stops showing a live terminal, cancel the RPC read driver (the
+        auto-forwarder), publish an explicit ``idle`` stop edge, clear any parked
+        elicitation card, and reclaim any sub-agent work entry.
+
+        NB: the codex/antigravity reader-owned idle suppression (the dispatch
+        guard that drops a reader's ``idle``) suppresses only the read driver's
+        own status edge; an explicit stop-edge ``idle`` published here is correct
+        — the spinner must clear on a hard stop.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 on success; 503 if the tmux target is unavailable.
+        """
+        from omnigent.antigravity_native_bridge import (
+            bridge_dir_for_bridge_id,
+            is_placeholder_conversation_id,
+            kill_session,
+            read_bridge_state,
+        )
+        from omnigent.antigravity_native_rpc import resolve_language_server_port
+
+        bridge_id = conv_id
+        if server_client is not None:
+            bridge_id = await _antigravity_native_bridge_id_for_session(
+                server_client=server_client,
+                session_id=conv_id,
+            )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+
+        # Release a parked elicitation card BEFORE the pane dies: once agy is
+        # killed its RPC port is gone and the freshest-WAITING step can't be read.
+        state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+        cascade_id = state.conversation_id if state is not None else None
+        if cascade_id is not None and not is_placeholder_conversation_id(cascade_id):
+            port = await asyncio.to_thread(resolve_language_server_port, cascade_id)
+            if port is not None:
+                await _clear_antigravity_native_pending_elicitation(
+                    conv_id, cascade_id=cascade_id, port=port
+                )
+
+        try:
+            await asyncio.to_thread(kill_session, bridge_dir, timeout_s=1.0)
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_stop_failed",
+                    "detail": _client_safe_error_detail(exc, context="antigravity-native stop"),
+                },
+            )
+        await _teardown_session_terminals(conv_id)
+        # Stop mirroring: cancel the RPC read driver so it isn't left polling a
+        # dead pane.
+        await _cancel_auto_forwarder_task(conv_id)
+        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        delivery_ack = _mark_subagent_terminal_and_wake(
+            conv_id,
+            status="cancelled",
+            output="[System: sub-agent stopped]",
+        )
+        if not delivery_ack.delivered and (
+            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
+        ):
+            _logger.warning(
+                "antigravity-native stop succeeded but sub-agent delivery was "
+                "not confirmed; session=%s reason=%s",
+                conv_id,
+                delivery_ack.reason,
+            )
+        return Response(status_code=204)
+
     async def _handle_claude_native_effort_change(
         conv_id: str,
         effort: str | None,
@@ -12318,6 +12580,10 @@ def create_runner_app(
             if _harness == "qwen-native":
                 # qwen turn lives in the qwen TUI; send Escape to stop it.
                 return await _handle_qwen_native_interrupt(conversation_id)
+            if _harness == "antigravity-native":
+                # agy turn lives in the runner-owned agy TUI; cancel the running
+                # cascade over connect-RPC (or DENY a WAITING interaction step).
+                return await _handle_antigravity_native_interrupt(conversation_id)
             # In-process harness: mark interrupted, forward an interrupt to the
             # harness, and force-cancel the runner turn task so the turn ends
             # promptly even if the harness can't honor the interrupt in time.
@@ -12394,6 +12660,10 @@ def create_runner_app(
             if _harness == "qwen-native":
                 # Hard-kill the qwen tmux pane (the TUI is the runtime).
                 return await _handle_qwen_native_stop(conversation_id)
+            if _harness == "antigravity-native":
+                # Hard-kill the agy tmux pane (the TUI is the runtime) so the
+                # agy process + pane don't leak.
+                return await _handle_antigravity_native_stop(conversation_id)
             await _cancel_inprocess_turn(conversation_id)
             return Response(status_code=204)
 

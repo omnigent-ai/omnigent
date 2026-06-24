@@ -1005,3 +1005,67 @@ def test_inject_user_message_via_tui_rejects_empty_content(tmp_path: Path) -> No
     """Empty content is a programming error, not something to type into the TUI."""
     with pytest.raises(RuntimeError, match="non-empty content"):
         inject_user_message_via_tui(tmp_path / "bridge", content="")
+
+
+# ---------------------------------------------------------------------------
+# Interrupt / hard-stop tmux primitives (inject_interrupt / kill_session)
+# ---------------------------------------------------------------------------
+
+
+class _FakeProc:
+    """Minimal ``subprocess.run`` result stand-in."""
+
+    def __init__(self, returncode: int = 0, stderr: str = "", stdout: str = "") -> None:
+        self.returncode = returncode
+        self.stderr = stderr
+        self.stdout = stdout
+
+
+def test_inject_interrupt_sends_escape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The interrupt sends a bare ``Escape`` key to the advertised pane."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/a.sock"), tmux_target="sess:0.0")
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        _mod.subprocess, "run", lambda cmd, **_k: captured.append(cmd) or _FakeProc(0)
+    )
+    _mod.inject_interrupt(bridge_dir, timeout_s=1.0)
+    # No ``-l``: tmux must interpret ``Escape`` as a key name, not literal text.
+    assert captured[0] == ["tmux", "-S", "/tmp/a.sock", "send-keys", "-t", "sess:0.0", "Escape"]
+
+
+def test_kill_session_kills_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The hard-stop kills the advertised tmux session outright."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/a.sock"), tmux_target="sess:0.0")
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        _mod.subprocess, "run", lambda cmd, **_k: captured.append(cmd) or _FakeProc(0)
+    )
+    _mod.kill_session(bridge_dir, timeout_s=1.0)
+    assert captured[0] == ["tmux", "-S", "/tmp/a.sock", "kill-session", "-t", "sess:0.0"]
+
+
+def test_inject_interrupt_raises_when_target_unadvertised(tmp_path: Path) -> None:
+    """No ``tmux.json`` → the readiness wait times out fast and raises."""
+    with pytest.raises(RuntimeError):
+        _mod.inject_interrupt(tmp_path / "bridge", timeout_s=0.05)
+
+
+def test_kill_session_raises_when_target_unadvertised(tmp_path: Path) -> None:
+    """No ``tmux.json`` → the readiness wait times out fast and raises."""
+    with pytest.raises(RuntimeError):
+        _mod.kill_session(tmp_path / "bridge", timeout_s=0.05)
+
+
+def test_kill_session_raises_on_tmux_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-zero tmux exit surfaces as a ``RuntimeError`` (not a silent no-op)."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/a.sock"), tmux_target="sess:0.0")
+    monkeypatch.setattr(
+        _mod.subprocess, "run", lambda *_a, **_k: _FakeProc(1, stderr="no such session")
+    )
+    with pytest.raises(RuntimeError, match="no such session"):
+        _mod.kill_session(bridge_dir, timeout_s=1.0)
