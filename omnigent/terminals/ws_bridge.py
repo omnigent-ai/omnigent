@@ -30,28 +30,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import logging
 import os
+import pty
 import shutil
 import signal
 import struct
-import sys
+import termios
 import time
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
-
-# fcntl/pty/termios are POSIX-only. This module drives tmux PTY ``attach``
-# sessions, a feature that is disabled on Windows (see the terminal
-# entrypoints), so importing it must not crash the server there. The
-# ``sys.platform`` guard is special-cased by mypy, which type-checks on Linux
-# and therefore still sees the real modules.
-if sys.platform != "win32":
-    import fcntl
-    import pty
-    import termios
 
 from fastapi import WebSocket, WebSocketDisconnect
 
