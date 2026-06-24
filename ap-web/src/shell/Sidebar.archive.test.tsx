@@ -6,8 +6,9 @@
 // clears the "Archiving…" status row). Unarchiving flips the flag back with
 // no stop and no status row. See ConversationRow.runArchive in Sidebar.tsx.
 //
-// Archived sessions render in the bottom "Archived" section, so the per-row
-// "Unarchive" action is reachable from there.
+// Archived sessions are no longer listed in the sidebar (they moved to the
+// Settings page), so unarchiving is covered by SettingsPage.test.tsx; this
+// file exercises the archive (stop→archive) path from a row's kebab.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -41,9 +42,9 @@ vi.mock("@/hooks/useConversations", () => ({
 }));
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
-vi.mock("@/components/theme/ThemeModeMenu", () => ({ ThemeModeMenu: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
+import { Toaster } from "@/components/ui/toast";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -92,6 +93,7 @@ function renderSidebar() {
       <TooltipProvider>
         <MemoryRouter initialEntries={["/"]}>
           <Sidebar open={true} onClose={vi.fn()} />
+          <Toaster />
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
@@ -133,24 +135,35 @@ describe("archive flow", () => {
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
     expect(mocks.archive.mutate).toHaveBeenCalledWith(
       { id: "conv_1", archived: true },
-      expect.objectContaining({ onSettled: expect.any(Function) }),
+      expect.objectContaining({
+        onSuccess: expect.any(Function),
+        onSettled: expect.any(Function),
+      }),
     );
   });
 
-  it("unarchives an archived row by clearing the flag (no stop, no status row)", () => {
-    // An archived session renders in the bottom "Archived" section
-    // (collapsed by default — expand to reach the row's kebab).
-    // Unarchiving is a quick flag flip — no runner stop and no
-    // "Archiving…" indicator, unlike the archive path above.
-    mockConversations([{ ...CONV, archived: true }]);
+  it("toasts a pointer to Settings once the archive succeeds", () => {
+    mockConversations([CONV]);
     renderSidebar();
-    fireEvent.click(screen.getByRole("button", { name: "Archived" }));
     clickArchive();
 
-    expect(mocks.stop.mutate).not.toHaveBeenCalled();
-    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
-    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: false });
+    // Drive stop→archive to the success callback.
+    const stopArgs = mocks.stop.mutate.mock.calls[0];
+    act(() => (stopArgs[1] as { onSettled: () => void }).onSettled());
+    const archiveArgs = mocks.archive.mutate.mock.calls[0];
+    act(() => (archiveArgs[1] as { onSuccess: () => void }).onSuccess());
+
+    const toast = screen.getByTestId("toast");
+    expect(within(toast).getByText(/View archived sessions in/)).toBeInTheDocument();
+    expect(within(toast).getByRole("link", { name: "Settings" })).toHaveAttribute(
+      "href",
+      "/settings/archived",
+    );
   });
+
+  // Unarchive moved out of the sidebar: archived sessions no longer render
+  // here (they're on the Settings page), so the "Unarchive" affordance is
+  // covered by SettingsPage.test.tsx instead.
 
   it("shows an 'Archiving…' status row while the archive is in flight", () => {
     // The stop mock never settles (vi.fn() stub), so the row stays in its

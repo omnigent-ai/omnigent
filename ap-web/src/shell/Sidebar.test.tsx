@@ -1,8 +1,9 @@
 // Integration tests for the Sidebar's session list. The search box no
 // longer carries a filter funnel (agent-type filter + "Show archived"
 // toggle were removed). The sidebar fetches a single session list with
-// archived sessions included, rendering them as grouped sections (Pinned /
-// Recent / Shared with me / Archived).
+// archived sessions included, rendering the non-archived ones as grouped
+// sections (Pinned / Recent / Shared with me). Archived sessions are no
+// longer listed here — they live on the Settings page.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -27,7 +28,6 @@ vi.mock("@/hooks/useConversations", () => ({
 }));
 // Header / dialog children that pull their own context — stub to keep the
 // test scoped to the conversation list + funnel.
-vi.mock("@/components/theme/ThemeModeMenu", () => ({ ThemeModeMenu: () => null }));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { useConversations } from "@/hooks/useConversations";
@@ -83,12 +83,12 @@ function mockConversations(convs: Conversation[]) {
   useConvMock.mockImplementation(() => result(convs));
 }
 
-function renderSidebar(open = true) {
+function renderSidebar(open = true, initialEntry = "/") {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
+        <MemoryRouter initialEntries={[initialEntry]}>
           <Sidebar open={open} onClose={vi.fn()} />
         </MemoryRouter>
       </TooltipProvider>
@@ -119,23 +119,40 @@ describe("Sidebar session list", () => {
     expect(useConvMock.mock.calls[0]).toEqual(["", true, { reconcileWhileConnected: true }]);
   });
 
-  it("groups archived sessions under an 'Archived' section, separate from Recent", () => {
+  it("swaps the card content to the settings section nav on /settings", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/settings");
+
+    // The same card now shows the settings nav (Back to app + sections),
+    // not the conversation search/list.
+    expect(screen.queryByPlaceholderText("Search sessions")).toBeNull();
+    expect(screen.getByRole("link", { name: /Back to Omnigent/ })).toHaveAttribute("href", "/");
+    expect(screen.getByTestId("settings-nav-appearance")).toHaveAttribute(
+      "href",
+      "/settings/appearance",
+    );
+    expect(screen.getByTestId("settings-nav-archived")).toHaveAttribute(
+      "href",
+      "/settings/archived",
+    );
+  });
+
+  it("keeps archived sessions out of the sidebar list (they live on the Settings page)", () => {
     mockConversations([
       conv("conv_active", "Claude Code"),
       conv("conv_archived", "Claude Code", { archived: true }),
     ]);
     renderSidebar();
 
-    // Archived starts collapsed by default; expand it to reach its rows.
-    fireEvent.click(screen.getByRole("button", { name: "Archived" }));
-
-    // The archived row lands in its own "Archived" <section>, not Recent —
-    // mixing it into Recent would defeat the grouping.
-    const archivedSection = screen.getByText("Archived").closest("section")!;
+    // There is no longer an "Archived" section in the sidebar — archived
+    // chats are surfaced on /settings, reached via the footer Settings row.
+    expect(screen.queryByRole("button", { name: "Archived" })).toBeNull();
+    expect(screen.queryByText("conv_archived")).toBeNull();
+    // Active sessions still render in Recent.
     const recentSection = screen.getByText("Recent").closest("section")!;
-    expect(within(archivedSection).getByText("conv_archived")).toBeInTheDocument();
-    expect(within(recentSection).queryByText("conv_archived")).toBeNull();
     expect(within(recentSection).getByText("conv_active")).toBeInTheDocument();
+    // The footer Settings link points at the settings page.
+    expect(screen.getByTestId("settings-button")).toHaveAttribute("href", "/settings");
   });
 
   it("renders sessions in one flat list with no connection grouping and no Sessions subheader", () => {

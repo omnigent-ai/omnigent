@@ -26,6 +26,9 @@ const ApprovePage = lazy(() =>
   import("@/pages/ApprovePage").then((m) => ({ default: m.ApprovePage })),
 );
 const InboxPage = lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage })));
+const SettingsPage = lazy(() =>
+  import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
+);
 
 interface AppProps {
   /**
@@ -120,6 +123,13 @@ function App({ basename }: AppProps = {}) {
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
+          {/* Settings renders into the chat outlet so the conversations
+              sidebar stays put — entering settings only swaps the card's
+              content (the section nav) and the main area. The active section
+              is carried in the URL (/settings/<section>); bare /settings
+              defaults to Appearance. */}
+          <Route path={`${prefix}/settings`} element={<SettingsPage />} />
+          <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
           {info.accounts_enabled && (
             <>
               <Route path={`${prefix}/members`} element={<MembersPage />} />
