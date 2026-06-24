@@ -2897,6 +2897,82 @@ async def test_sys_session_send_blocks_fresh_dispatch_when_harness_cli_missing(
 
 
 @pytest.mark.asyncio
+async def test_sys_session_send_blocks_fresh_dispatch_when_agy_unauthed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh agy dispatch with the binary present but no OAuth fails loud.
+
+    The binary-only preflight (``missing_harness_cli``) passes once ``agy`` is
+    on ``PATH``, but the antigravity family also needs a file-based OAuth
+    credential (``agy`` has no non-interactive login). Without the second
+    ``harness_is_configured`` gate this dispatch would create a child that then
+    stalls ~30-40s on agy's browser sign-in screen before dying with a
+    confusing turn-delivery error — instead of the actionable verdict the
+    launch path already gives. The dispatch must mirror the launch gate: fail
+    here with the agy sign-in hint, creating no child.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    # Binary present (autouse ``missing_harness_cli`` → None) but unauthed:
+    # mirror the launch gate's ``harness_is_configured`` refusal for the
+    # antigravity family. Patch where ``tool_dispatch`` imports it from.
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness.harness_is_configured",
+        lambda harness: harness not in ("antigravity-native", "native-antigravity"),
+    )
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+
+    create_posts = 0
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """Serve the fresh-create child lookup; count (and reject) any create."""
+        nonlocal create_posts
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_noagy/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts += 1
+            return httpx.Response(201, json={"id": "conv_should_not_exist"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "agent": "worker",
+                        "title": "review-auth",
+                        "args": {"input": "review the diff"},
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_noagy",
+                agent_spec=_spec_with_subagent_harness("antigravity-native"),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_parent_noagy", None)
+
+    # Plain error string carrying the actionable agy sign-in hint — the same
+    # remediation the launch gate yields via ``harness_setup_hint``.
+    assert output.startswith("Error:")
+    assert "antigravity-native" in output
+    assert "complete the browser sign-in" in output
+    # No child was created — the guard returned before the create POST.
+    assert create_posts == 0
+
+
+@pytest.mark.asyncio
 async def test_sys_session_send_model_rejected_for_existing_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

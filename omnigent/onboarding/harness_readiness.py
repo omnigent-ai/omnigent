@@ -150,12 +150,21 @@ def harness_is_configured(harness: str) -> bool:
     can't enumerate, so blocking them would risk false negatives that
     break working launches.
 
+    One family adds a credential axis on top of the binary: the antigravity
+    family (``antigravity-native`` / ``agy``) authenticates via a file-based
+    OAuth credential (it has no non-interactive ``login`` subcommand), so it
+    requires BOTH the binary on ``PATH`` AND a detected Gemini login (see
+    ``_FAMILY_CREDENTIAL_CHECK``). It therefore returns ``False`` when the
+    binary is missing *or* when it is present but unauthenticated.
+
     :param harness: A harness id, e.g. ``"claude-native"``, ``"codex"``,
         ``"openai-agents"``, ``"agents_sdk"``, ``"pi"``, ``"pi-native"``,
-        ``"qwen"``, or ``"qwen-code"``.
-    :returns: ``True`` when launchable (CLI installed, or a harness the
-        daemon doesn't gate); ``False`` only when a CLI-wrapping
-        harness's binary is missing from ``PATH``.
+        ``"qwen"``, ``"qwen-code"``, or ``"antigravity-native"``.
+    :returns: ``True`` when launchable (CLI installed — plus, for the
+        antigravity family, OAuth'd — or a harness the daemon doesn't
+        gate); ``False`` when a CLI-wrapping harness's binary is missing
+        from ``PATH``, or when the antigravity CLI is present but not yet
+        signed in.
     """
     canonical = _canonical_harness(harness)
     if canonical in _SDK_HARNESSES:
