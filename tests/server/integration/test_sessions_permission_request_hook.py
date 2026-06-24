@@ -32,6 +32,8 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import FastAPI
+from fastapi.routing import APIRoute
 
 from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.runtime import session_stream
@@ -248,6 +250,7 @@ async def test_cursor_permission_request_hook_allow_round_trip(
 
 
 async def test_top_level_elicitations_route_is_not_mounted(
+    app: FastAPI,
     client: httpx.AsyncClient,
 ) -> None:
     """
@@ -256,12 +259,38 @@ async def test_top_level_elicitations_route_is_not_mounted(
     Approval verdicts must travel through the session event route so
     they share normal session scoping and authorization. If the AP
     router gets mounted again, this test turns red immediately.
+
+    Checked two ways so the guard holds regardless of the environment:
+
+    - Route table (``app`` fixture): no ``APIRoute`` declares the
+      legacy ``POST /v1/elicitations/{elicitation_id}`` path. This
+      catches an exact re-mount even if its handler would 404 at
+      runtime, and is independent of which static assets are present.
+    - HTTP (``client`` fixture, same app): the live response is
+      ``404`` *or* ``405``. The status varies by environment because
+      ``create_app`` mounts a catch-all SPA at ``/`` only when a local
+      web-ui build exists at ``omnigent/server/static/web-ui/index.html``
+      (a gitignored dev artifact, absent on main/CI/fresh clones).
+      With no build the unmatched POST is a plain ``404``; with the
+      build present Starlette's ``StaticFiles`` matches the path but
+      rejects the non-GET method with ``405``. Either way no handler
+      ran. A re-mounted legacy route would instead run its handler and
+      return ``400`` (missing ``response_id`` for this body), ``501``,
+      or ``2xx`` — never ``404``/``405`` — so both assertions still
+      bite.
     """
+    assert not any(
+        isinstance(route, APIRoute)
+        and route.path == "/v1/elicitations/{elicitation_id}"
+        and "POST" in route.methods
+        for route in app.routes
+    ), "legacy POST /v1/elicitations/{elicitation_id} route is mounted again"
+
     resp = await client.post(
         "/v1/elicitations/elicit_removed",
         json={"action": "accept"},
     )
-    assert resp.status_code == 404, resp.text
+    assert resp.status_code in (404, 405), resp.text
 
 
 async def test_permission_request_hook_deny_round_trip(
