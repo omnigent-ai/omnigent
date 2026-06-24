@@ -2240,6 +2240,15 @@ def _build_session_response(
     # usage. Shared by the cost indicator and the per-model breakdown so
     # both read the same numbers.
     display_usage = subtree_usage if subtree_usage is not None else (conv.session_usage or {})
+    # Native-terminal-wrapper sessions (claude-native-ui / codex-native-ui) are
+    # always terminal-first: the web UI's Chat/Terminal pill is gated on the
+    # ``omnigent.ui = "terminal"`` label. That flag is fully determined by the
+    # agent identity, so derive it here from ``agent_name`` rather than relying
+    # solely on the stored label — the pill then stays correct even if the
+    # stored value is missing or stale. Idempotent: a no-op when already present.
+    labels = labels_with_closed_status(conv.labels, conv.title)
+    if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL):
+        labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -2247,7 +2256,7 @@ def _build_session_response(
         status=status,
         created_at=conv.created_at,
         title=title_without_closed_marker(conv.title),
-        labels=labels_with_closed_status(conv.labels, conv.title),
+        labels=labels,
         runner_id=conv.runner_id,
         host_id=conv.host_id,
         runner_online=runner_online,
