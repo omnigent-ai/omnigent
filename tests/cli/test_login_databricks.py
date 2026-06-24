@@ -22,6 +22,7 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
+from omnigent.cli import _load_global_config, _save_global_config
 from omnigent.cli import cli as cli_group
 
 _APPS_URL = "https://myapp-1234.aws.databricksapps.com"
@@ -78,7 +79,13 @@ def _response(
 
 @pytest.fixture()
 def token_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect auth_tokens.json to a temp dir (same seam as test_cli_auth).
+    """Redirect auth_tokens.json and the global config to a temp dir.
+
+    Logging in stores an auth record (auth_tokens.json, same seam as
+    test_cli_auth) and, on success, persists the just-logged-in server as
+    the user-level default (config.yaml, via OMNIGENT_CONFIG_HOME). Both
+    are redirected here so tests never touch the developer's real
+    ``~/.omnigent``.
 
     :param tmp_path: Pytest temp directory.
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -88,6 +95,7 @@ def token_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "omnigent.cli_auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
     )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     return tmp_path
 
 
@@ -344,6 +352,141 @@ def test_login_stale_cached_grant_triggers_fresh_login_and_retry(
     # The retry verify presented the freshly minted token, not the stale one.
     assert fake.requests[-1]["authorization"] == "Bearer tok-fresh"
     assert load_databricks_workspace_host(_APPS_URL) == _WORKSPACE
+
+
+# ── login sets the default server ───────────────────────────────────
+
+
+def test_login_sets_default_server(monkeypatch: pytest.MonkeyPatch, token_dir: Path) -> None:
+    """
+    A successful login records the server as the user-level default.
+
+    Without this, a freshly-logged-in user who runs a bare ``omnigent`` is
+    still routed at whatever default ``setup`` baked in — the "logged in,
+    yet asked to log in again to a different server" CUJ. The
+    just-logged-in server must become the configured default so the next
+    bare run targets it.
+    """
+    fake = _FakeHttpx(
+        responses=[
+            _response(302, headers={"location": _APPS_REDIRECT}),
+            _response(200, body={"user_id": "alice@example.com"}),
+        ]
+    )
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+
+    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+
+    assert result.exit_code == 0, result.output
+    assert _load_global_config().get("server") == _APPS_URL
+
+
+def test_login_header_mode_sets_default_server(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """
+    Header-auth mode logs in nothing but still records the default.
+
+    ``omnigent login <url>`` against a header-mode server needs no
+    credentials (a proxy injects identity), but the user's intent — "make
+    this my server" — is the same, so a bare ``omnigent`` afterwards
+    targets it. This also proves the default is set for a non-Databricks
+    posture, not just the Apps branch.
+    """
+    fake = _FakeHttpx(responses=[_response(200, body={"user_id": "proxied"})])
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+
+    result = CliRunner().invoke(cli_group, ["login", "http://proxy.internal:6767"])
+
+    assert result.exit_code == 0, result.output
+    assert "header-auth mode" in result.output
+    assert _load_global_config().get("server") == "http://proxy.internal:6767"
+
+
+def test_login_accounts_mode_sets_default_server(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """
+    A successful accounts-mode (username/password) login records the default.
+
+    Accounts mode is the common self-hosted, non-Databricks posture. The
+    default-setting lives in the login command *after* ``_accounts_login``
+    returns, so a successful sign-in repoints the default just like the
+    Databricks path. ``_accounts_login`` is stubbed to a clean return
+    (success) to isolate that wiring — its own HTTP flow is a separate
+    concern.
+    """
+    fake = _FakeHttpx(responses=[_response(401, body={"login_url": "/login"})])
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+    monkeypatch.setattr("omnigent.cli._accounts_login", lambda server: None)
+
+    result = CliRunner().invoke(cli_group, ["login", "http://omni.internal:6767"])
+
+    assert result.exit_code == 0, result.output
+    assert _load_global_config().get("server") == "http://omni.internal:6767"
+
+
+def test_login_oidc_mode_sets_default_server(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """
+    A successful OIDC (browser-ticket) login records the default.
+
+    OIDC is the other non-Databricks posture, and its success path is
+    inline in the login command (no helper to stub), so this drives the
+    full ticket → poll flow to prove the default is repointed there too.
+    """
+    import time
+    import webbrowser
+
+    server = "http://omni-oidc.internal:6767"
+    fake = _FakeHttpx(
+        responses=[
+            # Probe: OIDC 401 (login_url present but not "/login").
+            _response(401, body={"login_url": "/auth/login"}),
+            # Poll: the browser flow completed and the ticket is fulfilled.
+            _response(200, body={"token": "jwt", "user_id": "alice", "expires_in": 3600}),
+        ]
+    )
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, **kw: _response(200, body={"ticket": "t", "login_url": "/auth/go"}),
+    )
+    monkeypatch.setattr(webbrowser, "open", lambda url: True)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    result = CliRunner().invoke(cli_group, ["login", server])
+
+    assert result.exit_code == 0, result.output
+    assert _load_global_config().get("server") == server
+
+
+def test_login_failure_leaves_default_server_unchanged(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """
+    A login the server rejects must NOT repoint the default.
+
+    The default is persisted only after the server accepts the token —
+    otherwise a failed login against a server the user can't actually
+    reach would strand every later bare ``omnigent`` on that dead URL.
+    """
+    # Seed an existing default so we can prove it survives a failed login.
+    _save_global_config({"server": "https://existing.example.com"})
+    fake = _FakeHttpx(
+        responses=[
+            _response(302, headers={"location": _APPS_REDIRECT}),
+            _response(403),  # the app rejects the workspace token
+        ]
+    )
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+
+    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+
+    assert result.exit_code != 0
+    assert _load_global_config().get("server") == "https://existing.example.com"
 
 
 # ── bare-workspace URL expansion ────────────────────────────────────
