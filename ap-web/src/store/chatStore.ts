@@ -250,6 +250,16 @@ export interface ChatState {
    */
   isNativeTerminalSession: boolean;
   /**
+   * Whether this is a native-terminal wrapper whose model is chosen inside the
+   * vendor TUI (qwen/goose/cursor/pi/opencode) rather than through an Omnigent
+   * model picker. The composer status line hides its model/effort label for
+   * these — Omnigent's bound `llmModel` is just an unused default (it would
+   * otherwise read e.g. "claude-sonnet-4-6" on a Qwen session). claude-/codex-
+   * native DO expose an Omnigent picker, so they keep the label. `false` on
+   * `/`, before the snapshot resolves, and for non-native sessions.
+   */
+  nativeVendorOwnsModel: boolean;
+  /**
    * Server-bound agent id for the active conversation, read from
    * `GET /v1/sessions/{id}.agent_id` during bind. `null` while the
    * snapshot is in flight, on `/`, or for legacy conversations that
@@ -678,6 +688,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   status: "idle",
   sessionStatus: "idle",
   isNativeTerminalSession: false,
+  nativeVendorOwnsModel: false,
   boundAgentId: null,
   boundAgentName: null,
   loadingConversation: false,
@@ -1152,6 +1163,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         status: "idle",
         sessionStatus: "idle",
         isNativeTerminalSession: false,
+        nativeVendorOwnsModel: false,
         boundAgentId: null,
         boundAgentName: null,
         loadingConversation: conversationId !== null,
@@ -1596,6 +1608,7 @@ function sessionBindingPatch(
 ): Pick<
   ChatState,
   | "isNativeTerminalSession"
+  | "nativeVendorOwnsModel"
   | "boundAgentId"
   | "boundAgentName"
   | "llmModel"
@@ -1613,6 +1626,11 @@ function sessionBindingPatch(
   const wrapper = session.labels?.["omnigent.wrapper"];
   return {
     isNativeTerminalSession: isNativeWrapper(wrapper),
+    // Native wrapper whose model lives in the vendor TUI (no Omnigent picker):
+    // qwen/goose/cursor/pi/opencode. nativeModelFamilyForSession is non-null
+    // only for claude-/codex-native, which keep the composer model label.
+    nativeVendorOwnsModel:
+      isNativeWrapper(wrapper) && nativeModelFamilyForSession(session) === null,
     boundAgentId: session.agentId,
     boundAgentName: session.agentName,
     llmModel: session.llmModel ?? null,

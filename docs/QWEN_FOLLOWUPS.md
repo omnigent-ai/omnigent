@@ -80,8 +80,101 @@ comments; this is the *what*, not the *how*.)
 
 ### High
 
-- [ ] **Native TUI variant (`native-qwen`).** Attach to the live `qwen` terminal
-  (like `pi-native`) for a fully interactive experience instead of a piped turn.
+- [x] **Native TUI variant (`qwen-native` / `native-qwen`).** Implemented — the
+  live `qwen` TUI runs in a runner-owned tmux pane embedded in the web UI, driven
+  by `omnigent qwen`. Unlike the goose/cursor `tmux send-keys` native harnesses,
+  it uses qwen's built-in remote-control protocol: web-UI turns are appended to
+  qwen's `--input-file` (a `{"type":"submit"}` line, routed through the same
+  `submitQuery` path the keyboard uses, so it renders in the TUI), and the
+  transcript is mirrored back by tailing qwen's structured `--json-file` event
+  stream (Anthropic stream-json shape). Interrupt/stop still go through the pane
+  (`Escape` / kill) since the input-file watcher has no interrupt command. See
+  `docs/QWEN_NATIVE_DESIGN.md`. **Still a follow-up (PR2):** usage parsing from
+  the `result`/`assistant` events is not yet emitted on `TurnComplete.usage`
+  (see the status-line item below for the model/ring/cost consequences).
+
+- [ ] **Tool-approval elicitation card (TUI → web).** Today a tool call gates
+  only via qwen's **own in-terminal prompt** ("Apply this change? 1. Yes …") —
+  no approval card renders in the web chat, so a user on the Chat tab sees the
+  turn just hang. **Verified feasible** against a live session (and qwen
+  v0.18.1-preview.1): qwen emits a structured
+  `{"type":"control_request","request":{"subtype":"can_use_tool","tool_name",
+  "tool_use_id","input"},"request_id"}` on `--json-file` **and** accepts a
+  `{"type":"confirmation_response","request_id","allowed"}` on `--input-file`,
+  *coexisting* with its own TUI prompt (whichever answers first wins). The
+  forwarder currently just logs the `can_use_tool` (PR2 stub in
+  `qwen_native_forwarder.py`), so the request goes unanswered from the web side.
+  - **Template to copy:** cursor-native's approval mirror —
+    `omnigent/cursor_native_permissions.py` + `supervise_cursor_approval_mirror`
+    (wired in `runner/app.py::_auto_create_cursor_terminal`). qwen is *cleaner*:
+    read the structured `can_use_tool` from the event stream (no pane scraping)
+    and write `confirmation_response` to the input file (no keystrokes).
+  - **Reuse, don't add an endpoint:** POST the tool call to the existing
+    `/v1/sessions/{id}/policies/evaluate` (`_evaluate_tool_call_policy` in
+    `runner/app.py`) — it runs TOOL_CALL policy *and*, on ASK, parks a human
+    approval card (`response.elicitation_request`) and blocks for the verdict.
+    Map the verdict → `confirmation_response`. This delivers both the card and
+    the deferred policy gating in one shot.
+  - **Tricky edge (needs live E2E):** the user can answer in the **terminal**
+    *or* the **card**. The loser must be released — if qwen proceeds first
+    (a `tool_result` / next assistant event for that `tool_use_id` appears),
+    cancel the park via `external_elicitation_resolved` and skip the stale
+    `confirmation_response`; if the card answers first, write the response and
+    let the TUI prompt clear. Run the mirror as a supervised task alongside the
+    transcript forwarder in `_auto_create_qwen_terminal`.
+
+- [ ] **Composer status line: real model + context ring (Web UI).** For
+  native-qwen the composer's model/effort chip is currently **hidden** (web UI
+  flag `nativeVendorOwnsModel` in `chatStore.sessionBindingPatch` →
+  `ComposerStatusLine` in `ap-web/src/pages/ChatPage.tsx`). It was showing the
+  bound spec's *default* model (`claude-sonnet-4-6`) because the qwen-native-ui
+  spec sets no model and qwen picks its model inside the vendor TUI (OpenAI-compat
+  env / qwen's own `/model`), so Omnigent's `llmModel` was a misleading default.
+  Hiding it is the interim; the real fix is to **surface qwen's actual model**
+  (and effort/approval-mode if meaningful). The data is already on qwen's
+  `--json-file` stream — `assistant` message events carry `message.model` (e.g.
+  `openai/gpt-oss-120b:free`) and the `system/session_start` event carries model
+  metadata. The forwarder (`omnigent/qwen_native_forwarder.py`) could parse it
+  and report it onto the session so the chip reflects qwen's reality.
+  - **Context ring + cost tracking also missing**, same root cause: native-qwen
+    emits no token usage, so `tokensUsed` / `contextWindow` stay null (the ring
+    renders only when `contextWindow > 0 && tokensUsed != null`) and the session
+    cost stays $0 (cost is derived from per-turn usage × model price). The ACP
+    `qwen` harness already does this — see "Cost / token tracking" in *What works
+    today* (`_accumulate_usage`); native-qwen needs the equivalent off the
+    `--json-file` stream. Parse `result.usage` (`input_tokens` / `output_tokens`
+    / `cache_read_input_tokens` / `total_tokens`) in
+    `omnigent/qwen_native_forwarder.py`, split `cache_read_input_tokens` out of
+    `input_tokens` (qwen's `input_tokens` is cache-inclusive; cost wants the
+    non-cached portion), and report it onto the session so the cost observer +
+    context ring pick it up; the context-window *limit* comes from the curated
+    `_QWEN_CONTEXT_WINDOWS` lookup. One usage-parsing change feeds the model
+    chip, the ring, and cost together.
+
+- [x] **Restore qwen's TUI history on resume.** `omni qwen --resume <conv_id>`
+  used to relaunch a **blank** `qwen` TUI (only the web chat kept history, via the
+  forwarder). Fixed, using the **same `external_session_id` convention as
+  claude-/codex-/pi-native** (so it's consistent and fork-capable):
+  `_auto_create_qwen_terminal` persists the qwen session id on the Omnigent
+  session (`_persist_qwen_external_session_id` → `PATCH /v1/sessions/{id}`), reads
+  it back from the snapshot (`launch_config.external_session_id`) on the next
+  launch, and it's stamped as `omnigent.fork.source_external_session_id` for fork
+  history carry-over. qwen is cleaner than claude/codex here — it lets us *assign*
+  the id via `--session-id`, so we mint a deterministic one
+  (`qwen_session_id_for_conversation`, UUIDv5 of the `conv_id`) up front instead
+  of capturing a vendor-generated id, and a failed persist self-heals (the id is
+  recomputable). Launch is fresh `--session-id <id>` the first time, `--resume
+  <id>` once qwen has an on-disk recording — the recording check
+  (`qwen_session_recording_exists`, scoped to the launch workspace's qwen project
+  slug at `~/.qwen/projects/<slug>/chats/<id>.jsonl`) is the `--resume` guard,
+  since `--resume` on an id not recorded *under that cwd* shows qwen's blocking
+  "No saved session found" screen — qwen resolves `--resume` per-project, so the
+  check must be workspace-scoped, not a cross-project glob (also keeps
+  never-messaged / pre-convention sessions on the clean fresh path). **No forwarder change
+  needed:** verified that on `--resume` qwen restores history into the TUI from
+  its own checkpoint and emits *only new* events to `--json-file`, so the
+  transcript is never re-mirrored — qwen sidesteps the double-mirror problem that
+  forced goose-native to start fresh.
 
 ### Medium
 

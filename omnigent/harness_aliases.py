@@ -20,6 +20,9 @@ HARNESS_ALIASES: dict[str, str] = {
     "native-goose": "goose-native",
     # Qwen Code harness alias.
     "qwen-code": "qwen",
+    # User-facing reversed spelling for the qwen native-CLI harness; canonical
+    # id is "qwen-native" (the ACP-piped harness keeps the bare "qwen" name).
+    "native-qwen": "qwen-native",
     # OpenCode native-server harness: the bare ``opencode`` name and the
     # reversed ``native-opencode`` spelling both fold to ``opencode-native``
     # (there is no separate SDK ``opencode`` harness, so the bare name is free).
@@ -53,6 +56,8 @@ NATIVE_HARNESSES: frozenset[str] = frozenset(
         "native-antigravity",
         "goose-native",
         "native-goose",
+        "qwen-native",
+        "native-qwen",
         "opencode-native",
         "native-opencode",
     }

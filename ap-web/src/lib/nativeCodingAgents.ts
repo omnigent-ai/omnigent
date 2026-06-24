@@ -11,7 +11,8 @@ export type NativeCodingAgentIconKind =
   | "pi"
   | "cursor"
   | "goose"
-  | "antigravity";
+  | "antigravity"
+  | "qwen";
 export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
 
 export interface NativeCodingAgentSpec {
@@ -97,6 +98,19 @@ export const NATIVE_CODING_AGENTS = [
     iconKind: "goose",
     sortRank: 50,
   },
+  {
+    // qwen has no brand glyph yet, so it falls back to the generic bot icon
+    // (see AgentCard.iconForAgent / SubagentsPanel) — the `iconKind: "qwen"`
+    // intentionally matches no icon branch. Auth/approval surface in the
+    // embedded terminal, so no capability flags are declared here.
+    key: "qwen",
+    agentName: "qwen-native-ui",
+    harness: "qwen-native",
+    wrapperLabel: "qwen-native-ui",
+    displayName: "Qwen Code",
+    iconKind: "qwen",
+    sortRank: 60,
+  },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
 const BY_AGENT_NAME: Map<string, NativeCodingAgentSpec> = new Map(
@@ -118,6 +132,7 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-cursor": "cursor-native",
   "native-antigravity": "antigravity-native",
   "native-goose": "goose-native",
+  "native-qwen": "qwen-native",
 };
 
 export function nativeCodingAgentForAgentName(

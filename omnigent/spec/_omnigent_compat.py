@@ -96,6 +96,7 @@ OMNIGENT_HARNESSES = frozenset(
         "pi",
         "pi-native",
         "qwen",
+        "qwen-native",
     },
 )
 # User-facing aliases accepted in specs and normalized before runtime dispatch.

@@ -106,7 +106,7 @@ jobs:
           fi
 
   ui-snapshot:
-    name: UI Snapshot (visual baselines)
+    name: UI Snapshot (visual baselines) [non-blocking]
     needs: detect
     # Skipped (not failed) when no render input changed -> reports SUCCESS, so a
     # non-UI PR neither runs the render nor blocks a required check.

@@ -270,6 +270,15 @@ def _dispatch_wrapper(
             antigravity_args=(),
         )
         return True
+    if native_agent.key == "qwen":
+        from omnigent.qwen_native import run_qwen_native
+
+        run_qwen_native(
+            server=server,
+            session_id=session_id,
+            qwen_args=(),
+        )
+        return True
     return False
 
 
