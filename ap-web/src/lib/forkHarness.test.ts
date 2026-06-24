@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  agentBaseName,
+  agentRootName,
   harnessFamily,
   isNativeHarness,
   forkTargetCarriesHistory,
@@ -18,6 +18,9 @@ describe("harnessFamily", () => {
     ["openai-agents", "openai"],
     ["openai-agents-sdk", "openai"],
     ["agents_sdk", "openai"],
+    ["antigravity-native", "gemini"],
+    ["native-antigravity", "gemini"],
+    ["antigravity", "gemini"],
   ])("maps %s → %s", (harness, family) => {
     expect(harnessFamily(harness)).toBe(family);
   });
@@ -38,12 +41,18 @@ describe("isNativeHarness", () => {
     ["native-codex", true],
     ["pi-native", true],
     ["native-pi", true],
+    // Antigravity-native spellings are native too — aligned with Python
+    // NATIVE_HARNESSES (the in-process `antigravity` SDK harness is NOT).
+    ["antigravity-native", true],
+    ["native-antigravity", true],
     ["claude-sdk", false],
     ["claude_sdk", false],
     ["openai-agents", false],
     ["codex", false],
     // The SDK `pi` harness is in-process, not a native CLI wrapper.
     ["pi", false],
+    // The in-process Antigravity SDK harness is likewise not native.
+    ["antigravity", false],
     [null, false],
   ])("classifies %s as native=%s", (harness, expected) => {
     expect(isNativeHarness(harness as string | null)).toBe(expected);
@@ -54,12 +63,17 @@ describe("forkTargetCarriesHistory", () => {
   // SDK targets always carry history as context, regardless of source or
   // family — including native → SDK and cross-family. A false here would
   // wrongly hide a fully-supported switch from the picker.
-  it.each([["claude-sdk"], ["claude_sdk"], ["codex"], ["openai-agents"], ["agents_sdk"]])(
-    "SDK target %s carries history",
-    (target) => {
-      expect(forkTargetCarriesHistory(target)).toBe(true);
-    },
-  );
+  it.each([
+    ["claude-sdk"],
+    ["claude_sdk"],
+    ["codex"],
+    ["openai-agents"],
+    ["agents_sdk"],
+    // antigravity is the Gemini-family SDK target.
+    ["antigravity"],
+  ])("SDK target %s carries history", (target) => {
+    expect(forkTargetCarriesHistory(target)).toBe(true);
+  });
 
   // Native targets carry from ANY source: the runner clones the source's
   // native transcript when the source is same-family native, else rebuilds
@@ -77,6 +91,8 @@ describe("forkTargetCarriesHistory", () => {
     // still be offered, or the fork/switch-agent pickers silently drop it.
     ["pi-native"],
     ["native-pi"],
+    ["antigravity-native"],
+    ["native-antigravity"],
   ])("native target %s carries history", (target) => {
     expect(forkTargetCarriesHistory(target)).toBe(true);
   });
@@ -91,29 +107,27 @@ describe("forkTargetCarriesHistory", () => {
   });
 });
 
-describe("agentBaseName", () => {
+describe("agentRootName", () => {
   it("returns a plain name unchanged", () => {
-    expect(agentBaseName("claude-native-ui")).toBe("claude-native-ui");
+    expect(agentRootName("claude-native-ui")).toBe("claude-native-ui");
   });
 
-  it("strips a fork suffix", () => {
-    expect(agentBaseName("claude-native-ui (fork conv_ab12)")).toBe("claude-native-ui");
+  it("peels a single fork or switch layer", () => {
+    expect(agentRootName("claude-native-ui (fork ag_3a9fa87)")).toBe("claude-native-ui");
+    expect(agentRootName("nessie (switch conv_9f3c)")).toBe("nessie");
   });
 
-  it("strips a switch suffix", () => {
-    expect(agentBaseName("nessie (switch conv_9f3c)")).toBe("nessie");
+  it("peels every layer of a fork-of-a-fork", () => {
+    // A single-layer strip would stop at "claude-native-ui (fork ag_a)";
+    // agentRootName recurses to the root so a multi-fork clone of a built-in
+    // still matches the built-in catalog (and is dropped by the agent picker).
+    expect(agentRootName("claude-native-ui (fork ag_a) (fork ag_b)")).toBe("claude-native-ui");
+    expect(agentRootName("polly (fork conv_a) (switch conv_b)")).toBe("polly");
   });
 
   it("leaves interior or non-clone parentheses alone", () => {
-    // Only the exact trailing " (fork <id>)" / " (switch <id>)" shape is a
-    // clone marker — user-chosen names with parens must not be mangled.
-    expect(agentBaseName("my-agent (beta)")).toBe("my-agent (beta)");
-    expect(agentBaseName("agent (fork pun) helper")).toBe("agent (fork pun) helper");
-  });
-
-  it("strips only the outermost suffix when a clone was itself cloned", () => {
-    // Fork-of-a-fork names accumulate suffixes; one call removes one
-    // layer (callers compare against catalogs of single-layer names).
-    expect(agentBaseName("polly (fork conv_a) (switch conv_b)")).toBe("polly (fork conv_a)");
+    // Only trailing clone markers are peeled — user-chosen parens survive.
+    expect(agentRootName("my-agent (beta)")).toBe("my-agent (beta)");
+    expect(agentRootName("agent (fork pun) helper")).toBe("agent (fork pun) helper");
   });
 });

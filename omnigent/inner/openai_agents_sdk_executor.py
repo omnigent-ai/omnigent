@@ -438,10 +438,22 @@ def _get_openai_async_client(
     # Checked before profile and env-var lookups so the spec is self-contained.
     # base_url_override is populated from HARNESS_OPENAI_AGENTS_GATEWAY_BASE_URL
     # when the spec also declares executor.auth.base_url.
+    #
+    # Fall back to the ambient OPENAI_BASE_URL when no override reached us.
+    # The api_key is frequently a gateway credential (e.g. a Databricks AI
+    # Gateway PAT detected from OPENAI_API_KEY), and the companion base_url
+    # can be dropped anywhere on the daemon → runner → harness propagation
+    # chain (the spec auth bake omits it when OPENAI_BASE_URL is absent at
+    # materialization time; a reused local daemon may predate the env var).
+    # Without this fallback, a missing base_url silently routes the gateway
+    # token to api.openai.com and every request 401s; honoring the ambient
+    # OPENAI_BASE_URL the runner inherits keeps the gateway target present on
+    # every turn even when the override is lost. base_url=None still defaults
+    # to api.openai.com for a genuine OpenAI key with no gateway configured.
     if api_key and api_key.strip():
         return AsyncOpenAI(
             api_key=api_key,
-            base_url=base_url_override or None,
+            base_url=base_url_override or os.environ.get("OPENAI_BASE_URL") or None,
             **retry_kwargs,
         )
 
@@ -615,7 +627,7 @@ class _AgentsSessionState:
         before starting. Set by :meth:`interrupt_session`.
     """
 
-    sdk_session: _SanitizingSession
+    sdk_session: Any  # type: ignore[explicit-any]  # _SanitizingSession or OpenAIResponsesCompactionSession
     started: bool = False
     # agents.Agent[Any] instance; cached for reuse across turns.
     agent: SDKAgent = None
@@ -1063,7 +1075,45 @@ class OpenAIAgentsSDKExecutor(Executor):
         if state is not None:
             return state
 
-        sdk_session = _SanitizingSession(agents_sdk.SQLiteSession(session_key))
+        underlying = _SanitizingSession(agents_sdk.SQLiteSession(session_key))
+        sdk_session: Any = underlying  # type: ignore[explicit-any]
+        # Wrap with compaction session when the client targets a real
+        # HTTP endpoint. Skip for bare object() clients in unit tests
+        # that lack base_url.
+        _base = str(getattr(self._client, "base_url", ""))
+        if _base.startswith("http"):
+            try:
+                from agents.memory import OpenAIResponsesCompactionSession
+
+                class _SafeCompactionSession(OpenAIResponsesCompactionSession):
+                    """Compaction session that treats compaction failures as non-fatal.
+
+                    The responses.compact API may not be available on all
+                    endpoints (mock servers, some proxies). A 404 or other
+                    failure should not kill the turn — the session continues
+                    without compaction.
+                    """
+
+                    async def run_compaction(self, args=None):  # type: ignore[override]
+                        try:
+                            await super().run_compaction(args)
+                        except Exception:  # noqa: BLE001
+                            logger.debug(
+                                "Compaction call failed (endpoint may not support "
+                                "responses.compact), continuing without compaction",
+                                exc_info=True,
+                            )
+
+                sdk_session = _SafeCompactionSession(
+                    session_id=session_key,
+                    underlying_session=underlying,  # type: ignore[arg-type]
+                    client=self._client,
+                )
+            except (ImportError, AttributeError, ValueError) as exc:
+                logger.debug(
+                    "Compaction session setup failed, falling back to plain session: %s",
+                    exc,
+                )
         state = _AgentsSessionState(sdk_session=sdk_session)
         self._session_states[session_key] = state
         return state
@@ -1584,11 +1634,9 @@ class OpenAIAgentsSDKExecutor(Executor):
                 if state.interrupt_requested:
                     return
                 if _is_context_length_exceeded(exc):
-                    # Let the runtime compaction layer handle context
-                    # overflow.  Re-raising propagates the original
-                    # exception to the ExecutorAdapter, whose error
-                    # classifier maps it to ``context_length_exceeded``
-                    # so the workflow's reactive compaction fires.
+                    # Re-raise so the ExecutorAdapter's error classifier
+                    # maps it to ``context_length_exceeded`` and the
+                    # runner surfaces the overflow to the user.
                     raise
                 from .databricks_executor import DatabricksAuthError
 
@@ -1738,6 +1786,35 @@ class OpenAIAgentsSDKExecutor(Executor):
                 if cached_tok:
                     turn_usage["cache_read_input_tokens"] = cached_tok
         _notify_usage_from_dict(model=model, usage=turn_usage)
+
+        # Emit CompactionComplete if the SDK compacted this turn.
+        if result is not None:
+            for item in result.new_items:
+                if getattr(item, "type", None) == "compaction_item":
+                    from omnigent.inner.executor import CompactionComplete
+
+                    _compaction_tokens = 0
+                    if turn_usage is not None:
+                        _compaction_tokens = turn_usage.get("context_tokens", 0) or 0
+                    _compacted: list[dict[str, Any]] | None = None
+                    try:
+                        _compacted = await state.sdk_session.get_items()
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "Failed to read compacted session items",
+                            exc_info=True,
+                        )
+                    yield CompactionComplete(
+                        summary=(
+                            "[OpenAI Responses API compaction"
+                            " — context was automatically compacted]"
+                        ),
+                        token_count=_compaction_tokens,
+                        model=model,
+                        compacted_messages=_compacted,
+                    )
+                    break
+
         yield TurnComplete(response=final_text, usage=turn_usage)
 
     @staticmethod

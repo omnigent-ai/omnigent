@@ -621,6 +621,12 @@ class ChildSessionSummary(BaseModel):
         consult is what keeps the rail's "Working" badge correct.
     :param labels: Session-scoped guardrails labels on the child
         conversation (mirrors :class:`ConversationObject.labels`).
+    :param last_task_error: Error details from the child's most recent
+        failed run, e.g.
+        ``{"code": "required_terminal_exited", "message": "..."}``.
+        ``None`` when the child has no durable failure detail. This is
+        the typed projection of runner-owned failure labels; clients
+        should not parse those labels directly.
     :param last_message_preview: Single-line preview of the most
         recent message item in the child's conversation, truncated
         to ~150 chars with a trailing ellipsis when longer. ``None``
@@ -653,6 +659,7 @@ class ChildSessionSummary(BaseModel):
     current_task_status: str | None = None
     busy: bool = False
     labels: dict[str, str] = Field(default_factory=dict)
+    last_task_error: dict[str, str] | None = None
     last_message_preview: str | None = None
     pending_elicitations_count: int = 0
 
@@ -1418,6 +1425,14 @@ class SessionResponse(BaseModel):
         ``runner_online`` is ``False`` — host alive ⇒ "send a
         message to wake the runner"; host dead ⇒ "reconnect /
         fork". Never participates in the reachability decision.
+    :param host_resumable: Whether this session is bound to a dormant
+        managed host the server can wake in place (its provider sets
+        :attr:`SandboxLauncher.can_resume`). The open view reads it only
+        when ``host_online`` is ``False``, to split a confirmed host-down
+        into a recoverable "asleep" state (send a message — the relaunch
+        path resumes the sandbox) versus the terminal ``host_offline``
+        dead-end (reconnect from your machine / fork). ``False`` for
+        non-managed or non-resumable hosts.
     :param reasoning_effort: Per-session reasoning-effort hint.
         Accepted metadata values are ``"none"``, ``"minimal"``,
         ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, and
@@ -1560,6 +1575,10 @@ class SessionResponse(BaseModel):
         runner at startup. Empty list when the agent spec
         cannot be loaded, or when bundled + host discovery
         yields nothing.
+    :param model_options: Codex app-server ``model/list`` options
+        for codex-native sessions, including each model's supported
+        reasoning efforts. Empty for non-codex-native sessions or while
+        the bound runner / Codex app-server cannot answer yet.
     :param terminal_pending: ``True`` while the runner is auto-creating
         a terminal-first session's terminal (claude-native /
         codex-native), so the Web UI shows a spinner on the Terminal
@@ -1590,6 +1609,7 @@ class SessionResponse(BaseModel):
     host_id: str | None = None
     runner_online: bool | None = None
     host_online: bool | None = None
+    host_resumable: bool = False
     reasoning_effort: str | None = None
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None
@@ -1621,6 +1641,7 @@ class SessionResponse(BaseModel):
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
+    model_options: list[dict[str, Any]] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
 
@@ -1655,6 +1676,10 @@ class UpdateSessionRequest(BaseModel):
         models. Clear aliases such as ``"default"``, ``"off"``, or
         ``"reset"`` remove the override (matching the REPL's
         ``/model`` semantics). ``None`` leaves unchanged.
+    :param collaboration_mode: Codex-native collaboration-mode string.
+        ``"plan"`` enters Plan mode and ``"default"`` returns to Default
+        mode for subsequent Codex turns. Only valid for sessions stamped
+        with the codex-native wrapper label. Omitted leaves unchanged.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
         mode, ``"off"`` disables cost control for this session.
@@ -1675,8 +1700,8 @@ class UpdateSessionRequest(BaseModel):
         length) are validated server-side. ``None`` leaves unchanged.
     :param silent: When ``True``, persist metadata changes but skip
         the runner-side side effects — specifically the
-        claude-native ``/effort`` and ``/model`` slash-command
-        forwards into the tmux pane. Used by automatic bind-time
+        native ``/effort`` / ``/model`` / Codex collaboration-mode
+        forwards into the live runtime. Used by automatic bind-time
         handoffs (ap-web's sticky-pref apply on session switch, the
         REPL's pre-create ``/model`` snapshot) where injecting a
         visible slash command into a freshly-spawned pane would
@@ -1695,6 +1720,7 @@ class UpdateSessionRequest(BaseModel):
     labels: dict[str, str] | None = None
     reasoning_effort: str | None = None
     model_override: str | None = None
+    collaboration_mode: str | None = None
     cost_control_mode_override: str | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -2115,6 +2141,54 @@ class SessionModelEvent(_SSEEventBase):
     model: str
 
 
+class SessionReasoningEffortEvent(_SSEEventBase):
+    """
+    Active reasoning-effort update from a terminal-backed integration.
+
+    Emitted after an ``external_reasoning_effort_change`` POST from a native
+    terminal forwarder when the user changes the thinking level inside the
+    terminal UI. Lets the web effort picker reflect a TUI-side switch without
+    a reload.
+
+    :param type: Always ``"session.reasoning_effort"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param reasoning_effort: Reasoning effort now active for the session, e.g.
+        ``"medium"``, or ``None`` when Codex cleared to its default.
+
+    Category: **transient** (SSE-only). The server also writes
+    ``reasoning_effort`` on the conversation, so on reconnect clients restore
+    the selection from the session snapshot rather than from a replayed event.
+    """
+
+    type: Literal["session.reasoning_effort"]
+    conversation_id: str
+    reasoning_effort: str | None = None
+
+
+class SessionCollaborationModeEvent(_SSEEventBase):
+    """
+    Active collaboration-mode update from a Codex-native session.
+
+    Emitted after the web UI toggles Codex collaboration mode, and after the
+    Codex forwarder observes a ``thread/settings/updated`` notification from
+    the native Codex TUI. Lets connected clients show a clear Plan-mode
+    indicator without a reload.
+
+    :param type: Always ``"session.collaboration_mode"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param mode: The active collaboration mode string, e.g. ``"plan"`` or
+        ``"default"``.
+
+    Category: **transient** (SSE-only). The server also writes
+    ``omnigent.codex_native.collaboration_mode`` on the conversation labels,
+    so reconnect clients restore the same state from the session snapshot.
+    """
+
+    type: Literal["session.collaboration_mode"]
+    conversation_id: str
+    mode: str
+
+
 class SessionAgentChangedEvent(_SSEEventBase):
     """
     Bound-agent change on a live session.
@@ -2276,6 +2350,32 @@ class SessionSkillsEvent(_SSEEventBase):
     """
 
     type: Literal["session.skills"]
+    conversation_id: str
+
+
+class SessionModelOptionsEvent(_SSEEventBase):
+    """
+    Signal that a codex-native session's model catalog has resolved.
+
+    Model options are fetched from the bound runner's live
+    Codex app-server via ``model/list`` and cached on the session
+    snapshot. The initial snapshot can return an empty list while
+    this background fetch is in flight; this event tells connected
+    clients to re-read the snapshot and apply its now-populated
+    ``model_options``.
+
+    Carries no payload beyond the conversation id. The snapshot's
+    ``model_options`` field remains the source of truth.
+
+    :param type: Always ``"session.model_options"``.
+    :param conversation_id: Session identifier,
+        e.g. ``"conv_abc123"``.
+
+    Category: **transient** (SSE-only). On reconnect, clients seed
+    Codex model / effort controls from the session snapshot.
+    """
+
+    type: Literal["session.model_options"]
     conversation_id: str
 
 
@@ -3073,11 +3173,17 @@ class CompactionCompletedEvent(_SSEEventBase):
     """
     Conversation history compaction has finished.
 
-    Emitted by ``omnigent/server/routes/sessions.py`` after
-    ``compact_conversation_now()`` returns successfully. Clients
-    that rendered a "Compacting…" spinner on
+    Emitted after compaction completes — either by the server after
+    ``compact_conversation_now()`` (explicit ``/compact``), or by a
+    harness that compacted its own internal context. Clients that
+    rendered a "Compacting…" spinner on
     :class:`CompactionInProgressEvent` should upgrade it to the
     permanent "Conversation compacted" marker on this event.
+
+    When emitted by a harness, ``summary`` and ``summary_model``
+    are populated so the runner can persist a compaction item for
+    session resume. When emitted by the server's explicit
+    ``/compact`` path, those fields are ``None``.
 
     :param type: Always ``"response.compaction.completed"``.
     :param total_tokens: Tiktoken estimate of the post-compaction
@@ -3085,10 +3191,17 @@ class CompactionCompletedEvent(_SSEEventBase):
         update the context-ring immediately without waiting for the
         next ``response.completed`` usage report. ``None`` when
         token counting is unavailable.
+    :param summary: Text summary of the compacted conversation,
+        or ``None`` for server-side compaction (already persisted).
+    :param summary_model: Model used for summarization, or ``None``
+        if truncation-based or server-side.
     """
 
     type: Literal["response.compaction.completed"]
     total_tokens: int | None = None
+    summary: str | None = None
+    summary_model: str | None = None
+    compacted_messages: list[dict[str, Any]] | None = None
 
 
 class CompactionFailedEvent(_SSEEventBase):
@@ -3316,11 +3429,14 @@ ServerStreamEvent = Annotated[
     SessionStatusEvent
     | SessionUsageEvent
     | SessionModelEvent
+    | SessionReasoningEffortEvent
+    | SessionCollaborationModeEvent
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent
     | SessionSandboxStatusEvent
     | SessionSkillsEvent
+    | SessionModelOptionsEvent
     | SessionInputConsumedEvent
     | SessionInterruptedEvent
     | SessionCreatedEvent

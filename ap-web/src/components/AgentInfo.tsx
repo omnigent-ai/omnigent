@@ -1,8 +1,16 @@
 // Agent info surface: the MCP-server and policy badges plus the
 // header info-icon popover that displays them.
 
-import { useState } from "react";
-import { InfoIcon, PlusIcon, ServerIcon, ShieldCheckIcon, TrashIcon } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import {
+  CheckIcon,
+  CopyIcon,
+  InfoIcon,
+  PlusIcon,
+  ServerIcon,
+  ShieldCheckIcon,
+  TrashIcon,
+} from "lucide-react";
 import type { Agent, McpServerSummary } from "@/hooks/useAgents";
 import type { ModelUsage } from "@/lib/types";
 import {
@@ -24,7 +32,9 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { capitalizeAgentName } from "@/lib/agentLabels";
 import { coercePolicyParams } from "@/lib/policyParams";
+import { agentRootName } from "@/lib/forkHarness";
 import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
+import { copyText } from "@/lib/clipboard";
 import { useChatStore } from "@/store/chatStore";
 
 /**
@@ -32,11 +42,20 @@ import { useChatStore } from "@/store/chatStore";
  * the name capital-first (server agent names are lowercase slugs, e.g.
  * ``"polly"`` → ``"Polly"``). Keeps the chat surfaces consistent with
  * the new-chat picker's capitalization.
+ *
+ * Strips EVERY `" (fork <id>)"` / `" (switch <id>)"` suffix the fork/switch
+ * routes append to a cloned agent's name before resolving (a fork of a fork
+ * nests them), so a clone of a native wrapper (e.g.
+ * `"pi-native-ui (fork conv_a) (fork conv_b)"`) still maps to its display
+ * name ("Pi") instead of falling through to the capitalized raw slug
+ * ("Pi-native-ui (fork conv_a) …"). Mirrors how `useAvailableAgents` and the
+ * fork/switch pickers match clones back to their root agent.
  */
 export function agentDisplayLabel(name: string): string {
-  const nativeAgent = nativeCodingAgentForAgentName(name);
+  const baseName = agentRootName(name);
+  const nativeAgent = nativeCodingAgentForAgentName(baseName);
   if (nativeAgent?.key === "claude") return "Claude";
-  return nativeAgent?.displayName ?? capitalizeAgentName(name);
+  return nativeAgent?.displayName ?? capitalizeAgentName(baseName);
 }
 
 /** Compact pill row listing MCP servers attached to an agent. */
@@ -600,6 +619,8 @@ export function agentHasInfo(agent: Agent | undefined, sessionId?: string | null
 export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
   const servers = agent?.mcp_servers ?? [];
   const displayName = agent ? agentDisplayLabel(agent.name) : null;
+  const [sessionIdCopied, setSessionIdCopied] = useState(false);
+  const copyResetTimeoutRef = useRef<number | null>(null);
   // Cumulative session spend, live from the store (seeded on bind, updated
   // by SSE ``session_usage``). ``null`` when the session is unpriced (no
   // turn priced yet) — omit the row rather than show "$0.00" / "—".
@@ -609,6 +630,25 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
   // popover renders it directly — the frontend derives any aggregate view
   // from this map rather than receiving flat token fields.
   const usageByModel = useChatStore((s) => s.sessionUsageByModel);
+
+  useEffect(() => {
+    return () => {
+      if (copyResetTimeoutRef.current !== null) window.clearTimeout(copyResetTimeoutRef.current);
+    };
+  }, []);
+
+  async function copySessionId() {
+    if (!sessionId) return;
+    try {
+      await copyText(sessionId);
+    } catch (err) {
+      console.warn("Failed to copy session ID", err);
+      return;
+    }
+    setSessionIdCopied(true);
+    if (copyResetTimeoutRef.current !== null) window.clearTimeout(copyResetTimeoutRef.current);
+    copyResetTimeoutRef.current = window.setTimeout(() => setSessionIdCopied(false), 2000);
+  }
 
   return (
     <div className="flex flex-col gap-3">
@@ -620,11 +660,40 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
           )}
         </div>
       )}
+      {sessionId && (
+        <div className="flex flex-col gap-1.5">
+          <SectionLabel>Session ID</SectionLabel>
+          <div className="flex items-center gap-2">
+            <code
+              className="min-w-0 flex-1 truncate py-1 font-mono text-xs text-muted-foreground"
+              data-testid="agent-info-session-id"
+              title={sessionId}
+            >
+              {sessionId}
+            </code>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label={sessionIdCopied ? "Copied session ID" : "Copy session ID"}
+              data-testid="agent-info-copy-session-id"
+              onClick={copySessionId}
+              className="shrink-0"
+            >
+              {sessionIdCopied ? (
+                <CheckIcon className="size-3.5" />
+              ) : (
+                <CopyIcon className="size-3.5" />
+              )}
+            </Button>
+          </div>
+        </div>
+      )}
       {sessionId && sessionCostUsd != null && (
         <div className="flex flex-col gap-1.5">
           <SectionLabel>Session cost</SectionLabel>
           <span
-            className="text-sm tabular-nums text-muted-foreground"
+            className="font-mono text-xs tabular-nums text-muted-foreground"
             data-testid="agent-info-session-cost"
           >
             {formatSessionCostUsd(sessionCostUsd)}

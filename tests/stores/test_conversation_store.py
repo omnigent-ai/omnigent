@@ -718,6 +718,14 @@ def test_concurrent_appends_do_not_collide_on_position(
         f"persisted twice or list_items returned duplicates."
     )
 
+    # Positions are contiguous 0..N-1. The UNIQUE index catches *reused*
+    # positions (IntegrityError, asserted above), but a counter that
+    # over-advances — or an append silently skipped — leaves a *gap* with no
+    # error. list_items hides position, so assert on the raw column directly.
+    assert _stored_positions(conversation_store, conv.id) == list(range(expected_count)), (
+        "concurrent appends must allocate a gap-free 0..N-1 position sequence"
+    )
+
 
 def test_heavy_batch_racing_steering_append_does_not_collide(
     conversation_store: SqlAlchemyConversationStore,
@@ -856,6 +864,14 @@ def test_heavy_batch_racing_steering_append_does_not_collide(
     assert len(item_ids) == 80, (
         f"expected 80 distinct item IDs; got {len(item_ids)}. "
         f"Duplicate IDs would mean an item was persisted twice."
+    )
+
+    # Gap-free 0..79 across both threads: the heavy batch advances the
+    # next_position counter by 3 and the steering append by 1, so a counter
+    # that mis-advances under this asymmetric race would skip or reuse a
+    # position without tripping the UNIQUE index. Assert the raw column.
+    assert _stored_positions(conversation_store, conv.id) == list(range(80)), (
+        "heavy-batch + steering appends must allocate a gap-free 0..79 sequence"
     )
 
 
@@ -3276,6 +3292,79 @@ def test_fork_conversation_up_to_unknown_response_raises(
         conversation_store.fork_conversation(source.id, up_to_response_id="resp_nope")
 
 
+def test_fork_clone_agent_is_session_scoped(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A fork that clones an agent creates a session-scoped row, not a built-in.
+
+    The clone must be born with ``session_id`` set so it never appears in
+    the built-in agent list (``session_id IS NULL``) that backs the fork
+    picker — the regression that surfaced as duplicate "Claude Code" /
+    "Codex" entries in the fork dialog.
+    """
+    agent_store.create(
+        agent_id="ag_fork_src",
+        name="claude-native-ui",
+        bundle_location="ag_fork_src/hash",
+    )
+    source = conversation_store.create_conversation(agent_id="ag_fork_src")
+
+    fork = conversation_store.fork_conversation(
+        source.id,
+        agent_id="ag_clone_ok",
+        cloned_agent_name="claude-native-ui (fork ag_clone_o)",
+        cloned_agent_bundle_location="ag_fork_src/hash",
+        cloned_agent_description=None,
+    )
+
+    assert fork.agent_id == "ag_clone_ok"
+    cloned = agent_store.get("ag_clone_ok")
+    assert cloned is not None
+    assert cloned.session_id == fork.id, "clone must be bound to the fork session"
+    # The clone is session-scoped, so it must NOT leak into the built-in
+    # list (the source built-in is the only template-name row).
+    builtin_ids = {a.id for a in agent_store.list(limit=100).data}
+    assert "ag_clone_ok" not in builtin_ids
+    assert "ag_fork_src" in builtin_ids
+
+
+def test_fork_clone_agent_failure_leaves_no_orphan(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A failed clone-fork rolls the agent row back — no orphaned built-in.
+
+    Pre-fix the route pre-created the clone in its own committed
+    transaction, so a fork failure (here a stale ``up_to_response_id``)
+    orphaned a ``session_id IS NULL`` row that polluted the built-in agent
+    catalog. Creating the clone inside the fork transaction means the
+    failure rolls it back too.
+    """
+    agent_store.create(
+        agent_id="ag_fork_src2",
+        name="codex-native-ui",
+        bundle_location="ag_fork_src2/hash",
+    )
+    source = conversation_store.create_conversation(agent_id="ag_fork_src2")
+    _append_three_responses(conversation_store, source.id)
+
+    before = {a.id for a in agent_store.list(limit=100).data}
+    with pytest.raises(ValueError, match="resp_nope"):
+        conversation_store.fork_conversation(
+            source.id,
+            agent_id="ag_clone_orphan",
+            cloned_agent_name="codex-native-ui (fork ag_clone_o)",
+            cloned_agent_bundle_location="ag_fork_src2/hash",
+            up_to_response_id="resp_nope",
+        )
+
+    # The clone must not exist at all, and the built-in list is unchanged.
+    assert agent_store.get("ag_clone_orphan") is None
+    after = {a.id for a in agent_store.list(limit=100).data}
+    assert after == before
+
+
 def test_instance_scoped_label_keys_match_harness_constants() -> None:
     """
     The store's instance-scoped denylist matches the harness label keys.
@@ -3964,3 +4053,199 @@ def test_list_conversations_by_host_id_empty(
     conversation_store.create_conversation()
     result = conversation_store.list_conversations_by_host_id("host_nonexistent")
     assert result == []
+
+
+# ── next_position counter (write-path MAX(position) scan removal) ──────
+
+
+def _user_message(text: str, response_id: str = "resp_pos") -> NewConversationItem:
+    """A minimal user message item for position-counter tests."""
+    return NewConversationItem(
+        type="message",
+        response_id=response_id,
+        data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+    )
+
+
+def _stored_next_position(
+    conversation_store: SqlAlchemyConversationStore, conversation_id: str
+) -> int | None:
+    """Read the raw ``conversations.next_position`` counter for assertions."""
+    from omnigent.db.db_models import SqlConversation
+
+    with conversation_store._session() as session:
+        row = session.get(SqlConversation, conversation_id)
+        assert row is not None
+        return row.next_position
+
+
+def _stored_positions(
+    conversation_store: SqlAlchemyConversationStore, conversation_id: str
+) -> list[int]:
+    """Raw item positions for a conversation, ascending — the source of
+    truth ``list_items`` (which hides ``position``) cannot assert on."""
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationItem
+
+    with conversation_store._session() as session:
+        return sorted(
+            session.execute(
+                select(SqlConversationItem.position).where(
+                    SqlConversationItem.conversation_id == conversation_id
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+def test_new_conversation_seeds_next_position_zero(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A freshly created conversation starts its position allocator at 0, so
+    the first append reads the counter rather than scanning MAX(position)."""
+    conv = conversation_store.create_conversation()
+    assert _stored_next_position(conversation_store, conv.id) == 0
+
+
+@pytest.mark.parametrize("batch_sizes", [[1], [1, 1, 1], [3], [2, 1, 4]])
+def test_append_allocates_dense_positions_and_advances_counter(
+    conversation_store: SqlAlchemyConversationStore,
+    batch_sizes: list[int],
+) -> None:
+    """append() assigns contiguous positions from next_position and advances
+    the counter by the batch size, so the stored counter always equals the
+    total items appended — across single- and multi-item batches.
+
+    Real store, real SQLite; asserts on the raw position column and counter,
+    no mocks.
+    """
+    conv = conversation_store.create_conversation()
+    total = 0
+    for batch in batch_sizes:
+        conversation_store.append(conv.id, [_user_message(f"m{total + i}") for i in range(batch)])
+        total += batch
+        assert _stored_positions(conversation_store, conv.id) == list(range(total))
+        # The counter points one past the last item — the next position to hand out.
+        assert _stored_next_position(conversation_store, conv.id) == total
+
+
+def test_append_reads_counter_not_max_scan(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """append() allocates from the maintained counter, not a MAX(position)
+    scan: advancing the counter past the real max makes the next item land at
+    the counter value, which a scan-based implementation could never produce.
+    """
+    from omnigent.db.db_models import SqlConversation
+
+    conv = conversation_store.create_conversation()
+    conversation_store.append(conv.id, [_user_message("a"), _user_message("b")])
+    # Real max position is 1; jump the counter ahead to 100.
+    with conversation_store._session() as session:
+        session.get(SqlConversation, conv.id).next_position = 100
+
+    conversation_store.append(conv.id, [_user_message("c")])
+
+    # Position 100 (counter), not 2 (max + 1) — proves the scan path is unused.
+    assert _stored_positions(conversation_store, conv.id) == [0, 1, 100]
+    assert _stored_next_position(conversation_store, conv.id) == 101
+
+
+@pytest.mark.parametrize("preexisting", [0, 1, 3])
+def test_append_falls_back_to_scan_when_counter_null(
+    conversation_store: SqlAlchemyConversationStore,
+    preexisting: int,
+) -> None:
+    """A conversation written before the counter existed has
+    next_position = NULL. The next append falls back to a one-time
+    MAX(position) scan to place items correctly, then persists the advanced
+    counter so subsequent appends are scan-free.
+    """
+    from omnigent.db.db_models import SqlConversation
+
+    conv = conversation_store.create_conversation()
+    if preexisting:
+        conversation_store.append(conv.id, [_user_message(f"pre{i}") for i in range(preexisting)])
+    # Simulate a pre-counter row: clear the maintained counter.
+    with conversation_store._session() as session:
+        session.get(SqlConversation, conv.id).next_position = None
+    assert _stored_next_position(conversation_store, conv.id) is None
+
+    conversation_store.append(conv.id, [_user_message("new")])
+
+    # The fallback scan placed the new item right after the existing max...
+    assert _stored_positions(conversation_store, conv.id) == list(range(preexisting + 1))
+    # ...and the counter is now backfilled, so the next append won't scan.
+    assert _stored_next_position(conversation_store, conv.id) == preexisting + 1
+
+
+def test_fork_seeds_next_position_from_copied_items(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A full fork seeds the clone's allocator from the number of copied items,
+    so the clone's first append is scan-free and collision-free."""
+    agent_store.create(agent_id="ag_fork_pos", name="fork-pos", bundle_location="ag_fork_pos/h")
+    source = conversation_store.create_conversation(agent_id="ag_fork_pos")
+    conversation_store.append(
+        source.id, [_user_message(f"s{i}", response_id="resp_1") for i in range(3)]
+    )
+
+    fork = conversation_store.fork_conversation(source.id, title="fork")
+
+    # 3 items copied (dense positions 0..2) → allocator starts at 3.
+    assert _stored_next_position(conversation_store, fork.id) == 3
+    conversation_store.append(fork.id, [_user_message("after")])
+    assert _stored_positions(conversation_store, fork.id) == [0, 1, 2, 3]
+
+
+def test_truncated_fork_seeds_next_position_from_copied_items(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A truncated fork seeds the allocator from the count of the *copied*
+    items, not the source length, so the shorter clone stays collision-free."""
+    agent_store.create(
+        agent_id="ag_fork_trunc", name="fork-trunc", bundle_location="ag_fork_trunc/h"
+    )
+    source = conversation_store.create_conversation(agent_id="ag_fork_trunc")
+    conversation_store.append(
+        source.id,
+        [_user_message("a", "resp_1"), _user_message("b", "resp_1")],
+    )
+    conversation_store.append(
+        source.id,
+        [_user_message("c", "resp_2"), _user_message("d", "resp_2")],
+    )
+
+    fork = conversation_store.fork_conversation(source.id, up_to_response_id="resp_1")
+
+    # Only resp_1's 2 items are copied → allocator starts at 2.
+    assert _stored_positions(conversation_store, fork.id) == [0, 1]
+    assert _stored_next_position(conversation_store, fork.id) == 2
+    conversation_store.append(fork.id, [_user_message("after")])
+    assert _stored_positions(conversation_store, fork.id) == [0, 1, 2]
+
+
+def test_append_many_batches_stay_contiguous(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """End-to-end: many sequential appends produce a contiguous, gap-free
+    position sequence and a counter equal to the item count — the invariant
+    the maintained allocator must preserve across a long session (the
+    scan-per-write pattern this replaces grew with that length)."""
+    conv = conversation_store.create_conversation()
+    total = 0
+    for turn in range(25):
+        conversation_store.append(
+            conv.id,
+            [_user_message(f"t{turn}-{i}", response_id=f"resp_{turn}") for i in range(3)],
+        )
+        total += 3
+
+    assert _stored_positions(conversation_store, conv.id) == list(range(total))
+    assert _stored_next_position(conversation_store, conv.id) == total
+    listed = conversation_store.list_items(conv.id, limit=total)
+    assert len(listed.data) == total

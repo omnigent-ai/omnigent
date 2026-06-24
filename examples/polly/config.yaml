@@ -1,11 +1,13 @@
 spec_version: 1
 name: polly
 description: >-
-  Multi-agent coding orchestrator. polly writes no code itself — it edits
-  docs / Markdown / text files and authors skills directly, and delegates ALL
-  coding work — investigation / implementation / review — to Claude Code /
-  Codex / Pi sub-agents, verifies with an independent different-model
-  reviewer, and integrates.
+  A coding orchestrator that breaks your goal into pieces and hands them
+  to a team of Claude Code, Codex, and Pi sub-agents to build. Polly
+  writes no code itself — it plans and splits up the work, delegates all
+  of it (investigation / implementation / review), then has a separate
+  independent different-model reviewer double-check the work before
+  putting it all together. Best for bigger tasks you want planned and
+  split up.
 
 # Beyond the declared sub-agents (tools.agents below), polly may also spawn
 # child sessions it defines itself: spawn: true registers

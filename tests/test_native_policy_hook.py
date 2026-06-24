@@ -6,6 +6,7 @@ import pytest
 
 from omnigent.native_policy_hook import (
     evaluation_response_to_hook_output,
+    fail_closed_hook_output,
     hook_payload_to_evaluation_request,
 )
 
@@ -310,3 +311,46 @@ def test_user_prompt_submit_non_blocking_actions_return_none(action: str) -> Non
     """
     output = evaluation_response_to_hook_output("UserPromptSubmit", {"result": action})
     assert output is None
+
+
+def test_fail_closed_pre_tool_use_denies() -> None:
+    """
+    An unobtainable verdict on PreToolUse fails CLOSED with ``deny``.
+
+    PreToolUse is the authoritative pre-execution gate for native tools —
+    the sole enforcement point for connector-native ``mcp__*`` tools and
+    native Bash/Write/Edit — so a verdict that cannot be fetched must deny
+    rather than silently let the call through (issue #536).
+    """
+    output = fail_closed_hook_output("PreToolUse")
+    assert output is not None
+    hook_specific = output["hookSpecificOutput"]
+    assert hook_specific["hookEventName"] == "PreToolUse"
+    assert hook_specific["permissionDecision"] == "deny"
+    # A deny is inert without a reason on the consuming harnesses, so one
+    # must always be present.
+    assert hook_specific["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("hook_event", ["UserPromptSubmit", "PostToolUse"])
+def test_fail_closed_non_tool_call_phases_fail_open(hook_event: str) -> None:
+    """
+    Off the tool-call gate, an unobtainable verdict fails OPEN (``None``).
+
+    The request gate is advisory (the tool-call gate still catches
+    dangerous actions) and PostToolUse runs after the tool has executed, so
+    denying there only blocks an already-incurred side effect. This mirrors
+    the runner-side ``FAIL_CLOSED_PHASES`` (PR #163).
+    """
+    assert fail_closed_hook_output(hook_event) is None
+
+
+def test_fail_closed_unknown_event_fails_open() -> None:
+    """
+    An unrecognized hook event fails OPEN (``None``), not closed.
+
+    Only the exact ``PreToolUse`` event denies; any novel event name added
+    by a future harness must fall through to "no opinion" rather than
+    accidentally blocking — the conservative default for an unknown gate.
+    """
+    assert fail_closed_hook_output("SomeNewEvent") is None

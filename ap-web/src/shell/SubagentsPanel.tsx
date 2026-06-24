@@ -30,9 +30,13 @@ import {
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Badge } from "@/components/ui/badge";
+import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
+import { CursorIcon } from "@/components/icons/CursorIcon";
+import { GooseIcon } from "@/components/icons/GooseIcon";
 import { NessieIcon } from "@/components/icons/NessieIcon";
+import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
 import { RunningDot } from "@/components/RunningDot";
@@ -51,6 +55,7 @@ import { AddAgentDialog } from "./AddAgentDialog";
 // global and must be preserved across navigation.
 const SESSION_SCOPED_PARAMS = ["file", "diff", "comment", "view"] as const;
 const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
+const OPENCODE_NATIVE_SUBAGENT_WRAPPER = "opencode-native-ui-subagent";
 // Pi children are scaffold (no wrapper label); the spawn title's agent-type head (``tool``) is the signal.
 const PI_AGENT_NAME = "pi";
 type AgentRowIcon = ComponentType<SVGProps<SVGSVGElement>>;
@@ -149,6 +154,16 @@ interface AgentStatus {
   activity: AgentActivity;
   /** Human label, shown inline for notable states and always in the tooltip. */
   label: string;
+  /** Optional detail for the tooltip / accessible label. */
+  details?: string;
+}
+
+function firstErrorLine(message: string): string {
+  const first = message
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  return first ?? message;
 }
 
 /**
@@ -173,8 +188,15 @@ function childStatus(child: ChildSessionInfo): AgentStatus {
     return { activity: "launching", label: "Launching" };
   }
   if (child.busy) return { activity: "working", label: "Working" };
-  if (child.current_task_status === "completed") return { activity: "done", label: "Done" };
+  if (child.last_task_error) {
+    return {
+      activity: "failed",
+      label: "Failed",
+      details: firstErrorLine(child.last_task_error.message),
+    };
+  }
   if (child.current_task_status === "failed") return { activity: "failed", label: "Failed" };
+  if (child.current_task_status === "completed") return { activity: "done", label: "Done" };
   if (child.current_task_status) {
     return { activity: "other", label: child.current_task_status };
   }
@@ -198,8 +220,7 @@ function sessionStatus(status: string | undefined): AgentStatus {
 // Dot color per dot-rendered state. Working uses the animated RunningDot
 // and awaiting uses the "Needs response" tag, so both are excluded here.
 // "done" is a quiet, expected outcome, so it reads as a muted dot rather
-// than a loud green one — only failures keep a saturated (red) tone to draw
-// the eye.
+// than a loud green one.
 const DOT_TONE: Record<Exclude<AgentActivity, "working" | "awaiting">, string> = {
   done: "bg-muted-foreground/55",
   failed: "bg-destructive",
@@ -287,7 +308,11 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
   if (nativeAgent?.iconKind === "claude") return ClaudeIcon;
   if (nativeAgent?.iconKind === "codex") return CodexIcon;
+  if (nativeAgent?.iconKind === "opencode") return OpenCodeIcon;
   if (nativeAgent?.iconKind === "pi") return PiIcon;
+  if (nativeAgent?.iconKind === "cursor") return CursorIcon;
+  if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
+  if (nativeAgent?.iconKind === "goose") return GooseIcon;
   // Exact match — substring checks would false-match names like "pipeline".
   if (child.tool === PI_AGENT_NAME) return PiIcon;
   return null;
@@ -306,7 +331,8 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
  *
  * @param status - The resolved activity + label to render.
  */
-function StatusIndicator({ activity, label }: AgentStatus) {
+function StatusIndicator({ activity, label, details }: AgentStatus) {
+  const title = details ? `${label}: ${details}` : label;
   // Awaiting renders the exact same "Needs response" tag as the sidebar
   // (SessionStateBadge) so the approval affordance reads identically across
   // the app. The tag carries its own copy, so the row's separate label word
@@ -314,8 +340,8 @@ function StatusIndicator({ activity, label }: AgentStatus) {
   if (activity === "awaiting") {
     return (
       <span
-        aria-label={label}
-        title={label}
+        aria-label={title}
+        title={title}
         data-testid="subagent-status-dot"
         className="inline-flex shrink-0 items-center text-xs"
       >
@@ -323,10 +349,23 @@ function StatusIndicator({ activity, label }: AgentStatus) {
       </span>
     );
   }
+  if (activity === "failed") {
+    return (
+      <span
+        aria-label={title}
+        title={title}
+        data-testid="subagent-status-dot"
+        className="inline-flex shrink-0 items-center gap-1 text-destructive text-xs"
+      >
+        <span>{label}</span>
+        <span className={cn("inline-block size-2 shrink-0 rounded-full", DOT_TONE.failed)} />
+      </span>
+    );
+  }
   return (
     <span
-      aria-label={label}
-      title={label}
+      aria-label={title}
+      title={title}
       data-testid="subagent-status-dot"
       className="inline-flex shrink-0 items-center gap-1 text-muted-foreground text-xs"
     >
@@ -351,8 +390,11 @@ function childPrimaryLabel(child: ChildSessionInfo): string {
   // LLM-spawned titles cannot start with "ui:" because the spec validator
   // rejects "ui" as a sub-agent name.
   const isUserAdded = child.title?.startsWith("ui:") ?? false;
-  const isCodexNativeSubagent = child.labels?.[WRAPPER_LABEL_KEY] === CODEX_NATIVE_SUBAGENT_WRAPPER;
-  if (isCodexNativeSubagent && !isUserAdded) {
+  const childWrapper = child.labels?.[WRAPPER_LABEL_KEY];
+  const isNativeSubagent =
+    childWrapper === CODEX_NATIVE_SUBAGENT_WRAPPER ||
+    childWrapper === OPENCODE_NATIVE_SUBAGENT_WRAPPER;
+  if (isNativeSubagent && !isUserAdded) {
     return child.tool ?? child.title ?? child.id;
   }
   let titleTask: string | null = null;
@@ -430,11 +472,19 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
       ? ClaudeIcon
       : nativeAgent?.iconKind === "codex"
         ? CodexIcon
-        : nativeAgent?.iconKind === "pi"
-          ? PiIcon
-          : isNessie
-            ? NessieIcon
-            : BotIcon;
+        : nativeAgent?.iconKind === "opencode"
+          ? OpenCodeIcon
+          : nativeAgent?.iconKind === "pi"
+            ? PiIcon
+            : nativeAgent?.iconKind === "cursor"
+              ? CursorIcon
+              : nativeAgent?.iconKind === "antigravity"
+                ? AntigravityIcon
+                : nativeAgent?.iconKind === "goose"
+                  ? GooseIcon
+                  : isNessie
+                    ? NessieIcon
+                    : BotIcon;
   // Native wrappers show the product name (mirroring the sidebar) instead
   // of the spec's YAML name (e.g. "claude-native-ui"); other agents show
   // their agent name, with "main" only while the session loads or when it

@@ -38,10 +38,11 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     """
     Convert a runtime Agent entity to an API-layer AgentObject.
 
-    Loads the spec from cache to populate ``mcp_servers`` and
-    ``skills``; on any load failure both are left empty rather than
-    failing the whole list — one unreadable bundle must not break
-    discovery.
+    Loads the spec from cache to populate ``mcp_servers``,
+    ``skills``, and (when the stored row has none) the
+    ``description``; on any load failure those fall back to empty /
+    the stored value rather than failing the whole list — one
+    unreadable bundle must not break discovery.
 
     :param agent: The runtime agent entity, e.g. the seeded
         ``claude-native-ui`` agent.
@@ -52,6 +53,11 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     skills: list[SkillSummary] = []
     terminals: list[str] = []
     harness: str | None = None
+    # Prefer the stored entity's description; fall back to the spec's
+    # top-level description when the stored value is unset (single-file
+    # YAML agents don't persist it at registration today). Lets the
+    # new-session picker show a hover description without a migration.
+    description: str | None = agent.description
     try:
         # Built-ins are operator-authored template agents
         # (session_id is None), so ${VAR} expansion against the server
@@ -60,6 +66,8 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         loaded = agent_cache.load(
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
+        if description is None:
+            description = loaded.spec.description
         # Declared terminal names, in spec order (mirrors the
         # session-agent endpoint so both report it consistently).
         terminals = list(loaded.spec.terminals or {})
@@ -91,7 +99,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         id=agent.id,
         name=agent.name,
         version=agent.version,
-        description=agent.description,
+        description=description,
         created_at=agent.created_at,
         updated_at=agent.updated_at,
         harness=harness,

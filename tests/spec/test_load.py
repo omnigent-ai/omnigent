@@ -385,3 +385,261 @@ def test_load_omnigent_yaml_threads_executor_extra_max_tokens_to_llm_extra(
 
     assert spec.llm is not None
     assert spec.llm.extra["max_tokens"] == 65536
+
+
+def test_load_omnigent_yaml_unknown_harness_hints_at_version_skew(
+    tmp_path: Path,
+) -> None:
+    """
+    An unrecognized harness is most often a client-older-than-server skew:
+    the server emitted a harness this runner's allowlist doesn't know yet.
+    The synthesized-spec error must append a disclaimer pointing the operator
+    at that version skew rather than implying the spec itself is malformed.
+    """
+    yaml_text = textwrap.dedent("""\
+        name: skew-test
+        prompt: You are a helpful assistant.
+
+        executor:
+          harness: totally-made-up-harness
+          model: databricks-claude-sonnet-4
+    """)
+    (tmp_path / "skew-test.yaml").write_text(yaml_text)
+
+    with pytest.raises(OmnigentError) as excinfo:
+        load_omnigent_yaml(tmp_path / "skew-test.yaml")
+
+    message = str(excinfo.value)
+    assert "executor.config.harness" in message
+    assert "this client (runner) may be older than the server" in message
+
+
+def test_load_omnigent_yaml_missing_harness_omits_version_skew_hint(
+    tmp_path: Path,
+) -> None:
+    """
+    The version-skew hint is gated on a harness *enum mismatch*, not on any
+    ``executor.config.harness`` failure. A *missing* harness is a plain
+    authoring mistake — the synthesized-spec error still fires (same path),
+    but it must NOT imply the client is older than the server, since no
+    unrecognized harness value is involved.
+    """
+    yaml_text = textwrap.dedent("""\
+        name: no-harness-test
+        prompt: You are a helpful assistant.
+    """)
+    (tmp_path / "no-harness-test.yaml").write_text(yaml_text)
+
+    with pytest.raises(OmnigentError) as excinfo:
+        load_omnigent_yaml(tmp_path / "no-harness-test.yaml")
+
+    message = str(excinfo.value)
+    # Assert the exact "required when ..." variant (not just the field path):
+    # this keeps the test from passing vacuously if the default executor type
+    # ever stops routing a harness-less spec through the missing-harness branch.
+    assert "executor.config.harness" in message
+    assert "required when" in message
+    assert "this client (runner) may be older than the server" not in message
+
+
+# ── prune_invalid_sub_agents (execution-path backwards compat) ──────────
+#
+# The motivating incident: a newer server bumped polly to a definition with an
+# ``opencode`` sub-agent, and older clients failed to launch *any* polly
+# because the unknown ``opencode-native`` harness failed the whole spec's
+# validation. ``opencode-native`` is itself a recognized harness now, so these
+# tests use a deliberately-synthetic harness name to stand in for "whatever the
+# next server adds that this client doesn't know yet" — the mechanism must
+# survive that class of skew regardless of which specific harness triggers it.
+_UNKNOWN_HARNESS = "harness-from-a-newer-server"
+
+
+def _write_parent_with_sub_agents(
+    root: Path,
+    *,
+    parent_agents: list[str],
+    sub_agents: dict[str, dict],
+) -> None:
+    """Write a ``config.yaml`` parent bundle with ``agents/<name>/`` children.
+
+    :param root: Bundle root to populate.
+    :param parent_agents: Names placed under the parent's
+        ``tools.agents`` delegation list.
+    :param sub_agents: Map of sub-agent name → its ``config.yaml`` dict,
+        each written to ``agents/<name>/config.yaml``.
+    """
+    parent = {
+        "spec_version": 1,
+        "name": "parent",
+        "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+        "tools": {"agents": parent_agents},
+    }
+    (root / "config.yaml").write_text(yaml.dump(parent))
+    for name, cfg in sub_agents.items():
+        sub_dir = root / "agents" / name
+        sub_dir.mkdir(parents=True)
+        (sub_dir / "config.yaml").write_text(yaml.dump(cfg))
+
+
+def test_load_drops_invalid_sub_agent_when_pruning(tmp_path: Path) -> None:
+    """An unknown-harness sub-agent is dropped; the parent still loads.
+
+    This is matei's scenario: a newer server's bundle declares a
+    sub-agent whose harness this (older) client doesn't recognize. With
+    pruning on (the runner/AgentCache execution path), the bad sub-agent
+    is dropped — along with its ``tools.agents`` reference — and the
+    parent agent loads with its remaining capabilities.
+    """
+    _write_parent_with_sub_agents(
+        tmp_path,
+        parent_agents=["newcomer", "helper"],
+        sub_agents={
+            "newcomer": {
+                "spec_version": 1,
+                "name": "newcomer",
+                "executor": {
+                    "type": "omnigent",
+                    "config": {"harness": _UNKNOWN_HARNESS},
+                },
+            },
+            "helper": {
+                "spec_version": 1,
+                "name": "helper",
+                "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+            },
+        },
+    )
+
+    spec = load(tmp_path, prune_invalid_sub_agents=True)
+
+    sub_names = {sa.name for sa in spec.sub_agents}
+    assert sub_names == {"helper"}
+    # The dangling reference must be removed too, or the parent itself
+    # would fail validation on "references sub-agent 'newcomer'…".
+    assert spec.tools.agents == ["helper"]
+
+
+def test_load_without_pruning_still_fails_on_invalid_sub_agent(tmp_path: Path) -> None:
+    """Default (strict) load still fails the whole spec — unchanged behavior."""
+    _write_parent_with_sub_agents(
+        tmp_path,
+        parent_agents=["newcomer"],
+        sub_agents={
+            "newcomer": {
+                "spec_version": 1,
+                "name": "newcomer",
+                "executor": {
+                    "type": "omnigent",
+                    "config": {"harness": _UNKNOWN_HARNESS},
+                },
+            },
+        },
+    )
+
+    with pytest.raises(OmnigentError, match="invalid agent spec"):
+        load(tmp_path)
+
+
+def test_load_pruning_still_fails_on_invalid_root(tmp_path: Path) -> None:
+    """Pruning never masks a genuine *root*-level error."""
+    config = {"spec_version": 99, "name": "bad-root"}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    with pytest.raises(OmnigentError, match="invalid agent spec"):
+        load(tmp_path, prune_invalid_sub_agents=True)
+
+
+def test_load_pruning_keeps_valid_sub_agents_intact(tmp_path: Path) -> None:
+    """With only valid sub-agents, pruning is a no-op (nothing dropped)."""
+    _write_parent_with_sub_agents(
+        tmp_path,
+        parent_agents=["helper"],
+        sub_agents={
+            "helper": {
+                "spec_version": 1,
+                "name": "helper",
+                "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+            },
+        },
+    )
+
+    spec = load(tmp_path, prune_invalid_sub_agents=True)
+    assert {sa.name for sa in spec.sub_agents} == {"helper"}
+    assert spec.tools.agents == ["helper"]
+
+
+def test_load_pruning_logs_warning_for_dropped_sub_agent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Dropping a sub-agent is loud — a WARNING names it (never silent)."""
+    _write_parent_with_sub_agents(
+        tmp_path,
+        parent_agents=["newcomer"],
+        sub_agents={
+            "newcomer": {
+                "spec_version": 1,
+                "name": "newcomer",
+                "executor": {
+                    "type": "omnigent",
+                    "config": {"harness": _UNKNOWN_HARNESS},
+                },
+            },
+        },
+    )
+
+    with caplog.at_level("WARNING", logger="omnigent.spec"):
+        load(tmp_path, prune_invalid_sub_agents=True)
+
+    assert any("newcomer" in rec.message and rec.levelname == "WARNING" for rec in caplog.records)
+
+
+def test_load_pruning_drops_grandchild_but_keeps_valid_child(tmp_path: Path) -> None:
+    """Depth-first: a bad *grandchild* is pruned without taking out its parent.
+
+    parent → child (valid) → grandchild (unknown harness). Only the
+    grandchild is dropped; the valid child survives with the dangling
+    grandchild reference cleaned off its own ``tools.agents``.
+    """
+    # parent
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "spec_version": 1,
+                "name": "parent",
+                "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+                "tools": {"agents": ["child"]},
+            }
+        )
+    )
+    # parent/agents/child (valid; delegates to grandchild)
+    child_dir = tmp_path / "agents" / "child"
+    child_dir.mkdir(parents=True)
+    (child_dir / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "spec_version": 1,
+                "name": "child",
+                "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+                "tools": {"agents": ["grandchild"]},
+            }
+        )
+    )
+    # parent/agents/child/agents/grandchild (unknown harness)
+    grandchild_dir = child_dir / "agents" / "grandchild"
+    grandchild_dir.mkdir(parents=True)
+    (grandchild_dir / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "spec_version": 1,
+                "name": "grandchild",
+                "executor": {"type": "omnigent", "config": {"harness": _UNKNOWN_HARNESS}},
+            }
+        )
+    )
+
+    spec = load(tmp_path, prune_invalid_sub_agents=True)
+
+    assert {sa.name for sa in spec.sub_agents} == {"child"}
+    child = spec.sub_agents[0]
+    assert child.sub_agents == []
+    assert child.tools.agents == []

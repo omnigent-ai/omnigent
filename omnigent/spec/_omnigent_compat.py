@@ -17,8 +17,9 @@ deleting Omnigent support means:
    grep for ``_omnigent_compat`` to find them).
 3. Delete ``omnigent/spec/omnigent.py`` (the bidirectional
    translator).
-4. Delete ``omnigent/runtime/executors/omnigent.py`` (the
-   executor).
+4. The Omnigent executor module is already gone (it held an
+   experimental executor ABC that has since been removed), so
+   there is nothing left to delete here.
 5. Remove ``ExecutorSpec.config`` from
    ``omnigent/spec/types.py`` (the only field that couldn't
    move here because Python dataclasses don't support
@@ -72,24 +73,48 @@ OMNIGENT_EXECUTOR_TYPE = "omnigent"
 # made ``examples/terminal_workers.yaml``
 # fail at spec-load with a "must be one of [...], got
 # 'open-responses'" error.
+#
+# ``opencode-native`` is the native OpenCode server bridge (runner-owned
+# ``opencode serve`` + SSE forwarder); its ``opencode`` / ``native-opencode``
+# spellings are accepted aliases below.
 OMNIGENT_HARNESSES = frozenset(
     {
         "antigravity",
+        "antigravity-native",
         "claude-native",
         "claude-sdk",
         "codex",
         "codex-native",
+        "copilot",
         "cursor",
-        "databricks_supervisor",
+        "cursor-native",
+        "goose",
+        "goose-native",
+        "hermes",
         "openai-agents",
         "open-responses",
+        "opencode-native",
         "pi",
         "pi-native",
+        "qwen",
+        "qwen-native",
     },
 )
 # User-facing aliases accepted in specs and normalized before runtime dispatch.
 OMNIGENT_HARNESS_ALIASES = frozenset(
-    {"claude", "native-pi", "openai-agents-sdk", "agy", "google-antigravity"}
+    {
+        "claude",
+        "native-pi",
+        "native-antigravity",
+        "native-goose",
+        "openai-agents-sdk",
+        "agy",
+        "google-antigravity",
+        "qwen-code",
+        "opencode",
+        "native-opencode",
+        "github-copilot",
+    }
 )
 _OMNIGENT_ACCEPTED_HARNESSES = OMNIGENT_HARNESSES | OMNIGENT_HARNESS_ALIASES
 
@@ -252,7 +277,12 @@ def diagnose_yaml_rejection(path: Path) -> str:
     return "unknown reason — file passes all known checks (likely an internal bug)"
 
 
-def load_omnigent_yaml(path: Path, *, enforce_handler_allowlist: bool = False) -> AgentSpec:
+def load_omnigent_yaml(
+    path: Path,
+    *,
+    enforce_handler_allowlist: bool = False,
+    prune_invalid_sub_agents: bool = False,
+) -> AgentSpec:
     """
     Load an omnigent YAML and translate it to an
     :class:`AgentSpec`.
@@ -270,6 +300,12 @@ def load_omnigent_yaml(path: Path, *, enforce_handler_allowlist: bool = False) -
         unregistered ``type: function`` policy handlers are rejected
         before the loader resolves/calls them (bundle-upload
         guard). See :func:`omnigent.spec.load`.
+    :param prune_invalid_sub_agents: When ``True``, sub-agents that
+        fail validation are dropped (and their ``tools.agents``
+        references removed) instead of failing the whole load, with a
+        WARNING logged per drop. The root agent must still validate.
+        See :func:`omnigent.spec.load` for the full rationale — this
+        is the execution-path backwards-compatibility guard.
     :returns: A validated :class:`AgentSpec` with
         ``executor.type == OMNIGENT_EXECUTOR_TYPE``.
     :raises OmnigentError: If the synthesized spec fails
@@ -318,11 +354,40 @@ def load_omnigent_yaml(path: Path, *, enforce_handler_allowlist: bool = False) -
     if not isinstance(raw, dict):
         raw = {}
     spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw)
+    if prune_invalid_sub_agents:
+        # Local import avoids a module-load cycle: spec/__init__ imports
+        # this module at import time, so it cannot be imported at the top
+        # here. Drops sub-agents this client can't validate (version skew)
+        # before the root validation gate below; see omnigent.spec.load.
+        from omnigent.spec import _prune_invalid_sub_agents
+
+        _prune_invalid_sub_agents(spec)
     result = validate(spec)
     if not result.valid:
         errors = "; ".join(f"{e.path}: {e.message}" for e in result.errors)
-        raise OmnigentError(
-            f"invalid agent spec synthesized from omnigent YAML: {errors}",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        message = f"invalid agent spec synthesized from omnigent YAML: {errors}"
+        # An unrecognized harness *value* usually means this client
+        # (the omnigent runner validating the spec) is older than the
+        # server that produced it: the server knows a harness this
+        # runner's allowlist doesn't. Surface that so the operator
+        # checks for a version skew before assuming the spec is wrong.
+        #
+        # The ``"must be one of"`` prefix is the wording emitted by
+        # ``validate_omnigent_executor`` (same module) for an
+        # out-of-allowlist harness. It deliberately does NOT match the
+        # sibling "required when executor.type is 'omnigent' — must be
+        # one of ..." message for a *missing* harness, which is a plain
+        # authoring mistake, not a version skew. Producer and matcher
+        # live in this file, so the coupling stays local; if that
+        # message is reworded, update both together.
+        if any(
+            e.path == "executor.config.harness" and e.message.startswith("must be one of")
+            for e in result.errors
+        ):
+            message += (
+                "\n\nNote: if this harness is valid on a newer Omnigent server, "
+                "this client (runner) may be older than the server that produced "
+                "the spec — upgrade the runner to pick up newer harnesses."
+            )
+        raise OmnigentError(message, code=ErrorCode.INVALID_INPUT)
     return spec

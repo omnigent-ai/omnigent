@@ -1,19 +1,14 @@
 #!/usr/bin/env bash
-# Emits the e2e shard matrix as `matrix=<json>` on $GITHUB_OUTPUT. Shared by
-# e2e.yml and e2e-ui.yml (they differ only in NUM_SHARDS).
+# Emits the e2e shard matrix as `matrix=<json>` on $GITHUB_OUTPUT, or an EMPTY
+# matrix ({"include":[]}) to skip. Empty yields zero jobs and thus NO check-runs
+# -- the point of the indirection: a job-level `if:` skip would instead leave a
+# check-run with an unexpanded `E2E Tests (shard ${{ matrix.shard_id }}/...)` name.
 #
-# Returns an EMPTY matrix ({"include":[]}) when the run should be skipped:
-#   - draft PRs, or
-#   - a fork's pull_request (no secrets there; forks run via the fork-e2e/**
-#     mirror push instead).
-# An empty matrix yields zero jobs and therefore NO check-runs. This is the
-# whole reason for the indirection: a job-level `if:` skip of a matrixed job
-# would instead leave one check-run with an unexpanded
-# `E2E Tests (shard ${{ matrix.shard_id }}/...)` name.
+# Skips only draft PRs. These suites are mock-LLM (no secrets), so fork PRs run
+# directly, like CI.
 #
-# Env in:  EVENT_NAME (github.event_name), IS_DRAFT, IS_FORK (both may be empty
-#          on non-PR events), NUM_SHARDS.
-# Out:     matrix={"include":[{"shard_id":0,"num_shards":N}, ...]}  (or [] empty)
+# Env in:  EVENT_NAME, IS_DRAFT, NUM_SHARDS.
+# Shared by e2e.yml and e2e-ui.yml (differ in NUM_SHARDS).
 
 set -euo pipefail
 
@@ -21,13 +16,10 @@ skip=false
 if [[ "${IS_DRAFT:-false}" == "true" ]]; then
   skip=true
 fi
-if [[ "$EVENT_NAME" == "pull_request" && "${IS_FORK:-false}" == "true" ]]; then
-  skip=true
-fi
 
 if [[ "$skip" == "true" ]]; then
   echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
-  echo "skip: empty matrix (event=$EVENT_NAME draft=${IS_DRAFT:-} fork=${IS_FORK:-})"
+  echo "skip: empty matrix (event=$EVENT_NAME draft=${IS_DRAFT:-})"
   exit 0
 fi
 

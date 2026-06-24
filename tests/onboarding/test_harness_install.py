@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 from omnigent.onboarding import harness_install as hi
-from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
+from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 
 @pytest.mark.parametrize(
@@ -16,6 +16,7 @@ from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
         (ANTHROPIC_FAMILY, "claude", "@anthropic-ai/claude-code"),
         (OPENAI_FAMILY, "codex", "@openai/codex"),
         (hi.PI_KEY, "pi", "@earendil-works/pi-coding-agent"),
+        (hi.QWEN_KEY, "qwen", "@qwen-code/qwen-code"),
     ],
 )
 def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
@@ -48,6 +49,41 @@ def test_cursor_install_spec_is_login_only_no_npm() -> None:
     assert spec.logout_args == ("logout",)
     assert spec.status_args == ("status", "--format", "json")
     assert spec.login_status_key == "isAuthenticated"
+
+
+def test_antigravity_install_spec_status_only_no_npm() -> None:
+    """Antigravity (agy) ships via a shell installer (no npm) and has no login
+    subcommand — the user signs in by launching ``agy`` once. It DOES expose a
+    status check (``agy models``), so the spec carries ``status_args`` +
+    ``install_hint`` but no ``package`` / ``login_args`` / ``logout_args``.
+
+    Drift here (a package sneaking in, or losing ``status_args``) would make the
+    setup menu offer a bogus ``npm install`` or fall back to a file-only login
+    check that can't see server-side revocation.
+    """
+    spec = hi.harness_install_spec(GEMINI_FAMILY)
+    assert spec is not None
+    assert spec.binary == "agy"
+    assert spec.package is None
+    assert spec.install_hint is not None
+    assert "antigravity.google/cli/install.sh" in spec.install_hint
+    assert spec.status_args == ("models",)
+    assert spec.login_args is None
+    assert spec.logout_args is None
+    assert spec.login_status_key is None
+    assert spec.auth_hint is not None
+
+
+def test_harness_setup_hint_antigravity_surfaces_sign_in() -> None:
+    """A not-yet-signed-in agy can't be fixed by ``agy login`` (no such
+    command), so the launch hint names the installer AND the "run agy to sign
+    in" step — otherwise a user who already has agy installed gets a misleading
+    install-only hint.
+    """
+    hint = hi.harness_setup_hint("antigravity-native")
+    assert "antigravity.google/cli/install.sh" in hint
+    assert "agy" in hint
+    assert "sign" in hint.lower()
 
 
 def test_install_command_rejects_non_npm_harness() -> None:
@@ -85,6 +121,10 @@ def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
         ("claude-native", "claude"),
         ("codex-native", "codex"),
         ("pi", "pi"),
+        # Native Cursor wraps the cursor-agent CLI (distinct from the SDK
+        # ``cursor`` harness, which needs no binary — see the test below).
+        ("cursor-native", "cursor-agent"),
+        ("native-cursor", "cursor-agent"),
     ],
 )
 def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:
@@ -99,6 +139,30 @@ def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:
     assert spec.binary == binary
 
 
+@pytest.mark.parametrize("harness", ["cursor-native", "native-cursor"])
+def test_setup_hint_for_native_cursor_points_at_vendor_installer(harness: str) -> None:
+    """Native Cursor's "not configured" hint names the curl installer + login,
+    never ``omnigent setup`` — which only configures the SDK ``cursor`` harness
+    (``cursor-sdk`` + ``CURSOR_API_KEY``) and never installs ``cursor-agent``.
+
+    A regression to the generic hint sends a native-Cursor user down a dead end
+    (the exact bug this fixes).
+    """
+    hint = hi.harness_setup_hint(harness)
+    assert "cursor-agent" in hint
+    assert "cursor.com/install" in hint
+    assert "cursor-agent login" in hint
+    assert "omnigent setup" not in hint
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "codex", "pi", "claude-sdk", None])
+def test_setup_hint_defaults_to_omnigent_setup(harness: str | None) -> None:
+    """Harnesses whose CLI ``omnigent setup`` installs (npm CLIs) — and the
+    SDK / unknown / ``None`` cases — route to the ``omnigent setup`` hint."""
+    hint = hi.harness_setup_hint(harness)
+    assert "omnigent setup" in hint
+
+
 @pytest.mark.parametrize("harness", ["cursor", "claude-sdk", "openai-agents"])
 def test_sdk_harnesses_require_no_cli(harness: str) -> None:
     """SDK-based harnesses (incl. ``cursor``, which drives the cursor-sdk Python
@@ -111,7 +175,7 @@ def test_sdk_harnesses_require_no_cli(harness: str) -> None:
 
 @pytest.mark.parametrize(
     "harness",
-    ["claude-sdk", "codex", "openai-agents-sdk", "databricks_supervisor", "unknown"],
+    ["claude-sdk", "codex", "openai-agents-sdk", "unknown"],
 )
 def test_required_cli_none_for_sdk_or_unknown_harness(harness: str) -> None:
     """SDK-based / unknown harnesses need no CLI binary → ``None``.
@@ -494,6 +558,42 @@ def test_harness_cli_logged_in_uses_cursor_json_verdict(
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_cli_logged_in(hi.CURSOR_KEY) is expected
+
+
+@pytest.mark.parametrize(
+    "stdout,returncode,expected",
+    [
+        # ``agy models`` lists models (exit 0) only when signed in.
+        ("Gemini 3.5 Flash (Medium)\nGemini 3.1 Pro (High)\n", 0, True),
+        ("Error: Please sign in to view available models.", 1, False),
+        # Exit code is authoritative for agy (no ``login_status_key``): stdout
+        # that happens to be a JSON object with ``loggedIn`` must NOT override
+        # it, so an exit-0 run still reads as signed in.
+        ('{"loggedIn": false}', 0, True),
+        # Empty stdout (e.g. the list went to stderr) → exit code decides.
+        ("", 0, True),
+        ("", 1, False),
+    ],
+)
+def test_harness_cli_logged_in_agy_uses_exit_code(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, returncode: int, expected: bool
+) -> None:
+    """Antigravity's ``agy models`` is non-JSON, so the exit code is the verdict.
+
+    ``agy`` has no ``login status`` subcommand; ``agy models`` exits 0 only when
+    signed in (else exits non-zero with "Please sign in"). A regression would
+    misread agy login state in the setup menu's ✓/✗ marker.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object):
+        assert argv == ["agy", "models"]  # the status subcommand
+        return subprocess.CompletedProcess(
+            args=argv, returncode=returncode, stdout=stdout, stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_logged_in(GEMINI_FAMILY) is expected
 
 
 def test_harness_cli_logged_in_false_when_binary_missing(monkeypatch: pytest.MonkeyPatch) -> None:

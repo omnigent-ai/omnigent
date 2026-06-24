@@ -2,9 +2,9 @@
 
 # <img src="https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg" alt="" height="38" valign="middle" /> Omnigent
 
-### A meta-harness for all your AI agents
+### The open-source AI agent framework and meta-harness for all your AI agents.
 
-Omnigent provides a common layer over Claude Code, Codex, Cursor, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, keep them in check with policies and sandboxing, and collaborate in real time on the same live session, from any device.
+Omnigent is an open-source **AI agent framework** and meta-harness that gives you a common orchestration layer over Claude Code, Codex, Cursor, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
@@ -105,8 +105,9 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   sandbox and needs nothing extra.
 - **Databricks** (optional). To use a Databricks workspace as your model
   provider, install Omnigent with the `databricks` extra:
-  `uv tool install "omnigent[databricks]"`. Signing in to the workspace also
-  uses the [Databricks CLI](https://docs.databricks.com/aws/en/dev-tools/cli/install).
+  `uv tool install "omnigent[databricks]"` — or pass it to the bootstrap
+  installer with `... | sh -s -- --extra databricks`. Signing in to the
+  workspace also uses the [Databricks CLI](https://docs.databricks.com/aws/en/dev-tools/cli/install).
 
 </details>
 
@@ -163,18 +164,20 @@ omnigent codex                       # Codex
 omnigent run path/to/agent.yaml      # your own agent (see "Write your own agent")
 ```
 
-#### 🐙 Polly and 🟠🔵 Debby
+#### 🐙 Polly, 🟠🔵 Debby, and ✍️ Scribe
 
-Two example agents ship with the repo, and they make good first sessions:
+Three example agents ship with the repo, and they make good first sessions:
 
 ```bash
 omnigent run examples/polly/
 omnigent run examples/debby/
+omnigent run examples/scribe/
 
 # Run an orchestrator on a different harness (sub-agents keep their own):
 omnigent run examples/polly/ --harness pi
 omnigent run examples/debby/ --harness openai-agents
 omnigent run examples/polly/ --harness cursor  # Cursor CLI (needs cursor-agent + CURSOR_API_KEY)
+omnigent run examples/polly/ --harness copilot # GitHub Copilot SDK (needs a GitHub token w/ Copilot, e.g. GH_TOKEN)
 ```
 
 **🐙 Polly** is a multi-agent coding orchestrator who writes no code herself.
@@ -187,6 +190,13 @@ Every question you ask goes to both heads, and she lays the two answers out
 side by side. Type `/debate` and the heads critique each other for a few
 rounds before converging. (She needs both a Claude and an OpenAI credential;
 see step 3.)
+
+**✍️ Scribe** is a documentation orchestrator, the docs counterpart to Polly.
+She turns git diffs, commit history, and PRs into release notes, changelogs, and
+migration guides. She authors the prose herself and delegates only read-only
+code investigation to a researcher sub-agent, then can route a draft through an
+independent different-vendor reviewer to fact-check its claims before it ships.
+(The cross-model fact-check needs an OpenAI credential; the rest runs on one.)
 
 **Prefer the browser?** Start a server and register your machine as a host:
 
@@ -366,7 +376,7 @@ name: my_agent
 prompt: You are a helpful data analyst.
 
 executor:
-  harness: claude-sdk          # or: codex, codex-native, claude-native, cursor, openai-agents, pi, antigravity
+  harness: claude-sdk          # or: claude-native, codex, codex-native, cursor, cursor-native, openai-agents, pi, pi-native, antigravity, qwen, copilot
 
 tools:
   # A local Python function (schema auto-generated from the signature)
@@ -397,3 +407,13 @@ Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/e
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md) for how to set up your environment, run the checks, and open a pull request.
+
+
+### Contributors
+
+Thanks to all of our amazing contributors!
+
+<a href="https://github.com/omnigent-ai/omnigent/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=omnigent-ai/omnigent" />
+</a>
+

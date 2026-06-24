@@ -25,6 +25,9 @@ _PROVIDER_ENV_VARS = [
     "OPENAI_API_KEY",
     "OPENROUTER_API_KEY",
     "GEMINI_API_KEY",
+    "CLAUDE_CODE_USE_VERTEX",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLOUD_ML_REGION",
 ]
 
 
@@ -86,8 +89,10 @@ def test_no_credentials_detected(clean_env) -> None:
         ),
         (
             "GEMINI_API_KEY",
-            # Gemini has no omnigent harness family yet → family None.
-            DetectedProvider(name="gemini", kind="key", family=None, source="$GEMINI_API_KEY"),
+            # Gemini serves the ``gemini`` surface (the antigravity-sdk harness
+            # drives the Gemini SDK with a GEMINI_API_KEY), so a detected key
+            # is mapped to the gemini family — no longer dropped as family None.
+            DetectedProvider(name="gemini", kind="key", family="gemini", source="$GEMINI_API_KEY"),
         ),
     ],
 )
@@ -618,3 +623,69 @@ def test_codex_config_other_self_contained_auth_detected(
     )
     detected = detect_providers()
     assert [d.model_provider for d in detected] == ["Custom"]
+
+
+# ── Claude on Vertex AI (GCP ADC) detection ──────────────────────────────────
+
+
+def test_vertex_claude_detected_with_all_env_vars(
+    clean_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All three Vertex env vars present → vertex-claude is detected.
+
+    Claude Code natively supports Vertex AI via CLAUDE_CODE_USE_VERTEX,
+    ANTHROPIC_VERTEX_PROJECT_ID, and CLOUD_ML_REGION. When all three are
+    set, ambient detection must surface a vertex-claude provider so
+    Omnigent recognises the credential and routes through the CLI's own
+    Vertex auth (GCP ADC).
+    """
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+    monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "my-gcp-project")
+    monkeypatch.setenv("CLOUD_ML_REGION", "us-east5")
+    detected = detect_providers()
+    assert detected == [
+        DetectedProvider(
+            name="vertex-claude",
+            kind="key",
+            family="anthropic",
+            source="$CLAUDE_CODE_USE_VERTEX",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "label,env",
+    [
+        ("missing-use-vertex", {"ANTHROPIC_VERTEX_PROJECT_ID": "p", "CLOUD_ML_REGION": "r"}),
+        ("missing-project-id", {"CLAUDE_CODE_USE_VERTEX": "1", "CLOUD_ML_REGION": "r"}),
+        ("missing-region", {"CLAUDE_CODE_USE_VERTEX": "1", "ANTHROPIC_VERTEX_PROJECT_ID": "p"}),
+        (
+            "use-vertex-false",
+            {
+                "CLAUDE_CODE_USE_VERTEX": "0",
+                "ANTHROPIC_VERTEX_PROJECT_ID": "p",
+                "CLOUD_ML_REGION": "r",
+            },
+        ),
+        (
+            "use-vertex-blank",
+            {
+                "CLAUDE_CODE_USE_VERTEX": "",
+                "ANTHROPIC_VERTEX_PROJECT_ID": "p",
+                "CLOUD_ML_REGION": "r",
+            },
+        ),
+    ],
+)
+def test_vertex_claude_not_detected_when_incomplete(
+    clean_env, monkeypatch: pytest.MonkeyPatch, label: str, env: dict[str, str]
+) -> None:
+    """Missing or disabled Vertex env vars → no vertex-claude detection.
+
+    All three vars must be present and CLAUDE_CODE_USE_VERTEX must be
+    truthy. Failure means a partial configuration would surface a bogus
+    provider that fails at run time.
+    """
+    for var, val in env.items():
+        monkeypatch.setenv(var, val)
+    assert detect_providers() == []

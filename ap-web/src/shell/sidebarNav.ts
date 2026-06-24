@@ -21,7 +21,17 @@ export const CLAUDE_NATIVE_DEFAULT_LABEL = "Claude Code";
 export const CODEX_NATIVE_DEFAULT_LABEL = "Codex";
 export const PI_NATIVE_DEFAULT_LABEL = "Pi";
 
-export type ConversationIconKind = "claude" | "codex" | "pi" | "nessie" | null;
+export type ConversationIconKind =
+  | "claude"
+  | "codex"
+  | "opencode"
+  | "pi"
+  | "cursor"
+  | "goose"
+  | "antigravity"
+  | "qwen"
+  | "nessie"
+  | null;
 
 // Display label for a session with no title and no native-wrapper name —
 // shown in the sidebar row and as the browser tab title fallback.
@@ -115,6 +125,23 @@ export function togglePinnedConversationId(
     return pinnedIds.filter((id) => id !== conversationId);
   }
   return [conversationId, ...pinnedIds];
+}
+
+// Order pinned conversations by when they were pinned, not by `updated_at` —
+// a pinned session holds its slot even when a new message bumps its
+// `updated_at`. `pinnedIds` is kept most-recently-pinned-first (see
+// `togglePinnedConversationId`), so we reverse it: the oldest pin ranks
+// first (top) and a freshly pinned session lands at the bottom of the group.
+// Anything not in `pinnedIds` (shouldn't happen for this list) sinks to the
+// bottom in a stable order.
+export function orderByPinnedSequence(
+  conversations: Conversation[],
+  pinnedIds: readonly string[],
+): Conversation[] {
+  const oldestPinFirst = [...pinnedIds].reverse();
+  const rankById = new Map(oldestPinFirst.map((id, index) => [id, index]));
+  const rank = (c: Conversation): number => rankById.get(c.id) ?? Number.MAX_SAFE_INTEGER;
+  return [...conversations].sort((a, b) => rank(a) - rank(b));
 }
 
 export function normalizePinnedConversationIds(

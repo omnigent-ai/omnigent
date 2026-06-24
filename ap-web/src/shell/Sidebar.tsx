@@ -17,6 +17,7 @@ import {
   CircleStopIcon,
   GitBranchIcon,
   InboxIcon,
+  ListChecksIcon,
   Loader2Icon,
   MoreHorizontalIcon,
   PanelRightOpenIcon,
@@ -24,7 +25,10 @@ import {
   PinIcon,
   PinOffIcon,
   SearchIcon,
+  SettingsIcon,
   ShareIcon,
+  SquareIcon,
+  SquareCheckIcon,
   Trash2Icon,
   XIcon,
 } from "lucide-react";
@@ -47,6 +51,8 @@ import {
 import {
   type Conversation,
   useArchiveConversation,
+  useBulkArchiveConversations,
+  useBulkDeleteConversations,
   useConversations,
   usePinnedConversationBackfill,
   useRenameConversation,
@@ -54,6 +60,7 @@ import {
   useStopSession,
 } from "@/hooks/useConversations";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
@@ -66,15 +73,16 @@ import { sumPendingApprovals } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
+import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
-import { ThemeModeMenu } from "@/components/theme/ThemeModeMenu";
-import { AccountMenu } from "./AccountMenu";
+import { SettingsSidebarBody, useSettingsRoute } from "./settingsNav";
 import {
   type ActiveChatOverride,
   COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY,
   computeNextActiveOverride,
   conversationDisplayLabel,
   normalizePinnedConversationIds,
+  orderByPinnedSequence,
   PINNED_CONVERSATION_IDS_STORAGE_KEY,
   sortByUpdatedAtDesc,
   togglePinnedConversationId,
@@ -90,6 +98,14 @@ const TIME_MARKER_SLOT_CLASS =
 interface SidebarProps {
   open: boolean;
   onClose: () => void;
+  /**
+   * Live open fraction (0 = closed, 1 = open) while the iOS shell's left-edge
+   * swipe is dragging the sidebar; `null` when not dragging. When set, the
+   * mobile overlay tracks it directly (transition suppressed) so the drawer
+   * follows the finger; on release the parent clears it and toggles `open`,
+   * letting the CSS transition animate to the resting state.
+   */
+  dragProgress?: number | null;
 }
 
 /**
@@ -128,10 +144,51 @@ function useActiveNavItem(): { isNewChatPage: boolean; isInboxPage: boolean } {
  *     scrollback is fine; users typically want the conversations list
  *     to stay visible while they switch around.
  */
-export function Sidebar({ open, onClose }: SidebarProps) {
+/** Toast body shown after archiving a session — links to its new home. */
+function ArchivedToast() {
+  return (
+    <span>
+      View archived sessions in{" "}
+      <Link to="/settings/archived" className="font-medium text-primary hover:underline">
+        Settings
+      </Link>
+    </span>
+  );
+}
+
+/** Fire the post-archive toast. Hoisted so it isn't a render-scoped closure. */
+function showArchivedToast() {
+  showToast(<ArchivedToast />);
+}
+
+export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
   const [pinnedConversationIds, setPinnedConversationIds] = useState(readPinnedConversationIds);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  const toggleSelected = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const selectAll = useCallback((conversations: Conversation[]) => {
+    setSelectedIds(new Set(conversations.map((c) => c.id)));
+  }, []);
+
+  const deselectAll = useCallback(() => {
+    setSelectedIds(new Set());
+  }, []);
+
+  const exitSelectionMode = useCallback(() => {
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+  }, []);
 
   // Debounce search input so we don't fire a server request on every
   // keystroke. 300 ms is fast enough to feel responsive.
@@ -177,6 +234,11 @@ export function Sidebar({ open, onClose }: SidebarProps) {
   // Which top-level nav button to highlight for the current route.
   const { isNewChatPage, isInboxPage } = useActiveNavItem();
 
+  // On /settings the card keeps its chrome but swaps the conversation list
+  // for the settings section nav (see settingsNav.tsx) — entering settings
+  // shouldn't replace the whole sidebar.
+  const { inSettings } = useSettingsRoute();
+
   // Sync pinned ids to localStorage whenever state changes. Keeping
   // the write here (instead of inside the state updater) preserves the
   // purity contract of React updaters — important under StrictMode,
@@ -194,6 +256,12 @@ export function Sidebar({ open, onClose }: SidebarProps) {
   // class so it only applies on desktop — on mobile the sidebar is a
   // full-screen overlay (``fixed inset-0``) and the variable is ignored.
   const { width: sidebarWidth, handleProps: resizeHandleProps } = useResizableSidebar();
+
+  // While the iOS edge-swipe is dragging, the overlay is on-screen and
+  // interactive even though `open` hasn't flipped yet — treat a live drag as
+  // visually open so it isn't `inert`/`aria-hidden` mid-gesture.
+  const dragging = dragProgress != null;
+  const effectiveOpen = open || dragging;
 
   return (
     <aside
@@ -215,7 +283,13 @@ export function Sidebar({ open, onClose }: SidebarProps) {
         // there the sidebar pushes content aside, so nothing sits behind it.
         "max-md:bg-card-solid",
         "fixed inset-0 z-50",
-        open ? "translate-x-0" : "-translate-x-full",
+        // Mobile only: animate the slide so the iOS edge-swipe settles
+        // smoothly on release. Suppressed inline while a drag is live (the
+        // overlay must track the finger 1:1). Scoped to transform so it can't
+        // re-introduce the width-animation lag the base comment warns about,
+        // and gated to mobile so the desktop floating card is unaffected.
+        "max-md:transition-transform max-md:duration-200 max-md:ease-out",
+        effectiveOpen ? "translate-x-0" : "-translate-x-full",
         // Desktop: a floating card. Detached from the window edges by a
         // margin, rounded, and lifted off the bg-sidebar canvas with a
         // full border + shadow. Width (the user-resizable variable) animates
@@ -226,14 +300,23 @@ export function Sidebar({ open, onClose }: SidebarProps) {
           ? "md:m-2 md:w-[var(--sidebar-width)] md:rounded-xl md:border md:border-border md:shadow-lg"
           : "md:m-0 md:w-0 md:border-0",
       )}
-      style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
+      style={
+        {
+          "--sidebar-width": `${sidebarWidth}px`,
+          // Track the finger: map the 0→1 open fraction to translateX
+          // -100%→0% and kill the transition so it follows the drag exactly.
+          ...(dragging
+            ? { transform: `translateX(${(dragProgress - 1) * 100}%)`, transition: "none" }
+            : null),
+        } as CSSProperties
+      }
       // Hide from the accessibility tree when closed so screen readers
       // don't see the empty-state contents while focus is elsewhere.
-      aria-hidden={!open}
-      data-collapsed={!open || undefined}
+      aria-hidden={!effectiveOpen}
+      data-collapsed={!effectiveOpen || undefined}
       // Match the keyboard-focus story: when closed, the sidebar's
       // children shouldn't receive tabs.
-      inert={!open}
+      inert={!effectiveOpen}
     >
       {/* Right-edge resize handle (desktop only), mirroring the right rail's
           left-edge handle. Hidden on mobile, where the sidebar is a
@@ -243,121 +326,175 @@ export function Sidebar({ open, onClose }: SidebarProps) {
         {...resizeHandleProps}
         className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
       />
-      <div className="flex items-center justify-between px-4 pt-3">
-        {/* Brand mark doubles as the "home" affordance: clicking it
+      {inSettings ? (
+        <SettingsSidebarBody onNavClick={onNavClick} onClose={onClose} />
+      ) : (
+        <>
+          <div className="flex items-center justify-between px-4 pt-3">
+            {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
             session. Reuses onNavClick so a plain primary click closes
             the sidebar on mobile (where it's a full-screen overlay) but
             modifier/middle clicks still open `/` in a new tab. */}
-        <Link
-          to="/"
-          onClick={onNavClick}
-          className="rounded-sm text-[15px] font-semibold tracking-tight text-foreground transition-colors hover:text-foreground/70"
-        >
-          Omnigent
-        </Link>
-        <div className="flex items-center gap-1">
-          <ThemeModeMenu />
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                aria-label="Close sidebar"
-                onClick={onClose}
-                className="rounded-full"
-              >
-                {/* panel-right-open while the sidebar IS open — this button
+            <Link
+              to="/"
+              onClick={onNavClick}
+              className="rounded-sm text-[15px] font-semibold tracking-tight text-foreground transition-colors hover:text-foreground/70"
+            >
+              Omnigent
+            </Link>
+            <div className="flex items-center gap-1">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Close sidebar"
+                    onClick={onClose}
+                    className="rounded-full"
+                  >
+                    {/* panel-right-open while the sidebar IS open — this button
                     only renders in the open state (ChatHeader's PanelLeftIcon
                     covers the collapsed state). */}
-                <PanelRightOpenIcon className="size-4" />
-              </Button>
-            </TooltipTrigger>
-            {/* Bottom placement keeps the tooltip clear of the macOS
+                    <PanelRightOpenIcon className="size-4" />
+                  </Button>
+                </TooltipTrigger>
+                {/* Bottom placement keeps the tooltip clear of the macOS
                 Electron shell's traffic lights at the window's top edge. */}
-            <TooltipContent side="bottom">Collapse sidebar</TooltipContent>
-          </Tooltip>
-        </div>
-      </div>
+                <TooltipContent side="bottom">Collapse sidebar</TooltipContent>
+              </Tooltip>
+            </div>
+          </div>
 
-      <div className="px-3 py-3">
-        {/* "New session" routes to the home composer ("/"), which now owns
+          <div className="px-3 py-3">
+            {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
             tab; onNavClick still closes the sidebar on a plain mobile tap. */}
-        <Button
-          asChild
-          className={cn(
-            "w-full justify-start gap-2 text-sm",
-            isNewChatPage && "bg-muted font-semibold",
-          )}
-          variant="ghost"
-          data-testid="new-chat-button"
-        >
-          <Link to="/" onClick={onNavClick}>
-            <PencilIcon className="size-4 text-muted-foreground" />
-            New session
-          </Link>
-        </Button>
-        <Button
-          asChild
-          className={cn(
-            "w-full justify-start gap-2 text-sm",
-            isInboxPage && "bg-muted font-semibold",
-          )}
-          variant="ghost"
-          data-testid="inbox-button"
-        >
-          <Link to="/inbox" onClick={onNavClick}>
-            <InboxIcon className="size-4" />
-            Inbox
-            {inboxCount > 0 && (
-              <span
-                aria-label={
-                  inboxCount === 1 ? "1 inbox item waiting" : `${inboxCount} inbox items waiting`
+            <Button
+              asChild
+              className={cn(
+                "w-full justify-start gap-2 text-sm",
+                isNewChatPage && "bg-muted font-semibold",
+              )}
+              variant="ghost"
+              data-testid="new-chat-button"
+            >
+              <Link to="/" onClick={onNavClick}>
+                <PencilIcon className="size-4 text-muted-foreground" />
+                New session
+              </Link>
+            </Button>
+            <Button
+              asChild
+              className={cn(
+                "w-full justify-start gap-2 text-sm",
+                isInboxPage && "bg-muted font-semibold",
+              )}
+              variant="ghost"
+              data-testid="inbox-button"
+            >
+              <Link to="/inbox" onClick={onNavClick}>
+                <InboxIcon className="size-4" />
+                Inbox
+                {inboxCount > 0 && (
+                  <span
+                    aria-label={
+                      inboxCount === 1
+                        ? "1 inbox item waiting"
+                        : `${inboxCount} inbox items waiting`
+                    }
+                    className="ml-auto inline-flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full bg-warning/15 px-1.5 text-[11px] font-medium text-warning tabular-nums"
+                  >
+                    {inboxCount}
+                  </span>
+                )}
+              </Link>
+            </Button>
+            {selectionMode ? (
+              <BulkActionBar
+                selectedIds={selectedIds}
+                allConversations={(conversationsQuery.data?.pages ?? []).flatMap(
+                  (page) => page.data,
+                )}
+                onSelectAll={() =>
+                  selectAll((conversationsQuery.data?.pages ?? []).flatMap((page) => page.data))
                 }
-                className="ml-auto inline-flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full bg-warning/15 px-1.5 text-[11px] font-medium text-warning tabular-nums"
-              >
-                {inboxCount}
-              </span>
+                onDeselectAll={deselectAll}
+                onClear={deselectAll}
+                onExit={exitSelectionMode}
+              />
+            ) : (
+              <div className="relative mt-3 flex items-center gap-1.5">
+                <div className="relative flex-1">
+                  <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
+                  <input
+                    type="search"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    aria-label="Search sessions"
+                    placeholder="Search sessions"
+                    className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1"
+                  />
+                </div>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Select sessions"
+                      data-testid="toggle-selection-mode"
+                      className="shrink-0 rounded-full"
+                      onClick={() => setSelectionMode(true)}
+                    >
+                      <ListChecksIcon className="size-3.5" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">Select sessions</TooltipContent>
+                </Tooltip>
+              </div>
             )}
-          </Link>
-        </Button>
-        <div className="relative mt-3">
-          <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
-          <input
-            type="search"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            aria-label="Search sessions"
-            placeholder="Search sessions"
-            className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1"
-          />
-        </div>
-      </div>
+          </div>
 
-      {/* [scrollbar-gutter:stable]: with macOS classic (space-taking)
-          scrollbars, the list's scrollbar appearing/disappearing (e.g. while
-          a Radix menu locks scrolling) resizes every row — titles gain/lose
-          a character. Reserving the gutter keeps row width constant. */}
-      <nav className="flex-1 overflow-y-auto px-3 pb-3 [scrollbar-gutter:stable]">
-        <ConversationList
-          conversationsQuery={conversationsQuery}
-          onRowClick={onNavClick}
-          searchQuery={debouncedSearchQuery}
-          pinnedConversationIds={pinnedConversationIds}
-          onPinnedConversationIdsChange={setPinnedConversationIds}
-          onTogglePinned={togglePinnedConversation}
-        />
-      </nav>
+          <nav className="relative flex-1 overflow-y-auto px-3 pb-3 [scrollbar-gutter:stable]">
+            <ConversationList
+              conversationsQuery={conversationsQuery}
+              onRowClick={onNavClick}
+              searchQuery={debouncedSearchQuery}
+              pinnedConversationIds={pinnedConversationIds}
+              onPinnedConversationIdsChange={setPinnedConversationIds}
+              onTogglePinned={togglePinnedConversation}
+              selectionMode={selectionMode}
+              selectedIds={selectedIds}
+              onToggleSelected={toggleSelected}
+            />
+          </nav>
 
-      {/* Account footer. Sibling *after* the flex-1 nav so it pins to the
-          bottom of the sidebar column. Renders nothing (no border, no
-          padding) when the accounts auth provider is off, so non-accounts
-          deploys keep the conversation list flush to the bottom edge. */}
-      <AccountMenu />
+          {/* Settings footer. Sibling *after* the flex-1 nav so it pins to the
+          bottom of the sidebar column. Always present (every deploy): the
+          full settings surface — appearance, keyboard shortcuts, archived
+          chats, and the account/sign-out controls when accounts auth is on —
+          lives behind this row on the /settings page. */}
+          <div className="shrink-0 px-3 pb-3">
+            {/* Match the New session / Inbox buttons (default size, no extra
+            padding) so the gear icon lines up with their leading icons. */}
+            <Button
+              asChild
+              variant="ghost"
+              className="w-full justify-start gap-2 text-sm"
+              data-testid="settings-button"
+            >
+              <Link to="/settings" onClick={onNavClick}>
+                <SettingsIcon className="size-4 text-muted-foreground" />
+                Settings
+              </Link>
+            </Button>
+          </div>
+        </>
+      )}
     </aside>
   );
 }
@@ -369,6 +506,9 @@ interface ConversationListProps {
   pinnedConversationIds: string[];
   onPinnedConversationIdsChange: (ids: string[]) => void;
   onTogglePinned: (conversationId: string) => void;
+  selectionMode: boolean;
+  selectedIds: Set<string>;
+  onToggleSelected: (conversationId: string) => void;
 }
 
 // permission_level null (no ACL row / legacy) or >= 4 both mean owner.
@@ -383,6 +523,9 @@ function ConversationList({
   pinnedConversationIds,
   onPinnedConversationIdsChange,
   onTogglePinned,
+  selectionMode,
+  selectedIds,
+  onToggleSelected,
 }: ConversationListProps) {
   // All loaded conversations from the single paginated list (for pinned
   // backfill, normalization, and the flat session list).
@@ -412,9 +555,12 @@ function ConversationList({
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const sections = useMemo(() => {
     const allWithBackfill = [...allConversations, ...pinnedBackfill];
-    const pinned = sortByUpdatedAtDesc(
+    // Pinned rows are ordered strictly by when they were pinned (newest pin
+    // at the bottom), not by `updated_at` — a pinned session shouldn't jump
+    // when it gets a new message.
+    const pinned = orderByPinnedSequence(
       allWithBackfill.filter((c) => pinnedSet.has(c.id) && c.archived !== true),
-      activeOverride,
+      pinnedConversationIds,
     );
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
     const active = allConversations.filter((c) => !pinnedIdSet.has(c.id) && c.archived !== true);
@@ -428,7 +574,7 @@ function ConversationList({
       activeOverride,
     );
     return { pinned, sessions, shared, archived };
-  }, [allConversations, pinnedBackfill, pinnedSet, activeOverride]);
+  }, [allConversations, pinnedBackfill, pinnedSet, pinnedConversationIds, activeOverride]);
 
   // Collapsed section titles — persisted like pins so the preference
   // survives reloads. Lifted here (not per-section state) because the
@@ -446,19 +592,51 @@ function ConversationList({
     });
   }, []);
 
+  // When a search query appears, auto-expand all sections so results
+  // in collapsed groups (especially Archived) are visible. The user
+  // can still manually collapse sections while searching. When the
+  // search is cleared, restore the persisted collapsed state.
+  const prevSearchQuery = useRef(searchQuery);
+  const [searchCollapsedSections, setSearchCollapsedSections] = useState<string[]>([]);
+  useEffect(() => {
+    const wasEmpty = !prevSearchQuery.current;
+    const isNonEmpty = !!searchQuery;
+    prevSearchQuery.current = searchQuery;
+    if (wasEmpty && isNonEmpty) {
+      setSearchCollapsedSections([]);
+    }
+  }, [searchQuery]);
+  const effectiveCollapsedSections = searchQuery ? searchCollapsedSections : collapsedSections;
+  const effectiveToggleSectionCollapsed = searchQuery
+    ? (sectionTitle: string) => {
+        setSearchCollapsedSections((prev) =>
+          prev.includes(sectionTitle)
+            ? prev.filter((t) => t !== sectionTitle)
+            : [...prev, sectionTitle],
+        );
+      }
+    : toggleSectionCollapsed;
+
   // Visible rows in render order (collapsed sections excluded) for the Cmd+↑/↓
   // session hotkey. Titles must match the <ConversationSection> props below.
   const orderedConversationIds = useMemo(() => {
     const visible = (title: string, list: readonly Conversation[]) =>
-      collapsedSections.includes(title) ? [] : list;
+      effectiveCollapsedSections.includes(title) ? [] : list;
     return [
       ...visible("Pinned", sections.pinned),
       ...visible("Recent", sections.sessions),
       ...visible("Shared with me", sections.shared),
-      ...visible("Archived", sections.archived),
     ].map((c) => c.id);
-  }, [sections, collapsedSections]);
+  }, [sections, effectiveCollapsedSections]);
   useSessionSwitchHotkey(orderedConversationIds, activeId);
+
+  // Cmd/Ctrl+1..9/0 jumps to the first ten pinned sessions (desktop only;
+  // see the hook). Empty when the Pinned section is collapsed.
+  const pinnedSessionIds = useMemo(
+    () => (collapsedSections.includes("Pinned") ? [] : sections.pinned.map((c) => c.id)),
+    [sections.pinned, collapsedSections],
+  );
+  usePinnedSessionHotkeys(pinnedSessionIds, activeId);
 
   // Only normalize pinned ids once all pages are loaded; a pin that
   // lives on an unloaded page should not be dropped prematurely
@@ -494,11 +672,9 @@ function ConversationList({
   }
   const emptyMessage = searchQuery ? "No matching conversations" : "No active sessions";
 
-  const totalVisible =
-    sections.pinned.length +
-    sections.sessions.length +
-    sections.shared.length +
-    sections.archived.length;
+  // Archived sessions are surfaced on the Settings page, not here, so they
+  // don't count toward the sidebar's empty-state threshold.
+  const totalVisible = sections.pinned.length + sections.sessions.length + sections.shared.length;
 
   // Section structure comes from the muted micro-headers + whitespace
   // alone (Linear-style) — no divider rules between groups.
@@ -513,10 +689,13 @@ function ConversationList({
               title="Pinned"
               conversations={sections.pinned}
               pinnedConversationIds={pinnedConversationIds}
-              collapsedSections={collapsedSections}
-              onToggleCollapsed={toggleSectionCollapsed}
+              collapsedSections={effectiveCollapsedSections}
+              onToggleCollapsed={effectiveToggleSectionCollapsed}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
+              selectionMode={selectionMode}
+              selectedIds={selectedIds}
+              onToggleSelected={onToggleSelected}
             />
           )}
           {sections.sessions.length > 0 && (
@@ -524,10 +703,13 @@ function ConversationList({
               title="Recent"
               conversations={sections.sessions}
               pinnedConversationIds={pinnedConversationIds}
-              collapsedSections={collapsedSections}
-              onToggleCollapsed={toggleSectionCollapsed}
+              collapsedSections={effectiveCollapsedSections}
+              onToggleCollapsed={effectiveToggleSectionCollapsed}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
+              selectionMode={selectionMode}
+              selectedIds={selectedIds}
+              onToggleSelected={onToggleSelected}
             />
           )}
           {sections.shared.length > 0 && (
@@ -535,30 +717,20 @@ function ConversationList({
               title="Shared with me"
               conversations={sections.shared}
               pinnedConversationIds={pinnedConversationIds}
-              collapsedSections={collapsedSections}
-              onToggleCollapsed={toggleSectionCollapsed}
+              collapsedSections={effectiveCollapsedSections}
+              onToggleCollapsed={effectiveToggleSectionCollapsed}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
+              selectionMode={selectionMode}
+              selectedIds={selectedIds}
+              onToggleSelected={onToggleSelected}
             />
           )}
-          {/* Archived sessions, grouped at the very bottom (below "Shared
-              with me"). Collapsible + persisted like the other sections; this
-              is also the surface that makes the per-row "Unarchive" action
-              reachable again. */}
-          {sections.archived.length > 0 && (
-            <ConversationSection
-              title="Archived"
-              conversations={sections.archived}
-              pinnedConversationIds={pinnedConversationIds}
-              collapsedSections={collapsedSections}
-              onToggleCollapsed={toggleSectionCollapsed}
-              onRowClick={onRowClick}
-              onTogglePinned={onTogglePinned}
-            />
-          )}
+          {/* Archived sessions are no longer listed here — they live on the
+              Settings page ("Archived chats"), reachable from the footer. */}
           {/* Pagination extends the Recent list, so the button hides with
               it — a Load more under a collapsed group reads orphaned. */}
-          {hasMorePages && !collapsedSections.includes("Recent") && (
+          {hasMorePages && !effectiveCollapsedSections.includes("Recent") && (
             <button
               type="button"
               disabled={conversationsQuery.isFetchingNextPage}
@@ -591,25 +763,26 @@ function ConversationSection({
   onToggleCollapsed,
   onRowClick,
   onTogglePinned,
+  selectionMode,
+  selectedIds,
+  onToggleSelected,
 }: {
-  // Section header, e.g. "Recent". Untitled sections render as a bare
-  // list and cannot collapse (there is no header to click).
   title?: string;
   conversations: Conversation[];
   pinnedConversationIds: string[];
-  /** Titles currently collapsed; an untitled section can't collapse. */
   collapsedSections: string[];
   onToggleCollapsed: (sectionTitle: string) => void;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
+  selectionMode: boolean;
+  selectedIds: Set<string>;
+  onToggleSelected: (conversationId: string) => void;
 }) {
   const collapsed = title != null && collapsedSections.includes(title);
   return (
     <section>
       {title && (
         <h2>
-          {/* Full-width header button = a comfortable touch target on the
-              mobile drawer, where a chevron-sized hit area would be fiddly. */}
           <button
             type="button"
             aria-expanded={!collapsed}
@@ -617,9 +790,6 @@ function ConversationSection({
             className="group flex w-full items-center gap-1 rounded-md px-2 py-1 text-left text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
           >
             {title}
-            {/* Chevron trails the label (Codex/Cursor-style). Hidden until
-                hover when expanded; always visible when collapsed so the
-                hidden content stays discoverable. */}
             <ChevronRightIcon
               className={cn(
                 "size-3.5 shrink-0 transition-transform",
@@ -638,6 +808,9 @@ function ConversationSection({
               isPinned={pinnedConversationIds.includes(conv.id)}
               onClick={onRowClick}
               onTogglePinned={onTogglePinned}
+              selectionMode={selectionMode}
+              isSelected={selectedIds.has(conv.id)}
+              onToggleSelected={onToggleSelected}
             />
           ))}
         </ul>
@@ -651,11 +824,17 @@ function ConversationRow({
   isPinned,
   onClick,
   onTogglePinned,
+  selectionMode,
+  isSelected,
+  onToggleSelected,
 }: {
   conversation: Conversation;
   isPinned: boolean;
   onClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
+  selectionMode: boolean;
+  isSelected: boolean;
+  onToggleSelected: (conversationId: string) => void;
 }) {
   // `useParams` reads from the active matched route. On `/`, the param is
   // undefined; on `/c/:conversationId`, it carries the active id.
@@ -818,7 +997,12 @@ function ConversationRow({
       onSettled: () => {
         archive.mutate(
           { id: conversation.id, archived: true },
-          { onSettled: () => setIsArchiving(false) },
+          {
+            // Point the user at where the session went — it's no longer in
+            // the sidebar list, so surface its new home in Settings.
+            onSuccess: showArchivedToast,
+            onSettled: () => setIsArchiving(false),
+          },
         );
       },
     });
@@ -827,29 +1011,26 @@ function ConversationRow({
   return (
     <li className="group relative">
       <Link
-        to={`/c/${conversation.id}`}
+        to={selectionMode ? "#" : `/c/${conversation.id}`}
         className={cn(
-          // Right padding reserves room for the trailing controls so long
-          // titles truncate before colliding with them. On desktop the time
-          // marker shares a slot with the hover controls (pin + kebab,
-          // swapped in on hover), so reserve room for both (pr-16). On
-          // mobile there's no hover, so the marker, pin, and kebab are all
-          // visible side by side — reserve pr-28 to clear the marker that
-          // sits left of them. The wide "Needs response" tag replaces the
-          // timestamp in that slot, so reserve extra room for it
-          // (pr-44 / md:pr-28). flex-col stacks the name row over the
-          // git-branch subtitle row.
           "relative flex w-full flex-col gap-0.5 rounded-md px-4 py-2 text-left text-sm hover:bg-muted",
-          sessionState?.kind === "awaiting" ? "pr-44 md:pr-28" : "pr-28 md:pr-16",
-          isActive && "bg-muted font-semibold",
+          !selectionMode &&
+            (sessionState?.kind === "awaiting" ? "pr-44 md:pr-28" : "pr-28 md:pr-16"),
+          selectionMode && "pr-10",
+          isActive && "bg-muted",
+          selectionMode && isSelected && "bg-primary/5",
         )}
-        onClick={onClick}
-        // Double-click renames inline (a quick alternative to the kebab's
-        // Rename item). The first click of the gesture still selects/navigates
-        // the row natively; the dblclick then swaps in the edit field. Gated on
-        // edit permission so a viewer-only row stays read-only. preventDefault
-        // suppresses the browser's double-click text selection on the title.
+        onClick={(e) => {
+          if (selectionMode) {
+            e.preventDefault();
+            e.stopPropagation();
+            onToggleSelected(conversation.id);
+            return;
+          }
+          onClick(e);
+        }}
         onDoubleClick={(e) => {
+          if (selectionMode) return;
           if (!canEdit) return;
           e.preventDefault();
           setIsEditing(true);
@@ -862,7 +1043,7 @@ function ConversationRow({
             shared) were removed to keep rows text-clean; pinned rows still
             group under "Pinned". */}
         <div className="flex w-full items-center gap-1.5">
-          <span className={cn("relative min-w-0 truncate", hasUnseenMessages && "font-semibold")}>
+          <span className="relative min-w-0 truncate">
             {label}
             {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
           </span>
@@ -878,17 +1059,15 @@ function ConversationRow({
           </span>
         )}
       </Link>
-      {/* Time-marker slot. On desktop it shares the controls' slot (right-2)
-          and fades out on hover/focus so the pin + kebab can take over in
-          place. On mobile there is no hover, so it sits to the left of the
-          always-visible pin + kebab (right-[4.5rem]) and stays put — they
-          read side by side. When the session has a state badge (working dot,
-          "Needs response", unseen dot), the badge takes this slot INSTEAD of
-          the timestamp — the row shows one trailing marker, never both. */}
-      {sessionState !== null ? (
-        // pointer-events-none keeps clicks falling through to the row, so
-        // the badge's hover tooltip is intentionally inert here; screen
-        // readers still get the badge's own role="img" aria-label.
+      {selectionMode ? (
+        <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 right-2.5 flex items-center">
+          {isSelected ? (
+            <SquareCheckIcon className="size-4 text-primary" />
+          ) : (
+            <SquareIcon className="size-4 text-muted-foreground" />
+          )}
+        </span>
+      ) : sessionState !== null ? (
         <span className={TIME_MARKER_SLOT_CLASS}>
           <SessionStateBadge state={sessionState} />
         </span>
@@ -901,188 +1080,193 @@ function ConversationRow({
           {relativeTime(conversation.updated_at * 1000)}
         </span>
       )}
-      {/* Quick pin/unpin — the sole pin affordance now (removed from the
-          kebab menu). Sits just left of the kebab. On mobile (no hover) it's
-          always visible alongside the kebab; on desktop it reveals on
-          hover/focus, and stays surfaced while the kebab menu is open so it
-          doesn't vanish when the row's controls are otherwise visible. */}
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon-sm"
-        aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
-        data-testid="quick-pin-conversation"
-        className={cn(
-          "-translate-y-1/2 absolute top-1/2 right-9 transition-opacity",
-          "md:opacity-0 md:group-hover:opacity-100",
-          "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
-        )}
-        onClick={(e) => {
-          // Keep the toggle click off the surrounding Link (no navigation).
-          e.preventDefault();
-          e.stopPropagation();
-          onTogglePinned(conversation.id);
-        }}
-      >
-        {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
-      </Button>
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Conversation actions"
-            data-testid="conversation-actions"
-            // Absolute-positioned trigger. On mobile (no hover state)
-            // it's always visible. On desktop it stays hidden until
-            // hover / keyboard focus, with `aria-expanded` keeping it
-            // surfaced while the menu is open so the trigger doesn't
-            // vanish under the cursor.
-            className={cn(
-              "-translate-y-1/2 absolute top-1/2 right-1 transition-opacity",
-              "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
-              "md:aria-expanded:opacity-100",
-            )}
-            onClick={(e) => {
-              // Keep the trigger click from bubbling into the Link.
-              e.preventDefault();
-              e.stopPropagation();
-            }}
-          >
-            <MoreHorizontalIcon className="size-3.5" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-36">
-          {isOwner ? (
-            <DropdownMenuItem data-testid="archive-conversation" onSelect={runArchive}>
-              {isArchived ? (
-                <ArchiveRestoreIcon className="size-3.5" />
-              ) : (
-                <ArchiveIcon className="size-3.5" />
+      {!selectionMode && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
+          data-testid="quick-pin-conversation"
+          className={cn(
+            "-translate-y-1/2 absolute top-1/2 right-9 transition-opacity",
+            "md:opacity-0 md:group-hover:opacity-100",
+            "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
+          )}
+          onClick={(e) => {
+            // Keep the toggle click off the surrounding Link (no navigation).
+            e.preventDefault();
+            e.stopPropagation();
+            onTogglePinned(conversation.id);
+          }}
+        >
+          {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+        </Button>
+      )}
+      {!selectionMode && (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Conversation actions"
+              data-testid="conversation-actions"
+              // Absolute-positioned trigger. On mobile (no hover state)
+              // it's always visible. On desktop it stays hidden until
+              // hover / keyboard focus, with `aria-expanded` keeping it
+              // surfaced while the menu is open so the trigger doesn't
+              // vanish under the cursor.
+              className={cn(
+                "-translate-y-1/2 absolute top-1/2 right-1 transition-opacity",
+                "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
+                "md:aria-expanded:opacity-100",
               )}
-              {isArchived ? "Unarchive" : "Archive"}
-            </DropdownMenuItem>
-          ) : (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <div>
-                  <DropdownMenuItem data-testid="archive-conversation" disabled>
-                    {isArchived ? (
-                      <ArchiveRestoreIcon className="size-3.5" />
-                    ) : (
-                      <ArchiveIcon className="size-3.5" />
-                    )}
-                    {isArchived ? "Unarchive" : "Archive"}
-                  </DropdownMenuItem>
-                </div>
-              </TooltipTrigger>
-              <TooltipContent side="left">
-                Only the session owner can {isArchived ? "unarchive" : "archive"} this session
-              </TooltipContent>
-            </Tooltip>
-          )}
-          {canManage ? (
-            <DropdownMenuItem data-testid="share-conversation" onSelect={() => setShareOpen(true)}>
-              <ShareIcon className="size-3.5" />
-              Share
-            </DropdownMenuItem>
-          ) : (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <div>
-                  <DropdownMenuItem data-testid="share-conversation" disabled>
-                    <ShareIcon className="size-3.5" />
-                    Share
-                  </DropdownMenuItem>
-                </div>
-              </TooltipTrigger>
-              <TooltipContent side="left">
-                You need manage permissions to share this session
-              </TooltipContent>
-            </Tooltip>
-          )}
-          {canEdit ? (
-            <DropdownMenuItem data-testid="rename-conversation" onSelect={() => setIsEditing(true)}>
-              <PencilIcon className="size-3.5" />
-              Rename
-            </DropdownMenuItem>
-          ) : (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <div>
-                  <DropdownMenuItem data-testid="rename-conversation" disabled>
-                    <PencilIcon className="size-3.5" />
-                    Rename
-                  </DropdownMenuItem>
-                </div>
-              </TooltipTrigger>
-              <TooltipContent side="left">
-                You need edit permissions to rename this session
-              </TooltipContent>
-            </Tooltip>
-          )}
-          {/* Stop session — only on stoppable sessions whose runner isn't
-              already known-offline (canStop). Owner-gated like Delete:
-              non-owners see it disabled with an explanatory tooltip. */}
-          {canStop &&
-            (isOwner ? (
-              <DropdownMenuItem
-                data-testid="stop-conversation"
-                variant="destructive"
-                onSelect={() => {
-                  // Clear any prior failure so a stale "couldn't stop"
-                  // message doesn't greet the next attempt. Must happen
-                  // here: Radix only fires the Dialog's onOpenChange for
-                  // Radix-initiated changes, not this programmatic open.
-                  stopSession.reset();
-                  setStopOpen(true);
-                }}
-              >
-                <CircleStopIcon className="size-3.5" />
-                Stop session
+              onClick={(e) => {
+                // Keep the trigger click from bubbling into the Link.
+                e.preventDefault();
+                e.stopPropagation();
+              }}
+            >
+              <MoreHorizontalIcon className="size-3.5" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-36">
+            {isOwner ? (
+              <DropdownMenuItem data-testid="archive-conversation" onSelect={runArchive}>
+                {isArchived ? (
+                  <ArchiveRestoreIcon className="size-3.5" />
+                ) : (
+                  <ArchiveIcon className="size-3.5" />
+                )}
+                {isArchived ? "Unarchive" : "Archive"}
               </DropdownMenuItem>
             ) : (
               <Tooltip>
                 <TooltipTrigger asChild>
                   <div>
-                    <DropdownMenuItem data-testid="stop-conversation" disabled>
-                      <CircleStopIcon className="size-3.5" />
-                      Stop session
+                    <DropdownMenuItem data-testid="archive-conversation" disabled>
+                      {isArchived ? (
+                        <ArchiveRestoreIcon className="size-3.5" />
+                      ) : (
+                        <ArchiveIcon className="size-3.5" />
+                      )}
+                      {isArchived ? "Unarchive" : "Archive"}
                     </DropdownMenuItem>
                   </div>
                 </TooltipTrigger>
                 <TooltipContent side="left">
-                  Only the session owner can stop this session
+                  Only the session owner can {isArchived ? "unarchive" : "archive"} this session
                 </TooltipContent>
               </Tooltip>
-            ))}
-          {isOwner ? (
-            <DropdownMenuItem
-              data-testid="delete-conversation"
-              variant="destructive"
-              onSelect={() => setDeleteOpen(true)}
-            >
-              <Trash2Icon className="size-3.5" />
-              Delete
-            </DropdownMenuItem>
-          ) : (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <div>
-                  <DropdownMenuItem data-testid="delete-conversation" disabled>
-                    <Trash2Icon className="size-3.5" />
-                    Delete
-                  </DropdownMenuItem>
-                </div>
-              </TooltipTrigger>
-              <TooltipContent side="left">
-                Only the session owner can delete this session
-              </TooltipContent>
-            </Tooltip>
-          )}
-        </DropdownMenuContent>
-      </DropdownMenu>
+            )}
+            {canManage ? (
+              <DropdownMenuItem
+                data-testid="share-conversation"
+                onSelect={() => setShareOpen(true)}
+              >
+                <ShareIcon className="size-3.5" />
+                Share
+              </DropdownMenuItem>
+            ) : (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <div>
+                    <DropdownMenuItem data-testid="share-conversation" disabled>
+                      <ShareIcon className="size-3.5" />
+                      Share
+                    </DropdownMenuItem>
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent side="left">
+                  You need manage permissions to share this session
+                </TooltipContent>
+              </Tooltip>
+            )}
+            {canEdit ? (
+              <DropdownMenuItem
+                data-testid="rename-conversation"
+                onSelect={() => setIsEditing(true)}
+              >
+                <PencilIcon className="size-3.5" />
+                Rename
+              </DropdownMenuItem>
+            ) : (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <div>
+                    <DropdownMenuItem data-testid="rename-conversation" disabled>
+                      <PencilIcon className="size-3.5" />
+                      Rename
+                    </DropdownMenuItem>
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent side="left">
+                  You need edit permissions to rename this session
+                </TooltipContent>
+              </Tooltip>
+            )}
+            {/* Stop session — only on stoppable sessions whose runner isn't
+              already known-offline (canStop). Owner-gated like Delete:
+              non-owners see it disabled with an explanatory tooltip. */}
+            {canStop &&
+              (isOwner ? (
+                <DropdownMenuItem
+                  data-testid="stop-conversation"
+                  variant="destructive"
+                  onSelect={() => {
+                    // Clear any prior failure so a stale "couldn't stop"
+                    // message doesn't greet the next attempt. Must happen
+                    // here: Radix only fires the Dialog's onOpenChange for
+                    // Radix-initiated changes, not this programmatic open.
+                    stopSession.reset();
+                    setStopOpen(true);
+                  }}
+                >
+                  <CircleStopIcon className="size-3.5" />
+                  Stop session
+                </DropdownMenuItem>
+              ) : (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <div>
+                      <DropdownMenuItem data-testid="stop-conversation" disabled>
+                        <CircleStopIcon className="size-3.5" />
+                        Stop session
+                      </DropdownMenuItem>
+                    </div>
+                  </TooltipTrigger>
+                  <TooltipContent side="left">
+                    Only the session owner can stop this session
+                  </TooltipContent>
+                </Tooltip>
+              ))}
+            {isOwner ? (
+              <DropdownMenuItem
+                data-testid="delete-conversation"
+                variant="destructive"
+                onSelect={() => setDeleteOpen(true)}
+              >
+                <Trash2Icon className="size-3.5" />
+                Delete
+              </DropdownMenuItem>
+            ) : (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <div>
+                    <DropdownMenuItem data-testid="delete-conversation" disabled>
+                      <Trash2Icon className="size-3.5" />
+                      Delete
+                    </DropdownMenuItem>
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent side="left">
+                  Only the session owner can delete this session
+                </TooltipContent>
+              </Tooltip>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
       <PermissionsModal sessionId={conversation.id} open={shareOpen} onOpenChange={setShareOpen} />
       <Dialog
         open={deleteOpen}
@@ -1101,8 +1285,8 @@ function ConversationRow({
           <DialogHeader>
             <DialogTitle>Delete conversation?</DialogTitle>
             <DialogDescription>
-              <span className="font-medium">{label}</span> and all of its history will be removed.
-              This cannot be undone.
+              <span className="font-medium break-all">{label}</span> and all of its history will be
+              removed. This cannot be undone.
             </DialogDescription>
           </DialogHeader>
           {gitBranch !== null && (
@@ -1374,6 +1558,288 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
   );
 }
 
+function BulkActionBar({
+  selectedIds,
+  allConversations,
+  onSelectAll,
+  onDeselectAll,
+  onClear,
+  onExit,
+}: {
+  selectedIds: Set<string>;
+  allConversations: Conversation[];
+  onSelectAll: () => void;
+  onDeselectAll: () => void;
+  onClear: () => void;
+  onExit: () => void;
+}) {
+  const navigate = useNavigate();
+  const { conversationId: activeId } = useParams<{ conversationId: string }>();
+  const bulkArchive = useBulkArchiveConversations();
+  const bulkDelete = useBulkDeleteConversations();
+
+  const selectedConversations = useMemo(
+    () => allConversations.filter((c) => selectedIds.has(c.id)),
+    [allConversations, selectedIds],
+  );
+
+  const ownedSelected = useMemo(
+    () => selectedConversations.filter((c) => isOwnedByViewer(c)),
+    [selectedConversations],
+  );
+
+  const archivedSelected = useMemo(
+    () => ownedSelected.filter((c) => c.archived === true),
+    [ownedSelected],
+  );
+
+  const nonArchivedSelected = useMemo(
+    () => ownedSelected.filter((c) => c.archived !== true),
+    [ownedSelected],
+  );
+
+  const allSelectedSameArchiveGroup =
+    ownedSelected.length > 0 && (archivedSelected.length === 0 || nonArchivedSelected.length === 0);
+
+  const count = selectedIds.size;
+  const allSelected = count > 0 && count === allConversations.length;
+  const isBusy = bulkArchive.isPending || bulkDelete.isPending;
+
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+
+  function handleArchive() {
+    if (nonArchivedSelected.length === 0) return;
+    bulkArchive.mutate(
+      { ids: nonArchivedSelected.map((c) => c.id), archived: true },
+      {
+        onSuccess: () => {
+          onDeselectAll();
+        },
+      },
+    );
+  }
+
+  function handleUnarchive() {
+    if (archivedSelected.length === 0) return;
+    bulkArchive.mutate(
+      { ids: archivedSelected.map((c) => c.id), archived: false },
+      {
+        onSuccess: () => {
+          onDeselectAll();
+        },
+      },
+    );
+  }
+
+  function handleDelete() {
+    const ids = ownedSelected.map((c) => c.id);
+    if (ids.length === 0) return;
+    setConfirmDeleteOpen(false);
+    bulkDelete.mutate(ids, {
+      onSuccess: () => {
+        if (activeId && ids.includes(activeId)) navigate("/", { replace: true });
+        onDeselectAll();
+      },
+      onError: (err: any) => {
+        if (activeId && err?.succeeded?.includes(activeId)) navigate("/", { replace: true });
+      },
+    });
+  }
+
+  return (
+    <>
+      <div className="relative mt-3 flex flex-col gap-1.5">
+        <div className="relative flex min-h-8 items-center gap-1.5 px-2 pr-9">
+          <span className="shrink-0 whitespace-nowrap text-sm text-muted-foreground">
+            {count === 0 ? "None selected" : `${count} selected`}
+          </span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-6 px-1.5 text-sm"
+            onClick={allSelected ? onDeselectAll : onSelectAll}
+          >
+            {allSelected ? "Deselect all" : "Select all"}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-6 px-1.5 text-sm"
+            disabled={count === 0}
+            onClick={onClear}
+          >
+            Clear
+          </Button>
+          <div className="flex items-center gap-1.5 md:hidden">
+            {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 gap-1.5 text-xs"
+                disabled={isBusy}
+                onClick={handleArchive}
+              >
+                {bulkArchive.isPending ? (
+                  <Loader2Icon className="size-3 animate-spin" />
+                ) : (
+                  <ArchiveIcon className="size-3" />
+                )}
+                Archive
+              </Button>
+            )}
+            {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 gap-1.5 text-xs"
+                disabled={isBusy}
+                onClick={handleUnarchive}
+              >
+                {bulkArchive.isPending ? (
+                  <Loader2Icon className="size-3 animate-spin" />
+                ) : (
+                  <ArchiveRestoreIcon className="size-3" />
+                )}
+                Unarchive
+              </Button>
+            )}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className={cn("h-7 gap-1.5 text-xs", ownedSelected.length > 0 && "text-destructive")}
+              disabled={isBusy || ownedSelected.length === 0}
+              onClick={() => setConfirmDeleteOpen(true)}
+            >
+              {bulkDelete.isPending ? (
+                <Loader2Icon className="size-3 animate-spin" />
+              ) : (
+                <Trash2Icon className="size-3" />
+              )}
+              Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
+            </Button>
+          </div>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="secondary"
+                size="icon-sm"
+                className="-translate-y-1/2 absolute top-1/2 right-0 shrink-0 rounded-full"
+                aria-label="Exit selection mode"
+                data-testid="toggle-selection-mode"
+                onClick={onExit}
+              >
+                <XIcon className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Exit selection</TooltipContent>
+          </Tooltip>
+        </div>
+
+        <div className="hidden items-center gap-1.5 px-2 md:flex">
+          {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 gap-1.5 text-xs"
+              disabled={isBusy}
+              onClick={handleArchive}
+              data-testid="bulk-archive"
+            >
+              {bulkArchive.isPending ? (
+                <Loader2Icon className="size-3 animate-spin" />
+              ) : (
+                <ArchiveIcon className="size-3" />
+              )}
+              Archive
+            </Button>
+          )}
+          {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 gap-1.5 text-xs"
+              disabled={isBusy}
+              onClick={handleUnarchive}
+              data-testid="bulk-unarchive"
+            >
+              {bulkArchive.isPending ? (
+                <Loader2Icon className="size-3 animate-spin" />
+              ) : (
+                <ArchiveRestoreIcon className="size-3" />
+              )}
+              Unarchive
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className={cn("h-7 gap-1.5 text-xs", ownedSelected.length > 0 && "text-destructive")}
+            disabled={isBusy || ownedSelected.length === 0}
+            onClick={() => setConfirmDeleteOpen(true)}
+            data-testid="bulk-delete"
+          >
+            {bulkDelete.isPending ? (
+              <Loader2Icon className="size-3 animate-spin" />
+            ) : (
+              <Trash2Icon className="size-3" />
+            )}
+            Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
+          </Button>
+        </div>
+
+        {(bulkArchive.isError || bulkDelete.isError) && (
+          <p className="text-xs text-destructive" role="alert">
+            Some actions failed. Retry or dismiss.
+          </p>
+        )}
+      </div>
+
+      <Dialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete {ownedSelected.length} session(s)?</DialogTitle>
+            <DialogDescription>
+              This will permanently delete the selected sessions and all their history. This cannot
+              be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <p className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 p-3 text-xs text-muted-foreground">
+            <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0 text-warning" />
+            Branches are not cleaned up. Use single-session delete for branch surgery.
+          </p>
+          <DialogFooter className="border-t-0 bg-transparent">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setConfirmDeleteOpen(false)}
+              disabled={bulkDelete.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={handleDelete}
+              disabled={bulkDelete.isPending}
+            >
+              Delete {ownedSelected.length} session(s)
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
 /**
  * Returns true on mobile viewports (below the `md` breakpoint of
  * 768px). Used to gate the auto-close-on-navigation behavior — on
@@ -1383,7 +1849,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
  *
  * SSR-safe (returns false when window is undefined).
  */
-function isMobileViewport(): boolean {
+export function isMobileViewport(): boolean {
   if (typeof window === "undefined") return false;
   return !window.matchMedia("(min-width: 768px)").matches;
 }

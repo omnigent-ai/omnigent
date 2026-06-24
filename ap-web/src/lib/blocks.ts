@@ -8,7 +8,7 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseStartBlock → "response_start").
 
-import type { Response } from "./types";
+import type { RememberScope, Response } from "./types";
 
 /**
  * Metadata attached to every stream block.
@@ -435,6 +435,15 @@ export interface ElicitationBlock {
    * switch is a no-op.
    */
   allowAllEdits?: boolean;
+  /**
+   * Claude-native non-edit tool prompts only: present when the card
+   * should render an "Approve & don't ask again for <host|tool>" button
+   * that installs a session-scoped allow rule on accept (the web
+   * equivalent of the native TUI's "don't ask again" option). ``tool``
+   * is the gated tool; ``host`` is the WebFetch domain when present.
+   * Absent/null for all other elicitations.
+   */
+  rememberScope?: RememberScope | null;
 }
 
 /** Union of all block types. */

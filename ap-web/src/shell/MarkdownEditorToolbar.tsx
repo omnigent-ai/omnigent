@@ -21,6 +21,7 @@ import {
   Italic,
   List,
   ListOrdered,
+  ListTodo,
   Pilcrow,
   Quote,
   Redo2,
@@ -35,7 +36,11 @@ import "@tiptap/markdown";
 // Type-only import: activates @tiptap/extension-table's TypeScript module
 // augmentation so editor.chain() includes table commands (insertTable, etc.)
 // without pulling the full extension into the runtime bundle.
+// eslint-disable-next-line import/no-empty-named-blocks -- deliberate type-only augmentation trigger, not a stray empty import
 import type {} from "@tiptap/extension-table";
+// Same trick for the list package's command augmentation (toggleTaskList).
+// eslint-disable-next-line import/no-empty-named-blocks -- deliberate type-only augmentation trigger, not a stray empty import
+import type {} from "@tiptap/extension-list";
 import { TableMap, cellAround, colCount, findTable, isInTable } from "@tiptap/pm/tables";
 import { cn } from "@/lib/utils";
 
@@ -259,6 +264,7 @@ export function ToolbarPlugin({
       isItalic: ctx.editor?.isActive("italic") ?? false,
       isStrike: ctx.editor?.isActive("strike") ?? false,
       isCode: ctx.editor?.isActive("code") ?? false,
+      isTaskList: ctx.editor?.isActive("taskList") ?? false,
     }),
   });
 
@@ -311,6 +317,7 @@ export function ToolbarPlugin({
     isItalic,
     isStrike,
     isCode,
+    isTaskList,
   } = editorState ?? {};
 
   // Auto-save status pill (replaces the explicit Save button). ⌘S / clicking
@@ -435,6 +442,13 @@ export function ToolbarPlugin({
         onClick={() => editor?.chain().focus().toggleOrderedList().run()}
       >
         <ListOrdered className="size-3.5" />
+      </ToolbarBtn>
+      <ToolbarBtn
+        active={isTaskList}
+        title="Task list"
+        onClick={() => editor?.chain().focus().toggleTaskList().run()}
+      >
+        <ListTodo className="size-3.5" />
       </ToolbarBtn>
       <Divider />
       <TableBtn editor={editor} />

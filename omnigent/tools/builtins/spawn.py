@@ -154,6 +154,34 @@ class SysSessionSendTool(Tool):
         return _build_sys_session_send_schema(self._sub_specs)
 
 
+def _spec_opts_into_harness_override(spec: Any) -> bool:
+    """
+    Return ``True`` if a sub-agent spec opts into the ``args.harness`` override.
+
+    The override is allowlist-gated (design D.4): a sub-agent advertises it
+    only when its ``executor.config.allowed_harnesses`` declares a non-empty
+    allowlist. This mirrors the dispatch-side opt-in read in
+    ``omnigent/runner/tool_dispatch.py`` (``_subagent_allowed_harnesses``) so
+    the schema gate and the runtime guard agree on what "opted in" means.
+    Specs without the opt-in keep the base ``{input, purpose, model}`` args
+    contract.
+
+    :param spec: A sub-agent :class:`AgentSpec` (or structural equivalent).
+    :returns: ``True`` when the spec declares a non-empty allowlist.
+    """
+    executor = getattr(spec, "executor", None)
+    config = getattr(executor, "config", None)
+    if isinstance(config, dict):
+        raw_allowed: Any = config.get("allowed_harnesses")
+    elif config is not None:
+        raw_allowed = getattr(config, "allowed_harnesses", None)
+    else:
+        raw_allowed = None
+    if not isinstance(raw_allowed, (list, tuple, set, frozenset)):
+        return False
+    return any(isinstance(entry, str) and entry for entry in raw_allowed)
+
+
 def _build_sys_session_send_schema(
     sub_specs: dict[str, AgentSpec],
 ) -> dict[str, Any]:
@@ -220,6 +248,51 @@ def _build_sys_session_send_schema(
             "the same response — they dispatch concurrently."
         )
     )
+    # ``args.harness`` is allowlist-gated (design D.4): advertise it only when
+    # at least one declared sub-agent opts in via
+    # ``executor.config.allowed_harnesses``. Specs without the opt-in keep the
+    # base {input, purpose, model} args object, so the orchestrator never sees a
+    # harness knob it can't use. The dispatch-side guard in tool_dispatch.py
+    # re-enforces the opt-in per child (and the server create route does too).
+    harness_opt_in = any(_spec_opts_into_harness_override(spec) for spec in sub_specs.values())
+    harness_property: dict[str, Any] = (
+        {
+            "harness": {
+                "type": "string",
+                "description": (
+                    "Optional harness override for "
+                    "this sub-agent session, e.g. "
+                    "'opencode-native'. Applies only "
+                    "when this send CREATES the "
+                    "session AND the sub-agent spec "
+                    "allowlists it via "
+                    "executor.config.allowed_harnesses; "
+                    "otherwise rejected. Omitted = the "
+                    "sub-agent's declared harness."
+                ),
+            }
+        }
+        if harness_opt_in
+        else {}
+    )
+    args_description = (
+        (
+            "The user-input message to send to the sub-agent. The sub-agent "
+            "treats this as the first user turn in its conversation. Pass a "
+            "plain string for the normal contract, or pass "
+            "{input, purpose, model, harness} when a spec-level policy "
+            "requires explicit dispatch metadata, a per-dispatch model "
+            "override, or an allowlisted harness override."
+        )
+        if harness_opt_in
+        else (
+            "The user-input message to send to the sub-agent. The sub-agent "
+            "treats this as the first user turn in its conversation. Pass a "
+            "plain string for the normal contract, or pass "
+            "{input, purpose, model} when a spec-level policy requires "
+            "explicit dispatch metadata or a per-dispatch model override."
+        )
+    )
     return {
         "type": "function",
         "function": {
@@ -274,22 +347,13 @@ def _build_sys_session_send_schema(
                                             "omitted = the harness default."
                                         ),
                                     },
+                                    **harness_property,
                                 },
                                 "required": ["input"],
                                 "additionalProperties": False,
                             },
                         ],
-                        "description": (
-                            "The user-input message to send "
-                            "to the sub-agent. The sub-agent "
-                            "treats this as the first user "
-                            "turn in its conversation. Pass a "
-                            "plain string for the normal contract, "
-                            "or pass {input, purpose, model} when "
-                            "a spec-level policy requires explicit "
-                            "dispatch metadata or a per-dispatch "
-                            "model override."
-                        ),
+                        "description": args_description,
                     },
                 },
                 # Only ``args`` is universally required; the
@@ -541,6 +605,125 @@ class SysSessionGetInfoTool(Tool):
                         },
                     },
                     "required": [],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+
+class SysSessionShareTool(Tool):
+    """
+    Grant another user (or the public) access to a session.
+
+    Enabled by the spec's top-level ``agent_session_sharing:`` flag
+    (:class:`omnigent.spec.types.SharePolicy`), which is its sole gate:
+    ``none`` leaves the tool unregistered, ``non-public`` allows
+    granting named users, and ``public`` additionally allows the
+    ``__public__`` sentinel (anonymous read of the full transcript).
+    ``allow_public`` carries that last tier into the tool so it can
+    both advertise and refuse public grants when the policy is
+    ``non-public``.
+
+    ``session_id`` is optional — when omitted, the caller's own session
+    is shared, which is the common case ("share this session with X").
+    ``user_id`` is the grantee's email, or (when ``allow_public``) the
+    sentinel ``"__public__"`` for anonymous read-only access. ``level``
+    is ``"read"`` (default), ``"edit"``, or ``"manage"``; the server
+    caps public grants at read.
+
+    Runner-dispatched: the runner proxies ``PUT
+    /v1/sessions/{id}/permissions`` using its authenticated server
+    client, so the grant runs with the session user's own identity and
+    is subject to the server's permission checks (the caller needs
+    manage-level access — which the session owner has). Returns
+    ``access_denied`` when the server refuses and ``session_not_found``
+    for an unknown id.
+
+    :param allow_public: Whether ``__public__`` grants are permitted —
+        ``True`` only when the spec's ``agent_session_sharing:`` flag is
+        ``public``. Reflected in the schema and hard-enforced by the runner.
+    """
+
+    def __init__(self, allow_public: bool) -> None:
+        """
+        :param allow_public: ``True`` when the spec's
+            ``agent_session_sharing:`` policy is ``public`` — permits
+            granting the ``__public__`` sentinel.
+            ``False`` for ``non-public`` (named users only).
+        """
+        self._allow_public = allow_public
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_session_share"``."""
+        return "sys_session_share"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Share a session with another user by granting them access "
+            "(level 'read' default, 'edit', or 'manage'). Omit "
+            "session_id to share the calling session itself, or pass it "
+            "to share another session you manage. Requires manage-level "
+            "access (the session owner has it)."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """
+        Return the OpenAI-format tool schema.
+
+        The ``user_id`` description reflects ``allow_public``: it only
+        advertises the ``__public__`` sentinel when public grants are
+        permitted, so the model isn't told about an option the runner
+        would reject.
+
+        :returns: Dict with ``"type": "function"`` and a ``"function"``
+            sub-dict; ``user_id`` is required, ``level`` and
+            ``session_id`` optional.
+        """
+        if self._allow_public:
+            user_id_desc = (
+                "Grantee's email, e.g. 'alice@example.com', or the "
+                "sentinel '__public__' for anonymous read-only access "
+                "(anyone with the link)."
+            )
+        else:
+            user_id_desc = (
+                "Grantee's email, e.g. 'alice@example.com'. "
+                "Public/anonymous sharing is not enabled for this agent."
+            )
+        return {
+            "type": "function",
+            "function": {
+                "name": SysSessionShareTool.name(),
+                "description": SysSessionShareTool.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "user_id": {
+                            "type": "string",
+                            "description": user_id_desc,
+                        },
+                        "level": {
+                            "type": "string",
+                            "enum": ["read", "edit", "manage"],
+                            "description": (
+                                "Permission level to grant. Defaults to "
+                                "'read'. Public grants are capped at "
+                                "'read' regardless of this value."
+                            ),
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": (
+                                "The session (conversation_id) to share, "
+                                "e.g. 'conv_abc123'. Omit to share the "
+                                "calling session itself."
+                            ),
+                        },
+                    },
+                    "required": ["user_id"],
                     "additionalProperties": False,
                 },
             },

@@ -15,6 +15,7 @@ import { isMessageItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
 import { authenticatedFetch } from "./identity";
 import type {
+  CodexModelOption,
   ModelUsage,
   NestedSessionItem,
   SandboxStatus,
@@ -98,6 +99,14 @@ interface SessionResponseWire {
    * other carrier and it's absent for those.
    */
   host_id?: string | null;
+  /**
+   * Whether this session is bound to a dormant managed host the server can
+   * wake in place (its sandbox provider supports resume). Read only when the
+   * host is offline, to tell a recoverable "asleep" state (send a message —
+   * the server resumes the sandbox) from the terminal host_offline dead-end.
+   * Absent/`false` for non-managed/non-resumable hosts.
+   */
+  host_resumable?: boolean;
   status: SessionStatus;
   created_at: number;
   /**
@@ -184,6 +193,7 @@ interface SessionResponseWire {
    * description. Surfaced in the web composer's slash-command menu.
    */
   skills?: SkillSummary[];
+  model_options?: CodexModelOption[];
   /**
    * True while the runner is auto-creating a terminal-first session's
    * terminal. Drives the Terminal-pill spinner; absent on older
@@ -248,6 +258,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     agentName: wire.agent_name ?? null,
     runnerId: wire.runner_id,
     hostId: wire.host_id ?? null,
+    hostResumable: wire.host_resumable ?? false,
     status: wire.status,
     createdAt: wire.created_at,
     title: wire.title ?? null,
@@ -277,13 +288,14 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     subAgentName: wire.sub_agent_name ?? null,
     todos: wire.todos ?? [],
     skills: wire.skills ?? [],
+    codexModelOptions: wire.model_options ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
   };
 }
 
 async function readJsonOrThrow<T>(res: Response): Promise<T> {
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as T;
 }
 
@@ -403,6 +415,49 @@ export async function createSession(
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+/**
+ * Create a session with an inline agent bundle via multipart
+ * `POST /v1/sessions`.
+ *
+ * The server creates a session-scoped agent from the uploaded bundle
+ * (a `.tar.gz` containing `config.yaml` and optionally `AGENTS.md`)
+ * and binds it to the new session in one atomic operation. Session
+ * metadata (host, workspace, labels, etc.) is sent as a JSON string
+ * in the `metadata` form part.
+ *
+ * @param bundle - The agent bundle as a `File` (`.tar.gz`).
+ * @param metadata - Session-level metadata (host_id, workspace, labels, etc.).
+ * @returns The created session's id.
+ */
+export async function createBundledSession(
+  bundle: File,
+  metadata: {
+    host_id?: string;
+    host_type?: string;
+    workspace?: string;
+    labels?: Record<string, string>;
+    terminal_launch_args?: string[];
+    git?: { branch_name: string; base_branch?: string };
+  } = {},
+): Promise<{ id: string }> {
+  const form = new FormData();
+  form.append("metadata", JSON.stringify(metadata));
+  form.append("bundle", bundle);
+  const res = await authenticatedFetch("/v1/sessions", {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to create bundled session: ${res.status} ${text}`);
+  }
+  // The multipart response uses `session_id` (CreatedSessionResponse),
+  // while the JSON path uses `id` (SessionResponse). Normalize to `id`
+  // so callers don't need to care which path was taken.
+  const body = (await res.json()) as { session_id: string };
+  return { id: body.session_id };
 }
 
 /**
@@ -556,6 +611,7 @@ export async function updateSession(
   updates: {
     reasoningEffort?: string | null;
     modelOverride?: string | null;
+    codexPlanMode?: boolean;
     costControlModeOverride?: "on" | "off" | null;
     runnerId?: string;
     silent?: boolean;
@@ -567,6 +623,9 @@ export async function updateSession(
   }
   if ("modelOverride" in updates) {
     body.model_override = updates.modelOverride ?? "default";
+  }
+  if (updates.codexPlanMode !== undefined) {
+    body.collaboration_mode = updates.codexPlanMode ? "plan" : "default";
   }
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;
@@ -655,9 +714,26 @@ export async function getSession(sessionId: string): Promise<Session> {
  * on the SAME variant — mixing full and slim under one key would let a
  * cached slim snapshot serve a caller that expected items.
  */
-export async function getSessionSlim(sessionId: string): Promise<Session> {
+export interface GetSessionSlimOptions {
+  /**
+   * Ask the AP server to refresh runner-backed session state before
+   * returning the snapshot. Used by page-load/bind paths so a browser
+   * refresh pierces stale server-side capability caches.
+   */
+  refreshState?: boolean;
+}
+
+export async function getSessionSlim(
+  sessionId: string,
+  options: GetSessionSlimOptions = {},
+): Promise<Session> {
+  const params = new URLSearchParams({
+    include_items: "false",
+    include_liveness: "false",
+  });
+  if (options.refreshState === true) params.set("refresh_state", "true");
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}?include_items=false&include_liveness=false`,
+    `/v1/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`,
   );
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }

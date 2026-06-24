@@ -121,6 +121,28 @@ describe("SwitchAgentDialog", () => {
     expect(screen.getByTestId("switch-agent-option-ag_claude_native")).toBeInTheDocument();
   });
 
+  it("excludes the origin built-in and labels it for a fork-of-a-fork clone", () => {
+    // A fork of a fork nests suffixes: "claude (fork …) (fork …)". A
+    // single-layer strip would leave "claude (fork …)" — not a built-in
+    // name — so the origin would wrongly be offered AND the current label
+    // would show the raw suffixed slug. agentRootName peels to "claude".
+    setAgents({
+      id: "ag_src_clone2",
+      name: "claude (fork ag_a) (fork ag_b)",
+      harness: "claude-sdk",
+    });
+    renderDialog();
+
+    // Current-agent label resolves to the origin built-in's display name,
+    // not the raw "claude (fork ag_a)" a one-layer strip would leave.
+    expect(screen.getByTestId("switch-agent-current")).toHaveTextContent("Claude");
+
+    openAgentSelect();
+    // The origin built-in (claude → ag_claude_sdk) is still excluded.
+    expect(screen.queryByTestId("switch-agent-option-ag_claude_sdk")).not.toBeInTheDocument();
+    expect(screen.getByTestId("switch-agent-option-ag_claude_native")).toBeInTheDocument();
+  });
+
   it("submit is disabled until a target is chosen", () => {
     renderDialog();
     // No selection yet → the Switch button is disabled, so a stray click

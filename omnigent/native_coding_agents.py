@@ -5,9 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from omnigent._wrapper_labels import (
+    ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
+    CURSOR_NATIVE_WRAPPER_VALUE,
+    GOOSE_NATIVE_WRAPPER_VALUE,
+    OPENCODE_NATIVE_WRAPPER_VALUE,
     PI_NATIVE_WRAPPER_VALUE,
+    QWEN_NATIVE_WRAPPER_VALUE,
     UI_MODE_LABEL_KEY,
     UI_MODE_TERMINAL_VALUE,
     WRAPPER_LABEL_KEY,
@@ -65,10 +70,60 @@ PI_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="pi",
 )
 
+OPENCODE_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="opencode",
+    display_name="OpenCode",
+    agent_name="opencode-native-ui",
+    harness="opencode-native",
+    wrapper_label=OPENCODE_NATIVE_WRAPPER_VALUE,
+    terminal_name="opencode",
+    subagent_wrapper_label="opencode-native-ui-subagent",
+)
+
+CURSOR_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="cursor",
+    display_name="Cursor",
+    agent_name="cursor-native-ui",
+    harness="cursor-native",
+    wrapper_label=CURSOR_NATIVE_WRAPPER_VALUE,
+    terminal_name="cursor",
+)
+
+GOOSE_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="goose",
+    display_name="Goose",
+    agent_name="goose-native-ui",
+    harness="goose-native",
+    wrapper_label=GOOSE_NATIVE_WRAPPER_VALUE,
+    terminal_name="goose",
+)
+
+ANTIGRAVITY_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="antigravity",
+    display_name="Antigravity",
+    agent_name="antigravity-native-ui",
+    harness="antigravity-native",
+    wrapper_label=ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
+    terminal_name="antigravity",
+)
+QWEN_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="qwen",
+    display_name="Qwen Code",
+    agent_name="qwen-native-ui",
+    harness="qwen-native",
+    wrapper_label=QWEN_NATIVE_WRAPPER_VALUE,
+    terminal_name="qwen",
+)
+
 NATIVE_CODING_AGENTS: tuple[NativeCodingAgent, ...] = (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
+    OPENCODE_NATIVE_CODING_AGENT,
+    CURSOR_NATIVE_CODING_AGENT,
+    GOOSE_NATIVE_CODING_AGENT,
+    ANTIGRAVITY_NATIVE_CODING_AGENT,
+    QWEN_NATIVE_CODING_AGENT,
 )
 
 _BY_AGENT_NAME = {agent.agent_name: agent for agent in NATIVE_CODING_AGENTS}

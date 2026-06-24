@@ -221,6 +221,60 @@ def _pi_native_agents_body() -> str:
     )
 
 
+def _antigravity_native_agents_body() -> str:
+    """Stub body for ``GET /v1/agents``: the native Antigravity agent.
+
+    ``name: "antigravity-native-ui"`` + ``harness: "antigravity-native"`` is what
+    the frontend maps (via ``nativeCodingAgents``) to the display label
+    **"Antigravity"** and the antigravity-native wrapper labels. The wire
+    ``display_name`` is deliberately the raw ``"antigravity-native-ui"`` to prove
+    the picker derives "Antigravity" itself (``nativeDisplayNameForAgent`` ignores
+    the wire value) rather than echoing the server. Sole agent, so it auto-selects
+    and no explicit pick is needed.
+    """
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_antigravity_e2e",
+                    "name": "antigravity-native-ui",
+                    "display_name": "antigravity-native-ui",
+                    "description": "Google's Gemini coding agent (agy CLI)",
+                    "harness": "antigravity-native",
+                    "skills": [],
+                }
+            ]
+        }
+    )
+
+
+def _opencode_native_agents_body() -> str:
+    """Stub body for ``GET /v1/agents``: the native OpenCode agent.
+
+    ``name: "opencode-native-ui"`` + ``harness: "opencode-native"`` is what the
+    frontend maps (via ``nativeCodingAgents``) to the display label
+    **"OpenCode"** and the opencode-native wrapper labels. As with the Pi stub,
+    the wire ``display_name`` is deliberately the raw ``"opencode-native-ui"``
+    to prove the picker derives "OpenCode" itself (the harness→display mapping
+    wins) rather than echoing the server's raw value. Sole agent, so it
+    auto-selects and no explicit pick is needed.
+    """
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_opencode_e2e",
+                    "name": "opencode-native-ui",
+                    "display_name": "opencode-native-ui",
+                    "description": "OpenCode coding agent",
+                    "harness": "opencode-native",
+                    "skills": [],
+                }
+            ]
+        }
+    )
+
+
 def _hosts_body() -> str:
     """Stub body for ``GET /v1/hosts``: one online host the composer picks."""
     return json.dumps(
@@ -356,12 +410,13 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
 
 
 def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> None:
-    """Picking a non-default approval mode rides along to the create call.
+    """Picking a non-default approval preset rides along to the create call.
 
-    Selecting "Full auto" in the agent picker's Advanced settings menu
+    Selecting "Full access" in the agent picker's Advanced settings menu
     must (a) surface in the agent chip label as immediate feedback and
     (b) reach ``POST /v1/sessions`` as
-    ``terminal_launch_args: ["--approval-mode", "full-auto"]``.
+    ``terminal_launch_args: ["--sandbox", "danger-full-access",
+    "--ask-for-approval", "never"]``.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_approval_mode(base_url, session_id))
@@ -405,16 +460,16 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             # Codex auto-selects (only built-in), so the Advanced chip —
             # gated on the Codex-native agent — is present.
             await page.get_by_test_id("new-chat-landing-advanced-chip").click()
-            # All three Codex approval modes render as radio rows.
-            for mode in ("suggest", "auto-edit", "full-auto"):
+            # All three Codex approval presets render as radio rows.
+            for mode in ("default", "full-access", "read-only"):
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-approval-{mode}")
                 ).to_be_visible()
-            await page.get_by_test_id("new-chat-landing-approval-full-auto").click()
+            await page.get_by_test_id("new-chat-landing-approval-full-access").click()
 
             # The chip label reflects the non-default pick immediately.
             await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
-                "Full auto"
+                "Full access"
             )
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
@@ -425,7 +480,12 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             assert body["agent_id"] == "ag_codex_e2e", body
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
-            assert body.get("terminal_launch_args") == ["--approval-mode", "full-auto"], body
+            assert body.get("terminal_launch_args") == [
+                "--sandbox",
+                "danger-full-access",
+                "--ask-for-approval",
+                "never",
+            ], body
         finally:
             await browser.close()
 
@@ -606,6 +666,180 @@ async def _drive_pi_native_start(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_antigravity_native_picker_and_wrapper_labels(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Native Antigravity: the picker shows "Antigravity" and create carries terminal labels.
+
+    Covers the user-facing Antigravity native-agent flow this PR adds:
+
+    1. **Picker label/icon** — the agent chip renders the harness-derived display
+       label **"Antigravity"** (via ``nativeCodingAgents``), NOT the raw agent name
+       ``"antigravity-native-ui"`` the server sends.
+    2. **Session-creation wrapper labels** — selecting Antigravity and sending must
+       POST ``/v1/sessions`` with the terminal-first wrapper labels
+       (``omnigent.ui: terminal`` + ``omnigent.wrapper: antigravity-native-ui``)
+       that make the runner launch the agy TUI and the web UI render the
+       Chat/Terminal view.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_antigravity_native_start(base_url, session_id))
+
+
+async def _drive_antigravity_native_start(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_antigravity_native_agents_body(),
+            )
+
+            # Neutralize agent discovery so the picker shows ONLY the stubbed
+            # built-in Antigravity (sessions other tests left behind on the shared
+            # e2e_ui server would otherwise leak in and, ranking ahead, auto-select).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Antigravity auto-selects (sole agent). The chip shows the derived
+            # label "Antigravity" — and NOT "...native...": the raw agent name
+            # would surface "antigravity-native-ui" without the harness→display map.
+            agent_chip = page.get_by_test_id("new-chat-landing-agent-select")
+            await expect(agent_chip).to_contain_text("Antigravity")
+            await expect(agent_chip).not_to_contain_text("native")
+
+            await page.get_by_test_id("new-chat-landing-input").fill("explore the repo")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_antigravity_e2e", body
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/work/repo", body
+            # The terminal-first wrapper labels drive the runner-owned agy TUI and
+            # the web UI's Chat/Terminal view.
+            assert body.get("labels") == {
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "antigravity-native-ui",
+            }, body
+        finally:
+            await browser.close()
+
+
+def test_start_session_opencode_native_picker_and_wrapper_labels(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Native OpenCode: the picker shows "OpenCode" and create carries labels.
+
+    Covers the user-facing OpenCode native-agent flow this PR adds (mirrors
+    the Codex / Pi native rows):
+
+    1. **Picker label/icon** — the agent chip renders the harness-derived
+       display label **"OpenCode"** (via ``nativeCodingAgents``), NOT the raw
+       agent name ``"opencode-native-ui"`` the server sends.
+    2. **Session-creation wrapper labels** — selecting OpenCode and sending
+       must POST ``/v1/sessions`` with the terminal-first wrapper labels
+       (``omnigent.ui: terminal`` + ``omnigent.wrapper: opencode-native-ui``)
+       that make the runner launch the OpenCode TUI and the web UI render the
+       Chat/Terminal view.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_opencode_native_start(base_url, session_id))
+
+
+async def _drive_opencode_native_start(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_opencode_native_agents_body(),
+            )
+
+            # Neutralize agent discovery so the picker shows ONLY the stubbed
+            # built-in OpenCode. The landing picker merges `/v1/agents` with
+            # agents found by scanning the caller's sessions
+            # (`/v1/sessions?kind=any`); on the shared e2e_ui server, sessions
+            # other tests left behind (e.g. a claude-native fork) would
+            # otherwise leak in and — ranking ahead of OpenCode — auto-select,
+            # so the chip would read the wrong label. Registered after
+            # _register_common_routes so it wins for the kind=any scan; the
+            # bare POST /v1/sessions create still falls through to the
+            # capturing handler.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            # Seed a recent working directory so the working-directory chip
+            # auto-fills and Send can enable without touching the file browser.
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # OpenCode auto-selects (sole agent). The chip shows the derived
+            # label "OpenCode" — and crucially NOT "...native...": the raw
+            # agent name "opencode-native-ui" must never surface.
+            agent_chip = page.get_by_test_id("new-chat-landing-agent-select")
+            await expect(agent_chip).to_contain_text("OpenCode")
+            await expect(agent_chip).not_to_contain_text("native")
+
+            await page.get_by_test_id("new-chat-landing-input").fill("explore the repo")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_opencode_e2e", body
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/work/repo", body
+            # The terminal-first wrapper labels are the contract that drives the
+            # runner-owned OpenCode TUI and the web UI's Chat/Terminal view.
+            assert body.get("labels") == {
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "opencode-native-ui",
+            }, body
+        finally:
+            await browser.close()
+
+
 def test_start_session_select_folder(seeded_session: tuple[str, str]) -> None:
     """Browsing into a folder sets the new session's working directory.
 
@@ -707,6 +941,127 @@ async def _drive_folder_selection(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_create_folder(seeded_session: tuple[str, str]) -> None:
+    """Creating a folder in the picker makes it the session's workspace.
+
+    The user opens the file browser, navigates into a folder, clicks "New
+    folder", names it, and confirms. The picker POSTs
+    ``/v1/hosts/{id}/directories``, drops into the freshly created
+    directory, and the working-directory chip follows. On Send the new
+    folder's path must reach ``POST /v1/sessions`` as ``workspace`` — i.e.
+    the agent's working directory is the folder the user just made.
+
+    Like the other tests here, the tunneled runner registers no host, so
+    ``/v1/hosts/{id}/directories`` is faked: the handler captures the
+    requested path and echoes it back as the created absolute path (the
+    real ``os.makedirs`` never runs in this harness).
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_create_folder(base_url, session_id))
+
+
+async def _drive_create_folder(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            async def handle_filesystem(route: Route) -> None:
+                # Home shows "projects"; "/home/e2e/projects" shows its child;
+                # the freshly created "/home/e2e/projects/new-app" lists empty.
+                # Deepest match first so the new folder isn't shadowed.
+                path_part = route.request.url.split("?")[0]
+                if path_part.endswith("/filesystem/home/e2e/projects/new-app"):
+                    entries: list[dict[str, Any]] = []
+                elif path_part.endswith("/filesystem/home/e2e/projects"):
+                    entries = [
+                        {
+                            "name": "src",
+                            "path": "/home/e2e/projects/src",
+                            "type": "directory",
+                            "bytes": None,
+                            "modified_at": 0,
+                        }
+                    ]
+                else:
+                    entries = [
+                        {
+                            "name": "projects",
+                            "path": "/home/e2e/projects",
+                            "type": "directory",
+                            "bytes": None,
+                            "modified_at": 0,
+                        }
+                    ]
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"object": "list", "data": entries, "has_more": False}),
+                )
+
+            create_dir_bodies: list[dict[str, Any]] = []
+
+            async def handle_create_dir(route: Route) -> None:
+                # Mirror the server's success shape: echo the requested path
+                # back as the created absolute path. Capturing the body lets
+                # the test assert the picker sent the joined parent + name.
+                body = json.loads(route.request.post_data or "{}")
+                create_dir_bodies.append(body)
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"object": "directory", "path": body["path"]}),
+                )
+
+            # Registered after the broad globs so these win for their URLs.
+            await page.route(_FILESYSTEM_RE, handle_filesystem)
+            await page.route(re.compile(r"/v1/hosts/[^/]+/directories$"), handle_create_dir)
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "e2e"
+            )
+
+            # Open the picker and navigate into "projects" so the new folder
+            # has a resolved absolute parent to be created under.
+            await page.get_by_test_id("new-chat-landing-workspace-chip").click()
+            await expect(page.get_by_test_id("workspace-picker")).to_be_visible()
+            await page.get_by_test_id("workspace-picker-entry-projects").click()
+            await expect(page.get_by_test_id("workspace-picker-entry-src")).to_be_visible()
+
+            # Create a new folder under /home/e2e/projects.
+            await page.get_by_test_id("workspace-picker-new-folder").click()
+            await page.get_by_test_id("workspace-picker-new-folder-input").fill("new-app")
+            await page.get_by_test_id("workspace-picker-new-folder-create").click()
+
+            # The picker POSTs the joined path and drops into the new folder.
+            await _wait_until(lambda: len(create_dir_bodies) == 1)
+            assert create_dir_bodies[0]["path"] == "/home/e2e/projects/new-app", create_dir_bodies
+
+            # Filling the message closes the popover; the chip now shows the
+            # folder we just created.
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "new-app"
+            )
+
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/home/e2e/projects/new-app", body
+        finally:
+            await browser.close()
+
+
 def test_start_session_add_worktree(seeded_session: tuple[str, str]) -> None:
     """Naming a branch attaches a git worktree spec to the create call.
 
@@ -760,5 +1115,140 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
             assert body.get("git") == {"branch_name": "feature/login", "base_branch": "main"}, body
+        finally:
+            await browser.close()
+
+
+# Session-bound agents the discovery scan returns. Both clone names below root
+# to the built-in "claude-native-ui", so the picker must drop both; the fork of
+# a fork (two nested suffixes) is the case a single-layer strip missed.
+_SINGLE_FORK_NAME = "claude-native-ui (fork ag_aaa11111)"
+_FORK_OF_FORK_NAME = "claude-native-ui (fork ag_aaa11111) (fork ag_bbb22222)"
+
+
+def _fork_scan_body() -> str:
+    """Stub body for the ``GET /v1/sessions?kind=any`` agent-discovery scan.
+
+    Returns four session-bound agents that exercise every branch of the
+    picker's shadow-dropping: the built-in's own row (dropped by id), a single
+    fork and a fork-of-fork of the built-in (both dropped by rooted name), and
+    one genuinely custom agent (must survive).
+    """
+    return json.dumps(
+        {
+            "object": "list",
+            "data": [
+                # Binds the built-in's own agent row — dropped by id.
+                {
+                    "id": "conv_native",
+                    "agent_id": "ag_claude_e2e",
+                    "agent_name": "claude-native-ui",
+                },
+                # Single fork of the built-in — dropped by name (one layer).
+                {"id": "conv_f1", "agent_id": "ag_fork1", "agent_name": _SINGLE_FORK_NAME},
+                # Fork of a fork — the regression: dropped only if EVERY clone
+                # layer is stripped before the built-in-name check.
+                {"id": "conv_ff", "agent_id": "ag_forkfork", "agent_name": _FORK_OF_FORK_NAME},
+                # A genuinely custom agent — must SURVIVE and be offered.
+                {"id": "conv_doc", "agent_id": "ag_doc", "agent_name": "doc-writer"},
+            ],
+            "has_more": False,
+        }
+    )
+
+
+def test_start_session_picker_drops_fork_of_fork_shadows(
+    seeded_session: tuple[str, str],
+) -> None:
+    """The landing picker hides fork-of-fork clones of a built-in agent.
+
+    The picker (``useAvailableAgents``) merges the built-in list
+    (``GET /v1/agents``) with session-scoped agents discovered by scanning the
+    caller's sessions (``GET /v1/sessions?kind=any``), dropping any discovered
+    agent whose clone name roots back to a built-in. A fork of a fork nests two
+    clone suffixes — ``"claude-native-ui (fork …) (fork …)"`` — so a single-
+    layer strip leaves ``"claude-native-ui (fork …)"``, which is not a built-in
+    name, and the clone leaked into the picker as a SECOND "Claude Code" row.
+
+    This drives that regression end to end against the rendered picker: only
+    the real built-in Claude Code and a genuinely custom agent are offered;
+    both the single-fork and the fork-of-fork clones are dropped.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_fork_of_fork_dedup(base_url, session_id))
+
+
+async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+
+            async def handle_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_hosts_body()
+                )
+
+            async def handle_agents(route: Route) -> None:
+                # Sole built-in: claude-native-ui, display "Claude Code".
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_agents_body()
+                )
+
+            async def handle_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_fork_scan_body()
+                )
+
+            async def handle_enrich(route: Route) -> None:
+                # Only the surviving custom agent reaches the per-agent enrich
+                # fetch — the dropped shadows never get here.
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "id": "ag_doc",
+                            "object": "agent",
+                            "name": "doc-writer",
+                            "description": "Documentation specialist",
+                            "harness": "claude-sdk",
+                            "skills": [],
+                        }
+                    ),
+                )
+
+            await page.route("**/v1/hosts", handle_hosts)
+            await page.route("**/v1/agents", handle_agents)
+            # kind=any returns the fork + custom session-bound agents; the bare
+            # conversation-list GET still falls through to the real server.
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_scan)
+            # Per-agent enrich fetch for whichever agent survives the dedup.
+            await page.route(re.compile(r"/v1/sessions/[^/]+/agent$"), handle_enrich)
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Open the agent picker dropdown.
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+
+            # The real built-in Claude Code is offered...
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e")
+            ).to_be_visible(timeout=30_000)
+            # ...the genuinely custom agent survives...
+            await expect(page.get_by_test_id("new-chat-landing-agent-ag_doc")).to_be_visible()
+            # ...and BOTH fork clones of the built-in are dropped. Pre-fix the
+            # fork-of-fork (ag_forkfork) rendered as a duplicate "Claude Code".
+            await expect(page.get_by_test_id("new-chat-landing-agent-ag_fork1")).to_have_count(0)
+            await expect(page.get_by_test_id("new-chat-landing-agent-ag_forkfork")).to_have_count(
+                0
+            )
+            # Three options total: the built-in + the one custom agent +
+            # the "Create custom agent" action — no duplicate "Claude Code"
+            # sneaks in via a leaked clone.
+            await expect(page.get_by_role("menuitem")).to_have_count(3)
         finally:
             await browser.close()

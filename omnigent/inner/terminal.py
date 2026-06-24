@@ -94,6 +94,7 @@ def _tmux_managed_option_commands(
     scrollback: int,
     *,
     allow_passthrough: bool = False,
+    keep_alive_after_exit: bool = False,
 ) -> list[list[str]]:
     """
     Build tmux commands for Omnigent-managed global options.
@@ -101,6 +102,11 @@ def _tmux_managed_option_commands(
     :param scrollback: Tmux history limit, e.g. ``10000``.
     :param allow_passthrough: Whether to allow pane programs to send
         passthrough escape sequences to the real attached terminal.
+    :param keep_alive_after_exit: When ``True``, keep the private tmux server
+        alive after the pane's process exits (see
+        :func:`_tmux_session_persistence_commands`). Opt-in because it changes
+        the ``has-session``-means-alive contract that liveness probes rely on;
+        callers that enable it must use pane-dead-aware liveness checks.
     :returns: List of tmux commands to run before ``new-session``.
     """
     commands = [
@@ -108,9 +114,46 @@ def _tmux_managed_option_commands(
         *_tmux_lockdown_commands(),
         *_tmux_status_option_commands(),
     ]
+    if keep_alive_after_exit:
+        commands.extend(_tmux_session_persistence_commands())
     if allow_passthrough:
         commands.append(["set-option", "-g", "allow-passthrough", "on"])
     return commands
+
+
+def _tmux_session_persistence_commands() -> list[list[str]]:
+    """Keep the private tmux server alive when the pane's process exits.
+
+    Each managed terminal runs exactly ONE inner CLI (claude / codex / cursor /
+    pi / a shell) in a private, single-pane tmux server. Under tmux's defaults
+    (``exit-empty on`` + ``remain-on-exit off``) the instant that CLI exits —
+    a crash, ``/exit``, or an environment-specific early exit (issue #540: a
+    claude-native sub-agent on WSL2 that renders its prompt then exits) — the
+    pane closes, the lone session is destroyed, and the server exits on its
+    private socket. Every later control command (send-keys, model / effort
+    change, interrupt, stop) then fails with ``no server running`` and the CLI's
+    final output is gone, so a single child-process exit becomes an
+    unrecoverable, undiagnosable cascade and delegated messages are silently
+    lost.
+
+    ``remain-on-exit on`` keeps the dead pane — and therefore the session and
+    server — present after the inner process exits, so the socket stays usable
+    and the pane's last output stays capturable for diagnostics. The idle
+    watcher then reports the exit deterministically by detecting the dead pane
+    (see :meth:`TerminalInstance._pane_is_dead`) instead of racing the server's
+    disappearance. ``exit-empty off`` is belt-and-suspenders for the case where
+    the session is removed without the server being explicitly killed. Both use
+    ``-q`` so a tmux too old to know the option does not fail launch;
+    :meth:`TerminalInstance.close` still tears the server down unconditionally
+    via ``kill-server``, so nothing leaks.
+
+    :returns: Tmux option commands that keep the server alive past inner-CLI
+        exit.
+    """
+    return [
+        ["set-option", "-gq", "remain-on-exit", "on"],
+        ["set-option", "-sq", "exit-empty", "off"],
+    ]
 
 
 def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
@@ -721,7 +764,15 @@ class TerminalInstance:
     scrollback: int = 10000
     tmux_allow_passthrough: bool = False
     tmux_start_on_attach: bool = False
+    # Keep the private tmux server alive after the pane's inner process exits
+    # (``remain-on-exit`` / ``exit-empty off``). Opt-in per terminal because it
+    # changes the ``has-session``-means-alive contract: with it on, liveness is
+    # decided by ``#{pane_dead}`` (see :meth:`is_alive`), not session existence.
+    # Enabled for the claude-native agent terminal so a single inner-CLI exit no
+    # longer reaps the server and cascades into ``no server running`` (#540).
+    keep_alive_after_exit: bool = False
     running: bool = False
+    launch_cwd: str | None = None
     # Owned per-launch egress proxy. ``None`` when the sandbox
     # carries no ``egress_rules`` or the backend doesn't need a
     # spawn-time wrap (the ``none`` backend does nothing here). Cleaned
@@ -745,6 +796,7 @@ class TerminalInstance:
     # so a client attaching, detaching, focusing, clicking, or typing does
     # not read as agent activity. ``-inf`` until the first interaction.
     _last_client_interaction_at: float = field(default=float("-inf"), repr=False)
+    _last_pane_snapshot: str | None = field(default=None, repr=False)
 
     @property
     def tmux_target(self) -> str:
@@ -771,6 +823,23 @@ class TerminalInstance:
         :returns: None.
         """
         self._last_client_interaction_at = time.monotonic()
+
+    def last_pane_text(self) -> str | None:
+        """Return the last visible pane text captured for diagnostics.
+
+        The value is updated opportunistically by reads and watcher polls.
+        It is intentionally a snapshot, not a live tmux query, so callers can
+        still retrieve useful context after tmux has already disappeared.
+        """
+        snapshot = self._last_pane_snapshot
+        if snapshot is None:
+            return None
+        text = _strip_ansi(snapshot).strip()
+        return text or None
+
+    def _remember_pane_snapshot(self, snapshot: str) -> None:
+        """Store a pane capture for later exit diagnostics."""
+        self._last_pane_snapshot = snapshot
 
     def _tmux_base_cmd(self) -> list[str]:
         """
@@ -872,6 +941,7 @@ class TerminalInstance:
             *_tmux_managed_option_commands(
                 self.scrollback,
                 allow_passthrough=self.tmux_allow_passthrough,
+                keep_alive_after_exit=self.keep_alive_after_exit,
             ),
             [
                 "set-option",
@@ -928,6 +998,7 @@ class TerminalInstance:
             )
 
         self.running = True
+        self.launch_cwd = effective_cwd
 
     async def send(
         self,
@@ -999,6 +1070,7 @@ class TerminalInstance:
                 )
             }
 
+        self._remember_pane_snapshot(result)
         return {
             "terminal": f"{self.name}:{self.session_key}",
             "screen": _strip_ansi(result),
@@ -1110,6 +1182,8 @@ class TerminalInstance:
     def start_idle_watcher(
         self,
         on_idle: Callable[[], None | Awaitable[None]],
+        *,
+        on_exit: Callable[[], None | Awaitable[None]] | None = None,
     ) -> None:
         """Start a background task that fires ``on_idle`` each time the pane
         becomes quiet (no change for ``_IDLE_THRESHOLD_SECONDS``).
@@ -1122,7 +1196,7 @@ class TerminalInstance:
             raise RuntimeError("Cannot start idle watcher before launch")
         if self._idle_task is not None and not self._idle_task.done():
             return
-        self._idle_task = asyncio.create_task(self._idle_watch_loop(on_idle))
+        self._idle_task = asyncio.create_task(self._idle_watch_loop(on_idle, on_exit=on_exit))
 
     async def _stop_idle_watcher(self) -> None:
         task = self._idle_task
@@ -1138,6 +1212,8 @@ class TerminalInstance:
     async def _idle_watch_loop(
         self,
         on_idle: Callable[[], None | Awaitable[None]],
+        *,
+        on_exit: Callable[[], None | Awaitable[None]] | None = None,
     ) -> None:
         """
         Asyncio polling loop driving an :class:`_IdleDetector`.
@@ -1148,15 +1224,16 @@ class TerminalInstance:
         """
         detector = _IdleDetector()
 
-        async def _fire() -> bool:
-            """Invoke on_idle. Returns False if the callback raised (watcher should exit)."""
+        async def _fire(callback: Callable[[], None | Awaitable[None]], kind: str) -> bool:
+            """Invoke a callback. Returns False if it raised and the watcher should exit."""
             try:
-                result = on_idle()
+                result = callback()
                 if asyncio.iscoroutine(result):
                     await result
             except Exception:
                 logger.exception(
-                    "idle-notification callback failed for terminal %s:%s",
+                    "%s-notification callback failed for terminal %s:%s",
+                    kind,
                     self.name,
                     self.session_key,
                 )
@@ -1176,10 +1253,22 @@ class TerminalInstance:
                     "-e",
                 )
             except RuntimeError:
-                # tmux server likely gone; stop watching quietly.
+                # tmux server likely gone.
+                self.running = False
+                if on_exit is not None:
+                    await _fire(on_exit, "exit")
                 return
 
-            if detector.tick(snapshot) and not await _fire():
+            self._remember_pane_snapshot(snapshot)
+            if await self._pane_is_dead_async():
+                # remain-on-exit kept the server alive after the inner CLI
+                # exited; report the exit rather than treating the frozen pane
+                # as an idle agent.
+                self.running = False
+                if on_exit is not None:
+                    await _fire(on_exit, "exit")
+                return
+            if detector.tick(snapshot) and not await _fire(on_idle, "idle"):
                 return
 
     def start_idle_watcher_thread(
@@ -1187,8 +1276,10 @@ class TerminalInstance:
         on_idle: Callable[[], None] | None = None,
         *,
         on_activity: Callable[[], None] | None = None,
+        on_exit: Callable[[], None] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        replace: bool = False,
     ) -> None:
         """
         Start a daemon thread driving idle/activity edges from the pane.
@@ -1208,10 +1299,11 @@ class TerminalInstance:
         fires on every poll tick where the pane content changed — so at
         most once per *poll_interval_s*, which for the fast claude-native
         watcher (200ms) is up to ~5/sec while a pane redraws continuously.
+        ``on_exit`` fires once when the tmux session disappears unexpectedly.
         Any further rate-limiting of activity (e.g. the runner's
         one-pulse-per-second ``session.terminal.activity`` throttle) is
         the caller's responsibility, not this watcher's. At least one
-        callback should be provided; passing both is fine.
+        callback should be provided; passing several is fine.
 
         :param on_idle: Optional sync callback invoked once per idle
             edge, or ``None`` to skip idle detection. Must not block the
@@ -1220,6 +1312,9 @@ class TerminalInstance:
         :param on_activity: Optional sync callback invoked on each tick
             the pane changed (the runner-determined "PTY had output"
             signal). Same non-blocking contract as *on_idle*.
+        :param on_exit: Optional sync callback invoked when the watcher
+            observes that tmux has disappeared. Same non-blocking contract
+            as *on_idle*.
         :param idle_threshold_s: Per-watcher diff-track idle threshold in
             seconds passed to :class:`_IdleDetector`, e.g. ``1.0`` for the
             claude-native status watcher. ``None`` uses the module
@@ -1228,19 +1323,23 @@ class TerminalInstance:
             ``0.2`` for the claude-native status watcher (snappier
             running/idle transitions). ``None`` uses the module default
             :data:`_IDLE_POLL_INTERVAL_SECONDS`.
+        :param replace: When ``True``, replace any existing threaded watcher
+            so callbacks can be rebound after terminal ownership transfer.
         :raises RuntimeError: When the instance is not currently
             running (caller forgot to ``await launch`` first).
         """
         if not self.running:
             raise RuntimeError("Cannot start idle watcher before launch")
-        if on_idle is None and on_activity is None:
+        if on_idle is None and on_activity is None and on_exit is None:
             raise ValueError(
                 "start_idle_watcher_thread requires at least one of "
-                "on_idle / on_activity — a watcher with neither would poll "
+                "on_idle / on_activity / on_exit — a watcher with none would poll "
                 "tmux forever with no effect."
             )
         if self._idle_thread is not None and self._idle_thread.is_alive():
-            return
+            if not replace:
+                return
+            self._stop_idle_watcher_thread()
         stop_event = threading.Event()
         self._idle_stop_event = stop_event
         self._idle_thread = threading.Thread(
@@ -1249,6 +1348,7 @@ class TerminalInstance:
             kwargs={
                 "on_idle": on_idle,
                 "on_activity": on_activity,
+                "on_exit": on_exit,
                 "idle_threshold_s": idle_threshold_s,
                 "poll_interval_s": poll_interval_s,
             },
@@ -1263,6 +1363,7 @@ class TerminalInstance:
         *,
         on_idle: Callable[[], None] | None = None,
         on_activity: Callable[[], None] | None = None,
+        on_exit: Callable[[], None] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
     ) -> None:
@@ -1283,6 +1384,8 @@ class TerminalInstance:
             :meth:`start_idle_watcher_thread`); skipped when ``None``.
         :param on_activity: Optional pane-changed callback; fired each
             tick the pane content changed. Skipped when ``None``.
+        :param on_exit: Optional callback fired when tmux disappears.
+            Skipped when ``None``.
         :param idle_threshold_s: Per-watcher diff-track idle threshold in
             seconds forwarded to :class:`_IdleDetector`, e.g. ``1.0``.
             ``None`` uses the module default.
@@ -1302,6 +1405,20 @@ class TerminalInstance:
                 return
             snapshot = self._capture_pane_for_idle_or_none()
             if snapshot is None:
+                self.running = False
+                if on_exit is not None:
+                    self._fire_watch_callback(on_exit, "exit")
+                return
+            self._remember_pane_snapshot(snapshot)
+            if self._pane_is_dead():
+                # The inner CLI exited but remain-on-exit kept the server, so
+                # capture-pane still succeeds (the snapshot above is the final
+                # frame, now remembered for diagnostics). Report the exit
+                # deterministically instead of mistaking the frozen pane for an
+                # idle agent and leaving the session hung.
+                self.running = False
+                if on_exit is not None:
+                    self._fire_watch_callback(on_exit, "exit")
                 return
             # A pane change that lands within the recent-interaction window
             # is a client-driven repaint (attach/detach reflow, focus,
@@ -1340,6 +1457,30 @@ class TerminalInstance:
             return self._tmux_output_sync("capture-pane", "-t", self.tmux_target, "-p", "-e")
         except RuntimeError:
             return None
+
+    def _pane_is_dead(self) -> bool:
+        """
+        Report whether the pane's process exited while tmux kept the pane.
+
+        With ``remain-on-exit on`` (see
+        :func:`_tmux_session_persistence_commands`) the private server survives
+        the inner CLI's exit, so a *dead pane* — not a vanished server — is how
+        a normal or early exit now presents. The threaded idle watcher uses this
+        to report the exit deterministically once ``capture-pane`` still
+        succeeds against the surviving server.
+
+        :returns: ``True`` when tmux reports ``#{pane_dead}`` as ``1``.
+            ``False`` when the pane is live, or when the probe itself fails
+            (server already gone) — the caller's capture step already handles
+            the vanished-server path.
+        """
+        try:
+            out = self._tmux_output_sync(
+                "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead}"
+            )
+        except RuntimeError:
+            return False
+        return "1" in out.split()
 
     def _fire_watch_callback(self, callback: Callable[[], None], kind: str) -> bool:
         """
@@ -1391,36 +1532,65 @@ class TerminalInstance:
 
     async def is_alive(self) -> bool:
         """
-        Check if the tmux session is still running.
+        Check if the terminal's inner process is still running.
 
-        When tmux reports the session gone, or the probe cannot start,
-        this method marks ``self.running`` false. That side effect is
-        intentional: subsequent pollers use the in-memory flag as a
-        fast path instead of forking ``tmux has-session`` repeatedly
-        after the server has exited.
+        Probes the pane's ``#{pane_dead}`` flag rather than mere session
+        existence: with ``remain-on-exit on`` (see
+        :func:`_tmux_session_persistence_commands`) the session and server
+        deliberately outlive the inner CLI's exit, so a live session no longer
+        implies a live process. The terminal is alive only when the session
+        exists AND its pane process has not exited.
 
-        :returns: ``True`` when ``tmux has-session`` confirms the
-            session is alive; otherwise ``False``.
+        When the session is gone (probe exits non-zero), the pane is dead, or
+        the probe cannot start, this marks ``self.running`` false. That side
+        effect is intentional: subsequent pollers use the in-memory flag as a
+        fast path instead of re-forking tmux after the process has exited.
+
+        :returns: ``True`` when the session exists and its pane process is
+            still running; otherwise ``False``.
         """
         if not self.running:
             return False
         try:
             proc = await asyncio.create_subprocess_exec(
                 *self._tmux_base_cmd(),
-                "has-session",
+                "list-panes",
                 "-t",
                 self.tmux_target,
-                stdout=asyncio.subprocess.DEVNULL,
+                "-F",
+                "#{pane_dead}",
+                stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await proc.communicate()
-            if proc.returncode != 0:
+            stdout, _ = await proc.communicate()
+            # rc != 0 → session/server gone; a "1" line → the pane process
+            # exited but the session was kept alive by remain-on-exit. Both mean
+            # not-alive. (``list-panes`` errors on an unknown target, unlike
+            # ``display-message``, which silently falls back to another pane.)
+            panes = stdout.decode().split()
+            if proc.returncode != 0 or not panes or "1" in panes:
                 self.running = False
                 return False
             return True
         except OSError:
             self.running = False
             return False
+
+    async def _pane_is_dead_async(self) -> bool:
+        """
+        Async sibling of :meth:`_pane_is_dead` for the asyncio idle watcher.
+
+        :returns: ``True`` when tmux reports ``#{pane_dead}`` as ``1``;
+            ``False`` when the pane is live or the probe fails (server gone,
+            which the caller's capture step handles).
+        """
+        try:
+            out = await self._tmux_output(
+                "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead}"
+            )
+        except RuntimeError:
+            return False
+        return "1" in out.split()
 
     async def _tmux(self, *args: str) -> None:
         """Run a tmux command against this instance's server."""
@@ -1625,6 +1795,7 @@ def create_terminal_instance(
         scrollback=spec.scrollback,
         tmux_allow_passthrough=spec.tmux_allow_passthrough,
         tmux_start_on_attach=spec.tmux_start_on_attach,
+        keep_alive_after_exit=spec.keep_alive_after_exit,
     )
 
     return TerminalCreateResult(instance=instance, cwd=cwd)

@@ -19,6 +19,19 @@ export interface ConversationRef {
 }
 
 /**
+ * Scope of a claude-native "don't ask again" persistent allow rule,
+ * stamped by the PermissionRequest endpoint for non-edit eligible
+ * tools. ``tool`` is the gated tool; ``host`` is the WebFetch request
+ * domain when present (a domain-scoped rule), absent for a tool-wide
+ * rule. Shared by the elicitation event (`events.ts`), the reduced
+ * block (`blocks.ts`), and the ApprovalCard that renders the button.
+ */
+export interface RememberScope {
+  tool: string;
+  host?: string;
+}
+
+/**
  * An un-consumed web-composer user message replayed from the session
  * snapshot. Native-terminal sessions don't persist a web message at
  * POST time (the transcript forwarder is the single writer), so the
@@ -235,6 +248,13 @@ export interface Session {
    * older recorded fixtures may omit it (treated as `null`).
    */
   hostId?: string | null;
+  /**
+   * Whether this session's host is a dormant resumable managed host the
+   * server can wake on the next message. Carried on the snapshot so the open
+   * view shows a wakeable "asleep" state instead of the terminal host_offline
+   * dead-end. `false`/absent otherwise.
+   */
+  hostResumable?: boolean;
   status: SessionStatus;
   createdAt: number;
   /**
@@ -383,6 +403,13 @@ export interface Session {
    */
   skills?: SkillSummary[];
   /**
+   * Codex app-server model options for codex-native sessions. Each option
+   * comes from Codex ``model/list`` and carries the model-specific reasoning
+   * efforts the picker should offer. Empty for non-codex-native sessions or
+   * while the runner has not answered yet.
+   */
+  codexModelOptions?: CodexModelOption[];
+  /**
    * True while the runner is auto-creating the terminal for a
    * terminal-first session (claude-native / codex-native). Sourced
    * from the server's `_session_terminal_pending_cache` at snapshot
@@ -440,4 +467,33 @@ export interface SkillSummary {
   name: string;
   /** One-line summary from the SKILL.md frontmatter. */
   description: string;
+}
+
+/**
+ * One raw Codex model option from app-server ``model/list``.
+ */
+export interface CodexReasoningEffortOption {
+  /** Codex effort id, e.g. ``"xhigh"``. */
+  reasoningEffort: string;
+  /** Codex-provided description, when present. */
+  description?: string;
+  /** Additional Codex metadata. */
+  [key: string]: unknown;
+}
+
+export interface CodexModelOption {
+  /** Codex picker id to pass back to ``thread/settings/update``. */
+  id: string;
+  /** Provider-facing model id Codex will run. */
+  model?: string;
+  /** Codex display label. */
+  displayName?: string;
+  /** Default reasoning effort for this model. */
+  defaultReasoningEffort?: string;
+  /** Raw effort objects Codex advertises for this model. */
+  supportedReasoningEfforts?: CodexReasoningEffortOption[];
+  /** Whether Codex marks this as the default model. */
+  isDefault?: boolean;
+  /** Additional Codex metadata. */
+  [key: string]: unknown;
 }

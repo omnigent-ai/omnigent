@@ -1,0 +1,156 @@
+name: Polly Review Approval Dispatch
+
+# Stage 2 (privileged) of the "run Polly when a maintainer approves a fork PR"
+# relay. Triggered by the completion of "Polly Review On Approval", it runs from
+# the base repo on `workflow_run`, so it gets a writable token (actions: write)
+# even for fork PRs and isn't held behind the fork-approval gate.
+#
+# It reads the recorded PR number, then re-derives the trust decision from
+# TRUSTED sources only -- the PR object and reviews from the API, and the
+# maintainer list from MAINTAINER@main (never the PR head, never the artifact's
+# word on identity). If the PR is from a fork AND a maintainer's latest decisive
+# review is APPROVED, it dispatches polly-review.yml (its existing
+# workflow_dispatch entry point) for that PR.
+#
+# Maintainer approval is the trust gate that authorizes spending the LLM gateway
+# secret on fork code. Polly itself never runs PR code: it reviews the diff
+# fetched via the API from a default-branch checkout.
+#
+# This workflow checks out NO code and runs NO PR code -- it only reads API data
+# and dispatches a workflow, so it is not a "dangerous" workflow_run consumer.
+
+on:
+  workflow_run:
+    workflows: [Polly Review On Approval]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: polly-review-approval-dispatch-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read   # pulls.get + pulls.listReviews (validation)
+      actions: write        # dispatch polly-review.yml
+    steps:
+      - name: Download recorded PR number
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const arts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner, repo, run_id: context.payload.workflow_run.id,
+            });
+            const art = arts.data.artifacts.find(a => a.name === 'polly-approval-pr-number');
+            if (!art) {
+              core.info('No PR-number artifact on the triggering run; nothing to do.');
+              return;
+            }
+            const dl = await github.rest.actions.downloadArtifact({
+              owner, repo, artifact_id: art.id, archive_format: 'zip',
+            });
+            fs.writeFileSync(`${process.env.GITHUB_WORKSPACE}/pr_number.zip`, Buffer.from(dl.data));
+      - name: Unzip recorded PR number
+        run: |
+          if [ -f pr_number.zip ]; then
+            # Fail loudly on a corrupt archive -- don't mask it.
+            unzip -o pr_number.zip
+          else
+            # No artifact is the EXPECTED case when stage 1's record job was
+            # skipped (e.g. a same-repo PR approval, which still completes the
+            # stage-1 workflow). The next step no-ops cleanly on the missing file.
+            echo "No pr_number.zip from the triggering run; nothing to do."
+          fi
+      - name: Validate (fork + maintainer approval) and dispatch Polly
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+
+            if (!fs.existsSync('pr_number')) {
+              core.info('No pr_number file; nothing to do.');
+              return;
+            }
+            const pull_number = Number(fs.readFileSync('pr_number', 'utf8').trim());
+            if (!Number.isInteger(pull_number) || pull_number <= 0) {
+              core.warning('Recorded PR number is not a positive integer; aborting.');
+              return;
+            }
+
+            // Re-fetch the PR from the API -- never trust the artifact for identity.
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number });
+
+            // Ignore belated review events (network delay / GitHub retry) on a PR
+            // that is no longer open -- don't spend a gateway run on a merged/closed PR.
+            if (pr.state !== 'open') {
+              core.info(`PR #${pull_number} is ${pr.state}, not open; skipping.`);
+              return;
+            }
+
+            // Fork only: same-repo PRs already get Polly on open.
+            if (!pr.head.repo || pr.head.repo.full_name === `${owner}/${repo}`) {
+              core.info(`PR #${pull_number} is not from a fork; skipping (same-repo PRs get Polly on open).`);
+              return;
+            }
+
+            // Load maintainers from MAINTAINER@main (trusted; never the PR head,
+            // so a PR can't grant itself approval power by editing the file).
+            const maintainers = new Set();
+            try {
+              const { data: f } = await github.rest.repos.getContent({
+                owner, repo, path: '.github/MAINTAINER', ref: 'main',
+              });
+              const text = Buffer.from(f.content, 'base64').toString('utf8');
+              for (const line of text.split('\n')) {
+                const u = line.replace(/#.*$/, '').trim().toLowerCase();
+                if (u) maintainers.add(u);
+              }
+            } catch (e) {
+              core.warning('Could not read .github/MAINTAINER@main; aborting.');
+              return;
+            }
+            if (maintainers.size === 0) {
+              core.warning('No maintainers configured on main; aborting.');
+              return;
+            }
+
+            // Is a maintainer's latest DECISIVE (non-COMMENTED) review an APPROVAL?
+            // Keep each reviewer's latest decisive review by submitted_at, so a
+            // later DISMISSED / CHANGES_REQUESTED supersedes an earlier APPROVAL --
+            // a dismissed maintainer approval correctly does NOT count below.
+            const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number });
+            const latestByUser = new Map();
+            for (const r of reviews) {
+              if (r.state === 'COMMENTED') continue;        // non-decisive
+              const login = ((r.user && r.user.login) || '').toLowerCase();
+              if (!login) continue;
+              const prev = latestByUser.get(login);
+              if (!prev || new Date(r.submitted_at) >= new Date(prev.submitted_at)) {
+                latestByUser.set(login, r);
+              }
+            }
+            const approvedByMaintainer = [...latestByUser.entries()].some(
+              ([login, r]) => r.state === 'APPROVED' && maintainers.has(login)
+            );
+            if (!approvedByMaintainer) {
+              core.info(`No maintainer approval on PR #${pull_number}; not dispatching Polly.`);
+              return;
+            }
+
+            core.info(`Maintainer-approved fork PR #${pull_number}; dispatching Polly review.`);
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo,
+              workflow_id: 'polly-review.yml',
+              ref: 'main',
+              inputs: { pr: String(pull_number) },
+            });

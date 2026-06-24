@@ -31,6 +31,7 @@ Environment (Databricks):
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hmac
 import json
@@ -47,8 +48,10 @@ from dataclasses import dataclass, field
 from typing import Any, TypeAlias
 from urllib.parse import urlparse as _urlparse
 
+from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
+from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_subprocess_transport
@@ -122,6 +125,37 @@ JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dic
 # ---------------------------------------------------------------------------
 # TCP tool server — serves Omnigent tools to the Pi extension
 # ---------------------------------------------------------------------------
+
+
+def _safe_dumps(response: dict[str, Any], req_id: str | None) -> str:  # type: ignore[explicit-any]
+    """Serialize a tool-server response, never raising on bad payloads.
+
+    Tool callbacks may return values ``json.dumps`` can't encode (a
+    ``datetime``, ``set``, ``bytes``, custom object, ...). Encoding happens
+    on the response path *outside* :meth:`_ToolServer._execute`'s try, so an
+    unguarded ``json.dumps`` would propagate and the connection would close
+    with zero bytes written — leaving the JS ``callTool`` promise pending and
+    hanging the entire Pi turn. Mirrors codex's ``_result_text`` guard: on a
+    serialization failure, fall back to an ``{"error": ...}`` envelope so the
+    client always receives a valid frame.
+
+    :param response: The response dict to serialize.
+    :param req_id: The originating request id, echoed back on the error
+        envelope so the client correlates the failure with its call.
+    :returns: A compact JSON string (no trailing newline).
+    """
+    try:
+        return json.dumps(response, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        # Stringify ``req_id`` so the fallback envelope itself can never raise
+        # on a non-serializable id (the caller passes a ``str`` today, but the
+        # guard must hold for any future caller). ``None`` stays ``None`` so the
+        # client still sees a null id rather than the literal "None".
+        safe_id: str | None = req_id if req_id is None or isinstance(req_id, str) else str(req_id)
+        return json.dumps(
+            {"id": safe_id, "error": f"unserializable tool result: {exc}"},
+            separators=(",", ":"),
+        )
 
 
 class _ToolServer:
@@ -213,7 +247,14 @@ class _ToolServer:
                 else:
                     response = await self._execute(raw_tool_name, tool_args)
                     response["id"] = raw_req_id
-                out = json.dumps(response, separators=(",", ":")) + "\n"
+                # Serialize defensively: a tool result may carry a value
+                # ``json.dumps`` can't encode (e.g. ``datetime``/``set``).
+                # If it raises here — outside ``_execute``'s try — the frame
+                # is never written and the JS ``callTool`` promise hangs the
+                # whole turn (no ``data``/``error`` event). Always emit a JSON
+                # frame: a serializable error envelope when the response can't
+                # be encoded, mirroring codex's ``_result_text`` guard.
+                out = _safe_dumps(response, raw_req_id) + "\n"
                 writer.write(out.encode("utf-8"))
                 await writer.drain()
         except (asyncio.CancelledError, ConnectionError):
@@ -371,7 +412,17 @@ const TOKEN = {token_json};
 
 /** Send a tool call request over TCP and return the result. */
 function callTool(toolName, args) {{
-  return new Promise((resolve, reject) => {{
+  return new Promise((resolve) => {{
+    // Idempotent settle: a tool call must resolve exactly once. Route every
+    // resolve through finish() so a late "close" after a real "data" response
+    // can't clobber the result, and a bare close with no data still resolves
+    // (rather than hanging Pi's agent loop forever).
+    let settled = false;
+    const finish = (v) => {{ if (!settled) {{ settled = true; resolve(v); }} }};
+    const errorResult = (text) => ({{
+      content: [{{ type: "text", text: JSON.stringify({{ error: text }}) }}],
+      isError: true
+    }});
     const client = net.createConnection({{ port: PORT, host: "127.0.0.1" }}, () => {{
       const id = Math.random().toString(36).slice(2);
       const req = JSON.stringify({{ id, token: TOKEN, tool: toolName, args }}) + "\\n";
@@ -384,39 +435,33 @@ function callTool(toolName, args) {{
             const resp = JSON.parse(buf.slice(0, nl));
             client.end();
             if (resp.error) {{
-              resolve({{
-                content: [{{ type: "text", text: JSON.stringify({{ error: resp.error }}) }}],
-                isError: true
-              }});
+              finish(errorResult(resp.error));
             }} else {{
               const text = typeof resp.result === "string"
                 ? resp.result
                 : JSON.stringify(resp.result);
               const isError = resp.result && (resp.result.error || resp.result.blocked);
-              resolve({{ content: [{{ type: "text", text }}], isError: !!isError }});
+              finish({{ content: [{{ type: "text", text }}], isError: !!isError }});
             }}
           }} catch (e) {{
             client.end();
-            resolve({{
-              content: [{{ type: "text", text: JSON.stringify({{ error: e.message }}) }}],
-              isError: true
-            }});
+            finish(errorResult(e.message));
           }}
         }}
       }});
       client.on("error", (err) => {{
-        resolve({{
-          content: [{{ type: "text", text: JSON.stringify({{ error: err.message }}) }}],
-          isError: true
-        }});
+        finish(errorResult(err.message));
+      }});
+      // A clean FIN with no bytes (e.g. the server failed to serialize the
+      // result and closed) emits neither "data" nor "error"; without this
+      // the promise would hang forever. finish() is a no-op if already settled.
+      client.on("close", () => {{
+        finish(errorResult("tool server closed connection without a response"));
       }});
       client.write(req);
     }});
     client.on("error", (err) => {{
-      resolve({{
-        content: [{{ type: "text", text: JSON.stringify({{ error: err.message }}) }}],
-        isError: true
-      }});
+      finish(errorResult(err.message));
     }});
   }});
 }}
@@ -509,14 +554,44 @@ def _find_pi_cli() -> str | None:
 # override these provider URLs; the host-derived defaults remain for legacy
 # profile-only usage.
 
+# Each static entry declares ``input: ["text", "image"]`` for the same reason
+# the dynamic-registration path does (see _build_models_json): Pi's
+# transformMessages strips image blocks unless the model entry advertises
+# image input. These are all vision-capable models, and the run model is often
+# a static id — in which case _build_models_json's append is skipped, so the
+# capability has to be declared here too or attached images are silently
+# dropped (#515/#516).
 _DATABRICKS_RESPONSES_MODELS = [
     {
         "id": "databricks-gpt-5-4-mini",
         "name": "GPT-5.4 Mini",
         "contextWindow": 1047576,
         "maxTokens": 32768,
+        "input": ["text", "image"],
     },
-    {"id": "databricks-gpt-5-4", "name": "GPT-5.4", "contextWindow": 1047576, "maxTokens": 32768},
+    {
+        "id": "databricks-gpt-5-4",
+        "name": "GPT-5.4",
+        "contextWindow": 1047576,
+        "maxTokens": 32768,
+        "input": ["text", "image"],
+    },
+    {
+        "id": "databricks-gpt-5-5",
+        "name": "GPT-5.5",
+        # OSS profile endpoint metadata: 400K total context, 128K max output.
+        "contextWindow": 400000,
+        "maxTokens": 128000,
+        "input": ["text", "image"],
+    },
+    {
+        "id": "databricks-gpt-5-5-pro",
+        "name": "GPT-5.5 Pro",
+        # OSS profile endpoint metadata: 400K total context, 128K max output.
+        "contextWindow": 400000,
+        "maxTokens": 128000,
+        "input": ["text", "image"],
+    },
 ]
 
 _DATABRICKS_ANTHROPIC_MODELS = [
@@ -526,12 +601,14 @@ _DATABRICKS_ANTHROPIC_MODELS = [
         # Gateway-verified caps: >1000000 input rejects, 128001+ output rejects.
         "contextWindow": 1000000,
         "maxTokens": 128000,
+        "input": ["text", "image"],
     },
     {
         "id": "databricks-claude-sonnet-4-6",
         "name": "Claude Sonnet 4.6",
         "contextWindow": 1000000,
         "maxTokens": 128000,
+        "input": ["text", "image"],
     },
     {
         "id": "databricks-claude-sonnet-4-5",
@@ -539,6 +616,7 @@ _DATABRICKS_ANTHROPIC_MODELS = [
         # Gateway rejects this model past ~200k input.
         "contextWindow": 200000,
         "maxTokens": 16384,
+        "input": ["text", "image"],
     },
 ]
 
@@ -578,9 +656,51 @@ _PI_ENV_ALLOW_EXACT: frozenset[str] = frozenset(
         "LOGNAME",
         "SHELL",
         "TZ",
+        OMNIGENT_SESSION_ENV_VAR,  # "inside Omnigent" marker (CLAUDE_CODE/CODEX analog)
     }
 )
 _STREAM_READ_CHUNK_SIZE = 65536
+
+# CLI flags whose values are sensitive (e.g. the full system prompt) and must
+# not be written to logs verbatim. The value following these flags is replaced
+# with a length-only placeholder.
+_REDACTED_ARGV_FLAGS = frozenset({"--append-system-prompt", "--system-prompt"})
+
+
+def _redact_argv_for_log(args: Sequence[str]) -> list[str]:
+    """
+    Return a copy of ``args`` with sensitive flag values redacted for logging.
+
+    The system prompt value (e.g. passed via ``--append-system-prompt``) is
+    replaced with a ``[system prompt N chars]`` placeholder so it never leaks
+    into debug logs. Two argv forms are handled:
+
+    * the two-token form ``--append-system-prompt <value>`` (what the current
+      spawn code emits), and
+    * the equals-joined form ``--append-system-prompt=<value>`` (not emitted
+      today, but redacted defensively in case a future refactor switches to it).
+
+    All other tokens are preserved so the command remains useful for debugging.
+    """
+    redacted: list[str] = []
+    redact_next = False
+    for arg in args:
+        if redact_next:
+            redacted.append(f"[system prompt {len(arg)} chars]")
+            redact_next = False
+            continue
+        if arg in _REDACTED_ARGV_FLAGS:
+            # Two-token form: redact the following value token.
+            redacted.append(arg)
+            redact_next = True
+            continue
+        flag, sep, value = arg.partition("=")
+        if sep and flag in _REDACTED_ARGV_FLAGS:
+            # Equals-joined form: redact the inline value, keep the flag name.
+            redacted.append(f"{flag}=[system prompt {len(value)} chars]")
+            continue
+        redacted.append(arg)
+    return redacted
 
 
 def _build_models_json(
@@ -680,7 +800,19 @@ def _build_models_json(
             # Rebind (don't append): the static lists are module-level
             # constants shared across builds, so in-place mutation would
             # leak this run's model id into every later models.json.
-            provider["models"] = [*provider["models"], {"id": model}]
+            # Declare image input: Pi's transformMessages drops every image
+            # block ("model does not support images") unless the model entry
+            # advertises it, so a dynamically-registered vision model would
+            # silently lose its images (#515). We assert capability for ALL
+            # dynamically-routed ids (no per-model vision metadata here): for a
+            # genuinely text-only model this turns a silent image drop into a
+            # provider-side 400 on image turns — a deliberate trade (loud error
+            # over silent loss), since most current gateway models are
+            # multimodal and text-only turns are unaffected.
+            provider["models"] = [
+                *provider["models"],
+                {"id": model, "input": ["text", "image"]},
+            ]
     return config
 
 
@@ -812,7 +944,7 @@ class _PiRpcSession:
         if extra_args:
             args.extend(extra_args)
 
-        logger.debug("PiExecutor: spawning %s", " ".join(args))
+        logger.debug("PiExecutor: spawning %s", " ".join(_redact_argv_for_log(args)))
         self.process = await _create_subprocess_exec(
             *args,
             stdin=asyncio.subprocess.PIPE,
@@ -1011,6 +1143,84 @@ def _extract_latest_user_content(
                 return content
             return str(content)
     return ""
+
+
+def _split_pi_prompt(blocks: list[dict[str, Any]]) -> tuple[str, list[dict[str, str]]]:
+    """Split content blocks into Pi's prompt ``message`` text and ``images``.
+
+    Pi's RPC ``prompt`` command carries text in ``message`` and images in a
+    native ``images`` field (``ImageContent = {type, data, mimeType}``), which
+    the ``openai-completions`` provider converts to ``image_url`` blocks.
+    JSON-encoding the blocks into ``message`` instead (the previous behavior)
+    makes Pi forward the image data URI as literal text, so the model never
+    sees the image (#515).
+
+    :param blocks: Responses-API content block dicts. ``input_text`` →
+        message text; ``input_image`` → Pi ``images``; ``input_file`` (a
+        resolved attachment data URI) → its text payload is decoded into the
+        message for text-like MIME types and skipped (with a warning) for
+        binary ones, mirroring the Codex harness — Pi has no native file
+        channel, but a text file's content is still useful inline, and the
+        old ``json.dumps(prompt)`` path surfaced it as text, so neither a
+        silent drop nor a hard failure is the right default here. A genuinely
+        unknown block type raises ``ValueError`` (→ ``ExecutorError`` in
+        ``run_turn``) so a new shape fails loudly rather than vanishing.
+    :returns: ``(message, images)`` — joined text and a list of Pi
+        ``ImageContent`` dicts.
+    :raises ValueError: On a malformed ``input_image`` or an unhandled
+        block type.
+    """
+    text_parts: list[str] = []
+    images: list[dict[str, str]] = []
+    for block in blocks:
+        block_type = block.get("type")
+        if block_type in ("input_text", "output_text", "text"):
+            text_parts.append(str(block.get("text") or ""))
+        elif block_type == "input_image":
+            image_url = block.get("image_url")
+            if not isinstance(image_url, str) or not image_url.startswith("data:"):
+                raise ValueError(
+                    "input_image 'image_url' must be an inline data URI "
+                    "('data:<mime>;base64,...'); Pi forwards images inline and "
+                    "cannot fetch external URLs or resolve file references "
+                    f"(got {str(image_url)[:48]!r})."
+                )
+            parsed = parse_data_uri(image_url)
+            images.append(
+                {"type": "image", "data": parsed.base64_payload, "mimeType": parsed.mime_type}
+            )
+        elif block_type == "input_file":
+            # Pi has no file channel, so inline text-like files into the
+            # message (the model can still reason about them) and skip binary
+            # ones. Matches codex_executor's input_file fallback.
+            file_data = block.get("file_data") or ""
+            if isinstance(file_data, str) and file_data.startswith("data:"):
+                parsed = parse_data_uri(file_data)
+                if not parsed.mime_type.startswith("text/"):
+                    logger.warning(
+                        "Pi harness: skipping non-text input_file (%s) — Pi "
+                        "cannot consume binary attachments inline.",
+                        parsed.mime_type,
+                    )
+                    continue
+                try:
+                    decoded = base64.b64decode(parsed.base64_payload).decode("utf-8", "replace")
+                except ValueError as exc:  # binascii.Error subclasses ValueError
+                    raise ValueError(
+                        f"input_file has an undecodable base64 payload: {exc}"
+                    ) from exc
+                text_parts.append(decoded)
+            elif isinstance(file_data, str) and file_data:
+                # Already-inline text (no data: wrapper).
+                text_parts.append(file_data)
+        else:
+            raise ValueError(
+                f"Unsupported content block type {block_type!r} for the Pi "
+                "harness: only 'input_text', 'input_image', and 'input_file' "
+                "blocks can be forwarded. Dropping it silently would lose the "
+                "attachment, so the turn fails loudly instead."
+            )
+    return "\n".join(text_parts), images
 
 
 def _build_pi_prompt(
@@ -1838,24 +2048,26 @@ class PiExecutor(Executor):
         if state is not None:
             state._has_sent_prompt = True
 
-        # Send prompt command. Pi's JSONL protocol requires
-        # ``message`` to be a string. When the prompt carries
-        # multimodal content blocks, JSON-encode them so the
-        # LLM sees the image data URIs in its context.
+        # Send prompt command. Pi's JSONL protocol carries text in ``message``
+        # and images in a native ``images`` field. Split multimodal blocks into
+        # both (rather than JSON-encoding them into the text) so the model
+        # actually receives attached images instead of a base64 text blob (#515).
         message: str
+        images: list[dict[str, str]] = []
         if isinstance(prompt, list):
-            message = json.dumps(prompt)
+            try:
+                message, images = _split_pi_prompt(prompt)
+            except Exception as exc:  # noqa: BLE001 — prompt-prep boundary: any failure (malformed/unsupported block, bad data URI) surfaces as ExecutorError, never an uncaught crash, matching the send_command path below
+                yield ExecutorError(message=f"Failed to prepare prompt for Pi: {exc}")
+                return
         else:
             message = prompt
         cmd_id = f"turn_{id(messages)}"
+        command: dict[str, Any] = {"type": "prompt", "message": message, "id": cmd_id}
+        if images:
+            command["images"] = images
         try:
-            await rpc.send_command(
-                {
-                    "type": "prompt",
-                    "message": message,
-                    "id": cmd_id,
-                }
-            )
+            await rpc.send_command(command)
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces prompt-send errors as ExecutorError
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return

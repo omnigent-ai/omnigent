@@ -55,6 +55,16 @@ def _callable_registry_policy(base_url: str) -> dict:
     )
 
 
+def _registry_policy_by_handler(base_url: str, handler: str) -> dict:
+    """Return the registry entry for *handler*, or skip if it is unavailable."""
+    resp = httpx.get(f"{base_url}/v1/policy-registry", timeout=10.0)
+    resp.raise_for_status()
+    for entry in resp.json()["data"]:
+        if entry.get("handler") == handler:
+            return entry
+    raise pytest.skip.Exception(f"policy registry entry not found for {handler}")
+
+
 def _session_policies(base_url: str, session_id: str) -> list[dict]:
     """Return the session's policy rows (owner view) from the CRUD API."""
     resp = httpx.get(f"{base_url}/v1/sessions/{session_id}/policies", timeout=10.0)
@@ -65,6 +75,14 @@ def _session_policies(base_url: str, session_id: str) -> list[dict]:
 def _user_policy_names(base_url: str, session_id: str) -> set[str]:
     """Names of user-attached (``source == "session"``) policies on the session."""
     return {p["name"] for p in _session_policies(base_url, session_id) if p["source"] == "session"}
+
+
+def _user_policy_by_name(base_url: str, session_id: str, name: str) -> dict | None:
+    """Return a user-attached policy row by name, if present."""
+    for policy in _session_policies(base_url, session_id):
+        if policy["source"] == "session" and policy["name"] == name:
+            return policy
+    return None
 
 
 def _open_popover(page: Page) -> None:
@@ -129,6 +147,46 @@ def test_agent_info_policy_add_and_remove(
     # Re-open the popover: the section is empty again.
     _open_popover(page)
     expect(page.get_by_text("No policies added")).to_be_visible(timeout=15_000)
+
+
+def test_agent_info_policy_integer_params_validate_and_submit(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Factory integer params reject decimals and submit browser number notation."""
+    base_url, session_id = seeded_session
+    entry = _registry_policy_by_handler(
+        base_url,
+        "omnigent.policies.builtins.safety.max_tool_calls_per_session",
+    )
+    registry_name = entry["name"]
+    stored_name = re.sub(r"\s+", "_", registry_name.lower())
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+    assert not _user_policy_names(base_url, session_id), "session started with policies already"
+
+    _open_popover(page)
+    page.get_by_role("button", name="Add policy").click()
+    dialog = page.get_by_role("dialog").filter(has=page.get_by_text("Add Policy"))
+    expect(dialog).to_be_visible(timeout=15_000)
+    dialog.get_by_placeholder("Filter policies...").fill(registry_name)
+    dialog.get_by_role("button").filter(has_text=registry_name).first.click()
+
+    limit_input = dialog.locator('input[type="number"]').first
+    limit_input.fill("12.9")
+    dialog.get_by_role("button", name="Add", exact=True).click()
+    expect(dialog.get_by_role("alert")).to_contain_text("limit must be an integer")
+    assert _user_policy_by_name(base_url, session_id, stored_name) is None
+
+    limit_input.fill("1e2")
+    dialog.get_by_role("button", name="Add", exact=True).click()
+    expect(dialog).to_be_hidden(timeout=15_000)
+
+    _wait_for(lambda: _user_policy_by_name(base_url, session_id, stored_name) is not None)
+    stored_policy = _user_policy_by_name(base_url, session_id, stored_name)
+    assert stored_policy is not None
+    assert stored_policy["factory_params"] == {"limit": 100}
 
 
 def _wait_for(predicate, *, timeout_s: float = 15.0, interval_s: float = 0.25) -> None:

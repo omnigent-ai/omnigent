@@ -1,4 +1,4 @@
-// Pin the wire envelopes for the four `session.*` SSE events.
+// Pin the wire envelopes for `session.*` SSE events.
 //
 // Each event in `omnigent/server/schemas.py` uses either a FLAT
 // envelope (`{type, ...fields}`) or a NESTED envelope (`{type, data:
@@ -11,13 +11,16 @@ import { describe, expect, it } from "vitest";
 import type {
   ElicitationRequest,
   SessionAgentChangedEvent,
+  SessionCollaborationModeEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
+  SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
   SessionInterruptedEvent,
   SessionModelEvent,
   SessionPresenceEvent,
+  SessionReasoningEffortEvent,
   SessionResourceCreatedEvent,
   SessionResourceDeletedEvent,
   SessionSandboxStatusEvent,
@@ -704,6 +707,77 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     const ev = out[0] as ElicitationRequest;
     expect(ev.allowAllEdits).toBe(false);
   });
+
+  it("lifts the remember_scope hint with a host for WebFetch prompts", () => {
+    // The server stamps ``remember_scope`` on non-edit tool
+    // PermissionRequests so the card can offer "Approve & don't ask
+    // again for <host>". For WebFetch the host scopes the rule, so it
+    // must survive parsing.
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_webfetch",
+      params: {
+        mode: "form",
+        message: "Claude wants to call **WebFetch**",
+        phase: "pre_tool_use",
+        policy_name: "claude_native_permission",
+        content_preview: 'WebFetch({"url": "https://github.com/a/b"})',
+        requestedSchema: {},
+        tool_name: "WebFetch",
+        remember_scope: { tool: "WebFetch", host: "github.com" },
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.rememberScope).toEqual({ tool: "WebFetch", host: "github.com" });
+  });
+
+  it("lifts a tool-wide remember_scope hint (no host)", () => {
+    // Non-WebFetch tools (here Bash) get a tool-wide scope: ``tool``
+    // only, no ``host``. The card labels the button by the tool name.
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_bash_remember",
+      params: {
+        mode: "form",
+        message: "Claude wants to call **Bash**",
+        phase: "pre_tool_use",
+        policy_name: "claude_native_permission",
+        content_preview: "Bash({})",
+        requestedSchema: {},
+        tool_name: "Bash",
+        remember_scope: { tool: "Bash" },
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.rememberScope).toEqual({ tool: "Bash", host: undefined });
+  });
+
+  it("leaves rememberScope null when the hint is absent", () => {
+    // Edit tools / ExitPlanMode / AskUserQuestion carry no
+    // ``remember_scope``; the button must stay hidden.
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_edit_no_remember",
+      params: {
+        mode: "form",
+        message: "Claude wants to call **Edit**",
+        phase: "pre_tool_use",
+        policy_name: "claude_native_permission",
+        content_preview: "Edit({})",
+        requestedSchema: {},
+        tool_name: "Edit",
+        allow_all_edits: true,
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.rememberScope).toBeNull();
+  });
 });
 
 describe("response.elicitation_resolved (FLAT envelope)", () => {
@@ -1184,6 +1258,56 @@ describe("session.model (FLAT envelope)", () => {
   });
 });
 
+describe("session.reasoning_effort (FLAT envelope)", () => {
+  it("lifts conversation_id and effort", () => {
+    const events = parse("session.reasoning_effort", {
+      conversation_id: "conv_abc",
+      reasoning_effort: "medium",
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionReasoningEffortEvent;
+    expect(ev.type).toBe("session_reasoning_effort");
+    expect(ev.conversationId).toBe("conv_abc");
+    expect(ev.reasoningEffort).toBe("medium");
+  });
+
+  it("lifts null effort clears", () => {
+    const events = parse("session.reasoning_effort", {
+      conversation_id: "conv_abc",
+      reasoning_effort: null,
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionReasoningEffortEvent;
+    expect(ev.reasoningEffort).toBeNull();
+  });
+
+  it("rejects missing effort", () => {
+    expect(parse("session.reasoning_effort", { conversation_id: "conv_abc" })).toEqual([]);
+  });
+});
+
+describe("session.collaboration_mode (FLAT envelope)", () => {
+  it("lifts conversation_id and mode string", () => {
+    const events = parse("session.collaboration_mode", {
+      conversation_id: "conv_abc",
+      mode: "plan",
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionCollaborationModeEvent;
+    expect(ev.type).toBe("session_collaboration_mode");
+    expect(ev.conversationId).toBe("conv_abc");
+    expect(ev.mode).toBe("plan");
+  });
+
+  it("rejects missing mode", () => {
+    expect(parse("session.collaboration_mode", { conversation_id: "conv_abc" })).toEqual([]);
+  });
+
+  it("rejects missing conversation_id", () => {
+    expect(parse("session.collaboration_mode", { mode: "plan" })).toEqual([]);
+  });
+});
+
 describe("session.agent_changed (FLAT envelope)", () => {
   it("lifts conversation_id, agent_id, and agent_name", () => {
     const events = parse("session.agent_changed", {
@@ -1406,6 +1530,26 @@ describe("session.skills (FLAT envelope)", () => {
     const out = parse("session.skills", {
       type: "session.skills",
       conversation_id: "",
+    });
+    expect(out).toEqual([]);
+  });
+});
+
+describe("session.model_options (FLAT envelope)", () => {
+  it("lifts conversation_id into the bare nudge", () => {
+    const out = parse("session.model_options", {
+      type: "session.model_options",
+      conversation_id: "conv_abc",
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as SessionModelOptionsEvent;
+    expect(ev.type).toBe("session_model_options");
+    expect(ev.conversationId).toBe("conv_abc");
+  });
+
+  it("rejects missing conversation_id", () => {
+    const out = parse("session.model_options", {
+      type: "session.model_options",
     });
     expect(out).toEqual([]);
   });

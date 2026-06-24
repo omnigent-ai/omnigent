@@ -1051,6 +1051,9 @@ class ConversationStore(ABC):
         *,
         title: str | None = None,
         agent_id: str | None = None,
+        cloned_agent_name: str | None = None,
+        cloned_agent_bundle_location: str | None = None,
+        cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
@@ -1074,10 +1077,21 @@ class ConversationStore(ABC):
             ``None``, defaults to ``"Fork of <source_title>"``
             (or ``"Fork of <source_id>"`` when the source has no
             title).
-        :param agent_id: Agent ID to bind the fork to. When
-            ``None``, the fork inherits the source's ``agent_id``.
-            Callers that clone the agent row before forking pass
-            the cloned agent's ID here.
+        :param agent_id: Agent ID to bind the fork to. When ``None``,
+            the fork inherits the source's ``agent_id``. With
+            ``cloned_agent_bundle_location`` set, a fresh agent row is
+            created with this id; otherwise it must name an existing
+            agent, whose ``session_id`` is repointed at the fork.
+        :param cloned_agent_name: Name for the cloned agent row.
+            Required when ``cloned_agent_bundle_location`` is set.
+        :param cloned_agent_bundle_location: When set, clone this
+            bundle into a new session-scoped agent row created
+            atomically in the fork transaction, so a fork failure rolls
+            it back instead of orphaning a ``session_id IS NULL``
+            built-in. ``None`` keeps the legacy bind-existing behavior.
+        :param cloned_agent_description: Optional description for the
+            cloned agent row. Ignored unless
+            ``cloned_agent_bundle_location`` is set.
         :param copy_model_settings: When ``True`` (default), copy the
             source's ``model_override`` / ``reasoning_effort``. When
             ``False``, both are left ``None`` so the fork falls back to
@@ -1088,8 +1102,8 @@ class ConversationStore(ABC):
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript (clone the source's
             native transcript, or build from the copied Omnigent items) instead
-            of starting fresh. Set by the route whenever the fork binds a
-            native target, regardless of the source's provider family.
+            of starting fresh. Set by the route only for native targets whose
+            harness can replay fork history.
         :param resume_source_native_session: When ``True`` (default), a
             full fork of a source with a native session stamps
             :data:`FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY` so the runner

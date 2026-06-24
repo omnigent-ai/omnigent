@@ -8,7 +8,7 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseCreated → "response_created").
 
-import type { ErrorInfo, ModelUsage, Response, SandboxLaunchStage } from "./types";
+import type { ErrorInfo, ModelUsage, RememberScope, Response, SandboxLaunchStage } from "./types";
 
 /** Provider-native tool item types. */
 export const NATIVE_TOOL_TYPES = new Set<string>([
@@ -237,6 +237,22 @@ export interface ElicitationRequest {
    * mode switch is meaningful.
    */
   allowAllEdits?: boolean;
+  /**
+   * Producer-supplied extra (claude-native non-edit tool prompts only):
+   * present when the PermissionRequest endpoint is gating a tool that
+   * supports a persistent "don't ask again" allow rule (everything
+   * except edit tools, ExitPlanMode, and AskUserQuestion). ``tool`` is
+   * the gated tool name; ``host`` is the WebFetch request domain when
+   * present. The UI's ApprovalCard renders an "Approve & don't ask
+   * again for <host|tool>" button that, on accept, asks the server to
+   * install a session-scoped allow rule — the web equivalent of the
+   * native TUI's "don't ask again" permission option.
+   *
+   * Absent/null for every other elicitation (edit tools, ExitPlanMode,
+   * AskUserQuestion, codex, policy ASK), so the button only appears
+   * where the allow rule is meaningful.
+   */
+  rememberScope?: RememberScope | null;
 }
 
 /**
@@ -449,6 +465,33 @@ export interface SessionModelEvent {
   type: "session_model";
   conversationId: string;
   model: string;
+}
+
+/**
+ * `session.reasoning_effort` — active thinking-level switch from a native
+ * session.
+ *
+ * Emitted by the Omnigent server after a native wrapper reports an effort
+ * change observed outside the Web UI: Claude-native mirrors terminal/TUI
+ * changes, and Codex-native mirrors Codex app-server/config state. Carries
+ * `null` when the native runtime cleared back to its model default.
+ */
+export interface SessionReasoningEffortEvent {
+  type: "session_reasoning_effort";
+  conversationId: string;
+  reasoningEffort: string | null;
+}
+
+/**
+ * `session.collaboration_mode` — active Codex collaboration-mode switch.
+ *
+ * Emitted when a Codex-native thread enters or exits Plan mode, whether from
+ * the web UI toggle or from the native Codex TUI.
+ */
+export interface SessionCollaborationModeEvent {
+  type: "session_collaboration_mode";
+  conversationId: string;
+  mode: string;
 }
 
 /**
@@ -683,6 +726,16 @@ export interface SessionSkillsEvent {
   conversationId: string;
 }
 
+/**
+ * `session.model_options` — the Codex app-server model catalog just
+ * resolved for a session. Consumers refetch the session snapshot and apply
+ * its now-populated `codexModelOptions`.
+ */
+export interface SessionModelOptionsEvent {
+  type: "session_model_options";
+  conversationId: string;
+}
+
 /** One user currently viewing the session (holding its stream open). */
 export interface SessionViewer {
   /** Authenticated identity, e.g. `"alice@example.com"`. */
@@ -738,6 +791,8 @@ export type StreamEvent =
   | SessionStatusEvent
   | SessionUsageEvent
   | SessionModelEvent
+  | SessionReasoningEffortEvent
+  | SessionCollaborationModeEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent
@@ -751,4 +806,5 @@ export type StreamEvent =
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
   | SessionSkillsEvent
+  | SessionModelOptionsEvent
   | SessionPresenceEvent;

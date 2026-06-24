@@ -14,9 +14,9 @@ import sys
 
 REQUIRED_HEADINGS = (
     "Summary",
+    "Test Plan",
     "Type of change",
     "Test coverage",
-    "Coverage rationale",
 )
 
 TYPE_LABELS = (
@@ -40,10 +40,8 @@ TEST_LABELS = (
 PLACEHOLDER_FRAGMENTS = (
     "what changed and why",
     "check all that apply",
-    "describe the exact commands",
     "describe below",
-    "explain why",
-    "if you did not add or run tests",
+    "how was this change tested",
 )
 
 
@@ -107,6 +105,7 @@ def _contains_placeholder(text: str) -> bool:
 
 
 def validate_pr_body(body: str) -> ValidationResult:
+    body = body.lstrip("\ufeff")
     errors: list[str] = []
 
     spans = _heading_spans(body)
@@ -119,6 +118,12 @@ def validate_pr_body(body: str) -> ValidationResult:
         errors.append("Summary must describe what changed and why.")
     elif _contains_placeholder(summary):
         errors.append("Summary still contains template placeholder text.")
+
+    test_plan = _meaningful_text(_section(body, spans, "Test Plan"))
+    if not test_plan:
+        errors.append("Test Plan must describe how the change was tested.")
+    elif _contains_placeholder(test_plan):
+        errors.append("Test Plan still contains template placeholder text.")
 
     type_section = _section(body, spans, "Type of change")
     missing_type_labels = _missing_labels(type_section, TYPE_LABELS)
@@ -140,31 +145,19 @@ def validate_pr_body(body: str) -> ValidationResult:
     if not checked_tests:
         errors.append("Check at least one Test coverage checkbox.")
 
-    rationale = _meaningful_text(_section(body, spans, "Coverage rationale"))
-    if not rationale:
-        errors.append(
-            "Coverage rationale must explain tests run/added, or why more coverage is not needed."
-        )
-    elif _contains_placeholder(rationale):
-        errors.append("Coverage rationale still contains template placeholder text.")
-
-    automated_tests = {
-        "Unit tests added / updated",
-        "Integration tests added / updated",
-        "E2E tests added / updated",
-        "Existing tests cover this change",
-    }
-    if checked_tests and checked_tests.isdisjoint(automated_tests):
-        if len(rationale.split()) < 8:
+    # Coverage notes are optional in general, but required whenever "Manual
+    # verification completed" or "Not applicable" is checked — those choices
+    # need a written justification.
+    if checked_tests & {"Manual verification completed", "Not applicable"}:
+        coverage_notes = _meaningful_text(_section(body, spans, "Coverage notes"))
+        if not coverage_notes:
             errors.append(
-                "When no automated test coverage checkbox is selected, "
-                "the rationale must explain why."
+                "Coverage notes are required when 'Manual verification completed' or "
+                "'Not applicable' is selected — describe what you verified or why "
+                "automated coverage is not needed."
             )
-
-    if "Not applicable" in checked_tests and rationale and len(rationale.split()) < 8:
-        errors.append(
-            "Not applicable test coverage requires a concrete explanation in Coverage rationale."
-        )
+        elif _contains_placeholder(coverage_notes):
+            errors.append("Coverage notes still contains template placeholder text.")
 
     return ValidationResult(ok=not errors, errors=errors)
 

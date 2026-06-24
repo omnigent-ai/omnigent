@@ -16,7 +16,11 @@ from pydantic import BaseModel, model_validator
 from omnigent.entities import Comment
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
-from omnigent.server.routes._auth_helpers import get_user_id, require_access
+from omnigent.server.routes._auth_helpers import (
+    attribution_user,
+    get_user_id,
+    require_access,
+)
 from omnigent.stores import ConversationStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.permission_store import PermissionStore
@@ -211,7 +215,12 @@ def create_comments_router(
             start_index=body.start_index,
             end_index=body.end_index,
             anchor_content=body.anchor_content,
-            created_by=user_id,
+            # Map the single-user "local" sentinel to None (matching the
+            # sessions/messages write paths) so single-user comments record
+            # no author and stay editable/deletable by any editor — both the
+            # author-only server gate (``_require_comment_author``) and the
+            # client's Edit/Delete affordances key off ``created_by is None``.
+            created_by=attribution_user(user_id),
         )
         return asdict(comment)
 

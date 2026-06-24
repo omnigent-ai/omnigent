@@ -1,10 +1,12 @@
 """Unit tests for native-worker YOLO ``terminal_launch_args`` derivation.
 
 Nessie's native sub-agent workers (claude-native / codex-native) launch
-in a headless pane where no human can answer an approval prompt, so they
-declare full-bypass intent in their bundle. The server translates that
-declaration into the per-session ``terminal_launch_args`` the runner
-appends to the claude / codex argv.
+in a headless pane where no human can answer an approval prompt. The
+server translates a worker's bypass stance into the per-session
+``terminal_launch_args`` the runner appends to the claude / codex argv:
+claude-native opts in via ``permission_mode``, while codex-native
+defaults to full bypass (issue #171) because the headless seam has no
+safe non-bypass default, with ``yolo: false`` as the opt-out.
 
 These tests exercise the pure translation helper
 ``_derive_terminal_launch_args_from_spec`` directly with real
@@ -87,30 +89,51 @@ def test_codex_native_yolo_string_true_translates_to_bypass_flag() -> None:
     ]
 
 
-def test_native_spec_without_yolo_field_returns_none() -> None:
+def test_codex_native_without_yolo_field_defaults_to_bypass() -> None:
     """
-    A native sub-agent that declares no bypass field gets no args.
+    A headless codex-native sub-agent defaults to full bypass (issue #171).
 
-    Both native harnesses must return ``None`` when their respective
-    field is absent — otherwise a plain native sub-agent would silently
-    inherit YOLO. ``None`` (not ``[]``) is the contract the create path
+    A codex worker launched by polly runs headless: no human can answer
+    codex's ``approval_policy=on-request`` prompts, and codex's own command
+    sandbox often cannot even start (e.g. in a hardened container), so the
+    default stance stalls the worker on its first Edit/Write/Bash. The
+    derived args MUST carry ``--dangerously-bypass-approvals-and-sandbox``
+    even when the bundle never declared ``yolo`` — the headless seam has no
+    safe non-bypass default — and MUST NOT carry codex's on-request mode.
+    """
+    codex = _spec_with_config({"harness": "codex-native"})
+    args = _derive_terminal_launch_args_from_spec(codex)
+    assert args == ["--dangerously-bypass-approvals-and-sandbox"]
+    # The on-request approval default must not leak back in via these args.
+    assert not any("on-request" in arg for arg in args)
+    assert not any("approval_policy" in arg for arg in args)
+
+
+def test_claude_native_without_permission_mode_returns_none() -> None:
+    """
+    A claude-native sub-agent without ``permission_mode`` still gets no args.
+
+    The codex default-bypass change (issue #171) is scoped to codex-native;
+    claude-native keeps its existing contract (bypass is opt-in via
+    ``permission_mode``, and the harness has a separate one-time bypass
+    acceptance). ``None`` (not ``[]``) is the contract the create path
     treats as "leave terminal_launch_args unset".
     """
     claude = _spec_with_config({"harness": "claude-native"})
-    codex = _spec_with_config({"harness": "codex-native"})
-    # No permission_mode / yolo declared -> nothing to translate.
     assert _derive_terminal_launch_args_from_spec(claude) is None
-    assert _derive_terminal_launch_args_from_spec(codex) is None
 
 
-def test_codex_native_yolo_false_string_returns_none() -> None:
+def test_codex_native_yolo_false_string_opts_out_of_bypass() -> None:
     """
-    ``yolo: false`` (string ``"False"``) must NOT enable bypass.
+    ``yolo: false`` (string ``"False"``) is the explicit bypass opt-out.
 
-    This guards the ``bool("False") is True`` trap: a naive truthiness
-    check on the parser's stringified value would enable YOLO for an
-    explicit opt-out. A failure here means an agent that set
-    ``yolo: false`` would still launch with the dangerous bypass flag.
+    codex-native now defaults to bypass for the headless seam, so the only
+    way to keep codex prompting (e.g. a deliberately read-only sub-agent)
+    is to declare ``yolo: false``. This also guards the
+    ``bool("False") is True`` trap: a naive truthiness check on the
+    parser's stringified value would read ``"False"`` as still-disabled-opt
+    -out incorrectly. A failure here means the opt-out silently fails open
+    (still bypassing) or, conversely, that an absent flag stopped bypassing.
     """
     spec = _spec_with_config({"harness": "codex-native", "yolo": "False"})
     assert _derive_terminal_launch_args_from_spec(spec) is None
@@ -118,7 +141,7 @@ def test_codex_native_yolo_false_string_returns_none() -> None:
 
 @pytest.mark.parametrize(
     "harness",
-    ["claude-sdk", "codex", "openai-agents", "databricks_supervisor"],
+    ["claude-sdk", "codex", "openai-agents"],
 )
 def test_non_native_harness_with_bypass_fields_is_ignored(harness: str) -> None:
     """

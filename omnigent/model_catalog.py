@@ -99,6 +99,11 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
     "antigravity": "antigravity",
     "agy": "antigravity",
     "google-antigravity": "antigravity",
+    "qwen": "qwen",
+    # The native agy TUI bridge resolves its provider via the SDK sibling,
+    # mirroring the claude-native -> claude-sdk rule above.
+    "antigravity-native": "antigravity",
+    "native-antigravity": "antigravity",
 }
 
 # Preferred inline family per single-family harness (pi consumes both).
@@ -107,6 +112,7 @@ _KEY_AUTH_FAMILY: dict[str, str] = {
     "codex": OPENAI_FAMILY,
     "openai-agents-sdk": OPENAI_FAMILY,
     "antigravity": OPENAI_FAMILY,
+    "qwen": OPENAI_FAMILY,
 }
 
 # Multi-family providers (pi): anthropic first, matching _apply_provider_to_pi.

@@ -243,6 +243,42 @@ def _dispatch_wrapper(
             pi_args=(),
         )
         return True
+    if native_agent.key == "cursor":
+        from omnigent.cursor_native import run_cursor_native
+
+        run_cursor_native(
+            server=server,
+            session_id=session_id,
+            cursor_args=(),
+        )
+        return True
+    if native_agent.key == "goose":
+        from omnigent.goose_native import run_goose_native
+
+        run_goose_native(
+            server=server,
+            session_id=session_id,
+            goose_args=(),
+        )
+        return True
+    if native_agent.key == "antigravity":
+        from omnigent.antigravity_native import run_antigravity_native
+
+        run_antigravity_native(
+            server=server,
+            session_id=session_id,
+            antigravity_args=(),
+        )
+        return True
+    if native_agent.key == "qwen":
+        from omnigent.qwen_native import run_qwen_native
+
+        run_qwen_native(
+            server=server,
+            session_id=session_id,
+            qwen_args=(),
+        )
+        return True
     return False
 
 

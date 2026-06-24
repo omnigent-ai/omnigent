@@ -22,13 +22,16 @@ name: Security Scan
 
 on:
   pull_request:
-    # labeled/unlabeled so applying or removing the maintainer skip label
-    # (skip-security-scan) re-runs the scan and flips this check.
+    # labeled/unlabeled so applying or removing the skip label
+    # (skip-security-scan) re-runs the scan and flips this check. The waiver is
+    # label-only (should-scan.sh): applying it needs Triage permission, so the
+    # label alone is the maintainer gate -- no separate approval, hence no
+    # pull_request_review trigger.
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
 permissions:
   contents: read
-  pull-requests: read   # read PR labels + reviews for the maintainer skip waiver
+  pull-requests: read   # read PR labels for the skip waiver
 
 concurrency:
   group: security-scan-${{ github.event.pull_request.number }}
@@ -44,7 +47,7 @@ jobs:
       UV_INDEX_URL: https://pypi.org/simple
     steps:
       - name: Check out scanner from main
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: main             # trusted; never the PR head
           sparse-checkout: |
@@ -65,7 +68,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
-          # For the maintainer-effective skip-security-scan waiver (read-only).
+          # For the skip-security-scan label waiver + author check (read-only).
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
@@ -112,7 +115,7 @@ jobs:
 
       - name: Check out PR head for static analysis
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}  # untrusted: only statically scanned
           path: pr
@@ -128,6 +131,23 @@ jobs:
       - name: Install uv
         if: ${{ steps.gate.outputs.scan == 'true' }}
         uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
+
+      - name: OSV advisory scan (uv.lock)
+        # Checks every package version pinned in the PR's uv.lock against the
+        # OSV advisory database, which covers known-malicious, typosquatted,
+        # and CVE-flagged versions. Only fires when uv.lock is in the changeset
+        # to avoid blocking PRs when main's baseline lockfile already has open
+        # advisories on main.
+        if: ${{ steps.gate.outputs.scan == 'true' }}
+        working-directory: pr
+        run: |
+          if ! grep -qxF 'uv.lock' "$GITHUB_WORKSPACE/changed.txt"; then
+            echo "uv.lock not changed; skipping OSV scan."
+            exit 0
+          fi
+          uv export --frozen --format requirements-txt --all-extras \
+            > /tmp/uv-req.txt
+          uvx pip-audit --requirement /tmp/uv-req.txt --no-deps
 
       - name: Semgrep (changed files, local rules)
         if: ${{ steps.gate.outputs.scan == 'true' }}
@@ -150,3 +170,20 @@ jobs:
           # Gating pass: ERROR-severity rules fail the scan.
           uvx semgrep scan --config "$RULES" --severity=ERROR --error \
             --metrics=off --quiet $(cat targets.txt)
+
+      # Surfaced on ANY detector failure above (sensitive-path / secret / exfil
+      # / workflow-misuse / semgrep): the detectors say WHAT they found; this
+      # says HOW a maintainer can waive it. The waiver is label-only: applying
+      # the 'skip-security-scan' label needs Triage permission, so the label is
+      # itself the maintainer gate (see should-scan.sh). Applying it re-runs this
+      # scan via the labeled trigger above.
+      - name: Explain the maintainer waiver (on failure)
+        if: ${{ failure() }}
+        run: |
+          MSG="A maintainer can skip the Security Scan by applying the 'skip-security-scan' label (this requires Triage permission, so a fork author cannot self-waive). Applying the label re-runs this scan automatically."
+          echo "::error::$MSG"
+          {
+            echo "### Security Scan failed"
+            echo
+            echo "$MSG"
+          } >> "$GITHUB_STEP_SUMMARY"

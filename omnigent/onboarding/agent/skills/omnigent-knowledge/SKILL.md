@@ -54,7 +54,7 @@ executor:
 
   # Only for type: omnigent — pick the harness that runs the loop.
   # One of: claude-native | claude-sdk | codex-native | codex |
-  #         openai-agents | open-responses | pi | databricks_supervisor
+  #         openai-agents | open-responses | pi
   # config:
   #   harness: claude-native
   #   permission_mode: bypassPermissions   # claude-native headless
@@ -137,7 +137,6 @@ sub-agents; it **requires** a `config.harness`:
 | `openai-agents` | OpenAI Agents harness (any gateway model) |
 | `open-responses` | OpenResponses-compatible harness |
 | `pi` | Headless multi-model worker (bridged `sys_os_*` tools) |
-| `databricks_supervisor` | Databricks Agent Bricks Supervisor |
 
 ## AGENTS.md Format
 

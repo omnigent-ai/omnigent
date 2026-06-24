@@ -21,6 +21,22 @@ model sees it).
 from __future__ import annotations
 
 import json
+import secrets
+import sys
+import time
+
+import httpx
+
+# How long to keep retrying transient 5xx / connect errors on the
+# policy evaluate POST before failing closed. Keeps the pre-execution
+# gate from blocking long on a sick server while still absorbing brief
+# DB hiccups on a hosted deployment.
+_EVALUATE_POLICY_RETRY_BUDGET_S = 30.0
+_EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S = 1.0
+_EVALUATE_POLICY_RETRY_MAX_BACKOFF_S = 10.0
+# Fast connect budget so an unreachable server fails into the retry
+# loop quickly rather than blocking on the day-long read timeout.
+_EVALUATE_POLICY_CONNECT_TIMEOUT_S = 5.0
 
 # Hook event names that gate tool execution and therefore carry policy
 # meaning. ``PreToolUse`` fires before the tool runs (can block);
@@ -33,6 +49,14 @@ _POST_TOOL_USE = "PostToolUse"
 # this hook is the sole REQUEST gate and covers both web-UI-injected and
 # direct-terminal prompts). It can block the prompt before the model runs.
 _USER_PROMPT_SUBMIT = "UserPromptSubmit"
+
+# Reason surfaced when a tool call is denied because its policy verdict
+# could not be obtained (server unreachable / non-2xx / empty or malformed
+# body). Mirrors the runner-side fail-closed default in
+# ``omnigent.runner.app._evaluate_policy_via_omnigent`` (PR #163).
+_EVAL_UNAVAILABLE_REASON = (
+    "Omnigent policy evaluation unavailable; failing closed for this tool call."
+)
 
 
 def hook_payload_to_evaluation_request(
@@ -218,3 +242,141 @@ def evaluation_response_to_hook_output(
         return None
 
     return None
+
+
+def fail_closed_hook_output(hook_event: str) -> dict[str, object] | None:
+    """
+    Build the fail-closed hook output for an unobtainable policy verdict.
+
+    Called by the per-harness hooks when the ``/policies/evaluate``
+    round-trip cannot produce a usable verdict for an *already-governed*
+    session — the server is unreachable, returns a non-2xx status, or
+    returns an empty / malformed body. Without this the hooks emitted "no
+    opinion" on those paths, silently letting the gated tool run: for
+    native harnesses this hook is the sole enforcement point (it gates
+    Bash / Write / Edit / the native Skill tool / connector-native
+    ``mcp__*`` tools), so a transient outage disabled all DENY/ASK
+    enforcement.
+
+    The default is phase-aware, matching
+    :data:`omnigent.policies.types.FAIL_CLOSED_PHASES` (the runner-side
+    precedent from PR #163) — but expressed in hook-event terms so the
+    lightweight hook subprocess need not import the policy package:
+
+    - ``PreToolUse`` (``PHASE_TOOL_CALL``) fails CLOSED → ``deny``. This is
+      the authoritative pre-execution gate; an unevaluable policy must not
+      let the call through.
+    - ``UserPromptSubmit`` (``PHASE_REQUEST``) and ``PostToolUse``
+      (``PHASE_TOOL_RESULT``) fail OPEN → ``None``. The request gate is
+      advisory (the tool-call gate still catches dangerous actions) and by
+      the result phase the tool has already executed, so denying would only
+      block an already-incurred side effect.
+
+    :param hook_event: Hook event name, e.g. ``"PreToolUse"``.
+    :returns: A ``permissionDecision: "deny"`` hook output for
+        ``PreToolUse``; ``None`` for every other event (fail open).
+    """
+    if hook_event == _PRE_TOOL_USE:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": _PRE_TOOL_USE,
+                "permissionDecision": "deny",
+                "permissionDecisionReason": _EVAL_UNAVAILABLE_REASON,
+            },
+        }
+    return None
+
+
+def post_evaluate_with_retry(
+    url: str,
+    headers: dict[str, str],
+    eval_request: dict[str, object],
+    read_timeout: float,
+    hook_label: str,
+) -> httpx.Response | None:
+    """
+    POST to the Omnigent policy evaluate endpoint, retrying on transient errors.
+
+    Retries on 5xx HTTP responses and connection-level errors
+    (:class:`httpx.ConnectError`, :class:`httpx.ConnectTimeout`) within
+    :data:`_EVALUATE_POLICY_RETRY_BUDGET_S`. Returns the successful response,
+    or ``None`` if the budget is exhausted or a non-retryable error occurs.
+
+    A stable ``_omnigent_elicitation_id`` is minted once and stamped on
+    every attempt. When the server parks an ASK gate and the connection
+    drops (5xx or :class:`httpx.ConnectError`), the retry re-POSTs the
+    same id so the server re-attaches to the existing elicitation rather
+    than minting a new one — mirroring the ``_post_hook_with_reattach``
+    idiom used by the ``PermissionRequest`` hook. This prevents a
+    second approval card from appearing when the first was already
+    published before the error.
+
+    4xx responses are final — a bad request won't succeed on retry. Other
+    mid-stream errors (e.g. :class:`httpx.ReadTimeout`) are also not retried:
+    a read timeout fires *after* the server received the request and may
+    mean the long-polling ASK gate was severed mid-wait; retrying with the
+    same id will re-park the existing elicitation (no duplicate card), but
+    the caller's fail-closed path is equivalent and simpler. The caller is
+    responsible for fail-closed handling on ``None``.
+
+    :param url: Absolute URL of the evaluate endpoint.
+    :param headers: Auth headers for the Omnigent server.
+    :param eval_request: ``EvaluationRequest`` JSON body to POST.
+    :param read_timeout: Per-attempt read timeout in seconds. Should be
+        large (e.g. one day) to accommodate long-polling ASK gates.
+    :param hook_label: Diagnostic label used in stderr messages,
+        e.g. ``"evaluate-policy hook"`` or ``"codex evaluate-policy hook"``.
+    :returns: Successful :class:`httpx.Response`, or ``None`` when retries
+        are exhausted or the error is non-retryable.
+    """
+    # Mint one stable id for the whole retry sequence. Each retry re-sends
+    # it so the server can re-park the SAME elicitation rather than opening
+    # a second approval card. The ``elicit_evaluate_`` namespace is validated
+    # server-side by ``_EVALUATE_HOOK_ELICITATION_ID_RE``.
+    elicitation_id = f"elicit_evaluate_{secrets.token_hex(16)}"
+    request_body = {**eval_request, "_omnigent_elicitation_id": elicitation_id}
+    deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
+    backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
+    timeout = httpx.Timeout(read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S)
+    while True:
+        try:
+            with httpx.Client(headers=headers, timeout=timeout) as client:
+                resp = client.post(url, json=request_body)
+                resp.raise_for_status()
+                return resp
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code < 500:
+                body_preview = exc.response.text[:200] if exc.response.content else ""
+                print(
+                    f"omnigent {hook_label}: Omnigent returned {exc.response.status_code}"
+                    + (f": {body_preview}" if body_preview else ""),
+                    file=sys.stderr,
+                )
+                return None
+            print(
+                f"omnigent {hook_label}: Omnigent returned {exc.response.status_code}; retrying",
+                file=sys.stderr,
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            print(
+                f"omnigent {hook_label}: Omnigent request failed; retrying: {exc}",
+                file=sys.stderr,
+            )
+        except httpx.HTTPError as exc:
+            # Other HTTP errors (ReadTimeout while a long ASK poll is in flight,
+            # etc.) are not retried — retrying a severed ASK would open a new
+            # elicitation and prompt the human twice.
+            print(
+                f"omnigent {hook_label}: Omnigent request failed: {exc}",
+                file=sys.stderr,
+            )
+            return None
+        if time.monotonic() + backoff_s >= deadline:
+            print(
+                f"omnigent {hook_label}: retry budget exhausted",
+                file=sys.stderr,
+            )
+            return None
+        # Two-step backoff; not worth a retry library in this dependency-light hook.
+        time.sleep(backoff_s)
+        backoff_s = min(backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)

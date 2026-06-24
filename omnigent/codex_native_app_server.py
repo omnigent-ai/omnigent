@@ -198,7 +198,7 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
 
             shutil.copy2(target, config_path)
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    pin_line = f'model = "{model}"'
+    pin_line = f"model = {json.dumps(model)}"
     lines = existing.splitlines()
     replaced = False
     for i, line in enumerate(lines):

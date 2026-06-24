@@ -1049,6 +1049,14 @@ def _redirect_native_resume_if_needed(
             progress=progress,
         )
         return True
+    if native_agent.key == "cursor":
+        _run_cursor_native_resume_redirect(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            auto_open_conversation=auto_open_conversation,
+            progress=progress,
+        )
+        return True
     return False
 
 
@@ -1176,6 +1184,46 @@ def _run_pi_native_resume_redirect(
         server=base_url,
         session_id=conversation_id,
         pi_args=(),
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+def _run_cursor_native_resume_redirect(
+    *,
+    base_url: str,
+    conversation_id: str,
+    auto_open_conversation: bool,
+    progress: RunnerStartupProgress | None,
+) -> None:
+    """
+    Hand a cursor-native conversation back to ``omnigent cursor``.
+
+    The cursor-native session is driven by the ``cursor-agent`` TUI in a
+    runner-owned tmux pane, and the forwarder mirrors that transcript back
+    into the conversation. Resuming through the Omnigent REPL would instead
+    run an Omnigent turn per message (which persists its own user item) *and*
+    leave the forwarder mirroring the same message from the cursor store —
+    recording each user message twice. Redirecting to ``omnigent cursor``'s
+    direct tmux attach keeps the TUI the single source of turns.
+
+    :param base_url: Omnigent server base URL.
+    :param conversation_id: Omnigent conversation id.
+    :param auto_open_conversation: Browser-open preference for the wrapper.
+    :param progress: Optional Omnigent startup spinner to finish before redirect.
+    :returns: None.
+    """
+    _finish_native_redirect_progress(
+        progress=progress,
+        conversation_id=conversation_id,
+        wrapper_name="cursor-native",
+        native_command="cursor",
+    )
+    from omnigent.cursor_native import run_cursor_native
+
+    run_cursor_native(
+        server=base_url,
+        session_id=conversation_id,
+        cursor_args=(),
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -2248,12 +2296,93 @@ async def _query_sessions_once(
         if reconciled is not None:
             return reconciled
         raise
+    all_text_parts: list[str] = []
     if result.text:
-        return result.text
-    reconciled = await _persisted_turn_text(client, bound.id)
-    if reconciled is not None:
-        return reconciled
-    # No assistant text for this turn. If the runner persisted a terminal
+        all_text_parts.append(result.text)
+    elif (reconciled := await _persisted_turn_text(client, bound.id)) is not None:
+        all_text_parts.append(reconciled)
+
+    # Multi-turn loop for async orchestrators (e.g. polly) that dispatch
+    # sub-agents and are auto-woken by inbox completions across multiple
+    # turns.
+    #
+    # Why not _collect_query for the fast-exit signal: the runtime emits
+    # ``session.status: waiting`` AFTER ``response.completed`` (the runner
+    # finishes dispatching tools, then enters the async drain). _collect_query
+    # exits at CompletedEvent and never sees the subsequent "waiting".
+    #
+    # Why not refresh() for the fast-exit signal: the snapshot API collapses
+    # the ``"waiting"`` relay status to ``"idle"`` once the turn loop exits,
+    # even while sub-agents are still running.
+    #
+    # Probe approach: subscribe to the live stream for a short window after
+    # the first turn. The "waiting" event arrives O(ms–s) after CompletedEvent
+    # (runner dispatches tools, spawns sub-agents, then parks). The probe
+    # catches it before sub-agents have a chance to complete.
+    #
+    # ``await_turn`` resets ``last_turn_saw_waiting`` to False on
+    # ``session.status: running`` (synthesis starting), so the flag cleanly
+    # reflects only the most recent dispatch state after each call.
+    #
+    # Single-turn agents: no "waiting" event ever → probe times out in
+    # _STATUS_PROBE_TIMEOUT_S (~30 s) and the loop exits.
+    _MAX_EXTRA_TURNS = 30
+    # The runner emits session.status:waiting (not idle) when a turn ends with
+    # running sub-agents. The relay cache holds "waiting", which the snapshot
+    # collapses to "running". refresh() is therefore the authoritative signal:
+    # "running" → async orchestrator still waiting for inbox; "idle" → done.
+    #
+    # A short probe await_turn runs first: it catches synthesis text or the
+    # status event if the subscription opens before the event arrives. Both
+    # "waiting" and "idle" break the probe immediately so the generator closes
+    # cleanly without hitting the timeout.
+    #
+    # refresh() is called after every await_turn (probe + loop) — it is correct
+    # even when await_turn times out (sub-agents still running), unlike the
+    # last_turn_saw_waiting flag which would incorrectly exit on timeout.
+    _STATUS_PROBE_TIMEOUT_S = 5.0  # brief window; status events arrive fast
+    _PER_TURN_TIMEOUT_S = 120.0  # race-window guard per synthesis turn
+    _LOOP_TIMEOUT_S = 1800.0  # 30 min total
+
+    async def _drain_extra_turns() -> None:
+        # Probe: collect synthesis text or status events that arrive quickly.
+        probe = await chat.await_turn(timeout=_STATUS_PROBE_TIMEOUT_S)
+        if probe.text:
+            all_text_parts.append(probe.text)
+        # refresh() is the authoritative check: "running" means the runner's
+        # relay cache holds "waiting" (sub-agents still running); "idle" means
+        # truly done (single-turn agent, or synthesis completed in the probe).
+        await chat.refresh()
+        if chat.status not in ("running", "launching"):
+            return
+        # Async orchestrator confirmed. Loop, refreshing after each turn.
+        for _ in range(_MAX_EXTRA_TURNS):
+            extra = await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
+            if extra.text:
+                all_text_parts.append(extra.text)
+            await chat.refresh()
+            if chat.status not in ("running", "launching"):
+                return  # Idle: synthesis done or all sub-agents complete.
+        logger.warning(
+            "headless -p hit the %d-turn guard for session %s; "
+            "the orchestrator may still be running",
+            _MAX_EXTRA_TURNS,
+            bound.id,
+        )
+
+    try:
+        async with asyncio.timeout(_LOOP_TIMEOUT_S):
+            await _drain_extra_turns()
+    except asyncio.TimeoutError:
+        logger.warning(
+            "headless -p timed out after %.0fs waiting for session %s to complete",
+            _LOOP_TIMEOUT_S,
+            bound.id,
+        )
+
+    if all_text_parts:
+        return "\n\n".join(p for p in all_text_parts if p)
+    # No assistant text at all. If the runner persisted a terminal
     # ``error`` item (e.g. a harness start failure like the cursor SDK's
     # invalid-model rejection), surface it instead of returning ``None`` —
     # otherwise the headless caller renders a failed turn as a silent,

@@ -26,6 +26,7 @@ from omnigent.inner.codex_executor import (
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.inner.executor import (
     ExecutorError,
+    ReasoningChunk,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -146,6 +147,31 @@ class TestCodexExecutor(unittest.TestCase):
         self.assertTrue(any("databricks auth token --host" in item for item in overrides))
         self.assertTrue(any("refresh_interval_ms=900000" in item for item in overrides))
         self.assertFalse(any('env_key="DATABRICKS_TOKEN"' in item for item in overrides))
+
+    def test_codex_config_overrides_neutralize_toml_breakout(self):
+        """A model id full of TOML metacharacters stays a literal string.
+
+        Defense-in-depth for the model_override RCE: the model value is
+        ``json.dumps``-escaped, so even a string crafted to close the
+        ``model="..."`` field and inject its own ``auth.command`` parses
+        back as one inert model name and never overwrites the real
+        token-minting auth command.
+        """
+        import tomllib
+
+        payload = 'x",auth={command="sh",args=["-c","touch /tmp/pwned"]},wire_api="responses"}'
+        real_auth = 'databricks auth token --host "https://example.cloud.databricks.com"'
+        overrides = _databricks_codex_config_overrides(
+            model=payload,
+            base_url="https://example.cloud.databricks.com/ai-gateway/codex/v1",
+            auth_command=real_auth,
+        )
+        parsed = tomllib.loads("\n".join(overrides))
+        # The whole payload round-trips as the literal model name.
+        self.assertEqual(parsed["model"], payload)
+        # The injected auth command did not survive — the legit one did.
+        provider = parsed["model_providers"]["omnigent_databricks"]
+        self.assertEqual(provider["auth"]["args"], ["-c", real_auth])
 
     def test_constructor_databricks_flag_with_profile(self):
         with (
@@ -283,6 +309,7 @@ class TestCodexExecutor(unittest.TestCase):
             patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
             patch.dict("os.environ", {}, clear=True),
             patch("omnigent.inner.codex_executor._read_databrickscfg", return_value=None),
+            patch("omnigent.inner.codex_executor._read_databrickscfg_host", return_value=None),
         ):
             with self.assertRaises(EnvironmentError):
                 CodexExecutor(gateway=True)
@@ -1325,6 +1352,79 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_app_server_run_turn_reasoning_deltas_yield_reasoning_chunks(self):
+        """item/reasoning/textDelta and item/reasoning/summaryTextDelta events
+        yield ReasoningChunk events so the idle watchdog resets during long
+        think phases (regression guard for omnigent-ai/omnigent#738)."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+            async def _inject() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {
+                        "method": "item/reasoning/textDelta",
+                        "params": {"turnId": "turn-1", "delta": "thinking hard..."},
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "item/reasoning/summaryTextDelta",
+                        "params": {"turnId": "turn-1", "delta": "summary of thoughts"},
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "msg-1",
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": "Here is my answer.",
+                            },
+                        },
+                    }
+                )
+
+            inject_task = asyncio.create_task(_inject())
+            events = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "complex question"}],
+                    tools=[],
+                    system_prompt="",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+            await inject_task
+
+            reasoning_events = [e for e in events if isinstance(e, ReasoningChunk)]
+            self.assertEqual(len(reasoning_events), 2)
+            self.assertEqual(reasoning_events[0].delta, "thinking hard...")
+            self.assertEqual(reasoning_events[0].event_type, "reasoning_text")
+            self.assertEqual(reasoning_events[1].delta, "summary of thoughts")
+            self.assertEqual(reasoning_events[1].event_type, "reasoning_text")
+
+            turn_complete = events[-1]
+            self.assertIsInstance(turn_complete, TurnComplete)
+            self.assertEqual(turn_complete.response, "Here is my answer.")
+
+        _run(_t())
+
     def test_stderr_loop_handles_oversized_lines(self):
         async def _t():
             session = _CodexAppServerSession(
@@ -2238,6 +2338,28 @@ def test_clean_codex_env_includes_databricks_bearer(monkeypatch) -> None:
 
     assert env.get("DATABRICKS_BEARER") == "ci-bearer"
     assert "DATABRICKS_TOKEN" not in env
+
+
+def test_clean_codex_env_includes_omnigent_session_marker(monkeypatch) -> None:
+    """The ``OMNIGENT`` session marker survives the codex env scrub.
+
+    The marker (set once on the runner) must reach the codex CLI so the
+    shell commands codex runs can detect they are inside an Omnigent
+    session, like ``CLAUDE_CODE`` / ``CODEX``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.codex_executor import _clean_codex_env
+    from omnigent.runner.identity import (
+        OMNIGENT_SESSION_ENV_VALUE,
+        OMNIGENT_SESSION_ENV_VAR,
+    )
+
+    monkeypatch.setenv(OMNIGENT_SESSION_ENV_VAR, OMNIGENT_SESSION_ENV_VALUE)
+
+    env = _clean_codex_env()
+
+    assert env.get(OMNIGENT_SESSION_ENV_VAR) == OMNIGENT_SESSION_ENV_VALUE
 
 
 # ---------------------------------------------------------------------------

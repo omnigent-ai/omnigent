@@ -49,9 +49,15 @@ run-omnigents.sh
 *.db-shm
 # Persisted artifacts from ad-hoc runs.
 artifacts/
+.tmp-codex-parity-target/
 
 # Playwright test run output (screenshots, traces, videos).
 test-results/
+
+# Visual-snapshot failure output (actual/expected/diff PNGs from the UI diff
+# gate). Regenerated each run; only the baseline under
+# tests/e2e_ui/visual/snapshots/ is committed.
+tests/e2e_ui/visual/snapshot_failures/
 
 # ap-web SPA build output, emitted into the server's static dir by
 # `npm run build` / the e2e_ui test fixture. Regenerated on demand;
@@ -67,5 +73,8 @@ omnigent/server/static/web-ui/
 # bundle deploy` respects .gitignore for its file sync — gitignored
 # wheels would silently fail to reach the deployed app's source folder
 # and the install would error with "No such file or directory".
+# The per-deploy app payload (src/pyproject.toml, src/uv.lock) is regenerated
+# by deploy.py and likewise kept untracked rather than gitignored, for the same
+# reason — `bundle deploy` must be able to sync it to the app source folder.
 # DAB local state directory (created by `databricks bundle deploy`).
 deploy/databricks/.databricks/

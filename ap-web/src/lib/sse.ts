@@ -33,6 +33,7 @@ import type {
   RetryEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
+  SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
   SessionInterruptedEvent,
@@ -45,6 +46,8 @@ import type {
   SessionTerminalActivityEvent,
   SessionStatusEvent,
   SessionModelEvent,
+  SessionCollaborationModeEvent,
+  SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
   SessionTodosEvent,
   SessionSandboxStatusEvent,
@@ -58,7 +61,7 @@ import type {
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
-import type { ErrorInfo, ModelUsage, Response } from "./types";
+import type { ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
 
 /**
  * Out-param for `parseSseStream`: `sawDone` is set when the server's `[DONE]`
@@ -488,6 +491,28 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     if (typeof model !== "string" || !model) return null;
     return { type: "session_model", conversationId, model } satisfies SessionModelEvent;
   }
+  if (eventType === "session.reasoning_effort") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const reasoningEffort = data.reasoning_effort;
+    if (reasoningEffort !== null && typeof reasoningEffort !== "string") return null;
+    return {
+      type: "session_reasoning_effort",
+      conversationId,
+      reasoningEffort,
+    } satisfies SessionReasoningEffortEvent;
+  }
+  if (eventType === "session.collaboration_mode") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const mode = data.mode;
+    if (typeof mode !== "string") return null;
+    return {
+      type: "session_collaboration_mode",
+      conversationId,
+      mode,
+    } satisfies SessionCollaborationModeEvent;
+  }
   if (eventType === "session.agent_changed") {
     const conversationId = data.conversation_id;
     if (typeof conversationId !== "string" || !conversationId) return null;
@@ -679,6 +704,14 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
     } satisfies SessionSkillsEvent;
   }
+  if (eventType === "session.model_options") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    return {
+      type: "session_model_options",
+      conversationId,
+    } satisfies SessionModelOptionsEvent;
+  }
   if (eventType === "session.presence") {
     const conversationId = data.conversation_id;
     if (typeof conversationId !== "string" || !conversationId) return null;
@@ -733,6 +766,25 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // offers the "Accept & allow all edits" button (switches the
     // session to acceptEdits mode on accept).
     const allowAllEdits = p.allow_all_edits === true;
+    // claude-native non-edit tool prompts stamp this so the ApprovalCard
+    // offers the persistent "don't ask again" button (installs a
+    // session-scoped allow rule on accept). `tool` is the gated tool;
+    // `host` is the WebFetch request domain when present (drives the
+    // button label and the rule scope).
+    const rememberScopeRaw = p.remember_scope;
+    const rememberScope: RememberScope | null =
+      rememberScopeRaw &&
+      typeof rememberScopeRaw === "object" &&
+      !Array.isArray(rememberScopeRaw) &&
+      typeof (rememberScopeRaw as Record<string, unknown>).tool === "string"
+        ? {
+            tool: (rememberScopeRaw as Record<string, unknown>).tool as string,
+            host:
+              typeof (rememberScopeRaw as Record<string, unknown>).host === "string"
+                ? ((rememberScopeRaw as Record<string, unknown>).host as string)
+                : undefined,
+          }
+        : null;
     return {
       type: "elicitation_request",
       elicitationId,
@@ -772,6 +824,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
             }
           : null,
       allowAllEdits,
+      rememberScope,
     } satisfies ElicitationRequest;
   }
 

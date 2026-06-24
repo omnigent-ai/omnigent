@@ -39,14 +39,10 @@ jobs:
 
     steps:
       - name: Check out repo
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Set up Node.js
-        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af  # v4
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: ap-web/package-lock.json
+        uses: ./.github/actions/setup-node
 
       - name: Install dependencies
         working-directory: ap-web
@@ -59,6 +55,41 @@ jobs:
         working-directory: ap-web
         run: npm run format:check
 
-      - name: Run tests
+      - name: Run tests with coverage
         working-directory: ap-web
-        run: npm test
+        run: npm run test:coverage
+
+      # Distill the v8 json-summary into a single total.txt, mirroring the
+      # backend's coverage-report job. ui-code-coverage.yml (privileged
+      # workflow_run) consumes this artifact and posts the report-only status.
+      - name: Summarize coverage
+        if: always()
+        working-directory: ap-web
+        run: |
+          mkdir -p ui-coverage-summary
+          if [[ ! -f coverage/coverage-summary.json ]]; then
+            echo "::warning::No coverage-summary.json; skipping UI coverage report."
+            exit 0
+          fi
+          node -e "process.stdout.write(String(require('./coverage/coverage-summary.json').total.lines.pct))" \
+            > ui-coverage-summary/total.txt
+          echo "Total UI coverage: $(cat ui-coverage-summary/total.txt)%"
+          # Render a markdown table; tee it to both the job log (visible inline)
+          # and the run's Summary tab (parity with the backend coverage-report
+          # job's GITHUB_STEP_SUMMARY table).
+          node -e '
+            const t = require("./coverage/coverage-summary.json").total;
+            const row = (k) => `| ${k[0].toUpperCase()}${k.slice(1)} | ${t[k].pct}% | ${t[k].covered}/${t[k].total} |`;
+            process.stdout.write(
+              "## UI Coverage\n\n" +
+              "| Metric | % | Covered/Total |\n|---|---|---|\n" +
+              ["lines","statements","functions","branches"].map(row).join("\n") + "\n");
+          ' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload UI coverage summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ui-coverage-summary-${{ github.run_id }}
+          path: ap-web/ui-coverage-summary/
+          retention-days: 14

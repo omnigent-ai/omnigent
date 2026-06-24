@@ -40,6 +40,7 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
 )
+from omnigent.harness_aliases import canonicalize_harness
 from omnigent.model_override import (
     harness_supports_model_override,
     model_family_mismatch,
@@ -98,6 +99,15 @@ _SUBAGENT_POLICY_STATUSES = frozenset({"completed", "failed"})
 _SUBAGENT_INBOX_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _SUBAGENT_POLICY_FAILURE_OUTPUT = "[Result suppressed by policy: policy evaluation failed]"
 _SESSION_WRAPPER_LABEL_KEY = "omnigent.wrapper"
+# Read budget for runner→server message-send POSTs that are gated at the
+# recipient's REQUEST phase, which can PARK behind a human-approval ASK gate
+# (e.g. session_cost_budget) for the deciding policy's ``ask_timeout``. Held at
+# one day (86400s) — matching that default — so the send WAITS for the verdict
+# instead of severing the parked gate at a short read timeout (a 30s cut
+# previously fail-closed to DENY). Fast connect (30s) so an unreachable server
+# still fails out promptly. Guarded by tests/test_ask_timeout_infinite.py.
+_ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
+_ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
 
 # Read timeouts for the two MCP-proxy hops that carry a tool call back to the
 # runner (runner → Omnigent server → runner). ``sys_os_shell`` accepts caller-provided
@@ -198,20 +208,50 @@ _SUBAGENT_TOOLS = frozenset({"sys_session_send"})
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 
-# Priority 5f.0: Session query tools — peek/list/close/get_info. The runner
-# has no in-process ConversationStore, so these read/mutate session state via
-# the Omnigent server's existing REST endpoints (GET /items, GET /child_sessions,
-# GET /sessions/{id}, PATCH /sessions/{id}) over server_client — same channel
-# and security posture as _execute_subagent_tool / _execute_comment_tool.
+# Priority 5f.0: Session query tools — peek/list/close/get_info/share. The
+# runner has no in-process ConversationStore, so these read/mutate session
+# state via the Omnigent server's existing REST endpoints (GET /items, GET
+# /child_sessions, GET /sessions/{id}, PATCH /sessions/{id}, PUT
+# /sessions/{id}/permissions) over server_client — same channel and security
+# posture as _execute_subagent_tool / _execute_comment_tool.
 _SESSION_QUERY_TOOLS = frozenset(
-    {"sys_session_get_history", "sys_session_list", "sys_session_close", "sys_session_get_info"}
+    {
+        "sys_session_get_history",
+        "sys_session_list",
+        "sys_session_close",
+        "sys_session_get_info",
+        "sys_session_share",
+    }
 )
+
+# Grantee sentinel for an anonymous, public read-only share. Mirrors the
+# server's RESERVED_USER_PUBLIC; only specs with
+# ``agent_session_sharing: public`` may grant it (enforced in
+# _session_share_via_rest — the server can't see the agent's sharing
+# policy, so the runner is the gate).
+_PUBLIC_USER_SENTINEL = "__public__"
+
+# Spec ``agent_session_sharing:`` policy values
+# (omnigent.spec.types.SharePolicy) that enable the sys_session_share
+# tool. Compared as plain strings since SharePolicy is a str-enum;
+# anything else (incl. "none"/absent) is off.
+_SHARE_ENABLED_POLICIES = frozenset({"non-public", "public"})
+_SHARE_PUBLIC_POLICY = "public"
 
 # Priority 5f.1: web_fetch — translates the LLM-facing query/url
 # arguments into a sys_session_send call against the built-in
 # ``__web_researcher`` sub-agent, then reuses
 # ``_execute_subagent_tool``.
 _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
+
+# Priority 5f.1b: web_search — the first-party search builtin. Runner-local
+# so a non-OpenAI model's web_search function call resolves to the spec's
+# configured backend (google / perplexity / nimble) via WebSearchTool.invoke.
+# (OpenAI models use the native web_search_preview passthrough and never reach
+# this path.) Without this entry the call fell through to the spec-callable
+# branch and errored "tool unavailable" — the gap behind the non-OpenAI
+# web_search known-failure.
+_WEB_SEARCH_TOOLS = frozenset({"web_search"})
 
 # Priority 5f.2: sys_list_models — runner-local because provider resolution
 # reads the runner host's config/credentials, same as the spawn paths.
@@ -309,6 +349,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
     | _WEB_FETCH_TOOLS
+    | _WEB_SEARCH_TOOLS
     | _TIMER_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _SKILL_TOOLS
@@ -375,8 +416,8 @@ async def _execute_local_python_tool(
 ) -> str:
     if agent_spec is None:
         return f"Error: {tool_name} not in local dispatch table (no agent spec)"
+    manager = ToolManager(agent_spec, workdir=runner_workspace)
     try:
-        manager = ToolManager(agent_spec, workdir=runner_workspace)
         workspace = None
         if runner_workspace is not None and conversation_id is not None:
             workspace = runner_workspace / conversation_id
@@ -391,6 +432,8 @@ async def _execute_local_python_tool(
     except Exception as exc:
         _logger.exception("runner local Python tool dispatch failed for %s", tool_name)
         return f"Error: {type(exc).__name__}: {exc}"
+    finally:
+        manager.shutdown()
 
 
 # Cache of resolved callables keyed by dotted path. Avoids
@@ -808,6 +851,61 @@ def _subagent_harness(sub_agent_name: str, agent_spec: Any | None) -> str | None
     return spec_harness(sub_spec) if sub_spec is not None else None
 
 
+def _subagent_harness_override_from_args(args: dict[str, Any]) -> str | None:
+    """
+    Extract a per-dispatch harness override from ``sys_session_send`` args.
+
+    The optional ``harness`` field lives in the object form of ``args``
+    (``{"input": ..., "harness": "opencode-native"}``). Returned raw (not
+    yet canonicalized) so the caller can validate it against the sub-agent
+    allowlist and quote the original spelling in errors.
+
+    :param args: Parsed ``sys_session_send`` arguments.
+    :returns: The raw harness override, or ``None`` when absent.
+    :raises ValueError: If ``harness`` is present but not a string.
+    """
+    raw_message = args.get("args")
+    if not isinstance(raw_message, dict):
+        return None
+    raw_harness = raw_message.get("harness")
+    if raw_harness is None:
+        return None
+    if not isinstance(raw_harness, str) or not raw_harness:
+        raise ValueError("'harness' must be a non-empty string when provided")
+    return raw_harness
+
+
+def _subagent_allowed_harnesses(sub_agent_name: str, agent_spec: Any | None) -> frozenset[str]:
+    """
+    Resolve the canonical harness allowlist a sub-agent opts into.
+
+    Reads ``executor.config.allowed_harnesses`` from the named sub-agent's
+    spec — the explicit opt-in that gates ``args.harness``. Each entry is
+    canonicalized so a user-facing alias still matches.
+
+    :param sub_agent_name: Name of the sub-agent, e.g. ``"opencode"``.
+    :param agent_spec: Parent agent's spec.
+    :returns: Canonical allowlisted harness ids (empty when none declared).
+    """
+    sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
+    if sub_spec is None:
+        return frozenset()
+    executor = getattr(sub_spec, "executor", None)
+    config = getattr(executor, "config", None)
+    raw_allowed: Any = None
+    if isinstance(config, dict):
+        raw_allowed = config.get("allowed_harnesses")
+    elif config is not None:
+        raw_allowed = getattr(config, "allowed_harnesses", None)
+    if not isinstance(raw_allowed, (list, tuple, set, frozenset)):
+        return frozenset()
+    return frozenset(
+        canonicalize_harness(str(entry)) or str(entry)
+        for entry in raw_allowed
+        if isinstance(entry, str) and entry
+    )
+
+
 def _normalize_subagent_model(
     model: str,
     *,
@@ -931,6 +1029,11 @@ async def _execute_subagent_tool(
     except ValueError as exc:
         return f"Error: sys_session_send invalid 'model': {exc}"
 
+    try:
+        harness_override = _subagent_harness_override_from_args(args)
+    except ValueError as exc:
+        return f"Error: sys_session_send invalid 'harness': {exc}"
+
     # By-session-id mode: post to an existing direct child instead of
     # spawning/continuing a named (agent, title) sub-agent.
     target_session_id = args.get("session_id")
@@ -948,6 +1051,13 @@ async def _execute_subagent_tool(
                 "Error: sys_session_send 'model' applies only when a "
                 "sub-agent session is first created; it cannot change an "
                 "existing session. Re-send without 'model' to continue "
+                f"session {target_session_id!r}."
+            )
+        if harness_override is not None:
+            return (
+                "Error: sys_session_send 'harness' applies only when a "
+                "sub-agent session is first created; it cannot change an "
+                "existing session. Re-send without 'harness' to continue "
                 f"session {target_session_id!r}."
             )
         return await _send_to_existing_session(
@@ -1032,6 +1142,42 @@ async def _execute_subagent_tool(
             )
     else:
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
+        # Apply an allowlisted per-dispatch harness override. The sub-agent
+        # spec must explicitly opt in via executor.config.allowed_harnesses,
+        # and the requested harness must canonicalize into OMNIGENT_HARNESSES.
+        # NOTE: the server create route (``_validated_harness_override`` in
+        # server/routes/sessions.py) independently re-validates a session-create
+        # override against the GLOBAL ``OMNIGENT_HARNESSES`` (plus the omnigent
+        # executor-type rule), but it does NOT re-check the per-spec
+        # ``allowed_harnesses`` allowlist. So this orchestrator-dispatch check is
+        # the sole enforcement of that per-spec allowlist; a direct
+        # ``POST /v1/sessions`` harness_override is bounded only by the global
+        # allowlist.
+        harness_override_canonical: str | None = None
+        if harness_override is not None:
+            from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
+
+            canonical = canonicalize_harness(harness_override) or harness_override
+            allowed = _subagent_allowed_harnesses(str(sub_agent_name), agent_spec)
+            if not allowed:
+                return (
+                    f"Error: sys_session_send 'harness' override is not "
+                    f"permitted for sub-agent {sub_agent_name!r}: its spec "
+                    "declares no executor.config.allowed_harnesses allowlist."
+                )
+            if canonical not in allowed:
+                return (
+                    f"Error: sys_session_send 'harness' {harness_override!r} is "
+                    f"not allowlisted for sub-agent {sub_agent_name!r}: allowed "
+                    f"harnesses are {sorted(allowed)}."
+                )
+            if canonical not in OMNIGENT_HARNESSES:
+                return (
+                    f"Error: sys_session_send 'harness' {harness_override!r} is "
+                    f"not a known harness; must be one of {sorted(OMNIGENT_HARNESSES)}."
+                )
+            harness_override_canonical = canonical
+            child_harness = canonical
         # Fail loud at dispatch when the child's harness needs a CLI binary
         # that isn't on PATH. Otherwise a missing CLI surfaces only as a lazy
         # first-turn failure (e.g. the pi harness raises ImportError, which the
@@ -1068,6 +1214,8 @@ async def _execute_subagent_tool(
             "title": f"{sub_agent_name}:{session_name}",
             "sub_agent_name": sub_agent_name,
         }
+        if harness_override_canonical is not None:
+            create_body["harness_override"] = harness_override_canonical
         if model is not None:
             # Reject up front when the child harness would silently
             # ignore the persisted override — no silent drops.
@@ -1176,7 +1324,12 @@ async def _execute_subagent_tool(
                     "content": [{"type": "input_text", "text": str(message)}],
                 },
             },
-            timeout=30.0,
+            # This message is gated at the recipient's REQUEST phase, which can
+            # PARK on a human ASK (e.g. session_cost_budget) up to the policy's
+            # ``ask_timeout``. A 30s read budget severed that park → fail-closed
+            # /retry → duplicate cards. Wait for the real verdict (one-day read
+            # budget, fast connect); a non-parking eval still returns immediately.
+            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
         )
     except httpx.HTTPError as exc:
         _runner_app.unregister_child_session(child_session_id)
@@ -1318,7 +1471,11 @@ async def _send_to_existing_session(
                     "content": [{"type": "input_text", "text": message}],
                 },
             },
-            timeout=30.0,
+            # Same as the other message-send: gated at the recipient's REQUEST
+            # phase, which can PARK on a human ASK up to the policy's
+            # ``ask_timeout``. Wait for the real verdict (one-day read budget,
+            # fast connect) instead of severing at 30s and retrying into duplicates.
+            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
         )
     except httpx.HTTPError as exc:
         _runner_app.unregister_child_session(target_session_id)
@@ -1853,6 +2010,83 @@ async def _execute_web_fetch_tool(
     )
 
 
+def _web_search_config_from_spec(agent_spec: Any | None) -> dict[str, str]:
+    """
+    Return the ``web_search`` builtin's config dict from the parent spec.
+
+    Mirrors ``ToolManager._register_builtin_tools``: scans
+    ``spec.tools.builtins`` for the entry named ``"web_search"`` and returns
+    its ``config`` (``search_provider`` + credentials). Empty dict when the
+    builtin is declared as a bare string or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :returns: The web_search config dict, e.g.
+        ``{"search_provider": "nimble", "api_key": "..."}``.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == "web_search":
+            return getattr(entry, "config", None) or {}
+    return {}
+
+
+async def _execute_web_search_tool(
+    args: dict[str, Any],
+    *,
+    agent_spec: Any | None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """
+    Dispatch a ``web_search`` tool call to the spec's configured backend.
+
+    Builds ``WebSearchTool`` from the spec's ``web_search`` builtin config and
+    runs its synchronous ``invoke`` off the event loop (the backend makes a
+    blocking HTTP call).
+
+    ``llm_provider`` is inferred exactly as ``ToolManager._create_web_search``
+    does, so the dispatch path preserves the same invariants as session setup:
+
+    - **OpenAI models** keep the native ``web_search_preview`` passthrough; if a
+      ``web_search`` function call ever reached this path, ``invoke()`` raises
+      (its built-in fence) and the third-party backend is never run. In normal
+      operation OpenAI models never emit a ``web_search`` function call, so this
+      is defensive — but it keeps the promise rather than silently weakening it.
+    - **``databricks-*`` models** skip provider inference (they don't support
+      ``web_search_preview``) and run in function-tool mode.
+
+    :param args: Parsed LLM arguments — ``query`` (required).
+    :param agent_spec: Parent agent's spec; carries the web_search config + model.
+    :param conversation_id: Parent session id, threaded into the context.
+    :param task_id: Calling task id, threaded into the context.
+    :param agent_id: Calling agent id, threaded into the context.
+    :returns: The formatted search results, or an error string.
+    """
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.web_search import WebSearchTool
+
+    config = _web_search_config_from_spec(agent_spec)
+    # Mirror ToolManager._create_web_search's provider inference (same skip for
+    # databricks-*, same OpenAI passthrough fence) so dispatch honors session-setup invariants.
+    llm_provider: str | None = None
+    model = getattr(getattr(agent_spec, "executor", None), "model", None)
+    if model and not model.startswith("databricks-"):
+        from omnigent.llms.routing import parse_model_string
+
+        llm_provider = parse_model_string(model).provider
+    tool = WebSearchTool(config=config, llm_provider=llm_provider)
+    ctx = ToolContext(
+        task_id=task_id or "web_search",
+        agent_id=agent_id or "web_search",
+        conversation_id=conversation_id,
+    )
+    return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
+
+
 def _has_subagent(
     sub_agent_name: str,
     agent_spec: Any | None,
@@ -2343,6 +2577,7 @@ async def _execute_session_query_tool(
     *,
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
+    agent_spec: Any | None = None,
 ) -> str:
     """
     Runner-local handler for ``sys_session_get_history`` / ``sys_session_list`` /
@@ -2359,6 +2594,8 @@ async def _execute_session_query_tool(
       best-effort ``GET /v1/runners/{id}/status`` for connectivity)
     - ``sys_session_close`` → ``GET`` the target snapshot then ``PATCH
       /v1/sessions/{target}`` with a tombstoned title
+    - ``sys_session_share`` → ``PUT /v1/sessions/{target}/permissions``
+      with the grantee + numeric level
 
     Output shapes mirror the in-process tools in
     :mod:`omnigent.tools.builtins.spawn` so the LLM sees identical
@@ -2368,13 +2605,19 @@ async def _execute_session_query_tool(
     :func:`_execute_subagent_tool`.
 
     :param tool_name: ``"sys_session_get_history"``, ``"sys_session_list"``,
-        ``"sys_session_close"``, or ``"sys_session_get_info"``.
+        ``"sys_session_close"``, ``"sys_session_get_info"``, or
+        ``"sys_session_share"``.
     :param arguments: JSON-encoded arguments string from the LLM, e.g.
         ``'{"conversation_id": "conv_abc123", "tail_items": 5}'``.
     :param conversation_id: The calling session id, e.g. ``"conv_root1"``;
         used as the parent for ``sys_session_list``.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         if unavailable (returns an error string).
+    :param agent_spec: The session's :class:`AgentSpec`. Used only by
+        ``sys_session_share`` to read the spec's
+        ``agent_session_sharing:`` policy (the server can't see it, so
+        the runner is the gate). ``None`` when no spec is available —
+        sharing then fails closed.
     :returns: Tool output JSON string matching the in-process tool shape.
     """
     if server_client is None:
@@ -2392,6 +2635,8 @@ async def _execute_session_query_tool(
         return await _session_get_history_via_rest(args, server_client)
     if tool_name == "sys_session_get_info":
         return await _session_get_info_via_rest(args, conversation_id, server_client)
+    if tool_name == "sys_session_share":
+        return await _session_share_via_rest(args, conversation_id, server_client, agent_spec)
     return await _session_close_via_rest(args, conversation_id, server_client)
 
 
@@ -2495,6 +2740,147 @@ async def _session_get_info_via_rest(
             "pending_elicitations": pending,
             "pending_elicitation_count": len(pending),
         }
+    )
+
+
+def _omnigent_error_message(resp: httpx.Response) -> str | None:
+    """
+    Extract the human-readable message from an Omnigent error response.
+
+    The server renders :class:`omnigent.errors.OmnigentError` as
+    ``{"error": {"code": ..., "message": ...}}`` (see the exception
+    handler in ``omnigent/server/app.py``). Return that ``message`` so a
+    tool can surface the server's own explanation rather than a bare
+    status code; return ``None`` when the body is not that envelope (a
+    non-JSON body, or a differently-shaped payload) so the caller can
+    fall back to a generic message.
+
+    :param resp: The HTTP response whose body to parse, e.g. a 400 from
+        ``PUT /v1/sessions/{id}/permissions``.
+    :returns: The ``error.message`` string, or ``None`` if absent.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        # Non-JSON error body (e.g. an HTML proxy page) — no detail to surface.
+        return None
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            message = err.get("message")
+            if isinstance(message, str) and message:
+                return message
+    return None
+
+
+async def _session_share_via_rest(
+    args: dict[str, Any],
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+    agent_spec: Any | None,
+) -> str:
+    """
+    Grant a user access to a session via ``PUT /v1/sessions/{id}/permissions``.
+
+    Resolves the target from ``args["session_id"]`` (falling back to the
+    caller's own ``conversation_id`` when omitted), maps the friendly
+    ``level`` name to the server's numeric level, and PUTs the grant.
+    Same channel and security posture as the other session REST tools:
+    the server enforces that ``server_client``'s identity holds
+    manage-level access on the target (the session owner does), and caps
+    public (``__public__``) grants at read.
+
+    The spec's ``agent_session_sharing:`` policy is enforced HERE, in the
+    runner, because the server cannot see it: an ``agent_session_sharing:
+    none`` (or unknown) spec refuses every grant, and an
+    ``agent_session_sharing: non-public`` spec refuses ``__public__``.
+    This is the real gate — tool *advertisement* is gated in the
+    ToolManager, but an unadvertised-yet-named call must still be denied
+    so a prompt-injected agent can't escalate by emitting the tool name.
+
+    Maps 404 to ``session_not_found`` and 401/403 to ``access_denied``;
+    other 4xx/5xx surface the server's own error message when present
+    (e.g. the "public is read-only" rejection of a ``__public__`` grant
+    above read level) instead of a bare status code.
+
+    :param args: Parsed tool arguments. Requires ``user_id`` (grantee
+        email or ``"__public__"``); optional ``level`` (``"read"``
+        default / ``"edit"`` / ``"manage"``) and ``session_id``.
+    :param conversation_id: The caller's own session id, used as the
+        default target when ``session_id`` is omitted.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param agent_spec: The session's :class:`AgentSpec`; its
+        ``agent_session_sharing`` policy gates this call. ``None`` (or
+        ``agent_session_sharing: none``) fails closed — no grant is
+        attempted.
+    :returns: JSON ``{"shared": true, ...}`` on success, or a JSON
+        error object.
+    """
+    target = args.get("session_id") or conversation_id
+    if not isinstance(target, str) or not target:
+        return json.dumps({"error": "sys_session_share requires a non-empty 'session_id' string"})
+    user_id = args.get("user_id")
+    if not isinstance(user_id, str) or not user_id:
+        return json.dumps({"error": "sys_session_share requires a non-empty 'user_id'"})
+    # Enforce the spec's ``agent_session_sharing:`` policy (SharePolicy is
+    # a str-enum, so compare its value directly). ``none``/absent disables
+    # the feature; ``__public__`` requires the ``public`` tier specifically.
+    share_policy = getattr(agent_spec, "agent_session_sharing", None)
+    if share_policy not in _SHARE_ENABLED_POLICIES:
+        return json.dumps(
+            {
+                "error": (
+                    "sys_session_share: session sharing is not enabled for this "
+                    "agent (set agent_session_sharing: non-public or "
+                    "agent_session_sharing: public in the spec)"
+                ),
+                "session_id": target,
+            }
+        )
+    if user_id == _PUBLIC_USER_SENTINEL and share_policy != _SHARE_PUBLIC_POLICY:
+        return json.dumps(
+            {
+                "error": (
+                    "sys_session_share: public ('__public__') sharing is not "
+                    "enabled for this agent (requires agent_session_sharing: "
+                    "public); grant a specific user instead"
+                ),
+                "session_id": target,
+            }
+        )
+    # Friendly level name -> the server's numeric permission level
+    # (GrantPermissionRequest accepts 1=read, 2=edit, 3=manage).
+    level_by_name = {"read": 1, "edit": 2, "manage": 3}
+    level_name = args.get("level", "read")
+    if level_name not in level_by_name:
+        return json.dumps(
+            {"error": f"sys_session_share: level must be one of {sorted(level_by_name)}"}
+        )
+    try:
+        resp = await server_client.put(
+            f"/v1/sessions/{target}/permissions",
+            json={"user_id": user_id, "level": level_by_name[level_name]},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_share failed: {exc}"})
+    if resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "session_id": target})
+    if resp.status_code in (401, 403):
+        return json.dumps({"error": "access_denied", "session_id": target})
+    if resp.status_code >= 400:
+        # Surface the server's own message when present — e.g. the 400
+        # rejecting a __public__ grant above read level carries "Public
+        # access is limited to read-only (level 1)", which is far more
+        # actionable for the agent than a bare status code.
+        detail = _omnigent_error_message(resp)
+        if detail is not None:
+            return json.dumps(
+                {"error": detail, "status_code": resp.status_code, "session_id": target}
+            )
+        return json.dumps({"error": f"sys_session_share returned {resp.status_code}"})
+    return json.dumps(
+        {"shared": True, "session_id": target, "user_id": user_id, "level": level_name}
     )
 
 
@@ -3359,6 +3745,7 @@ async def execute_tool(
     arguments: str,
     server_client: httpx.AsyncClient | None = None,
     terminal_registry: Any | None = None,
+    resource_registry: Any | None = None,
     agent_spec: Any | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
@@ -3386,6 +3773,9 @@ async def execute_tool(
         runner's per-session outbound queue. ``None`` from
         dispatch sites that don't need event emission (e.g.
         async background tools).
+    :param resource_registry: Optional session-resource registry used to
+        observe tool-launched terminals through the same lifecycle path as
+        runner-launched terminals.
     :param filesystem_registry: Optional registry for tracking agent
         file modifications. Forwarded to ``_execute_os_env_tool``
         so that ``sys_os_write`` and ``sys_os_edit`` calls record changed
@@ -3436,6 +3826,7 @@ async def execute_tool(
                 tool_name,
                 args,
                 terminal_registry=terminal_registry,
+                resource_registry=resource_registry,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
                 task_id=task_id,
@@ -3453,6 +3844,7 @@ async def execute_tool(
                 harness_client=harness_client or httpx.AsyncClient(),
                 server_client=server_client,
                 terminal_registry=terminal_registry,
+                resource_registry=resource_registry,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
                 task_id=task_id,
@@ -3488,6 +3880,7 @@ async def execute_tool(
                 arguments,
                 conversation_id=conversation_id,
                 server_client=server_client,
+                agent_spec=agent_spec,
             )
         elif tool_name in _WEB_FETCH_TOOLS:
             output = await _execute_web_fetch_tool(
@@ -3498,6 +3891,14 @@ async def execute_tool(
                 task_id=task_id,
                 publish_event=publish_event,
                 session_inbox=session_inbox,
+            )
+        elif tool_name in _WEB_SEARCH_TOOLS:
+            output = await _execute_web_search_tool(
+                args,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
             )
         elif tool_name in _TIMER_TOOLS:
             if tool_name == "sys_timer_set":
@@ -3632,6 +4033,7 @@ async def dispatch_tool_locally(
     harness_client: httpx.AsyncClient,
     server_client: httpx.AsyncClient | None = None,
     terminal_registry: Any | None = None,
+    resource_registry: Any | None = None,
     agent_spec: Any | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
@@ -3662,6 +4064,8 @@ async def dispatch_tool_locally(
         file modifications. Forwarded to ``execute_tool`` so that
         ``sys_os_write`` and ``sys_os_edit`` calls record changed paths
         for the ``GET …/changes`` endpoint.
+    :param resource_registry: Optional session-resource registry used to
+        observe tool-launched terminals.
     :returns: The tool output string.
     """
     output = await execute_tool(
@@ -3669,6 +4073,7 @@ async def dispatch_tool_locally(
         arguments=arguments,
         server_client=server_client,
         terminal_registry=terminal_registry,
+        resource_registry=resource_registry,
         agent_spec=agent_spec,
         conversation_id=conversation_id,
         task_id=task_id,
@@ -4179,6 +4584,7 @@ async def _execute_terminal_tool(
     args: dict[str, Any],
     *,
     terminal_registry: Any | None,
+    resource_registry: Any | None = None,
     agent_spec: Any | None,
     conversation_id: str | None,
     task_id: str | None,
@@ -4202,6 +4608,8 @@ async def _execute_terminal_tool(
         the web rail updates mid-turn instead of waiting for the
         response-end terminals-cache invalidation. ``None`` for
         in-process callers / tests that don't relay.
+    :param resource_registry: Optional session-resource registry used to
+        observe fresh launches as auxiliary terminal resources.
     """
     import asyncio
 
@@ -4255,24 +4663,26 @@ async def _execute_terminal_tool(
         SysTerminalLaunchTool.name(),
         SysTerminalCloseTool.name(),
     ):
-        _emit_terminal_resource_event(
+        await _emit_terminal_resource_event(
             tool_name=tool_name,
             output=output,
             args=args,
             conversation_id=conversation_id,
             terminal_registry=terminal_registry,
+            resource_registry=resource_registry,
             publish_event=publish_event,
         )
     return output
 
 
-def _emit_terminal_resource_event(
+async def _emit_terminal_resource_event(
     *,
     tool_name: str,
     output: str,
     args: dict[str, Any],
     conversation_id: str,
     terminal_registry: Any,
+    resource_registry: Any | None,
     publish_event: Callable[[str, dict[str, Any]], None],
 ) -> None:
     """Emit a ``session.resource.{created,deleted}`` event for a terminal tool.
@@ -4300,6 +4710,8 @@ def _emit_terminal_resource_event(
         ``"conv_abc123"``.
     :param terminal_registry: The runner's ``TerminalRegistry``,
         used to look up the live instance for a fresh launch.
+    :param resource_registry: Optional session-resource registry used to
+        observe fresh launches as auxiliary terminal resources.
     :param publish_event: The runner's per-session SSE emitter.
     """
     try:
@@ -4315,11 +4727,12 @@ def _emit_terminal_resource_event(
 
     status = envelope.get("status")
     if tool_name == SysTerminalLaunchTool.name() and status == "launched":
-        _publish_terminal_created_event(
+        await _publish_terminal_created_event(
             conversation_id=conversation_id,
             terminal_name=terminal_name,
             session_key=session_key,
             terminal_registry=terminal_registry,
+            resource_registry=resource_registry,
             publish_event=publish_event,
         )
     elif tool_name == SysTerminalCloseTool.name() and status == "closed":
@@ -4331,12 +4744,13 @@ def _emit_terminal_resource_event(
         )
 
 
-def _publish_terminal_created_event(
+async def _publish_terminal_created_event(
     *,
     conversation_id: str,
     terminal_name: str,
     session_key: str,
     terminal_registry: Any,
+    resource_registry: Any | None,
     publish_event: Callable[[str, dict[str, Any]], None],
 ) -> None:
     """Build and publish ``session.resource.created`` for a fresh launch.
@@ -4352,38 +4766,53 @@ def _publish_terminal_created_event(
     :param terminal_name: Terminal spec name, e.g. ``"bash"``.
     :param session_key: Per-launch session key, e.g. ``"s1"``.
     :param terminal_registry: The runner's ``TerminalRegistry``.
+    :param resource_registry: Optional session-resource registry used to
+        observe the launched terminal as auxiliary.
     :param publish_event: The runner's per-session SSE emitter.
     """
-    from omnigent.entities.session_resources import (
-        session_resource_view_to_dict,
-        terminal_resource_view,
-    )
-    from omnigent.terminals.registry import TerminalListEntry
+    from omnigent.entities.session_resources import session_resource_view_to_dict
 
     instance = terminal_registry.get(conversation_id, terminal_name, session_key)
     if instance is None:
         return
-    entry = TerminalListEntry(
-        terminal_name=terminal_name,
-        session_key=session_key,
-        instance=instance,
-    )
-    resource = session_resource_view_to_dict(terminal_resource_view(conversation_id, entry))
+    if resource_registry is not None:
+        try:
+            view = await resource_registry.observe_auxiliary_terminal(
+                conversation_id,
+                terminal_name,
+                session_key,
+                instance,
+            )
+        except Exception:
+            _logger.exception(
+                "Failed to observe tool-launched terminal: session=%s terminal=%s:%s",
+                conversation_id,
+                terminal_name,
+                session_key,
+            )
+            return
+        resource = session_resource_view_to_dict(view)
+    else:
+        from omnigent.entities.session_resources import terminal_resource_view
+        from omnigent.terminals.registry import TerminalListEntry
+
+        entry = TerminalListEntry(
+            terminal_name=terminal_name,
+            session_key=session_key,
+            instance=instance,
+        )
+        resource = session_resource_view_to_dict(terminal_resource_view(conversation_id, entry))
     publish_event(
         conversation_id,
         {"type": "session.resource.created", "resource": resource},
     )
 
-    # Start the runner-side pane-activity watcher for this tool-launched
-    # terminal so the web "active" badge works for it without a client
-    # attach. The agent-tool launch path uses ``terminal_registry``
-    # directly (not ``resource_registry.launch_terminal``), so this is the
-    # only hook that covers it. We run on the runner's MAIN event loop
-    # here (this fires after the launch ``to_thread`` returns), so capture
-    # it for the watcher daemon thread to hop onto via
-    # ``call_soon_threadsafe`` — the loop the tool's launch ran on is a
-    # throwaway per-call ``asyncio.run`` loop and would be dead. Idempotent
-    # (the watcher no-ops if already running) and stopped by ``close()``.
+    # Legacy fallback for callers that do not have a SessionResourceRegistry:
+    # start the runner-side pane-activity watcher here so the web "active"
+    # badge still works. Normal runner dispatch uses observe_auxiliary_terminal
+    # above, which owns the watcher and terminal-exit lifecycle semantics.
+    if resource_registry is not None:
+        return
     resource_id = resource["id"]
     if isinstance(resource_id, str) and resource_id:
         loop = asyncio.get_running_loop()
@@ -4445,6 +4874,7 @@ async def _execute_async_inbox_tool(
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None,
     server_client: httpx.AsyncClient | None,
     terminal_registry: Any | None,
+    resource_registry: Any | None,
     agent_spec: Any | None,
     conversation_id: str | None,
     task_id: str | None,
@@ -4470,6 +4900,8 @@ async def _execute_async_inbox_tool(
         changes made by tools spawned via ``sys_call_async``.
         Forwarded to ``_spawn_async_tool`` so that async OS-env tool
         calls record paths for the ``GET …/changes`` endpoint.
+    :param resource_registry: Optional session-resource registry used by
+        async terminal-tool launches.
     :param harness_client: Unused; kept for caller compatibility.
     :returns: Tool output string.
     """
@@ -4488,6 +4920,7 @@ async def _execute_async_inbox_tool(
             session_async_tasks=session_async_tasks,
             server_client=server_client,
             terminal_registry=terminal_registry,
+            resource_registry=resource_registry,
             agent_spec=agent_spec,
             conversation_id=conversation_id,
             task_id=task_id,
@@ -4871,6 +5304,7 @@ def _spawn_async_tool(
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None,
     server_client: httpx.AsyncClient | None,
     terminal_registry: Any | None,
+    resource_registry: Any | None,
     agent_spec: Any | None,
     conversation_id: str | None,
     task_id: str | None,
@@ -4893,6 +5327,8 @@ def _spawn_async_tool(
         ``execute_tool`` so that OS-env tools invoked via
         ``sys_call_async`` record file changes for the
         ``GET …/changes`` endpoint.
+    :param resource_registry: Optional session-resource registry used by
+        async terminal-tool launches.
     :returns: JSON handle string with ``handle_id``, ``tool_name``,
         ``status``.
     """
@@ -4926,6 +5362,7 @@ def _spawn_async_tool(
                 arguments=target_args,
                 server_client=server_client,
                 terminal_registry=terminal_registry,
+                resource_registry=resource_registry,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
                 task_id=task_id,

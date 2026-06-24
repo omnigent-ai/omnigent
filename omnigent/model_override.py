@@ -26,7 +26,17 @@ _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]*$")
 # SDK harnesses whose model override lands in the spawn env — must stay
 # in sync with ``_HARNESS_MODEL_ENV_KEY`` in ``omnigent/runner/app.py``.
 _SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
-    {"claude-sdk", "codex", "pi", "openai-agents", "cursor", "antigravity"}
+    {
+        "claude-sdk",
+        "codex",
+        "pi",
+        "openai-agents",
+        "cursor",
+        "antigravity",
+        "qwen",
+        "goose",
+        "copilot",
+    }
 )
 
 
@@ -81,7 +91,15 @@ _CODEX_FAMILY_HARNESSES: frozenset[str] = frozenset({"codex", "codex-native", "n
 # dispatch gate instead of leaking a ``HARNESS_ANTIGRAVITY_MODEL`` the SDK can
 # never route.
 _ANTIGRAVITY_FAMILY_HARNESSES: frozenset[str] = frozenset(
-    {"antigravity", "agy", "google-antigravity"}
+    {
+        "antigravity",
+        "agy",
+        "google-antigravity",
+        # The native agy TUI bridge is equally Gemini-native (it drives the
+        # same Gemini-backed ``agy`` runtime), so it shares the reject-list.
+        "antigravity-native",
+        "native-antigravity",
+    }
 )
 # A ``databricks-`` gateway prefix marks an id bound to the Databricks gateway,
 # which antigravity never reaches — a definitive mismatch on its own.
@@ -116,7 +134,7 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
         return (
             f"harness {canon!r} only runs Claude models (id containing "
             f"'claude'); got {model!r}. Use the codex worker for GPT models "
-            "or the pi worker for any other gateway model."
+            "or the pi / openai-agents worker for any other gateway model."
         )
     if canon in _CODEX_FAMILY_HARNESSES and not is_gpt:
         return (
@@ -215,7 +233,7 @@ def harness_supports_model_override(harness: str | None) -> bool:
     Native CLIs (claude-native / codex-native) receive the override as
     ``--model`` at terminal launch; the SDK harnesses receive it via
     ``HARNESS_<H>_MODEL`` in the spawn env. Anything else (e.g.
-    ``databricks_supervisor``, unknown harnesses) silently ignores the
+    unknown harnesses) silently ignores the
     persisted value, so callers must reject the override up front.
 
     :param harness: Harness id from a spec, e.g. ``"codex-native"`` or

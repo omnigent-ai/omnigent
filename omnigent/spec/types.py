@@ -26,10 +26,17 @@ if TYPE_CHECKING:
 DEFAULT_POLICY_CLASSIFIER_TIMEOUT = 30
 
 # Default timeout (seconds) for user approval on an ASK policy.
-# 30 s matches omnigent parity. Overrideable per-policy via
-# ``PolicySpec.ask_timeout`` or spec-wide via
-# ``GuardrailsSpec.ask_timeout``. See POLICIES.md §7, §13.
-DEFAULT_ASK_TIMEOUT = 30
+# One day — an ASK is a human-in-the-loop gate and should outlive a
+# user stepping away, matching every other wait-for-a-human budget in
+# the native path (the PermissionRequest / evaluate-policy hook
+# long-polls and their server-side mirrors are all 86400). A shorter
+# default fails closed (DENY) without any user input, flipping the web
+# card to a neutral "Resolved elsewhere" — surprising for an
+# interactive session. Headless/unattended agents that want a fast
+# fail-closed should override this per-policy via ``PolicySpec.ask_timeout``
+# or spec-wide via ``GuardrailsSpec.ask_timeout`` (see polly's config).
+# See POLICIES.md §7, §13.
+DEFAULT_ASK_TIMEOUT = 86400
 
 
 @dataclass(frozen=True)
@@ -492,9 +499,8 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
     :param max_iterations: Maximum ``run_turn()`` calls before the
         loop terminates as incomplete, e.g. ``1000``.
     :param profile: The Databricks workspace profile name from
-        ``~/.databrickscfg``, e.g. ``"dev"``. Used by the
-        ``databricks_supervisor`` harness and (during the
-        omnigent-compat sunset) lifted from raw YAML's
+        ``~/.databrickscfg``, e.g. ``"dev"``. During the
+        omnigent-compat sunset this is lifted from raw YAML's
         ``executor.profile`` in the omnigent path too. ``None``
         means resolve via env vars / DEFAULT section.
 
@@ -553,24 +559,6 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         ring and the compression threshold. Use this for models that
         are not yet in the registry, e.g. ``context_window: 400000``
         in ``config.yaml``. ``None`` means auto-detect (default).
-    :param supervisor_tools: Verbatim list of nested tool
-        declarations for the ``databricks_supervisor`` harness, e.g.
-        ``[{"type": "genie_space",
-        "genie_space": {"id": "abc-123",
-        "description": "Sales analytics"}},
-        {"type": "uc_function",
-        "uc_function": {"name": "main.search",
-        "description": "Search the catalog"}}]``. Each entry has a
-        ``type`` key plus a nested sub-dict keyed on the same type
-        carrying the tool's per-type config (post env-var
-        expansion) — the shape the real Databricks Supervisor API
-        accepts. The list round-trips verbatim — the parser does
-        NOT normalize these into a function-tool shape because the
-        supervisor executor consumes them as-is. ``None`` when the
-        ``databricks_supervisor`` harness is not selected. The
-        value type is ``dict[str, Any]`` because the nested
-        sub-dict carries heterogeneous fields (booleans, numbers,
-        etc.) per the gateway's per-type schema.
     :param auth: Explicit LLM authentication configuration. When set,
         the harness uses this to authenticate instead of falling back
         to ambient environment variables or profile auto-detection.
@@ -585,8 +573,7 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
     timeout: int = 3600
     max_iterations: int = 1000
     # Databricks workspace profile name from ~/.databrickscfg.
-    # Used by the databricks_supervisor harness and (during the
-    # omnigent-compat sunset) lifted from raw YAML's
+    # During the omnigent-compat sunset, lifted from raw YAML's
     # executor.profile in the omnigent path too. None = resolve
     # via env vars / DEFAULT section. See class docstring.
     # DEPRECATED: use executor.auth: {type: databricks, profile: <name>} instead.
@@ -604,14 +591,6 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
     connection: dict[str, str] | None = None
     # Explicit context window override (input + output tokens). None = auto-detect via litellm.
     context_window: int | None = None
-    # Verbatim list of nested tool declarations for the
-    # databricks_supervisor harness. Populated only when
-    # config.harness == "databricks_supervisor". Each entry:
-    # {type: X, X: {<config>}} matching the Databricks Supervisor
-    # API. Inner config dict values are heterogeneous (the gateway
-    # accepts strings, numbers, bools), so the value type is
-    # dict[str, Any]. None when the supervisor harness is not used.
-    supervisor_tools: list[dict[str, Any]] | None = None  # type: ignore[explicit-any]
     # Explicit executor auth. Populated from executor.auth in the YAML.
     # Takes precedence over ambient env vars and profile auto-detection.
     # None = fall back to env vars / profile defaults.
@@ -772,12 +751,34 @@ class SandboxConfig:
     is enabled/enforced is a runtime decision — see
     ``RuntimeCaps.sandbox_enabled``.
 
-    :param docker_image: When set, tools run inside this Docker
-        container instead of a local subprocess. Docker provides
-        its own isolation, e.g. ``"python:3.12-slim"``.
+    :param container_image: When set, tools run inside this
+        container instead of a local subprocess, e.g.
+        ``"python:3.12-slim"``.
+    :param docker_image: Deprecated alias for ``container_image``.
+        If both are set, ``container_image`` takes precedence.
+    :param container_runtime: The container CLI to use, either
+        ``"docker"`` (default) or ``"podman"``.
     """
 
+    container_image: str | None = None
     docker_image: str | None = None
+    container_runtime: Literal["docker", "podman"] = "docker"
+
+    _ALLOWED_RUNTIMES = frozenset({"docker", "podman"})
+
+    def __post_init__(self) -> None:
+        if self.container_runtime not in self._ALLOWED_RUNTIMES:
+            raise ValueError(
+                f"container_runtime must be one of {sorted(self._ALLOWED_RUNTIMES)}, "
+                f"got {self.container_runtime!r}"
+            )
+        # Resolve the deprecated docker_image alias: if only
+        # docker_image was provided, promote it to container_image.
+        # Then sync docker_image to container_image so both fields
+        # always agree after construction.
+        if self.container_image is None and self.docker_image is not None:
+            self.container_image = self.docker_image
+        self.docker_image = self.container_image
 
 
 @dataclass
@@ -962,6 +963,28 @@ class ToolRuntime(str, Enum):
     SERVER = "server"
     CLIENT = "client"
     UC_FUNCTION = "uc_function"
+
+
+class SharePolicy(str, Enum):
+    """How much session-sharing authority ``sys_session_share`` grants.
+
+    Maps the top-level ``agent_session_sharing:`` YAML flag. The flag is
+    the *only* thing that enables the ``sys_session_share`` tool — it is
+    independent of ``spawn`` / ``tools.agents`` (which gate the
+    spawn-lifecycle tools). Sharing mutates access control, so it is
+    off by default and the public tier is a deliberate extra opt-in.
+
+    - :attr:`NONE`: sharing disabled — ``sys_session_share`` is not
+      registered at all (default).
+    - :attr:`NON_PUBLIC`: the agent may grant access to named users
+      (emails), but NOT to ``__public__`` — no anonymous-read exposure.
+    - :attr:`PUBLIC`: the agent may additionally grant ``__public__``
+      (anonymous read of the full transcript).
+    """
+
+    NONE = "none"
+    NON_PUBLIC = "non-public"
+    PUBLIC = "public"
 
 
 @dataclass
@@ -1332,7 +1355,7 @@ class GuardrailsSpec:
     :param ask_timeout: Spec-wide default approval timeout in
         seconds. Individual policies may override via
         ``PolicySpec.ask_timeout``. Defaults to
-        :data:`DEFAULT_ASK_TIMEOUT` (30 s).
+        :data:`DEFAULT_ASK_TIMEOUT` (1 day).
     """
 
     labels: dict[str, LabelDef] | None = None
@@ -1449,6 +1472,16 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``sys_session_get_history`` / ``sys_session_get_info``)
         are always registered and are not affected by either
         opt-in.
+    :param agent_session_sharing: Authority for the agent to share the
+        session it is running in, via ``sys_session_share``. YAML key is
+        ``agent_session_sharing:`` (top-level, like ``spawn:``). This
+        flag is the SOLE enabler of that tool — it is independent of
+        ``spawn`` / ``tools.agents``, and has no bearing on sharing the
+        session through the server API or CLI. One of
+        :class:`SharePolicy`: ``none`` (default — tool not registered),
+        ``non-public`` (grant named users only), or ``public`` (also
+        allow ``__public__`` anonymous read). **Defaults to
+        ``SharePolicy.NONE``.**
     """
 
     spec_version: int
@@ -1494,3 +1527,4 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     terminals: dict[str, TerminalEnvSpec] | None = None
     timers: bool = False
     spawn: bool = False
+    agent_session_sharing: SharePolicy = SharePolicy.NONE

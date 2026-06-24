@@ -114,8 +114,7 @@ class TextChunk(ExecutorEvent):
 class ReasoningChunk(ExecutorEvent):
     """Streaming reasoning / chain-of-thought output.
 
-    Mirrors :class:`omnigent.runtime.executors.base.ReasoningChunk` so the
-    workflow's ``_event_to_sse_dict`` can map either flavor onto the same
+    The workflow's ``_event_to_sse_dict`` maps this onto the
     ``response.reasoning_text.delta`` / ``response.reasoning.started`` SSE
     events.
 
@@ -209,6 +208,29 @@ class ToolCallComplete(ExecutorEvent):
     error: str | None = None
     duration_ms: float = 0.0
     metadata: ToolCallMetadata = field(default_factory=dict)
+
+
+@dataclass
+class CompactionComplete(ExecutorEvent):
+    """The harness compacted its internal context.
+
+    The runner persists this as a compaction item so resumed sessions
+    receive pre-compacted history.
+
+    :param summary: Text summary of the compacted conversation.
+    :param token_count: Estimated token count of the summary.
+    :param model: Model used for summarization, or None if truncation-based.
+    :param compacted_messages: The compacted message list that replaces
+        the pre-compaction history, stored by the runner so a resumed
+        session replays these instead of the full original history.
+        ``None`` when the harness cannot export its compacted state
+        (e.g. claude-sdk where compaction is internal to the CLI).
+    """
+
+    summary: str
+    token_count: int
+    model: str | None = None
+    compacted_messages: list[dict[str, Any]] | None = None
 
 
 @dataclass

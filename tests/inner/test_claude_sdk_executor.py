@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -100,7 +100,7 @@ class TestConstructor(unittest.TestCase):
         self.assertIsNone(executor._os_env_spec)
         self.assertIsNone(executor._cwd)
         self.assertIsNone(executor._model_override)
-        self.assertEqual(executor._permission_mode, "bypassPermissions")
+        self.assertEqual(executor._permission_mode, "auto")
         self.assertIsNone(executor._tool_executor)
         self.assertEqual(executor._clients, {})
         self.assertEqual(executor._crashed_sessions, {})
@@ -694,6 +694,44 @@ class TestConstructor(unittest.TestCase):
             terminate_tree.assert_called_once()
 
         _run(_t())
+
+    def test_force_close_client_handles_sdk_without_stderr_task_group(self):
+        # Regression: claude-agent-sdk >=0.2.x renamed the stderr reader from an
+        # anyio task group (`_stderr_task_group`) to a single `_stderr_task`
+        # TaskHandle. A transport shaped like the current SDK (no
+        # `_stderr_task_group` attribute at all) must not raise AttributeError
+        # out of `_force_close_client` — that exception escaped the runner's
+        # lifespan shutdown and crashed it on every session stop.
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        stderr_task = SimpleNamespace(cancel=Mock())
+
+        class _Transport:
+            def __init__(self):
+                self._process = SimpleNamespace(returncode=None, pid=12345, wait=AsyncMock())
+                self._stdout_stream = object()
+                self._stdin_stream = object()
+                self._stderr_stream = object()
+                self._stderr_task = stderr_task  # current SDK shape
+                self._ready = True
+
+        transport = _Transport()
+        client = SimpleNamespace(_query=None, _transport=transport)
+
+        async def _t():
+            with patch(
+                "omnigent.inner.claude_sdk_executor._terminate_process_tree"
+            ) as terminate_tree:
+                await ClaudeSDKExecutor._force_close_client(client)
+            terminate_tree.assert_called_once()
+
+        _run(_t())
+
+        # New-shape stderr task was cancelled, the missing legacy attribute was
+        # never created, and the handle was cleared.
+        stderr_task.cancel.assert_called_once()
+        self.assertFalse(hasattr(transport, "_stderr_task_group"))
+        self.assertIsNone(transport._stderr_task)
 
     def test_claude_internal_write_files_omits_missing_config(self):
         from omnigent.inner.claude_sdk_executor import _claude_internal_write_files
@@ -1553,6 +1591,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             class ClaudeSDKClient:
                 def __init__(self, options):
                     captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
+                    captured_options["system_prompt"] = getattr(options, "system_prompt", None)
 
                 async def connect(self):
                     return None
@@ -1588,10 +1627,14 @@ class TestStreamEventStreaming(unittest.TestCase):
                                 },
                             }
                         ],
-                        "",
+                        "Delegate through `sys_session_send`.",
                     )
                 ]
             self.assertIn("mcp__omnigent__sys_session_send", captured_options["allowed_tools"])
+            self.assertIn(
+                "use `mcp__omnigent__sys_session_send` when instructions say `sys_session_send`",
+                captured_options["system_prompt"],
+            )
             self.assertIsInstance(events[-1], TurnComplete)
 
         _run(_t())
@@ -3333,3 +3376,191 @@ class TestToolCallPolicyGate(unittest.TestCase):
             self.assertIsNone(captured["can_use_tool"])
 
         _run(_t())
+
+
+# ---------------------------------------------------------------------------
+# Tests: Compaction detection via PreCompact hook
+# ---------------------------------------------------------------------------
+
+
+def test_precompact_hook_emits_compaction_complete_with_session_messages() -> None:
+    """When PreCompact fires and a ResultMessage carries a session_id,
+    CompactionComplete is emitted with compacted_messages read from
+    the CLI's session transcript."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete
+
+    class _ResultMessage:
+        def __init__(self, session_id, result):
+            self.session_id = session_id
+            self.result = result
+            self.content = []
+            self.model = "claude-test"
+            self.usage = type(
+                "U",
+                (),
+                {
+                    "input_tokens": 500,
+                    "output_tokens": 100,
+                },
+            )()
+
+    class _SystemMessage:
+        def __init__(self, subtype, data, hook_event_name=None):
+            self.subtype = subtype
+            self.data = data
+            self.hook_event_name = hook_event_name
+
+    class _HookEventMessage(_SystemMessage):
+        pass
+
+    class _FakeSessionMessage:
+        def __init__(self, type, message):
+            self.type = type
+            self.message = message
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = _SystemMessage
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+        messages: list = []
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                _FakeSDK.messages = [
+                    _HookEventMessage(
+                        subtype="hook_started",
+                        data={"hook_event": "PreCompact"},
+                        hook_event_name="PreCompact",
+                    ),
+                    _ResultMessage("claude-uuid-123", "compacted result"),
+                ]
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    fake_session_msgs = [
+        _FakeSessionMessage("user", {"content": [{"type": "text", "text": "hi"}]}),
+        _FakeSessionMessage("assistant", {"content": [{"type": "text", "text": "compacted"}]}),
+    ]
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                return_value=_FakeSDK,
+            ),
+            patch(
+                "claude_agent_sdk.get_session_messages",
+                return_value=fake_session_msgs,
+            ) as mock_get_msgs,
+        ):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        compaction_events = [e for e in events if isinstance(e, CompactionComplete)]
+        assert len(compaction_events) == 1
+        ce = compaction_events[0]
+        assert ce.compacted_messages is not None
+        assert len(ce.compacted_messages) == 2
+        assert ce.compacted_messages[0]["role"] == "user"
+        assert ce.compacted_messages[1]["role"] == "assistant"
+        mock_get_msgs.assert_called_once_with("claude-uuid-123", directory=None)
+        # CompactionComplete before TurnComplete
+        turn_completes = [e for e in events if isinstance(e, TurnComplete)]
+        assert len(turn_completes) == 1
+        assert events.index(compaction_events[0]) < events.index(turn_completes[0])
+
+    _run(_t())
+
+
+def test_no_precompact_no_compaction_event() -> None:
+    """When no PreCompact hook fires, no CompactionComplete is yielded."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete
+
+    class _ResultMessage:
+        def __init__(self, session_id, result):
+            self.session_id = session_id
+            self.result = result
+            self.content = []
+            self.model = "claude-test"
+            self.usage = type(
+                "U",
+                (),
+                {
+                    "input_tokens": 500,
+                    "output_tokens": 100,
+                },
+            )()
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = type("SystemMessage", (), {})
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+        messages: list = []
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                _FakeSDK.messages = [_ResultMessage(session_id, "normal result")]
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        compaction_events = [e for e in events if isinstance(e, CompactionComplete)]
+        assert len(compaction_events) == 0
+
+    _run(_t())

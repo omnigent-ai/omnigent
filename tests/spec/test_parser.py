@@ -9,7 +9,7 @@ import yaml
 
 from omnigent.errors import OmnigentError
 from omnigent.spec.parser import discover_host_skills, parse
-from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth
+from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
 
 @pytest.fixture()
@@ -1070,6 +1070,45 @@ def test_parse_inline_mcp_skips_standard_tools_keys(tmp_path: Path) -> None:
     # If any standard key leaked through, len() would be > 1.
     assert len(spec.mcp_servers) == 1
     assert spec.mcp_servers[0].name == "real_mcp"
+
+
+def test_parse_tools_sandbox_docker_image_alias(tmp_path: Path) -> None:
+    """Legacy ``tools.sandbox.docker_image`` remains a valid image alias."""
+    config = {
+        "spec_version": 1,
+        "name": "legacy-docker-image",
+        "tools": {
+            "sandbox": {
+                "docker_image": "python:3.12-slim",
+                "container_runtime": "podman",
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.tools.sandbox.container_image == "python:3.12-slim"
+    assert spec.tools.sandbox.docker_image == "python:3.12-slim"
+    assert spec.tools.sandbox.container_runtime == "podman"
+
+
+def test_parse_tools_sandbox_container_image_precedence(tmp_path: Path) -> None:
+    """Preferred ``container_image`` wins when both image keys exist."""
+    config = {
+        "spec_version": 1,
+        "name": "container-image-precedence",
+        "tools": {
+            "sandbox": {
+                "container_image": "python:3.12-slim",
+                "docker_image": "python:3.11-slim",
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.tools.sandbox.container_image == "python:3.12-slim"
+    assert spec.tools.sandbox.docker_image == "python:3.12-slim"
 
 
 def test_parse_inline_mcp_skips_non_mcp_type_entries(tmp_path: Path) -> None:
@@ -2316,6 +2355,65 @@ def test_parse_spawn_true_sets_flag(tmp_path: Path) -> None:
     assert spec.spawn is True
 
 
+def test_parse_share_defaults_to_none_when_omitted(agent_dir: Path) -> None:
+    """
+    Without a top-level ``agent_session_sharing:`` key the parsed
+    ``AgentSpec.agent_session_sharing`` is :attr:`SharePolicy.NONE` —
+    sharing is off by default, so ``sys_session_share`` is not
+    registered. A regression flipping the default would expose the
+    access-control mutation (incl. ``__public__``) to every agent.
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    spec = parse(agent_dir)
+    assert spec.agent_session_sharing is SharePolicy.NONE
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("none", SharePolicy.NONE),
+        ("non-public", SharePolicy.NON_PUBLIC),
+        ("public", SharePolicy.PUBLIC),
+    ],
+)
+def test_parse_share_maps_each_policy_string(
+    tmp_path: Path,
+    value: str,
+    expected: SharePolicy,
+) -> None:
+    """
+    Each recognized ``agent_session_sharing:`` string round-trips to its
+    :class:`SharePolicy` member. The flag is the sole enabler of
+    ``sys_session_share`` (and ``public`` of the ``__public__`` tier);
+    a parser regression dropping or mismapping it would silently change
+    what the agent is allowed to expose.
+
+    :param tmp_path: pytest-provided temporary directory.
+    :param value: The YAML ``agent_session_sharing:`` string under test.
+    :param expected: The :class:`SharePolicy` it must parse to.
+    """
+    config = {"spec_version": 1, "name": "share-agent", "agent_session_sharing": value}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.agent_session_sharing is expected
+
+
+def test_parse_share_invalid_value_fails_loud(tmp_path: Path) -> None:
+    """
+    An unrecognized ``agent_session_sharing:`` value (here a plausible
+    typo) raises rather than silently disabling sharing — fail-loud, so
+    a misconfigured capability surfaces at parse time instead of becoming
+    a confusing "the tool isn't there" at runtime.
+
+    :param tmp_path: pytest-provided temporary directory.
+    """
+    config = {"spec_version": 1, "name": "bad-share", "agent_session_sharing": "private"}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match="agent_session_sharing"):
+        parse(tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # os_env.sandbox.env_passthrough
 # ---------------------------------------------------------------------------
@@ -2546,55 +2644,6 @@ def test_parse_os_env_start_in_scratch_with_sandbox_none_rejected(
         parse(tmp_path)
 
 
-# ── Supervisor executor parser tests ──────────────────────────────
-
-
-def _write_supervisor_config(
-    tmp_path: Path,
-    *,
-    extra_executor: dict[str, object] | None = None,
-    llm_extra: dict[str, object] | None = None,
-    tools: list[dict[str, object]] | None = None,
-) -> None:
-    """
-    Write a minimal supervisor-harness config.yaml under *tmp_path*.
-
-    Uses ``executor.type: omnigent`` with
-    ``config.harness: databricks_supervisor``.
-
-    :param tmp_path: pytest-provided temporary directory.
-    :param extra_executor: Additional keys to merge into the
-        ``executor:`` block, e.g. ``{"profile": "dev"}``.
-        Default ``None``.
-    :param llm_extra: Additional keys to merge into the ``llm:``
-        block on top of ``{"model": "...", "connection":
-        {"api_key": "..."}}``. Default ``None``.
-    :param tools: Top-level ``tools:`` list to write. Default
-        ``None`` (no tools key).
-    """
-    executor: dict[str, object] = {
-        "type": "omnigent",
-        "config": {"harness": "databricks_supervisor"},
-    }
-    if extra_executor is not None:
-        executor.update(extra_executor)
-    llm: dict[str, object] = {
-        "model": "databricks-claude-sonnet-4-6",
-        "connection": {"api_key": "sk-test"},
-    }
-    if llm_extra is not None:
-        llm.update(llm_extra)
-    config: dict[str, object] = {
-        "spec_version": 1,
-        "name": "sup-agent",
-        "executor": executor,
-        "llm": llm,
-    }
-    if tools is not None:
-        config["tools"] = tools
-    (tmp_path / "config.yaml").write_text(yaml.dump(config))
-
-
 def test_executor_profile_field_lifted_from_yaml(tmp_path: Path) -> None:
     """
     Top-level ``executor.profile`` lifts into the concrete
@@ -2628,324 +2677,22 @@ def test_executor_profile_field_lifted_from_yaml(tmp_path: Path) -> None:
     assert spec.executor.config.get("profile") == "dev"
 
 
-def test_executor_profile_field_supervisor(tmp_path: Path) -> None:
-    """
-    ``executor.profile`` lifts into ``ExecutorSpec.profile`` for
-    the supervisor harness. Since the executor type is
-    ``"omnigent"``, profile is also mirrored into
-    ``executor.config["profile"]``.
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(tmp_path, extra_executor={"profile": "prod"})
+def test_executor_profile_field_lifted_for_non_omnigent(tmp_path: Path) -> None:
+    """``executor.profile`` lifts into ``ExecutorSpec.profile`` for all executor types."""
+    config = {
+        "spec_version": 1,
+        "name": "agent",
+        "executor": {"type": "claude_sdk", "profile": "prod"},
+        "llm": {"model": "databricks-claude-sonnet-4-6"},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
     spec = parse(tmp_path)
     assert spec.executor.profile == "prod"
-    assert spec.executor.config.get("harness") == "databricks_supervisor"
-    assert spec.executor.config.get("profile") == "prod"
+    assert "profile" not in spec.executor.config
 
 
-def test_supervisor_harness_accepted(tmp_path: Path) -> None:
-    """
-    Minimal supervisor harness YAML parses without error and produces
-    ``executor.type == "omnigent"`` with
-    ``config.harness == "databricks_supervisor"`` and no tools.
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(tmp_path)
-    spec = parse(tmp_path)
-    assert spec.executor.type == "omnigent"
-    assert spec.executor.config.get("harness") == "databricks_supervisor"
-    # No tools declared → empty list (NOT None) so downstream
-    # readers don't have to special-case the missing-key form
-    # vs the empty-list form.
-    assert spec.executor.supervisor_tools == []
-    assert spec.llm is not None
-    assert spec.llm.model == "databricks-claude-sonnet-4-6"
-
-
-def test_supervisor_typed_tools_pass_through_verbatim(tmp_path: Path) -> None:
-    """
-    All five typed supervisor tool shapes parse and round-trip
-    verbatim into ``executor.supervisor_tools``.
-
-    The parser must NOT normalize these into a function-tool
-    shape — the supervisor executor consumes them as-is.
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    # Nested shape — the real Databricks Supervisor API rejects
-    # flat tool entries.
-    tools: list[dict[str, object]] = [
-        {
-            "type": "genie_space",
-            "genie_space": {
-                "id": "space-abc",
-                "description": "Sales analytics",
-            },
-        },
-        {
-            "type": "uc_function",
-            "uc_function": {
-                "name": "main.search",
-                "description": "Search the catalog",
-            },
-        },
-        {
-            "type": "uc_connection",
-            "uc_connection": {
-                "name": "system_ai_agent_google_drive",
-                "description": "Google Drive connection",
-            },
-        },
-        {
-            "type": "app",
-            "app": {
-                "name": "my-app",
-                "description": "Custom app",
-            },
-        },
-        {
-            "type": "knowledge_assistant",
-            "knowledge_assistant": {
-                "knowledge_assistant_id": "ka-123",
-                "description": "Knowledge assistant",
-            },
-        },
-    ]
-    _write_supervisor_config(tmp_path, tools=tools)
-    spec = parse(tmp_path)
-    assert spec.executor.supervisor_tools is not None
-    # Length must match input — a missing or extra entry would
-    # mean the parser dropped or duplicated a tool, which the
-    # supervisor executor would silently surface as a mismatched
-    # tool surface to the LLM.
-    assert len(spec.executor.supervisor_tools) == 5
-
-    # Per-entry verbatim equality (NESTED form) — each input dict
-    # must round-trip with the exact same outer ``type`` plus the
-    # nested sub-dict carrying the per-type config. Wrong values
-    # would mean the parser is normalizing the typed dicts (e.g.
-    # flattening, dropping unknown keys, or coercing types).
-    expected_first = {
-        "type": "genie_space",
-        "genie_space": {
-            "id": "space-abc",
-            "description": "Sales analytics",
-        },
-    }
-    assert spec.executor.supervisor_tools[0] == expected_first
-
-    expected_second = {
-        "type": "uc_function",
-        "uc_function": {
-            "name": "main.search",
-            "description": "Search the catalog",
-        },
-    }
-    assert spec.executor.supervisor_tools[1] == expected_second
-
-    expected_third = {
-        "type": "uc_connection",
-        "uc_connection": {
-            "name": "system_ai_agent_google_drive",
-            "description": "Google Drive connection",
-        },
-    }
-    assert spec.executor.supervisor_tools[2] == expected_third
-
-    expected_fourth = {
-        "type": "app",
-        "app": {
-            "name": "my-app",
-            "description": "Custom app",
-        },
-    }
-    assert spec.executor.supervisor_tools[3] == expected_fourth
-
-    expected_fifth = {
-        "type": "knowledge_assistant",
-        "knowledge_assistant": {
-            "knowledge_assistant_id": "ka-123",
-            "description": "Knowledge assistant",
-        },
-    }
-    assert spec.executor.supervisor_tools[4] == expected_fifth
-
-
-def test_supervisor_rejects_unknown_tool_type(tmp_path: Path) -> None:
-    """
-    A tool whose ``type`` is not in the supported set fails loud
-    with a message that names the supported types.
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(
-        tmp_path,
-        tools=[
-            {
-                "type": "web_search",
-                "description": "Search the web",
-            }
-        ],
-    )
-    # The error must list every supported type (7 of them) so a
-    # spec author can pick one without checking the source. The
-    # parser sorts the supported set alphabetically, which is the
-    # order asserted here. We spot-check three rather than every
-    # entry to keep the assertion readable.
-    with pytest.raises(
-        OmnigentError,
-        match=r"genie_space.*knowledge_assistant.*uc_function",
-    ):
-        parse(tmp_path)
-
-
-def test_supervisor_genie_space_requires_id_and_description(
-    tmp_path: Path,
-) -> None:
-    """
-    A ``genie_space`` tool whose nested sub-dict is missing ``id``
-    or ``description`` fails loud naming the missing field(s).
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    # Missing ``id`` inside the nested sub-dict.
-    _write_supervisor_config(
-        tmp_path,
-        tools=[{"type": "genie_space", "genie_space": {"description": "abc"}}],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'id'"):
-        parse(tmp_path)
-
-    # Missing ``description``.
-    _write_supervisor_config(
-        tmp_path,
-        tools=[{"type": "genie_space", "genie_space": {"id": "space-abc"}}],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'description'"):
-        parse(tmp_path)
-
-
-def test_supervisor_uc_function_requires_name_and_description(
-    tmp_path: Path,
-) -> None:
-    """
-    A ``uc_function`` tool whose nested sub-dict is missing ``name``
-    or ``description`` fails loud naming the missing field(s).
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(
-        tmp_path,
-        tools=[{"type": "uc_function", "uc_function": {"description": "abc"}}],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'name'"):
-        parse(tmp_path)
-
-    _write_supervisor_config(
-        tmp_path,
-        tools=[{"type": "uc_function", "uc_function": {"name": "main.search"}}],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'description'"):
-        parse(tmp_path)
-
-
-def test_supervisor_uc_connection_requires_name_and_description(
-    tmp_path: Path,
-) -> None:
-    """
-    A ``uc_connection`` tool whose nested sub-dict is missing
-    ``name`` or ``description`` fails loud naming the missing
-    field(s).
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(
-        tmp_path,
-        tools=[{"type": "uc_connection", "uc_connection": {"description": "abc"}}],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'name'"):
-        parse(tmp_path)
-
-    _write_supervisor_config(
-        tmp_path,
-        tools=[
-            {"type": "uc_connection", "uc_connection": {"name": "google_drive"}},
-        ],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'description'"):
-        parse(tmp_path)
-
-
-def test_supervisor_app_requires_name_and_description(tmp_path: Path) -> None:
-    """
-    An ``app`` tool whose nested sub-dict is missing ``name`` or
-    ``description`` fails loud naming the missing field(s).
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(
-        tmp_path,
-        tools=[{"type": "app", "app": {"description": "abc"}}],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'name'"):
-        parse(tmp_path)
-
-    _write_supervisor_config(
-        tmp_path,
-        tools=[{"type": "app", "app": {"name": "my-app"}}],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'description'"):
-        parse(tmp_path)
-
-
-def test_supervisor_knowledge_assistant_requires_id_and_description(
-    tmp_path: Path,
-) -> None:
-    """
-    A ``knowledge_assistant`` tool whose nested sub-dict is missing
-    ``knowledge_assistant_id`` or ``description`` fails loud naming
-    the missing field(s).
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(
-        tmp_path,
-        tools=[
-            {
-                "type": "knowledge_assistant",
-                "knowledge_assistant": {"description": "abc"},
-            }
-        ],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'knowledge_assistant_id'"):
-        parse(tmp_path)
-
-    _write_supervisor_config(
-        tmp_path,
-        tools=[
-            {
-                "type": "knowledge_assistant",
-                "knowledge_assistant": {"knowledge_assistant_id": "ka-1"},
-            }
-        ],
-    )
-    with pytest.raises(OmnigentError, match=r"missing required field.*'description'"):
-        parse(tmp_path)
-
-
-def test_existing_executor_types_still_parse(tmp_path: Path) -> None:
-    """
-    Both the legacy ``omnigent`` executor and the default
-    ``llm`` executor minimal YAMLs continue to parse cleanly,
-    confirming the supervisor additions did not regress
-    pre-existing executor types.
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    # ``omnigent`` minimal — harness is required by the
-    # validator but the parser should accept it without error.
+def test_omnigent_and_default_executor_minimal_configs_still_parse(tmp_path: Path) -> None:
+    """Both legacy ``omnigent`` and default minimal YAMLs continue to parse cleanly."""
     omni_config = {
         "spec_version": 1,
         "name": "omni-agent",
@@ -2960,14 +2707,8 @@ def test_existing_executor_types_still_parse(tmp_path: Path) -> None:
     (omni_dir / "config.yaml").write_text(yaml.dump(omni_config))
     omni_spec = parse(omni_dir)
     assert omni_spec.executor.type == "omnigent"
-    # config["harness"] preserved verbatim; supervisor_tools is
-    # None for non-supervisor harnesses so downstream code can
-    # discriminate by ``is None``.
     assert omni_spec.executor.config.get("harness") == "claude-sdk"
-    assert omni_spec.executor.supervisor_tools is None
 
-    # ``llm`` minimal (default executor type) — no executor
-    # block at all is the most common shape.
     llm_config = {
         "spec_version": 1,
         "name": "llm-agent",
@@ -2980,114 +2721,8 @@ def test_existing_executor_types_still_parse(tmp_path: Path) -> None:
     llm_dir.mkdir()
     (llm_dir / "config.yaml").write_text(yaml.dump(llm_config))
     llm_spec = parse(llm_dir)
-    # Default ExecutorSpec applies — type "omnigent", no
-    # supervisor_tools, no profile.
     assert llm_spec.executor.type == "omnigent"
-    assert llm_spec.executor.supervisor_tools is None
     assert llm_spec.executor.profile is None
-
-
-def test_supervisor_tools_expand_env_vars_in_nested_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """
-    ``${VAR}`` references inside the nested per-tool config dict
-    expand against the process environment at parse time. Without
-    this, a YAML like ``genie_space.id: ${GENIE_SPACE_ID}`` would
-    pass the literal string to the gateway which rejects it.
-
-    :param tmp_path: pytest temp dir.
-    :param monkeypatch: used to set ``GENIE_SPACE_ID`` and
-        ``UC_FUNCTION_NAME`` for the test.
-    """
-    monkeypatch.setenv("GENIE_SPACE_ID", "real-space-id-from-env")
-    monkeypatch.setenv("UC_FUNCTION_NAME", "main.search.fn")
-    _write_supervisor_config(
-        tmp_path,
-        tools=[
-            {
-                "type": "genie_space",
-                "genie_space": {
-                    "id": "${GENIE_SPACE_ID}",
-                    "description": "Sales analytics",
-                },
-            },
-            {
-                "type": "uc_function",
-                "uc_function": {
-                    "name": "${UC_FUNCTION_NAME}",
-                    "description": "Custom UC fn",
-                },
-            },
-        ],
-    )
-
-    spec = parse(tmp_path)
-
-    assert spec.executor.supervisor_tools is not None
-    nested_genie = spec.executor.supervisor_tools[0]["genie_space"]
-    nested_fn = spec.executor.supervisor_tools[1]["uc_function"]
-    # The literal ${VAR} string must NOT survive into the parsed
-    # spec; the gateway would reject it (verified empirically when
-    # probing — `${UC_FUNCTION_NAME:-...}` came back as
-    # INVALID_PARAMETER_VALUE: name must be in catalog.schema.fn
-    # format).
-    assert nested_genie["id"] == "real-space-id-from-env"
-    assert nested_fn["name"] == "main.search.fn"
-
-
-def test_supervisor_tools_unresolved_env_var_fails_loud(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """
-    A ``${VAR}`` reference that doesn't resolve at parse time
-    fails loud rather than passing the literal text to the gateway.
-    Catches typos and forgotten env exports before the run starts.
-    """
-    # Make sure the env var is NOT set
-    monkeypatch.delenv("DEFINITELY_UNSET_VAR_XYZ", raising=False)
-    _write_supervisor_config(
-        tmp_path,
-        tools=[
-            {
-                "type": "genie_space",
-                "genie_space": {
-                    "id": "${DEFINITELY_UNSET_VAR_XYZ}",
-                    "description": "x",
-                },
-            },
-        ],
-    )
-
-    with pytest.raises(OmnigentError) as excinfo:
-        parse(tmp_path)
-    msg = str(excinfo.value)
-    # The error decorates with the offending tool index/type so the
-    # user knows which YAML field to fix.
-    assert "tools[0]" in msg
-    assert "genie_space" in msg
-    assert "DEFINITELY_UNSET_VAR_XYZ" in msg
-
-
-def test_supervisor_rejects_tools_that_are_not_a_list(tmp_path: Path) -> None:
-    """
-    A top-level ``tools:`` block written as a mapping (the legacy
-    shape used by every other executor type) fails loud when the
-    supervisor harness is selected rather than silently landing as
-    an empty list.
-
-    :param tmp_path: pytest-provided temporary directory.
-    """
-    _write_supervisor_config(
-        tmp_path,
-        tools=[],  # placeholder overridden below
-    )
-    # Overwrite with a mapping-shaped tools block instead of a list.
-    raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
-    raw["tools"] = {"agents": ["foo"]}
-    (tmp_path / "config.yaml").write_text(yaml.dump(raw))
-    with pytest.raises(OmnigentError, match=r"tools must be a YAML list"):
-        parse(tmp_path)
 
 
 # ---------------------------------------------------------------------------

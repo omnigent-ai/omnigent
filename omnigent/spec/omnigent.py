@@ -58,6 +58,7 @@ from omnigent.spec.types import (
     LLMConfig,
     LocalToolInfo,
     MCPServerConfig,
+    SharePolicy,
     ToolRuntime,
     ToolsConfig,
 )
@@ -222,10 +223,10 @@ def _reject_unsupported_concepts(spec: AgentSpec) -> None:
     # a spec field" because the field is consumed upstream and
     # has no meaning to the harness.
 
-    # Sandbox declarations (omnigent ``tools.sandbox.docker_image``
+    # Sandbox declarations (omnigent ``tools.sandbox.container_image``
     # and the omnigent OSEnvSandboxSpec) are unsupported. Fail loud
     # if either is populated.
-    if spec.tools.sandbox.docker_image is not None:
+    if spec.tools.sandbox.container_image is not None:
         raise OmnigentError(
             "tools.sandbox translation to omnigent OSEnvSpec is unsupported; "
             "the adapter rejects specs with sandbox rather than silently dropping it",
@@ -1176,6 +1177,10 @@ def agent_def_to_agent_spec(
         terminals=terminals,
         timers=agent_def.timers,
         spawn=agent_def.spawn,
+        # AgentDef.agent_session_sharing is the raw YAML string
+        # ("none"/"non-public"/"public"); map it to the SharePolicy enum
+        # AgentSpec expects.
+        agent_session_sharing=SharePolicy(agent_def.agent_session_sharing),
         skills_filter=skills_filter,
     )
 
@@ -1367,6 +1372,17 @@ def _agent_tool_to_sub_spec(
         resolved os_env is also ``None`` and the sub-agent boots
         without filesystem access (matching legacy behavior when
         the parent itself has no os_env).
+    :param raw_executor: The raw ``executor:`` dict for this inline
+        AgentTool taken directly from the parent's YAML (before
+        omnigent' dataclass parsing dropped unknown keys). When set,
+        fields the omnigent :class:`~omnigent.inner.datamodel.ExecutorSpec`
+        datamodel does not expose — ``auth`` and ``use_responses`` —
+        are read from this dict and forwarded into the child's
+        :class:`ExecutorSpec` via :func:`_translate_executor_from_def`.
+        Without this, an ``executor.auth`` block declared on an inline
+        AgentTool is silently ignored, causing child sub-agents to fall
+        back to the ambient ``OPENAI_BASE_URL`` rather than the explicitly
+        declared mock/gateway URL.
     :returns: A nested :class:`AgentSpec` representing the
         sub-agent.
     """
@@ -1754,14 +1770,18 @@ def _translate_executor_from_def(
     # ``spec.executor.config["use_responses"]`` to set
     # ``HARNESS_OPENAI_AGENTS_USE_RESPONSES``, which controls
     # whether the inner executor uses /responses or /chat/completions.
-    auth: ApiKeyAuth | DatabricksAuth | None = None
+    # ``use_responses`` is carried via raw_executor when present
     if raw_executor is not None:
         use_responses_raw = raw_executor.get("use_responses")
         if use_responses_raw is not None:
             config["use_responses"] = bool(use_responses_raw)
-        # ``auth:`` is also not in the omnigent datamodel — parse it
-        # directly from the raw YAML so YAML-declared auth is not
-        # silently dropped and overridden by the global config default.
+    # ``auth`` is now parsed by the loader into OmniExecutorSpec.auth;
+    # fall back to raw_executor for the top-level agent path that still
+    # goes through _translate_executor_from_def(raw_executor=...).
+    auth: ApiKeyAuth | DatabricksAuth | None = None
+    if oa_executor is not None and oa_executor.auth is not None:
+        auth = oa_executor.auth  # type: ignore[assignment]
+    elif raw_executor is not None:
         from omnigent.spec.parser import _parse_executor_auth
 
         auth = _parse_executor_auth(raw_executor)
@@ -1773,7 +1793,6 @@ def _translate_executor_from_def(
             f"whose prefix maps to a known harness.",
             code=ErrorCode.INVALID_INPUT,
         )
-    # Supervisor spawn-env reads spec.executor.profile, not config["profile"].
     return ExecutorSpec(
         type=OMNIGENT_EXECUTOR_TYPE,
         config=config,
