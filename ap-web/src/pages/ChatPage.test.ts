@@ -23,7 +23,7 @@ import {
   shouldShowWorkingIndicator,
   shouldShowTerminalSurface,
   splitSlashCommand,
-  stripPinnedElicitations,
+  stripPendingElicitations,
   subAgentComposerLabel,
 } from "./ChatPage";
 
@@ -537,31 +537,31 @@ describe("collectPendingElicitations", () => {
   });
 });
 
-describe("stripPinnedElicitations", () => {
+describe("stripPendingElicitations", () => {
   it("removes a pending card but keeps the trailing text in the same bubble", () => {
     // The motivating case: the agent emits a card AND a bunch of text. The
-    // card is pinned (removed here); the text stays inline.
+    // card floats to the bottom (removed here); the text stays inline.
     const bubbles = [assistantWith("a1", [elicitItem("e1", "pending"), textItem("t1")])];
-    const stripped = stripPinnedElicitations(bubbles);
+    const stripped = stripPendingElicitations(bubbles);
     const a1 = stripped[0] as Extract<Bubble, { kind: "assistant" }>;
     expect(a1.items.map((it) => it.kind)).toEqual(["text"]);
   });
 
   it("leaves answered cards inline", () => {
     const bubbles = [assistantWith("a1", [elicitItem("e1", "responded")])];
-    const stripped = stripPinnedElicitations(bubbles);
+    const stripped = stripPendingElicitations(bubbles);
     expect(stripped).toBe(bubbles);
   });
 
-  it("returns the same array reference when nothing is pinned (memo stability)", () => {
+  it("returns the same array reference when nothing is pending (memo stability)", () => {
     const bubbles = [userBubble("u1"), assistantText("a1")];
-    expect(stripPinnedElicitations(bubbles)).toBe(bubbles);
+    expect(stripPendingElicitations(bubbles)).toBe(bubbles);
   });
 
   it("clones only the affected bubble and keeps other references intact", () => {
     const a1 = assistantText("a1");
     const a2 = assistantWith("a2", [elicitItem("e2", "pending")]);
-    const stripped = stripPinnedElicitations([a1, a2]);
+    const stripped = stripPendingElicitations([a1, a2]);
     expect(stripped[0]).toBe(a1);
     expect(stripped[1]).not.toBe(a2);
     expect((stripped[1] as Extract<Bubble, { kind: "assistant" }>).items).toEqual([]);
