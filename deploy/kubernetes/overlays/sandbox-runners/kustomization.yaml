@@ -13,7 +13,9 @@ resources:
   - role.yaml # Role in omnigent-sandboxes (scoped Pod + Secret rights)
   - rolebinding.yaml # cross-ns binding: server SA → runner-ns Role
   - sandbox-config.yaml # server config (omnigent); points at runner ns
-  - runner-credentials.yaml # harness creds Secret in omnigent-sandboxes
+# The harness-credentials Secret (sandbox.kubernetes.secret_name, default
+# omnigent-creds) is NOT checked in — create it out of band like the base
+# OIDC secret (see README.md "Apply"). Prefer sealed-secrets/external-secrets.
 
 # The base server image lacks the `kubernetes` extra, so a managed launch would
 # fail to import the client. Build the server WITH it

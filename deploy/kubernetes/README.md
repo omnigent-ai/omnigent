@@ -200,9 +200,9 @@ image must be built with the `kubernetes` extra
 `overlays/sandbox-runners/README.md` for the full guide.
 
 ```bash
-# edit overlays/sandbox-runners/runner-credentials.yaml + the image in
-# kustomization.yaml first
+# set the server image in overlays/sandbox-runners/kustomization.yaml first
 kubectl apply -k deploy/kubernetes/overlays/sandbox-runners
+# then create the omnigent-creds harness Secret (see the overlay README)
 ```
 
 ## Verify the deployment

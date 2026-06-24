@@ -46,20 +46,31 @@ the generated runner Pod is already restricted-compliant (non-root uid 1000, dro
    it, so `_ensure_sdk()` would fail every launch. Build with
    `--build-arg OMNIGENT_EXTRAS=kubernetes` (see `deploy/docker`) and set the
    image in `kustomization.yaml` (`images:` → `newName`/`newTag`).
-2. **Harness credentials.** Edit `runner-credentials.yaml` with your real LLM /
-   git credentials (or point `secret_name` at a sealed-secret / external-secrets
-   managed Secret). The placeholder values are not usable as-is.
+2. **Harness credentials.** The runners read their LLM / git credentials from a
+   Secret named by `secret_name` (default `omnigent-creds`); you create it out of
+   band after applying the overlay — see step 2 of **Apply**. It is deliberately
+   not checked in; for production prefer a sealed-secret / external-secrets Secret.
 
 ## Apply
 
 ```sh
+# 1. RBAC, the runner namespace, the server sandbox config, and the Deployment patch.
 kubectl apply -k deploy/kubernetes/overlays/sandbox-runners
+
+# 2. The harness-credentials Secret the runners read — created out of band, like
+#    the OIDC secret in ../README.md. Add only the keys your agents use.
+kubectl create secret generic omnigent-creds -n omnigent-sandboxes \
+  --from-literal=ANTHROPIC_API_KEY=sk-ant-... \
+  --from-literal=OPENAI_API_KEY=sk-...
 ```
 
-This creates the runner namespace, both ServiceAccounts, the scoped Role +
-RoleBinding, the harness-creds Secret, and the server `sandbox:` config, and
-patches the server Deployment to run as `omnigent-server` with the config
-mounted.
+Step 1 creates the runner namespace, both ServiceAccounts, the scoped Role +
+RoleBinding, and the server `sandbox:` config, and patches the server Deployment
+to run as `omnigent-server` with the config mounted. Step 2 supplies the LLM / git
+credentials: use `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) for a Claude
+subscription, `GIT_TOKEN` for private clones, `GEMINI_API_KEY` / `CODEX_ACCESS_TOKEN`
+as needed. For production prefer a sealed-secret / external-secrets operator over an
+imperative `kubectl create secret`.
 
 ## Configuration (`sandbox-config.yaml`)
 

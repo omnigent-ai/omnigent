@@ -22,8 +22,8 @@ data:
       kubernetes:
         # Runner-Pod namespace (secret_name / service_account resolve here).
         namespace: omnigent-sandboxes
-        # Harness LLM/git creds projected into every Pod via envFrom
-        # (runner-credentials.yaml) — separate from the per-Pod launch-token Secret.
+        # Harness LLM/git creds projected into every Pod via envFrom. Created out
+        # of band (see README "Apply") — separate from the per-Pod launch-token Secret.
         secret_name: omnigent-creds
         # ServiceAccount the runner Pods run as (deliberately powerless).
         service_account: omnigent-runner
