@@ -272,6 +272,97 @@ def _freshest_waiting(
     return same_kind
 
 
+def _freshest_pending(steps: list[dict[str, object]]) -> PendingInteraction | None:
+    """
+    Return the highest-index WAITING interaction of ANY kind from *steps*.
+
+    Unlike :func:`_freshest_waiting` (which filters to a single ``kind`` for the
+    answer-round-trip path), the interrupt-DENY path doesn't know the kind up
+    front — it just wants the live WAITING step to refuse. agy keys delivery on
+    ``trajectoryId``+``stepIndex`` with no kind check, and the per-kind deny
+    payload is built from the matched step's own ``kind``, so taking the freshest
+    step of any kind is safe.
+
+    :param steps: A trajectory steps snapshot (from ``get_trajectory_steps``).
+    :returns: The highest-``step_index`` :class:`PendingInteraction`, or ``None``
+        when no step is WAITING.
+    """
+    freshest: PendingInteraction | None = None
+    for step in steps:
+        pending = pending_interaction(step)
+        if pending is None:
+            continue
+        if freshest is None or pending["step_index"] > freshest["step_index"]:
+            freshest = pending
+    return freshest
+
+
+async def deny_pending_interaction(
+    cascade_id: str,
+    *,
+    port: int,
+    get_steps: GetSteps,
+    deliver: Deliver = _deliver_via_rpc,
+) -> bool:
+    """
+    DENY the freshest WAITING agy interaction so a parked card clears.
+
+    ``CancelCascadeSteps`` is a NO-OP on a step that is WAITING for a user
+    interaction (ask-question / command-permission): agy returns HTTP 200 but
+    the WAITING step does not transition (see
+    :meth:`omnigent.inner.antigravity_native_executor.AntigravityNativeExecutor.interrupt_session`).
+    The only way to unblock such a step on an interrupt/stop is to deliver a
+    refusal through ``HandleCascadeUserInteraction``: an empty ``askQuestion``
+    responses list, or ``permission.allow=False``. This builds that deny payload
+    from a synthetic ``decline`` verdict (the same shape the web UI's decline
+    produces) and delivers it against the freshest WAITING step.
+
+    Best-effort and never raises on the expected RPC paths: a transport / shape
+    error is logged and swallowed so the interrupt handler always returns.
+
+    :param cascade_id: agy cascade id (equal to the conversation id).
+    :param port: Validated agy connect-RPC port.
+    :param get_steps: Re-reads the freshest trajectory steps (production wraps
+        :func:`omnigent.antigravity_native_rpc.get_trajectory_steps`).
+    :param deliver: Delivers the built deny payload to agy; defaults to
+        :func:`_deliver_via_rpc`.
+    :returns: ``True`` when a deny was delivered against a WAITING step; ``False``
+        when no step was WAITING or delivery failed.
+    """
+    pending = _freshest_pending(await get_steps())
+    if pending is None:
+        return False
+    payload = to_interaction_payload(
+        pending["kind"],
+        ElicitationResult(action="decline"),
+        pending["spec"],
+    )
+    try:
+        await deliver(
+            port,
+            cascade_id,
+            trajectory_id=pending["trajectory_id"],
+            step_index=pending["step_index"],
+            payload=payload,
+        )
+    except AntigravityRpcError as exc:
+        _logger.warning(
+            "agy interrupt deny failed (cascade=%s, step=%d, kind=%s): %s",
+            cascade_id,
+            pending["step_index"],
+            pending["kind"],
+            exc,
+        )
+        return False
+    _logger.info(
+        "agy interrupt: denied WAITING %s step %d (cascade=%s)",
+        pending["kind"],
+        pending["step_index"],
+        cascade_id,
+    )
+    return True
+
+
 async def bridge_interaction(
     cascade_id: str,
     pending: PendingInteraction,

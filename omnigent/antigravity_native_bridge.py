@@ -1082,6 +1082,49 @@ def inject_user_message_via_tui(
     _submit_and_verify(socket_path, tmux_target)
 
 
+def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
+    """Cancel the in-flight agy turn by sending ``Escape`` to the pane.
+
+    The agy TUI stops a running turn on ``Escape`` (the same key the footer's
+    ``esc to cancel`` hint advertises). The executor's ``run_turn`` returns right
+    after the TUI paste, so the runner's in-process cancel floor can't reach the
+    turn — this is the TUI-key analog of :func:`inject_user_message_via_tui` for
+    the web UI's Stop button. Mirrors
+    :func:`omnigent.cursor_native_bridge.inject_interrupt`.
+
+    The runner's interrupt handler prefers the connect-RPC ``CancelCascadeSteps``
+    path (and a WAITING-step DENY); this is the bridge-level fallback / hard
+    floor for a turn whose RPC port can't be resolved.
+
+    :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
+    :param timeout_s: Readiness budget for the advertised tmux target.
+    :returns: None.
+    :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
+    """
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    # No ``-l``: tmux must interpret ``Escape`` as a key name, not literal text.
+    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
+
+
+def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
+    """Hard-stop the agy session by killing its tmux session.
+
+    Terminates the ``agy`` process and the pane outright — the analog of the user
+    manually exiting the attached TUI, for the web UI's "Stop session"
+    affordance. Without this the agy process + runner-owned pane leak (the
+    terminal panel keeps showing a live pane) until the host SIGTERMs or the
+    session is deleted. Mirrors
+    :func:`omnigent.cursor_native_bridge.kill_session`.
+
+    :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
+    :param timeout_s: Readiness budget for the advertised tmux target.
+    :returns: None.
+    :raises RuntimeError: If the tmux target is not advertised or kill-session fails.
+    """
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+
+
 def send_interaction_keys_via_tui(
     bridge_dir: Path,
     *keys: str,
