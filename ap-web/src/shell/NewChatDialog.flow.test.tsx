@@ -468,6 +468,33 @@ describe("NewChatLandingScreen create flow", () => {
     });
   });
 
+  it("attaches terminal-wrapper labels when the antigravity-native agent is chosen", async () => {
+    setAgents([
+      agent({ id: "ag_agy", name: "antigravity-native-ui", display_name: "Antigravity" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_agy" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("do the thing");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    // antigravity-native opens terminal-first too; the wrapper value is the
+    // agent name (unlike claude, whose wrapper is "claude-code-native-ui").
+    // The runner/server key off exactly this value to boot the agy terminal.
+    expect(body.labels).toEqual({
+      "omnigent.ui": "terminal",
+      "omnigent.wrapper": "antigravity-native-ui",
+    });
+  });
+
   it("posts --permission-mode <mode> when a non-default mode is picked for claude-native", async () => {
     setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({

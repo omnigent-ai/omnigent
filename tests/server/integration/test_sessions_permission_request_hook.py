@@ -32,6 +32,8 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import FastAPI
+from fastapi.routing import APIRoute
 
 from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.runtime import session_stream
@@ -248,6 +250,7 @@ async def test_cursor_permission_request_hook_allow_round_trip(
 
 
 async def test_top_level_elicitations_route_is_not_mounted(
+    app: FastAPI,
     client: httpx.AsyncClient,
 ) -> None:
     """
@@ -256,12 +259,38 @@ async def test_top_level_elicitations_route_is_not_mounted(
     Approval verdicts must travel through the session event route so
     they share normal session scoping and authorization. If the AP
     router gets mounted again, this test turns red immediately.
+
+    Checked two ways so the guard holds regardless of the environment:
+
+    - Route table (``app`` fixture): no ``APIRoute`` declares the
+      legacy ``POST /v1/elicitations/{elicitation_id}`` path. This
+      catches an exact re-mount even if its handler would 404 at
+      runtime, and is independent of which static assets are present.
+    - HTTP (``client`` fixture, same app): the live response is
+      ``404`` *or* ``405``. The status varies by environment because
+      ``create_app`` mounts a catch-all SPA at ``/`` only when a local
+      web-ui build exists at ``omnigent/server/static/web-ui/index.html``
+      (a gitignored dev artifact, absent on main/CI/fresh clones).
+      With no build the unmatched POST is a plain ``404``; with the
+      build present Starlette's ``StaticFiles`` matches the path but
+      rejects the non-GET method with ``405``. Either way no handler
+      ran. A re-mounted legacy route would instead run its handler and
+      return ``400`` (missing ``response_id`` for this body), ``501``,
+      or ``2xx`` — never ``404``/``405`` — so both assertions still
+      bite.
     """
+    assert not any(
+        isinstance(route, APIRoute)
+        and route.path == "/v1/elicitations/{elicitation_id}"
+        and "POST" in route.methods
+        for route in app.routes
+    ), "legacy POST /v1/elicitations/{elicitation_id} route is mounted again"
+
     resp = await client.post(
         "/v1/elicitations/elicit_removed",
         json={"action": "accept"},
     )
-    assert resp.status_code == 404, resp.text
+    assert resp.status_code in (404, 405), resp.text
 
 
 async def test_permission_request_hook_deny_round_trip(
@@ -3504,3 +3533,206 @@ async def test_codex_hook_gap_verdict_returned_on_repost(
     for task in set(sessions_route._deferred_elicitation_clear_tasks):
         await asyncio.wait_for(task, timeout=5.0)
     pending_elicitations.reset_for_tests()
+
+
+# ── Antigravity elicitation hook tests ──────────────────────────────────────
+
+
+async def test_antigravity_elicitation_hook_accept_round_trip(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Antigravity ``antigravity-elicitation-request`` hook: accept path.
+
+    The bridge POSTs ``{"elicitation_id": ..., "params": {...}}``; the
+    hook parks on the shared elicitation registry, the web ``approval``
+    event resolves it, and the hook returns the raw
+    ``ElicitationResult`` (action + content + _meta) so the bridge can
+    deliver the answer to agy.  This is simpler than the codex hook:
+    the endpoint does NOT build a JSON-RPC envelope — the bridge does
+    that with ``to_interaction_payload``.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    agent = await create_test_agent(client, "test-agy-elicit-accept")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = "elicit_agy_00000000000000000000000000000001"
+    params_body = {
+        "mode": "form",
+        "message": "Antigravity needs your input",
+        "phase": "agy_ask_question",
+        "policy_name": "agy_native_ask_question",
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request",
+            json={"elicitation_id": elicitation_id, "params": params_body},
+        )
+    )
+
+    event = await drain_task
+    assert event["elicitation_id"] == elicitation_id
+    assert event["params"]["message"] == "Antigravity needs your input"
+    assert event["params"]["phase"] == "agy_ask_question"
+
+    verdict = await _post_approval(
+        client,
+        session_id,
+        elicitation_id,
+        "accept",
+        content={"selectedOptionIds": ["1"]},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "action": "accept",
+        "content": {"selectedOptionIds": ["1"]},
+    }
+
+
+async def test_antigravity_elicitation_hook_decline_round_trip(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Antigravity elicitation hook: decline path returns the verdict.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    agent = await create_test_agent(client, "test-agy-elicit-decline")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = "elicit_agy_00000000000000000000000000000002"
+    params_body = {
+        "mode": "form",
+        "message": "Antigravity wants to run a command",
+        "phase": "agy_permission",
+        "policy_name": "agy_native_permission",
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request",
+            json={"elicitation_id": elicitation_id, "params": params_body},
+        )
+    )
+
+    event = await drain_task
+    assert event["elicitation_id"] == elicitation_id
+
+    verdict = await _post_approval(client, session_id, elicitation_id, "decline")
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"action": "decline", "content": None}
+
+
+async def test_antigravity_elicitation_hook_timeout_returns_empty_200(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Antigravity elicitation hook: timeout path returns empty 200.
+
+    When the user does not resolve the elicitation within the hook
+    timeout, the endpoint returns ``200`` with an empty body so the
+    bridge's ``request_elicitation`` callable gets ``None`` and can
+    leave agy's WAITING step to time out on its own.
+
+    :param client: Test HTTP client.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.runtime import pending_elicitations, session_stream
+
+    monkeypatch.setattr(
+        sessions_route,
+        "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
+        0.1,
+    )
+    monkeypatch.setattr(
+        sessions_route,
+        "_HARNESS_ELICITATION_REPARK_GRACE_S",
+        0.05,
+    )
+    pending_elicitations.reset_for_tests()
+    agent = await create_test_agent(client, "test-agy-elicit-timeout")
+    session_id = await _create_session(client, agent["id"])
+
+    async def _drain_until_resolved() -> None:
+        """
+        Wait for the deferred ``response.elicitation_resolved`` publish.
+
+        :returns: None.
+        """
+        async with asyncio.timeout(3.0):
+            async for event in session_stream.subscribe(session_id):
+                if event.get("type") == "response.elicitation_resolved":
+                    return
+
+    drain_task = asyncio.create_task(_drain_until_resolved())
+    await asyncio.sleep(0.05)
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request",
+        json={
+            "elicitation_id": "elicit_agy_00000000000000000000000000000099",
+            "params": {
+                "mode": "form",
+                "message": "Antigravity needs your input",
+            },
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.content == b""
+    await drain_task
+    assert pending_elicitations.count_for(session_id) == 0
+    pending_elicitations.reset_for_tests()
+
+
+async def test_antigravity_elicitation_hook_rejects_invalid_json(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Antigravity elicitation hook: malformed JSON body returns 400.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    agent = await create_test_agent(client, "test-agy-elicit-badjson")
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request",
+        content=b"not-json",
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400, resp.text
+
+
+async def test_antigravity_elicitation_hook_rejects_non_dict_body(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Antigravity elicitation hook: non-object JSON body returns 400.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    agent = await create_test_agent(client, "test-agy-elicit-nondict")
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request",
+        json=["not", "a", "dict"],
+    )
+    assert resp.status_code == 400, resp.text

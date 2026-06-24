@@ -123,6 +123,11 @@ def _build_tool_call() -> Executor:
                 name="echo_tool",
                 status=ToolCallStatus.SUCCESS,
                 result="tool result",
+                # A handles_tools_internally executor (e.g. antigravity) stamps
+                # the request's real call_id on the completion too, so the
+                # observed function_call and its function_call_output pair
+                # downstream (an id-less completion cannot pair and is dropped).
+                metadata={"call_id": "call_test_1"},
             ),
             TurnComplete(response=None),
         ]

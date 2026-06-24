@@ -3,7 +3,9 @@ import { vi } from "vitest";
 
 // The @lobehub icon packages have broken nested-module resolution
 // under vitest; stub presentational glyphs so component modules that
-// import them can still load in tests.
+// import them can still load in tests. (The Antigravity glyph additionally
+// drags in @lobehub/fluent-emoji → @emoji-mart/data, whose JSON modules need
+// an import attribute Node refuses under vitest — so it must be stubbed too.)
 vi.mock("@/components/icons/ClaudeIcon", () => ({
   ClaudeIcon: () => null,
 }));
@@ -18,6 +20,9 @@ vi.mock("@/components/icons/CursorIcon", () => ({
 }));
 vi.mock("@/components/icons/GooseIcon", () => ({
   GooseIcon: () => null,
+}));
+vi.mock("@/components/icons/AntigravityIcon", () => ({
+  AntigravityIcon: () => null,
 }));
 
 // Radix UI primitives (DropdownMenu, etc.) call these pointer-capture and

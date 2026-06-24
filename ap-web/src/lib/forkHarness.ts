@@ -19,7 +19,9 @@
 // and tests/e2e/test_host_cross_family_fork_e2e.py).
 
 /** Provider family a harness consumes, or null when unknown. */
-export function harnessFamily(harness: string | null | undefined): "anthropic" | "openai" | null {
+export function harnessFamily(
+  harness: string | null | undefined,
+): "anthropic" | "openai" | "gemini" | null {
   if (!harness) return null;
   switch (harness) {
     case "claude-native":
@@ -34,12 +36,24 @@ export function harnessFamily(harness: string | null | undefined): "anthropic" |
     case "openai-agents-sdk":
     case "agents_sdk":
       return "openai";
+    // Antigravity is Gemini-family: the native CLI (`antigravity-native`)
+    // and the in-process SDK (`antigravity`, plus reversed spellings) all
+    // consume Gemini models.
+    case "antigravity-native":
+    case "native-antigravity":
+    case "antigravity":
+      return "gemini";
     default:
       return null;
   }
 }
 
-/** Whether a harness is a native CLI harness (Claude Code / Codex / Pi). */
+/**
+ * Whether a harness is a native CLI harness (Claude Code / Codex / Pi /
+ * Antigravity). Mirrors Python `NATIVE_HARNESSES` (`omnigent/harness_aliases.py`)
+ * — including both native-antigravity spellings (the in-process `antigravity`
+ * SDK harness is NOT native) — so both sides classify the same set.
+ */
 export function isNativeHarness(harness: string | null | undefined): boolean {
   return (
     harness === "claude-native" ||
@@ -47,7 +61,9 @@ export function isNativeHarness(harness: string | null | undefined): boolean {
     harness === "codex-native" ||
     harness === "native-codex" ||
     harness === "pi-native" ||
-    harness === "native-pi"
+    harness === "native-pi" ||
+    harness === "antigravity-native" ||
+    harness === "native-antigravity"
   );
 }
 

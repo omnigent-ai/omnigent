@@ -89,8 +89,10 @@ def test_no_credentials_detected(clean_env) -> None:
         ),
         (
             "GEMINI_API_KEY",
-            # Gemini has no omnigent harness family yet → family None.
-            DetectedProvider(name="gemini", kind="key", family=None, source="$GEMINI_API_KEY"),
+            # Gemini serves the ``gemini`` surface (the antigravity-sdk harness
+            # drives the Gemini SDK with a GEMINI_API_KEY), so a detected key
+            # is mapped to the gemini family — no longer dropped as family None.
+            DetectedProvider(name="gemini", kind="key", family="gemini", source="$GEMINI_API_KEY"),
         ),
     ],
 )

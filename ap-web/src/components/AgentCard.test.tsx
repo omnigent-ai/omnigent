@@ -22,6 +22,7 @@ vi.mock("@/components/icons/GooseIcon", () => ({ GooseIcon: stub("goose") }));
 vi.mock("@/components/icons/NessieIcon", () => ({ NessieIcon: stub("nessie") }));
 vi.mock("@/components/icons/OpenCodeIcon", () => ({ OpenCodeIcon: stub("opencode") }));
 vi.mock("@/components/icons/PiIcon", () => ({ PiIcon: stub("pi") }));
+vi.mock("@/components/icons/AntigravityIcon", () => ({ AntigravityIcon: stub("antigravity") }));
 vi.mock("lucide-react", () => ({ BotIcon: stub("bot") }));
 
 function agent(overrides: Partial<AvailableAgent> = {}): AvailableAgent {
@@ -60,6 +61,9 @@ describe("AgentCard icon selection", () => {
     { name: "x", harness: "goose", expected: "goose" },
     // The SDK "cursor" harness also reads as Cursor via the harness fallback.
     { name: "x", harness: "cursor", expected: "cursor" },
+    { name: "antigravity-native-ui", harness: "antigravity-native", expected: "antigravity" },
+    // The in-process Antigravity SDK harness shares the same glyph.
+    { name: "x", harness: "antigravity", expected: "antigravity" },
     { name: "x", harness: "claude-sdk", expected: "claude" },
     { name: "pi", harness: "pi", expected: "pi" },
     // The pi match is exact: a harness merely containing "pi" stays generic.

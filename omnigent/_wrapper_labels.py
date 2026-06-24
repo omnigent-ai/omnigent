@@ -62,6 +62,10 @@ CURSOR_NATIVE_WRAPPER_VALUE = "cursor-native-ui"
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 GOOSE_NATIVE_WRAPPER_VALUE = "goose-native-ui"
 
+# Value the ``omnigent antigravity`` native (agy TUI) wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+ANTIGRAVITY_NATIVE_WRAPPER_VALUE = "antigravity-native-ui"
+
 # Value the ``omnigent qwen`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 QWEN_NATIVE_WRAPPER_VALUE = "qwen-native-ui"
