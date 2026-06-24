@@ -55,6 +55,59 @@ def to_elicitation_params(pending: dict[str, Any]) -> ElicitationRequestParams:
     raise ValueError(f"Unsupported agy interaction kind: {kind!r}")
 
 
+def _agy_questions_to_ask_user_question(spec: object) -> list[dict[str, Any]]:
+    """
+    Convert an agy ``askQuestion`` spec to the web UI's AskUserQuestion shape.
+
+    The web UI already ships an interactive ``AskUserQuestionForm`` keyed on the
+    ``ask_user_question`` params extra (Claude Code's built-in tool); reusing it
+    is what makes an agy question render with selectable options AND round-trip a
+    real answer (the SPA's generic approve/reject card cannot). The mapping:
+
+    * each agy ``questions[i]`` → one Claude question with a synthetic string
+      ``id`` equal to its index ``i``, so the form keys its answer by that id
+      (robust to duplicate question text) and :func:`_agy_ask_question_response`
+      can line answers back up to agy questions positionally;
+    * agy ``is_multi_select`` → Claude ``multiSelect`` (radios vs checkboxes);
+    * each agy option's ``text`` → the Claude option ``label`` (the human-
+      readable choice the form displays and returns). The agy option ``id`` is
+      NOT sent to the SPA — the form returns the chosen *label*, which
+      :func:`_agy_ask_question_response` maps back to the agy id by ``text``.
+
+    :param spec: The ``requestedInteraction.askQuestion`` block.
+    :returns: A list of Claude-shaped question dicts (possibly empty).
+    """
+    out: list[dict[str, Any]] = []
+    if not isinstance(spec, dict):
+        return out
+    questions = spec.get("questions")
+    if not isinstance(questions, list):
+        return out
+    for i, question in enumerate(questions):
+        if not isinstance(question, dict):
+            continue
+        text = question.get("question")
+        if not isinstance(text, str) or not text:
+            continue
+        options: list[dict[str, Any]] = []
+        raw_options = question.get("options")
+        if isinstance(raw_options, list):
+            for opt in raw_options:
+                if isinstance(opt, dict):
+                    label = opt.get("text")
+                    if isinstance(label, str) and label:
+                        options.append({"label": label})
+        out.append(
+            {
+                "id": str(i),
+                "question": text,
+                "options": options,
+                "multiSelect": bool(question.get("is_multi_select")),
+            }
+        )
+    return out
+
+
 def _agy_ask_question_params(
     trajectory_id: object,
     step_index: object,
@@ -63,6 +116,13 @@ def _agy_ask_question_params(
     """
     Build elicitation params for an ``ask_question`` pending interaction.
 
+    Stamps the question under ``ask_user_question`` (Claude Code's built-in
+    AskUserQuestion key) so the web UI's existing interactive form renders the
+    options and returns a real selection. The raw agy ``askQuestion`` block is
+    ALSO forwarded under ``ask_question`` (carrying option ids + verbatim
+    question text) so the response mapper can translate the form's option
+    *labels* back to agy option *ids*.
+
     :param trajectory_id: agy trajectory id string.
     :param step_index: Step index integer (0 when absent).
     :param spec: The ``requestedInteraction.askQuestion`` block; carries
@@ -70,6 +130,7 @@ def _agy_ask_question_params(
     :returns: ``ElicitationRequestParams`` for an ask-question form.
     """
     extras: dict[str, Any] = {
+        "ask_user_question": {"questions": _agy_questions_to_ask_user_question(spec)},
         "ask_question": spec,
     }
     if isinstance(trajectory_id, str) and trajectory_id:
@@ -159,6 +220,25 @@ def to_interaction_payload(
     raise ValueError(f"Unsupported agy interaction kind: {kind!r}")
 
 
+def _answer_labels(answer: object) -> list[str]:
+    """
+    Normalize one web-form answer value to a list of selected option labels.
+
+    The ``AskUserQuestionForm`` posts a single-select answer as a string label
+    and a multi-select answer as a list of string labels (plus, in either case,
+    any free-form custom text as one more label). This flattens both to a list,
+    dropping non-string / empty entries.
+
+    :param answer: The per-question value from ``ElicitationResult.content``.
+    :returns: Selected labels (possibly empty).
+    """
+    if isinstance(answer, str):
+        return [answer] if answer else []
+    if isinstance(answer, list):
+        return [a for a in answer if isinstance(a, str) and a]
+    return []
+
+
 def _agy_ask_question_response(
     result: ElicitationResult,
     spec: dict[str, Any],
@@ -166,34 +246,24 @@ def _agy_ask_question_response(
     """
     Build the ``askQuestion`` interaction payload from a web result.
 
-    On ``accept``, ``content`` must carry ``selectedOptionIds`` (a list of
-    option id strings, e.g. ``["2"]``).  An optional ``writeInResponse``
-    string is forwarded verbatim when present and non-empty.
+    The web UI renders the question via its ``AskUserQuestionForm`` (see
+    :func:`_agy_questions_to_ask_user_question`) and, on submit, posts a flat
+    ``content`` map keyed by each question's synthetic id (its index) — the
+    value being the selected option *label(s)* (single-select → one string,
+    multi-select → list of strings), or free-form custom text. agy's
+    ``HandleCascadeUserInteraction`` instead wants option *ids* per question, so
+    this maps each selected label back to its agy option id by matching option
+    ``text``; any label with no matching option is forwarded as
+    ``writeInResponse`` (the user's custom answer). EVERY question is answered
+    (the form requires it), so multi-question prompts now round-trip fully.
 
-    On ``decline`` or ``cancel``, an empty ``responses`` list is returned
-    so the caller can forward it without special-casing the verdict.
-
-    MULTI-QUESTION LIMITATION (minimal-safe guard): agy's ``askQuestion`` can
-    carry several ``questions[i]`` (each with its own option ids and
-    ``is_multi_select`` flag — see ``_merge_is_multi_select`` in
-    ``antigravity_native_steps``), and the agy wire wants one response entry PER
-    question. But :class:`ElicitationResult.content` is flat — it carries ONE
-    ``selectedOptionIds`` / ``writeInResponse``, with no per-question key — so the
-    SPA can only collect a single answer end-to-end. Broadcasting that single
-    answer to EVERY question (the prior behaviour) is semantically wrong: those
-    option ids belong to the first question and rarely map onto the others.
-
-    So we answer ONLY the first question with the verdict and leave the remaining
-    questions unanswered (logging the limitation), letting agy handle the rest on
-    its own terms rather than mis-answering them. A full per-question fix requires
-    a schema + SPA-form change (a per-question ``content`` shape) and is tracked
-    as a follow-up; single-question — the dominant, fully-working case — stays
-    correct because there is no "rest" to drop.
+    On ``decline`` / ``cancel`` (or a non-dict content), an empty ``responses``
+    list is returned so the caller can forward it without special-casing.
 
     :param result: Web-submitted elicitation verdict.
-    :param spec: The ``askQuestion`` spec block; used to recover verbatim
-        question text for the answered response entry.
-    :returns: ``{"askQuestion": {"responses": [...]}}`` with at most one entry.
+    :param spec: The ``askQuestion`` spec block; supplies the option id↔text map
+        and verbatim question text.
+    :returns: ``{"askQuestion": {"responses": [...]}}`` (one entry per question).
     """
     if result.action != "accept" or not isinstance(result.content, dict):
         return {"askQuestion": {"responses": []}}
@@ -202,47 +272,47 @@ def _agy_ask_question_response(
     if not isinstance(questions_raw, list):
         return {"askQuestion": {"responses": []}}
 
-    # Only the first question with usable text can be answered: the flat result
-    # shape carries a single answer. Skip leading non-dict / text-less entries so
-    # a malformed first entry does not waste the one answer we can represent.
-    answerable = [
-        entry
-        for entry in questions_raw
-        if isinstance(entry, dict) and isinstance(entry.get("question"), str)
-    ]
-    if not answerable:
-        return {"askQuestion": {"responses": []}}
+    content = result.content
+    responses: list[dict[str, Any]] = []
+    for i, question in enumerate(questions_raw):
+        if not isinstance(question, dict):
+            continue
+        question_text = question.get("question")
+        if not isinstance(question_text, str) or not question_text:
+            continue
 
-    if len(answerable) > 1:
-        # Genuine multi-question: the flat verdict cannot represent per-question
-        # answers, so answer the first and leave the rest to agy. Do NOT broadcast.
-        _logger.warning(
-            "agy askQuestion carried %d questions but the elicitation result "
-            "represents a single answer; answering only the first question and "
-            "leaving the remaining %d to agy (flat ElicitationResult.content has "
-            "no per-question structure — full per-question support is a follow-up)",
-            len(answerable),
-            len(answerable) - 1,
-        )
+        # The form keys each answer by the synthetic question id (its index);
+        # fall back to the verbatim question text for robustness.
+        answer = content.get(str(i))
+        if answer is None:
+            answer = content.get(question_text)
+        labels = _answer_labels(answer)
 
-    selected_ids: list[str] = []
-    raw_ids = result.content.get("selectedOptionIds")
-    if isinstance(raw_ids, list):
-        selected_ids = [s for s in raw_ids if isinstance(s, str)]
+        # Map selected labels back to agy option ids by matching option text.
+        text_to_id: dict[str, str] = {}
+        raw_options = question.get("options")
+        if isinstance(raw_options, list):
+            for opt in raw_options:
+                if isinstance(opt, dict):
+                    opt_text = opt.get("text")
+                    opt_id = opt.get("id")
+                    if isinstance(opt_text, str) and isinstance(opt_id, str):
+                        text_to_id.setdefault(opt_text, opt_id)
 
-    write_in: str | None = None
-    raw_write_in = result.content.get("writeInResponse")
-    if isinstance(raw_write_in, str) and raw_write_in:
-        write_in = raw_write_in
+        selected_ids = [text_to_id[label] for label in labels if label in text_to_id]
+        write_ins = [label for label in labels if label not in text_to_id]
 
-    response: dict[str, Any] = {
-        "question": answerable[0]["question"],
-        "selectedOptionIds": selected_ids,
-    }
-    if write_in is not None:
-        response["writeInResponse"] = write_in
+        response: dict[str, Any] = {
+            "question": question_text,
+            "selectedOptionIds": selected_ids,
+        }
+        if write_ins:
+            response["writeInResponse"] = (
+                write_ins[0] if len(write_ins) == 1 else ", ".join(write_ins)
+            )
+        responses.append(response)
 
-    return {"askQuestion": {"responses": [response]}}
+    return {"askQuestion": {"responses": responses}}
 
 
 def _agy_permission_response(result: ElicitationResult) -> dict[str, Any]:

@@ -177,6 +177,46 @@ class TestToElicitationParamsAskQuestion:
         assert extra.get("step_index") == 3
 
 
+class TestAskUserQuestionExtra:
+    """The agy question is also stamped under the web UI's ``ask_user_question``
+    key (Claude AskUserQuestion shape) so the existing interactive form renders
+    it and returns a real selection (not a generic approve/reject card)."""
+
+    def test_ask_user_question_extra_present(self) -> None:
+        params = to_elicitation_params(_ASK_QUESTION_PENDING)
+        extra = params.model_extra or {}
+        assert "ask_user_question" in extra
+
+    def test_ask_user_question_questions_shape(self) -> None:
+        params = to_elicitation_params(_ASK_QUESTION_PENDING)
+        extra = params.model_extra or {}
+        payload = extra["ask_user_question"]
+        assert isinstance(payload, dict)
+        questions = payload.get("questions")
+        assert isinstance(questions, list) and len(questions) == 1
+        q = questions[0]
+        # Synthetic string id == index so the form keys its answer by it.
+        assert q["id"] == "0"
+        assert q["question"] == "What type of project?"
+        assert q["multiSelect"] is False
+        # agy option text becomes the Claude option label (no id leaked to UI).
+        labels = [o["label"] for o in q["options"]]
+        assert labels == ["Web app", "CLI tool", "Testing"]
+        assert all("id" not in o for o in q["options"])
+
+    def test_ask_user_question_multiselect_flag(self) -> None:
+        params = to_elicitation_params(_MULTI_SELECT_PENDING)
+        extra = params.model_extra or {}
+        q = extra["ask_user_question"]["questions"][0]
+        assert q["multiSelect"] is True
+
+    def test_ask_user_question_multi_question_indices(self) -> None:
+        params = to_elicitation_params(_MULTI_QUESTION_PENDING)
+        extra = params.model_extra or {}
+        questions = extra["ask_user_question"]["questions"]
+        assert [q["id"] for q in questions] == ["0", "1"]
+
+
 # ── to_elicitation_params: permission ───────────────────────────────
 
 
@@ -214,7 +254,12 @@ class TestToElicitationParamsPermission:
 
 
 class TestToInteractionPayloadAskQuestion:
-    """Tests for ask_question result → handleUserInteraction payload."""
+    """ask_question result → handleUserInteraction payload.
+
+    The web form posts a flat ``content`` keyed by each question's synthetic id
+    (its index), valued by the selected option *label(s)* / custom text. The
+    mapper translates labels back to agy option *ids* by matching option text.
+    """
 
     def _spec(self) -> dict[str, object]:
         spec = _ASK_QUESTION_PENDING["spec"]
@@ -222,133 +267,94 @@ class TestToInteractionPayloadAskQuestion:
         return spec
 
     def test_single_option_selected(self) -> None:
-        result = ElicitationResult(
-            action="accept",
-            content={"selectedOptionIds": ["2"]},
-        )
+        # Form posts the chosen LABEL keyed by question id "0".
+        result = ElicitationResult(action="accept", content={"0": "CLI tool"})
         payload = to_interaction_payload("ask_question", result, self._spec())
-        assert "askQuestion" in payload
         responses = payload["askQuestion"]["responses"]
         assert len(responses) == 1
         assert responses[0]["question"] == "What type of project?"
+        # Label "CLI tool" maps back to its agy option id "2".
         assert responses[0]["selectedOptionIds"] == ["2"]
 
-    def test_option_id_not_text(self) -> None:
-        result = ElicitationResult(
-            action="accept",
-            content={"selectedOptionIds": ["1"]},
-        )
+    def test_selected_id_is_agy_id_not_label(self) -> None:
+        result = ElicitationResult(action="accept", content={"0": "Web app"})
         payload = to_interaction_payload("ask_question", result, self._spec())
         selected = payload["askQuestion"]["responses"][0]["selectedOptionIds"]
         assert selected == ["1"]
         assert "Web app" not in selected
 
+    def test_answer_keyed_by_question_text_fallback(self) -> None:
+        # Robustness: a content keyed by verbatim question text still maps.
+        result = ElicitationResult(action="accept", content={"What type of project?": "Testing"})
+        payload = to_interaction_payload("ask_question", result, self._spec())
+        assert payload["askQuestion"]["responses"][0]["selectedOptionIds"] == ["3"]
+
     def test_decline_returns_empty(self) -> None:
         result = ElicitationResult(action="decline")
         payload = to_interaction_payload("ask_question", result, self._spec())
-        assert "askQuestion" in payload
-        responses = payload["askQuestion"]["responses"]
-        assert responses == []
+        assert payload["askQuestion"]["responses"] == []
 
     def test_cancel_returns_empty(self) -> None:
         result = ElicitationResult(action="cancel")
         payload = to_interaction_payload("ask_question", result, self._spec())
-        assert "askQuestion" in payload
-        responses = payload["askQuestion"]["responses"]
-        assert responses == []
+        assert payload["askQuestion"]["responses"] == []
 
     def test_multi_select_multiple_ids(self) -> None:
         multi_spec = _MULTI_SELECT_PENDING["spec"]
         assert isinstance(multi_spec, dict)
-        result = ElicitationResult(
-            action="accept",
-            content={"selectedOptionIds": ["1", "3"]},
-        )
+        # Multi-select posts a list of labels.
+        result = ElicitationResult(action="accept", content={"0": ["React", "Angular"]})
         payload = to_interaction_payload("ask_question", result, multi_spec)
         responses = payload["askQuestion"]["responses"]
         assert len(responses) == 1
         assert responses[0]["selectedOptionIds"] == ["1", "3"]
 
     def test_write_in_response_included(self) -> None:
-        result = ElicitationResult(
-            action="accept",
-            content={"selectedOptionIds": [], "writeInResponse": "my custom answer"},
-        )
+        # A label with no matching option is the user's free-form answer.
+        result = ElicitationResult(action="accept", content={"0": "my custom answer"})
         payload = to_interaction_payload("ask_question", result, self._spec())
-        responses = payload["askQuestion"]["responses"]
-        assert responses[0].get("writeInResponse") == "my custom answer"
+        response = payload["askQuestion"]["responses"][0]
+        assert response["selectedOptionIds"] == []
+        assert response["writeInResponse"] == "my custom answer"
 
-    def test_write_in_absent_when_not_in_content(self) -> None:
-        result = ElicitationResult(
-            action="accept",
-            content={"selectedOptionIds": ["2"]},
-        )
+    def test_write_in_absent_when_only_predefined(self) -> None:
+        result = ElicitationResult(action="accept", content={"0": "CLI tool"})
         payload = to_interaction_payload("ask_question", result, self._spec())
-        responses = payload["askQuestion"]["responses"]
-        assert "writeInResponse" not in responses[0]
+        assert "writeInResponse" not in payload["askQuestion"]["responses"][0]
 
 
 class TestToInteractionPayloadMultiQuestion:
-    """Multi-question guard: a flat verdict must NOT broadcast to all questions."""
+    """Multi-question prompts round-trip EVERY question (the form answers all)."""
 
     def _spec(self) -> dict[str, object]:
         spec = _MULTI_QUESTION_PENDING["spec"]
         assert isinstance(spec, dict)
         return spec
 
-    def test_multi_question_answers_only_first(self) -> None:
-        # The flat ElicitationResult.content carries one answer; it belongs to the
-        # first question. Broadcasting it to BOTH questions (the prior behaviour)
-        # is semantically wrong, so only the first question is answered.
-        result = ElicitationResult(
-            action="accept",
-            content={"selectedOptionIds": ["2"]},
-        )
+    def test_each_question_answered_with_its_own_option(self) -> None:
+        result = ElicitationResult(action="accept", content={"0": "CLI tool", "1": "Python"})
         payload = to_interaction_payload("ask_question", result, self._spec())
         responses = payload["askQuestion"]["responses"]
-        assert len(responses) == 1
+        assert len(responses) == 2
         assert responses[0]["question"] == "What type of project?"
         assert responses[0]["selectedOptionIds"] == ["2"]
+        assert responses[1]["question"] == "Which language?"
+        assert responses[1]["selectedOptionIds"] == ["1"]
 
-    def test_multi_question_does_not_broadcast(self) -> None:
-        result = ElicitationResult(
-            action="accept",
-            content={"selectedOptionIds": ["2"]},
-        )
+    def test_no_cross_question_broadcast(self) -> None:
+        # Each question's ids come from ITS own options (both questions reuse the
+        # ids "1"/"2", so a broadcast bug would be invisible without per-question
+        # mapping). "Web app" is q0 id 1; "TypeScript" is q1 id 2.
+        result = ElicitationResult(action="accept", content={"0": "Web app", "1": "TypeScript"})
         payload = to_interaction_payload("ask_question", result, self._spec())
         responses = payload["askQuestion"]["responses"]
-        # The second question must NOT be answered with the first's option ids.
-        answered_questions = [r["question"] for r in responses]
-        assert "Which language?" not in answered_questions
+        assert responses[0]["selectedOptionIds"] == ["1"]  # Web app
+        assert responses[1]["selectedOptionIds"] == ["2"]  # TypeScript
 
-    def test_multi_question_logs_limitation(self, caplog: pytest.LogCaptureFixture) -> None:
-        result = ElicitationResult(
-            action="accept",
-            content={"selectedOptionIds": ["1"]},
-        )
-        with caplog.at_level("WARNING"):
-            to_interaction_payload("ask_question", result, self._spec())
-        assert any(
-            "askQuestion carried" in rec.message and "questions" in rec.message
-            for rec in caplog.records
-        )
-
-    def test_multi_question_decline_returns_empty(self) -> None:
+    def test_decline_returns_empty(self) -> None:
         result = ElicitationResult(action="decline")
         payload = to_interaction_payload("ask_question", result, self._spec())
         assert payload["askQuestion"]["responses"] == []
-
-    def test_single_question_does_not_log(self, caplog: pytest.LogCaptureFixture) -> None:
-        # The dominant single-question case must stay silent (no spurious warning).
-        single_spec = _ASK_QUESTION_PENDING["spec"]
-        assert isinstance(single_spec, dict)
-        result = ElicitationResult(
-            action="accept",
-            content={"selectedOptionIds": ["2"]},
-        )
-        with caplog.at_level("WARNING"):
-            to_interaction_payload("ask_question", result, single_spec)
-        assert not any("askQuestion carried" in rec.message for rec in caplog.records)
 
 
 # ── to_interaction_payload: permission ──────────────────────────────

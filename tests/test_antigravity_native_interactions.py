@@ -256,7 +256,7 @@ async def test_happy_path_delivers_selected_option_to_fresh_step() -> None:
     pending = _pending_question(step_index=3)
     waiting = _question_step(step_index=3)
     request, elicit_calls = _elicitation_returner(
-        ElicitationResult(action="accept", content={"selectedOptionIds": ["2"]})
+        ElicitationResult(action="accept", content={"0": "Second"})
     )
     deliver = _DeliverRecorder()
 
@@ -294,8 +294,8 @@ async def test_input_not_registered_reads_new_step_and_redelivers() -> None:
     retry = _question_step(step_index=4)
     # request_elicitation is called once per surfaced step (original + retry).
     request, elicit_calls = _elicitation_returner(
-        ElicitationResult(action="accept", content={"selectedOptionIds": ["2"]}),
-        ElicitationResult(action="accept", content={"selectedOptionIds": ["2"]}),
+        ElicitationResult(action="accept", content={"0": "Second"}),
+        ElicitationResult(action="accept", content={"0": "Second"}),
     )
     deliver = _DeliverRecorder(
         errors=[AntigravityRpcError("input not registered for step 3"), None]
@@ -336,8 +336,8 @@ async def test_input_not_registered_match_is_case_insensitive() -> None:
     stale = _question_step(step_index=3)
     retry = _question_step(step_index=4)
     request, _ = _elicitation_returner(
-        ElicitationResult(action="accept", content={"selectedOptionIds": ["2"]}),
-        ElicitationResult(action="accept", content={"selectedOptionIds": ["2"]}),
+        ElicitationResult(action="accept", content={"0": "Second"}),
+        ElicitationResult(action="accept", content={"0": "Second"}),
     )
     # Mixed-case message (note the capitalization) — must still match the race.
     deliver = _DeliverRecorder(
@@ -397,7 +397,7 @@ async def test_freshest_waiting_overrides_stale_captured_index() -> None:
     pending = _pending_question(step_index=5)  # captured at detection time
     fresher = _question_step(step_index=6)  # agy retried before the human answered
     request, _ = _elicitation_returner(
-        ElicitationResult(action="accept", content={"selectedOptionIds": ["1"]})
+        ElicitationResult(action="accept", content={"0": "First"})
     )
     deliver = _DeliverRecorder()
 
@@ -450,7 +450,7 @@ async def test_no_fresh_waiting_step_skips_delivery() -> None:
     pending = _pending_question(step_index=3)
     done = _question_step(step_index=3, status="CORTEX_STEP_STATUS_DONE")
     request, _ = _elicitation_returner(
-        ElicitationResult(action="accept", content={"selectedOptionIds": ["2"]})
+        ElicitationResult(action="accept", content={"0": "Second"})
     )
     deliver = _DeliverRecorder()
 
@@ -507,7 +507,7 @@ async def test_other_rpc_error_does_not_loop() -> None:
     pending = _pending_question(step_index=3)
     waiting = _question_step(step_index=3)
     request, _ = _elicitation_returner(
-        ElicitationResult(action="accept", content={"selectedOptionIds": ["2"]})
+        ElicitationResult(action="accept", content={"0": "Second"})
     )
     deliver = _DeliverRecorder(errors=[AntigravityRpcError("trajectory not found")])
 
@@ -537,7 +537,7 @@ async def test_retry_storm_is_bounded_by_max_retries() -> None:
         return [_question_step(step_index=counter["n"])]
 
     request, _ = _elicitation_returner(
-        ElicitationResult(action="accept", content={"selectedOptionIds": ["2"]})
+        ElicitationResult(action="accept", content={"0": "Second"})
     )
     deliver = _DeliverRecorder(
         errors=[AntigravityRpcError("input not registered for step N")] * 50
