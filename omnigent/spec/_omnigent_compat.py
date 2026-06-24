@@ -275,7 +275,12 @@ def diagnose_yaml_rejection(path: Path) -> str:
     return "unknown reason — file passes all known checks (likely an internal bug)"
 
 
-def load_omnigent_yaml(path: Path, *, enforce_handler_allowlist: bool = False) -> AgentSpec:
+def load_omnigent_yaml(
+    path: Path,
+    *,
+    enforce_handler_allowlist: bool = False,
+    prune_invalid_sub_agents: bool = False,
+) -> AgentSpec:
     """
     Load an omnigent YAML and translate it to an
     :class:`AgentSpec`.
@@ -293,6 +298,12 @@ def load_omnigent_yaml(path: Path, *, enforce_handler_allowlist: bool = False) -
         unregistered ``type: function`` policy handlers are rejected
         before the loader resolves/calls them (bundle-upload
         guard). See :func:`omnigent.spec.load`.
+    :param prune_invalid_sub_agents: When ``True``, sub-agents that
+        fail validation are dropped (and their ``tools.agents``
+        references removed) instead of failing the whole load, with a
+        WARNING logged per drop. The root agent must still validate.
+        See :func:`omnigent.spec.load` for the full rationale — this
+        is the execution-path backwards-compatibility guard.
     :returns: A validated :class:`AgentSpec` with
         ``executor.type == OMNIGENT_EXECUTOR_TYPE``.
     :raises OmnigentError: If the synthesized spec fails
@@ -341,6 +352,14 @@ def load_omnigent_yaml(path: Path, *, enforce_handler_allowlist: bool = False) -
     if not isinstance(raw, dict):
         raw = {}
     spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw)
+    if prune_invalid_sub_agents:
+        # Local import avoids a module-load cycle: spec/__init__ imports
+        # this module at import time, so it cannot be imported at the top
+        # here. Drops sub-agents this client can't validate (version skew)
+        # before the root validation gate below; see omnigent.spec.load.
+        from omnigent.spec import _prune_invalid_sub_agents
+
+        _prune_invalid_sub_agents(spec)
     result = validate(spec)
     if not result.valid:
         errors = "; ".join(f"{e.path}: {e.message}" for e in result.errors)
