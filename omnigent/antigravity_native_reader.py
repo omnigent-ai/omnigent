@@ -440,7 +440,11 @@ def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str)
         return None
     # Rotate only when the most-recent sibling is STRICTLY newer than the bound
     # cascade's own activity. A bound cascade that itself has no parseable activity
-    # (bound_activity is None) is treated as the oldest, so any active sibling wins.
+    # (bound_activity is None) is treated as the oldest, so any active sibling wins
+    # — this is the /clear-before-first-turn case: a freshly-bound cascade that
+    # never took a turn, then a sibling the user actually used, MUST rotate (else
+    # the reader stays on the dead pre-/clear cascade). Siblings with no activity
+    # are already excluded above, so this only fires for a genuinely-active sibling.
     if bound_activity is None or best_activity > bound_activity:
         return best_id
     return None
