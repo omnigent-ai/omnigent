@@ -277,3 +277,46 @@ async def test_policy_callback_orphan_advisory_phase_allows_and_counts() -> None
     assert verdict.action == "POLICY_ACTION_ALLOW"
     # Counted toward the watchdog even though it failed open.
     assert adapter._orphan_callback_count == 1
+
+
+async def test_abnormal_exit_detaches_executor_synchronously() -> None:
+    """Review-3: abnormal exit detaches the executor BEFORE the bg interrupt.
+
+    A buffered continuation can start a new turn the instant ``run_turn``'s
+    finally returns. If the abandoned executor were left cached, the new turn
+    would reuse the same inner client/session_key and the still-pending
+    ``interrupt_session`` would kill the NEW generation. The finally must null
+    ``self._executor`` synchronously so the next turn rebuilds a FRESH client,
+    and the detached interrupt must target ONLY the abandoned executor.
+    """
+    block = asyncio.Event()
+    executor1 = _FakeExecutor(block_event=block)
+    executor2 = _FakeExecutor(events=[TurnComplete(response="ok")])
+    built: list[_FakeExecutor] = []
+
+    def _factory() -> Executor:
+        nxt = executor2 if built else executor1
+        built.append(nxt)
+        return nxt
+
+    adapter = ExecutorAdapter(executor_factory=_factory)
+
+    task = asyncio.create_task(adapter.run_turn(_request(), _ctx("resp_abn")))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Detached synchronously in the finally — BEFORE the bg interrupt drains.
+    assert adapter._executor is None
+
+    # A fresh turn rebuilds a NEW executor (executor2), not the abandoned one.
+    await adapter.run_turn(_request(), _ctx("resp_new"))
+    assert adapter._executor is executor2
+
+    await adapter.on_shutdown()
+    # The detached interrupt hit ONLY the abandoned executor; the new turn's
+    # executor was never interrupted (no cross-turn kill).
+    assert executor1.interrupt_calls == [adapter._session_key]
+    assert executor2.interrupt_calls == []

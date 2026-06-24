@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+import pytest
 
 from omnigent.runner.app import _evaluate_policy_via_omnigent
 
@@ -84,6 +85,40 @@ async def test_httpcore_read_error_is_treated_as_dead_channel() -> None:
     )
     assert harness.attempts == 2
     assert signaled == ["conv_abc"]
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectError("connection refused"),
+        httpx.ConnectTimeout("connect timed out"),
+    ],
+)
+async def test_connect_failure_is_treated_as_dead_channel(exc: BaseException) -> None:
+    """Review-2: a connect failure (subprocess already gone) retries-then-signals.
+
+    If the harness exited before the verdict POST opens a socket (or the retry
+    lands after it is gone) httpx raises ``ConnectError`` / ``ConnectTimeout``.
+    Those must signal the desync — not fall into the generic log-and-swallow
+    path, which would leave the harness ``evaluate_policy`` future parked 24h.
+    """
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _DeadChannelHarnessClient(exc)
+    await _evaluate_policy_via_omnigent(
+        server_client=_OkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_conn",
+        evaluation_id="poleval_conn",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_conn"]
 
 
 async def test_non_dead_channel_delivery_error_swallows_without_signal() -> None:

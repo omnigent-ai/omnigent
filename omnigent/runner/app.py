@@ -198,13 +198,22 @@ _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, co
 # torn down instead of hanging. ``httpx.RemoteProtocolError`` ("peer closed
 # connection without sending complete message body") is the canonical SIGKILL
 # symptom; the httpcore-level read error surfaces when the drop happens below
-# httpx's framing layer.
+# httpx's framing layer. ``httpx.ConnectError`` / ``httpx.ConnectTimeout``
+# (and their httpcore counterparts) cover the case where the subprocess has
+# already exited before the verdict POST opens a socket, or the retry lands
+# after it is gone — those raise on connect rather than mid-stream, but the
+# parked policy future is just as dead, so they must signal the desync too
+# (not fall through to the generic log-and-swallow path).
 _DEAD_HARNESS_CHANNEL_ERRORS: tuple[type[BaseException], ...] = (
     httpx.RemoteProtocolError,
     httpx.ReadError,
     httpx.WriteError,
     httpx.StreamClosed,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
     httpcore.ReadError,
+    httpcore.ConnectError,
+    httpcore.ConnectTimeout,
 )
 
 # Stable, client-visible error code for a turn-context desync (the harness
@@ -12369,8 +12378,16 @@ def create_runner_app(
 
         :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
         """
+        # Distinguish "no live turn" (absent) from a stream-mode turn (present
+        # as the ``None`` sentinel — the turn is driven by the AP request's
+        # consumption of ``proxy_stream``, so the runner owns no cancellable
+        # Task). A completed background Task is also nothing to do. Everything
+        # else — a live Task OR the None sentinel — has a live HARNESS turn
+        # parked on its policy/tool future, so the interrupt must be forwarded.
+        if conv_id not in _active_turns:
+            return
         target = _active_turns.get(conv_id)
-        if not isinstance(target, asyncio.Task) or target.done():
+        if isinstance(target, asyncio.Task) and target.done():
             return
         _interrupted_sessions.add(conv_id)
         try:
@@ -12387,7 +12404,16 @@ def create_runner_app(
                 conv_id,
                 exc_info=True,
             )
-        await _cancel_active_turn(conv_id, expected_task=target)
+        # Floor: force-cancel the runner Task when we own one (background turn).
+        # In stream-mode (None sentinel) there is no Task to cancel — the
+        # forwarded interrupt unwinds the harness ``run_turn`` (releasing the
+        # parked policy future), which ends ``proxy_stream`` → its
+        # ``_on_proxy_stream_end`` clears ``_active_turns`` and drains the
+        # buffer. If the harness is already dead, the open ``proxy_stream`` read
+        # errors out to the same terminal cleanup. Either way the active-turn
+        # gate clears instead of staying stuck.
+        if isinstance(target, asyncio.Task):
+            await _cancel_active_turn(conv_id, expected_task=target)
 
     async def _resync_turn_state(conv_id: str, reason: str) -> None:
         """Single ordered recovery entry for a harness↔runner desync.
@@ -12436,6 +12462,23 @@ def create_runner_app(
                     ),
                 },
             )
+        else:
+            # A continuation is buffered, so we suppressed the failure publish
+            # above (P1.7) — but a background turn cancelled while blocked in
+            # ``_drain_streaming_response`` pops ``_active_turns`` and re-raises
+            # WITHOUT routing through ``_on_proxy_stream_end``, so NO continuation
+            # drain was scheduled and the buffered message would strand while the
+            # session shows idle. Kick the drain explicitly here. Idempotent:
+            # ``_check_and_start_next_turn`` bails when a turn is already active,
+            # so paths that DID route through ``_on_proxy_stream_end`` (setup-phase
+            # cancel, stream-mode end) don't double-start.
+            try:
+                loop = asyncio.get_running_loop()
+                _cont = loop.create_task(_check_and_start_next_turn(conv_id))
+                _cont.add_done_callback(_background_tasks.discard)
+                _background_tasks.add(_cont)
+            except RuntimeError:
+                pass
 
     async def _resync_turn_state_on_delivery_failure(conv_id: str) -> None:
         """Single-arg ``on_delivery_failure`` adapter for ``_resync_turn_state``.

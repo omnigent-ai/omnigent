@@ -590,8 +590,22 @@ class ExecutorAdapter(HarnessApp):
             # leak the run_task the verdict future is parked under. The task
             # is strongly referenced via ``_bg_tasks`` (drained on shutdown)
             # and self-discards on completion.
+            #
+            # DETACH the executor SYNCHRONOUSLY here, before scheduling the
+            # background interrupt: a buffered continuation can start a new
+            # turn the instant this finally returns. If we left the abandoned
+            # executor cached, that new turn's ``_ensure_executor`` would reuse
+            # the SAME inner client and session_key — and the still-pending
+            # ``interrupt_session`` would then kill the NEW generation (or the
+            # new turn would attach to the abandoned stream). Nulling
+            # ``self._executor`` now forces the next turn to rebuild a fresh
+            # client; the detached instance is interrupted + closed off-thread.
             if not clean_exit:
-                interrupt_task = asyncio.ensure_future(self._safe_interrupt(self._session_key))
+                abandoned_executor = self._executor
+                self._executor = None
+                interrupt_task = asyncio.ensure_future(
+                    self._safe_interrupt(abandoned_executor, self._session_key)
+                )
                 self._bg_tasks.add(interrupt_task)
                 interrupt_task.add_done_callback(self._bg_tasks.discard)
 
@@ -621,14 +635,18 @@ class ExecutorAdapter(HarnessApp):
             await self._executor.interrupt_session(self._session_key)
         return response
 
-    async def _safe_interrupt(self, session_key: str) -> None:
-        """Best-effort, bounded interrupt of an abandoned inner generation.
+    async def _safe_interrupt(self, executor: Executor | None, session_key: str) -> None:
+        """Best-effort, bounded interrupt + close of an abandoned generation.
 
         Scheduled (never awaited inline) from :meth:`run_turn`'s finally on
         an abnormal exit so a cached inner-SDK generation that outlived its
         turn can't later flush queued ``tool_use`` blocks as orphaned
-        callbacks. ``interrupt_session`` drops the live client, which forces
-        the next turn to rebuild fresh.
+        callbacks. Operates on the executor instance *detached* by the caller
+        (``self._executor`` is already nulled) — NOT on ``self._executor``,
+        which a fresh continuation turn may have already rebuilt; interrupting
+        that one would kill the new generation. ``interrupt_session`` drops the
+        live client, then ``close``/``close_session`` reaps the abandoned
+        subprocess so it doesn't leak now that nothing else references it.
 
         Bounded by :data:`INTERRUPT_TIMEOUT_S` so a wedged subprocess (HTTP
         unresponsive) can't make this hang and leak the background task.
@@ -636,13 +654,15 @@ class ExecutorAdapter(HarnessApp):
         because there is no turn context left to surface it to and the
         per-conversation watchdog (P1.8) is the next line of defence.
 
+        :param executor: The detached inner executor to interrupt, or ``None``
+            (no executor was ever built — nothing to do).
         :param session_key: The inner executor session key to interrupt.
         """
-        if self._executor is None:
+        if executor is None:
             return
         try:
             await asyncio.wait_for(
-                self._executor.interrupt_session(session_key),
+                executor.interrupt_session(session_key),
                 timeout=INTERRUPT_TIMEOUT_S,
             )
         except (Exception, asyncio.TimeoutError):  # best-effort: log, never raise
@@ -651,6 +671,12 @@ class ExecutorAdapter(HarnessApp):
                 session_key,
                 exc_info=True,
             )
+        # Reap the detached executor — it is no longer referenced by the
+        # adapter, so close it so its subprocess/session is not orphaned.
+        with contextlib.suppress(Exception):
+            await executor.close_session(session_key)
+        with contextlib.suppress(Exception):
+            await executor.close()
 
     async def _maybe_resync_on_orphan(self) -> None:
         """Tier-1 per-conversation SDK reset after repeated orphan callbacks.

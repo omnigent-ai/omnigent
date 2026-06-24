@@ -16726,3 +16726,95 @@ async def test_desynced_session_releases_and_recovers() -> None:
         ):
             desync_failed.append(event)
     assert desync_failed == []
+
+
+@pytest.mark.asyncio
+async def test_desync_drains_buffer_when_turn_pops_active_slot() -> None:
+    """Review-1: a desync drains the buffer even when the cancelled turn self-pops.
+
+    A background turn cancelled while blocked in ``_drain_streaming_response``
+    pops ``_active_turns`` itself and re-raises WITHOUT routing through
+    ``_on_proxy_stream_end`` — so ``_cancel_active_turn``'s ``is turn_task``
+    guard fails and NO continuation drain is scheduled. ``_resync_turn_state``
+    must kick the drain explicitly, or the buffered message strands while the
+    session shows idle. This stub reproduces the self-pop and asserts recovery.
+    """
+    conv = "conv_desync_selfpop"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    forever = asyncio.Event()
+
+    async def _wedged_turn() -> None:
+        # Mimic _drain_streaming_response: on cancel, pop _active_turns and
+        # re-raise WITHOUT _on_proxy_stream_end (so no continuation is kicked).
+        try:
+            await forever.wait()
+        except asyncio.CancelledError:
+            app.state.active_turns.pop(conv, None)
+            raise
+
+    async with _runner_client(app) as http:
+        task = asyncio.create_task(_wedged_turn())
+        app.state.active_turns[conv] = task
+        try:
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "follow up"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+
+            loop = asyncio.get_running_loop()
+            await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+            assert task.cancelled() or task.done()
+
+            # The explicit continuation kick started a fresh turn, which clears
+            # the desynced flag at ``_run_turn_bg`` start. Without the kick this
+            # would never clear (the buffer would strand and the session idle).
+            deadline = loop.time() + 3.0
+            while loop.time() < deadline and conv in app.state.desynced_sessions:
+                await asyncio.sleep(0.02)
+            assert conv not in app.state.desynced_sessions
+        finally:
+            forever.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.asyncio
+async def test_desync_stream_mode_forwards_interrupt() -> None:
+    """Review-4: stream-mode (None-sentinel) desync forwards a harness interrupt.
+
+    A ``stream=true`` turn parks ``_active_turns[conv] = None`` (no runner Task
+    — the AP request drives ``proxy_stream``). The old ``_cancel_inprocess_turn``
+    returned immediately for a non-Task slot, so a dead verdict channel left the
+    proxy stream parked on the harness policy future and the active-turn gate
+    stuck. Recovery must still forward the interrupt so the harness unwinds.
+    """
+    conv = "conv_desync_streammode"
+    harness = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app):
+        # Stream-mode active turn: the None sentinel, not an asyncio.Task.
+        app.state.active_turns[conv] = None
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    # The interrupt was forwarded to the harness (releasing its parked future),
+    # and the session was flagged interrupted — neither happened before the fix.
+    assert {"type": "interrupt"} in harness.patched_events
+    assert conv in app.state.interrupted_sessions
