@@ -976,9 +976,7 @@ def _child_spec_model(sub_spec: Any | None) -> str | None:
     return None
 
 
-async def _parent_resolved_model(
-    server_client: Any, parent_session_id: str
-) -> str | None:
+async def _parent_resolved_model(server_client: Any, parent_session_id: str) -> str | None:
     """Read the parent session's resolved model from its snapshot.
 
     The orchestrator's per-session ``/model`` override (or, failing that, its
@@ -991,9 +989,7 @@ async def _parent_resolved_model(
     :returns: The parent's resolved model id, or ``None`` when unavailable.
     """
     try:
-        resp = await server_client.get(
-            f"/v1/sessions/{parent_session_id}", timeout=10.0
-        )
+        resp = await server_client.get(f"/v1/sessions/{parent_session_id}", timeout=10.0)
         if resp.status_code >= 400:
             return None
         snap = resp.json()

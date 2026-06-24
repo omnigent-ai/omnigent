@@ -3597,23 +3597,15 @@ class TestModelResolution(unittest.TestCase):
         executor = self._databricks_executor(
             model="databricks-claude-sonnet-4-6", model_source="session-override"
         )
-        self.assertEqual(
-            executor._resolve_turn_model(None), "databricks-claude-sonnet-4-6"
-        )
+        self.assertEqual(executor._resolve_turn_model(None), "databricks-claude-sonnet-4-6")
 
     def test_unconfigured_keeps_opus_default(self):
-        executor = self._databricks_executor(
-            model=None, model_source="unconfigured-default"
-        )
-        self.assertEqual(
-            executor._resolve_turn_model(None), "databricks-claude-opus-4-8"
-        )
+        executor = self._databricks_executor(model=None, model_source="unconfigured-default")
+        self.assertEqual(executor._resolve_turn_model(None), "databricks-claude-opus-4-8")
 
     def test_absent_source_keeps_default_for_backcompat(self):
         executor = self._databricks_executor(model=None)
-        self.assertEqual(
-            executor._resolve_turn_model(None), "databricks-claude-opus-4-8"
-        )
+        self.assertEqual(executor._resolve_turn_model(None), "databricks-claude-opus-4-8")
 
     def test_lost_selection_fails_closed(self):
         executor = self._databricks_executor(
