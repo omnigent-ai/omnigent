@@ -180,6 +180,12 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``goose-native`` is excluded for the same reason as ``claude-native`` /
     ``cursor-native``: it is a terminal-first TUI launched via ``omni goose``
     (tmux pane + bridge dir), not ``omnigent run --harness goose-native``.
+
+    ``antigravity-native`` is excluded for the union of both reasons above: it
+    is a terminal-first TUI launched via ``omnigent antigravity`` (runner-owned
+    agy tmux pane + bridge dir), not ``omnigent run --harness antigravity-native``,
+    AND it is Gemini-native (agy authenticates via Google OAuth, not the shared
+    Databricks gateway/profile probe wiring this matrix drives).
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
@@ -189,6 +195,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "cursor",
         "cursor-native",
         "antigravity",
+        "antigravity-native",
         "copilot",
         "qwen",
         "goose",

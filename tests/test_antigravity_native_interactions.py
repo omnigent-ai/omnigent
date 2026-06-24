@@ -396,9 +396,7 @@ async def test_freshest_waiting_overrides_stale_captured_index() -> None:
     """Captured index N but freshest WAITING is N+1 → delivery targets N+1."""
     pending = _pending_question(step_index=5)  # captured at detection time
     fresher = _question_step(step_index=6)  # agy retried before the human answered
-    request, _ = _elicitation_returner(
-        ElicitationResult(action="accept", content={"0": "First"})
-    )
+    request, _ = _elicitation_returner(ElicitationResult(action="accept", content={"0": "First"}))
     deliver = _DeliverRecorder()
 
     await bridge_interaction(
@@ -449,9 +447,7 @@ async def test_no_fresh_waiting_step_skips_delivery() -> None:
     """No WAITING step at delivery time (all timed out) → no delivery, no crash."""
     pending = _pending_question(step_index=3)
     done = _question_step(step_index=3, status="CORTEX_STEP_STATUS_DONE")
-    request, _ = _elicitation_returner(
-        ElicitationResult(action="accept", content={"0": "Second"})
-    )
+    request, _ = _elicitation_returner(ElicitationResult(action="accept", content={"0": "Second"}))
     deliver = _DeliverRecorder()
 
     await bridge_interaction(
@@ -506,9 +502,7 @@ async def test_other_rpc_error_does_not_loop() -> None:
     """A non-'input not registered' RPC error stops the loop after one attempt."""
     pending = _pending_question(step_index=3)
     waiting = _question_step(step_index=3)
-    request, _ = _elicitation_returner(
-        ElicitationResult(action="accept", content={"0": "Second"})
-    )
+    request, _ = _elicitation_returner(ElicitationResult(action="accept", content={"0": "Second"}))
     deliver = _DeliverRecorder(errors=[AntigravityRpcError("trajectory not found")])
 
     await bridge_interaction(
@@ -536,9 +530,7 @@ async def test_retry_storm_is_bounded_by_max_retries() -> None:
         counter["n"] += 1
         return [_question_step(step_index=counter["n"])]
 
-    request, _ = _elicitation_returner(
-        ElicitationResult(action="accept", content={"0": "Second"})
-    )
+    request, _ = _elicitation_returner(ElicitationResult(action="accept", content={"0": "Second"}))
     deliver = _DeliverRecorder(
         errors=[AntigravityRpcError("input not registered for step N")] * 50
     )
