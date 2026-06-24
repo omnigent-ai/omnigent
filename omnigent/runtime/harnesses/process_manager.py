@@ -1150,17 +1150,35 @@ class HarnessProcessManager:
 
 def _pid_alive(pid: int) -> bool:
     """
-    Return True if ``pid`` corresponds to a live process.
+    Return True if ``pid`` is still in the process table.
 
-    Delegates to :func:`omnigent.inner._proc.process_alive`, a psutil-based
-    probe. ``os.kill(pid, 0)`` cannot be used cross-platform: on Windows it
-    maps to ``TerminateProcess`` and would *kill* the target rather than probe
-    it.
+    On POSIX this is ``os.kill(pid, 0)``: a process that was killed but not yet
+    reaped is still a zombie in the table and counts as alive here. That matters
+    — callers (the orphan sweep, and tests that SIGKILL a harness then wait on
+    this before expecting a respawn) use ``not _pid_alive(pid)`` as a proxy for
+    "fully reaped", which is the moment the asyncio child watcher sets the
+    subprocess ``returncode`` and ``get_client`` respawns. A psutil probe that
+    treats a zombie as already-dead would break that synchronization (the wait
+    returns while ``returncode`` is still ``None``).
+
+    ``os.kill(pid, 0)`` cannot be used on Windows — it maps to
+    ``TerminateProcess`` and would *kill* the target — so there we fall back to
+    the psutil probe. (Windows has no zombies, so the distinction is moot.)
 
     :param pid: OS process id to check.
     :returns: True if the process exists, False otherwise.
     """
-    return _proc.process_alive(pid)
+    if IS_WINDOWS:
+        return _proc.process_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but owned by another user — for the orphan sweep that means
+        # "live, leave alone".
+        return True
+    return True
 
 
 async def _pids_holding_socket(socket_path: Path) -> list[int]:
