@@ -2446,9 +2446,7 @@ async def run_reader_with_bridge(
                 # resume loaded as an EMPTY conversation (the whole chat silently
                 # vanished). external_session_id is set-once; the cold-start no
                 # longer records the phantom, so this first adoption sets it.
-                await _record_external_session_id(
-                    client, current["session_id"], new_cascade_id
-                )
+                await _record_external_session_id(client, current["session_id"], new_cascade_id)
                 continue
             # GENUINE /clear (the bound cascade HAD turns): move Omnigent ownership
             # onto a fresh conversation bound to the new cascade, then rebind by
