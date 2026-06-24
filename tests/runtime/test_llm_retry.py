@@ -445,6 +445,119 @@ def test_detail_to_dict_with_none() -> None:
     assert result is None
 
 
+def test_execute_with_retry_records_gen_ai_retry_events_on_span(
+    retry_config_fast: RetryPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When ``execute_with_retry`` receives an active ``llm_span``,
+    each failed attempt lands as a ``gen_ai.retry`` event on that
+    span. The number of events equals the number of failures that
+    triggered a retry (not the total attempt count) so operators
+    can read the retry timeline directly from the trace.
+    """
+    # Patch time.sleep so the test doesn't actually sleep.
+    monkeypatch.setattr("omnigent.runtime.llm_retry.time.sleep", lambda _: None)
+
+    # Set up a fresh OTel provider + in-memory exporter so we can
+    # inspect the span events end-to-end. Mirrors the in_memory_exporter
+    # fixture used in test_telemetry.py; duplicated locally to keep this
+    # file's dependency surface small.
+    import mlflow
+    import mlflow.tracing
+    from mlflow.entities import SpanType
+    from mlflow.tracing.provider import provider as mlflow_provider_wrapper
+    from mlflow.tracing.trace_manager import InMemoryTraceManager
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from omnigent.runtime import telemetry as runtime_telemetry
+    from omnigent.runtime.llm_retry import execute_with_retry
+
+    monkeypatch.setenv("MLFLOW_USE_DEFAULT_TRACER_PROVIDER", "false")
+    monkeypatch.setattr(runtime_telemetry, "_initialized", False)
+
+    trace_manager_instance = getattr(InMemoryTraceManager, "_instance", None)
+    if trace_manager_instance is not None:
+        trace_manager_instance._traces.clear()  # type: ignore[attr-defined]
+        trace_manager_instance._otel_id_to_mlflow_trace_id.clear()  # type: ignore[attr-defined]
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
+    mlflow_provider_wrapper._global_provider_init_once._done = False  # type: ignore[attr-defined]
+    mlflow.tracing.enable()
+
+    # Fail twice, succeed on the third attempt. With max_retries=3
+    # the policy allows 4 total tries, so 2 failures result in 2
+    # retry events recorded on the span.
+    call_fn = MagicMock(
+        side_effect=[
+            httpx.TimeoutException("first timeout"),
+            httpx.TimeoutException("second timeout"),
+            "recovered",
+        ]
+    )
+    on_retry = MagicMock()
+
+    with mlflow.start_span("llm_call", span_type=SpanType.CHAT_MODEL) as span:
+        result = execute_with_retry(
+            call_fn,
+            retry_config_fast,
+            on_retry,
+            llm_span=span,
+        )
+
+    assert result == "recovered"
+    assert call_fn.call_count == 3
+    # on_retry fires once per failure that triggers a retry.
+    assert on_retry.call_count == 2
+
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 1, f"expected 1 span, got {len(spans)}"
+    events = [e for e in spans[0].events if e.name == "gen_ai.retry"]
+    # Two failures → two gen_ai.retry events.
+    assert len(events) == 2, (
+        f"expected 2 gen_ai.retry events, got {len(events)}. "
+        "Each failed attempt that triggers a retry must emit one event."
+    )
+    # Attempt numbers count failed attempts: 1, then 2.
+    attrs_by_attempt = {int(e.attributes["attempt"]): dict(e.attributes or {}) for e in events}
+    assert set(attrs_by_attempt.keys()) == {1, 2}
+    for attempt, attrs in attrs_by_attempt.items():
+        assert attrs["max_attempts"] == retry_config_fast.max_retries + 1
+        assert attrs["error.type"] == "RetryableLLMError"
+        assert "timed out" in attrs["error.message"]
+        assert attrs["backoff_seconds"] > 0
+
+
+def test_execute_with_retry_without_span_is_safe(
+    retry_config_fast: RetryPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Omitting ``llm_span`` keeps the original behavior intact.
+    Retries happen, on_retry fires, and no span events get recorded
+    because no span exists.
+    """
+    monkeypatch.setattr("omnigent.runtime.llm_retry.time.sleep", lambda _: None)
+
+    call_fn = MagicMock(side_effect=[httpx.TimeoutException("t"), "ok"])
+    on_retry = MagicMock()
+
+    result = execute_with_retry(call_fn, retry_config_fast, on_retry)
+
+    assert result == "ok"
+    assert call_fn.call_count == 2
+    assert on_retry.call_count == 1
+
+
 def test_detail_to_dict_with_empty_detail() -> None:
     """
     detail_to_dict with all-None fields must return None, not empty dict.

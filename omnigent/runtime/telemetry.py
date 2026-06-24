@@ -404,6 +404,51 @@ def record_error(span: LiveSpan, exc: BaseException) -> None:
     span.record_exception(exc)
 
 
+def record_llm_retry(
+    span: LiveSpan | None,
+    *,
+    attempt: int,
+    max_attempts: int,
+    error_type: str,
+    error_message: str,
+    backoff_seconds: float | None = None,
+) -> None:
+    """
+    Record a retry attempt as a ``gen_ai.retry`` event on an LLM span.
+
+    Called from the LLM retry loop after a failed attempt and before
+    the backoff sleep. The event lets operators reconstruct the
+    full retry timeline from the span without inferring it from the
+    final outcome alone.
+
+    When ``span`` is ``None`` the call is a no-op so retry sites
+    outside an active tracing context (e.g. background batch jobs)
+    can call the helper unconditionally.
+
+    :param span: The LLM span being retried, or ``None`` when no
+        span is active.
+    :param attempt: 1-based attempt number that just failed.
+    :param max_attempts: Total attempts allowed by the retry policy.
+    :param error_type: Exception class name, e.g. ``"TimeoutException"``.
+    :param error_message: Short error message from the failed attempt.
+    :param backoff_seconds: Sleep duration before the next attempt,
+        or ``None`` when no backoff applies (e.g. the last attempt).
+    """
+    if span is None:
+        return
+    from mlflow.entities.span_event import SpanEvent
+
+    attrs: dict[str, Any] = {
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "error.type": error_type,
+        "error.message": error_message,
+    }
+    if backoff_seconds is not None:
+        attrs["backoff_seconds"] = backoff_seconds
+    span.add_event(SpanEvent(name="gen_ai.retry", attributes=attrs))
+
+
 def record_cancellation(span: LiveSpan) -> None:
     """
     Mark a span as cancelled.

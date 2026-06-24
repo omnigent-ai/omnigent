@@ -13,7 +13,7 @@ import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import httpx
 
@@ -23,7 +23,11 @@ from omnigent.llms.errors import (
     PermanentLLMError,
     RetryableLLMError,
 )
+from omnigent.runtime import telemetry
 from omnigent.spec.types import RetryPolicy
+
+if TYPE_CHECKING:
+    from mlflow.entities.span import LiveSpan
 
 _logger = logging.getLogger(__name__)
 
@@ -275,6 +279,8 @@ def execute_with_retry(
     call_fn: Callable[[], T],
     retry_policy: RetryPolicy,
     on_retry: Callable[[dict[str, Any]], None],
+    *,
+    llm_span: LiveSpan | None = None,
 ) -> T:
     """
     Execute ``call_fn`` with retry on transient failures.
@@ -284,11 +290,18 @@ def execute_with_retry(
     via ``on_retry`` before each backoff sleep. Total tries:
     ``1 + retry_policy.max_retries``.
 
+    When ``llm_span`` is provided, each failed attempt is also
+    recorded as a ``gen_ai.retry`` span event so operators can
+    reconstruct the retry timeline from the trace alone.
+
     :param call_fn: Zero-argument callable that performs the LLM
         call. Raises httpx exceptions on failure.
     :param retry_policy: Retry policy from the agent's LLM config.
     :param on_retry: Callback to emit a ``response.retry`` SSE event.
         Called with the event dict before sleeping.
+    :param llm_span: Active ``llm_call`` span to annotate with
+        ``gen_ai.retry`` events. Pass ``None`` when no tracing
+        context is active (background jobs, smoke tests, etc.).
     :returns: The successful result from ``call_fn``.
     :raises PermanentLLMError: On non-retryable errors.
     :raises RetryableLLMError: When all retry attempts are exhausted.
@@ -305,7 +318,7 @@ def execute_with_retry(
             # ``classify_llm_error`` on this path).
             last_error = exc
             if attempt + 1 < total_tries:
-                _emit_retry_and_sleep(attempt, retry_policy, exc, on_retry)
+                _emit_retry_and_sleep(attempt, retry_policy, exc, on_retry, llm_span)
         except PermanentLLMError:
             raise
         except Exception as exc:
@@ -315,7 +328,7 @@ def execute_with_retry(
 
             last_error = classified
             if attempt + 1 < total_tries:
-                _emit_retry_and_sleep(attempt, retry_policy, classified, on_retry)
+                _emit_retry_and_sleep(attempt, retry_policy, classified, on_retry, llm_span)
 
     # All retries exhausted.
     assert last_error is not None
@@ -327,6 +340,7 @@ def _emit_retry_and_sleep(
     retry_policy: RetryPolicy,
     error: RetryableLLMError,
     on_retry: Callable[[dict[str, Any]], None],
+    llm_span: LiveSpan | None = None,
 ) -> None:
     """
     Emit a retry SSE event and sleep for the backoff delay.
@@ -337,6 +351,8 @@ def _emit_retry_and_sleep(
     :param error: The classified retryable error.
     :param on_retry: Callback to emit the ``response.retry``
         SSE event dict.
+    :param llm_span: Optional active ``llm_call`` span to annotate
+        with a ``gen_ai.retry`` event for this attempt.
     """
     delay = retry_policy.compute_backoff_delay(retry_index=attempt + 1)
     total_tries = retry_policy.max_retries + 1
@@ -353,6 +369,14 @@ def _emit_retry_and_sleep(
         },
     }
     on_retry(event)
+    telemetry.record_llm_retry(
+        llm_span,
+        attempt=attempt + 1,
+        max_attempts=total_tries,
+        error_type=type(error).__name__,
+        error_message=str(error),
+        backoff_seconds=delay,
+    )
     _logger.info(
         "LLM retry %d/%d after %.1fs: %s",
         attempt + 2,
