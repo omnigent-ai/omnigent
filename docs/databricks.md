@@ -42,6 +42,14 @@ wired:
   executor snapshots persist in Lakebase Postgres and Unity Catalog
   Volumes. Lifecycle managed by the workspace.
 
+> **A note on auth tier.** The audit + cost-tracking + guardrails
+> story above assumes API-key tier with the provider. Consumer
+> subscriptions like Anthropic Claude Max, OpenAI ChatGPT Plus, and
+> Cursor Pro use a per-user OAuth flow that the Gateway can't proxy.
+> See [Auth tier compatibility](#auth-tier-compatibility-api-key-vs-subscription--oauth)
+> in the Gateway section for the details and the org-deployment
+> guidance.
+
 ---
 
 ## Architecture
