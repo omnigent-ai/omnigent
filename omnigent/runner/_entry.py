@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, cast
 import httpx
 from fastapi import FastAPI
 
+from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
 
 if TYPE_CHECKING:
@@ -424,13 +425,9 @@ def _parent_process_is_alive(parent_pid: int) -> bool:
     :returns: ``True`` when the process exists or is not visible due
         to permissions, otherwise ``False``.
     """
-    try:
-        os.kill(parent_pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    # Not ``os.kill(parent_pid, 0)``: on Windows that maps to TerminateProcess
+    # and would kill the parent rather than probe it.
+    return _proc.process_alive(parent_pid)
 
 
 def _parent_is_orphaned(parent_pid: int) -> bool:

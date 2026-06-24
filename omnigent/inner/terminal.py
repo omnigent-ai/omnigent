@@ -23,6 +23,7 @@ from typing import Any, TypeAlias
 
 from omnigent.runner.identity import strip_runner_auth_secrets
 
+from . import _proc
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from .egress import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .os_env import (
@@ -544,15 +545,7 @@ def _process_alive(pid: int) -> bool:
         e.g. ``48213``.
     :returns: ``True`` when a process with that pid exists.
     """
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return _proc.process_alive(pid)
 
 
 def _terminals_tmp_root() -> Path:
