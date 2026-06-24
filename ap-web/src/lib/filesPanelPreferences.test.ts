@@ -20,10 +20,8 @@ describe("filesPanelPreferences", () => {
   });
 
   it("round-trips a written preference", () => {
-    writeFilesPanelPreferences({ changedOnly: true });
-    // The written value must come back — proves the write serialized and the
-    // read parsed/validated the field.
-    expect(readFilesPanelPreferences()).toEqual({ changedOnly: true });
+    writeFilesPanelPreferences({ changedOnly: true, collapsed: false });
+    expect(readFilesPanelPreferences()).toEqual({ changedOnly: true, collapsed: false });
   });
 
   it("falls back to defaults on malformed JSON", () => {
@@ -43,6 +41,6 @@ describe("filesPanelPreferences", () => {
     // A record present but with a non-boolean changedOnly must default the
     // field rather than pass a garbage value through to the panel.
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ changedOnly: "yes" }));
-    expect(readFilesPanelPreferences()).toEqual({ changedOnly: false });
+    expect(readFilesPanelPreferences()).toEqual({ changedOnly: false, collapsed: false });
   });
 });

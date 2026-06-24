@@ -21,9 +21,16 @@
 # and the coding-harness CLIs (claude / codex / pi, via Node) — and
 # skips everything server-only: no SPA bundle, no psycopg, no
 # uvicorn entrypoint. Modal's `Image.from_registry` requirements shape
-# it: built for linux/amd64, `python` + `pip` on $PATH, and CMD-only
-# (an ENTRYPOINT that doesn't exec its args would block Modal's own
-# runtime from running).
+# it: `python` + `pip` on $PATH, and CMD-only (an ENTRYPOINT that
+# doesn't exec its args would block Modal's own runtime from running).
+#
+# Both images publish multi-arch (linux/amd64 + linux/arm64) — see
+# .github/workflows/oss-publish-images.yml — so they run natively on
+# arm64 hosts (Apple Silicon laptops, arm64 clusters) as well as amd64.
+# Nothing below is arch-specific: the python/node base images are
+# multi-arch and apt/pip/npm/COPY-from-node all resolve per-arch under
+# buildx. Amd64-only consumers (Modal, Daytona, CoreWeave) keep pulling
+# the amd64 variant from the manifest list, unchanged.
 #
 # Build (from repo root):
 #

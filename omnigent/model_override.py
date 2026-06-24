@@ -26,7 +26,17 @@ _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]*$")
 # SDK harnesses whose model override lands in the spawn env — must stay
 # in sync with ``_HARNESS_MODEL_ENV_KEY`` in ``omnigent/runner/app.py``.
 _SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
-    {"claude-sdk", "codex", "pi", "openai-agents", "cursor", "antigravity"}
+    {
+        "claude-sdk",
+        "codex",
+        "pi",
+        "openai-agents",
+        "cursor",
+        "antigravity",
+        "qwen",
+        "goose",
+        "copilot",
+    }
 )
 
 

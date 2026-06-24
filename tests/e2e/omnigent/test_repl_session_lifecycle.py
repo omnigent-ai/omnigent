@@ -436,8 +436,7 @@ def _runner_pid_from_daemon_log(home: Path, runner_id: str) -> int:
     daemon's process tree, which assumes the runner is a process-tree
     descendant of the daemon. That holds locally but NOT under CI's
     container/daemon model, where the tree walk yields "No runner
-    subprocess found under <pid>" (the same CI-process-model gap that
-    keeps ``local_mode_launches_runner_subprocess`` quarantined).
+    subprocess found under <pid>".
 
     :param home: Isolated HOME for the REPL/daemon under test.
     :param runner_id: Runner id whose pid to resolve, e.g.

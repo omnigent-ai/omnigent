@@ -78,10 +78,22 @@ def _agent_id_by_name(base_url: str, name: str) -> str:
         # SDK → Claude Code: CROSS-family native target. The runner rebuilds
         # the Claude transcript from the copied items, so carry-history is
         # stamped and the wrapper flips to the claude-native terminal UI.
-        pytest.param("claude-native-ui", "claude-code-native-ui", True, id="sdk-to-claude-code"),
+        pytest.param(
+            "claude-native-ui",
+            "claude-code-native-ui",
+            True,
+            id="sdk-to-claude-code",
+            marks=pytest.mark.nightly,
+        ),
         # SDK → Codex: SAME-family native target. Same carry-history rebuild
         # path; the wrapper flips to the codex-native terminal UI.
-        pytest.param("codex-native-ui", "codex-native-ui", True, id="sdk-to-codex"),
+        pytest.param(
+            "codex-native-ui",
+            "codex-native-ui",
+            True,
+            id="sdk-to-codex",
+            marks=pytest.mark.nightly,
+        ),
         # SDK → Pi: native, but it cannot replay fork history, so the fork
         # must flip to the Pi terminal UI without carry-history stamped.
         pytest.param("pi-native-ui", "pi-native-ui", False, id="sdk-to-pi"),

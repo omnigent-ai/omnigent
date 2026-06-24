@@ -401,6 +401,164 @@
 [data-electron-mac] :is(a, button, input, textarea, [role="button"]) {
   -webkit-app-region: no-drag;
 }
+
+/* iOS native shell (SwiftUI/WKWebView) runs the webview full-screen under the
+ * system status bar and home indicator. Keep the web app visually full-bleed,
+ * but move interactive mobile chrome out of unsafe areas. Scoped to the native
+ * bridge marker so normal iOS Safari keeps its existing browser-safe layout. */
+@media (width < 48rem) {
+  [data-ios-native].app-shell {
+    height: 100vh;
+    height: 100lvh;
+    min-height: 100vh;
+    min-height: 100lvh;
+    max-height: 100vh;
+    max-height: 100lvh;
+    overflow: hidden;
+  }
+
+  [data-ios-native] .conversations-sidebar {
+    transition: transform 360ms cubic-bezier(0.32, 0.72, 0, 1);
+    will-change: transform;
+  }
+
+  [data-ios-native] :is(input, textarea, select, [contenteditable="true"]) {
+    font-size: 16px;
+  }
+
+  [data-ios-native] .chat-header {
+    top: max(0px, calc(env(safe-area-inset-top, 0px) - 0.5rem));
+  }
+
+  [data-ios-native] .chat-conversation-content {
+    padding-top: calc(5rem + env(safe-area-inset-top, 0px));
+  }
+
+  [data-ios-native] .main-terminal-view {
+    padding-top: calc(3.25rem + env(safe-area-inset-top, 0px));
+  }
+
+  [data-ios-native] .chat-scroll-fade {
+    mask-image: linear-gradient(
+      to bottom,
+      transparent calc(48px + env(safe-area-inset-top, 0px)),
+      black calc(80px + env(safe-area-inset-top, 0px))
+    );
+    -webkit-mask-image: linear-gradient(
+      to bottom,
+      transparent calc(48px + env(safe-area-inset-top, 0px)),
+      black calc(80px + env(safe-area-inset-top, 0px))
+    );
+  }
+
+  [data-ios-native] .chat-composer-form {
+    padding-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px));
+  }
+
+  [data-ios-native] .chat-composer-form.terminal-first-composer-form {
+    padding-bottom: 0.25rem;
+  }
+
+  [data-ios-native] .terminal-first-switcher-container {
+    padding-bottom: calc(0.35rem + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* Reserve room for the native Liquid Glass switcher that floats over the web
+     view (the in-page pill is suppressed in the iOS shell). Fixed height: the
+     bar's footprint above the home-indicator inset (env). Chat sits 1rem
+     tighter — its composer status line already cushions the gap to the bar. */
+  [data-ios-native] .omnigent-native-bottom-spacer {
+    height: calc(3rem + env(safe-area-inset-bottom, 0px));
+    flex: none;
+  }
+
+  [data-ios-native] .omnigent-native-bottom-spacer--chat {
+    height: calc(2rem + env(safe-area-inset-bottom, 0px));
+  }
+
+  [data-ios-native] .terminal-first-switcher {
+    min-height: 46px;
+    gap: 0.25rem;
+    padding: 0.25rem;
+    border-color: color-mix(in srgb, var(--border) 72%, transparent);
+    background: color-mix(in srgb, var(--card) 88%, transparent);
+    -webkit-backdrop-filter: saturate(180%) blur(18px);
+    backdrop-filter: saturate(180%) blur(18px);
+    box-shadow:
+      0 12px 28px rgb(0 0 0 / 0.13),
+      0 1px 0 rgb(255 255 255 / 0.55) inset;
+    font-size: 16px;
+    line-height: 1;
+  }
+
+  [data-ios-native] .terminal-first-switcher > div {
+    gap: 0.25rem;
+  }
+
+  [data-ios-native] .terminal-first-switcher-option {
+    min-height: 38px;
+    gap: 0.45rem;
+    padding: 0 0.85rem;
+    font-size: 16px;
+    font-weight: 500;
+    letter-spacing: 0;
+    transition:
+      background-color 160ms ease,
+      color 160ms ease,
+      box-shadow 160ms ease,
+      transform 160ms ease;
+  }
+
+  [data-ios-native] .terminal-first-switcher-option:active:not(:disabled) {
+    transform: scale(0.97);
+  }
+
+  [data-ios-native] .terminal-first-switcher-option[aria-pressed="true"] {
+    background: color-mix(in srgb, var(--background) 82%, white 18%);
+    box-shadow:
+      0 3px 10px rgb(0 0 0 / 0.1),
+      0 1px 0 rgb(255 255 255 / 0.72) inset;
+  }
+
+  [data-ios-native] .terminal-first-switcher-option svg {
+    width: 1.15rem;
+    height: 1.15rem;
+  }
+
+  .dark [data-ios-native] .terminal-first-switcher {
+    border-color: color-mix(in srgb, var(--border) 82%, transparent);
+    background: color-mix(in srgb, var(--card) 78%, transparent);
+    box-shadow:
+      0 14px 30px rgb(0 0 0 / 0.35),
+      0 1px 0 rgb(255 255 255 / 0.1) inset;
+  }
+
+  .dark [data-ios-native] .terminal-first-switcher-option[aria-pressed="true"] {
+    background: color-mix(in srgb, var(--muted) 82%, white 6%);
+    box-shadow:
+      0 3px 12px rgb(0 0 0 / 0.28),
+      0 1px 0 rgb(255 255 255 / 0.12) inset;
+  }
+
+  [data-ios-native]
+    :is(
+      .conversations-sidebar,
+      [data-testid="file-viewer"],
+      [data-testid="files-panel-drawer"],
+      [data-testid="terminals-panel"],
+      [data-testid="subagents-panel-drawer"],
+      [data-testid="todos-panel-drawer"]
+    ) {
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+}
+
+@media (width < 48rem) and (prefers-reduced-motion: reduce) {
+  [data-ios-native] .conversations-sidebar {
+    transition-duration: 1ms;
+  }
+}
 /* Share button — glassy pink effect (both modes). The vertical
  * gradient alone does the embossed work (lighter top = light catch,
  * darker bottom = shadow, simulating a convex surface lit from above);
@@ -503,6 +661,27 @@
   font-size: 0.875em;
 }
 
+/* Word-wrap toggle for chat code blocks (see ChatCodeBlockPre in message.tsx).
+ * Streamdown renders the body with `overflow-x-auto` and the <code> with
+ * `white-space: pre`, so long lines scroll horizontally. When `.chat-code-wrap`
+ * is set we soft-wrap instead so everything fits the column width. */
+.chat-code-wrap [data-streamdown="code-block-body"] {
+  overflow-x: hidden;
+}
+.chat-code-wrap [data-streamdown="code-block-body"] pre,
+.chat-code-wrap [data-streamdown="code-block-body"] code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Hang-indent wrapped continuation lines past the line-number gutter so they
+ * align with the code, not under the numbers. Gutter = before:w-6 (1.5rem) +
+ * before:mr-4 (1rem) = 2.5rem; the negative text-indent pulls the first line
+ * (and its ::before number) back to the left edge. */
+.chat-code-wrap [data-streamdown="code-block-body"] code > span {
+  padding-left: 2.5rem;
+  text-indent: -2.5rem;
+}
+
 /* Streamdown's <button> link-safety-modal variant and wrap-anywhere reset can
  * leave the default arrow cursor on links — force pointer to signal affordance. */
 [data-streamdown="link"] {
@@ -521,6 +700,22 @@
 }
 [data-streamdown="heading-4"] {
   font-size: 1em;
+}
+
+/* GitHub task lists in chat messages (Streamdown + remark-gfm). remark-gfm tags
+   each task item `task-list-item` with a disabled <input type="checkbox">, but
+   Streamdown also applies Tailwind `list-disc`, so a disc renders right next to
+   the checkbox (bullet + checkbox). Drop the marker per ITEM (not on the whole
+   `.contains-task-list` list) so a list mixing task and plain items only loses
+   the bullet on the task items — matching GitHub. `list-style-type` is
+   inherited, so setting it on the <li> overrides the list's `list-disc`. Space
+   the checkbox from its label. */
+[data-streamdown="list-item"].task-list-item {
+  list-style: none;
+}
+[data-streamdown="list-item"].task-list-item > input[type="checkbox"] {
+  margin-right: 0.4em;
+  vertical-align: -0.075em;
 }
 
 /* Flash highlight on nav jump. Duration must match FLASH_DURATION_MS in chatStore.ts. */

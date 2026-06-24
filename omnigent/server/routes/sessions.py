@@ -159,6 +159,7 @@ from omnigent.server.managed_hosts import (
     ManagedLaunchTracker,
     ManagedSandboxConfig,
     RepoWorkspace,
+    host_resume_supported,
 )
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.permissions import check_session_access
@@ -584,6 +585,109 @@ def _allow_all_edits_eligible(tool_name: str, permission_mode: str | None) -> bo
     )
 
 
+# Tools that own a dedicated approval affordance and therefore must NOT
+# get the generic "don't ask again" (persistent allow-rule) button:
+# ``ExitPlanMode`` (plan-review card with its own auto-mode action) and
+# ``AskUserQuestion`` (interactive answer form, not a yes/no gate). Edit
+# tools are excluded separately via ``_CLAUDE_NATIVE_EDIT_TOOLS`` — they
+# take the ``setMode``/``acceptEdits`` path instead of an allow rule.
+_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS: frozenset[str] = frozenset(
+    {"ExitPlanMode", "AskUserQuestion"}
+)
+
+
+def _allow_remember_eligible(tool_name: str, permission_mode: str | None) -> bool:
+    """
+    Whether a claude-native PermissionRequest may offer / honor the
+    persistent "don't ask again" affordance — a session-scoped allow
+    rule for the gated tool (WebFetch domain, or tool-wide otherwise).
+
+    This restores native Claude Code parity for NON-edit tools: the
+    native TUI lets the user approve a tool/domain once and adds an
+    allow rule so same-scope calls stop prompting. The web UI used to
+    collapse every prompt into binary Approve/Reject and never wrote a
+    rule, so e.g. each WebFetch — even same-domain github.com URLs —
+    re-prompted forever.
+
+    Eligible for any tool that ISN'T an edit tool (those take the
+    ``acceptEdits`` ``setMode`` path) and isn't one of the tools with a
+    bespoke card (see ``_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS``),
+    under any mode that still prompts. ``bypassPermissions`` never
+    prompts (the hook doesn't even fire), so a rule there would be
+    inert. Used at BOTH the stamp site (drives the UI button) and the
+    verdict site (gates the ``addRules`` decision), so the server never
+    honors a client-supplied ``remember`` flag on a tool/mode the
+    affordance was never offered for.
+
+    :param tool_name: The gated tool from Claude's PermissionRequest
+        payload, e.g. ``"WebFetch"`` or ``"Bash"``.
+    :param permission_mode: Claude's current permission mode from the
+        payload, e.g. ``"default"`` / ``"plan"`` / ``"acceptEdits"`` /
+        ``None`` when absent.
+    :returns: ``True`` iff the affordance applies.
+    """
+    return (
+        tool_name not in _CLAUDE_NATIVE_EDIT_TOOLS
+        and tool_name not in _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS
+        and permission_mode != "bypassPermissions"
+    )
+
+
+def _claude_native_remember_host(tool_name: str, tool_input: Any) -> str | None:
+    """
+    Derive the domain host that a WebFetch "don't ask again" rule should
+    scope to, from the gated tool's input.
+
+    For ``WebFetch`` the persistent rule is scoped to the request's
+    host (``WebFetch(domain:<host>)`` in Claude rule syntax), so
+    approving ``https://github.com/a/b`` stops prompting for
+    ``https://github.com/c/d`` too — but not for other domains. Any
+    other tool (or a WebFetch with a missing/unparseable URL) returns
+    ``None``, which the callers treat as a tool-wide scope.
+
+    Only ``http`` / ``https`` URLs yield a domain scope: WebFetch
+    domain permissions are semantically HTTP(S)-oriented, so a
+    non-HTTP scheme (``ftp://``, ``file://``, …) falls back to a
+    tool-wide rule rather than persisting a ``domain:<host>`` that
+    would never match a real fetch.
+
+    :param tool_name: The gated tool from Claude's PermissionRequest
+        payload.
+    :param tool_input: The tool's input dict (``None``/non-dict tolerated).
+    :returns: The lowercased host (no port), bracketed when it is an IPv6
+        literal (``[2001:db8::1]``), or ``None`` when no domain scope
+        applies.
+    """
+    if tool_name != "WebFetch" or not isinstance(tool_input, dict):
+        return None
+    url = tool_input.get("url")
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in ("http", "https"):
+        return None
+    host = parsed.hostname
+    if not host:
+        return None
+    # urlparse already lowercases ``hostname`` and strips the port and
+    # any userinfo; lower() again makes the documented invariant explicit.
+    host = host.lower()
+    # urlparse strips the brackets off an IPv6 literal authority
+    # (``[2001:db8::1]`` → ``2001:db8::1``), but Claude's
+    # ``domain:<host>`` rule grammar is colon-delimited, so a bare
+    # colon-laden IPv6 atom persists a broken/inert rule (the user
+    # clicks "don't ask again" and keeps getting prompted). A registered
+    # domain name can never contain a colon, so a ``:`` here is an
+    # unambiguous IPv6 literal — re-bracket it so the emitted rule is
+    # ``domain:[2001:db8::1]``.
+    if ":" in host:
+        return f"[{host}]"
+    return host
+
+
 # Server-side wait budget for Codex app-server requests forwarded by
 # ``omnigent codex``. Held at one day like the Claude permission hook:
 # a terminal-side answer ends the wait early via the app-server's
@@ -596,6 +700,11 @@ _CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S = 86400.0
 # Codex: a terminal-side verdict (or agy's own WAITING timeout) ends the
 # wait early, so the long park never blocks native-TUI paths.
 _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S = 86400.0
+# Same one-day park budget for cursor-native tool-approval prompts mirrored
+# from the TUI: a terminal-side answer ends the wait early via
+# ``external_elicitation_resolved`` (posted by the runner-side approval mirror),
+# so the long park never blocks the cursor pane.
+_CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
 
 # ``external_elicitation_resolved`` can arrive just before the matching
 # Codex hook registers, and a web verdict can land between a severed
@@ -615,6 +724,10 @@ _HARNESS_ELICITATION_REPARK_GRACE_S = 10.0
 # Client-supplied re-attach ids, namespaced so they cannot collide
 # with Codex deterministic ids or server-minted ids.
 _CLAUDE_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_claude_[0-9a-f]{32}$")
+# Stable re-attach id for ``POST /policies/evaluate`` retries. Allows the
+# server to re-park the existing ASK elicitation rather than minting a new
+# approval card when a transient 5xx or connect-drop triggered a retry.
+_EVALUATE_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_evaluate_[0-9a-f]{32}$")
 
 # Cap on reaping a cancelled disconnect/terminal-resolved race task in
 # the harness-elicitation gate's cleanup. Reaping normally completes in
@@ -2066,6 +2179,7 @@ def _build_session_response(
     skills: list[SkillSummary] | None = None,
     runner_online: bool | None = None,
     host_online: bool | None = None,
+    host_resumable: bool = False,
     pending_elicitation_events: list[dict[str, Any]] | None = None,
     subtree_usage: dict[str, Any] | None = None,
     model_options: list[dict[str, Any]] | None = None,
@@ -2144,6 +2258,15 @@ def _build_session_response(
     # usage. Shared by the cost indicator and the per-model breakdown so
     # both read the same numbers.
     display_usage = subtree_usage if subtree_usage is not None else (conv.session_usage or {})
+    # Native-terminal-wrapper sessions (claude-native-ui / codex-native-ui) are
+    # always terminal-first: the web UI's Chat/Terminal pill is gated on the
+    # ``omnigent.ui = "terminal"`` label. That flag is fully determined by the
+    # agent identity, so derive it here from ``agent_name`` rather than relying
+    # solely on the stored label — the pill then stays correct even if the
+    # stored value is missing or stale. Idempotent: a no-op when already present.
+    labels = labels_with_closed_status(conv.labels, conv.title)
+    if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL):
+        labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -2151,11 +2274,12 @@ def _build_session_response(
         status=status,
         created_at=conv.created_at,
         title=title_without_closed_marker(conv.title),
-        labels=labels_with_closed_status(conv.labels, conv.title),
+        labels=labels,
         runner_id=conv.runner_id,
         host_id=conv.host_id,
         runner_online=runner_online,
         host_online=host_online,
+        host_resumable=host_resumable,
         reasoning_effort=conv.reasoning_effort,
         items=items,
         permission_level=permission_level,
@@ -3705,6 +3829,7 @@ async def _hold_native_ask_gate(
     engine: PolicyEngine,
     result: PolicyResult,
     conversation_store: ConversationStore,
+    elicitation_id: str | None = None,
 ) -> bool:
     """
     Hold a server-side ASK gate until a human resolves it.
@@ -3747,6 +3872,13 @@ async def _hold_native_ask_gate(
         the reason, deciding_policy, and withheld set_labels.
     :param conversation_store: Store used to mirror child-session
         prompts into ancestor streams.
+    :param elicitation_id: Optional stable re-attach id from the
+        calling hook, e.g. ``"elicit_evaluate_abc123"``. When supplied,
+        ``_publish_and_wait_for_harness_elicitation`` re-attaches to the
+        existing parked elicitation rather than publishing a new card —
+        used by ``POST /policies/evaluate`` retries so a hook retry after
+        a transient 5xx / connect-drop does not prompt the human twice.
+        ``None`` mints a fresh id (the default for non-retry callers).
     :returns: ``True`` iff a human accepted; ``False`` on decline /
         cancel / timeout / disconnect (fail closed).
     """
@@ -3762,11 +3894,11 @@ async def _hold_native_ask_gate(
     )
     # Per-policy ``ask_timeout`` override wins over the spec-level default.
     timeout_s = float(resolve_ask_timeout(engine, result))
-    # Mint the id up front so we can also surface this ASK in the native
-    # terminal (a tmux popup) before parking on the web verdict; both
-    # surfaces resolve the same id, so whichever answers first releases the
-    # gate.
-    elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    # Use the caller-supplied id when present (hook retries re-attach to
+    # the same elicitation); otherwise mint a fresh one so we can surface
+    # this ASK in the native terminal before parking on the web verdict.
+    if elicitation_id is None:
+        elicitation_id = f"elicit_{secrets.token_hex(16)}"
     _spawn_native_approval_popup_forward(
         session_id, elicitation_id, params.message, result.deciding_policy
     )
@@ -5821,16 +5953,33 @@ async def _maybe_relaunch_managed_sandbox(
         return False
     launch = tracker.get(session_id)
     if launch is None or launch.settled.is_set():
-        _kick_managed_relaunch(
-            session_id=session_id,
-            conv=conv,
-            host=host,
-            sandbox_config=sandbox_config,
-            tracker=tracker,
-            conversation_store=conversation_store,
-            host_store=host_store,
-            app_state=app_state,
-        )
+        # A resumable managed host whose sandbox merely idle-stopped is WOKEN
+        # in place (resume: same sandbox + workspace volume) rather than
+        # relaunched onto a fresh empty sandbox — same gate the wake itself
+        # uses (host_resume_supported). Both run in the background through this
+        # same tracker, so the message parks on the rendezvous either way; only
+        # the provision step differs.
+        if host_resume_supported(host, sandbox_config):
+            _kick_managed_wake(
+                session_id=session_id,
+                conv=conv,
+                sandbox_config=sandbox_config,
+                tracker=tracker,
+                conversation_store=conversation_store,
+                host_store=host_store,
+                app_state=app_state,
+            )
+        else:
+            _kick_managed_relaunch(
+                session_id=session_id,
+                conv=conv,
+                host=host,
+                sandbox_config=sandbox_config,
+                tracker=tracker,
+                conversation_store=conversation_store,
+                host_store=host_store,
+                app_state=app_state,
+            )
         launch = tracker.get(session_id)
     if launch is not None:
         await _await_settled_managed_launch(launch)
@@ -5910,6 +6059,164 @@ def _kick_managed_relaunch(
     )
     _managed_launch_tasks.add(relaunch_task)
     relaunch_task.add_done_callback(_managed_launch_tasks.discard)
+
+
+def _kick_managed_wake(
+    *,
+    session_id: str,
+    conv: Conversation,
+    sandbox_config: ManagedSandboxConfig,
+    tracker: ManagedLaunchTracker,
+    conversation_store: ConversationStore,
+    host_store: HostStore,
+    app_state: Any,
+) -> None:
+    """
+    Register and spawn the background WAKE for a dormant resumable host.
+
+    Unlike :func:`_kick_managed_relaunch` (which provisions a NEW sandbox and
+    re-clones the repo), this resumes the SAME stopped sandbox in place
+    (reattaching its persistent volume) — so it does NOT re-bind the session's
+    host/workspace. Reuses the launch tracker so a racing message POST parks on
+    the rendezvous instead of forwarding into a half-woken host or triggering a
+    workspace-destroying relaunch.
+
+    :param session_id: Session/conversation identifier.
+    :param conv: The session row bound to the dormant host.
+    :param sandbox_config: The deployment's sandbox config.
+    :param tracker: The app's launch tracker.
+    :param conversation_store: Store holding the session row.
+    :param host_store: Persistent host registrations.
+    :param app_state: ``request.app.state`` — supplies the registries.
+    """
+    _logger.info(
+        "Managed host %s (session %s) is dormant but resumable; waking in background",
+        conv.host_id,
+        session_id,
+    )
+    tracker.begin(session_id)
+    # Seed the progress indicator immediately — the user is watching the
+    # session page when the wake fires (the composer let them send into a
+    # host_asleep session).
+    _publish_sandbox_status(session_id, "provisioning")
+    wake_task = asyncio.create_task(
+        _run_managed_wake(
+            session_id=session_id,
+            conv=conv,
+            sandbox_config=sandbox_config,
+            tracker=tracker,
+            conversation_store=conversation_store,
+            host_store=host_store,
+            host_registry=getattr(app_state, "host_registry", None),
+            tunnel_registry=getattr(app_state, "tunnel_registry", None),
+        )
+    )
+    _managed_launch_tasks.add(wake_task)
+    wake_task.add_done_callback(_managed_launch_tasks.discard)
+
+
+async def _run_managed_wake(
+    *,
+    session_id: str,
+    conv: Conversation,
+    sandbox_config: ManagedSandboxConfig,
+    tracker: ManagedLaunchTracker,
+    conversation_store: ConversationStore,
+    host_store: HostStore,
+    host_registry: HostRegistry | None,
+    tunnel_registry: TunnelRegistry | None,
+) -> None:
+    """
+    Wake a dormant resumable managed host in the background, settling the
+    tracker so a parked message POST forwards once the host is back.
+
+    Resumes the stopped sandbox in place (:func:`resume_managed_host`: resume +
+    re-arm token + re-exec host, preserving the workspace volume — no re-bind),
+    then launches a runner on the woken host and waits for its tunnel so a
+    rendezvoused message resolves on the first try. The parked send runs the
+    session-init handshake (transcript forwarder attach) before forwarding, so
+    the first post-wake turn is mirrored + persisted.
+
+    Mirrors :func:`_bind_and_launch_managed_runner` (launch runner + wait
+    tunnel + settle) but with a resume instead of a fresh provision + bind.
+    Every exit settles the tracker — a failed wake does NOT tear the sandbox
+    down (the volume is the user's), it just surfaces the reason to the waiter.
+
+    :param session_id: Session/conversation identifier.
+    :param conv: The session row bound to the dormant host.
+    :param sandbox_config: The deployment's sandbox config.
+    :param tracker: The app's launch tracker (this session's entry was begun
+        by the caller).
+    :param conversation_store: Store holding the session row.
+    :param host_store: Persistent host registrations.
+    :param host_registry: Live host tunnels, used to send the launch-runner
+        frame. ``None`` in minimal test wirings.
+    :param tunnel_registry: Runner-tunnel registry used to await the launched
+        runner's connection. ``None`` in minimal test wirings.
+    """
+    from omnigent.server.managed_hosts import resume_managed_host
+
+    try:
+        # Wake the same sandbox in place; resume_managed_host is single-flight
+        # per host and a no-op if it's already online.
+        await resume_managed_host(conv.host_id, host_store, sandbox_config)
+        _publish_sandbox_status(session_id, "connecting")
+        refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if refreshed is None:
+            tracker.fail(session_id, "session not found after wake")
+            return
+        runner_id: str | None = None
+        host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
+        if host_registry is not None and host_conn is None:
+            # resume_managed_host waits on cross-replica host-store liveness, not
+            # this replica's in-memory tunnel registry — the woken host's tunnel
+            # can lag here (or land on another replica). Poll briefly so the runner
+            # launches once it reconnects, instead of settling "ready" with no
+            # runner; fail clearly if it never shows rather than losing the turn.
+            _host_reconnect_deadline = time.monotonic() + _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
+            while host_conn is None and time.monotonic() < _host_reconnect_deadline:
+                await asyncio.sleep(0.5)
+                host_conn = host_registry.get(conv.host_id)
+            if host_conn is None:
+                tracker.fail(session_id, "managed host did not reconnect after wake")
+                _publish_sandbox_status(
+                    session_id, "failed", "managed host did not reconnect after wake"
+                )
+                return
+        if host_conn is not None:
+            launch_attempt = await _launch_runner_on_host(
+                refreshed,
+                conversation_store,
+                host_registry,
+                host_conn,
+            )
+            if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
+                reason = launch_attempt.error or "harness not configured on the sandbox host"
+                tracker.fail(session_id, reason)
+                _publish_sandbox_status(session_id, "failed", reason)
+                return
+            runner_id = launch_attempt.runner_id
+        if runner_id is not None and tunnel_registry is not None:
+            # Wait for the runner tunnel before settling so a rendezvoused
+            # message resolves its runner client on the first try (the
+            # post-settle session-init handshake then attaches the forwarder
+            # before the message is forwarded).
+            await tunnel_registry.wait_for_runner(
+                runner_id,
+                timeout_s=_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+            )
+        tracker.finish(session_id)
+        _publish_sandbox_status(session_id, "ready")
+    except HTTPException as exc:
+        tracker.fail(session_id, str(exc.detail))
+        _publish_sandbox_status(session_id, "failed", str(exc.detail))
+    except Exception:
+        # Fire-and-forget task — settle the tracker (else a waiting message
+        # POST hangs to its timeout) and never escape as an unhandled-task
+        # traceback. A failed wake leaves the sandbox intact for a retry.
+        _logger.exception("Managed host wake crashed for session %s", session_id)
+        tracker.fail(session_id, "internal error during managed host wake")
+        _publish_sandbox_status(session_id, "failed", "internal error during managed host wake")
 
 
 # Matches the create / PATCH handshake timeout — POST /v1/sessions caches
@@ -7624,19 +7931,30 @@ async def _forward_event_to_runner(
             _resolve_message_content,
         )
 
-        try:
-            forwarded_data["content"] = _resolve_message_content(
-                forwarded_data["content"],
-                file_store,
-                artifact_store,
-                session_id=session_id,
-            )
-        except (ValueError, KeyError):
-            _logger.warning(
-                "File reference resolution failed for session=%s",
-                session_id,
-                exc_info=True,
-            )
+        _unresolved = [
+            b for b in forwarded_data["content"] if isinstance(b, dict) and "file_id" in b
+        ]
+        if _unresolved:
+            try:
+                forwarded_data["content"] = _resolve_message_content(
+                    forwarded_data["content"],
+                    file_store,
+                    artifact_store,
+                    session_id=session_id,
+                )
+                _logger.debug(
+                    "Resolved %d file_id block(s) for session=%s before forwarding",
+                    len(_unresolved),
+                    session_id,
+                )
+            except (ValueError, KeyError):
+                _logger.warning(
+                    "File reference resolution failed for session=%s "
+                    "(unresolved file_id blocks will reach the runner unresolved — "
+                    "runner will attempt fallback resolution)",
+                    session_id,
+                    exc_info=True,
+                )
 
     # Flatten SessionEventInput {type, data} into the runner's
     # discriminated-union shape {type, ...data_fields}. The runner's
@@ -9073,7 +9391,7 @@ async def _register_policy_elicitation(
         message=result.reason or "Approval required",
         requested_schema={},
         phase=Phase.TOOL_CALL.value,
-        policy_name=result.deciding_policy or "unknown",
+        policy_names=result.deciding_policies or ["unknown"],
         content_preview=arguments_preview[:1024],
     )
     # Approval state lives on the runner (in-memory
@@ -10662,6 +10980,8 @@ async def _create_session_from_existing_agent(
     user_id: str | None = None,
     permission_store: PermissionStore | None = None,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
+    file_store: FileStore | None = None,
+    artifact_store: ArtifactStore | None = None,
 ) -> SessionResponse:
     """
     Create a session bound to an already-registered agent.
@@ -10687,6 +11007,10 @@ async def _create_session_from_existing_agent(
         ``parent_session_id`` and session-scoped ``agent_id``.
     :param liveness_lookup: Optional session-scoped liveness lookup
         to populate ``SessionResponse.runner_online``.
+    :param file_store: Optional file metadata store for resolving
+        ``file_id`` references in ``initial_items`` before forwarding
+        to the runner.
+    :param artifact_store: Optional binary content store for the same.
     :returns: The newly created session snapshot.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
@@ -10959,6 +11283,8 @@ async def _create_session_from_existing_agent(
                     conversation_store,
                     runner_client,
                     agent_name=agent.name,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
                     created_by=_attribution_user(user_id),
                 )
     # Re-read rather than reusing the local ``conv``: the label-only branch
@@ -12102,6 +12428,44 @@ async def _handle_mcp_tools_call(
     )
 
 
+# Read uploads in 1 MiB chunks so an oversized body is aborted ~1 MiB past
+# the cap instead of being buffered whole (the previous unconditional
+# ``await file.read()`` was an OOM risk for very large uploads).
+_UPLOAD_READ_CHUNK_BYTES: int = 1024 * 1024
+
+
+async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
+    """
+    Read an uploaded file into memory, aborting if it exceeds *limit_bytes*.
+
+    Reads in :data:`_UPLOAD_READ_CHUNK_BYTES` chunks and raises HTTP 413 as
+    soon as the cap is crossed, so an oversized upload never buffers more
+    than one chunk past the limit.
+
+    :param file: The multipart upload.
+    :param limit_bytes: Maximum allowed size in bytes.
+    :returns: The full file content.
+    :raises HTTPException: 413 when the upload exceeds *limit_bytes*.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_UPLOAD_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Attachment exceeds the {limit_bytes // (1024 * 1024)} MB "
+                    "limit for this file type."
+                ),
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def create_sessions_router(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -12263,6 +12627,8 @@ def create_sessions_router(
             user_id=user_id,
             permission_store=permission_store,
             liveness_lookup=liveness_lookup,
+            file_store=file_store,
+            artifact_store=artifact_store,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -12621,6 +12987,8 @@ def create_sessions_router(
             include_items=include_items,
             runner_exit_reports=runner_exit_reports,
             refresh_state=refresh_state,
+            host_store=getattr(request.app.state, "host_store", None),
+            sandbox_config=getattr(request.app.state, "sandbox_config", None),
         )
 
     @router.get(
@@ -14042,11 +14410,13 @@ def create_sessions_router(
                 "PermissionRequest hook body 'tool_input' must be an object when present.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        # ``tool_use_id`` is not stable on Claude Code's
-        # PermissionRequest payload, and newer builds can write the
-        # transcript ``function_call`` (tool_use) before this hook
-        # returns — so neither can correlate/resolve the parked
-        # request. The parked wait ends on one of three signals: an
+        # Claude Code's PermissionRequest payload carries no
+        # ``tool_use_id`` (verified against a real payload — the field
+        # is absent, not merely unstable; the id is only minted when the
+        # tool call is emitted, AFTER this permission check). And newer
+        # builds can write the transcript ``function_call`` (tool_use)
+        # before this hook returns — so neither can correlate/resolve the
+        # parked request. The parked wait ends on one of three signals: an
         # explicit web verdict, hook disconnect, or the mirrored
         # ``function_call_output`` (tool_result) for this gated tool,
         # which — unlike the tool_use — is written only AFTER the
@@ -14081,12 +14451,29 @@ def create_sessions_router(
             extras["cwd"] = cwd
         if permission_mode is not None:
             extras["permission_mode"] = permission_mode
-        # Stamp the "Accept & allow all edits" hint (drives the UI's
-        # third button) only for edit-tool prompts under a still-prompting
-        # mode — see _allow_all_edits_eligible. The verdict site re-checks
-        # the same predicate before honoring the flag.
+        # The card offers ONE persistent-approval affordance, picked by
+        # the gated tool — the two hints below are mutually exclusive
+        # (disjoint eligibility), never two buttons competing on one card.
+        #
+        # Edit tools → "Accept & allow all edits" (switches the session to
+        # acceptEdits via setMode). Stamped only for edit-tool prompts
+        # under a still-prompting mode — see _allow_all_edits_eligible.
+        # The verdict site re-checks the same predicate before honoring it.
         if _allow_all_edits_eligible(tool_name, permission_mode):
             extras["allow_all_edits"] = True
+        # Non-edit eligible tools → "don't ask again" (installs a
+        # session-scoped allow rule via addRules). Stamped only when the
+        # affordance applies — see _allow_remember_eligible.
+        # ``remember_scope`` carries the gated tool and, for WebFetch, the
+        # request host so the UI can label the button ("… for github.com"
+        # vs "… for WebFetch"); the verdict site re-derives the same scope
+        # before honoring the flag, never trusting a client-supplied rule.
+        if _allow_remember_eligible(tool_name, permission_mode):
+            remember_scope: dict[str, Any] = {"tool": tool_name}
+            remember_host = _claude_native_remember_host(tool_name, tool_input)
+            if remember_host is not None:
+                remember_scope["host"] = remember_host
+            extras["remember_scope"] = remember_scope
         # When Claude's built-in AskUserQuestion tool is the one
         # needing permission, the PermissionRequest payload
         # already carries the full questions + options structure
@@ -14217,6 +14604,43 @@ def create_sessions_router(
             decision["updatedPermissions"] = [
                 {"type": "setMode", "mode": "default", "destination": "session"}
             ]
+        # "Approve & don't ask again" — the user approved this non-edit
+        # tool AND asked to stop prompting for the same scope. Echo an
+        # ``addRules`` permission update so Claude Code installs a
+        # session-scoped allow rule, exactly as the native TUI's "don't
+        # ask again" option does. The shape matches the Agent SDK's
+        # ``PermissionUpdate`` union (``addRules``): ``rules`` is a list
+        # of ``{toolName, ruleContent?}`` — ``ruleContent`` omitted means
+        # the whole tool; ``destination: "session"`` scopes it to this
+        # session so it resets on the next one. The claude-native hook
+        # forwards this decision verbatim to Claude Code.
+        #
+        # The host is re-derived server-side from the gated tool's input
+        # rather than trusting any client-supplied rule, and gated by the
+        # same ``_allow_remember_eligible`` predicate the button was
+        # offered under — so a forged ``remember`` flag on an ineligible
+        # tool (e.g. an edit tool, which takes the setMode path) can't
+        # smuggle in an allow rule. Mutually exclusive with the edit-tool
+        # ``allow_all_edits``/ExitPlanMode branches above (disjoint tool
+        # sets), so it never overwrites their ``updatedPermissions``.
+        if (
+            behavior == "allow"
+            and isinstance(result.content, dict)
+            and result.content.get("remember") is True
+            and _allow_remember_eligible(tool_name, permission_mode)
+        ):
+            rule: dict[str, Any] = {"toolName": tool_name}
+            remember_host = _claude_native_remember_host(tool_name, tool_input)
+            if remember_host is not None:
+                rule["ruleContent"] = f"domain:{remember_host}"
+            decision["updatedPermissions"] = [
+                {
+                    "type": "addRules",
+                    "rules": [rule],
+                    "behavior": "allow",
+                    "destination": "session",
+                }
+            ]
         body = {
             "hookSpecificOutput": {
                 "hookEventName": "PermissionRequest",
@@ -14315,6 +14739,20 @@ def create_sessions_router(
                 f"Expected one of {list(_PROTO_EVENT_TYPE_TO_PHASE)}.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        # Optional stable re-attach id for hook retries. Validated but not
+        # required — absent on non-retrying callers (old hooks, direct API use).
+        raw_elicitation_id = payload.get("_omnigent_elicitation_id")
+        hook_elicitation_id: str | None = None
+        if raw_elicitation_id is not None:
+            if not isinstance(raw_elicitation_id, str) or not (
+                _EVALUATE_HOOK_ELICITATION_ID_RE.fullmatch(raw_elicitation_id)
+            ):
+                raise OmnigentError(
+                    "Policy evaluate '_omnigent_elicitation_id' must match "
+                    "'elicit_evaluate_' + 32 hex chars.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            hook_elicitation_id = raw_elicitation_id
         data = event.get("data") or {}
 
         conv = conversation_store.get_conversation(session_id)
@@ -14430,6 +14868,7 @@ def create_sessions_router(
                             engine=engine,
                             result=result,
                             conversation_store=conversation_store,
+                            elicitation_id=hook_elicitation_id,
                         )
                         verdict_body: dict[str, Any] = (
                             {"result": "POLICY_ACTION_ALLOW"}
@@ -14621,6 +15060,98 @@ def create_sessions_router(
             return Response(status_code=status.HTTP_200_OK)
         return Response(
             content=result.model_dump_json(),
+            media_type="application/json",
+        )
+
+    # ── POST /sessions/{session_id}/hooks/cursor-permission-request ─
+
+    @router.post(
+        "/sessions/{session_id}/hooks/cursor-permission-request",
+        response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def cursor_permission_request_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Cursor-native tool-approval hook (TUI → web elicitation).
+
+        Receives a tool-approval prompt detected on the ``cursor-agent`` TUI
+        pane by the runner-side mirror
+        (:mod:`omnigent.cursor_native_permissions`), publishes the standard
+        ``response.elicitation_request`` event for the web UI, then parks for
+        the session ``approval`` verdict — the same registry / publish /
+        cleanup path as the Codex- and Claude-native hooks, so pending badges
+        and disconnect handling stay consistent across native harnesses. An
+        empty ``200`` (no web verdict — the prompt was answered in the TUI, or
+        the wait timed out) leaves cursor's native prompt authoritative.
+
+        :param request: FastAPI request carrying the detected prompt
+            (``elicitation_id`` plus the ``message`` / ``content_preview`` /
+            ``operation_type`` to render).
+        :param session_id: Omnigent conversation id from the URL path.
+        :returns: An ``ElicitationResult`` (``{"action": …}``) on a web
+            verdict, or ``200`` with empty body on TUI-resolution / timeout /
+            disconnect.
+        :raises OmnigentError: 404 if the session does not exist, 400 if the
+            body is malformed.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in cursor permission hook body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "Cursor permission hook body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        elicitation_id = payload.get("elicitation_id")
+        if not isinstance(elicitation_id, str) or not elicitation_id:
+            raise OmnigentError(
+                "Cursor permission hook body must include 'elicitation_id'.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        message = payload.get("message")
+        if not isinstance(message, str) or not message:
+            message = "Cursor wants approval to run a tool"
+        content_preview = payload.get("content_preview")
+        if not isinstance(content_preview, str):
+            content_preview = None
+        operation_type = payload.get("operation_type")
+        if not isinstance(operation_type, str) or not operation_type:
+            operation_type = "tool"
+        params = ElicitationRequestParams(
+            mode="form",
+            message=message,
+            requestedSchema=None,
+            url=None,
+            phase="pre_tool_use",
+            policy_name="cursor_native_permission",
+            content_preview=content_preview,
+        )
+        result = await _publish_and_wait_for_harness_elicitation(
+            request,
+            session_id=session_id,
+            params=params,
+            timeout_s=_CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
+            conversation_store=conversation_store,
+            elicitation_id=elicitation_id,
+            tool_name=f"Cursor({operation_type})",
+        )
+        if result is None:
+            return Response(status_code=status.HTTP_200_OK)
+        return Response(
+            content=json.dumps(result.model_dump(exclude_none=True)),
             media_type="application/json",
         )
 
@@ -15465,14 +15996,44 @@ def create_sessions_router(
                 "filename is required",
                 code=ErrorCode.INVALID_INPUT,
             )
-        content = await file.read()
         from omnigent.runtime.content_resolver import (
+            MAX_ATTACHMENT_UPLOAD_BYTES,
             _resolve_content_type,
+            attachment_text_type_for_extension,
+            attachment_upload_limit,
         )
 
+        # Resolve the type from the declared MIME + filename BEFORE reading
+        # the body, so an unsupported or oversized upload is rejected without
+        # buffering it. Attachments are inlined into the model context as
+        # base64 (see content_resolver.resolve_content_references); only
+        # images, PDF, and text/code files are usable — others (pptx, docx,
+        # zip, …) would be garbled or blow the request size, so reject them.
         content_type = _resolve_content_type(
             file.content_type,
             file.filename,
+        )
+        type_limit = attachment_upload_limit(content_type)
+        if type_limit is None:
+            # The browser/OS can mislabel a text/code file as binary (e.g. a
+            # .csv reported as application/vnd.ms-excel on Windows). Fall back
+            # to the extension — matching the web client's allowlist — and
+            # normalize the type so the resolver inlines it as text.
+            ext_type = attachment_text_type_for_extension(file.filename)
+            if ext_type is not None:
+                content_type = ext_type
+                type_limit = attachment_upload_limit(content_type)
+        if type_limit is None:
+            raise HTTPException(
+                status_code=415,
+                detail=(
+                    f"Unsupported attachment type '{content_type}'. Only images, "
+                    "PDF, and text/code files can be attached."
+                ),
+            )
+        content = await _read_upload_capped(
+            file,
+            min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES),
         )
         stored = file_store.create(
             session_id=session_id,
@@ -18248,6 +18809,8 @@ async def _get_session_snapshot(
     include_items: bool = True,
     runner_exit_reports: RunnerExitReports | None = None,
     refresh_state: bool = False,
+    host_store: HostStore | None = None,
+    sandbox_config: ManagedSandboxConfig | None = None,
 ) -> SessionResponse:
     """
     Read a full session snapshot from the store.
@@ -18338,30 +18901,31 @@ async def _get_session_snapshot(
     if runner_client is None:
         runner_client = get_runner_client()
 
-    status = _session_status_cache.get(session_id)
-    if status is None:
-        # Cache miss: either the server restarted, or the relay
-        # has not yet published the first ``"running"`` event
-        # for a freshly bound session (the relay's GET /stream
-        # is still in its tunnel handshake). Ask the runner for
-        # live status so we don't synthesize a stale ``"idle"``
-        # while a turn is actually in flight.
-        if runner_client is not None:
+    status = _session_status_from_cache(session_id)
+    if status == "idle":
+        # Cache miss (or truly idle): either the server restarted, or the
+        # relay has not yet published the first ``"running"`` event for a
+        # freshly bound session (the relay's GET /stream is still in its
+        # tunnel handshake). Ask the runner for live status so we don't
+        # synthesize a stale ``"idle"`` while a turn is actually in flight.
+        # ``_session_status_from_cache`` already collapses the fine-grained
+        # relay values (``"waiting"`` → ``"running"``), so the raw cache value
+        # is only needed here when it is actually missing (None).
+        if _session_status_cache.get(session_id) is None and runner_client is not None:
             try:
                 resp = await runner_client.get(
                     f"/v1/sessions/{session_id}",
                     timeout=5.0,
                 )
                 if resp.status_code == 200:
-                    status = resp.json().get("status", "idle")
-                    _session_status_cache[session_id] = status
+                    raw = resp.json().get("status", "idle")
+                    _session_status_cache[session_id] = raw
+                    status = _session_status_from_cache(session_id)
             except httpx.HTTPError:
                 _logger.debug(
                     "Runner status query failed for %s",
                     session_id,
                 )
-        if status is None:
-            status = "idle"
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
     last_total_tokens: int | None = None
@@ -18409,28 +18973,33 @@ async def _get_session_snapshot(
                     if spec.name:
                         agent_name = spec.name
                     llm_model = spec.executor.model
-                    # Size the context ring against whatever the next turn
-                    # will actually run. spec.executor.context_window only
-                    # applies to spec.model, so it's bypassed when an
-                    # override is active.
-                    effective_model = (
-                        conv.model_override if conv.model_override is not None else llm_model
+                    from omnigent.llms.context_window import (
+                        resolve_effective_context_window,
                     )
-                    spec_cw = spec.executor.context_window
-                    if spec_cw is not None and conv.model_override is None:
-                        context_window = spec_cw
-                    elif effective_model is not None:
-                        from omnigent.llms.context_window import get_model_context_window
 
-                        # Offload to a worker thread: on a cache-cold
-                        # provider catalog this does a blocking HTTP fetch
-                        # (and litellm registry lookups are CPU-bound), so
-                        # running it inline would stall the single-worker
-                        # event loop and serialize every concurrent request
-                        # behind this snapshot.
-                        context_window = await asyncio.to_thread(
-                            get_model_context_window, effective_model
-                        )
+                    # Size the context ring against whatever the next turn will
+                    # actually run, using the SAME resolver the runner uses to
+                    # budget compaction. That makes the UI ring and the runner's
+                    # compaction trigger a single source of truth — computed by
+                    # one function — so they can't drift even though they run in
+                    # different processes at different times. (They previously
+                    # each inlined this rule and silently fell out of step; see
+                    # PR #769 review. Sharing the function removes the manual
+                    # sync.) spec.executor.context_window describes only the spec
+                    # model, so an active override bypasses it — the resolver
+                    # makes that decision from the spec model + override.
+                    #
+                    # Offload to a worker thread: an active override (or an
+                    # undeclared window) can trigger a cache-cold provider
+                    # catalog fetch (blocking HTTP / CPU-bound litellm) inside
+                    # the resolver, which would otherwise stall the single-worker
+                    # event loop and serialize every concurrent snapshot.
+                    context_window = await asyncio.to_thread(
+                        resolve_effective_context_window,
+                        spec.executor.context_window,
+                        llm_model,
+                        model_override=conv.model_override,
+                    )
         except Exception:  # noqa: BLE001 — best-effort; missing agent must not break session fetch
             pass
     # Skills are runner-owned: the bound runner discovers them against its
@@ -18471,6 +19040,17 @@ async def _get_session_snapshot(
     # parent's own session_usage would under-report. Off the event loop
     # because it pages the conversation tree from the store.
     subtree_usage = await asyncio.to_thread(load_session_usage, conv.id, conv_store)
+    # Static signal telling the open view a host-bound, host-down session is a
+    # resumable managed host it can wake by sending a message, vs a terminal
+    # host_offline dead-end. Computed independently of liveness_lookup (the web
+    # chat passes include_liveness=False, so host_online is None here and
+    # liveness arrives via the poll/stream). One indexed host read, gated to
+    # host-bound sessions.
+    host_resumable = False
+    if host_store is not None and sandbox_config is not None and conv.host_id is not None:
+        host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
+        if host_for_resume is not None:
+            host_resumable = host_resume_supported(host_for_resume, sandbox_config)
     return _build_session_response(
         conv,
         items,
@@ -18485,6 +19065,7 @@ async def _get_session_snapshot(
         model_options=model_options,
         runner_online=runner_online,
         host_online=host_online,
+        host_resumable=host_resumable,
         pending_elicitation_events=await asyncio.to_thread(
             _pending_elicitation_snapshot_for_session,
             conv_store,

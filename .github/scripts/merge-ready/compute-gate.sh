@@ -4,9 +4,9 @@
 #
 # The gate is green iff every required check is green on its own merits
 # AND (for fork PRs) a maintainer has approved. There is no CI bypass: to
-# land despite red required checks, quarantine the flaky test
-# (tests/known_failures.yaml) or have a repo admin use GitHub's native
-# "merge without waiting for requirements" affordance.
+# land despite red required checks, fix or delete the failing test, or
+# have a repo admin use GitHub's native "merge without waiting for
+# requirements" affordance.
 #
 #   CI eval  | fork approval | state    | meaning
 #   ---------+---------------+----------+---------------------------------

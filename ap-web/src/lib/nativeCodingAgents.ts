@@ -4,7 +4,14 @@ export const WRAPPER_LABEL_KEY = "omnigent.wrapper";
 export const UI_MODE_LABEL_KEY = "omnigent.ui";
 export const UI_MODE_TERMINAL_VALUE = "terminal";
 
-export type NativeCodingAgentIconKind = "claude" | "codex" | "pi" | "cursor" | "antigravity";
+export type NativeCodingAgentIconKind =
+  | "claude"
+  | "codex"
+  | "opencode"
+  | "pi"
+  | "cursor"
+  | "goose"
+  | "antigravity";
 export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
 
 export interface NativeCodingAgentSpec {
@@ -40,6 +47,16 @@ export const NATIVE_CODING_AGENTS = [
     capabilities: ["approvalMode"],
   },
   {
+    key: "opencode",
+    agentName: "opencode-native-ui",
+    harness: "opencode-native",
+    wrapperLabel: "opencode-native-ui",
+    displayName: "OpenCode",
+    iconKind: "opencode",
+    sortRank: 25,
+    capabilities: ["approvalMode"],
+  },
+  {
     key: "cursor",
     agentName: "cursor-native-ui",
     harness: "cursor-native",
@@ -69,7 +86,16 @@ export const NATIVE_CODING_AGENTS = [
     wrapperLabel: "antigravity-native-ui",
     displayName: "Antigravity",
     iconKind: "antigravity",
-    sortRank: 40,
+    sortRank: 45,
+  },
+  {
+    key: "goose",
+    agentName: "goose-native-ui",
+    harness: "goose-native",
+    wrapperLabel: "goose-native-ui",
+    displayName: "Goose",
+    iconKind: "goose",
+    sortRank: 50,
   },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
@@ -91,6 +117,7 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-pi": "pi-native",
   "native-cursor": "cursor-native",
   "native-antigravity": "antigravity-native",
+  "native-goose": "goose-native",
 };
 
 export function nativeCodingAgentForAgentName(

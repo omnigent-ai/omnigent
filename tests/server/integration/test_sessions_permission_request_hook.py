@@ -72,7 +72,7 @@ async def _drain_until_elicitation(
     elicitation future, so subscribing here is the simplest way to
     learn the id without monkey-patching ``uuid``. Returning the
     whole event lets callers also inspect the params block for the
-    Claude-native extras (``tool_use_id``, ``cwd``, ``permission_mode``).
+    Claude-native extras (``cwd``, ``permission_mode``).
 
     :param session_id: Session to subscribe to.
     :param timeout_s: Maximum seconds to wait for the elicitation
@@ -128,6 +128,9 @@ async def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
     :param tool_name: Tool Claude wants to call.
     :returns: JSON-serializable payload mirroring Claude Code's
         published wire shape for the ``PermissionRequest`` event.
+        Deliberately carries no ``tool_use_id``: the real
+        PermissionRequest payload has no per-call id (it is minted only
+        when the tool call is emitted, after this permission check).
     """
     return {
         "session_id": "claude_sess_abc",
@@ -137,7 +140,6 @@ async def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
         "hook_event_name": "PermissionRequest",
         "tool_name": tool_name,
         "tool_input": {"command": "ls -la"},
-        "tool_use_id": "tool_use_xyz",
     }
 
 
@@ -186,6 +188,63 @@ async def test_permission_request_hook_allow_round_trip(
             "decision": {"behavior": "allow"},
         }
     }
+
+
+async def test_cursor_permission_request_hook_allow_round_trip(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    cursor-native TUI prompt → web ApprovalCard → accept → verdict.
+
+    The runner-side mirror (``omnigent.cursor_native_permissions``) POSTs a
+    detected cursor TUI approval prompt to
+    ``/hooks/cursor-permission-request``; the route publishes a
+    ``response.elicitation_request`` (phase ``pre_tool_use``, policy
+    ``cursor_native_permission``, carrying the runner-minted elicitation id and
+    the rendered command preview) and parks on the same harness-elicitation
+    registry the Claude hook uses, then returns the MCP ``ElicitationResult``
+    once the UI answers. This is the cursor-native analog of
+    ``test_permission_request_hook_allow_round_trip``.
+
+    Catches: the SSE event never emitted (the card never renders); the
+    runner-minted id not preserved (the runner can't correlate its verdict); the
+    park/resolve plumbing not wired (the POST never wakes on the UI verdict).
+    """
+    agent = await create_test_agent(client, "test-cursor-permission-allow")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_cursor_{session_id}_deadbeef"
+    payload = {
+        "elicitation_id": elicitation_id,
+        "operation_type": "shell",
+        "message": "Run this command?",
+        "content_preview": "echo hi > out.txt",
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/cursor-permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    # The runner-minted id is preserved end-to-end, and the card carries the
+    # cursor-native rendering extras.
+    assert event["elicitation_id"] == elicitation_id
+    params = event["params"]
+    assert params["message"] == "Run this command?"
+    assert params["phase"] == "pre_tool_use"
+    assert params["policy_name"] == "cursor_native_permission"
+    assert params["content_preview"] == "echo hi > out.txt"
+
+    verdict = await _post_approval(client, session_id, elicitation_id, "accept")
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"action": "accept"}
 
 
 async def test_top_level_elicitations_route_is_not_mounted(
@@ -424,6 +483,280 @@ async def test_permission_request_hook_edit_plain_accept_has_no_mode_switch(
     assert "updatedPermissions" not in decision
 
 
+async def _claude_webfetch_payload(url: str = "https://github.com/cli/cli") -> dict[str, Any]:
+    """
+    Build a Claude PermissionRequest hook body for a WebFetch call.
+
+    :param url: The URL WebFetch wants to fetch — its host scopes the
+        persistent "don't ask again" rule.
+    :returns: JSON-serializable PermissionRequest payload for WebFetch.
+    """
+    return {
+        "session_id": "claude_sess_abc",
+        "transcript_path": "/tmp/transcript.jsonl",
+        "cwd": "/tmp/cwd",
+        "permission_mode": "default",
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "WebFetch",
+        "tool_input": {"url": url, "prompt": "summarize"},
+    }
+
+
+async def test_permission_request_hook_remember_webfetch_domain_round_trip(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    WebFetch prompt: the endpoint stamps a ``remember_scope`` carrying
+    the request host, and resolving with ``content.remember`` makes the
+    decision carry an ``addRules`` permission update that installs a
+    session-scoped ``WebFetch(domain:<host>)`` allow rule.
+
+    This restores native Claude Code parity: approving one github.com
+    URL stops the per-call re-prompting for the whole domain. Failure
+    modes this catches: the scope hint never gets stamped (no button);
+    the verdict drops ``updatedPermissions`` (rule never installed, so
+    same-domain calls keep prompting); the rule shape is wrong (Claude
+    Code ignores it).
+    """
+    agent = await create_test_agent(client, "test-permission-remember-webfetch")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_webfetch_payload("https://github.com/cli/cli/issues/42")
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    # The scope hint drives the "don't ask again for github.com" button.
+    assert event["params"]["remember_scope"] == {"tool": "WebFetch", "host": "github.com"}
+
+    verdict = await _post_approval(
+        client,
+        session_id,
+        event["elicitation_id"],
+        "accept",
+        content={"remember": True},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    decision = resp.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    # Shape matches the Agent SDK's PermissionUpdate ``addRules`` variant;
+    # ``domain:`` scopes the rule to the host, "session" to this session.
+    assert decision["updatedPermissions"] == [
+        {
+            "type": "addRules",
+            "rules": [{"toolName": "WebFetch", "ruleContent": "domain:github.com"}],
+            "behavior": "allow",
+            "destination": "session",
+        }
+    ]
+
+
+async def test_permission_request_hook_remember_tool_wide_fallback(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Non-WebFetch tool (Bash): the ``remember_scope`` carries only the
+    tool (no host), and accepting with ``content.remember`` installs a
+    TOOL-WIDE allow rule — an ``addRules`` entry with ``toolName`` and
+    no ``ruleContent``.
+
+    Same fallback path a WebFetch with a missing/unparseable URL takes:
+    when there's no domain to scope to, the rule covers the whole tool.
+    """
+    agent = await create_test_agent(client, "test-permission-remember-bash")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload(tool_name="Bash")
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    # Tool-wide scope: tool only, no host.
+    assert event["params"]["remember_scope"] == {"tool": "Bash"}
+
+    verdict = await _post_approval(
+        client,
+        session_id,
+        event["elicitation_id"],
+        "accept",
+        content={"remember": True},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    decision = resp.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    # No ``ruleContent`` → the rule matches the whole tool.
+    assert decision["updatedPermissions"] == [
+        {
+            "type": "addRules",
+            "rules": [{"toolName": "Bash"}],
+            "behavior": "allow",
+            "destination": "session",
+        }
+    ]
+
+
+async def test_permission_request_hook_remember_not_offered_for_edit_tool(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Edit tools take the ``acceptEdits``/``setMode`` path, NOT a
+    persistent allow rule, so the endpoint must not stamp
+    ``remember_scope`` for them — and a forged ``content.remember`` on
+    an edit-tool prompt must NOT produce an ``addRules`` decision.
+
+    Server-side eligibility guard (mirrors the ``allow_all_edits``
+    re-check): without it, a crafted approval payload could smuggle an
+    allow rule onto a tool the affordance was never offered for.
+    """
+    agent = await create_test_agent(client, "test-permission-remember-edit-guard")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload(tool_name="Edit")
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    # No remember hint for edit tools (they get allow_all_edits instead).
+    assert "remember_scope" not in event["params"]
+
+    # Forge the flag the UI would never attach to an edit-tool prompt.
+    verdict = await _post_approval(
+        client,
+        session_id,
+        event["elicitation_id"],
+        "accept",
+        content={"remember": True},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    decision = resp.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    # Server ignores the spoofed flag — no allow rule for an edit tool.
+    # (No allow_all_edits flag was sent either, so no setMode update,
+    # leaving the decision a plain allow with no permission updates.)
+    assert "updatedPermissions" not in decision
+
+
+async def test_permission_request_hook_webfetch_plain_accept_has_no_rule(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    WebFetch accepted via plain Approve (no ``remember`` flag) → a plain
+    ``allow`` with no ``updatedPermissions``.
+
+    Regression guard: the allow rule must be opt-in per click. A plain
+    Approve must approve only THIS call, leaving future same-domain
+    calls still prompting.
+    """
+    agent = await create_test_agent(client, "test-permission-webfetch-plain")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_webfetch_payload()
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    # The hint is present (WebFetch is remember-eligible)…
+    assert event["params"]["remember_scope"]["tool"] == "WebFetch"
+    # …but a plain accept (no content flag) must not carry it through.
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    decision = resp.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    assert "updatedPermissions" not in decision
+
+
+async def test_permission_request_hook_remember_webfetch_no_host_tool_wide(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    WebFetch whose URL has NO derivable host (a non-HTTP scheme) falls
+    back to a TOOL-WIDE rule: the ``remember_scope`` carries the tool
+    only (no ``host`` key), and accepting with ``content.remember``
+    installs an ``addRules`` entry with ``toolName`` and no
+    ``ruleContent``.
+
+    Guards the WebFetch branch of the tool-wide fallback specifically:
+    domain rules are HTTP(S)-oriented, so an ``ftp://`` URL can't be
+    scoped to a domain — but the user can still stop the per-call
+    prompting for WebFetch as a whole.
+    """
+    agent = await create_test_agent(client, "test-permission-remember-webfetch-toolwide")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_webfetch_payload("ftp://files.example.com/x")
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    # No host could be derived → tool-wide scope (tool only, no host).
+    assert event["params"]["remember_scope"] == {"tool": "WebFetch"}
+
+    verdict = await _post_approval(
+        client,
+        session_id,
+        event["elicitation_id"],
+        "accept",
+        content={"remember": True},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    decision = resp.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    # No ``ruleContent`` → the rule matches every WebFetch call.
+    assert decision["updatedPermissions"] == [
+        {
+            "type": "addRules",
+            "rules": [{"toolName": "WebFetch"}],
+            "behavior": "allow",
+            "destination": "session",
+        }
+    ]
+
+
 async def test_permission_request_hook_forwards_cwd_and_permission_mode(
     client: httpx.AsyncClient,
 ) -> None:
@@ -436,8 +769,8 @@ async def test_permission_request_hook_forwards_cwd_and_permission_mode(
     ``permission_mode`` lets the UI badge the card with the mode
     Claude is in (``"default"`` / ``"acceptEdits"`` / ``"plan"``).
 
-    Note: ``tool_use_id`` is intentionally not asserted here.
-    Claude Code's PermissionRequest payload doesn't carry one
+    Note: ``tool_use_id`` is intentionally absent — the fixtures omit
+    it because Claude Code's PermissionRequest payload doesn't carry one
     (the id is only minted when the tool call is emitted, AFTER
     the permission check). The UI's auto-clear falls back to a
     "first pending" heuristic instead — see

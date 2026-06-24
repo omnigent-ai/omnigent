@@ -9,6 +9,8 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
+    GOOSE_NATIVE_WRAPPER_VALUE,
+    OPENCODE_NATIVE_WRAPPER_VALUE,
     PI_NATIVE_WRAPPER_VALUE,
     UI_MODE_LABEL_KEY,
     UI_MODE_TERMINAL_VALUE,
@@ -67,6 +69,16 @@ PI_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="pi",
 )
 
+OPENCODE_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="opencode",
+    display_name="OpenCode",
+    agent_name="opencode-native-ui",
+    harness="opencode-native",
+    wrapper_label=OPENCODE_NATIVE_WRAPPER_VALUE,
+    terminal_name="opencode",
+    subagent_wrapper_label="opencode-native-ui-subagent",
+)
+
 CURSOR_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="cursor",
     display_name="Cursor",
@@ -74,6 +86,15 @@ CURSOR_NATIVE_CODING_AGENT = NativeCodingAgent(
     harness="cursor-native",
     wrapper_label=CURSOR_NATIVE_WRAPPER_VALUE,
     terminal_name="cursor",
+)
+
+GOOSE_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="goose",
+    display_name="Goose",
+    agent_name="goose-native-ui",
+    harness="goose-native",
+    wrapper_label=GOOSE_NATIVE_WRAPPER_VALUE,
+    terminal_name="goose",
 )
 
 ANTIGRAVITY_NATIVE_CODING_AGENT = NativeCodingAgent(
@@ -89,7 +110,9 @@ NATIVE_CODING_AGENTS: tuple[NativeCodingAgent, ...] = (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
+    OPENCODE_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    GOOSE_NATIVE_CODING_AGENT,
     ANTIGRAVITY_NATIVE_CODING_AGENT,
 )
 

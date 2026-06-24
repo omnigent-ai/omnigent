@@ -369,6 +369,57 @@ async def test_tmux_session_alive_tracks_real_session(tmp_path: Path) -> None:
     assert await _tmux_session_alive(str(tmp_path / "absent.sock"), "main") is False
 
 
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux required")
+@pytest.mark.asyncio
+async def test_tmux_session_alive_false_for_dead_pane(tmp_path: Path) -> None:
+    """
+    A kept-alive session whose pane process exited reads as not-alive.
+
+    The claude-native terminal opts into ``remain-on-exit`` (#540), so a crashed
+    agent leaves a dead pane on a still-present session. The probe must report
+    that as gone via ``#{pane_dead}`` — otherwise a detach-vs-exit decision
+    would treat the crash as a mere detach and the web client would reconnect
+    to a dead pane forever instead of closing.
+
+    :param tmp_path: Pytest tmp directory for the private socket.
+    """
+    socket_path = tmp_path / "tmux.sock"
+    base = ["tmux", "-S", str(socket_path), "-f", "/dev/null"]
+    # One command sequence on a fresh server (";" separates tmux commands):
+    # set remain-on-exit globally BEFORE new-session so the session inherits it
+    # and survives the inner process exiting. A bare set-option can't run first
+    # on its own — no server exists yet to connect to.
+    subprocess.run(
+        [
+            *base,
+            "set-option",
+            "-g",
+            "remain-on-exit",
+            "on",
+            ";",
+            "new-session",
+            "-d",
+            "-s",
+            "main",
+            "sh -c 'exit 0'",
+        ],
+        check=True,
+    )
+    try:
+        for _ in range(250):
+            if await _tmux_session_alive(str(socket_path), "main") is False:
+                break
+            await asyncio.sleep(0.02)
+        else:  # pragma: no cover - only on a hang/regression
+            raise AssertionError("dead pane was never reported as not-alive")
+        # The session itself is still present (remain-on-exit), proving the
+        # not-alive verdict came from the dead pane, not a vanished session.
+        has = subprocess.run([*base, "has-session", "-t", "main"], capture_output=True)
+        assert has.returncode == 0, "session vanished; remain-on-exit was not honored"
+    finally:
+        subprocess.run([*base, "kill-server"], capture_output=True, check=False)
+
+
 class _ParkingFakeWebSocket:
     """
     WebSocket fake whose client side never ends, isolating the PTY side.
@@ -1297,9 +1348,11 @@ async def test_tmux_session_alive_returns_false_on_timeout(
     """
 
     class _HangingProcess:
-        async def wait(self) -> int:
+        returncode: int | None = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
             await asyncio.sleep(999)
-            return 0
+            return b"", b""
 
         def kill(self) -> None:
             pass

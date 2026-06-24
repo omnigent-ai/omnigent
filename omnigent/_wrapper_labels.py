@@ -50,9 +50,17 @@ CODEX_NATIVE_WRAPPER_VALUE = "codex-native-ui"
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 PI_NATIVE_WRAPPER_VALUE = "pi-native-ui"
 
+# Value the ``omnigent opencode`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+OPENCODE_NATIVE_WRAPPER_VALUE = "opencode-native-ui"
+
 # Value the ``omnigent cursor`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 CURSOR_NATIVE_WRAPPER_VALUE = "cursor-native-ui"
+
+# Value the ``omnigent goose`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+GOOSE_NATIVE_WRAPPER_VALUE = "goose-native-ui"
 
 # Value the ``omnigent antigravity`` native (agy TUI) wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.

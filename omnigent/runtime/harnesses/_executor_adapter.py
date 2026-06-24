@@ -201,10 +201,15 @@ class ExecutorAdapter(HarnessApp):
         self,
         executor_factory: Callable[[], Executor],
         session_key: str | None = None,
+        harness_label: str = "Claude",
     ) -> None:
         super().__init__()
         self._executor_factory = executor_factory
         self._session_key = session_key or uuid.uuid4().hex
+        # Human-readable harness name used in elicitation card messages,
+        # e.g. "Claude" → "Claude wants to call **Bash**" or
+        # "Cursor" → "Cursor wants to use **Bash**".
+        self._harness_label = harness_label
         # Layer 1: lazily-constructed inner executor, reused
         # across turns for the conversation's lifetime.
         self._executor: Executor | None = None
@@ -709,7 +714,7 @@ class ExecutorAdapter(HarnessApp):
         or before a turn starts), returns ``False`` to deny by default
         rather than granting unreviewed permission.
 
-        :param tool_name: Tool name Claude wants to call, e.g. ``"Bash"``.
+        :param tool_name: Tool name the agent wants to call, e.g. ``"Bash"``.
         :param tool_input: Arguments dict for the tool call,
             e.g. ``{"command": "ls -la"}``.
         :returns: ``True`` when the user approves the tool call;
@@ -738,13 +743,15 @@ class ExecutorAdapter(HarnessApp):
             preview = repr(tool_input)
         preview = preview[:300]
 
+        label = self._harness_label
+        policy_name = f"{label.lower()}_sdk_permission"
         params = ElicitationRequestParams(
             mode="form",
-            message=f"Claude wants to call **{tool_name}**",
+            message=f"{label} wants to use **{tool_name}**",
             requestedSchema=None,
             url=None,
             phase="tool_call",
-            policy_name="claude_sdk_permission",
+            policy_name=policy_name,
             content_preview=f"{tool_name}({preview})",
         )
         result = await ctx.elicit(elicitation_id, params)

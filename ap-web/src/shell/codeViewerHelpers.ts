@@ -96,6 +96,35 @@ export function isBinaryPath(path: string): boolean {
   return BINARY_EXTENSIONS.has(ext);
 }
 
+// Image formats the browser can render directly via an <img> tag. SVG is
+// included but is only ever rendered through a blob URL (never inlined into
+// the DOM), so scripts embedded in it cannot execute.
+const IMAGE_EXTENSIONS = new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "bmp",
+  "ico",
+  "webp",
+  "avif",
+  "svg",
+]);
+
+/**
+ * Return true if `path` should be previewed as an image.
+ *
+ * MIME-first: when the server supplies a `content_type` it is authoritative
+ * (handles files with missing or misleading extensions). Falls back to the
+ * file extension when no content type is available (e.g. `guess_type`
+ * returned null).
+ */
+export function isImageFile(path: string, contentType?: string | null): boolean {
+  if (contentType) return contentType.startsWith("image/");
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  return IMAGE_EXTENSIONS.has(ext);
+}
+
 export function detectLang(path: string): BundledLanguage | "text" {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   const map: Record<string, BundledLanguage> = {

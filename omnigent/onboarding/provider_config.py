@@ -112,6 +112,7 @@ GATEWAY_KIND = "gateway"
 LOCAL_KIND = "local"
 DATABRICKS_KIND = "databricks"
 CLI_CONFIG_KIND = "cli-config"
+BEDROCK_KIND = "bedrock"
 _VALID_KINDS = (
     KEY_KIND,
     SUBSCRIPTION_KIND,
@@ -119,6 +120,7 @@ _VALID_KINDS = (
     LOCAL_KIND,
     DATABRICKS_KIND,
     CLI_CONFIG_KIND,
+    BEDROCK_KIND,
 )
 
 # Provider kinds that resolve their model/credentials from inline families
@@ -127,7 +129,9 @@ _VALID_KINDS = (
 # families. _parse_provider dispatches subscription/databricks first, then
 # treats every remaining kind as a family kind.
 
-ProviderKind = Literal["key", "subscription", "gateway", "local", "databricks", "cli-config"]
+ProviderKind = Literal[
+    "key", "subscription", "gateway", "local", "databricks", "cli-config", "bedrock"
+]
 
 # Maps a canonical harness name to the provider family it consumes. The
 # ``pi`` harness consumes both families and so is absent here — callers
@@ -154,6 +158,8 @@ _HARNESS_FAMILY: dict[str, str] = {
     # Antigravity is Gemini-native but routes generic-provider traffic over
     # the OpenAI-compatible wire, so it consumes the ``openai`` family.
     "antigravity": OPENAI_FAMILY,
+    # Qwen Code uses an OpenAI-compatible provider (like Kimi v1).
+    "qwen": OPENAI_FAMILY,
     # The native agy TUI bridge authenticates via the Gemini OAuth credential
     # (file-based, checked in :mod:`omnigent.onboarding.gemini_auth`) and the
     # detected GEMINI_API_KEY is adopted as a ``gemini``-family key, so the
@@ -958,6 +964,12 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
         ``frozenset({"anthropic", "openai", "pi"})`` for a Databricks
         profile.
     """
+    if entry.kind == BEDROCK_KIND:
+        # Bedrock mode is native-``omnigent claude`` only — the in-process /
+        # gateway harnesses (incl. pi) reject it (see
+        # configure_agent_harness_with_provider). Surface only its real
+        # family (anthropic), never the pi scope.
+        return frozenset(entry.families)
     if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
         served = frozenset(entry.families)
         # The Gemini surface is key-ONLY: it is consumed by the antigravity
@@ -1030,14 +1042,13 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
     default. The ``pi`` harness (and any unmapped harness) consumes both
     families: an explicit :data:`PI_SURFACE` default wins; otherwise it
     falls back to the ``anthropic`` then ``openai`` family default,
-    skipping ``subscription`` and ``cli-config`` defaults — their
-    credential lives in the claude/codex CLI (a login, or a provider
-    table pinned in the CLI's own config file) that an unmapped harness
-    does not wrap and cannot read. Routing pi to one fails:
-    ``configure_agent_harness_with_provider`` no-ops on subscription
-    (spawning pi authless) and raises on cli-config for any harness
-    but codex. This mirrors :func:`provider_families`, which never
-    reports the :data:`PI_SURFACE` scope for either kind.
+    skipping ``subscription``, ``cli-config``, and ``bedrock`` defaults —
+    the first two live in the claude/codex CLI's own files an unmapped
+    harness can't read, and ``bedrock`` is native-``omnigent claude`` only.
+    Routing pi to any of them fails: ``configure_agent_harness_with_provider``
+    no-ops on subscription (spawning pi authless) and raises on cli-config
+    (non-codex) and bedrock. This mirrors :func:`provider_families`, which
+    never reports the :data:`PI_SURFACE` scope for these kinds.
 
     :param config: The parsed config mapping (``providers:`` block).
     :param harness: The canonical harness name, e.g. ``"claude-sdk"`` or
@@ -1061,8 +1072,15 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
         provider = get_default_provider(config, fam)
         # Subscription logins and cli-config provider pins live in the
         # claude/codex CLI's own files, which an unmapped harness doesn't
-        # wrap — fall through to the next family.
-        if provider is not None and provider.kind not in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND):
+        # wrap; a bedrock provider is native-``omnigent claude`` only
+        # (configure_agent_harness_with_provider raises for it). None can
+        # serve pi, so skip them and fall through — otherwise a bedrock Claude
+        # default would turn a working pi run (own login) into a hard error.
+        if provider is not None and provider.kind not in (
+            SUBSCRIPTION_KIND,
+            CLI_CONFIG_KIND,
+            BEDROCK_KIND,
+        ):
             return provider
     return None
 
