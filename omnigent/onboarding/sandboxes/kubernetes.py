@@ -25,9 +25,10 @@ Platform notes that shape this launcher:
   any audit-logged surface. Harness LLM credentials ride a pre-created Secret
   projected via ``envFrom`` (``sandbox.kubernetes.secret_name``).
 - **Writable HOME.** The host image's WORKDIR is ``/root`` (root-owned), but
-  the Pod runs as uid 1000 for least privilege, so ``$HOME`` would be
-  unwritable. The Pod sets ``HOME`` to :data:`_HOME_DIR`, mounts an ``emptyDir``
-  there shared by both containers, and ``fsGroup`` 1000 makes it group-writable.
+  the Pod runs as the image's non-root ``sandbox`` user (:data:`_RUN_AS_UID`)
+  for least privilege, so ``$HOME`` would be unwritable. The Pod sets ``HOME``
+  to :data:`_HOME_DIR`, mounts an ``emptyDir`` there shared by both containers,
+  and ``fsGroup`` makes it group-writable.
 - **PID-1 reaper.** The in-sandbox host re-parents orphaned runner processes to
   PID 1, so the container command is a tiny supervisor that spawns
   ``omnigent host``, reaps any children, and forwards SIGTERM for prompt,
@@ -131,10 +132,15 @@ _MANAGED_BY_VALUE: str = "omnigent"
 _ROLE_LABEL: str = "omnigent.ai/role"
 _ROLE_VALUE: str = "sandbox-host"
 
-# Non-root identity the Pod runs as. uid/gid 1000 is the conventional first
-# non-system user; fsGroup makes the HOME emptyDir group-writable.
-_RUN_AS_UID: int = 1000
-_RUN_AS_GID: int = 1000
+# Non-root identity the Pod runs as: the ``sandbox`` user/group baked into the
+# official host image (deploy/docker/Dockerfile, uid/gid 1000660000). It MUST be
+# a uid that EXISTS in the image's /etc/passwd — a uid with no passwd entry has
+# no name, so ``whoami`` fails ("cannot find name for user ID …"), the shell
+# prompt shows glibc's "I have no name!" fallback, and ``git commit`` aborts with
+# "Author identity unknown" (git derives its default identity via getpwuid).
+# fsGroup makes the HOME emptyDir group-writable.
+_RUN_AS_UID: int = 1000660000
+_RUN_AS_GID: int = 1000660000
 
 # Writable HOME for the uid-1000 Pod (the image's /root is unwritable to it).
 # A constant the launcher controls, so the workspace path is known without
@@ -478,9 +484,9 @@ def build_pod_manifest(
       the host identity rides literal env; harness credentials are projected via
       ``envFrom`` when *harness_secret* is set.
     - Pod + container ``securityContext`` satisfy Pod Security "restricted"
-      (runAsNonRoot uid/gid 1000, drop ALL caps, ``seccompProfile:
-      RuntimeDefault``, no privilege escalation). The root filesystem stays
-      writable (the host writes ``/tmp`` + ``~/.omnigent``).
+      (runAsNonRoot as the image's ``sandbox`` user :data:`_RUN_AS_UID`, drop ALL
+      caps, ``seccompProfile: RuntimeDefault``, no privilege escalation). The
+      root filesystem stays writable (the host writes ``/tmp`` + ``~/.omnigent``).
     - ``kubernetes.io/arch: amd64`` is always enforced (the host image is
       amd64-only) and CANNOT be overridden by *node_selector*.
 
