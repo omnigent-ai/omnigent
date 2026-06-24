@@ -105,6 +105,8 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
     # don't fall through to a noisy "unknown harness" branch.
     "kimi": "kimi",
     "kimi-code": "kimi",
+    # Native Kimi TUI harness shares the multi-provider kimi resolution path.
+    "kimi-native": "kimi",
     "qwen": "qwen",
 }
 

@@ -235,6 +235,9 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same
     # ``goose`` CLI as the native TUI, so it gates on the same binary.
     GOOSE_KEY: GOOSE_KEY,
+    # Native Kimi TUI harness — same binary gate as the bare ``kimi`` surface.
+    "kimi-native": KIMI_KEY,
+    "native-kimi": KIMI_KEY,
     QWEN_KEY: QWEN_KEY,
     "qwen-code": QWEN_KEY,
     # Native qwen TUI (``qwen-native``) wraps the same ``qwen`` CLI as the ACP

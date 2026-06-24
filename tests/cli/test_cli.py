@@ -35,6 +35,7 @@ from omnigent.cli import (
     _is_run_shorthand,
     _load_global_config,
     _manage_goose_harness,
+    _manage_kimi_harness,
     _manage_qwen_harness,
     _materialize_harness_launcher_file,
     _node_dependency_problem,
@@ -4775,3 +4776,82 @@ def test_manage_goose_harness_configure_launches(
     _manage_goose_harness()
 
     launch.assert_called_once()
+
+
+# ── omnigent setup: Kimi Code drill-in (_manage_kimi_harness) ────────────
+
+
+def test_manage_kimi_harness_not_installed_shows_hint_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing kimi CLI shows the curl install_hint and returns.
+
+    Kimi is curl-installed (no npm ``package``), so the drill-in can't
+    auto-install it — it must surface the install_hint and bail without
+    touching login / logout.
+    """
+    import omnigent.onboarding.harness_install as hi
+    import omnigent.onboarding.interactive as it
+
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda key: False)
+    console = Mock()
+    monkeypatch.setattr(it, "console", console)
+    login = Mock()
+    logout = Mock()
+    monkeypatch.setattr(hi, "harness_login", login)
+    monkeypatch.setattr(hi, "harness_logout", logout)
+    # If the drill-in wrongly reached the menu loop, this select would drive it.
+    monkeypatch.setattr(it, "select", lambda *a, **k: 0)
+
+    _manage_kimi_harness()
+
+    login.assert_not_called()
+    logout.assert_not_called()
+    # The curl install command was surfaced to the user.
+    printed = " ".join(str(c.args[0]) for c in console.print.call_args_list if c.args)
+    assert "code.kimi.com/kimi-code/install.sh" in printed
+
+
+def test_manage_kimi_harness_back_does_not_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the CLI installed, choosing "← Back" exits without signing in."""
+    import omnigent.onboarding.harness_install as hi
+    import omnigent.onboarding.interactive as it
+
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
+    monkeypatch.setattr(it, "console", Mock())
+    login = Mock()
+    logout = Mock()
+    monkeypatch.setattr(hi, "harness_login", login)
+    monkeypatch.setattr(hi, "harness_logout", logout)
+    # rows = [Sign in, Sign out, Show auth options, ← Back]; pick Back (3).
+    monkeypatch.setattr(it, "select", lambda *a, **k: 3)
+
+    _manage_kimi_harness()
+
+    login.assert_not_called()
+    logout.assert_not_called()
+
+
+def test_manage_kimi_harness_login_runs_kimi_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selecting "Sign in" drives ``harness_login(KIMI_KEY)`` then loops; Back exits."""
+    import omnigent.onboarding.harness_install as hi
+    import omnigent.onboarding.interactive as it
+
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
+    monkeypatch.setattr(it, "console", Mock())
+    login = Mock(return_value=False)  # kimi has no status probe; return is ignored
+    logout = Mock()
+    monkeypatch.setattr(hi, "harness_login", login)
+    monkeypatch.setattr(hi, "harness_logout", logout)
+    # First iteration: Sign in (0); second: ← Back (3) to exit the loop.
+    choices = iter([0, 3])
+    monkeypatch.setattr(it, "select", lambda *a, **k: next(choices))
+
+    _manage_kimi_harness()
+
+    login.assert_called_once_with(hi.KIMI_KEY)
+    logout.assert_not_called()

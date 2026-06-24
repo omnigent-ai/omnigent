@@ -33,8 +33,21 @@ def test_native_pi_alias_resolves_like_canonical() -> None:
 
 def test_canonical_native_harnesses_resolve() -> None:
     """The canonical native spellings all resolve to their agents."""
-    for harness in ("claude-native", "codex-native", "pi-native"):
+    for harness in ("claude-native", "codex-native", "pi-native", "cursor-native", "kimi-native"):
         assert native_coding_agent_for_harness(harness) is not None
+
+
+def test_native_kimi_alias_resolves_like_canonical() -> None:
+    """``native-kimi`` resolves to the same native agent as ``kimi-native``.
+
+    Mirrors the ``native-pi`` fold: ``canonicalize_harness`` maps the reversed
+    spelling to the canonical id so a forked/switched kimi-native agent keeps
+    its terminal-first presentation labels.
+    """
+    agent = native_coding_agent_for_harness("native-kimi")
+    assert agent is not None
+    assert agent is native_coding_agent_for_harness("kimi-native")
+    assert agent.terminal_name == "kimi"
 
 
 def test_unknown_harness_returns_none() -> None:

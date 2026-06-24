@@ -54,6 +54,7 @@ OPENCODE_NATIVE_TERMINAL_ROLE = "opencode-native"
 CURSOR_NATIVE_TERMINAL_ROLE = "cursor-native"
 GOOSE_NATIVE_TERMINAL_ROLE = "goose-native"
 QWEN_NATIVE_TERMINAL_ROLE = "qwen-native"
+KIMI_NATIVE_TERMINAL_ROLE = "kimi-native"
 # Role marker for the embedded Omnigent REPL terminal auto-created for
 # runner-hosted SDK sessions (``omnigent attach`` in a tmux pane — the
 # SDK mirror of the native terminals above). The attach WebSocket uses
@@ -971,6 +972,10 @@ class SessionResourceRegistry:
             # JSON event transcript, not status), so the PTY watcher is its
             # status source too.
             QWEN_NATIVE_TERMINAL_ROLE,
+            # kimi-native also has no forwarder/hook (the injection run_turn
+            # returns right after the tmux paste), so the PTY watcher is its
+            # only running/idle status source — same as cursor/pi/claude.
+            KIMI_NATIVE_TERMINAL_ROLE,
         }
         if activity_publisher is None and not emit_status and exit_publisher is None:
             return

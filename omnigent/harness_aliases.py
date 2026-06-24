@@ -21,6 +21,9 @@ HARNESS_ALIASES: dict[str, str] = {
     # User-facing reversed spelling for the Goose native-CLI harness; canonical
     # id is "goose-native".
     "native-goose": "goose-native",
+    # Reversed spelling for the native Kimi Code TUI harness; canonical id is
+    # "kimi-native" (the SDK/headless harness keeps the bare "kimi" id).
+    "native-kimi": "kimi-native",
     # Qwen Code harness alias.
     "qwen-code": "qwen",
     # User-facing reversed spelling for the qwen native-CLI harness; canonical
@@ -58,6 +61,8 @@ NATIVE_HARNESSES: frozenset[str] = frozenset(
         "native-qwen",
         "opencode-native",
         "native-opencode",
+        "kimi-native",
+        "native-kimi",
     }
 )
 

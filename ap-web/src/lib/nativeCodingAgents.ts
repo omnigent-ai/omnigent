@@ -11,7 +11,8 @@ export type NativeCodingAgentIconKind =
   | "pi"
   | "cursor"
   | "goose"
-  | "qwen";
+  | "qwen"
+  | "kimi";
 export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
 
 export interface NativeCodingAgentSpec {
@@ -96,6 +97,15 @@ export const NATIVE_CODING_AGENTS = [
     iconKind: "qwen",
     sortRank: 60,
   },
+  {
+    key: "kimi",
+    agentName: "kimi-native-ui",
+    harness: "kimi-native",
+    wrapperLabel: "kimi-native-ui",
+    displayName: "Kimi",
+    iconKind: "kimi",
+    sortRank: 70,
+  },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
 const BY_AGENT_NAME: Map<string, NativeCodingAgentSpec> = new Map(
@@ -116,6 +126,7 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-cursor": "cursor-native",
   "native-goose": "goose-native",
   "native-qwen": "qwen-native",
+  "native-kimi": "kimi-native",
 };
 
 export function nativeCodingAgentForAgentName(

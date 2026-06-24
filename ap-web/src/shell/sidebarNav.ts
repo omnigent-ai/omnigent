@@ -29,6 +29,7 @@ export type ConversationIconKind =
   | "cursor"
   | "goose"
   | "qwen"
+  | "kimi"
   | "nessie"
   | null;
 

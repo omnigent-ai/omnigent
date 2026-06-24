@@ -84,6 +84,12 @@ _CURSOR_NATIVE_HARNESSES: frozenset[str] = frozenset({"cursor-native", "native-c
 # there is no SDK variant or key to gate on.
 _GOOSE_NATIVE_HARNESSES: frozenset[str] = frozenset({"goose-native", "native-goose"})
 
+# Native Kimi TUI harnesses (``omnigent kimi``). Like the other native CLIs,
+# they wrap the resident ``kimi`` binary and can't launch without it on
+# ``PATH`` — gate on it. Distinct from the bare ``kimi`` SDK surface
+# (:data:`KIMI_SURFACE`), which gates on the same binary but renders headlessly.
+_KIMI_NATIVE_HARNESSES: frozenset[str] = frozenset({"kimi-native", "native-kimi"})
+
 # CLI-wrapping qwen harnesses. ``qwen`` / ``qwen-code`` (the ACP harness) and
 # ``qwen-native`` / ``native-qwen`` (the native TUI via ``omni qwen``) all resolve
 # to the same ``qwen`` binary (canonicalize_harness folds ``qwen-code`` → ``qwen``
@@ -122,7 +128,7 @@ def _install_key(canonical: str) -> str:
         :data:`~omnigent.onboarding.harness_install.QWEN_KEY` for qwen, or
         :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi.
     """
-    if canonical == KIMI_SURFACE:
+    if canonical == KIMI_SURFACE or canonical in _KIMI_NATIVE_HARNESSES:
         return KIMI_KEY
     if canonical in _OPENCODE_HARNESSES:
         return OPENCODE_KEY
@@ -207,6 +213,7 @@ def harness_is_configured(harness: str) -> bool:
         canonical not in _HARNESS_FAMILY
         and canonical not in _PI_HARNESSES
         and canonical != KIMI_SURFACE
+        and canonical not in _KIMI_NATIVE_HARNESSES
         and canonical not in _OPENCODE_HARNESSES
         and canonical not in _QWEN_HARNESSES
     ):
@@ -237,6 +244,7 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_OPENCODE_HARNESSES)
     spellings.update(_CURSOR_NATIVE_HARNESSES)
     spellings.update(_GOOSE_NATIVE_HARNESSES)
+    spellings.update(_KIMI_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(KIMI_SURFACE)

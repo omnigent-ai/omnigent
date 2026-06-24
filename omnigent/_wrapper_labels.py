@@ -65,3 +65,7 @@ GOOSE_NATIVE_WRAPPER_VALUE = "goose-native-ui"
 # Value the ``omnigent qwen`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 QWEN_NATIVE_WRAPPER_VALUE = "qwen-native-ui"
+
+# Value the ``omnigent kimi`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+KIMI_NATIVE_WRAPPER_VALUE = "kimi-native-ui"
