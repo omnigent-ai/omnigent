@@ -20,6 +20,14 @@ HARNESS_ALIASES: dict[str, str] = {
     "native-goose": "goose-native",
     # Qwen Code harness alias.
     "qwen-code": "qwen",
+    # OpenCode native-server harness: the bare ``opencode`` name and the
+    # reversed ``native-opencode`` spelling both fold to ``opencode-native``
+    # (there is no separate SDK ``opencode`` harness, so the bare name is free).
+    "opencode": "opencode-native",
+    "native-opencode": "opencode-native",
+    # User-facing spelling for the GitHub Copilot SDK harness; the canonical id
+    # is "copilot" (matches the registry / workflow type).
+    "github-copilot": "copilot",
 }
 
 # Canonical native-CLI harness spellings. These harnesses type messages into
@@ -40,6 +48,8 @@ NATIVE_HARNESSES: frozenset[str] = frozenset(
         "native-cursor",
         "goose-native",
         "native-goose",
+        "opencode-native",
+        "native-opencode",
     }
 )
 

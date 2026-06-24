@@ -56,11 +56,23 @@ QWEN_KEY = "qwen"
 # installer rather than npm — so it carries an ``install_hint``, not a ``package``.
 CURSOR_KEY = "cursor"
 
+# OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
+# installed via the ``opencode-ai`` npm package. No login/logout/status argv
+# is wired yet — readiness is binary-only until an auth check exists.
+OPENCODE_KEY = "opencode"
+
 # Goose authenticates against its own config (``goose configure`` → keyring /
 # ``~/.config/goose/config.yaml``) with no Omnigent-managed credential, and ships
 # via Homebrew / a curl installer rather than npm — so it carries an
 # ``install_hint``, not a ``package``.
 GOOSE_KEY = "goose"
+
+# Copilot runs in-process via the ``github-copilot-sdk`` package, which bundles
+# the Copilot CLI binary it drives — so, like cursor, there is no separately
+# installed CLI to gate on; readiness is whether a GitHub token resolves (see
+# :func:`omnigent.onboarding.harness_readiness.harness_is_configured`). The key
+# is kept here purely as the canonical harness id the readiness layer shares.
+COPILOT_KEY = "copilot"
 
 
 @dataclass(frozen=True)
@@ -124,6 +136,11 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         status_args=("login", "status"),
     ),
     PI_KEY: HarnessInstallSpec("Pi", "pi", "@earendil-works/pi-coding-agent"),
+    # Pin the install to the supported 1.17.x range: opencode-ai's npm ``latest``
+    # is a ``0.0.0-beta-*`` pre-release, so a bare ``opencode-ai`` would install a
+    # version the runtime version-check (``check_opencode_version``,
+    # >=1.17.7,<1.18.0) then rejects. ``~1.17.7`` mirrors that exact range.
+    OPENCODE_KEY: HarnessInstallSpec("OpenCode", "opencode", "opencode-ai@~1.17.7"),
     QWEN_KEY: HarnessInstallSpec(
         "Qwen Code",
         "qwen",
@@ -161,10 +178,11 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # :data:`_HARNESS_INSTALL` family key. Only the CLI-backed harnesses appear
 # here — the ones that cannot launch without a binary on ``PATH``:
 # ``claude-native`` wraps the ``claude`` CLI, ``codex-native`` the ``codex``
-# CLI, ``pi`` / ``pi-native`` the ``pi`` CLI, ``qwen`` / ``qwen-code`` the
-# ``qwen`` CLI, and ``cursor-native`` / ``native-cursor`` the ``cursor-agent``
-# CLI (the native Cursor TUI, installed via Cursor's curl installer rather than
-# npm — see its ``install_hint``).
+# CLI, ``pi`` / ``pi-native`` the ``pi`` CLI, ``opencode-native`` the
+# ``opencode`` CLI, ``qwen`` / ``qwen-code`` the ``qwen`` CLI, and
+# ``cursor-native`` / ``native-cursor`` the ``cursor-agent`` CLI (the native
+# Cursor TUI, installed via Cursor's curl installer rather than npm — see its
+# ``install_hint``).
 # SDK-based harnesses run in-process and are deliberately absent, so they
 # resolve to "no CLI required": ``claude-sdk``, ``codex``, ``openai-agents-sdk``,
 # and the SDK ``cursor`` harness (which drives the ``cursor-sdk`` Python package
@@ -183,6 +201,10 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     GOOSE_KEY: GOOSE_KEY,
     QWEN_KEY: QWEN_KEY,
     "qwen-code": QWEN_KEY,
+    # Native OpenCode (``opencode-native``) wraps the ``opencode`` CLI; its
+    # ``native-opencode`` reversed spelling gates on the same binary.
+    "opencode-native": OPENCODE_KEY,
+    "native-opencode": OPENCODE_KEY,
 }
 
 

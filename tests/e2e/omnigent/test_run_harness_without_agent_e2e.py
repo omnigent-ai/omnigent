@@ -137,10 +137,15 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``_HARNESS_MODULES``, this file must gain a live round-trip row
     for it.
 
-    ``claude-native``, ``codex-native``, and ``pi-native`` are excluded
-    because their inner executors require bridge directories plus
-    runner-managed terminal panes to inject keys into — both set up by
-    their native launchers, not by ``omnigent run --harness <native>``.
+    ``claude-native``, ``codex-native``, ``pi-native``, and
+    ``opencode-native`` are excluded because their inner executors require
+    bridge directories plus runner-managed terminal panes to inject keys
+    into — both set up by their native launchers, not by
+    ``omnigent run --harness <native>``. (``opencode-native`` is a
+    terminal-takeover ``native-server`` harness, the same shape as the
+    other natives.) Running them through this matrix would hang or crash.
+    Their e2e coverage is via native launcher smoke tests (tracked
+    separately as native-launcher PTY/REPL smoke tests).
 
     ``cursor`` is excluded because this matrix authenticates through
     the Databricks gateway/profile, while cursor-agent talks only to
@@ -149,6 +154,13 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``antigravity`` is excluded for the same reason as ``cursor``: it is
     Gemini-native and its SDK launches a native binary needing a modern
     glibc.
+
+    ``copilot`` is excluded for the same reason as ``cursor`` / ``antigravity``:
+    the GitHub Copilot SDK authenticates with a GitHub token and talks only to
+    GitHub's Copilot backend (no Databricks gateway path), so ``_build_copilot_spawn_env``
+    emits none of the shared ``HARNESS_<H>_GATEWAY`` / profile probe vars this
+    matrix drives. Its live round-trip is covered by the gated
+    ``tests/e2e/test_polly_copilot_e2e.py`` and the ``copilot-sdk-e2e-dev`` skill.
 
     ``cursor-native`` is excluded for the union of both reasons above.
 
@@ -173,9 +185,11 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "claude-native",
         "codex-native",
         "pi-native",
+        "opencode-native",
         "cursor",
         "cursor-native",
         "antigravity",
+        "copilot",
         "qwen",
         "goose",
         "goose-native",

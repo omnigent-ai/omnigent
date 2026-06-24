@@ -177,6 +177,7 @@ omnigent run examples/scribe/
 omnigent run examples/polly/ --harness pi
 omnigent run examples/debby/ --harness openai-agents
 omnigent run examples/polly/ --harness cursor  # Cursor CLI (needs cursor-agent + CURSOR_API_KEY)
+omnigent run examples/polly/ --harness copilot # GitHub Copilot SDK (needs a GitHub token w/ Copilot, e.g. GH_TOKEN)
 ```
 
 **🐙 Polly** is a multi-agent coding orchestrator who writes no code herself.
@@ -375,7 +376,7 @@ name: my_agent
 prompt: You are a helpful data analyst.
 
 executor:
-  harness: claude-sdk          # or: claude-native, codex, codex-native, cursor, cursor-native, openai-agents, pi, pi-native, antigravity, qwen
+  harness: claude-sdk          # or: claude-native, codex, codex-native, cursor, cursor-native, openai-agents, pi, pi-native, antigravity, qwen, copilot
 
 tools:
   # A local Python function (schema auto-generated from the signature)

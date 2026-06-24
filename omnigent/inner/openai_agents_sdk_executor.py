@@ -627,7 +627,7 @@ class _AgentsSessionState:
         before starting. Set by :meth:`interrupt_session`.
     """
 
-    sdk_session: _SanitizingSession
+    sdk_session: Any  # type: ignore[explicit-any]  # _SanitizingSession or OpenAIResponsesCompactionSession
     started: bool = False
     # agents.Agent[Any] instance; cached for reuse across turns.
     agent: SDKAgent = None
@@ -1075,7 +1075,25 @@ class OpenAIAgentsSDKExecutor(Executor):
         if state is not None:
             return state
 
-        sdk_session = _SanitizingSession(agents_sdk.SQLiteSession(session_key))
+        underlying = _SanitizingSession(agents_sdk.SQLiteSession(session_key))
+        sdk_session: Any = underlying  # type: ignore[explicit-any]
+        # Enable SDK-native compaction only for direct OpenAI endpoints.
+        # Databricks-hosted endpoints don't support the responses.compact
+        # API, and the compaction model must be an OpenAI model name.
+        # Mock / local servers also lack the endpoint, so gate on the
+        # real OpenAI hostname.
+        _base = str(getattr(self._client, "base_url", ""))
+        if not self._databricks and "api.openai.com" in _base:
+            try:
+                from agents.memory import OpenAIResponsesCompactionSession
+
+                sdk_session = OpenAIResponsesCompactionSession(
+                    session_id=session_key,
+                    underlying_session=underlying,  # type: ignore[arg-type]
+                    client=self._client,
+                )
+            except (ImportError, AttributeError, ValueError):
+                pass
         state = _AgentsSessionState(sdk_session=sdk_session)
         self._session_states[session_key] = state
         return state
@@ -1596,11 +1614,9 @@ class OpenAIAgentsSDKExecutor(Executor):
                 if state.interrupt_requested:
                     return
                 if _is_context_length_exceeded(exc):
-                    # Let the runtime compaction layer handle context
-                    # overflow.  Re-raising propagates the original
-                    # exception to the ExecutorAdapter, whose error
-                    # classifier maps it to ``context_length_exceeded``
-                    # so the workflow's reactive compaction fires.
+                    # Re-raise so the ExecutorAdapter's error classifier
+                    # maps it to ``context_length_exceeded`` and the
+                    # runner surfaces the overflow to the user.
                     raise
                 from .databricks_executor import DatabricksAuthError
 
@@ -1750,6 +1766,35 @@ class OpenAIAgentsSDKExecutor(Executor):
                 if cached_tok:
                     turn_usage["cache_read_input_tokens"] = cached_tok
         _notify_usage_from_dict(model=model, usage=turn_usage)
+
+        # Emit CompactionComplete if the SDK compacted this turn.
+        if result is not None:
+            for item in result.new_items:
+                if getattr(item, "type", None) == "compaction_item":
+                    from omnigent.inner.executor import CompactionComplete
+
+                    _compaction_tokens = 0
+                    if turn_usage is not None:
+                        _compaction_tokens = turn_usage.get("context_tokens", 0) or 0
+                    _compacted: list[dict[str, Any]] | None = None
+                    try:
+                        _compacted = await state.sdk_session.get_items()
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "Failed to read compacted session items",
+                            exc_info=True,
+                        )
+                    yield CompactionComplete(
+                        summary=(
+                            "[OpenAI Responses API compaction"
+                            " — context was automatically compacted]"
+                        ),
+                        token_count=_compaction_tokens,
+                        model=model,
+                        compacted_messages=_compacted,
+                    )
+                    break
+
         yield TurnComplete(response=final_text, usage=turn_usage)
 
     @staticmethod

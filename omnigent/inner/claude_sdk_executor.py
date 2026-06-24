@@ -2003,6 +2003,7 @@ class ClaudeSDKExecutor(Executor):
             "settings": settings_payload,
             "stderr": _on_stderr,
             "include_partial_messages": True,
+            "include_hook_events": True,
             "skills": resolved.skills,
             "plugins": bundle_plugins,
             "extra_args": {"no-session-persistence": None},
@@ -2098,6 +2099,7 @@ class ClaudeSDKExecutor(Executor):
         observed_model: str | None = None
         system_diagnostics: list[str] = []
         terminal_error: str | None = None
+
         # Track in-flight tool calls so we can emit ToolCallComplete
         # with the tool name and duration when results arrive.
         pending_tools: dict[str, tuple[str, float]] = {}  # id → (name, start_mono)
@@ -2467,6 +2469,8 @@ class ClaudeSDKExecutor(Executor):
                                     "Check ANTHROPIC_BASE_URL / Databricks endpoint configuration."
                                 )
                                 break
+                        elif getattr(system_msg, "hook_event_name", None) == "PreCompact":
+                            logger.info("Claude SDK compaction detected (PreCompact hook)")
                         else:
                             logger.info("Claude CLI system message: %s", data)
             finally:

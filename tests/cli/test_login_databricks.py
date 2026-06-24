@@ -22,8 +22,9 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
-from omnigent.cli import _load_global_config, _save_global_config
-from omnigent.cli import cli as cli_group
+import omnigent.cli as cli_mod
+
+cli_group = cli_mod.cli
 
 _APPS_URL = "https://myapp-1234.aws.databricksapps.com"
 _WORKSPACE = "https://example.databricks.com"
@@ -118,7 +119,6 @@ def _patch_login_env(
     :returns: A list capturing each ``subprocess.run`` argv (the
         ``databricks auth login`` invocations).
     """
-    import omnigent.cli as cli_mod
 
     monkeypatch.setattr(httpx, "get", fake_httpx.get)
     # URL normalization has its own probe + dedicated tests; identity here
@@ -301,7 +301,6 @@ def test_login_accounts_mode_not_hijacked_by_databricks_detection(
     omnigent accounts server has no such header and must keep its
     username/password flow.
     """
-    import omnigent.cli as cli_mod
 
     fake = _FakeHttpx(responses=[_response(401, body={"login_url": "/login"})])
     _patch_login_env(monkeypatch, fake_httpx=fake)
@@ -378,7 +377,7 @@ def test_login_sets_default_server(monkeypatch: pytest.MonkeyPatch, token_dir: P
     result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
 
     assert result.exit_code == 0, result.output
-    assert _load_global_config().get("server") == _APPS_URL
+    assert cli_mod._load_global_config().get("server") == _APPS_URL
 
 
 def test_login_header_mode_sets_default_server(
@@ -400,7 +399,7 @@ def test_login_header_mode_sets_default_server(
 
     assert result.exit_code == 0, result.output
     assert "header-auth mode" in result.output
-    assert _load_global_config().get("server") == "http://proxy.internal:6767"
+    assert cli_mod._load_global_config().get("server") == "http://proxy.internal:6767"
 
 
 def test_login_accounts_mode_sets_default_server(
@@ -423,7 +422,7 @@ def test_login_accounts_mode_sets_default_server(
     result = CliRunner().invoke(cli_group, ["login", "http://omni.internal:6767"])
 
     assert result.exit_code == 0, result.output
-    assert _load_global_config().get("server") == "http://omni.internal:6767"
+    assert cli_mod._load_global_config().get("server") == "http://omni.internal:6767"
 
 
 def test_login_oidc_mode_sets_default_server(
@@ -460,7 +459,7 @@ def test_login_oidc_mode_sets_default_server(
     result = CliRunner().invoke(cli_group, ["login", server])
 
     assert result.exit_code == 0, result.output
-    assert _load_global_config().get("server") == server
+    assert cli_mod._load_global_config().get("server") == server
 
 
 def test_login_failure_leaves_default_server_unchanged(
@@ -474,7 +473,7 @@ def test_login_failure_leaves_default_server_unchanged(
     reach would strand every later bare ``omnigent`` on that dead URL.
     """
     # Seed an existing default so we can prove it survives a failed login.
-    _save_global_config({"server": "https://existing.example.com"})
+    cli_mod._save_global_config({"server": "https://existing.example.com"})
     fake = _FakeHttpx(
         responses=[
             _response(302, headers={"location": _APPS_REDIRECT}),
@@ -486,7 +485,7 @@ def test_login_failure_leaves_default_server_unchanged(
     result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
 
     assert result.exit_code != 0
-    assert _load_global_config().get("server") == "https://existing.example.com"
+    assert cli_mod._load_global_config().get("server") == "https://existing.example.com"
 
 
 # ── bare-workspace URL expansion ────────────────────────────────────
@@ -524,7 +523,6 @@ def test_workspace_url_expands_bare_workspace_host(
     DatabricksRealm challenge. Users paste the bare host, so this is
     the difference between "just works" and a confusing 404.
     """
-    import omnigent.cli as cli_mod
 
     _scripted_normalizer_httpx(
         monkeypatch,
@@ -548,7 +546,6 @@ def test_workspace_url_leaves_oss_server_alone(
     Rewriting here would break every self-hosted deployment whose
     server happens to 401 the unauthenticated probe.
     """
-    import omnigent.cli as cli_mod
 
     _scripted_normalizer_httpx(
         monkeypatch,
@@ -572,7 +569,6 @@ def test_workspace_url_leaves_apps_edge_alone(
     workspace, so a regression here would bolt /api/2.0/omnigent onto
     every app URL.
     """
-    import omnigent.cli as cli_mod
 
     _scripted_normalizer_httpx(
         monkeypatch,
@@ -595,7 +591,6 @@ def test_workspace_url_with_path_probes_nothing(
     explicit path is the user's choice, and probing on every command
     would tax all remote invocations.
     """
-    import omnigent.cli as cli_mod
 
     probed = _scripted_normalizer_httpx(monkeypatch, {})
 
@@ -617,7 +612,6 @@ def test_workspace_url_expands_when_mount_hidden_from_anonymous_probe(
     a cached ``databricks auth login`` grant, the probe is retried
     authenticated and the mount is adopted.
     """
-    import omnigent.cli as cli_mod
 
     fake = _FakeHttpx(
         responses=[
@@ -672,7 +666,6 @@ def test_workspace_url_hints_when_mount_dark_and_no_cached_grant(
     workspace URL whose host tunnel can only 404, so the decline must
     name the ``databricks auth login`` remedy.
     """
-    import omnigent.cli as cli_mod
 
     fake = _FakeHttpx(
         responses=[
@@ -711,7 +704,6 @@ def test_workspace_url_hints_when_authed_probe_also_misses(
     as given, and the message distinguishes this from the
     never-logged-in case so the user doesn't loop on `auth login`.
     """
-    import omnigent.cli as cli_mod
 
     fake = _FakeHttpx(
         responses=[
@@ -750,7 +742,6 @@ def test_workspace_url_skips_authed_probe_without_databricks_extra(
     ModuleNotFoundError. The ``databricks_sdk_installed()`` gate must
     short-circuit first so plain OSS installs keep working.
     """
-    import omnigent.cli as cli_mod
 
     fake = _FakeHttpx(
         responses=[
@@ -778,3 +769,135 @@ def test_workspace_url_skips_authed_probe_without_databricks_extra(
     assert result == _WORKSPACE
     # Only the two anonymous probes — no token, no authed retry.
     assert [r["authorization"] for r in fake.requests] == [None, None]
+
+
+# ── schemeless input + web-UI URL acceptance (internal user guide) ──
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # The guide hands out the web URL without a scheme; default https.
+        (
+            "dbc-a5d4177a-49dc.cloud.databricks.com/omnigent",
+            "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent",
+        ),
+        ("example.cloud.databricks.com", "https://example.cloud.databricks.com"),
+        # Loopback hosts stay http — local dev servers are plain http.
+        ("localhost:6767", "http://localhost:6767"),
+        ("127.0.0.1:6767", "http://127.0.0.1:6767"),
+        ("[::1]:6767", "http://[::1]:6767"),
+        # An explicit scheme is always preserved (even http to a remote host).
+        ("http://localhost:6767", "http://localhost:6767"),
+        ("https://example.cloud.databricks.com", "https://example.cloud.databricks.com"),
+        ("http://example.databricks.com", "http://example.databricks.com"),
+    ],
+)
+def test_with_default_scheme(raw: str, expected: str) -> None:
+    """A schemeless server URL defaults to https (http for loopback).
+
+    The internal user guide hands out the web URL without a scheme
+    (``<ws>/omnigent``); defaulting to https lets it be pasted verbatim,
+    while loopback hosts stay http so local dev still connects.
+    """
+
+    assert cli_mod._with_default_scheme(raw) == expected
+
+
+def test_resolve_server_url_defaults_scheme_and_expands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared normalizer composes scheme-defaulting with expansion.
+
+    ``_resolve_server_url`` is the single seam every ``--server`` entry
+    point routes through; a schemeless bare host AND the guide's
+    ``/omnigent`` web URL both reach the ``/api/2.0/omnigent`` mount over
+    https.
+    """
+
+    _scripted_normalizer_httpx(
+        monkeypatch,
+        {
+            f"{_WORKSPACE}/v1/me": _response(404, headers={"server": "databricks"}),
+            f"{_WORKSPACE_API_URL}/v1/me": _response(
+                401, headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'}
+            ),
+        },
+    )
+
+    assert cli_mod._resolve_server_url("example.databricks.com") == _WORKSPACE_API_URL
+    assert cli_mod._resolve_server_url("example.databricks.com/omnigent") == _WORKSPACE_API_URL
+
+
+def test_workspace_url_expands_web_ui_path_to_api_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guide's web-UI URL (``<ws>/omnigent``) expands to the API mount.
+
+    The internal user guide hands out ``<ws>/omnigent`` for the browser;
+    a user who pastes it into ``omnigent login`` must reach the API mount
+    (``/api/2.0/omnigent``), not 404 the UI path's own /v1/me probe.
+    """
+
+    probed = _scripted_normalizer_httpx(
+        monkeypatch,
+        {
+            f"{_WORKSPACE}/v1/me": _response(404, headers={"server": "databricks"}),
+            f"{_WORKSPACE_API_URL}/v1/me": _response(
+                401, headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'}
+            ),
+        },
+    )
+
+    assert cli_mod._workspace_api_server_url(f"{_WORKSPACE}/omnigent") == _WORKSPACE_API_URL
+    # The bare root and its API mount were probed — never the UI path itself.
+    assert f"{_WORKSPACE}/omnigent/v1/me" not in probed
+
+
+def test_workspace_url_web_ui_path_left_alone_off_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``/omnigent`` URL on a non-workspace host is returned untouched.
+
+    Only the bare root is probed; without the ``server: databricks``
+    marker the pasted URL is kept verbatim, so a non-workspace server
+    served under ``/omnigent`` still works.
+    """
+
+    _scripted_normalizer_httpx(
+        monkeypatch,
+        {
+            "https://omni.example.com/v1/me": _response(401, body={"login_url": "/login"}),
+        },
+    )
+
+    assert (
+        cli_mod._workspace_api_server_url("https://omni.example.com/omnigent")
+        == "https://omni.example.com/omnigent"
+    )
+
+
+def test_login_defaults_scheme_to_https(monkeypatch: pytest.MonkeyPatch, token_dir: Path) -> None:
+    """A schemeless workspace URL logs in over https.
+
+    The internal user guide's URLs omit the scheme; ``login`` defaults it
+    to https so the probe reaches the workspace API proxy and the stored
+    record keys on the https URL.
+    """
+    from omnigent.cli_auth import load_databricks_workspace_host
+
+    fake = _FakeHttpx(
+        responses=[
+            _response(401, headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'}),
+            _response(200, body={"user_id": "alice@example.com"}),
+        ]
+    )
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+
+    # Schemeless input (no https://) — the guide hands out bare URLs.
+    result = CliRunner().invoke(cli_group, ["login", "example.databricks.com/api/2.0/omnigent"])
+
+    assert result.exit_code == 0, result.output
+    # The probe used the https:// default, and the record keys on it.
+    assert fake.requests[0]["url"] == f"{_WORKSPACE_API_URL}/v1/me"
+    assert load_databricks_workspace_host(_WORKSPACE_API_URL) == _WORKSPACE

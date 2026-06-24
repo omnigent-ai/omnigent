@@ -3376,3 +3376,164 @@ class TestToolCallPolicyGate(unittest.TestCase):
             self.assertIsNone(captured["can_use_tool"])
 
         _run(_t())
+
+
+# ---------------------------------------------------------------------------
+# Tests: Compaction detection via PreCompact hook
+# ---------------------------------------------------------------------------
+
+
+def test_precompact_hook_does_not_emit_compaction_complete() -> None:
+    """Claude SDK owns its own session persistence, so PreCompact hooks
+    are logged but do NOT emit CompactionComplete — the runner has no
+    useful compacted state to persist."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete
+
+    class _ResultMessage:
+        def __init__(self, session_id, result):
+            self.session_id = session_id
+            self.result = result
+            self.content = []
+            self.model = "claude-test"
+            self.usage = type(
+                "U",
+                (),
+                {
+                    "input_tokens": 500,
+                    "output_tokens": 100,
+                },
+            )()
+
+    class _SystemMessage:
+        def __init__(self, subtype, data, hook_event_name=None):
+            self.subtype = subtype
+            self.data = data
+            self.hook_event_name = hook_event_name
+
+    class _HookEventMessage(_SystemMessage):
+        pass
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = _SystemMessage
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+        messages: list = []
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                _FakeSDK.messages = [
+                    _HookEventMessage(
+                        subtype="hook_started",
+                        data={"hook_event": "PreCompact"},
+                        hook_event_name="PreCompact",
+                    ),
+                    _ResultMessage(session_id, "compacted result"),
+                ]
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        compaction_events = [e for e in events if isinstance(e, CompactionComplete)]
+        assert len(compaction_events) == 0, (
+            "claude-sdk should not emit CompactionComplete — it owns its own session persistence"
+        )
+
+    _run(_t())
+
+
+def test_no_precompact_no_compaction_event() -> None:
+    """When no PreCompact hook fires, no CompactionComplete is yielded."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete
+
+    class _ResultMessage:
+        def __init__(self, session_id, result):
+            self.session_id = session_id
+            self.result = result
+            self.content = []
+            self.model = "claude-test"
+            self.usage = type(
+                "U",
+                (),
+                {
+                    "input_tokens": 500,
+                    "output_tokens": 100,
+                },
+            )()
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = type("SystemMessage", (), {})
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+        messages: list = []
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                _FakeSDK.messages = [_ResultMessage(session_id, "normal result")]
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        compaction_events = [e for e in events if isinstance(e, CompactionComplete)]
+        assert len(compaction_events) == 0
+
+    _run(_t())

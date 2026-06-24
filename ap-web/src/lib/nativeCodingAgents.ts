@@ -4,7 +4,7 @@ export const WRAPPER_LABEL_KEY = "omnigent.wrapper";
 export const UI_MODE_LABEL_KEY = "omnigent.ui";
 export const UI_MODE_TERMINAL_VALUE = "terminal";
 
-export type NativeCodingAgentIconKind = "claude" | "codex" | "pi" | "cursor" | "goose";
+export type NativeCodingAgentIconKind = "claude" | "codex" | "opencode" | "pi" | "cursor" | "goose";
 export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
 
 export interface NativeCodingAgentSpec {
@@ -37,6 +37,16 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Codex",
     iconKind: "codex",
     sortRank: 20,
+    capabilities: ["approvalMode"],
+  },
+  {
+    key: "opencode",
+    agentName: "opencode-native-ui",
+    harness: "opencode-native",
+    wrapperLabel: "opencode-native-ui",
+    displayName: "OpenCode",
+    iconKind: "opencode",
+    sortRank: 25,
     capabilities: ["approvalMode"],
   },
   {

@@ -145,6 +145,11 @@ agents-sdk = [
 # harness module imports the SDK lazily on first turn, so only users of the
 # harness need this extra. Early SDK (v0.1.x) — pin minor.
 antigravity = ["google-antigravity>=0.1,<1"]
+# GitHub Copilot SDK harness (`harness: copilot`). Optional: the harness module
+# imports the SDK lazily on first turn, so only users of the harness need this
+# extra. The wheel bundles the Copilot CLI binary it drives (~90MB), which is
+# why it is not part of the baseline install. Pin major.
+copilot = ["github-copilot-sdk>=1,<2"]
 # Cursor SDK harness (`harness: cursor`). Optional like antigravity: the
 # harness imports the cursor-sdk lazily on first turn, so only `--harness
 # cursor` users need this extra (`omnigent[cursor]`). Was a baseline dependency;
