@@ -207,9 +207,10 @@ def _mock_polly_spec_dir(
         machines where the binary is absent from ``PATH``.
     :returns: Path to the copied polly bundle directory.
     """
-    # Native harnesses that require a CLI binary on PATH.  Replaced with
-    # ``openai-agents`` (SDK-based, no binary needed) when
-    # ``rewrite_sub_agent_harnesses`` is True.
+    # Harnesses that need a real external dependency the mock env lacks — a CLI
+    # binary on PATH, or (for ``antigravity``) the ``google-antigravity`` SDK
+    # plus Gemini credentials.  Replaced with ``openai-agents`` (SDK-based,
+    # mock-wired) when ``rewrite_sub_agent_harnesses`` is True.
     _NATIVE_HARNESSES = frozenset(
         {
             "claude-native",
@@ -221,6 +222,7 @@ def _mock_polly_spec_dir(
             "native-pi",
             "cursor-native",
             "native-cursor",
+            "antigravity",
         }
     )
 

@@ -1935,7 +1935,15 @@ def test_materialize_directory_bundle_with_override_keeps_nested_harness_unpinne
 @pytest.mark.parametrize(
     ("bundle_name", "expected_workers"),
     [
-        ("polly", {"claude_code": "claude-native", "codex": "codex-native", "pi": "pi"}),
+        (
+            "polly",
+            {
+                "claude_code": "claude-native",
+                "codex": "codex-native",
+                "pi": "pi",
+                "antigravity": "antigravity",
+            },
+        ),
         ("debby", {"claude": "claude-sdk", "gpt": "codex"}),
     ],
 )

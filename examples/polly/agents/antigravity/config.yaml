@@ -1,20 +1,27 @@
 spec_version: 1
-name: pi
-description: Pi coding sub-agent — the multi-model third worker; reviews, explores, or implements a scoped task headlessly, on any gateway model picked per dispatch.
+name: antigravity
+description: Antigravity coding sub-agent — Google's Antigravity agent runtime (runs Gemini by default); implements, cross-vendor reviews, or explores a scoped task headlessly in its own worktree.
 
-# Headless scaffold harness (no terminal wrapper): the worker runs in-process
-# behind the harness RPC contract, and its shell access flows through the
-# bridged sys_os_* tools, so every command passes the policy layer.
+# Headless SDK harness (no terminal wrapper). Like `pi`, the worker is headless
+# — no terminal panel for the human to take over — and gates approvals on the
+# runner ASK path; its shell access flows through the bridged sys_os_* tools, so
+# every command passes the policy layer. What is UNIQUE to antigravity: it has
+# no CLI on PATH to probe (pi still needs its own `pi` binary). The Antigravity
+# SDK (`google-antigravity`) runs in-process and authenticates Gemini-natively
+# (API key or Vertex AI); it needs glibc >= 2.36 on the host. An absent SDK /
+# unconfigured key surfaces as a boot failure the orchestrator treats as
+# UNAVAILABLE.
 executor:
   type: omnigent
   config:
-    harness: pi
+    harness: antigravity
 
 prompt: |
-  You are Pi, a coding sub-agent dispatched by the polly
-  orchestrator for a single scoped task in a dedicated git worktree. Your task
-  prompt names its purpose — IMPLEMENT, REVIEW, or EXPLORE. Do exactly that one
-  thing; don't refactor or wander unprompted.
+  You are Antigravity, a coding sub-agent dispatched by the polly
+  orchestrator for a single scoped task in a dedicated git worktree. You run on
+  Google's Antigravity agent runtime (Gemini by default). Your task prompt names
+  its purpose — IMPLEMENT, REVIEW, or EXPLORE. Do exactly that one thing; don't
+  refactor or wander unprompted.
 
   IMPLEMENT — write real product code:
   - Stay strictly within the files/scope named in your task and acceptance
@@ -52,9 +59,10 @@ os_env:
 # (gate_pushes: false). Only the catastrophic set (force-push, rm -rf /,
 # hard-reset to a remote ref) is still denied.
 guardrails:
-  # Pi gates on the runner ASK path (like antigravity; claude_code / codex
-  # gate via their native CLI hooks, which wait a day) — match that window
-  # instead of auto-denying while the human reads the approval card.
+  # Headless in-process harness: like `pi`, antigravity has no native approval
+  # hook (claude_code / codex gate via their CLI hooks), so it gates on the
+  # runner ASK path — match pi's day-long window instead of auto-denying while
+  # the human reads the approval card.
   ask_timeout: 86400
   policies:
     blast_radius:
