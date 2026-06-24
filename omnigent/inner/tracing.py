@@ -197,12 +197,31 @@ class TracingContext:
         self,
         messages: list[Message] | None = None,
         model: str | None = None,
+        operation: str = "chat",
     ) -> LiveSpan:
-        """Begin a CHAT_MODEL span for an executor.run_turn call."""
+        """Begin a CHAT_MODEL span for an executor.run_turn call.
+
+        :param messages: Conversation messages sent to the model.
+        :param model: Provider-prefixed model string, e.g.
+            ``"openai/gpt-5.4"``. The provider prefix is split out so the
+            ``gen_ai.provider.name`` and ``gen_ai.request.model``
+            semantic-convention attributes can be set on the span and
+            later read back at end-time to key the GenAI metrics.
+        :param operation: GenAI operation name attached to the span as
+            ``gen_ai.operation.name`` (default ``"chat"``).
+        """
         mlflow = _mlflow()
         attributes: dict[str, str] = {}
         if model:
             attributes["model"] = model
+            from omnigent.runtime.telemetry import parse_provider_name
+
+            provider, request_model = parse_provider_name(model)
+            if request_model:
+                attributes["gen_ai.request.model"] = request_model
+            if provider:
+                attributes["gen_ai.provider.name"] = provider
+        attributes["gen_ai.operation.name"] = operation
         return cast(
             "LiveSpan",
             mlflow.start_span_no_context(
@@ -220,7 +239,22 @@ class TracingContext:
         response_text: str | None = None,
         status: str = "OK",
         error: str | None = None,
+        usage: dict[str, Any] | None = None,
     ) -> None:
+        """End a CHAT_MODEL span and emit the GenAI metric instruments.
+
+        :param span: Span handle returned by ``start_llm_span``, or
+            ``None`` when tracing was disabled at start time.
+        :param response_text: Assistant text attached to the span's
+            outputs.
+        :param status: MLflow span status, e.g. ``"OK"`` / ``"ERROR"``.
+        :param error: Optional error message attached as
+            ``error.message``; also forces the status to ``"ERROR"``.
+        :param usage: Token usage dict, used to record the
+            ``gen_ai.client.token.usage`` histogram in addition to the
+            on-span attribute set elsewhere via
+            ``telemetry.record_llm_usage``.
+        """
         if span is None:
             return
         # Pass the optional through to MLflow directly; ``None`` is a
@@ -234,6 +268,53 @@ class TracingContext:
         else:
             span.set_status(status)
         span.end()
+        self._emit_llm_metrics(span, usage)
+
+    def _emit_llm_metrics(
+        self,
+        span: LiveSpan,
+        usage: dict[str, Any] | None,
+    ) -> None:
+        """Emit ``gen_ai.client.*`` metric data points for one LLM span.
+
+        Reads ``gen_ai.provider.name`` / ``gen_ai.request.model`` /
+        ``gen_ai.operation.name`` back off the span so the metric
+        emission stays in sync with the on-span semantic-convention
+        attributes set by ``start_llm_span``.
+
+        :param span: The ended LLM span.
+        :param usage: Optional token usage dict; when present, recorded
+            on the token-usage histogram.
+        """
+        try:
+            from omnigent.runtime.telemetry import (
+                record_operation_duration_metric,
+                record_token_usage_metric,
+            )
+
+            provider = _read_str_attr(span, "gen_ai.provider.name")
+            request_model = _read_str_attr(span, "gen_ai.request.model")
+            operation = _read_str_attr(span, "gen_ai.operation.name") or "chat"
+
+            start_ns = span.start_time_ns or 0
+            end_ns = span.end_time_ns or 0
+            if start_ns and end_ns and end_ns >= start_ns:
+                duration_s = (end_ns - start_ns) / 1e9
+                record_operation_duration_metric(
+                    duration_s,
+                    provider=provider or "",
+                    model=request_model or "",
+                    operation=operation,
+                )
+
+            if usage:
+                record_token_usage_metric(
+                    usage,
+                    provider=provider or "",
+                    model=request_model or "",
+                )
+        except Exception:  # noqa: BLE001 — telemetry must never break the request path
+            logger.debug("failed to emit LLM metrics", exc_info=True)
 
     def start_tool_span(
         self,
@@ -277,6 +358,19 @@ class TracingContext:
         # Restore parent as current.
         if span is self._current_span:
             self._current_span = parent_span
+        # Emit the tool duration histogram from the recorded ms value.
+        # ``span.name`` is the ``tool:<name>`` form set in ``start_tool_span``;
+        # strip the prefix so the metric attribute holds the plain tool name.
+        if duration_ms:
+            try:
+                from omnigent.runtime.telemetry import record_tool_duration_metric
+
+                tool_name = span.name or ""
+                if tool_name.startswith("tool:"):
+                    tool_name = tool_name[len("tool:") :]
+                record_tool_duration_metric(duration_ms / 1000.0, tool_name)
+            except Exception:  # noqa: BLE001 — telemetry must never break the request path
+                logger.debug("failed to emit tool duration metric", exc_info=True)
 
     def start_policy_span(
         self,
@@ -357,6 +451,36 @@ def _safe_serialize(value: TraceValue, max_len: int = 4000) -> TraceValue:
         if len(s) > max_len:
             return s[:max_len] + "...(truncated)"
         return s
+
+
+def _read_str_attr(span: LiveSpan, key: str) -> str | None:
+    """Read a string attribute off a span, tolerating JSON-wrapped values.
+
+    MLflow stores span attribute values via ``json.dumps``. Strings come
+    back wrapped in quotes when read via ``span.get_attribute`` on the
+    raw OTel attributes mapping; this helper unwraps them so callers can
+    treat the result as a plain string.
+
+    :param span: LiveSpan to read from.
+    :param key: Attribute key.
+    :returns: The unwrapped string value, or ``None`` when the attribute
+        is unset or the value is not a string.
+    """
+    raw = span.get_attribute(key)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+            try:
+                import json
+
+                decoded = json.loads(raw)
+                if isinstance(decoded, str):
+                    return decoded
+            except (json.JSONDecodeError, ValueError):
+                return raw
+        return raw
+    return None
 
 
 def _truncate_messages(

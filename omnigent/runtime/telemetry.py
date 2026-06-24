@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from fastapi import FastAPI
     from mlflow.entities.span import LiveSpan
+    from opentelemetry.metrics import Histogram, Meter
     from opentelemetry.sdk.metrics.export import MetricExporter
     from opentelemetry.sdk.trace import ReadableSpan, Span
 
@@ -55,9 +56,32 @@ _DUMMY_PARENT_SPAN_ID = "1000000000000001"
 _W3C_VERSION = "00"
 _W3C_FLAGS_SAMPLED = "01"
 
+_METER_NAME = "omnigent.runtime"
+
+# OpenTelemetry GenAI semantic conventions for metric and attribute names.
+# Keeping them as module-level constants ensures every emission site uses the
+# spec-compliant identifier so backends like Tempo, Grafana, and Datadog can
+# aggregate omnigent telemetry alongside other GenAI sources without remapping.
+_METRIC_TOKEN_USAGE = "gen_ai.client.token.usage"
+_METRIC_OPERATION_DURATION = "gen_ai.client.operation.duration"
+_METRIC_TOOL_DURATION = "omnigent.tool.duration"
+
+_ATTR_PROVIDER = "gen_ai.provider.name"
+_ATTR_REQUEST_MODEL = "gen_ai.request.model"
+_ATTR_OPERATION = "gen_ai.operation.name"
+_ATTR_TOKEN_TYPE = "gen_ai.token.type"
+_ATTR_TOOL_NAME = "tool.name"
+
 _capture_content: bool = False
 _initialized: bool = False
 _metrics_initialized: bool = False
+
+# Lazily-created histogram instruments. Creating an instrument is cheap but
+# allocates per call; caching the references avoids churning the SDK and keeps
+# attribute keys aligned across emission sites.
+_token_usage_histogram: Histogram | None = None
+_operation_duration_histogram: Histogram | None = None
+_tool_duration_histogram: Histogram | None = None
 
 
 class _RemoteParentTraceState:
@@ -448,6 +472,175 @@ def get_traceparent_env() -> dict[str, str]:
     if "tracestate" in carrier:
         result["TRACESTATE"] = carrier["tracestate"]
     return result
+
+
+def _get_meter() -> Meter:
+    """
+    Return the omnigent runtime ``Meter`` from the global meter provider.
+
+    The meter is acquired on every call rather than cached because OTel's
+    ``get_meter`` is a cheap lookup against the global provider, and caching
+    the meter itself would freeze it against the first provider seen,
+    breaking tests that swap providers between cases.
+
+    :returns: Meter scoped to ``omnigent.runtime``.
+    """
+    from opentelemetry import metrics as otel_metrics
+
+    return otel_metrics.get_meter(_METER_NAME)
+
+
+def _get_token_usage_histogram() -> Histogram:
+    """
+    Return the cached ``gen_ai.client.token.usage`` histogram instrument.
+
+    Histogram instruments are created lazily on first use and cached at the
+    module level so repeated record calls do not allocate a new instrument
+    per call.
+
+    :returns: Histogram measured in ``{token}``.
+    """
+    global _token_usage_histogram
+
+    if _token_usage_histogram is None:
+        _token_usage_histogram = _get_meter().create_histogram(
+            name=_METRIC_TOKEN_USAGE,
+            unit="{token}",
+            description="Number of input and output tokens used per LLM request.",
+        )
+    return _token_usage_histogram
+
+
+def _get_operation_duration_histogram() -> Histogram:
+    """
+    Return the cached ``gen_ai.client.operation.duration`` histogram instrument.
+
+    :returns: Histogram measured in seconds.
+    """
+    global _operation_duration_histogram
+
+    if _operation_duration_histogram is None:
+        _operation_duration_histogram = _get_meter().create_histogram(
+            name=_METRIC_OPERATION_DURATION,
+            unit="s",
+            description="End-to-end duration of an LLM client operation.",
+        )
+    return _operation_duration_histogram
+
+
+def _get_tool_duration_histogram() -> Histogram:
+    """
+    Return the cached ``omnigent.tool.duration`` histogram instrument.
+
+    :returns: Histogram measured in seconds.
+    """
+    global _tool_duration_histogram
+
+    if _tool_duration_histogram is None:
+        _tool_duration_histogram = _get_meter().create_histogram(
+            name=_METRIC_TOOL_DURATION,
+            unit="s",
+            description="End-to-end duration of a tool invocation.",
+        )
+    return _tool_duration_histogram
+
+
+def record_token_usage_metric(
+    usage: dict[str, Any],
+    provider: str,
+    model: str,
+) -> None:
+    """
+    Record per-LLM-call token usage on the ``gen_ai.client.token.usage``
+    histogram.
+
+    Mirrors :func:`record_llm_usage` for the metric pipeline: one histogram
+    data point per token type (``input`` / ``output``), keyed on provider
+    and model so operators can aggregate token spend per ``(provider,
+    model)`` combination.
+
+    The helper no-ops on any exception so a misconfigured meter provider
+    (or the absence of one) cannot break a request hot path.
+
+    :param usage: Token usage dict from the LLM response. Known keys:
+        ``"input_tokens"``, ``"output_tokens"``.
+    :param provider: Provider name, e.g. ``"openai"``.
+    :param model: Model identifier without the provider prefix, e.g.
+        ``"gpt-5.4"``.
+    """
+    try:
+        histogram = _get_token_usage_histogram()
+        base_attrs = {
+            _ATTR_PROVIDER: provider,
+            _ATTR_REQUEST_MODEL: model,
+        }
+        input_tokens = usage.get("input_tokens")
+        if input_tokens is not None:
+            histogram.record(
+                int(input_tokens),
+                attributes={**base_attrs, _ATTR_TOKEN_TYPE: "input"},
+            )
+        output_tokens = usage.get("output_tokens")
+        if output_tokens is not None:
+            histogram.record(
+                int(output_tokens),
+                attributes={**base_attrs, _ATTR_TOKEN_TYPE: "output"},
+            )
+    except Exception:
+        _logger.debug("failed to record token usage metric", exc_info=True)
+
+
+def record_operation_duration_metric(
+    duration_s: float,
+    provider: str,
+    model: str,
+    operation: str,
+) -> None:
+    """
+    Record an LLM client operation duration on the
+    ``gen_ai.client.operation.duration`` histogram.
+
+    The helper no-ops on any exception so a misconfigured meter provider
+    cannot break a request hot path.
+
+    :param duration_s: Operation duration in seconds.
+    :param provider: Provider name, e.g. ``"openai"``.
+    :param model: Model identifier without the provider prefix.
+    :param operation: GenAI operation name, e.g. ``"chat"``.
+    """
+    try:
+        histogram = _get_operation_duration_histogram()
+        histogram.record(
+            float(duration_s),
+            attributes={
+                _ATTR_PROVIDER: provider,
+                _ATTR_REQUEST_MODEL: model,
+                _ATTR_OPERATION: operation,
+            },
+        )
+    except Exception:
+        _logger.debug("failed to record operation duration metric", exc_info=True)
+
+
+def record_tool_duration_metric(duration_s: float, tool_name: str) -> None:
+    """
+    Record a tool invocation duration on the ``omnigent.tool.duration``
+    histogram.
+
+    The helper no-ops on any exception so a misconfigured meter provider
+    cannot break a request hot path.
+
+    :param duration_s: Tool invocation duration in seconds.
+    :param tool_name: Logical tool name, e.g. ``"web_search"``.
+    """
+    try:
+        histogram = _get_tool_duration_histogram()
+        histogram.record(
+            float(duration_s),
+            attributes={_ATTR_TOOL_NAME: tool_name},
+        )
+    except Exception:
+        _logger.debug("failed to record tool duration metric", exc_info=True)
 
 
 def _metrics_exporter_name() -> str:
