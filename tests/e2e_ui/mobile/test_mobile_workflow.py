@@ -250,6 +250,13 @@ def test_mobile_files_drawer_opens_seeded_file(
     expect(file_viewer.get_by_text(_SEEDED_FILE_CONTENT).first).to_be_visible(timeout=20_000)
 
 
+# The agent turn is dispatched to the in-process harness, which
+# occasionally produces no assistant output on the first turn (the
+# runner goes idle after dispatch — a nondeterministic harness
+# scheduling stall, not a real-LLM artifact since this drives the mock
+# LLM). Rerun on failure rather than widen the already-generous 60s
+# wait, which a stalled turn would never satisfy.
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_mobile_chat_send_and_response(
     page: Page,
     seeded_session: tuple[str, str],
