@@ -54,27 +54,16 @@ def test_build_argv_first_turn_no_resume() -> None:
     assert argv[-2:] == ["-p", "hello"]
 
 
-def test_build_argv_second_turn_uses_c() -> None:
+def test_build_argv_with_session_id() -> None:
     ex = VibeExecutor(binary_path="vibe")
-    ex._is_first_turn = False
-    argv = ex._build_argv(prompt_text="hello")
-    assert "-c" in argv
-    assert "--resume" not in argv
-
-
-def test_build_argv_second_turn_uses_resume_if_session_id_exists() -> None:
-    ex = VibeExecutor(binary_path="vibe")
-    ex._is_first_turn = False
-    ex._session_id = "session_123"
-    argv = ex._build_argv(prompt_text="hello")
-    assert "-c" not in argv
+    argv = ex._build_argv(prompt_text="hello", session_id="session_123")
     assert "--resume" in argv
     assert argv[argv.index("--resume") + 1] == "session_123"
 
 
 def test_translate_event_assistant_text() -> None:
     ex = VibeExecutor(binary_path="vibe")
-    events = ex._translate_event({"role": "assistant", "content": "Hi there!"})
+    events = ex._translate_event({"role": "assistant", "content": "Hi there!"}, "key_1")
     assert len(events) == 1
     assert isinstance(events[0], TextChunk)
     assert events[0].text == "Hi there!"
@@ -88,7 +77,7 @@ def test_translate_event_tool_call() -> None:
             "id": "call_123",
             "function": {"name": "Bash", "arguments": '{"command": "ls"}'}
         }]
-    })
+    }, "key_1")
     assert len(events) == 1
     assert isinstance(events[0], ToolCallRequest)
     assert events[0].name == "Bash"
@@ -102,7 +91,7 @@ def test_translate_event_tool_result() -> None:
         "role": "tool",
         "tool_call_id": "call_123",
         "content": "some output"
-    })
+    }, "key_1")
     assert len(events) == 1
     assert isinstance(events[0], ToolCallComplete)
     assert events[0].result == "some output"
@@ -116,9 +105,9 @@ def test_translate_event_session_id_capture() -> None:
         "role": "assistant",
         "content": "Hi",
         "session_id": "session_abc"
-    })
+    }, "key_1")
     assert len(events) == 1
-    assert ex._session_id == "session_abc"
+    assert ex._session_map["key_1"] == "session_abc"
 
 
 class _FakeStdout:
@@ -126,9 +115,9 @@ class _FakeStdout:
         self._lines = [line.encode("utf-8") + b"\n" for line in lines]
     def __aiter__(self) -> _FakeStdout:
         return self
-    async def __anext__(self) -> bytes:
+    async def readline(self) -> bytes:
         if not self._lines:
-            raise StopAsyncIteration
+            return b""
         return self._lines.pop(0)
 
 

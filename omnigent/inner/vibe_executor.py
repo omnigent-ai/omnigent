@@ -36,6 +36,7 @@ from omnigent.inner.executor import (
 _logger = logging.getLogger(__name__)
 
 _STREAM_LIMIT = 16 * 1024 * 1024
+_VIBE_TURN_TIMEOUT_S = 600.0
 
 def _resolve_vibe_binary() -> str:
     explicit = os.environ.get("HARNESS_VIBE_PATH", "").strip()
@@ -75,10 +76,20 @@ class VibeExecutor(Executor):
         self._agent = agent
         self._binary_path = binary_path or _resolve_vibe_binary()
 
-        self._session_id: str | None = None
-        self._is_first_turn: bool = True
+        self._session_map: dict[str, str] = {}
         self._warned_tools_without_bridge: bool = False
         self._active_process: asyncio.subprocess.Process | None = None
+
+    def _session_key(self, messages: list[Message]) -> str:
+        """Derive a stable session key from the conversation history."""
+        for msg in messages:
+            sid = msg.get("session_id")
+            if isinstance(sid, str) and sid:
+                return sid
+        # Fallback to hash
+        return str(
+            hash(tuple((m.get("role", ""), str(m.get("content", ""))[:200]) for m in messages))
+        )
 
     def handles_tools_internally(self) -> bool:
         return True
@@ -124,27 +135,30 @@ class VibeExecutor(Executor):
             _logger.warning("Could not apply sandbox for vibe; running unsandboxed: %s", exc)
             return self._binary_path
 
-    def _build_argv(self, *, prompt_text: str) -> list[str]:
+    def _build_argv(
+        self,
+        *,
+        prompt_text: str,
+        model: str | None = None,
+        session_id: str | None = None,
+    ) -> list[str]:
         argv: list[str] = [
             self._binary_path,
             "--output",
             "streaming",
         ]
 
-        if self._agent:
-            argv.extend(["--agent", self._agent])
+        resolved_agent = model or self._agent
+        if resolved_agent:
+            argv.extend(["--agent", resolved_agent])
 
-        if self._session_id:
-            argv.extend(["--resume", self._session_id])
-        elif not self._is_first_turn:
-            argv.append("-c")
-
-        self._is_first_turn = False
+        if session_id:
+            argv.extend(["--resume", session_id])
 
         argv.extend(["-p", prompt_text])
         return argv
 
-    def _translate_event(self, payload: dict[str, Any]) -> list[ExecutorEvent]:  # type: ignore[explicit-any]
+    def _translate_event(self, payload: dict[str, Any], session_key: str) -> list[ExecutorEvent]:  # type: ignore[explicit-any]
         events: list[ExecutorEvent] = []
         # Schema verified against Mistral Vibe's vibe.core.types.LLMMessage
         # (Vibe does not emit session_id in its streaming JSON payload)
@@ -196,7 +210,7 @@ class VibeExecutor(Executor):
         # Look for session_id in any message
         session_id = payload.get("session_id")
         if isinstance(session_id, str) and session_id:
-            self._session_id = session_id
+            self._session_map[session_key] = session_id
 
         return events
 
@@ -205,7 +219,7 @@ class VibeExecutor(Executor):
         messages: list[Message],
         tools: list[ToolSpec],
         system_prompt: str,  # noqa: ARG002
-        config: ExecutorConfig | None = None,  # noqa: ARG002
+        config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
 
         if tools and not self._warned_tools_without_bridge:
@@ -229,11 +243,16 @@ class VibeExecutor(Executor):
             yield TurnComplete(response=None)
             return
 
-        argv = self._build_argv(prompt_text=prompt_text)
+        session_key = self._session_key(messages)
+        vibe_sid = self._session_map.get(session_key)
+        model = config.model if config else None
+
+        argv = self._build_argv(prompt_text=prompt_text, model=model, session_id=vibe_sid)
         env = self._build_spawn_env()
         argv[0] = self._sandbox_launch_path(tuple(env.keys()))
 
         started_at = time.monotonic()
+        deadline = started_at + _VIBE_TURN_TIMEOUT_S
         process: asyncio.subprocess.Process | None = None
         stderr_buf = bytearray()
         any_text_emitted = False
@@ -263,7 +282,11 @@ class VibeExecutor(Executor):
 
             stderr_task = asyncio.create_task(_drain_stderr())
             try:
-                async for raw_line in process.stdout:
+                while True:
+                    timeout = max(0.0, deadline - time.monotonic())
+                    raw_line = await asyncio.wait_for(process.stdout.readline(), timeout=timeout)
+                    if not raw_line:
+                        break
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
@@ -274,7 +297,7 @@ class VibeExecutor(Executor):
                         continue
                     if not isinstance(payload, dict):
                         continue
-                    for event in self._translate_event(payload):
+                    for event in self._translate_event(payload, session_key):
                         if isinstance(event, TextChunk):
                             any_text_emitted = True
                             final_text_parts.append(event.text)
@@ -282,6 +305,15 @@ class VibeExecutor(Executor):
             finally:
                 with contextlib.suppress(asyncio.CancelledError):
                     await stderr_task
+        except asyncio.TimeoutError:
+            if process is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.terminate()
+            yield ExecutorError(
+                message=f"vibe subprocess timed out after {_VIBE_TURN_TIMEOUT_S}s",
+                retryable=True,
+            )
+            return
         except asyncio.CancelledError:
             if process is not None:
                 with contextlib.suppress(ProcessLookupError):
@@ -315,8 +347,7 @@ class VibeExecutor(Executor):
         )
 
     async def close_session(self, session_key: str) -> None:  # noqa: ARG002
-        self._session_id = None
-        self._is_first_turn = True
+        self._session_map.pop(session_key, None)
 
     async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002
         process = self._active_process
