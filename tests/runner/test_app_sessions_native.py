@@ -26,7 +26,12 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent import claude_native_bridge, codex_native_bridge, cursor_native_bridge
+from omnigent import (
+    antigravity_native_bridge,
+    claude_native_bridge,
+    codex_native_bridge,
+    cursor_native_bridge,
+)
 from omnigent.antigravity_native_bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
 )
@@ -11228,6 +11233,240 @@ async def test_events_model_change_on_non_native_session_is_204_noop(
 
     assert resp.status_code == 204, (
         f"Non-native model_change must return 204 no-op; got {resp.status_code}: {resp.text}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_on_antigravity_native_session_types_slash_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    POST ``/events`` with ``{"type":"model_change","model":"gemini-2.5-pro"}``
+    on an antigravity-native session injects ``/model gemini-2.5-pro`` into tmux.
+
+    Mirrors the claude-native model_change happy-path. Pins that the runner
+    dispatch routes antigravity-native model_change to its own handler — not the
+    204 no-op it used to fall through to — and assembles the right slash command.
+    The agy executor's ``run_turn`` never reads ``config.model``, so without this
+    a mid-session web ``/model`` switch would never reach the running agy.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    captured: list[Any] = []
+
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        command: str,
+        timeout_s: float,
+        auto_confirm: bool = False,
+    ) -> None:
+        """Record the call and return without touching tmux."""
+        captured.append((bridge_dir, command, timeout_s, auto_confirm))
+
+    monkeypatch.setattr(antigravity_native_bridge, "inject_slash_command", _fake_inject)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the antigravity-native spec for any agent_id."""
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_agy_model", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        # Drain creation-time events (antigravity-native auto-create may
+        # enqueue terminal_pending / a failure with no real workspace) so the
+        # drain below isolates only what model_change emits.
+        _drain_session_event_queue(_session_event_queues_ref.get("conv_agy_model"))
+
+        resp = await client.post(
+            "/v1/sessions/conv_agy_model/events",
+            json={"type": "model_change", "model": "gemini-2.5-pro"},
+        )
+
+        # model_change is a control signal, not a state change — no events
+        # should land on the SSE queue.
+        queue = _session_event_queues_ref.get("conv_agy_model")
+        queued_events: list[dict[str, Any]] = []
+        if queue is not None:
+            while not queue.empty():
+                item = queue.get_nowait()
+                if isinstance(item, dict):
+                    queued_events.append(item)
+
+    assert resp.status_code == 204, (
+        f"Antigravity-native model_change must return 204 from /events; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    assert len(captured) == 1, (
+        f"Expected one inject_slash_command call from antigravity-native "
+        f"model_change, got {len(captured)}."
+    )
+    _bridge_dir, command, timeout_s, auto_confirm = captured[0]
+    assert command == "/model gemini-2.5-pro", (
+        f"Expected '/model gemini-2.5-pro' literal, got {command!r}."
+    )
+    assert timeout_s == 1.0
+    assert auto_confirm is True, "agy's /model can pop a confirm dialog; auto_confirm must be set."
+    assert queued_events == [], (
+        f"model_change must not publish session events; got {queued_events!r}."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model_value",
+    # There is no slash form for "use the spawn default", so ``None`` (clear)
+    # must skip injection. Empty / whitespace-only strings must also skip —
+    # typing ``/model `` with nothing after would land as a TUI error.
+    [None, "", "   "],
+)
+async def test_events_model_change_on_antigravity_native_session_skips_inject_for_empty_or_null(
+    monkeypatch: pytest.MonkeyPatch,
+    model_value: str | None,
+) -> None:
+    """
+    Null / empty / whitespace-only model values 204 without typing.
+
+    Pins that the empty-value guard lives in the antigravity-native handler,
+    matching the claude-native handler's behavior.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        command: str,
+        timeout_s: float,
+        auto_confirm: bool = False,
+    ) -> None:
+        """Fail the test if the runner reaches inject for an empty value."""
+        del bridge_dir, command, timeout_s, auto_confirm
+        raise AssertionError(
+            f"inject_slash_command must not be called for model={model_value!r}; "
+            f"the antigravity-native handler should skip empty / null values."
+        )
+
+    monkeypatch.setattr(antigravity_native_bridge, "inject_slash_command", _fake_inject)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the antigravity-native spec for any agent_id."""
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_agy_model_skip", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            "/v1/sessions/conv_agy_model_skip/events",
+            json={"type": "model_change", "model": model_value},
+        )
+
+    assert resp.status_code == 204, (
+        f"Antigravity-native model_change with empty / null value must return "
+        f"204 (no-op); got {resp.status_code}: {resp.text}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_on_antigravity_native_returns_503_when_bridge_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Bridge-not-ready RuntimeError surfaces as 503 from /events.
+
+    Sister to the happy-path test. Pins that the failure mode of the
+    antigravity-native model dispatch (tmux pane gone / bridge dir not yet
+    advertised) returns 503. The Omnigent server's PATCH swallows this 503 and
+    still returns 200 with the persisted value — the next spawn applies the new
+    model via ``--model``.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        command: str,
+        timeout_s: float,
+        auto_confirm: bool = False,
+    ) -> None:
+        """Simulate the bridge-not-ready path."""
+        del bridge_dir, command, timeout_s, auto_confirm
+        raise RuntimeError("antigravity-native tmux target was not advertised")
+
+    monkeypatch.setattr(antigravity_native_bridge, "inject_slash_command", _fake_inject)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the antigravity-native spec for any agent_id."""
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_agy_model_fail", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            "/v1/sessions/conv_agy_model_fail/events",
+            json={"type": "model_change", "model": "gemini-2.5-pro"},
+        )
+
+    assert resp.status_code == 503, (
+        f"Antigravity-native model_change with inject failure must return 503; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    body = resp.json()
+    assert body.get("error") == "antigravity_native_model_failed", (
+        f"503 body must carry the bridge-failure error code; got {body!r}"
     )
 
 

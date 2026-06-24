@@ -9579,6 +9579,77 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _handle_antigravity_native_model_change(
+        conv_id: str,
+        model: str | None,
+    ) -> Response:
+        """
+        Type ``/model <name>`` into agy's tmux pane.
+
+        Antigravity-native sessions can't read the persisted ``model_override``
+        field at turn boundaries — the executor's ``run_turn`` never consults
+        ``config.model``, and the ``--model`` flag on the ``agy`` binary is baked
+        in at spawn. To propagate a live change without restarting the pane, this
+        helper types agy's built-in slash command into the terminal, mirroring
+        :func:`_handle_claude_native_model_change`. The model id is passed through
+        verbatim: the launch path forwards ``model_override`` straight to
+        ``--model`` (see ``antigravity_native_launch``), so the same id is what
+        agy's ``/model`` expects.
+
+        Skipped silently when *model* is ``None`` or empty / whitespace only —
+        there is no slash form for "use the spawn default", so a clear only takes
+        effect on the next spawn.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param model: New persisted model identifier, e.g. ``"gemini-2.5-pro"``;
+            ``None`` when the user cleared the override.
+        :returns: 204 on success or skip (caller treats both the same — the
+            persisted value is the authoritative fallback). 503 if the tmux
+            target isn't yet advertised (best-effort failure).
+        """
+        from omnigent.antigravity_native_bridge import (
+            ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+            inject_slash_command,
+        )
+
+        if model is None or not model.strip():
+            # Persistence already happened on the Omnigent server; the next
+            # spawn will pick up the new value via ``--model``.
+            return Response(status_code=204)
+        # Resolve the bridge id from the session's labels so ``/clear``
+        # rotations (where bridge_id != conv_id) land in the right tmux pane.
+        # Falls back to ``conv_id`` for legacy single-session bridges — the same
+        # pattern :func:`_antigravity_native_terminal_arrives_via_transfer` uses.
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        command = f"/model {model.strip()}"
+        try:
+            # Short timeout: missing tmux.json means the pane isn't attached;
+            # the persisted model still applies on the next spawn.
+            await asyncio.to_thread(
+                inject_slash_command,
+                bridge_dir,
+                command=command,
+                timeout_s=1.0,
+                auto_confirm=True,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_model_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="antigravity-native model change"
+                    ),
+                },
+            )
+        return Response(status_code=204)
+
     async def _handle_claude_native_compact(conv_id: str) -> Response:
         """
         Type ``/compact`` into Claude's tmux pane.
@@ -12430,12 +12501,17 @@ def create_runner_app(
         if body_type == "model_change":
             # Omnigent server forwards the persisted model_override here so
             # harnesses that can't re-read it from store at turn
-            # boundaries can propagate it live. Claude-native types
-            # ``/model`` into its tmux pane; codex-native queues a
-            # Codex app-server next-turn settings update. Other harnesses
-            # pick up the persisted value on the next turn and 204 here.
+            # boundaries can propagate it live. Claude-native and
+            # antigravity-native type ``/model`` into their tmux pane;
+            # codex-native queues a Codex app-server next-turn settings
+            # update. Antigravity-native must type it because its
+            # executor's ``run_turn`` never consults ``config.model`` —
+            # the persisted value would otherwise only apply on a fresh
+            # spawn (via ``--model``), making a mid-session switch a
+            # silent no-op. Other harnesses re-read the persisted value
+            # on the next turn and 204 here.
             harness = _session_harness_name(conversation_id)
-            if harness in ("claude-native", "codex-native"):
+            if harness in ("claude-native", "codex-native", "antigravity-native"):
                 model = body.get("model") if isinstance(body, dict) else None
                 if model is not None and not isinstance(model, str):
                     return JSONResponse(
@@ -12451,6 +12527,11 @@ def create_runner_app(
                     return await _handle_codex_native_settings_update(
                         conversation_id,
                         {"model": model.strip()},
+                    )
+                if harness == "antigravity-native":
+                    return await _handle_antigravity_native_model_change(
+                        conversation_id,
+                        model,
                     )
                 return await _handle_claude_native_model_change(
                     conversation_id,

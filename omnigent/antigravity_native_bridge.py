@@ -815,3 +815,66 @@ def inject_user_message_via_tui(
             time.sleep(_TMUX_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
     _submit_and_verify(socket_path, tmux_target)
+
+
+def inject_slash_command(
+    bridge_dir: Path,
+    *,
+    command: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    auto_confirm: bool = False,
+) -> None:
+    """
+    Type an agy TUI slash command into the tmux pane and submit it.
+
+    A live control (e.g. ``/model``) that agy reads only from its TUI — never
+    from a config file at turn boundaries — must be typed into the running pane,
+    not delivered over agy's connect-RPC. This mirrors
+    :func:`omnigent.claude_native_bridge.inject_slash_command`, but uses agy's
+    own clear primitive (Home + kill-to-end, as :func:`inject_user_message_via_tui`
+    does) rather than Claude Code's ``C-u``, since the two TUIs bind their input
+    boxes differently.
+
+    A slash command is a single short line with no interior newline, so it is
+    sent literally (``send-keys -l``) instead of streamed through the paste
+    buffer the way a multi-line user message is.
+
+    :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
+    :param command: Single-line slash command including the leading ``/``, e.g.
+        ``"/model gemini-2.5-pro"``.
+    :param timeout_s: Seconds to wait for ``tmux.json`` to be advertised, e.g.
+        ``30.0``.
+    :param auto_confirm: If ``True``, send an extra ``Enter`` after a short delay
+        to accept the default option of any TUI confirmation dialog the command
+        may pop. When no dialog appears the extra Enter falls on an empty prompt
+        and is a no-op. Callers that don't trigger confirmations should leave
+        this ``False``.
+    :returns: None.
+    :raises ValueError: If *command* is empty, does not start with ``/``, or
+        contains a newline.
+    :raises RuntimeError: If the tmux target is not advertised within *timeout_s*,
+        or if a ``tmux send-keys`` invocation fails.
+    """
+    if not command or not command.startswith("/"):
+        raise ValueError(f"slash command must start with '/'; got {command!r}")
+    if "\n" in command:
+        raise ValueError("slash command must be a single line")
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    # Clear any leftover draft before typing: Home (C-a) + kill-to-end (C-k) —
+    # otherwise the literal send below concatenates with the user's in-progress
+    # text and the Enter submits ``<their-draft>/model ...`` as a turn. This is
+    # agy's clear primitive (see :func:`inject_user_message_via_tui`); Claude's
+    # bridge uses ``C-u`` because its input box binds the kill differently.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    # ``-l`` types ``/`` and spaces literally; the trailing Enter submits.
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    if auto_confirm:
+        # Give the TUI time to render its confirmation dialog before the
+        # auto-Enter arrives; otherwise the keystroke races the prompt and gets
+        # dropped.
+        time.sleep(0.3)
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
