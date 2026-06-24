@@ -25,6 +25,7 @@ import {
   PinIcon,
   PinOffIcon,
   SearchIcon,
+  SettingsIcon,
   ShareIcon,
   SquareIcon,
   SquareCheckIcon,
@@ -59,6 +60,7 @@ import {
   useStopSession,
 } from "@/hooks/useConversations";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
@@ -73,8 +75,7 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
-import { ThemeModeMenu } from "@/components/theme/ThemeModeMenu";
-import { AccountMenu } from "./AccountMenu";
+import { SettingsSidebarBody, useSettingsRoute } from "./settingsNav";
 import {
   type ActiveChatOverride,
   COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY,
@@ -143,6 +144,23 @@ function useActiveNavItem(): { isNewChatPage: boolean; isInboxPage: boolean } {
  *     scrollback is fine; users typically want the conversations list
  *     to stay visible while they switch around.
  */
+/** Toast body shown after archiving a session — links to its new home. */
+function ArchivedToast() {
+  return (
+    <span>
+      View archived sessions in{" "}
+      <Link to="/settings/archived" className="font-medium text-primary hover:underline">
+        Settings
+      </Link>
+    </span>
+  );
+}
+
+/** Fire the post-archive toast. Hoisted so it isn't a render-scoped closure. */
+function showArchivedToast() {
+  showToast(<ArchivedToast />);
+}
+
 export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
@@ -215,6 +233,11 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
 
   // Which top-level nav button to highlight for the current route.
   const { isNewChatPage, isInboxPage } = useActiveNavItem();
+
+  // On /settings the card keeps its chrome but swaps the conversation list
+  // for the settings section nav (see settingsNav.tsx) — entering settings
+  // shouldn't replace the whole sidebar.
+  const { inSettings } = useSettingsRoute();
 
   // Sync pinned ids to localStorage whenever state changes. Keeping
   // the write here (instead of inside the state updater) preserves the
@@ -303,6 +326,10 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
         {...resizeHandleProps}
         className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
       />
+      {inSettings ? (
+        <SettingsSidebarBody onNavClick={onNavClick} onClose={onClose} />
+      ) : (
+        <>
       <div className="flex items-center justify-between px-4 pt-3">
         {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
@@ -318,7 +345,6 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
           Omnigent
         </Link>
         <div className="flex items-center gap-1">
-          <ThemeModeMenu />
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
@@ -443,11 +469,28 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
         />
       </nav>
 
-      {/* Account footer. Sibling *after* the flex-1 nav so it pins to the
-          bottom of the sidebar column. Renders nothing (no border, no
-          padding) when the accounts auth provider is off, so non-accounts
-          deploys keep the conversation list flush to the bottom edge. */}
-      <AccountMenu />
+      {/* Settings footer. Sibling *after* the flex-1 nav so it pins to the
+          bottom of the sidebar column. Always present (every deploy): the
+          full settings surface — appearance, keyboard shortcuts, archived
+          chats, and the account/sign-out controls when accounts auth is on —
+          lives behind this row on the /settings page. */}
+      <div className="shrink-0 px-3 pb-3">
+        {/* Match the New session / Inbox buttons (default size, no extra
+            padding) so the gear icon lines up with their leading icons. */}
+        <Button
+          asChild
+          variant="ghost"
+          className="w-full justify-start gap-2 text-sm"
+          data-testid="settings-button"
+        >
+          <Link to="/settings" onClick={onNavClick}>
+            <SettingsIcon className="size-4 text-muted-foreground" />
+            Settings
+          </Link>
+        </Button>
+      </div>
+        </>
+      )}
     </aside>
   );
 }
@@ -579,7 +622,6 @@ function ConversationList({
       ...visible("Pinned", sections.pinned),
       ...visible("Recent", sections.sessions),
       ...visible("Shared with me", sections.shared),
-      ...visible("Archived", sections.archived),
     ].map((c) => c.id);
   }, [sections, effectiveCollapsedSections]);
   useSessionSwitchHotkey(orderedConversationIds, activeId);
@@ -626,11 +668,10 @@ function ConversationList({
   }
   const emptyMessage = searchQuery ? "No matching conversations" : "No active sessions";
 
+  // Archived sessions are surfaced on the Settings page, not here, so they
+  // don't count toward the sidebar's empty-state threshold.
   const totalVisible =
-    sections.pinned.length +
-    sections.sessions.length +
-    sections.shared.length +
-    sections.archived.length;
+    sections.pinned.length + sections.sessions.length + sections.shared.length;
 
   // Section structure comes from the muted micro-headers + whitespace
   // alone (Linear-style) — no divider rules between groups.
@@ -682,20 +723,8 @@ function ConversationList({
               onToggleSelected={onToggleSelected}
             />
           )}
-          {sections.archived.length > 0 && (
-            <ConversationSection
-              title="Archived"
-              conversations={sections.archived}
-              pinnedConversationIds={pinnedConversationIds}
-              collapsedSections={effectiveCollapsedSections}
-              onToggleCollapsed={effectiveToggleSectionCollapsed}
-              onRowClick={onRowClick}
-              onTogglePinned={onTogglePinned}
-              selectionMode={selectionMode}
-              selectedIds={selectedIds}
-              onToggleSelected={onToggleSelected}
-            />
-          )}
+          {/* Archived sessions are no longer listed here — they live on the
+              Settings page ("Archived chats"), reachable from the footer. */}
           {/* Pagination extends the Recent list, so the button hides with
               it — a Load more under a collapsed group reads orphaned. */}
           {hasMorePages && !effectiveCollapsedSections.includes("Recent") && (
@@ -965,7 +994,12 @@ function ConversationRow({
       onSettled: () => {
         archive.mutate(
           { id: conversation.id, archived: true },
-          { onSettled: () => setIsArchiving(false) },
+          {
+            // Point the user at where the session went — it's no longer in
+            // the sidebar list, so surface its new home in Settings.
+            onSuccess: showArchivedToast,
+            onSettled: () => setIsArchiving(false),
+          },
         );
       },
     });
