@@ -1,6 +1,23 @@
 # Task T-D — Reader streaming mode (output_text_delta + poll fallback)
 
-**Status:** DONE_WITH_CONCERNS (one reconciliation judgment call below; reasoning-stream skipped by contract). All gates green; 19 reader tests + 87 reader/steps tests pass.
+**Status:** DONE_WITH_CONCERNS (reasoning-stream skipped by contract). All gates green; 88 reader+steps tests pass.
+
+## Follow-up fix (commit 2960b9b2) — poll-path double-render
+
+Review found a Critical: the original mapper emitted a planner `message` at ANY
+status (only tool-results were DONE-gated), and the poll fallback does not
+intercept GENERATING (only the stream path does). So a poll catching a planner
+GENERATING then DONE posted TWO messages for one step — the exact double-render
+the rework removes, on the fallback path. **Fix:** gate the PLANNER_RESPONSE
+committed items (message + function_calls) on `status == DONE` in
+`map_step_to_events` (symmetric with the tool-result gate). A non-DONE planner →
+`[]`; its partial text is conveyed only via the stream reader's
+`output_text_delta`. Result: exactly one committed message with the FINAL text on
+BOTH paths. The `_is_settled` dedup fix is retained and now consistent (a planner
+records `seen` only at DONE). All planner fixtures are DONE → no Task-4 mapper
+test needed updating. Added poll-path regression test
+(`test_poll_planner_generating_then_done_posts_one_final_message`) + strengthened
+the stream analog to assert final committed text.
 
 ## What was built
 
