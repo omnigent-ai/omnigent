@@ -27,6 +27,7 @@ import shutil
 import signal
 import socket
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -43,11 +44,20 @@ from omnigent.runtime.harnesses import _HARNESS_MODULES
 _logger = logging.getLogger(__name__)
 
 # Per-AP-instance directory holding all per-conversation Unix
-# sockets and the AP_PID sentinel file. ``/tmp/omnigent`` is the
-# default parent — each Omnigent instance gets a uuid-named subdir so
-# concurrent Omnigent processes (zero-downtime restarts, multi-tenant
-# single-machine deployments) don't step on each other.
-_TMP_PARENT = Path("/tmp/omnigent")
+# sockets (POSIX) and the AP_PID sentinel file. Each Omnigent instance gets a
+# uuid-named subdir so concurrent Omnigent processes (zero-downtime restarts,
+# multi-tenant single-machine deployments) don't step on each other.
+#
+# POSIX pins ``/tmp/omnigent`` deliberately: Unix socket paths have a tight
+# length limit, so a short, predictable parent matters (gettempdir() can be a
+# long ``/var/folders/...`` path on macOS). Windows uses TCP loopback for the
+# harness IPC (no socket-path length concern) and has no ``/tmp`` — a literal
+# ``/tmp/omnigent`` there resolves to ``\tmp\omnigent`` on the current drive —
+# so use the real temp dir.
+if IS_WINDOWS:
+    _TMP_PARENT = Path(tempfile.gettempdir()) / "omnigent"
+else:
+    _TMP_PARENT = Path("/tmp/omnigent")
 _TMP_PARENT_ENV_VAR = "OMNIGENT_HARNESS_TMP_PARENT"
 
 # Sentinel file the Omnigent instance writes into its subdir on boot. The
