@@ -1163,6 +1163,7 @@ def cli() -> None:
 # Keep in sync with ``@cli.command()`` decorations below.
 _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
     {
+        "antigravity",
         "attach",
         "claude",
         "codex",
@@ -4756,6 +4757,100 @@ def goose(
         session_id=resolved_session_id,
         resume_picker=choice.picker,
         goose_args=goose_args,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, binds a runner, "
+        "launches Antigravity (agy) in a terminal resource, and attaches "
+        'this TTY. Pass --server "" to auto-spawn a persistent local '
+        "server in the background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to antigravity-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.option("--model", default=None, help="Antigravity (agy) model to use for the session.")
+@click.argument("antigravity_args", nargs=-1, type=click.UNPROCESSED)
+def antigravity(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    model: str | None,
+    antigravity_args: tuple[str, ...],
+) -> None:
+    """Launch the Antigravity (agy) TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent antigravity
+      omnigent antigravity --resume conv_abc123
+      omnigent antigravity --resume                  # interactive picker
+      omnigent antigravity --server https://<app>.databricksapps.com
+    """
+    # Validate option combinations BEFORE any side effects (daemon spawn,
+    # server discovery) -- see the same comment in the claude command.
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+
+    from omnigent.antigravity_native import run_antigravity_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    if model is None:
+        model = cfg.get("model")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+
+    # permission_mode is left None here (parity with the claude/codex/pi CLI
+    # launchers): the attended terminal launch lets agy's own request-review
+    # prompt govern each tool, and an unattended/headless launch auto-bypasses
+    # inside run_antigravity_native. It is plumbed through build_agy_launch so a
+    # future caller CAN set it, but this human CLI path exposes no permission
+    # flag and never needs one.
+    run_antigravity_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        antigravity_args=antigravity_args,
+        model=model,
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -9465,6 +9560,64 @@ def _manage_goose_harness() -> None:
             status = None
 
 
+def _manage_hermes_harness() -> None:
+    """Run the level-2 loop for Hermes: ensure the CLI is installed.
+
+    Hermes owns its own auth via ``hermes model`` (interactive provider/model
+    picker) and is installed via a curl script from Nous Research — Omnigent
+    stores no Hermes credential. A missing CLI gates the drill-in; when
+    installed, the drill-in offers to launch ``hermes model`` for provider
+    configuration.
+
+    :returns: None. Side effects: may launch ``hermes model``.
+    """
+    from omnigent.onboarding.harness_install import (
+        HERMES_KEY,
+        harness_cli_installed,
+        harness_install_spec,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    if not harness_cli_installed(HERMES_KEY):
+        spec = harness_install_spec(HERMES_KEY)
+        hint = (
+            spec.install_hint
+            if spec and spec.install_hint
+            else "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+        )
+        console.print(
+            f"  Hermes isn't installed. Install it with:\n    [bold]{hint}[/bold]\n"
+            "  then re-open this menu."
+        )
+        return
+
+    status: str | None = None
+    while True:
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow("Run hermes model (configure provider)", action="model"),
+            _HarnessMenuRow("← Back", action="back"),
+        ]
+        idx = select(
+            "Hermes Agent",
+            [r.label for r in rows],
+            clear_on_exit=True,
+            status=status,
+        )
+        if idx < 0:
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "model":
+            import subprocess
+
+            try:
+                subprocess.run(["hermes", "model"], check=False)
+                status = "✓ hermes model completed"
+            except FileNotFoundError:
+                status = "✗ hermes binary not found"
+
+
 def _prompt_install_copilot() -> str | None:
     """Offer to install the missing ``copilot`` extra; return a status line.
 
@@ -10183,6 +10336,7 @@ def _run_configure_harnesses_interactive() -> None:
         COPILOT_KEY,
         CURSOR_KEY,
         GOOSE_KEY,
+        HERMES_KEY,
         OPENCODE_KEY,
         QWEN_KEY,
         harness_cli_installed,
@@ -10240,6 +10394,9 @@ def _run_configure_harnesses_interactive() -> None:
     # provider family (Goose owns its own auth via ``goose configure``, not an
     # Omnigent credential), so it dispatches to its own drill-in.
     _GOOSE = "\x00goose"
+    # Sentinel marking the Hermes row — like Goose it owns its own auth via
+    # ``hermes model`` and is installed via a curl installer.
+    _HERMES = "\x00hermes"
     families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE]
     while True:
         config = _load_global_config()
@@ -10459,6 +10616,28 @@ def _run_configure_harnesses_interactive() -> None:
             options.append(f"  {copilot_sub}")
             selectable.append(False)
             row_target.append(None)
+        # Hermes Agent (its own provider config via ``hermes model``, installed
+        # via a curl installer from Nous Research — no npm package or Omnigent
+        # credential).
+        hermes_installed = harness_cli_installed(HERMES_KEY)
+        options.append(f"{'  ' if hermes_installed else '[red]✗[/] '}Hermes")
+        selectable.append(True)
+        row_target.append(_HERMES)
+        if not hermes_installed:
+            from rich.markup import escape as _rich_escape
+
+            hermes_spec = harness_install_spec(HERMES_KEY)
+            hermes_hint = _rich_escape(
+                hermes_spec.install_hint
+                if hermes_spec and hermes_spec.install_hint
+                else "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+            )
+            hermes_sub = f"[dim]not installed — open to install ({hermes_hint})[/]"
+        else:
+            hermes_sub = "[green]✓[/] ready"
+        options.append(f"  {hermes_sub}")
+        selectable.append(False)
+        row_target.append(None)
         options.append("Quit")
         selectable.append(True)
         row_target.append(_QUIT)
@@ -10485,6 +10664,8 @@ def _run_configure_harnesses_interactive() -> None:
             _manage_opencode_harness()
         elif target == _GOOSE:
             _manage_goose_harness()
+        elif target == _HERMES:
+            _manage_hermes_harness()
         else:  # Quit row (or, defensively, a non-family row)
             return
 

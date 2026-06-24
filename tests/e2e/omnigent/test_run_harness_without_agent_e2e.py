@@ -181,11 +181,22 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``cursor-native``: it is a terminal-first TUI launched via ``omni goose``
     (tmux pane + bridge dir), not ``omnigent run --harness goose-native``.
 
+    ``antigravity-native`` is excluded for the union of both reasons above: it
+    is a terminal-first TUI launched via ``omnigent antigravity`` (runner-owned
+    agy tmux pane + bridge dir), not ``omnigent run --harness antigravity-native``,
+    AND it is Gemini-native (agy authenticates via Google OAuth, not the shared
+    Databricks gateway/profile probe wiring this matrix drives).
+
     ``qwen-native`` is excluded for the same reason as ``goose-native`` /
     ``cursor-native``: it is a terminal-first TUI launched via ``omni qwen``
     (tmux pane + bridge dir, driving qwen's ``--input-file`` / ``--json-file``),
     not ``omnigent run --harness qwen-native``. Its coverage is the dedicated
     qwen-native bridge/executor/forwarder unit tests.
+
+    ``hermes`` is excluded because it requires the ``hermes`` CLI binary
+    (installed separately via Nous Research's install script) and authenticates
+    through its own provider config, not the shared gateway/profile probe
+    wiring this matrix drives.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
@@ -195,10 +206,12 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "cursor",
         "cursor-native",
         "antigravity",
+        "antigravity-native",
         "copilot",
         "qwen",
         "qwen-native",
         "goose",
         "goose-native",
+        "hermes",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

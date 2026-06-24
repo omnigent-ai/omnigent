@@ -49,6 +49,10 @@ _HARNESS_MODULES: dict[str, str] = {
     "pi": "omnigent.inner.pi_harness",
     # Native Pi TUI bridge used by ``omnigent pi``.
     "pi-native": "omnigent.inner.pi_native_harness",
+    # Native Antigravity (agy) TUI terminal bridge used by
+    # ``omnigent antigravity``. The in-process SDK counterpart is the
+    # canonical ``antigravity`` harness registered below.
+    "antigravity-native": "omnigent.inner.antigravity_native_harness",
     # Step 4e: openai-agents harness wrap. See
     # omnigent/inner/openai_agents_sdk_harness.py. Registry
     # key is the Omnigent-side spelling (``openai-agents``,
@@ -111,6 +115,12 @@ _HARNESS_MODULES: dict[str, str] = {
     # Omnigent spawns no separately-installed CLI. Authenticates against GitHub's
     # Copilot backend with a GitHub token (no Databricks gateway).
     "copilot": "omnigent.inner.copilot_harness",
+    # Hermes Agent harness wrap. Runs the ``hermes`` CLI as a subprocess
+    # for each turn, managing its own session state via Hermes' SQLite
+    # session store. See omnigent/inner/hermes_harness.py and
+    # omnigent/inner/hermes_executor.py. The ``hermes`` binary must be
+    # on PATH (or set by HARNESS_HERMES_PATH).
+    "hermes": "omnigent.inner.hermes_harness",
 }
 
 __all__ = ["_HARNESS_MODULES"]

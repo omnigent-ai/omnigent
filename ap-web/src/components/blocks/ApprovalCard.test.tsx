@@ -624,6 +624,37 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.queryByText("Claude has questions")).toBeNull();
   });
 
+  it("labels Antigravity structured input prompts as Antigravity prompts", () => {
+    // Antigravity (agy) reuses the same AskUserQuestion renderer via the
+    // ``ask_user_question`` extra, so the title must reflect the producer
+    // rather than defaulting to "Claude has questions".
+    render(
+      <ApprovalCard
+        elicitationId="elic_agy_label"
+        message="Antigravity needs your input"
+        phase="agy_ask_question"
+        policyName="agy_native_ask_question"
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        askUserQuestion={{
+          questions: [
+            {
+              id: "0",
+              question: "What type of project?",
+              options: [{ label: "Web app" }, { label: "CLI tool" }],
+              multiSelect: false,
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Antigravity needs your input")).toBeDefined();
+    expect(screen.queryByText("Claude has questions")).toBeNull();
+  });
+
   it("submits multi-select answers as an array", () => {
     const submitSpy = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({ submitApproval: submitSpy } as Partial<
