@@ -393,3 +393,34 @@ def test_function_policies_have_nonempty_arguments(polly_spec: AgentSpec) -> Non
     # = 3; sub-agents: blast_radius x4 (claude_code, codex, pi, opencode) = 4
     # -> 7 total. Fewer = a policy dropped.
     assert checked == 7, f"expected 7 function policies in the bundle, inspected {checked}"
+
+
+def test_roster_preflight_is_credential_aware_not_binary_only() -> None:
+    """
+    Regression guard for #152: a worker is AVAILABLE only when its CLI resolves
+    AND ``sys_list_models`` shows a usable credential (``source != "none"``), not
+    on binary presence alone (the host image ships every coding CLI).
+
+    Scoped to the preflight paragraph because ``sys_list_models`` also appears in
+    the per-dispatch paragraph, so a whole-file check would false-pass.
+    """
+    config = (_POLLY_BUNDLE / "config.yaml").read_text(encoding="utf-8")
+    compact = " ".join(config.split())
+    preflight = compact[
+        compact.index("Roster preflight") : compact.index("Every dispatch may carry")
+    ]
+
+    assert "sys_list_models" in preflight, (
+        "roster preflight no longer grounds availability in sys_list_models"
+    )
+    assert any(token in preflight for token in ("credential", "source")), (
+        "roster preflight does not describe credential/provider readiness"
+    )
+    # A logged-in subscription reports source "static" / verified false, so it
+    # must still count as available; gating on verified would re-break #152.
+    assert "static" in preflight, (
+        "roster preflight does not keep a static-subscription worker available"
+    )
+    assert "A worker is AVAILABLE only if its binary resolved" not in preflight, (
+        "preflight still treats a resolved CLI binary as sufficient for availability"
+    )

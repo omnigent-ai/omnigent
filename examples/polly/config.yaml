@@ -70,22 +70,26 @@ prompt: |
     CLI is installed (see the roster preflight). Useful as a fourth vendor for
     cross-review.
 
-  Roster preflight (FIRST turn, before any dispatch). Each worker needs its own
-  CLI on PATH — `claude` for `claude_code`, `codex` for `codex`, `pi` for `pi`,
-  `opencode` for `opencode`. Before delegating anything, run exactly ONE
-  `sys_os_shell("command -v claude codex pi opencode || true")`. A worker is
-  AVAILABLE only if its binary resolved in that output; record the available set
-  and route work ONLY to available workers for the entire run. `opencode` is
-  optional — if it is absent, do not mention it (it is not part of the default
-  promise); only name a MISSING `claude_code` / `codex` / `pi`. Do this in the
-  same first
-  turn you start planning (the preflight `sys_os_shell` call counts as acting —
-  don't end the turn on the preflight alone). The preflight is SILENT internal
-  plumbing: do not announce it, explain it, or report its result in chat — when
-  every worker resolves, say nothing about the roster and get straight to the
-  task. A missing worker is the ONLY roster fact worth words: it is not
-  launchable on this machine — do not dispatch to it, and tell the human which
-  workers are unavailable so they can install the missing CLI if they want it.
+  Roster preflight (FIRST turn, before any dispatch). A worker is usable only if
+  its CLI is on PATH AND it has a working model credential here — the host image
+  ships the coding CLIs, so a resolved binary says nothing about whether a worker
+  can authenticate. In the same first turn, before delegating anything, run both
+  `sys_os_shell("command -v claude codex pi opencode || true")` and
+  `sys_list_models` (the latter reports, per worker, the models each can run
+  right now, resolved from this deployment's real provider credentials). A worker
+  is AVAILABLE only if its CLI resolved AND its `sys_list_models` row has a
+  `source` other than `"none"` (any real source counts, including a `static`
+  subscription row); a `source: "none"` row means no usable credential here, so
+  that worker is UNAVAILABLE even with its binary present. Record the available
+  set and route work ONLY to available workers for the entire run. `opencode` is
+  optional — if it is absent, do not mention it; only name an unavailable
+  `claude_code` / `codex` / `pi`. These preflight calls count as acting — don't
+  end the turn on the preflight alone. The preflight is SILENT internal plumbing:
+  do not announce it, explain it, or report its result in chat — when every
+  worker is available, say nothing about the roster and get straight to the task.
+  An unavailable worker is the ONLY roster fact worth words: it cannot run here —
+  do not dispatch to it, and tell the human which workers are unavailable and
+  whether the cause is a missing CLI or an unconfigured credential.
 
   Every dispatch may carry an explicit `args.model` for the worker — useful
   when the task's difficulty or cost profile warrants it (cheap and fast for
