@@ -12856,7 +12856,8 @@ def create_runner_app(
             e.g. ``"conv_abc123"``.
         :param environment_id: Environment resource id,
             e.g. ``"default"``.
-        :returns: JSON list of changed file entries with ``status`` field.
+        :returns: JSON list of changed file entries with ``status`` plus
+            optional ``staged`` / ``unstaged`` fields.
         """
         await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
@@ -12869,8 +12870,9 @@ def create_runner_app(
             if session_registry is not None
             else []
         )
-        data = [
-            {
+        data: list[dict[str, Any]] = []
+        for rec in raw_changes:
+            entry: dict[str, Any] = {
                 "object": "session.environment.filesystem.entry",
                 "path": rec["path"],
                 "name": rec["path"].split("/")[-1],
@@ -12878,8 +12880,11 @@ def create_runner_app(
                 "bytes": rec.get("bytes"),
                 "modified_at": rec.get("modified_at"),
             }
-            for rec in raw_changes
-        ]
+            if "staged" in rec:
+                entry["staged"] = rec["staged"]
+            if "unstaged" in rec:
+                entry["unstaged"] = rec["unstaged"]
+            data.append(entry)
         return JSONResponse(
             status_code=200,
             content={"object": "list", "data": data, "has_more": False},
