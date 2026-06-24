@@ -827,12 +827,18 @@ class SkillSpec:
         disk, e.g. ``Path("/agents/code-review")``. Used by
         ``read_skill_file`` to resolve resource paths. ``None``
         when the skill was created in-memory (e.g. tests).
+    :param user_invocable: Whether the skill may be invoked directly
+        by a user as a slash command. ``False`` for internal
+        orchestration skills (frontmatter ``user-invocable: false``);
+        such skills are excluded from the composer's ``/`` menu.
+        Defaults to ``True`` (absent frontmatter field = invocable).
     """
 
     name: str
     description: str
     content: str
     skill_dir: Path | None = None
+    user_invocable: bool = True
 
 
 @dataclass

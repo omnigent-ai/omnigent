@@ -64,7 +64,7 @@ from omnigent.runner.resource_registry import (
     TerminalLifecycle,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.spec.parser import discover_host_skills
+from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -12278,14 +12278,37 @@ def create_runner_app(
             roots.append(Path.cwd())
 
         def _discover() -> list[SkillSpec]:
-            """Merge bundled + host skills (every root) off the event loop."""
-            merged: list[SkillSpec] = list(spec.skills)
-            seen = {s.name for s in merged}
-            for root in roots:
-                for hs in discover_host_skills(root, spec.skills_filter):
-                    if hs.name not in seen:
-                        seen.add(hs.name)
-                        merged.append(hs)
+            """Merge bundled skills with the harness's extra skills off the loop."""
+            # Drop user-invocable:false skills from the bundle too, so the
+            # composer menu never lists a non-invocable skill regardless of
+            # source (harness skills are already filtered in resolve_harness_skills).
+            merged: list[SkillSpec] = [s for s in spec.skills if s.user_invocable]
+            # Seed the dedup set from EVERY bundled name — including the
+            # non-invocable ones dropped above — so marking a bundled skill
+            # non-invocable can't un-shadow a same-named host/harness skill
+            # the author never meant to surface.
+            seen = {s.name for s in spec.skills}
+            # Also dedup by on-disk skill dir: a harness provider (e.g. codex)
+            # may rediscover a bundle skill under a *different* name than its
+            # frontmatter ``name`` (it keys by directory), which would otherwise
+            # double-list the same skill. Same dir == same skill, drop it.
+            seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
+            ctx = SkillSourceContext(
+                roots=tuple(roots),
+                home=Path.home(),
+                skills_filter=spec.skills_filter,
+                bundle_dir=_resolved_spec_workdir(entry),
+            )
+            harness = canonicalize_harness(spec.executor.harness_kind)
+            for hs in resolve_harness_skills(ctx, harness):
+                if hs.name in seen:
+                    continue
+                if hs.skill_dir is not None and hs.skill_dir.resolve() in seen_dirs:
+                    continue
+                seen.add(hs.name)
+                if hs.skill_dir is not None:
+                    seen_dirs.add(hs.skill_dir.resolve())
+                merged.append(hs)
             return merged
 
         skills = await asyncio.to_thread(_discover)
