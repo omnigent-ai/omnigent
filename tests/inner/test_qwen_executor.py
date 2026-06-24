@@ -1230,14 +1230,16 @@ async def test_run_turn_no_replay_on_genuine_first_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_respond_to_fs_read_text_file_is_unsupported() -> None:
-    """fs/* is intentionally unsupported (no clientCapabilities.fs advertised).
+async def test_respond_to_fs_read_text_file_unsupported_without_os_env() -> None:
+    """fs/* is method-not-found when fs delegation isn't advertised.
 
-    qwen never delegates file ops to us, so the handlers were removed; an
-    ``fs/read_text_file`` request must get a JSON-RPC method-not-found error
+    With no os_env configured, ``_fs_delegation`` is False and we never
+    advertise ``clientCapabilities.fs``, so qwen uses its own file tools. A
+    stray ``fs/read_text_file`` must get a JSON-RPC method-not-found error
     rather than a fabricated (and dangerous) empty/real-file response.
     """
-    executor = QwenExecutor()
+    executor = QwenExecutor()  # no os_env → delegation off
+    assert executor._fs_delegation is False
     sent: list[dict] = []
     executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
 
@@ -1248,6 +1250,228 @@ async def test_respond_to_fs_read_text_file_is_unsupported() -> None:
     assert sent[0]["id"] == 7
     assert sent[0]["error"]["code"] == -32601
     assert "result" not in sent[0]
+
+
+# ---------------------------------------------------------------------------
+# Filesystem delegation (fs/read_text_file, fs/write_text_file)
+# ---------------------------------------------------------------------------
+
+
+class _FakeOSEnv:
+    """Minimal OSEnvironment stand-in capturing read/write calls."""
+
+    def __init__(self, read_result: dict | None = None, write_result: dict | None = None) -> None:
+        self._read_result = read_result if read_result is not None else {}
+        self._write_result = write_result if write_result is not None else {}
+        self.read_calls: list[tuple] = []
+        self.write_calls: list[tuple] = []
+        self.closed = False
+
+    async def read(self, path: str, offset: int = 1, limit: int | None = None) -> dict:
+        self.read_calls.append((path, offset, limit))
+        return self._read_result
+
+    async def write(self, path: str, content: str) -> dict:
+        self.write_calls.append((path, content))
+        return self._write_result
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_fs_delegation_flag_tracks_os_env() -> None:
+    """Delegation is on with an os_env, off without one or for a fork env."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    assert QwenExecutor()._fs_delegation is False  # no os_env
+    assert QwenExecutor(os_env=OSEnvSpec(type="caller_process"))._fs_delegation is True
+    # A fork env operates on a copied tree → path would diverge from the qwen
+    # subprocess cwd, so delegation must stay off.
+    assert QwenExecutor(os_env=OSEnvSpec(type="caller_process", fork=True))._fs_delegation is False
+
+
+@pytest.mark.asyncio
+async def test_initialize_advertises_fs_capability_per_delegation() -> None:
+    """initialize advertises clientCapabilities.fs matching the delegation flag."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    init_result = {"result": {"agentCapabilities": {"promptCapabilities": {}}}}
+
+    # Delegation ON (os_env configured).
+    on = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    on._rpc = AsyncMock(return_value=init_result)  # type: ignore[method-assign]
+    await on._ensure_initialized()
+    caps = on._rpc.call_args.args[1]["clientCapabilities"]["fs"]
+    assert caps == {"readTextFile": True, "writeTextFile": True}
+
+    # Delegation OFF (no os_env).
+    off = QwenExecutor()
+    off._rpc = AsyncMock(return_value=init_result)  # type: ignore[method-assign]
+    await off._ensure_initialized()
+    caps = off._rpc.call_args.args[1]["clientCapabilities"]["fs"]
+    assert caps == {"readTextFile": False, "writeTextFile": False}
+
+
+@pytest.mark.asyncio
+async def test_fs_read_returns_content_and_maps_window() -> None:
+    """fs/read_text_file reads through the OSEnvironment; line/limit → offset/limit."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(read_result={"content": "hello\nworld\n", "encoding": "utf-8"})
+    executor._os_environment = fake  # type: ignore[assignment]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "fs/read_text_file",
+            "params": {"path": "a.txt", "line": 2, "limit": 5},
+        }
+    )
+
+    assert sent[0]["result"] == {"content": "hello\nworld\n"}
+    assert fake.read_calls == [("a.txt", 2, 5)]  # line→offset, limit→limit
+
+
+@pytest.mark.asyncio
+async def test_fs_read_whole_file_when_no_window() -> None:
+    """Absent line/limit reads the whole file (offset=1, limit=None)."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(read_result={"content": "x", "encoding": "utf-8"})
+    executor._os_environment = fake  # type: ignore[assignment]
+    executor._send = AsyncMock()  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "fs/read_text_file", "params": {"path": "a.txt"}}
+    )
+
+    assert fake.read_calls == [("a.txt", 1, None)]
+
+
+@pytest.mark.asyncio
+async def test_fs_read_missing_file_maps_to_enoent() -> None:
+    """A 'no such file' read error maps to qwen's ENOENT code (-32002)."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        read_result={"error": "[Errno 2] No such file or directory: 'gone.txt'"}
+    )
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 5, "method": "fs/read_text_file", "params": {"path": "gone.txt"}}
+    )
+
+    assert sent[0]["error"]["code"] == -32002
+    assert "result" not in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_fs_read_binary_file_is_rejected() -> None:
+    """A non-utf-8 (binary) file is refused rather than returned as bytes."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        read_result={"content": "AAAA", "encoding": "base64", "total_bytes": 3}
+    )
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 6, "method": "fs/read_text_file", "params": {"path": "img.png"}}
+    )
+
+    assert sent[0]["error"]["code"] == -32603
+    assert "text file" in sent[0]["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_fs_write_writes_through_os_env() -> None:
+    """fs/write_text_file writes via the OSEnvironment and returns an empty result."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(write_result={"path": "out.txt", "bytes": 3})
+    executor._os_environment = fake  # type: ignore[assignment]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "abc"},
+        }
+    )
+
+    assert sent[0]["result"] == {}
+    assert fake.write_calls == [("out.txt", "abc")]
+
+
+@pytest.mark.asyncio
+async def test_fs_write_error_surfaces_as_internal_error() -> None:
+    """A write failure surfaces as a JSON-RPC internal error (-32603)."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        write_result={"error": "Permission denied"}
+    )
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "abc"},
+        }
+    )
+
+    assert sent[0]["error"]["code"] == -32603
+    assert "Permission denied" in sent[0]["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_fs_write_rejects_missing_args() -> None:
+    """Missing path / non-string content is an invalid-params error (-32602)."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv()  # type: ignore[assignment]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 10, "method": "fs/write_text_file", "params": {"path": "out.txt"}}
+    )
+
+    assert sent[0]["error"]["code"] == -32602
+
+
+@pytest.mark.asyncio
+async def test_close_releases_fs_os_environment() -> None:
+    """close() tears down a lazily-created fs-delegation OSEnvironment."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv()
+    executor._os_environment = fake  # type: ignore[assignment]
+
+    await executor.close()
+
+    assert fake.closed is True
+    assert executor._os_environment is None
 
 
 # Realistic qwen session/request_permission payload (from the ACP probe).

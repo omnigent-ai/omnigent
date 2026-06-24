@@ -42,9 +42,49 @@ from omnigent.inner.executor import (
     TextChunk,
     TurnComplete,
 )
+from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 
 logger = logging.getLogger(__name__)
+
+# ACP error code qwen maps to a filesystem "not found" (ENOENT) when a
+# delegated ``fs/read_text_file`` fails — qwen's AcpFileSystemService special-
+# cases exactly this code (cli.js: ``RESOURCE_NOT_FOUND_CODE = -32002``) to
+# raise an ENOENT the model understands. Any other error code surfaces raw.
+_ACP_RESOURCE_NOT_FOUND_CODE = -32002
+
+
+class _AcpRequestError(Exception):
+    """A handler failure to return as a JSON-RPC error on a server request.
+
+    Carries the JSON-RPC ``code`` / ``message`` so the dispatch in
+    :meth:`QwenExecutor._respond_to_agent_request` can build the error reply
+    without each handler assembling the wire envelope itself.
+    """
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _looks_like_missing_file(message: str) -> bool:
+    """Heuristic: does an os_env error message indicate a missing path?
+
+    The os_env helper returns failures as ``{"error": "<str>"}`` rather than
+    typed exceptions, so the only signal that a read missed because the file is
+    absent (vs. a permission / decode failure) is the message text. Used to map
+    onto qwen's ENOENT code so the model sees "file not found" rather than a
+    generic internal error.
+    """
+    lowered = message.lower()
+    return (
+        "no such file" in lowered
+        or "errno 2" in lowered
+        or "not found" in lowered
+        or "does not exist" in lowered
+    )
+
 
 # ACP protocol constants (JSON-RPC 2.0 method names)
 _AGENT_METHOD_INITIALIZE = "initialize"
@@ -161,6 +201,19 @@ class QwenExecutor(Executor):
         """
         self._cwd = cwd or os.getcwd()
         self._os_env = os_env
+        # Whether to advertise ``clientCapabilities.fs`` so qwen delegates file
+        # reads/writes back to us (executed through the Omnigent OSEnvironment,
+        # which enforces the spec's sandbox read/write roots) instead of using
+        # its own raw file tools. Enabled only when an os_env is configured and
+        # it isn't a ``fork`` env — a forked env operates on a *copied* tree
+        # whose path would diverge from the cwd the qwen subprocess actually
+        # runs in, so delegating there would read/write the wrong directory.
+        # When disabled, qwen falls back to its own file tools (see
+        # :meth:`_ensure_initialized` / :meth:`_respond_to_agent_request`).
+        self._fs_delegation: bool = os_env is not None and not bool(getattr(os_env, "fork", False))
+        # Live OSEnvironment backing fs delegation, created lazily on the first
+        # delegated op and torn down in :meth:`close`. ``None`` until then.
+        self._os_environment: OSEnvironment | None = None
         self._model = model
         self._qwen_path = qwen_path or "qwen"
         self._gateway_base_url = gateway_base_url
@@ -500,6 +553,17 @@ class QwenExecutor(Executor):
             {
                 "protocolVersion": _PROTOCOL_VERSION,
                 "clientInfo": {"name": "omnigent", "version": "1.0"},
+                # Advertise fs delegation so qwen routes file reads/writes back
+                # to us (executed via the OSEnvironment) rather than touching
+                # disk directly. qwen's AcpFileSystemService swaps in only when
+                # the matching flag is true (cli.js: ``setupFileSystem``); both
+                # false (no os_env / fork env) leaves qwen on its own tools.
+                "clientCapabilities": {
+                    "fs": {
+                        "readTextFile": self._fs_delegation,
+                        "writeTextFile": self._fs_delegation,
+                    }
+                },
             },
             timeout=_INIT_TIMEOUT_SECONDS,
         )
@@ -563,16 +627,16 @@ class QwenExecutor(Executor):
         - ``session/request_permission`` — decide via Omnigent's TOOL_CALL
           policy + human-consent elicitation (:meth:`_decide_permission`),
           then select the matching allow/reject option. NOT a blind approve.
+        - ``fs/read_text_file`` / ``fs/write_text_file`` — when fs delegation is
+          advertised (an os_env is configured; see :attr:`_fs_delegation`), qwen
+          routes its file I/O here. Executed through the Omnigent OSEnvironment
+          so the spec's sandbox read/write roots are enforced at the Python
+          layer and the I/O flows through Omnigent rather than qwen touching
+          disk directly. With delegation off, these never arrive (qwen uses its
+          own tools) and would hit the ``method not found`` branch.
         - anything else — reply with a JSON-RPC ``method not found`` error
           rather than a bogus success, so qwen fails loudly instead of acting
           on empty data.
-
-        NB: we do **not** advertise ``clientCapabilities.fs`` in ``initialize``,
-        so qwen never delegates file ops to us — it uses its own file tools, and
-        any ``fs/*`` request would hit the ``method not found`` branch. To route
-        file I/O through Omnigent, advertise the capability and add
-        ``fs/read_text_file`` / ``fs/write_text_file`` handlers (see
-        docs/QWEN_FOLLOWUPS.md).
 
         :param request: The decoded JSON-RPC request object (has ``id`` and
             ``method``).
@@ -591,11 +655,19 @@ class QwenExecutor(Executor):
             if method == "session/request_permission":
                 allow = await self._decide_permission(params)
                 result = {"outcome": self._permission_outcome(params, allow=allow)}
+            elif method == "fs/read_text_file" and self._fs_delegation:
+                result = await self._handle_fs_read(params)
+            elif method == "fs/write_text_file" and self._fs_delegation:
+                result = await self._handle_fs_write(params)
             else:
                 error = {
                     "code": -32601,
                     "message": f"omnigent: unsupported ACP request method {method!r}",
                 }
+        except _AcpRequestError as exc:
+            # A handler-raised, client-facing failure (e.g. file not found):
+            # forward its specific code/message so qwen maps it correctly.
+            error = {"code": exc.code, "message": exc.message}
         except Exception as exc:  # noqa: BLE001
             logger.debug("qwen agent request %s failed: %s", method, exc)
             error = {"code": -32603, "message": f"{method} failed: {exc}"}
@@ -606,6 +678,83 @@ class QwenExecutor(Executor):
         else:
             reply["result"] = result
         await self._send(reply)
+
+    # ------------------------------------------------------------------
+    # Filesystem delegation (qwen → client, when fs capability advertised)
+    # ------------------------------------------------------------------
+
+    async def _ensure_os_environment(self) -> OSEnvironment:
+        """Lazily create the OSEnvironment backing fs delegation.
+
+        Created on the first delegated op (not at construction) so a turn that
+        never touches files pays nothing, and torn down in :meth:`close`.
+
+        :returns: The live OSEnvironment for this executor's os_env spec.
+        :raises _AcpRequestError: When no usable os_env can be created — surfaced
+            to qwen as an internal error rather than crashing the turn.
+        """
+        if self._os_environment is None:
+            env = create_os_environment(self._os_env)
+            if env is None:
+                raise _AcpRequestError(-32603, "omnigent: no os_env for fs delegation")
+            self._os_environment = env
+        return self._os_environment
+
+    async def _handle_fs_read(self, params: dict[str, Any]) -> dict[str, Any]:  # type: ignore[explicit-any]
+        """Serve an ACP ``fs/read_text_file`` by reading through the OSEnvironment.
+
+        ACP params: ``{path, line?, limit?}`` where ``line`` is a 1-based start
+        line and ``limit`` a max line count (both optional → whole file). Maps
+        onto :meth:`OSEnvironment.read`'s ``offset`` / ``limit``.
+
+        :param params: The request params.
+        :returns: ``{"content": <text>}`` per the ACP response shape.
+        :raises _AcpRequestError: On a missing path arg, a non-text/binary file,
+            or a read failure (mapped to ENOENT when it looks like a missing
+            file so qwen raises the right error to the model).
+        """
+        path = params.get("path")
+        if not isinstance(path, str) or not path:
+            raise _AcpRequestError(-32602, "fs/read_text_file requires a string 'path'")
+        line = params.get("line")
+        limit = params.get("limit")
+        offset = line if isinstance(line, int) and line >= 1 else 1
+        read_limit = limit if isinstance(limit, int) and limit >= 1 else None
+
+        env = await self._ensure_os_environment()
+        result = await env.read(path, offset=offset, limit=read_limit)
+        if "error" in result:
+            message = str(result["error"])
+            code = _ACP_RESOURCE_NOT_FOUND_CODE if _looks_like_missing_file(message) else -32603
+            raise _AcpRequestError(code, message)
+        # A binary file comes back base64-encoded (or descriptor-only); ACP
+        # read_text_file is text-only, so refuse rather than hand back bytes.
+        if result.get("encoding") != "utf-8":
+            raise _AcpRequestError(-32603, f"{path}: not a UTF-8 text file")
+        return {"content": result.get("content", "")}
+
+    async def _handle_fs_write(self, params: dict[str, Any]) -> dict[str, Any]:  # type: ignore[explicit-any]
+        """Serve an ACP ``fs/write_text_file`` by writing through the OSEnvironment.
+
+        ACP params: ``{path, content}``. The write goes through the helper, so
+        the spec's sandbox write roots are enforced at the Python layer.
+
+        :param params: The request params.
+        :returns: An empty result object (ACP expects no payload on success).
+        :raises _AcpRequestError: On missing/invalid args or a write failure.
+        """
+        path = params.get("path")
+        content = params.get("content")
+        if not isinstance(path, str) or not path:
+            raise _AcpRequestError(-32602, "fs/write_text_file requires a string 'path'")
+        if not isinstance(content, str):
+            raise _AcpRequestError(-32602, "fs/write_text_file requires string 'content'")
+
+        env = await self._ensure_os_environment()
+        result = await env.write(path, content)
+        if "error" in result:
+            raise _AcpRequestError(-32603, str(result["error"]))
+        return {}
 
     @staticmethod
     def _extract_tool_call(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:  # type: ignore[explicit-any]
@@ -1143,6 +1292,13 @@ class QwenExecutor(Executor):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._stderr_task
             self._stderr_task = None
+
+        # Release the fs-delegation OSEnvironment's helper subprocess, if one
+        # was spawned for a delegated file op this session.
+        if self._os_environment is not None:
+            with contextlib.suppress(Exception):
+                self._os_environment.close()
+            self._os_environment = None
 
         if self._proc:
             with contextlib.suppress(Exception):
