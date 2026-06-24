@@ -51,7 +51,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib import error, request
 
-from omnigent._platform import stable_user_id
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 
 if TYPE_CHECKING:
@@ -74,8 +73,8 @@ BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
 # trusted parent (`/tmp`) is shared; everything under
 # `_BRIDGE_ROOT_PARENT` must be owned by the current uid and not be a
 # symlink — see :func:`_ensure_secure_dir`.
-_TRUSTED_PARENT = Path(tempfile.gettempdir())
-_BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{stable_user_id()}"
+_TRUSTED_PARENT = Path("/tmp")
+_BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{os.getuid()}"
 _BRIDGE_ROOT = _BRIDGE_ROOT_PARENT / "claude-native"
 _CONFIG_FILE = "bridge.json"
 _SERVER_FILE = "server.json"
@@ -612,7 +611,7 @@ def _ensure_secure_dir(target: Path) -> None:
     if cur != trusted_parent:
         raise RuntimeError(f"bridge dir {target!s} is not under trusted parent {trusted_parent!s}")
     ancestors.reverse()
-    my_uid = getattr(os, "getuid", lambda: -1)()
+    my_uid = os.getuid()
     for ancestor in ancestors:
         try:
             os.mkdir(ancestor, mode=0o700)

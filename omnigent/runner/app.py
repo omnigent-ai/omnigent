@@ -35,7 +35,6 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from omnigent._platform import IS_WINDOWS
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -2662,16 +2661,7 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
         the raw cause is logged for operators, not surfaced to the caller.
     """
     _logger.warning("Native %s terminal start failed: %s", runtime_name, exc, exc_info=True)
-    if IS_WINDOWS:
-        # Native terminals are tmux/PTY-based and disabled on Windows by design.
-        # Give the client an actionable message instead of "see runner logs".
-        message = (
-            f"Native {runtime_name} terminal (tmux/PTY) is not supported on "
-            "Windows. Use an SDK-based harness (e.g. claude-sdk, cursor, "
-            "copilot, or codex) for this agent, or run it on Linux/macOS."
-        )
-    else:
-        message = f"Native {runtime_name} terminal failed to start; see runner logs for details."
+    message = f"Native {runtime_name} terminal failed to start; see runner logs for details."
     return {"code": _NATIVE_TERMINAL_START_FAILED_CODE, "message": message}
 
 
