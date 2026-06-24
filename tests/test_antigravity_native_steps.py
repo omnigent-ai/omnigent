@@ -373,16 +373,96 @@ class TestRunCommandWaiting:
 
 
 # ---------------------------------------------------------------------------
-# RUN_COMMAND ERROR → no output (graceful skip)
+# RUN_COMMAND ERROR → error-marker output (close the dangling call)
 # ---------------------------------------------------------------------------
 
 
 class TestRunCommandError:
-    """RUN_COMMAND ERROR step → empty list (no output to report)."""
+    """A terminal-ERROR tool step must still close its ``function_call``.
 
-    def test_error_emits_no_event(self) -> None:
-        """A failed (ERROR-status) run_command step is skipped."""
+    The invocation side emits a ``function_call`` for the tool unconditionally,
+    so an ERROR result (e.g. an ignored/timed-out interactive prompt that flips
+    WAITING→ERROR) must emit a paired ``function_call_output`` keyed on the same
+    id, or the web UI strands a perpetual in-progress tool card.
+    """
+
+    def test_error_emits_one_output_event(self) -> None:
+        """A failed (ERROR-status) run_command emits one function_call_output."""
         step = _load("run_command_error")
+        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        assert len(events) == 1
+        assert events[0].data["item_type"] == "function_call_output"
+
+    def test_error_output_keyed_on_real_id(self) -> None:
+        """The error output pairs by the real agy id (matches the invocation)."""
+        step = _load("run_command_error")
+        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        item_data = cast(dict[str, Any], events[0].data["item_data"])
+        # Fixture carries toolCall.id="cbawg2v8" — the same id the planner
+        # invocation emits, so the pair correlates.
+        assert item_data["call_id"] == "cbawg2v8"
+
+    def test_error_output_text_is_nonempty_marker(self) -> None:
+        """The output is a non-empty error marker mentioning the ERROR status."""
+        step = _load("run_command_error")
+        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        item_data = cast(dict[str, Any], events[0].data["item_data"])
+        output = item_data["output"]
+        assert isinstance(output, str) and output
+        assert "ERROR" in output
+
+    def test_error_step_index(self) -> None:
+        """step_index matches fixture stepIndex=6."""
+        step = _load("run_command_error")
+        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        assert events[0].step_index == 6
+
+
+# ---------------------------------------------------------------------------
+# Tool-result closure: empty output + unmapped result types
+# ---------------------------------------------------------------------------
+
+
+class TestToolResultClosure:
+    """Every tool call is closed, even with empty or unmapped results.
+
+    Regression coverage for dangling ``function_call``s: a successful command
+    whose output proto3-omits empty ``combinedOutput.full``, and a result step
+    of a type the mapper has no extractor for (e.g. VIEW_FILE / CODE_ACTION),
+    must each still emit a ``function_call_output`` keyed on the real
+    ``metadata.toolCall.id`` so the web UI's tool card resolves.
+    """
+
+    def test_done_run_command_empty_output_still_closes(self) -> None:
+        """DONE run_command with no combinedOutput → one event, empty output."""
+        step = _load("run_command_done")
+        # Proto3 omits empty scalars: drop combinedOutput to simulate a
+        # ``cd`` / ``mkdir`` / redirect that produced no captured output.
+        step["runCommand"].pop("combinedOutput", None)
+        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        assert len(events) == 1
+        assert events[0].data["item_type"] == "function_call_output"
+        item_data = cast(dict[str, Any], events[0].data["item_data"])
+        assert item_data["call_id"] == "cbawg2v8"
+        assert item_data["output"] == ""
+
+    def test_unmapped_tool_result_type_with_id_closes(self) -> None:
+        """A result type with no extractor but a toolCall.id still closes the call."""
+        step = _load("run_command_done")
+        # Re-label as a result type the mapper has no extractor for; keep the
+        # real toolCall.id so the pair still correlates.
+        step["type"] = "CORTEX_STEP_TYPE_VIEW_FILE"
+        step.pop("runCommand", None)
+        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        assert len(events) == 1
+        assert events[0].data["item_type"] == "function_call_output"
+        item_data = cast(dict[str, Any], events[0].data["item_data"])
+        assert item_data["call_id"] == "cbawg2v8"
+        assert item_data["output"] == ""
+
+    def test_system_step_without_tool_id_is_skipped(self) -> None:
+        """A non-tool step with no toolCall.id is NOT treated as a tool result."""
+        step = _load("checkpoint")
         events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
         assert events == []
 

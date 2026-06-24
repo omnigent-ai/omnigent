@@ -149,6 +149,7 @@ _TYPE_ASK_QUESTION = "CORTEX_STEP_TYPE_ASK_QUESTION"
 # RPC step status constants (CORTEX_STEP_STATUS_* enum values).
 _STATUS_DONE = "CORTEX_STEP_STATUS_DONE"
 _STATUS_WAITING = "CORTEX_STEP_STATUS_WAITING"
+_STATUS_ERROR = "CORTEX_STEP_STATUS_ERROR"
 
 
 def _source_traj_info(step: dict[str, object]) -> dict[str, object] | None:
@@ -747,6 +748,30 @@ def _tool_result_output(step: dict[str, object], step_type: str) -> str | None:
     return None
 
 
+def _tool_error_output(step: dict[str, object]) -> str:
+    """
+    Build a best-effort ``function_call_output`` text for a terminal-ERROR tool step.
+
+    An agy tool step that ends in ``CORTEX_STEP_STATUS_ERROR`` (e.g. a WAITING
+    interaction that timed out / was cancelled, or a command that failed before
+    producing output) carries no result text, but its invocation
+    ``function_call`` was already mirrored, so the pair MUST still be closed or
+    the web UI strands a perpetual in-progress tool card. This returns a short
+    error marker naming the tool when available.
+
+    :param step: The terminal-ERROR tool-result step dict.
+    :returns: A non-empty error marker string.
+    """
+    metadata = step.get("metadata")
+    if isinstance(metadata, dict):
+        tool_call = metadata.get("toolCall")
+        if isinstance(tool_call, dict):
+            name = tool_call.get("name")
+            if isinstance(name, str) and name:
+                return f"[antigravity: {name} did not complete (status ERROR)]"
+    return "[antigravity: tool did not complete (status ERROR)]"
+
+
 def map_step_to_events(
     step: dict[str, object],
     *,
@@ -778,12 +803,20 @@ def map_step_to_events(
       fix).  ``modifiedResponse`` takes precedence over ``response`` because it is
       the post-moderation text (both fields present in the live DONE fixtures; they
       are equal when no moderation occurred).
-    * ``CORTEX_STEP_TYPE_RUN_COMMAND`` / ``LIST_DIRECTORY`` / ``ASK_QUESTION``
-      (status DONE) → one ``function_call_output`` item carrying the result
-      text, keyed on ``metadata.toolCall.id``.  WAITING steps → ``[]`` (no
-      result yet; Task 5 extracts the pending interaction).
-    * Any other step type (CHECKPOINT, CONVERSATION_HISTORY, unrecognized) →
-      ``[]`` (system noise; no conversation content).
+    * A tool-result step — a known result type
+      (``CORTEX_STEP_TYPE_RUN_COMMAND`` / ``LIST_DIRECTORY`` / ``ASK_QUESTION``)
+      OR any step carrying a ``metadata.toolCall.id`` (generically catches
+      result types with no dedicated extractor, e.g. VIEW_FILE / CODE_ACTION) —
+      → one ``function_call_output`` keyed on that id once it reaches a terminal
+      status. The text is the type-specific extractor's output, an error marker
+      on ERROR, or an empty string when neither is available. WAITING steps →
+      ``[]`` (no result yet; Task 5 extracts the pending interaction). Closing
+      EVERY tool call this way is required because the invocation side emits a
+      ``function_call`` for every tool unconditionally, and an unpaired one
+      strands a perpetual in-progress card.
+    * Any other step type (CHECKPOINT, CONVERSATION_HISTORY, unrecognized
+      system steps with no ``toolCall.id``) → ``[]`` (system noise; no
+      conversation content).
 
     Step-index handling: ``sourceTrajectoryStepInfo.stepIndex`` is proto-omitted
     when zero.  A missing index is treated as ``0`` so slot-0 steps (which in
@@ -851,27 +884,62 @@ def map_step_to_events(
                 )
         return events
 
-    # Tool-result steps: emit function_call_output only when DONE.
-    # WAITING → no output yet (pending interaction; Task 5 handles extraction).
-    # ERROR → no output to report (command failed before producing output).
-    if step_type in (
+    # Tool-result steps. The invocation side (_function_call_events) emits a
+    # function_call for EVERY entry in plannerResponse.toolCalls regardless of
+    # tool name, so the result side MUST close every one of them — the reader is
+    # the SOLE completion signal and the server pairs strictly by call_id, so a
+    # function_call with no paired function_call_output strands a perpetual
+    # in-progress tool card and breaks transcript reconstruction.
+    #
+    # A step is a tool result iff it is one of the known result types OR agy
+    # stamped a ``metadata.toolCall.id`` on it (the id that pairs with the
+    # invocation). The latter generically catches result types this mapper has
+    # no extractor for (e.g. VIEW_FILE / CODE_ACTION on agy 1.0.10) — system
+    # steps (CHECKPOINT / CONVERSATION_HISTORY / USER_INPUT) carry no toolCall.id
+    # and so are NOT treated as tool results.
+    #
+    # Status handling:
+    #   * Non-terminal (WAITING / RUNNING / PENDING / GENERATING) → [] — no
+    #     result yet (for WAITING the interaction bridge surfaces the prompt;
+    #     the step's later terminal transition closes the call).
+    #   * terminal (DONE / ERROR) → exactly one function_call_output keyed on
+    #     the toolCall.id, with best-effort text:
+    #       - the type-specific extractor when it yields text;
+    #       - an explicit error marker on ERROR;
+    #       - else an empty string (e.g. a successful RUN_COMMAND whose
+    #         combinedOutput proto-omitted empty output, or an unmapped result
+    #         type) — empty-but-paired beats a dangling call.
+    result_call_id = _result_call_id(step)
+    is_known_tool_result = step_type in (
         _TYPE_RUN_COMMAND,
         _TYPE_LIST_DIRECTORY,
         _TYPE_ASK_QUESTION,
-    ):
-        if status != _STATUS_DONE:
+    )
+    if is_known_tool_result or result_call_id is not None:
+        if status not in (_STATUS_DONE, _STATUS_ERROR):
             return []
         idx = _step_index(step)
         step_idx = idx if idx is not None else 0
         output = _tool_result_output(step, step_type)
         if output is None:
-            return []
+            if status == _STATUS_ERROR:
+                output = _tool_error_output(step)
+            else:
+                output = ""
+                if not is_known_tool_result:
+                    _logger.warning(
+                        "agy RPC tool-result step has no extractor; closing the "
+                        "call with empty output: type=%s status=%s call_id=%s",
+                        step_type,
+                        status,
+                        result_call_id,
+                    )
         return [
             _function_call_output_event(
                 conversation_id=conversation_id,
                 step_idx=step_idx,
                 output=output,
-                real_id=_result_call_id(step),
+                real_id=result_call_id,
                 allocator=allocator,
             )
         ]
