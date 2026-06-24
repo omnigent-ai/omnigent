@@ -39,6 +39,7 @@ from ._events import (
     ReasoningDelta,
     ReasoningStarted,
     ReasoningSummaryDelta,
+    ReasoningSummaryPartDone,
     ResponseCancelled,
     ResponseCompleted,
     ResponseCreated,
@@ -320,6 +321,22 @@ class BlockStream:
                         )
                         reasoning_accumulated = reasoning_accumulated[last_space + 1 :]
                         reasoning_chunks_emitted = True
+
+            elif isinstance(event, ReasoningSummaryPartDone):
+                # A summary part (paragraph) finished. Codex reasoning
+                # summaries stream as one continuous run of
+                # ReasoningSummaryDelta with no newline and no fresh
+                # ReasoningStarted between parts; the boundary arrives
+                # out-of-band here. Flush this part's held tail and insert
+                # a separator so the next part renders on its own line
+                # instead of glued onto this one ("…names.I have…"). See
+                # issue #654. Mirrors the ReasoningStarted-between-parts
+                # branch above. No-op outside reasoning or before any
+                # content streamed (no leading separator).
+                if in_reasoning and (reasoning_accumulated or reasoning_chunks_emitted):
+                    yield ReasoningChunk(text=reasoning_accumulated + "\n\n", ctx=_ctx())
+                    reasoning_accumulated = ""
+                    reasoning_chunks_emitted = True
 
             # ── Text ─────────────────────────────────
             elif isinstance(event, TextDelta):

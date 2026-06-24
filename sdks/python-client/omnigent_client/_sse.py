@@ -25,6 +25,7 @@ from ._events import (
     ReasoningDelta,
     ReasoningStarted,
     ReasoningSummaryDelta,
+    ReasoningSummaryPartDone,
     ResponseCancelled,
     ResponseCompleted,
     ResponseCreated,
@@ -74,6 +75,7 @@ _T_RESPONSE_OUTPUT_TEXT_DELTA = _wire_type(_srv_events.OutputTextDeltaEvent)
 _T_RESPONSE_REASONING_STARTED = _wire_type(_srv_events.ReasoningStartedEvent)
 _T_RESPONSE_REASONING_TEXT_DELTA = _wire_type(_srv_events.ReasoningTextDeltaEvent)
 _T_RESPONSE_REASONING_SUMMARY_TEXT_DELTA = _wire_type(_srv_events.ReasoningSummaryTextDeltaEvent)
+_T_RESPONSE_REASONING_SUMMARY_PART_DONE = _wire_type(_srv_events.ReasoningSummaryPartDoneEvent)
 _T_RESPONSE_OUTPUT_ITEM_DONE = _wire_type(_srv_events.OutputItemDoneEvent)
 _T_RESPONSE_OUTPUT_FILE_DONE = _wire_type(_srv_events.OutputFileDoneEvent)
 _T_RESPONSE_RETRY = _wire_type(_srv_events.RetryEvent)
@@ -198,6 +200,8 @@ def _parse_event(event_type: str, data: dict[str, Any]) -> StreamEvent | None:
         if isinstance(delta, str):
             return ReasoningSummaryDelta(delta=delta)
         return None
+    if event_type == _T_RESPONSE_REASONING_SUMMARY_PART_DONE:
+        return ReasoningSummaryPartDone()
 
     # Output items
     if event_type == _T_RESPONSE_OUTPUT_ITEM_DONE:

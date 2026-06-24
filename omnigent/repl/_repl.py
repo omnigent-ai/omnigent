@@ -1020,6 +1020,7 @@ def _server_event_to_sdk_event(event: object) -> object | None:
         ReasoningDelta,
         ReasoningStarted,
         ReasoningSummaryDelta,
+        ReasoningSummaryPartDone,
         ResponseCancelled,
         ResponseCompleted,
         ResponseCreated,
@@ -1051,6 +1052,7 @@ def _server_event_to_sdk_event(event: object) -> object | None:
         OutputTextDeltaEvent,
         QueuedEvent,
         ReasoningStartedEvent,
+        ReasoningSummaryPartDoneEvent,
         ReasoningSummaryTextDeltaEvent,
         ReasoningTextDeltaEvent,
     )
@@ -1083,6 +1085,8 @@ def _server_event_to_sdk_event(event: object) -> object | None:
         return ReasoningDelta(delta=event.delta)
     if isinstance(event, ReasoningSummaryTextDeltaEvent):
         return ReasoningSummaryDelta(delta=event.delta)
+    if isinstance(event, ReasoningSummaryPartDoneEvent):
+        return ReasoningSummaryPartDone()
     if isinstance(event, ElicitationRequestEvent):
         params = event.params
         return ElicitationRequest(

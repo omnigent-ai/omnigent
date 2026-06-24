@@ -418,6 +418,34 @@ describe("BlockStream — reasoning", () => {
     expect(startIdx).toBeLessThan(chunkIdx);
   });
 
+  it("reasoning_summary_part_done flushes the held tail and separates consecutive parts", () => {
+    // Issue #654: Codex reasoning-summary paragraphs stream as one
+    // continuous run of ReasoningSummaryDelta with no \n in the text and
+    // no fresh ReasoningStarted between parts. The paragraph boundary
+    // arrives out-of-band as response.reasoning_summary_part.done. Without
+    // handling it, part one's trailing fragment ("names.") stays buffered
+    // and renders late, glued onto part two ("names.I have…"). The boundary
+    // event must flush the held tail AND insert a "\n\n" separator.
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      { type: "reasoning_summary_delta", delta: "drilling into folder names." },
+      { type: "reasoning_summary_part_done" },
+      { type: "reasoning_summary_delta", delta: "I have the runner now." },
+      { type: "text_delta", delta: "Answer" },
+      { type: "message_done", content: [], itemId: "", responseId: "" },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+
+    const chunks = blocks.filter((b): b is ReasoningChunk => b.type === "reasoning_chunk");
+    const joined = chunks.map((c) => c.text).join("");
+    // Symptom 2: a paragraph separator lands between the two parts.
+    expect(joined).toContain("names.\n\nI have the runner now.");
+    expect(joined).not.toContain("names.I have");
+    // Symptom 1: part one's tail flushes AT the boundary (a chunk ending
+    // in "names.\n\n"), not late and glued onto part two.
+    expect(chunks.some((c) => c.text === "names.\n\n")).toBe(true);
+  });
+
   it("interleaved text→reasoning→text closes each text section (no orphan, no concatenation)", () => {
     // think→speak→think→speak in one response: reasoning must close text
     // or the pre-reasoning text orphans and the final text_done concatenates.

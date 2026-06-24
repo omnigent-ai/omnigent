@@ -60,3 +60,13 @@ describe("parseEvent — response.output_text.delta", () => {
     expect(parseEvent("response.output_text.delta", { delta: { text: "bad" } })).toBeNull();
   });
 });
+
+describe("parseEvent — response.reasoning_summary_part.done", () => {
+  it("maps the reasoning-summary part boundary to reasoning_summary_part_done", () => {
+    // Issue #654: the Responses-API paragraph boundary must reach the
+    // reducer so consecutive reasoning parts render separated.
+    expect(parseEvent("response.reasoning_summary_part.done", {})).toEqual({
+      type: "reasoning_summary_part_done",
+    });
+  });
+});

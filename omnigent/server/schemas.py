@@ -2629,6 +2629,27 @@ class ReasoningSummaryTextDeltaEvent(_SSEEventBase):
     delta: str
 
 
+class ReasoningSummaryPartDoneEvent(_SSEEventBase):
+    """
+    A reasoning-summary part (paragraph) finished.
+
+    The Responses API delimits successive reasoning-summary
+    paragraphs with ``response.reasoning_summary_part.done`` (one per
+    completed part), while the ``reasoning_summary_text.delta``
+    fragments within a part carry no trailing newline of their own.
+    Without this boundary, consecutive parts render run together
+    ("...folder names.I have the runner...") and the part's trailing
+    fragment streams late, glued onto the next paragraph. Consumers
+    (the ap-web / SDK ``BlockStream`` reducers) use this event to
+    flush the held tail and insert a paragraph separator. See issue
+    #654.
+
+    :param type: Always ``"response.reasoning_summary_part.done"``.
+    """
+
+    type: Literal["response.reasoning_summary_part.done"]
+
+
 class OutputItemDoneEvent(_SSEEventBase):
     """
     A conversation output item completed during the turn.
@@ -3452,6 +3473,7 @@ ServerStreamEvent = Annotated[
     | ReasoningStartedEvent
     | ReasoningTextDeltaEvent
     | ReasoningSummaryTextDeltaEvent
+    | ReasoningSummaryPartDoneEvent
     # ── Persistent (POST + SSE replay) — wraps conv-store items
     | OutputItemDoneEvent
     # ── Transient (SSE-only) — file annotations / keepalive ────
