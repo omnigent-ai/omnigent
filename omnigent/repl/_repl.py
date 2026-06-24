@@ -172,6 +172,12 @@ class _SessionSnapshot(Protocol):
 # by iTerm2/Warp/tmux). Updating the hint without updating the
 # binding would desync the user's expectation from what actually
 # fires.
+# NOTE: keep this list short enough that the bottom toolbar
+# (``{model · state} … hints … state: sleeping``) fits the e2e PTY
+# width (120 cols). Adding an entry here can wrap the toolbar and
+# split the ``state: sleeping`` sync marker the e2e harness waits on
+# (tests/e2e/omnigent/_pexpect_harness.py). /quit discoverability is
+# served by the grouped ``/help`` output instead.
 WELCOME_HINTS = ["/help help", "Ctrl+O debug", "Ctrl+T show tools", "Esc cancel", "Ctrl+C exit"]
 
 # Per-request item count for ``client.sessions.list_items``
@@ -4395,11 +4401,36 @@ async def _cmd_help(
 ) -> None:
     from rich.text import Text
 
-    lines = []
-    for name, (desc, _) in COMMANDS.items():
-        if name in ("/?", "/exit"):
-            continue  # Skip aliases.
-        lines.append(f"  [{fmt.accent}]{name}[/{fmt.accent}]  [{fmt.muted}]{desc}[/{fmt.muted}]")
+    # Grouped, column-aligned command help instead of a flat alphabetical
+    # wall. Commands not listed in a group still render (under "Other"), so a
+    # newly registered command is never silently hidden from /help.
+    groups: list[tuple[str, list[str]]] = [
+        ("Chat", ["/new", "/clear", "/switch", "/fork", "/history", "/cancel"]),
+        ("Context", ["/compact", "/context", "/model", "/effort"]),
+        ("Display", ["/theme"]),
+        ("Diagnostics", ["/logs", "/report"]),
+        ("Help", ["/help", "/quit"]),
+    ]
+    visible = {n: d for n, (d, _) in COMMANDS.items() if n not in ("/?", "/exit")}
+    grouped = {name for _, names in groups for name in names}
+    leftover = [n for n in visible if n not in grouped]
+    if leftover:
+        groups.append(("Other", leftover))
+
+    name_width = max((len(n) for n in visible), default=0)
+    lines: list[str] = []
+    for title, names in groups:
+        rows = [(n, visible[n]) for n in names if n in visible]
+        if not rows:
+            continue
+        if lines:
+            lines.append("")  # blank line between sections
+        lines.append(f"  [{fmt.muted}]{title}[/{fmt.muted}]")
+        for name, desc in rows:
+            padded = name.ljust(name_width)
+            lines.append(
+                f"    [{fmt.accent}]{padded}[/{fmt.accent}]  [{fmt.muted}]{desc}[/{fmt.muted}]"
+            )
     host.output(Text.from_markup("\n".join(lines)))
 
 
