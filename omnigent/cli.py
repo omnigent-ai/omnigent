@@ -4899,7 +4899,7 @@ def resume(
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
     "'cursor', "
-    "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', or 'goose'"
+    "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', 'goose', or 'copilot'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (
@@ -9384,6 +9384,115 @@ def _manage_goose_harness() -> None:
             status = None
 
 
+def _manage_copilot_harness() -> None:
+    """Run the level-2 loop for Copilot: manage its GitHub token.
+
+    Copilot runs via the ``github-copilot-sdk`` package and authenticates against
+    GitHub's Copilot backend with a GitHub token — the SDK requires one and it
+    has no provider/gateway family. So this manages exactly that credential:
+    set / replace / remove a token stored in the omnigent secret store, mirroring
+    how cursor / antigravity persist theirs (the secret in the store, a
+    ``keychain:``/``env:`` reference in ``~/.omnigent/config.yaml``).
+
+    :returns: None. Side effects: may write the ``copilot:`` block of
+        ``~/.omnigent/config.yaml`` and the secret store.
+    """
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.onboarding.copilot_auth import (
+        COPILOT_CONFIG_KEY,
+        COPILOT_SECRET_NAME,
+        copilot_github_token_configured,
+        copilot_github_token_ref,
+    )
+    from omnigent.onboarding.interactive import select
+
+    status: str | None = None
+    while True:
+        config = _load_global_config()
+        token_set = copilot_github_token_configured(config)
+
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow(
+                "Replace GitHub token" if token_set else "Set GitHub token",
+                action="set_key",
+            )
+        ]
+        if token_set:
+            rows.append(_HarnessMenuRow("Remove GitHub token", action="remove_key"))
+        rows.append(_HarnessMenuRow("← Back", action="back"))
+
+        header = (
+            "Copilot — GitHub token configured" if token_set else "Copilot — no GitHub token yet"
+        )
+        idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
+        if idx < 0:  # Esc / q
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "set_key":
+            status = _set_copilot_github_token()
+        elif action == "remove_key":
+            ref = copilot_github_token_ref(config)
+            # Only the secret we own (``keychain:copilot``) is ours to delete: a
+            # hand-edited block may point at a shared ``keychain:<other>`` secret,
+            # and an ``env:`` ref names the user's own environment. In both of
+            # those cases just drop the config block and leave the secret.
+            if ref == f"keychain:{COPILOT_SECRET_NAME}":
+                secret_store.delete_secret(COPILOT_SECRET_NAME)
+            _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
+            status = "✓ Removed Copilot GitHub token"
+
+
+def _set_copilot_github_token() -> str | None:
+    """Prompt for and store a Copilot GitHub token; return a status line.
+
+    Offers an existing ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` / ``GITHUB_TOKEN``
+    first (recorded as an ``env:`` ref, so the secret stays in the environment),
+    else reads it with a hidden prompt and stores it under ``keychain:copilot``.
+    The token shape is checked softly (a classic ``ghp_`` PAT — which Copilot
+    rejects — or a wrong paste is flagged but can be forced). The token is never
+    echoed.
+
+    :returns: A status string for the menu, or ``None`` if the user aborted.
+    """
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.onboarding.copilot_auth import (
+        COPILOT_SECRET_NAME,
+        COPILOT_TOKEN_ENV_VARS,
+        copilot_github_token_settings,
+        looks_like_github_copilot_token,
+    )
+    from omnigent.onboarding.interactive import prompt_text
+
+    detected_var = next((v for v in COPILOT_TOKEN_ENV_VARS if os.environ.get(v)), None)
+    if detected_var is not None and click.confirm(
+        f"Detected {detected_var} in the environment — use it?", default=True
+    ):
+        detected = os.environ[detected_var]
+        if not looks_like_github_copilot_token(detected) and not click.confirm(
+            f"${detected_var} doesn't look like a Copilot-capable GitHub token "
+            "(github_pat_/gho_). Use it anyway?",
+            default=False,
+        ):
+            return None
+        _save_global_config(copilot_github_token_settings(f"env:{detected_var}"))
+        return f"✓ Copilot GitHub token set (from ${detected_var})"
+
+    pasted = prompt_text("GitHub token with Copilot access", hide_input=True).strip()
+    if not pasted:
+        return None
+    if not looks_like_github_copilot_token(pasted) and not click.confirm(
+        "That doesn't look like a Copilot-capable GitHub token (github_pat_/gho_). "
+        "Store it anyway?",
+        default=False,
+    ):
+        return None
+    secret_store.store_secret(COPILOT_SECRET_NAME, pasted)
+    _save_global_config(copilot_github_token_settings(f"keychain:{COPILOT_SECRET_NAME}"))
+    return "✓ Copilot GitHub token stored"
+
+
 def _manage_credential(provider: str, family: str) -> str | None:
     """Run the level-3 loop for one credential: make default / remove.
 
@@ -9908,6 +10017,10 @@ def _run_configure_harnesses_interactive() -> None:
         antigravity_sdk_installed,
     )
     from omnigent.onboarding.configure_models import family_label
+    from omnigent.onboarding.copilot_auth import (
+        COPILOT_TOKEN_ENV_VARS,
+        copilot_github_token_configured,
+    )
     from omnigent.onboarding.cursor_auth import (
         CURSOR_EXTRA_INSTALL_COMMAND,
         cursor_api_key_configured,
@@ -9915,6 +10028,7 @@ def _run_configure_harnesses_interactive() -> None:
     )
     from omnigent.onboarding.goose_auth import goose_config_summary
     from omnigent.onboarding.harness_install import (
+        COPILOT_KEY,
         CURSOR_KEY,
         GOOSE_KEY,
         OPENCODE_KEY,
@@ -10161,6 +10275,24 @@ def _run_configure_harnesses_interactive() -> None:
         options.append(f"  {goose_sub}")
         selectable.append(False)
         row_target.append(None)
+        # Copilot (GitHub Copilot SDK, no provider family): like Cursor, readiness
+        # is just whether a GitHub token with Copilot access is configured (the
+        # ``copilot:`` block or an ambient ``COPILOT_GITHUB_TOKEN``/``GH_TOKEN``/
+        # ``GITHUB_TOKEN``); its drill-in manages that token.
+        copilot_token_set = copilot_github_token_configured(config) or any(
+            os.environ.get(v) for v in COPILOT_TOKEN_ENV_VARS
+        )
+        options.append(f"{'  ' if copilot_token_set else '[red]✗[/] '}Copilot")
+        selectable.append(True)
+        row_target.append(COPILOT_KEY)
+        copilot_sub = (
+            "[green]✓[/] GitHub token configured"
+            if copilot_token_set
+            else "[dim]no GitHub token yet — open to add one[/]"
+        )
+        options.append(f"  {copilot_sub}")
+        selectable.append(False)
+        row_target.append(None)
         options.append("Quit")
         selectable.append(True)
         row_target.append(_QUIT)
@@ -10175,6 +10307,8 @@ def _run_configure_harnesses_interactive() -> None:
         target = row_target[idx]
         if target == CURSOR_KEY:
             _manage_cursor_harness()
+        elif target == COPILOT_KEY:
+            _manage_copilot_harness()
         elif target in families:
             _manage_harness_providers(target)
         elif target == _ANTIGRAVITY:

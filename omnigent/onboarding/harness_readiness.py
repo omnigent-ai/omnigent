@@ -28,6 +28,7 @@ import os
 
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
 from omnigent.onboarding.harness_install import (
+    COPILOT_KEY,
     CURSOR_KEY,
     GOOSE_KEY,
     OPENCODE_KEY,
@@ -169,6 +170,22 @@ def harness_is_configured(harness: str) -> bool:
         from omnigent.onboarding.cursor_auth import cursor_api_key_configured
 
         return cursor_api_key_configured() or bool(os.environ.get("CURSOR_API_KEY"))
+    if canonical == COPILOT_KEY:
+        # Copilot runs in-process via the ``github-copilot-sdk`` package (the
+        # SDK bundles the CLI binary it drives, so there is no separate binary to
+        # gate on) and authenticates against GitHub's Copilot backend with a
+        # GitHub token. So, like cursor, readiness is whether a token is
+        # resolvable — one stored by ``omnigent setup`` (the ``copilot:`` config
+        # block — see :mod:`omnigent.onboarding.copilot_auth`) or inherited from
+        # the environment. A bad / Copilot-less token surfaces at run time.
+        from omnigent.onboarding.copilot_auth import (
+            COPILOT_TOKEN_ENV_VARS,
+            copilot_github_token_configured,
+        )
+
+        return copilot_github_token_configured() or any(
+            os.environ.get(var) for var in COPILOT_TOKEN_ENV_VARS
+        )
     if (
         canonical not in _HARNESS_FAMILY
         and canonical not in _PI_HARNESSES
@@ -205,4 +222,5 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
+    spellings.add(COPILOT_KEY)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}

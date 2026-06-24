@@ -25,6 +25,9 @@ HARNESS_ALIASES: dict[str, str] = {
     # (there is no separate SDK ``opencode`` harness, so the bare name is free).
     "opencode": "opencode-native",
     "native-opencode": "opencode-native",
+    # User-facing spelling for the GitHub Copilot SDK harness; the canonical id
+    # is "copilot" (matches the registry / workflow type).
+    "github-copilot": "copilot",
 }
 
 # Canonical native-CLI harness spellings. These harnesses type messages into

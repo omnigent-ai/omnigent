@@ -155,6 +155,13 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     Gemini-native and its SDK launches a native binary needing a modern
     glibc.
 
+    ``copilot`` is excluded for the same reason as ``cursor`` / ``antigravity``:
+    the GitHub Copilot SDK authenticates with a GitHub token and talks only to
+    GitHub's Copilot backend (no Databricks gateway path), so ``_build_copilot_spawn_env``
+    emits none of the shared ``HARNESS_<H>_GATEWAY`` / profile probe vars this
+    matrix drives. Its live round-trip is covered by the gated
+    ``tests/e2e/test_polly_copilot_e2e.py`` and the ``copilot-sdk-e2e-dev`` skill.
+
     ``cursor-native`` is excluded for the union of both reasons above.
 
     ``qwen`` is excluded because it does not follow the shared
@@ -182,6 +189,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "cursor",
         "cursor-native",
         "antigravity",
+        "copilot",
         "qwen",
         "goose",
         "goose-native",
