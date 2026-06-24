@@ -14071,16 +14071,14 @@ def create_sessions_router(
                 )
             base_agent = target_agent
 
-        # Clone the chosen agent's bundle into a fresh session-scoped row so
-        # the fork can be reconfigured without mutating the original.
+        # Clone params for the fork's session-scoped agent. Created inside
+        # fork_conversation's transaction (not agent_store.create): a
+        # pre-created row would survive a fork failure as an orphaned
+        # session_id=NULL built-in polluting the picker. Session-scoped rows
+        # are exempt from the unique built-in-name index, so the clone reuses
+        # the source's name verbatim — no "(fork …)" suffix needed.
         cloned_agent_id = generate_agent_id()
-        await asyncio.to_thread(
-            agent_store.create,
-            agent_id=cloned_agent_id,
-            name=f"{base_agent.name} (fork {cloned_agent_id[:10]})",
-            bundle_location=base_agent.bundle_location,
-            description=base_agent.description,
-        )
+        cloned_agent_name = base_agent.name
 
         # A model id is provider-bound, so the source's model_override /
         # reasoning_effort only carry over when the switch stays in the same
@@ -14131,6 +14129,9 @@ def create_sessions_router(
                 source_id,
                 title=body.title,
                 agent_id=cloned_agent_id,
+                cloned_agent_name=cloned_agent_name,
+                cloned_agent_bundle_location=base_agent.bundle_location,
+                cloned_agent_description=base_agent.description,
                 copy_model_settings=copy_model_settings,
                 carry_history_into_native=carry_history_into_native,
                 resume_source_native_session=resume_source_native_session,

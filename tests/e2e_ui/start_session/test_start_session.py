@@ -1246,8 +1246,9 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_forkfork")).to_have_count(
                 0
             )
-            # Exactly two options total: the built-in + the one custom agent —
-            # no duplicate "Claude Code" sneaks in via a leaked clone.
-            await expect(page.get_by_role("menuitem")).to_have_count(2)
+            # Three options total: the built-in + the one custom agent +
+            # the "Create custom agent" action — no duplicate "Claude Code"
+            # sneaks in via a leaked clone.
+            await expect(page.get_by_role("menuitem")).to_have_count(3)
         finally:
             await browser.close()

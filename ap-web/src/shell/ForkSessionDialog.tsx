@@ -22,6 +22,7 @@ import {
   Select,
   SelectContent,
   SelectItem,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -29,6 +30,7 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { partitionAgentsByKind } from "@/lib/agentGrouping";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
@@ -250,6 +252,12 @@ export function ForkSessionForm({
       a.name !== sourceAgentName &&
       a.name !== sourceAgentBaseName &&
       forkTargetCarriesHistory(a.harness),
+  );
+  // Group the switch targets like the new-session picker: built-ins first,
+  // then a divider, then custom agents — each sorted into display order.
+  const { builtins: builtinSwitchable, customs: customSwitchable } = useMemo(
+    () => partitionAgentsByKind(switchableAgents),
+    [switchableAgents],
   );
 
   const switching = agentChoice !== SAME_AS_SOURCE;
@@ -535,7 +543,20 @@ export function ForkSessionForm({
                 {sourceAgentDisplay}{" "}
                 <span className="text-muted-foreground">(same as original session)</span>
               </SelectItem>
-              {switchableAgents.map((agent) => (
+              {builtinSwitchable.map((agent) => (
+                <SelectItem
+                  key={agent.id}
+                  value={agent.id}
+                  data-testid={`fork-session-agent-option-${agent.id}`}
+                  className="text-xs"
+                >
+                  {agent.display_name}
+                </SelectItem>
+              ))}
+              {/* Divider between the built-in group and the custom group,
+                  only when both are present (mirrors NewChatDialog). */}
+              {builtinSwitchable.length > 0 && customSwitchable.length > 0 && <SelectSeparator />}
+              {customSwitchable.map((agent) => (
                 <SelectItem
                   key={agent.id}
                   value={agent.id}
