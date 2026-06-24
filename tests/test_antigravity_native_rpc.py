@@ -1615,7 +1615,7 @@ async def test_stream_agent_state_updates_raises_on_non_2xx_status(
 
 
 # ---------------------------------------------------------------------------
-# Functional-RPC timeout: the four functional calls use _RPC_CALL_TIMEOUT_S, the
+# Functional-RPC timeout: the functional calls use _RPC_CALL_TIMEOUT_S, the
 # discovery probes keep the tight _PROBE_TIMEOUT_S
 # ---------------------------------------------------------------------------
 
@@ -1640,15 +1640,19 @@ def _capture_sync_client_timeouts(
 
 
 def test_functional_rpcs_use_rpc_call_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The four functional RPCs build their client with ``_RPC_CALL_TIMEOUT_S``.
+    """The functional RPCs build their client with ``_RPC_CALL_TIMEOUT_S``.
 
     A tight discovery-probe timeout (2s) misused here would raise a transport
     ``TimeoutException`` against a momentarily busy agy; the caller does not retry
     — the interaction bridge only retries on the "input not registered" substring
     (a timed-out human-answer delivery would be permanently abandoned) and the
     cold-start does NOT retry ``StartCascade`` (a slow ack would deadlock the
-    placeholder conversation id). The functional calls therefore get the generous
-    ``_RPC_CALL_TIMEOUT_S`` headroom.
+    placeholder conversation id). ``get_available_models`` resolves the per-turn
+    model enum with no retry (a 2s abort against a momentarily-busy agy surfaces a
+    spurious "no model" error instead of completing the turn) and
+    ``get_all_cascade_trajectories`` is the /clear-rotation functional poll
+    (morally a step-read), so both also belong on the generous
+    ``_RPC_CALL_TIMEOUT_S`` headroom rather than the probe budget.
     """
     monkeypatch.setattr(
         rpc,
@@ -1664,33 +1668,34 @@ def test_functional_rpcs_use_rpc_call_timeout(monkeypatch: pytest.MonkeyPatch) -
     )
     rpc.send_user_cascade_message(52548, "c", "hi", plan_model="MODEL_X")
     rpc.start_cascade(52548, "c")
+    rpc.get_available_models(52548)
+    rpc.get_all_cascade_trajectories(52548)
 
-    assert timeouts == [rpc._RPC_CALL_TIMEOUT_S] * 5
+    assert timeouts == [rpc._RPC_CALL_TIMEOUT_S] * 7
 
 
 def test_discovery_probes_keep_probe_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """The discovery/probe RPCs keep the tight ``_PROBE_TIMEOUT_S``.
 
-    Scanning several candidate ports must stay fast, so ``Heartbeat`` /
-    ``GetConversationMetadata`` (during discovery) / ``GetAvailableModels`` keep
-    the short probe budget — they were NOT widened to the functional timeout.
+    Scanning several candidate ports must stay fast, so the port-discovery probes
+    ``Heartbeat`` and ``GetConversationMetadata`` keep the short probe budget —
+    they were NOT widened to the functional timeout. (The functional ``GetAvailable
+    Models`` / ``GetAllCascadeTrajectories`` calls, by contrast, use
+    ``_RPC_CALL_TIMEOUT_S`` — see ``test_functional_rpcs_use_rpc_call_timeout``.)
     """
     monkeypatch.setattr(
         rpc,
         "_HTTP_TRANSPORT",
         httpx.MockTransport(
-            lambda r: httpx.Response(
-                200, json={"metadata": {"rootConversationId": "c"}, "models": {}}
-            )
+            lambda r: httpx.Response(200, json={"metadata": {"rootConversationId": "c"}})
         ),
     )
 
     timeouts = _capture_sync_client_timeouts(monkeypatch)
     rpc._heartbeat_ok(52548)
     rpc._conversation_matches(52548, "c")
-    rpc.get_available_models(52548)
 
-    assert timeouts == [rpc._PROBE_TIMEOUT_S] * 3
+    assert timeouts == [rpc._PROBE_TIMEOUT_S] * 2
 
 
 # ---------------------------------------------------------------------------

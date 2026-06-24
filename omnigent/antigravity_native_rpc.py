@@ -723,7 +723,7 @@ def get_available_models(port: int) -> dict[str, object]:
     """
     url = _rpc_url(port, _METHOD_GET_AVAILABLE_MODELS)
     _assert_loopback_url(url)
-    with _sync_client(_PROBE_TIMEOUT_S) as client:
+    with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
         response = client.post(
             url,
             headers={"Content-Type": "application/json"},
@@ -796,7 +796,7 @@ def get_all_cascade_trajectories(port: int) -> dict[str, object]:
     """
     url = _rpc_url(port, _METHOD_GET_ALL_CASCADE_TRAJECTORIES)
     _assert_loopback_url(url)
-    with _sync_client(_PROBE_TIMEOUT_S) as client:
+    with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
         response = client.post(
             url,
             headers={"Content-Type": "application/json"},
