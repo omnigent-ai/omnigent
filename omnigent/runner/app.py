@@ -16475,6 +16475,7 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "qwen": "HARNESS_QWEN_MODEL",
     "goose": "HARNESS_GOOSE_MODEL",
     "copilot": "HARNESS_COPILOT_MODEL",
+    "vibe": "HARNESS_VIBE_AGENT",
 }
 
 
@@ -16514,6 +16515,7 @@ def _build_spawn_env_from_spec(
             _build_openai_agents_sdk_spawn_env,
             _build_pi_spawn_env,
             _build_qwen_spawn_env,
+            _build_vibe_spawn_env,
         )
 
         if harness == "claude-sdk":
@@ -16536,6 +16538,8 @@ def _build_spawn_env_from_spec(
             env = _build_goose_spawn_env(spec, workdir=workdir)
         elif harness == "copilot":
             env = _build_copilot_spawn_env(spec, workdir=workdir)
+        elif harness == "vibe":
+            env = _build_vibe_spawn_env(spec, workdir=workdir)
         else:
             # Native terminal harnesses and unknown harnesses build env elsewhere.
             return None

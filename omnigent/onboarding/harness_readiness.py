@@ -83,6 +83,8 @@ _PI_HARNESSES: frozenset[str] = frozenset({PI_SURFACE, "pi-native"})
 # — kimi is a CLI-backed harness with its own backend (Moonshot AI's), not a
 # member of the anthropic/openai families that :data:`_HARNESS_FAMILY` keys.
 KIMI_SURFACE = "kimi"
+# Vibe surface
+VIBE_SURFACE = "vibe"
 
 # Native OpenCode harness. Like pi, it wraps a CLI (``opencode``) with no
 # ``_HARNESS_FAMILY`` entry, so it must be gated explicitly or it would fail
@@ -152,6 +154,7 @@ def _install_key(canonical: str) -> str:
         ``"kimi"``.
     :returns: ``"anthropic"`` / ``"openai"`` for the claude/codex CLIs,
         :data:`~omnigent.onboarding.harness_install.KIMI_KEY` for kimi,
+        :data:`~omnigent.onboarding.harness_install.VIBE_KEY` for vibe,
         :data:`~omnigent.onboarding.harness_install.OPENCODE_KEY` for
         opencode-native,
         :data:`~omnigent.onboarding.harness_install.QWEN_KEY` for qwen, or
@@ -159,6 +162,9 @@ def _install_key(canonical: str) -> str:
     """
     if canonical == KIMI_SURFACE or canonical in _KIMI_NATIVE_HARNESSES:
         return KIMI_KEY
+    if canonical == VIBE_SURFACE:
+        from omnigent.onboarding.harness_install import VIBE_KEY
+        return VIBE_KEY
     if canonical in _OPENCODE_HARNESSES:
         return OPENCODE_KEY
     if canonical in _QWEN_HARNESSES:
