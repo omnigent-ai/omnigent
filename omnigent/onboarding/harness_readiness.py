@@ -27,7 +27,13 @@ from __future__ import annotations
 import os
 
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
-from omnigent.onboarding.harness_install import CURSOR_KEY, PI_KEY, QWEN_KEY, harness_cli_installed
+from omnigent.onboarding.harness_install import (
+    AIDER_KEY,
+    CURSOR_KEY,
+    PI_KEY,
+    QWEN_KEY,
+    harness_cli_installed,
+)
 from omnigent.onboarding.provider_config import (
     _EXECUTOR_TYPE_HARNESS_ALIASES,
     _HARNESS_FAMILY,
@@ -64,6 +70,12 @@ _CURSOR_NATIVE_HARNESSES: frozenset[str] = frozenset({"cursor-native", "native-c
 # be gated explicitly or they fail open.
 _QWEN_HARNESSES: frozenset[str] = frozenset({QWEN_KEY, "qwen-code"})
 
+# CLI-wrapping aider harness. Gates on the ``aider`` binary (``pip install
+# aider-chat``). Like qwen it has an ``_HARNESS_FAMILY`` entry (the OpenAI
+# family), so ``_install_key`` must special-case it to the ``aider`` CLI rather
+# than the family's claude/codex binary.
+_AIDER_HARNESSES: frozenset[str] = frozenset({AIDER_KEY})
+
 
 def _canonical_harness(harness: str) -> str:
     """Normalize a harness id to its canonical spelling.
@@ -93,6 +105,8 @@ def _install_key(canonical: str) -> str:
     """
     if canonical in _QWEN_HARNESSES:
         return QWEN_KEY
+    if canonical in _AIDER_HARNESSES:
+        return AIDER_KEY
     return _HARNESS_FAMILY.get(canonical) or PI_KEY
 
 
@@ -144,6 +158,7 @@ def harness_is_configured(harness: str) -> bool:
         canonical not in _HARNESS_FAMILY
         and canonical not in _PI_HARNESSES
         and canonical not in _QWEN_HARNESSES
+        and canonical not in _AIDER_HARNESSES
     ):
         # Unknown harness — the daemon has no install metadata for it, so
         # it can't assess readiness. Fail open (custom/newer harnesses,
@@ -171,5 +186,6 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_PI_HARNESSES)
     spellings.update(_CURSOR_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
+    spellings.update(_AIDER_HARNESSES)
     spellings.add(CURSOR_KEY)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}

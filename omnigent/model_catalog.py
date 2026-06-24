@@ -100,6 +100,7 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
     "agy": "antigravity",
     "google-antigravity": "antigravity",
     "qwen": "qwen",
+    "aider": "aider",
 }
 
 # Preferred inline family per single-family harness (pi consumes both).
@@ -109,6 +110,7 @@ _KEY_AUTH_FAMILY: dict[str, str] = {
     "openai-agents-sdk": OPENAI_FAMILY,
     "antigravity": OPENAI_FAMILY,
     "qwen": OPENAI_FAMILY,
+    "aider": OPENAI_FAMILY,
 }
 
 # Multi-family providers (pi): anthropic first, matching _apply_provider_to_pi.

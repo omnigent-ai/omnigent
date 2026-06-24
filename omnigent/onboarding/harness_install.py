@@ -56,6 +56,12 @@ QWEN_KEY = "qwen"
 # installer rather than npm — so it carries an ``install_hint``, not a ``package``.
 CURSOR_KEY = "cursor"
 
+# Aider installs via pip (``pip install aider-chat``), not npm, so like Cursor it
+# carries an ``install_hint`` and no ``package``. The binary name is ``aider``.
+# Auth is bring-your-own provider key via env (no CLI login), like qwen — so no
+# login/logout/status args.
+AIDER_KEY = "aider"
+
 
 @dataclass(frozen=True)
 class HarnessInstallSpec:
@@ -141,6 +147,12 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint="curl https://cursor.com/install -fsS | bash",
         login_status_key="isAuthenticated",
     ),
+    AIDER_KEY: HarnessInstallSpec(
+        "Aider",
+        "aider",
+        package=None,
+        install_hint="python -m pip install aider-chat",
+    ),
 }
 
 
@@ -166,6 +178,7 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "native-cursor": CURSOR_KEY,
     QWEN_KEY: QWEN_KEY,
     "qwen-code": QWEN_KEY,
+    AIDER_KEY: AIDER_KEY,
 }
 
 

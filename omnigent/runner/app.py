@@ -13467,6 +13467,7 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     # ``--model`` arg in _auto_create_cursor_terminal, not via an env var.
     "antigravity": "HARNESS_ANTIGRAVITY_MODEL",
     "qwen": "HARNESS_QWEN_MODEL",
+    "aider": "HARNESS_AIDER_MODEL",
 }
 
 
@@ -13494,6 +13495,7 @@ def _build_spawn_env_from_spec(
     """
     try:
         from omnigent.runtime.workflow import (
+            _build_aider_spawn_env,
             _build_antigravity_spawn_env,
             _build_claude_sdk_spawn_env,
             _build_codex_spawn_env,
@@ -13517,6 +13519,8 @@ def _build_spawn_env_from_spec(
             env = _build_antigravity_spawn_env(spec)
         elif harness == "qwen":
             env = _build_qwen_spawn_env(spec, workdir=workdir)
+        elif harness == "aider":
+            env = _build_aider_spawn_env(spec, workdir=workdir)
         else:
             # Native terminal harnesses and unknown harnesses build env elsewhere.
             return None

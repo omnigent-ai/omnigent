@@ -138,6 +138,9 @@ _HARNESS_FAMILY: dict[str, str] = {
     "antigravity": OPENAI_FAMILY,
     # Qwen Code uses an OpenAI-compatible provider (like Kimi v1).
     "qwen": OPENAI_FAMILY,
+    # Aider routes through LiteLLM; default it to the OpenAI-compatible family
+    # (BYO provider key / OpenAI-compatible gateway), like qwen.
+    "aider": OPENAI_FAMILY,
 }
 
 # Executor-type spellings that ``AgentSpec.harness_kind`` returns for SDK

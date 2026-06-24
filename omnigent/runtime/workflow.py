@@ -140,7 +140,9 @@ _logger = logging.getLogger(__name__)
 # (hyphen), e.g. ``"claude_sdk"`` → ``"claude-sdk"`` used by ``_HARNESS_MODULES``.
 
 
-AgentHarnessType = Literal["claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "qwen"]
+AgentHarnessType = Literal[
+    "claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "qwen", "aider"
+]
 
 
 @dataclass(frozen=True)
@@ -232,6 +234,16 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         base_urls_key=None,
         host_key="HARNESS_QWEN_GATEWAY_HOST",
         auth_key="HARNESS_QWEN_GATEWAY_AUTH_COMMAND",
+        refresh_key=None,
+    ),
+    "aider": UcodeHarnessConfig(
+        agent_name="aider",
+        model_key="HARNESS_AIDER_MODEL",
+        base_url_key="HARNESS_AIDER_GATEWAY_BASE_URL",
+        base_url_family="openai",
+        base_urls_key=None,
+        host_key="HARNESS_AIDER_GATEWAY_HOST",
+        auth_key="HARNESS_AIDER_GATEWAY_AUTH_COMMAND",
         refresh_key=None,
     ),
     # NB: ``antigravity`` is intentionally absent. Unlike the gateway
@@ -396,6 +408,8 @@ _PROVIDER_HARNESS_FAMILY: dict[AgentHarnessType, str] = {
     "antigravity": OPENAI_FAMILY,
     # Qwen Code routes through OpenAI-compatible providers (like Kimi v1).
     "qwen": OPENAI_FAMILY,
+    # Aider routes through LiteLLM / OpenAI-compatible providers.
+    "aider": OPENAI_FAMILY,
 }
 
 # Maps harnesses that gate the vendor-neutral gateway transport on a
@@ -409,6 +423,7 @@ _HARNESS_GATEWAY_FLAG: dict[AgentHarnessType, str] = {
     "codex": "HARNESS_CODEX_GATEWAY",
     "pi": "HARNESS_PI_GATEWAY",
     "qwen": "HARNESS_QWEN_GATEWAY",
+    "aider": "HARNESS_AIDER_GATEWAY",
 }
 
 # Maps a generic-provider family to the key pi uses in its
@@ -430,6 +445,7 @@ _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     "pi": "HARNESS_PI_DATABRICKS_PROFILE",
     "openai-agents-sdk": "HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE",
     "qwen": "HARNESS_QWEN_DATABRICKS_PROFILE",
+    "aider": "HARNESS_AIDER_DATABRICKS_PROFILE",
     # NB: no ``antigravity`` — it has no Databricks/gateway path (Gemini-native).
 }
 
@@ -1345,6 +1361,58 @@ def _build_qwen_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_QWEN_OS_ENV"] = os_env_payload
+    return env
+
+
+def _build_aider_spawn_env(
+    spec: AgentSpec,
+    *,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """
+    Build the env-var dict the aider harness wrap reads.
+
+    Maps spec.executor fields → the ``HARNESS_AIDER_*`` env vars defined in
+    ``omnigent/inner/aider_harness.py``. Mirrors :func:`_build_qwen_spawn_env`;
+    aider routes through OpenAI-compatible providers via LiteLLM, so it reuses
+    the same generic-provider / ucode-gateway plumbing.
+
+    :param spec: The agent spec.
+    :param workdir: The bundle's on-disk path. Accepted for signature parity
+        with the other ``_build_*_spawn_env`` builders; the aider wrap does not
+        consume a bundle dir (no skills bridge).
+    :returns: A dict of env-var overrides for
+        :meth:`HarnessProcessManager.get_client(env=...)`.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_AIDER_MODEL"] = model
+
+    # Generic-provider branch first (a ProviderAuth on the spec, or the
+    # per-family global default), then the legacy-profile / databricks path —
+    # mirrors _build_qwen_spawn_env. Aider routes through OpenAI-compatible
+    # providers.
+    provider = _resolve_provider_for_build(spec, harness_type="aider")
+    if provider is not None:
+        configure_agent_harness_with_provider(env, provider, harness_type="aider")
+    else:
+        profile = spec.executor.config.get("profile")
+        use_databricks = bool(profile) or (
+            model is not None and model.startswith(("databricks-", "databricks/"))
+        )
+        if use_databricks:
+            env["HARNESS_AIDER_GATEWAY"] = "true"
+            if profile:
+                env["HARNESS_AIDER_DATABRICKS_PROFILE"] = str(profile)
+        configure_agent_harness_with_ucode(
+            env,
+            str(profile) if profile else None,
+            harness_type="aider",
+        )
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_AIDER_OS_ENV"] = os_env_payload
     return env
 
 

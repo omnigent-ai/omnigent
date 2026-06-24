@@ -77,6 +77,10 @@ _HARNESS_MODULES: dict[str, str] = {
     # Qwen Code harness wrap. See omnigent/inner/qwen_harness.py.
     # Drives the ``qwen`` CLI in ACP mode (``qwen --acp``) for agent execution.
     "qwen": "omnigent.inner.qwen_harness",
+    # Aider harness wrap. See omnigent/inner/aider_harness.py. Drives the
+    # ``aider`` CLI in one-shot mode (``aider --message ...``); an SDK-style
+    # harness (no native TUI), so it is NOT in NATIVE_HARNESSES.
+    "aider": "omnigent.inner.aider_harness",
 }
 
 __all__ = ["_HARNESS_MODULES"]

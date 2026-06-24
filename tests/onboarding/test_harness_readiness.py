@@ -145,6 +145,8 @@ def test_configured_harness_map_covers_all_spellings(
         # Qwen harnesses
         "qwen",
         "qwen-code",
+        # Aider harness
+        "aider",
     }
     assert set(result) == expected_keys
 

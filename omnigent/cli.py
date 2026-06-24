@@ -4716,7 +4716,7 @@ def resume(
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
     "'cursor', "
-    "'openai-agents', 'open-responses', 'pi', 'antigravity', or 'qwen'"
+    "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', or 'aider'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (
@@ -4751,6 +4751,9 @@ _DEFAULT_HARNESS_PROMPTS = {
     "qwen": (
         "You are Qwen Code, running through Omnigent. "
         "Help the user with software engineering tasks."
+    ),
+    "aider": (
+        "You are Aider, running through Omnigent. Help the user with software engineering tasks."
     ),
 }
 _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnigent."

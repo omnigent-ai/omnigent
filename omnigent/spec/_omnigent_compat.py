@@ -75,6 +75,7 @@ OMNIGENT_EXECUTOR_TYPE = "omnigent"
 # 'open-responses'" error.
 OMNIGENT_HARNESSES = frozenset(
     {
+        "aider",
         "antigravity",
         "claude-native",
         "claude-sdk",
