@@ -10,9 +10,10 @@ import { useSidebarToggleHotkeys } from "./useSidebarToggleHotkeys";
 
 /** Dispatch a keydown that reaches window from body (default: Ctrl+Alt+[). */
 function press(
-  mods: Partial<
-    Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "altKey" | "shiftKey" | "repeat">
-  > = { ctrlKey: true, altKey: true },
+  mods: Partial<Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "altKey" | "shiftKey" | "repeat">> = {
+    ctrlKey: true,
+    altKey: true,
+  },
   code = "BracketLeft",
 ): void {
   document.body.dispatchEvent(
