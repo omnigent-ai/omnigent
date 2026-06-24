@@ -101,6 +101,11 @@ def stable_user_id() -> str:
     derive a short hex digest from the login name so the value is stable across
     runs and safe to embed in a path.
 
+    The digest is for path namespacing only — not security — so ``getuser``'s
+    value never needs to be recoverable or collision-proof against an
+    adversary; it just needs to be stable and filesystem-safe. SHA-256 with
+    ``usedforsecurity=False`` documents that intent (and avoids flagging SHA-1).
+
     :returns: A short string with no path separators or shell-special chars.
     """
     if IS_POSIX and hasattr(os, "getuid"):
@@ -109,7 +114,7 @@ def stable_user_id() -> str:
         name = getpass.getuser()
     except (OSError, KeyError, ModuleNotFoundError):
         name = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
-    return hashlib.sha1(name.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256(name.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
 
 
 def resolve_repo_symlink(path: Path) -> Path:
