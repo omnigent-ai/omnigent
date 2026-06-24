@@ -1200,8 +1200,14 @@ export function NewChatLandingScreen() {
         // (POST /v1/hosts/{id}/runners) to bind the session to a runner, the
         // same way the fork-resume path does.
         const bundle = await buildAgentBundle(pendingAgent);
-        data = await createBundledSession(bundle, {});
-        // Launch the runner on the selected host.
+        const metadata: Record<string, unknown> = {};
+        if (workspaceTrimmed) metadata.workspace = workspaceTrimmed;
+        data = await createBundledSession(
+          bundle,
+          metadata as Parameters<typeof createBundledSession>[1],
+        );
+        // Launch the runner on the selected host. The multipart create
+        // only stores DB rows — launchRunner binds + starts the runner.
         if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
           const gitOpts = trimmedBranch
             ? { branchName: trimmedBranch, baseBranch: baseBranch.trim() || undefined }
