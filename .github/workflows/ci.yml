@@ -112,6 +112,14 @@ jobs:
               --ignore=tests/spec
               --ignore=tests/llms
               --ignore=tests/codex_parity
+          # Databricks-coupled tests (Lakebase token engine, psycopg). This is
+          # the only lane that installs the `databricks` extra; the
+          # @pytest.mark.databricks marker keeps these tests off the lean lanes
+          # (which run -m "not databricks") and selects them here.
+          - group: databricks
+            paths: tests/db tests/deploy
+            extra: databricks
+            markexpr: databricks
 
     steps:
       - name: Check out repo
@@ -144,7 +152,9 @@ jobs:
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install dependencies
-        run: uv sync --locked --extra all --extra dev
+        # matrix.extra (e.g. "databricks") adds an extra for lanes that need it;
+        # empty for the default lanes.
+        run: uv sync --locked --extra all --extra dev ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
 
       - name: Run pytest
         shell: bash
@@ -165,6 +175,7 @@ jobs:
           # shellcheck disable=SC2086
           env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \
             uv run pytest ${{ matrix.paths }} \
+              -m "${{ matrix.markexpr || 'not databricks' }}" \
               -n ${{ matrix.workers || '8' }} \
               --dist=${{ matrix.dist || 'loadfile' }} \
               --timeout=${{ matrix.timeout || '300' }} \

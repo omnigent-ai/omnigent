@@ -46,6 +46,7 @@ from omnigent.spec.types import (
     ProviderAuth,
     RetryPolicy,
     SandboxConfig,
+    SharePolicy,
     SkillSpec,
     ToolsConfig,
 )
@@ -212,6 +213,13 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # the specified sub-agent types. Defaults to False — session
     # reads stay always-on, but every write grant is explicit.
     spawn = bool(raw.get("spawn", False))
+    # Top-level ``agent_session_sharing:`` flag is the SOLE enabler of
+    # the ``sys_session_share`` tool, independent of ``spawn`` /
+    # ``tools.agents`` (and unrelated to server-API / CLI sharing).
+    # ``none`` (default) leaves it unregistered; ``non-public`` allows
+    # granting named users; ``public`` also allows ``__public__``
+    # anonymous read.
+    agent_session_sharing = _parse_share_policy(raw.get("agent_session_sharing"))
 
     # Honor ``prompt:`` as the legacy alias for ``instructions:`` (per
     # ``_OMNIGENT_SYSTEM_PROMPT_KEYS``); ``instructions:`` wins if both set.
@@ -248,6 +256,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         terminals=terminals,
         timers=timers,
         spawn=spawn,
+        agent_session_sharing=agent_session_sharing,
     )
 
 
@@ -1731,6 +1740,42 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
         except OSError:
             pass
     return None
+
+
+def _parse_share_policy(raw: object) -> SharePolicy:
+    """
+    Parse the top-level YAML ``agent_session_sharing:`` field into a
+    :class:`SharePolicy`.
+
+    This flag is the sole enabler of the ``sys_session_share`` tool
+    (independent of ``spawn`` / ``tools.agents``). Sharing mutates
+    access control, so it is off by default and an unrecognized value
+    fails loud rather than silently disabling the feature.
+
+    Supported YAML shapes:
+
+    - field omitted / ``null`` → :attr:`SharePolicy.NONE` (default;
+      tool not registered).
+    - ``"none"`` / ``"non-public"`` / ``"public"`` → the matching
+      :class:`SharePolicy` member.
+
+    :param raw: The raw YAML value (already parsed). ``None`` or one
+        of the three policy strings, e.g. ``"non-public"``.
+    :returns: The resolved :class:`SharePolicy`.
+    :raises OmnigentError: When the value is neither ``None`` nor one
+        of the recognized policy strings (e.g. a boolean, a typo like
+        ``"private"``, or a non-string).
+    """
+    if raw is None:
+        return SharePolicy.NONE
+    try:
+        return SharePolicy(raw)
+    except ValueError:
+        valid = ", ".join(repr(p.value) for p in SharePolicy)
+        raise OmnigentError(
+            f"top-level agent_session_sharing: must be one of {valid}; got {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from None
 
 
 def _parse_skills_filter(raw: object) -> str | list[str]:
