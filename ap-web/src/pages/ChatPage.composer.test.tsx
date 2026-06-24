@@ -78,9 +78,10 @@ describe("Composer slash-command menu", () => {
   it("highlights the first match as soon as the menu opens", () => {
     render(<Composer {...composerProps()} />);
     fireEvent.change(textarea(), { target: { value: "/" } });
-    // Built-ins are inserted first, so "/compact" tops the list and is the
+    // Built-ins are inserted first, so "/context" tops the list and is the
     // default highlight — the crux of the fix (was -1 / nothing selected).
-    expect(activeRow()?.textContent).toContain("/compact");
+    // (/compact is hidden for non-native-wrapper sessions.)
+    expect(activeRow()?.textContent).toContain("/context");
   });
 
   it("Tab completes the highlighted skill into the textarea", () => {
@@ -151,11 +152,11 @@ describe("Composer slash-command menu", () => {
     render(<Composer {...composerProps()} />);
     const ta = textarea();
     fireEvent.change(ta, { target: { value: "/" } });
-    expect(activeRow()?.textContent).toContain("/compact");
+    expect(activeRow()?.textContent).toContain("/context");
 
     fireEvent.keyDown(ta, { key: "ArrowDown" });
-    // Second built-in entry.
-    expect(activeRow()?.textContent).toContain("/context");
+    // Second built-in entry (/compact is hidden for non-native-wrapper sessions).
+    expect(activeRow()?.textContent).toContain("/effort");
   });
 });
 
@@ -431,10 +432,10 @@ describe("Composer effort slash-command visibility", () => {
     render(<Composer {...composerProps({ showEffort: false })} />);
     fireEvent.change(textarea(), { target: { value: "/" } });
 
-    // Row testids — the active entry ("/compact") also renders in the
-    // detail card, so a text query would double-match.
+    // Row testids — /compact is hidden for non-native-wrapper sessions,
+    // so verify /context is present instead.
     expect(screen.queryByTestId("slash-menu-item-effort")).toBeNull();
-    expect(screen.getByTestId("slash-menu-item-compact")).toBeInTheDocument();
+    expect(screen.getByTestId("slash-menu-item-context")).toBeInTheDocument();
   });
 
   it("shows /model in suggestions for in-process and picker-backed native sessions", () => {
