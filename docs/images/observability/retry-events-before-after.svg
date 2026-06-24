@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1052" height="508" viewBox="0 0 1052 508">
+  <defs>
+    <style>text { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; }</style>
+  </defs>
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="256" y="62" font-size="22" fill="#1971c2" opacity="1"><tspan x="256" dy="0">gen_ai.retry events on llm_call spans: before vs after</tspan></text>
+  <text x="216" y="104" font-size="14" fill="#868e96" opacity="1"><tspan x="216" dy="0">Before (on main)</tspan></text>
+  <text x="716" y="104" font-size="14" fill="#868e96" opacity="1"><tspan x="716" dy="0">After (this PR)</tspan></text>
+  <rect x="40" y="124" width="472" height="344" rx="8" stroke="#c92a2a" fill="#c92a2a" stroke-width="1" opacity="1" />
+  <text x="56" y="149" font-size="13" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">llm_call span (took 4.2s, failed 3 times)</tspan></text>
+  <text x="56" y="176" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">Attributes:</tspan></text>
+  <text x="56" y="199" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">  model = openai/gpt-5</tspan></text>
+  <text x="56" y="219" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">  status = OK</tspan></text>
+  <text x="56" y="248" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">Events: none</tspan></text>
+  <text x="56" y="288" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">Operator sees: a slow llm_call that</tspan></text>
+  <text x="56" y="308" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">eventually succeeded. No visibility into:</tspan></text>
+  <text x="56" y="335" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">  - how many times we retried</tspan></text>
+  <text x="56" y="355" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">  - which error class hit which attempt</tspan></text>
+  <text x="56" y="375" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">  - whether the issue was rate limit or connection</tspan></text>
+  <text x="56" y="395" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">  - backoff schedule between attempts</tspan></text>
+  <text x="56" y="436" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">Diagnosing flaky LLM endpoints from a trace is</tspan></text>
+  <text x="56" y="456" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">effectively impossible.</tspan></text>
+  <rect x="540" y="124" width="472" height="344" rx="8" stroke="#087f5b" fill="#087f5b" stroke-width="1" opacity="1" />
+  <text x="556" y="149" font-size="13" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">llm_call span (took 4.2s, succeeded on attempt 4)</tspan></text>
+  <text x="556" y="176" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">Events:</tspan></text>
+  <text x="556" y="199" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">gen_ai.retry @ T+0.0s</tspan></text>
+  <text x="556" y="216" font-size="10" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  attempt=1, max=4, ConnectionError, backoff=0.5s</tspan></text>
+  <text x="556" y="247" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">gen_ai.retry @ T+0.7s</tspan></text>
+  <text x="556" y="264" font-size="10" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  attempt=2, max=4, ConnectionError, backoff=1.0s</tspan></text>
+  <text x="556" y="295" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">gen_ai.retry @ T+1.9s</tspan></text>
+  <text x="556" y="312" font-size="10" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  attempt=3, max=4, RateLimitError, backoff=2.0s</tspan></text>
+  <text x="556" y="343" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">Final status: OK</tspan></text>
+  <text x="556" y="384" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">Operator filters by error.type and sees the</tspan></text>
+  <text x="556" y="404" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">pattern across 1000s of traces.</tspan></text>
+  <text x="556" y="436" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">One span, full retry timeline, ready for</tspan></text>
+  <text x="556" y="456" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">aggregation by attempt count or error class.</tspan></text>
+</svg>
