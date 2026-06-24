@@ -501,16 +501,20 @@ def test_telemetry_env_injected_when_configured_and_span_active(
     """
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
 
-    import mlflow
-    from mlflow.entities import SpanType
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
 
-    from omnigent.runtime import telemetry
+    # Use a fresh OTel TracerProvider directly so the active-span
+    # context is guaranteed regardless of MLflow tracing init state.
+    provider = TracerProvider()
+    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
+    tracer = otel_trace.get_tracer("omnigent.test")
 
-    with telemetry.trace_context_for_response(response_id="resp_" + "a" * 32):
-        with mlflow.start_span("agent", span_type=SpanType.AGENT):
-            env = _build_openai_agents_sdk_spawn_env(
-                _make_spec(model="gpt-4o", auth=ApiKeyAuth(api_key="sk-test"))
-            )
+    with tracer.start_as_current_span("agent"):
+        env = _build_openai_agents_sdk_spawn_env(
+            _make_spec(model="gpt-4o", auth=ApiKeyAuth(api_key="sk-test"))
+        )
 
     assert "TRACEPARENT" in env
     assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://localhost:4317"
