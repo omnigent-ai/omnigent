@@ -2845,11 +2845,13 @@ export function buildSlashCommandMap(
   skills: ReadonlyArray<{ name: string; description: string }>,
   showEffort: boolean,
   showModel: boolean,
+  showCompact: boolean = true,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
     if (name === "/effort" && !showEffort) continue;
     if (name === "/model" && !showModel) continue;
+    if (name === "/compact" && !showCompact) continue;
     m[name] = description;
   }
   for (const skill of skills) {
@@ -3300,9 +3302,13 @@ export function Composer({
   // it each turn; native wrappers expose it only when they have a picker
   // path that the runner can propagate without blocking the vendor TUI.
   const showModel = !isNativeWrapper || showModels;
+  // /compact is only functional for native wrappers (claude-native,
+  // codex-native) which inject the slash command into the terminal.
+  // SDK harnesses (openai-agents-sdk, claude-sdk) don't support it yet.
+  const showCompact = isNativeWrapper;
   const slashCommands = useMemo(
-    () => buildSlashCommandMap(skills, showEffort, showModel),
-    [skills, showEffort, showModel],
+    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact),
+    [skills, showEffort, showModel, showCompact],
   );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
@@ -3371,6 +3377,10 @@ export function Composer({
   const executeSlashCommand = (cmd: string, arg: string): boolean => {
     switch (cmd) {
       case "/compact":
+        if (!showCompact) {
+          setCommandError("/compact is not supported for this agent type");
+          return true;
+        }
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
