@@ -134,6 +134,10 @@ export default defineConfig({
     globals: true,
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],
+    // Scope discovery to src/ — the ap-web suite lives there. Without this,
+    // vitest's default glob descends into the nested electron package and
+    // tries to run its node:test files (which aren't vitest suites).
+    include: ["src/**/*.{test,spec}.?(c|m)[jt]s?(x)"],
     coverage: {
       provider: "v8",
       // With `include` set, vitest counts every matching source file (untested

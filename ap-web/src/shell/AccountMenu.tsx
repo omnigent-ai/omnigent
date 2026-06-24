@@ -21,8 +21,16 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "@/lib/routing";
-import { KeyRoundIcon, LogOutIcon, ShieldCheckIcon, UserCogIcon, UsersIcon } from "lucide-react";
+import {
+  KeyboardIcon,
+  KeyRoundIcon,
+  LogOutIcon,
+  ShieldCheckIcon,
+  UserCogIcon,
+  UsersIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { MOD_KEY, openKeyboardShortcuts } from "@/components/KeyboardShortcutsDialog";
 import {
   Dialog,
   DialogContent,
@@ -37,6 +45,7 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
@@ -166,6 +175,13 @@ export function AccountMenu() {
               </DropdownMenuItem>
             </>
           )}
+          <DropdownMenuItem
+            onClick={() => openKeyboardShortcuts()}
+            className="flex items-center gap-2"
+          >
+            <KeyboardIcon /> Keyboard shortcuts
+            <DropdownMenuShortcut>{MOD_KEY} /</DropdownMenuShortcut>
+          </DropdownMenuItem>
           <DropdownMenuItem
             onClick={() => {
               resetPwForm();

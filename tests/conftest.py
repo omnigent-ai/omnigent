@@ -7,13 +7,9 @@ import shutil
 import sys
 import tempfile
 import time
-import warnings
-from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any
 
 import pytest
-import yaml
 
 try:
     import resource as _resource  # POSIX-only; absent on Windows.
@@ -65,116 +61,10 @@ from tests import _model_pools
 
 pytest_plugins = ["tests._token_usage"]
 
-_KNOWN_FAILURES_PATH = Path(__file__).parent / "known_failures.yaml"
 
-
-def _load_known_failures() -> dict[str, dict[str, Any]]:
-    """Map nodeid -> entry from `tests/known_failures.yaml`."""
-    if not _KNOWN_FAILURES_PATH.exists():
-        return {}
-    data = yaml.safe_load(_KNOWN_FAILURES_PATH.read_text()) or {}
-    return {entry["id"]: entry for entry in (data.get("skips") or [])}
-
-
-_KNOWN_FAILURES: dict[str, dict[str, Any]] = _load_known_failures()
-
-
-def _nodeid_path(nodeid: str) -> str:
-    return nodeid.split("::", 1)[0]
-
-
-def _strip_nodeid_suffix(path: str) -> str:
-    return path.split("::", 1)[0]
-
-
-def _normalize_collection_path(raw_path: object, rootpath: Path) -> str:
-    path = Path(_strip_nodeid_suffix(str(raw_path)))
-    try:
-        if path.is_absolute():
-            path = path.relative_to(rootpath)
-    except ValueError:
-        pass
-    return path.as_posix().removeprefix("./").rstrip("/")
-
-
-def _nodeid_is_under_path(nodeid: str, collection_path: str) -> bool:
-    node_path = _nodeid_path(nodeid)
-    if not collection_path or collection_path == ".":
-        return True
-    return node_path == collection_path or node_path.startswith(f"{collection_path}/")
-
-
-def _known_failure_is_in_collection_scope(config: pytest.Config, nodeid: str) -> bool:
-    rootpath = Path(str(config.rootpath))
-    selected_paths = config.args or list(config.getini("testpaths")) or ["."]
-    return any(
-        _nodeid_is_under_path(nodeid, _normalize_collection_path(path, rootpath))
-        for path in selected_paths
-    )
-
-
-def _known_failure_is_ignored(config: pytest.Config, nodeid: str) -> bool:
-    rootpath = Path(str(config.rootpath))
-    ignored_paths = config.getoption("ignore", default=[]) or []
-    ignored_globs = config.getoption("ignore_glob", default=[]) or []
-    node_path = _nodeid_path(nodeid)
-
-    for raw_path in ignored_paths:
-        ignored_path = _normalize_collection_path(raw_path, rootpath)
-        if _nodeid_is_under_path(nodeid, ignored_path):
-            return True
-
-    for raw_glob in ignored_globs:
-        ignored_glob = _normalize_collection_path(raw_glob, rootpath)
-        if fnmatch(node_path, ignored_glob):
-            return True
-
-    return False
-
-
-def _known_failure_stale_check_enabled(config: pytest.Config) -> bool:
-    return not (
-        config.getoption("keyword", default="")
-        or config.getoption("markexpr", default="")
-        or config.getoption("deselect", default=[])
-    )
-
-
-def _stale_known_failure_ids(config: pytest.Config, seen: set[str]) -> list[str]:
-    if not _known_failure_stale_check_enabled(config):
-        return []
-    return sorted(
-        nodeid
-        for nodeid in set(_KNOWN_FAILURES) - seen
-        if _known_failure_is_in_collection_scope(config, nodeid)
-        and not _known_failure_is_ignored(config, nodeid)
-    )
-
-
-def pytest_collection_modifyitems(
-    config: pytest.Config,
-    items: list[pytest.Item],
-) -> None:
-    """Apply skip / xfail markers to tests listed in `tests/known_failures.yaml`.
-
-    Each entry's `mode` selects the marker:
-    - `skip` (default): test does not run.
-    - `xfail`: test runs with `strict=False`. Fails report as
-      `XFAIL` (silent); a passing test reports `XPASS` so the
-      manifest entry can be removed.
-
-    Bypassed entirely when `--no-skip-known` is passed (CLI flag,
-    set by the `force-all-tests` PR label in ci.yml). Useful for
-    validating that manifest entries are still needed.
-
-    Emits a warning at collection end for in-scope manifest entries whose
-    `id` doesn't match a collected test, so renames / removals
-    don't leave stale entries lingering silently. Entries outside the
-    current collection scope, under ignored paths, or hidden by explicit
-    ``-k`` / ``-m`` / ``--deselect`` filters are not treated as stale.
-
-    Also translates ``@pytest.mark.llm_flaky`` into a rerunfailures
-    ``flaky`` marker; each rerun resolves to a different model via
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Translate ``@pytest.mark.llm_flaky`` into a rerunfailures ``flaky``
+    marker; each rerun resolves to a different model via
     :mod:`tests._model_pools` rotation.
     """
     for item in items:
@@ -186,43 +76,6 @@ def pytest_collection_modifyitems(
             reruns = int(llm_flaky.kwargs.get("reruns", 2))
             delay = int(llm_flaky.kwargs.get("reruns_delay", 1))
             item.add_marker(pytest.mark.flaky(reruns=reruns, reruns_delay=delay))
-
-    if config.getoption("--no-skip-known"):
-        return
-    if not _KNOWN_FAILURES:
-        return
-    seen: set[str] = set()
-    for item in items:
-        entry = _KNOWN_FAILURES.get(item.nodeid)
-        if entry is None:
-            continue
-        seen.add(item.nodeid)
-        reason = entry.get("reason", "known failure")
-        issue = entry.get("issue")
-        cluster = entry.get("cluster")
-        prefix = f"known failure (#{issue})" if issue else "known failure"
-        if cluster:
-            prefix = f"{prefix} [{cluster}]"
-        marker_reason = f"{prefix}: {reason}"
-        mode = entry.get("mode", "skip")
-        if mode == "xfail":
-            item.add_marker(pytest.mark.xfail(reason=marker_reason, strict=False))
-        else:
-            if mode != "skip":
-                warnings.warn(
-                    f"known_failures.yaml entry {item.nodeid!r} has invalid "
-                    f"mode {mode!r}; expected 'skip' or 'xfail'. Defaulting to skip.",
-                    stacklevel=1,
-                )
-            item.add_marker(pytest.mark.skip(reason=marker_reason))
-
-    stale = _stale_known_failure_ids(config, seen)
-    if stale:
-        warnings.warn(
-            f"tests/known_failures.yaml has {len(stale)} entries that "
-            f"don't match any collected test (rename or removal?): {stale}",
-            stacklevel=1,
-        )
 
 
 # Tmpdir owned by *this* process (master or single worker) for the
@@ -405,17 +258,6 @@ def pytest_addoption(parser):
 
     :param parser: the pytest option parser.
     """
-    parser.addoption(
-        "--no-skip-known",
-        action="store_true",
-        default=False,
-        help=(
-            "Bypass tests/known_failures.yaml; run every collected test "
-            "including those listed as skipped or xfailed. Set by the "
-            "force-all-tests PR label in ci.yml; useful locally to "
-            "validate that manifest entries are still needed."
-        ),
-    )
     parser.addoption(
         "--integration",
         action="store_true",

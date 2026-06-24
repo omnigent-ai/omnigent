@@ -58,6 +58,14 @@ import { parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
+import { validateAttachments } from "@/lib/attachments";
+import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
+import {
+  isIOSShell,
+  onNativeViewModeChanged,
+  setNativeServerSwitcherHidden,
+  setNativeViewMode,
+} from "@/lib/nativeBridge";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -73,6 +81,7 @@ import { usePermissions } from "@/hooks/usePermissions";
 import type { CodexModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
+import { useIOSNativeKeyboardVisible } from "@/hooks/useIOSNativeKeyboardInset";
 import type { MessageContentBlock } from "@/lib/blocks";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -96,6 +105,7 @@ import { useSession } from "@/hooks/useSession";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
+  type LivenessRow,
   type SessionLiveness,
   livenessRowFromSession,
   useSessionLiveness,
@@ -237,11 +247,22 @@ export function buildPendingBubbles(
 // bubble. Used by `mergePendingBubbles` and
 // `reorderCommittedRequestElicitations` to keep the prompt above the card
 // that asks about it, both before and after approval.
-function isRequestElicitationBubble(bubble: Bubble): boolean {
+function isStandaloneElicitationBubble(bubble: Bubble): boolean {
+  // A committed assistant bubble that is ENTIRELY an elicitation card with no
+  // turn to anchor to, so it must sit BELOW the user message it gated:
+  //   • REQUEST-phase policy ASKs (gate the prompt before any turn), and
+  //   • terminal-driven harness gates such as cursor-native `pre_tool_use`,
+  //     which never emit `response_created` (blockStream stamps these with
+  //     their own `elicit_*` id, so they land as standalone bubbles).
+  // A `tool_call` card inside an active SDK turn renders inline — it is grouped
+  // WITH the turn, so it is never an all-elicitation standalone bubble — and is
+  // intentionally excluded here.
   return (
     bubble.kind === "assistant" &&
     bubble.items.length > 0 &&
-    bubble.items.every((it) => it.kind === "elicitation" && it.phase === "request")
+    bubble.items.every(
+      (it) => it.kind === "elicitation" && (it.phase === "request" || it.phase === "pre_tool_use"),
+    )
   );
 }
 
@@ -261,7 +282,7 @@ function isRequestElicitationBubble(bubble: Bubble): boolean {
 export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble[] {
   let result: Bubble[] | null = null;
   for (let i = 0; i < committed.length - 1; i += 1) {
-    if (isRequestElicitationBubble(committed[i]!) && committed[i + 1]!.kind === "user") {
+    if (isStandaloneElicitationBubble(committed[i]!) && committed[i + 1]!.kind === "user") {
       if (result === null) result = [...committed];
       const card = result[i]!;
       result[i] = result[i + 1]!;
@@ -285,7 +306,7 @@ export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble
 export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
   if (pending.length === 0) return committed;
   let insertAt = committed.length;
-  while (insertAt > 0 && isRequestElicitationBubble(committed[insertAt - 1]!)) {
+  while (insertAt > 0 && isStandaloneElicitationBubble(committed[insertAt - 1]!)) {
     insertAt -= 1;
   }
   if (insertAt === committed.length) return [...committed, ...pending];
@@ -726,7 +747,15 @@ export function ChatPage() {
   // so `host_id` still reaches the hook — otherwise a host-bound, host-down
   // session misclassifies as `local_stranded` and shows the wrong reconnect
   // path. See `livenessRowFromSession`.
-  const livenessRow = activeConv ?? livenessRowFromSession(activeSession);
+  //
+  // Always source `host_resumable` from the session snapshot — the sidebar
+  // `Conversation` row doesn't carry it. activeSession is loaded for the open
+  // session, so a host-bound, host-down session whose host is a resumable
+  // managed host classifies as `host_asleep` (composer open, send wakes it)
+  // instead of dead-ending on `host_offline`.
+  const livenessRow: LivenessRow | null = activeConv
+    ? { ...activeConv, host_resumable: activeSession?.hostResumable ?? false }
+    : livenessRowFromSession(activeSession);
   const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
     turnActive: status === "streaming",
   });
@@ -1272,6 +1301,21 @@ function MainAgentSurface({
     conversationRef.current = el;
     setContainerEl(el);
   }, []);
+  const [terminalSurfaceEl, setTerminalSurfaceEl] = useState<HTMLElement | null>(null);
+  // True only while the chat/terminal surface is the frontmost thing on screen.
+  // Drives both native overlays so neither floats over an opened drawer.
+  const surfaceFrontmost = useSurfaceFrontmost(
+    showTerminal ? terminalSurfaceEl : containerEl,
+    !!conversationId,
+  );
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    setNativeServerSwitcherHidden(!surfaceFrontmost);
+  }, [surfaceFrontmost]);
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    return () => setNativeServerSwitcherHidden(true);
+  }, []);
   // The conversation's scroll container + the StickToBottom controls needed to
   // override its bottom-lock, lifted out of the context by
   // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
@@ -1318,12 +1362,17 @@ function MainAgentSurface({
         <MainTerminalView
           conversationId={conversationId}
           initialTerminalKey={terminalFirst?.terminalViewKey}
+          onSurfaceElement={setTerminalSurfaceEl}
           // Non-owners attach read-only: a shared PTY can't attribute
           // input per-user, so only the owner may type. They drive the
           // agent via the composer instead. Server enforces this too.
           readOnly={!isOwnerLevel(permissionLevel)}
         />
-        <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
+        <ConnectionIndicator
+          liveness={liveness}
+          onShowReconnectHelp={onShowReconnectHelp}
+          surfaceFrontmost={surfaceFrontmost}
+        />
       </>
     );
   }
@@ -1338,7 +1387,12 @@ function MainAgentSurface({
             ChatHeader overlay's controls (geometry in index.css). */}
         <Conversation className="chat-scroll-fade flex-1">
           {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread. */}
-          <ConversationContent className={cn("mx-auto w-full gap-4 pt-20 pb-6", CHAT_COLUMN_WIDTH)}>
+          <ConversationContent
+            className={cn(
+              "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6",
+              CHAT_COLUMN_WIDTH,
+            )}
+          >
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
             <ConversationScrollRefBridge onScroller={setScroller} />
@@ -1457,7 +1511,8 @@ function MainAgentSurface({
         showCodexPlanMode={showCodexPlanMode}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
-        reconnectHint={liveness.kind === "runner_asleep"}
+        reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
+        sandboxAsleepHint={liveness.kind === "host_asleep"}
         unreachable={
           !sandboxLaunching &&
           (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
@@ -1470,7 +1525,11 @@ function MainAgentSurface({
       {/* Chat/Terminal toggle for terminal-first sessions, reconnect-or-
           fork banner when unreachable, nothing otherwise. Sits below the
           composer so its position is consistent with the terminal view. */}
-      <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
+      <ConnectionIndicator
+        liveness={liveness}
+        onShowReconnectHelp={onShowReconnectHelp}
+        surfaceFrontmost={surfaceFrontmost}
+      />
     </>
   );
 }
@@ -2015,12 +2074,42 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
 export function ConnectionIndicator({
   liveness,
   onShowReconnectHelp,
+  surfaceFrontmost = true,
 }: {
   liveness: SessionLiveness;
   onShowReconnectHelp: () => void;
+  // Whether the chat/terminal surface is frontmost (not under a drawer). Gates
+  // the native iOS bar so it doesn't float over an opened sidebar/panel.
+  surfaceFrontmost?: boolean;
 }) {
   const terminalFirst = useTerminalFirst();
+  const keyboardVisible = useIOSNativeKeyboardVisible(
+    terminalFirst?.isTerminalFirst === true,
+    terminalFirst?.view === "chat",
+  );
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
+  // Genuinely-unreachable states get the reconnect banner, for
+  // both terminal-first and regular sessions. `runner_asleep` (host up,
+  // runner relaunches on the next message), `host_asleep` (resumable managed
+  // host the server wakes on the next message), and `unknown` (pre-poll) are
+  // NOT unreachable — they're handled below.
+  const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
+
+  // In the iOS shell the Chat/Terminal toggle is the native Liquid Glass bar,
+  // not the in-page pill. Drive it from here (always mounted) with the SAME
+  // visibility the pill would have, expressed as a stable boolean so switching
+  // views never flickers the bar. Hook is called unconditionally (before any
+  // early return) to satisfy the rules of hooks.
+  const nativeBarVisible =
+    isIOSShell() &&
+    terminalFirst?.isTerminalFirst === true &&
+    !terminalFirst.isShellView &&
+    sandboxStatus?.stage !== "failed" &&
+    !unreachable &&
+    !keyboardVisible &&
+    surfaceFrontmost;
+  useNativeChatTerminalBar(terminalFirst, nativeBarVisible);
+
   if (sandboxStatus !== null) {
     // A failed launch owns this band with its reason. An IN-FLIGHT
     // launch renders in the chat thread (RunnerStartingIndicator)
@@ -2031,11 +2120,6 @@ export function ConnectionIndicator({
     }
     return null;
   }
-  // Genuinely-unreachable states get the reconnect banner, for
-  // both terminal-first and regular sessions. `runner_asleep` (host up,
-  // runner relaunches on the next message) and `unknown` (pre-poll) are
-  // NOT unreachable — they're handled below.
-  const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
   if (unreachable) {
     return (
       <button
@@ -2067,11 +2151,28 @@ export function ConnectionIndicator({
   // as the runner comes back. The strict `runner_online` still gates the
   // inline PTY *view* (it needs a live tunnel) — but not the toggle.
   if (terminalFirst?.isTerminalFirst) {
+    // In the iOS shell the toggle is the native bar (driven above). Render only
+    // a spacer reserving its fixed footprint so the composer clears it — and
+    // nothing when the bar is hidden.
+    if (isIOSShell()) {
+      // Chat reserves a touch less than terminal: the composer's own bottom
+      // content (the status line) already cushions the gap to the bar.
+      return nativeBarVisible ? (
+        <div
+          aria-hidden
+          className={cn(
+            "omnigent-native-bottom-spacer",
+            terminalFirst.view === "chat" && "omnigent-native-bottom-spacer--chat",
+          )}
+        />
+      ) : null;
+    }
     // A rail-opened shell owns the main view chrome-free — no pill: a
     // "Chat" option under someone else's shell misreads as the shell
     // being the agent. The shell view carries its own close affordance
     // (MainTerminalView's X) back to chat.
     if (terminalFirst.isShellView) return null;
+    if (keyboardVisible) return null;
     return <ConnectedTerminalFirstPill ctx={terminalFirst} />;
   }
 
@@ -2094,8 +2195,8 @@ export function ConnectionIndicator({
   }
 
   // `online`/`unknown` for a non-terminal-first session and
-  // `runner_asleep` for any session: status lives in the sidebar / the
-  // composer stays open, so render nothing here.
+  // `runner_asleep`/`host_asleep` for any session: status lives in the
+  // sidebar / the composer stays open, so render nothing here.
   return null;
 }
 
@@ -2175,8 +2276,63 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
 }
 
 /**
+ * Mirrors the Chat/Terminal state onto the iOS shell's native Liquid Glass
+ * switcher and routes its taps back into `setView`. Driven by a stable
+ * `visible` boolean (not this hook's mount/unmount), so toggling Chat/Terminal
+ * updates the bar in place instead of flickering it hidden→shown. A no-op
+ * outside the iOS shell; the caller renders its own in-page pill there.
+ */
+function useNativeChatTerminalBar(
+  ctx: ReturnType<typeof useTerminalFirst> | null,
+  visible: boolean,
+): void {
+  const native = isIOSShell();
+  const view = ctx?.view ?? "chat";
+  const terminalsAvailable = ctx?.terminalsAvailable ?? false;
+  const terminalStartingUp = ctx?.terminalStartingUp ?? false;
+
+  // Keep `setView` reachable from the subscribe-once effect without
+  // resubscribing whenever the callback identity changes.
+  const setViewRef = useRef(ctx?.setView);
+  setViewRef.current = ctx?.setView;
+
+  // Push current state + visibility down whenever any of it changes.
+  useEffect(() => {
+    if (!native) return;
+    setNativeViewMode({
+      mode: view,
+      terminalEnabled: terminalsAvailable,
+      terminalStartingUp,
+      visible,
+    });
+  }, [native, view, terminalsAvailable, terminalStartingUp, visible]);
+
+  // Belt-and-suspenders: hide the bar if the host component ever unmounts.
+  useEffect(() => {
+    if (!native) return;
+    return () => {
+      setNativeViewMode({
+        mode: "chat",
+        terminalEnabled: false,
+        terminalStartingUp: false,
+        visible: false,
+      });
+    };
+  }, [native]);
+
+  // Route native taps back into the web layer.
+  useEffect(() => {
+    if (!native) return;
+    return onNativeViewModeChanged((mode) => setViewRef.current?.(mode));
+  }, [native]);
+}
+
+/**
  * Chat/Terminal segmented control for terminal-first sessions. Status
  * lives in the sidebar — this band is purely a view toggle.
+ *
+ * Only rendered outside the iOS shell; inside it the switcher is drawn natively
+ * (Liquid Glass) over the web view — see {@link useNativeChatTerminalBar}.
  */
 function ConnectedTerminalFirstPill({
   ctx,
@@ -2189,17 +2345,18 @@ function ConnectedTerminalFirstPill({
   // reachable: greyed-and-spinning reads as "loading", greyed-and-static as
   // "no terminal / stopped".
   const { view, setView, terminalsAvailable, terminalStartingUp } = ctx;
+
   return (
     <div
       className={cn(
-        "mx-auto flex w-full items-center justify-center px-6 pb-1.5",
+        "terminal-first-switcher-container mx-auto flex w-full items-center justify-center px-6 pb-1.5",
         CHAT_COLUMN_WIDTH,
       )}
     >
       <div
         role="group"
         aria-label="View mode"
-        className="flex items-center gap-1 rounded-full border border-border bg-card/90 p-1 text-xs shadow-sm"
+        className="terminal-first-switcher flex items-center gap-1 rounded-full border border-border bg-card/90 p-1 text-xs shadow-sm"
       >
         <div className="flex items-center gap-0.5">
           <button
@@ -2208,7 +2365,7 @@ function ConnectedTerminalFirstPill({
             aria-label="Chat"
             onClick={() => setView("chat")}
             className={cn(
-              "flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors",
+              "terminal-first-switcher-option flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors",
               view === "chat"
                 ? "bg-muted text-foreground"
                 : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
@@ -2225,7 +2382,7 @@ function ConnectedTerminalFirstPill({
             title={terminalStartingUp ? "Terminal is starting up…" : undefined}
             onClick={() => setView("terminal")}
             className={cn(
-              "flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+              "terminal-first-switcher-option flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors disabled:cursor-not-allowed disabled:opacity-50",
               view === "terminal"
                 ? "bg-muted text-foreground"
                 : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
@@ -2562,6 +2719,14 @@ interface ComposerProps {
    * turn is streaming (the follow-up placeholder wins).
    */
   reconnectHint?: boolean;
+  /**
+   * The session is host-bound to a dormant resumable managed host that is
+   * offline (`host_asleep`): the composer stays enabled, and the placeholder
+   * tells the user their next message will resume the sandbox host (which can
+   * take a few minutes) so the wake latency is expected, not surprising.
+   * Ignored once a turn is streaming.
+   */
+  sandboxAsleepHint?: boolean;
   /**
    * The session is unreachable (`host_offline` / `local_stranded`): a message
    * can't wake it. The composer is blocked (disabled) and the reconnect
@@ -2929,6 +3094,7 @@ export function Composer({
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
+  sandboxAsleepHint = false,
   unreachable = false,
   costRoutingVerdict = null,
   costRoutingEligible = false,
@@ -2936,6 +3102,7 @@ export function Composer({
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<File[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
   // Index of the highlighted item in the slash-command suggestions menu.
@@ -2992,13 +3159,27 @@ export function Composer({
   // the input, which would delete the draft. Only save when the user
   // has actually changed the value since the last restore.
   const dirtyRef = useRef(false);
+  // On mobile, programmatic focus immediately summons the software keyboard.
+  // Keep desktop's fast-type affordance, but let mobile users explicitly tap
+  // the composer when switching back from Terminal or changing sessions.
+  const [isMobile, setIsMobile] = useState(
+    () => typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches,
+  );
+  const isMobileRef = useRef(isMobile);
+  isMobileRef.current = isMobile;
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 767px)");
+    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
 
   useEffect(() => {
     const restored = conversationId ? sessionDrafts.get(conversationId) : undefined;
     setValue(restored?.text ?? "");
     setFiles(restored?.files ?? []);
     dirtyRef.current = false;
-    textareaRef.current?.focus();
+    if (!isMobileRef.current) textareaRef.current?.focus();
 
     return () => {
       if (!conversationId || !dirtyRef.current) return;
@@ -3018,7 +3199,7 @@ export function Composer({
   // focus when the count grows — removing a quote shouldn't steal focus.
   const prevQuoteCountRef = useRef(replyQuotes.length);
   useEffect(() => {
-    if (replyQuotes.length > prevQuoteCountRef.current) {
+    if (!isMobileRef.current && replyQuotes.length > prevQuoteCountRef.current) {
       textareaRef.current?.focus();
     }
     prevQuoteCountRef.current = replyQuotes.length;
@@ -3224,20 +3405,6 @@ export function Composer({
     }
   };
 
-  // On mobile-sized viewports the on-screen keyboard has no easy way to
-  // produce Shift+Enter, so Enter-to-send would lock users out of multi-line
-  // composition entirely. Below Tailwind's `md` breakpoint, fall back to
-  // native textarea behavior (Enter = newline) and require tapping Send.
-  const [isMobile, setIsMobile] = useState(
-    () => typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches,
-  );
-  useEffect(() => {
-    const mq = window.matchMedia("(max-width: 767px)");
-    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, []);
-
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
   useAutoGrowTextarea(textareaRef, value);
 
@@ -3252,8 +3419,15 @@ export function Composer({
   const [isDragActive, setIsDragActive] = useState(false);
 
   const addFiles = (incoming: File[]) => {
-    setFiles((prev) => [...prev, ...incoming]);
-    dirtyRef.current = true;
+    // Reject unsupported types (only images, PDF, and text/code) and
+    // oversized files up front — before the upload — with a friendly
+    // message. The server enforces the same limits authoritatively.
+    const { accepted, errors } = validateAttachments(incoming);
+    if (accepted.length > 0) {
+      setFiles((prev) => [...prev, ...accepted]);
+      dirtyRef.current = true;
+    }
+    setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   };
 
   const handleDrop = (e: DragEvent<HTMLDivElement>) => {
@@ -3286,6 +3460,7 @@ export function Composer({
 
   const removeFile = (index: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
+    setAttachmentError(null);
     dirtyRef.current = true;
   };
 
@@ -3368,6 +3543,7 @@ export function Composer({
     dirtyRef.current = true;
     setValue("");
     setFiles([]);
+    setAttachmentError(null);
     onClearAllQuotes();
   };
 
@@ -3489,7 +3665,10 @@ export function Composer({
   return (
     <form
       onSubmit={handleSubmit}
-      className={cn("px-4 md:px-6", isTerminalFirst ? "pb-1.5" : "pb-3")}
+      className={cn(
+        "chat-composer-form px-4 md:px-6",
+        isTerminalFirst ? "terminal-first-composer-form pb-1.5" : "pb-3",
+      )}
     >
       {/* Hidden file input for the attach button */}
       <input
@@ -3633,9 +3812,11 @@ export function Composer({
                         ? "Waiting for agents…"
                         : isStreaming
                           ? "Send a follow-up (queued) — Esc to stop"
-                          : reconnectHint
-                            ? "Send a message to reconnect this session"
-                            : "Ask the agent anything…"
+                          : sandboxAsleepHint
+                            ? "Current session's host is offline. Next message will resume the sandbox host which can take minutes"
+                            : reconnectHint
+                              ? "Send a message to reconnect this session"
+                              : "Ask the agent anything…"
             }
             rows={1}
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
@@ -3672,6 +3853,12 @@ export function Composer({
                 </button>
               </span>
             ))}
+          </div>
+        )}
+        {/* Rejected-attachment feedback: unsupported type or too large */}
+        {attachmentError !== null && (
+          <div className="px-4 pb-2 text-xs text-destructive whitespace-pre-wrap">
+            {attachmentError}
           </div>
         )}
         {/* Inline slash-command feedback: errors and /help output */}

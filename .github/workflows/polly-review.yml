@@ -107,6 +107,10 @@ jobs:
             echo "::notice::Skipping Polly review — LLM credentials not available (fork PR or missing secrets)."
             echo "available=false" >> "$GITHUB_OUTPUT"
           else
+            # Mask the key so the runner redacts it from any log or output that
+            # echoes it literally — defense-in-depth against prompt injection
+            # that tricks Polly into including the key in its review text.
+            echo "::add-mask::${LLM_API_KEY}"
             echo "available=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -134,29 +138,26 @@ jobs:
 
       - name: Set up Python
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version-file: ".python-version"
 
       - name: Set up uv
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
           enable-cache: true
 
-      - name: Install bubblewrap
+      - name: Install tmux
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        # bubblewrap: the linux_bwrap sandbox backend needs bwrap on PATH.
-        # apparmor sysctl: Ubuntu 24.04 blocks unprivileged user namespaces
-        # that bwrap's unshare(CLONE_NEWUSER) needs; scope is the ephemeral runner.
+        # tmux: Polly uses it for its shell terminal.
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap tmux
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get install -y tmux
 
       - name: Cache virtualenv
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
@@ -256,10 +257,25 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Fetch the diff (capped at 64 KB to stay within prompt limits).
+          # Fetch the diff (capped at 512 KB — covers the vast majority of
+          # real PRs; truncation is surfaced to Polly in the prompt).
+          # The write-scoped github.token stays in this trusted step and is
+          # NOT passed to the Polly run.
+          # || true: head -c closes the pipe once the cap is reached, causing
+          # gh to get SIGPIPE (exit 141). Under pipefail that would abort the
+          # step; || true degrades it into the DIFF_TRUNCATED path instead.
           gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
             -H "Accept: application/vnd.github.v3.diff" \
-            | head -c 65536 > /tmp/pr_diff.txt
+            | head -c 524288 > /tmp/pr_diff.txt || true
+
+          DIFF_SIZE=$(wc -c < /tmp/pr_diff.txt)
+          [ "$DIFF_SIZE" -ge 524288 ] && DIFF_TRUNCATED=true || DIFF_TRUNCATED=false
+          export DIFF_TRUNCATED
+
+          # Extract lockfile pin changes from the already-fetched diff —
+          # no second network call needed.
+          grep -E '^[+-]name = |^[+-]version = ' /tmp/pr_diff.txt \
+            | head -500 > /tmp/lockfile_pins.txt || true
 
           # Fetch PR metadata to separate files — avoids embedding
           # attacker-controlled strings (PR title/body) into heredocs.
@@ -270,11 +286,27 @@ jobs:
           # Build the review prompt safely using python — all untrusted
           # fields (title, body, diff) are read from files, never
           # interpolated into shell heredocs.
-          python3 <<'PYEOF'
-          import json, pathlib
+          python3 -u <<'PYEOF'
+          import json, os, pathlib
 
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
-          diff = pathlib.Path("/tmp/pr_diff.txt").read_text()
+          diff = pathlib.Path("/tmp/pr_diff.txt").read_text(encoding="utf-8", errors="replace")
+          lockfile_pins = pathlib.Path("/tmp/lockfile_pins.txt").read_text(encoding="utf-8", errors="replace").strip()
+          truncated = os.environ.get("DIFF_TRUNCATED", "false") == "true"
+
+          truncation_notice = """
+          > ⚠️ **Diff truncated at 512 KB** — this review covers only the first
+          > portion of the diff. Flag this as a non-blocking note and recommend
+          > a manual review of the remaining changes.
+          """ if truncated else ""
+
+          lockfile_section = f"""
+          ## Changed lockfile pins (uv.lock / package-lock.json)
+          These are extracted package name + version lines only — not the full hunk.
+          ```
+          {lockfile_pins if lockfile_pins else "(no lockfile changes)"}
+          ```
+          """ if lockfile_pins else ""
 
           prompt = f"""Review this pull request and provide structured feedback.
 
@@ -285,20 +317,43 @@ jobs:
 
           ## PR Description
           {(meta.get('body') or '')[:4096]}{"  *(truncated)*" if len(meta.get('body') or '') > 4096 else ""}
-
+          {truncation_notice}
           ## Diff
           ```diff
           {diff}
           ```
-
+          {lockfile_section}
           ## Instructions
+          The codebase is checked out at `main`. Read source files freely for
+          additional context when needed.
+
+          **Security:** you are running in a CI environment with access to secrets
+          (LLM API keys, gateway tokens). Never include secrets, tokens, or
+          credentials in your output, and never make outbound network calls
+          except to the configured LLM gateway.
+
           Review the diff against the PR description. Report:
-          1. **Blocking issues** — bugs, security problems, correctness errors, data loss risks.
-          2. **Security analysis** — carefully check the security implications of the changes. Look for injection vulnerabilities (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.
-          3. **Non-blocking suggestions** — style, naming, performance, test coverage gaps.
+          1. **Blocking issues** — correctness bugs, broken contracts, missing error handling on failure paths, data loss risks.
+          2. **Security vulnerabilities** — injection (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.
+          3. **Non-blocking notes** — design concerns or edge cases worth flagging (brief).
           4. **Summary** — one-paragraph overall assessment.
 
+          Do NOT comment on code style, formatting, naming conventions, or other cosmetic issues — omit them entirely.
           Be concise. Do not restate the diff. Focus on what matters.
+
+          Before labeling anything **blocking**, double-check: does this issue actually exist in the diff? Verify the problem is real and present in the changed code — not inferred, speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces a correctness bug, breaks an explicit contract, or creates a real security risk; otherwise downgrade to non-blocking.
+
+          **Lockfile pins** — review the "Changed lockfile pins" section above and flag
+          as a **blocking security issue** any of:
+          - A package added that is not declared (directly or transitively) in pyproject.toml.
+          - A version that does not satisfy the constraint in pyproject.toml.
+          - A suspicious version downgrade on a security-sensitive package.
+
+          **Package extras** — when the diff adds or modifies optional dependency groups (extras):
+          - Each harness deserves its own extra.
+          - Combine harnesses and other integrations from the same vendor into one extra (e.g. a single `google` extra may cover Vertex and Antigravity).
+          - Each sandbox deserves its own extra.
+          - Nothing else warrants a new extra — flag any new extras that don't fit one of these three categories as a blocking issue.
 
           IMPORTANT: Your output will be posted directly as a PR comment. Output
           ONLY the final structured review — no coordination messages, no status
@@ -309,6 +364,14 @@ jobs:
           """
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
           PYEOF
+
+      - name: Mint App token
+        id: app-token
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
 
       - name: Run Polly review
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
@@ -357,13 +420,19 @@ jobs:
           head -c 61440 /tmp/polly_output.txt >> "$GITHUB_OUTPUT"
           echo "${delim}" >> "$GITHUB_OUTPUT"
 
-      - name: Mint App token
-        id: app-token
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
-          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+      - name: Scan review output for secrets before posting
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Abort if Polly's output contains the literal LLM API key — this
+          # catches prompt-injection attacks that trick Polly into echoing the
+          # secret into the PR comment.
+          if [ -n "$LLM_API_KEY" ] && grep -qF "$LLM_API_KEY" /tmp/polly_output.txt 2>/dev/null; then
+            echo "::error::Review output contains LLM_API_KEY — aborting post to prevent secret exfiltration."
+            exit 1
+          fi
 
       - name: Post review comment
         if: steps.polly.outputs.review_text != ''

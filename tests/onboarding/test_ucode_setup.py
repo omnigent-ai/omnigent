@@ -214,3 +214,22 @@ def test_configure_ucode_for_workspace_raises_on_nonzero_exit() -> None:
         pytest.raises(ClickException, match="exited with code 3"),
     ):
         configure_ucode_for_workspace("https://example.cloud.databricks.com")
+
+
+def test_build_ucode_configure_command_normalizes_pasted_url() -> None:
+    """A browser-pasted workspace URL is reduced to scheme://host in the
+    ``--workspaces`` argument, so ``ucode configure`` never receives the
+    ``/browse?o=...`` path the Databricks CLI cannot tokenize."""
+    argv = build_ucode_configure_command(
+        ["ucode"],
+        workspace_urls=["https://example.cloud.databricks.com/browse?o=42"],
+        agents=["claude"],
+    )
+    assert argv == [
+        "ucode",
+        "configure",
+        "--workspaces",
+        "https://example.cloud.databricks.com",
+        "--agents",
+        "claude",
+    ]

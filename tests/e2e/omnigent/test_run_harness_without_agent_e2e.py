@@ -75,18 +75,31 @@ def test_run_harness_without_agent_live_repl_round_trip(
     marker = f"{probe.marker}_RUN_HARNESS_WITHOUT_AGENT"
     prompt = _PROMPT_TEMPLATE.format(marker=marker)
 
+    # claude-code issues a warmup/title call before the turn that consumes one
+    # queued response, so the turn call needs another; queue a few markers.
+    responses = [{"text": marker}] * (4 if probe.harness == "claude-sdk" else 1)
     configure_mock_llm(
         mock_llm_server_url,
-        [{"text": marker}],
+        responses,
         key=model,
     )
+
+    # claude-sdk speaks the Anthropic wire, not OPENAI_*. Point it at the mock
+    # and pass a static gateway token via ANTHROPIC_AUTH_TOKEN (Authorization:
+    # Bearer) -- the docs-sanctioned custom-gateway auth. ANTHROPIC_API_KEY
+    # (x-api-key) would trigger claude-code's external-key validation, which
+    # the mock cannot satisfy ("Invalid API key").
+    env = dict(mock_credentials_env)
+    if probe.harness == "claude-sdk":
+        env["ANTHROPIC_BASE_URL"] = mock_llm_server_url
+        env["ANTHROPIC_AUTH_TOKEN"] = "mock-key"
 
     child = spawn_omnigent_run(
         omnigent_python=omnigent_python,
         yaml_path=None,
         model=model,
         harness=probe.harness,
-        env=mock_credentials_env,
+        env=env,
         cwd=omnigent_repo_root,
         timeout=_SPAWN_TIMEOUT,
         initial_prompt=prompt,
@@ -124,10 +137,15 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``_HARNESS_MODULES``, this file must gain a live round-trip row
     for it.
 
-    ``claude-native``, ``codex-native``, and ``pi-native`` are excluded
-    because their inner executors require bridge directories plus
-    runner-managed terminal panes to inject keys into — both set up by
-    their native launchers, not by ``omnigent run --harness <native>``.
+    ``claude-native``, ``codex-native``, ``pi-native``, and
+    ``opencode-native`` are excluded because their inner executors require
+    bridge directories plus runner-managed terminal panes to inject keys
+    into — both set up by their native launchers, not by
+    ``omnigent run --harness <native>``. (``opencode-native`` is a
+    terminal-takeover ``native-server`` harness, the same shape as the
+    other natives.) Running them through this matrix would hang or crash.
+    Their e2e coverage is via native launcher smoke tests (tracked
+    separately as native-launcher PTY/REPL smoke tests).
 
     ``cursor`` is excluded because this matrix authenticates through
     the Databricks gateway/profile, while cursor-agent talks only to
@@ -137,14 +155,43 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     Gemini-native and its SDK launches a native binary needing a modern
     glibc.
 
+    ``copilot`` is excluded for the same reason as ``cursor`` / ``antigravity``:
+    the GitHub Copilot SDK authenticates with a GitHub token and talks only to
+    GitHub's Copilot backend (no Databricks gateway path), so ``_build_copilot_spawn_env``
+    emits none of the shared ``HARNESS_<H>_GATEWAY`` / profile probe vars this
+    matrix drives. Its live round-trip is covered by the gated
+    ``tests/e2e/test_polly_copilot_e2e.py`` and the ``copilot-sdk-e2e-dev`` skill.
+
     ``cursor-native`` is excluded for the union of both reasons above.
+
+    ``qwen`` is excluded because it does not follow the shared
+    ``HARNESS_<HARNESS>_GATEWAY``/``DATABRICKS_PROFILE`` probe wiring that
+    this matrix (and ``test_harness_wrap_e2e.py``) drive harnesses with: its
+    wrap routes through ``HARNESS_QWEN_GATEWAY_BASE_URL`` /
+    ``HARNESS_QWEN_GATEWAY_AUTH_COMMAND`` instead. Its live round-trip is
+    covered by the dedicated ``test_per_harness_qwen.py`` suite.
+
+    ``goose`` (headless ACP) is excluded for the same reason as ``qwen``: it
+    authenticates from Goose's own config (``goose configure``), not the shared
+    gateway/profile probe wiring, so ``_build_goose_spawn_env`` emits no
+    ``HARNESS_GOOSE_GATEWAY*`` vars for this matrix to drive. Its live round-trip
+    is covered by the dedicated ``test_goose_acp_e2e.py`` suite.
+
+    ``goose-native`` is excluded for the same reason as ``claude-native`` /
+    ``cursor-native``: it is a terminal-first TUI launched via ``omni goose``
+    (tmux pane + bridge dir), not ``omnigent run --harness goose-native``.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
         "codex-native",
         "pi-native",
+        "opencode-native",
         "cursor",
         "cursor-native",
         "antigravity",
+        "copilot",
+        "qwen",
+        "goose",
+        "goose-native",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

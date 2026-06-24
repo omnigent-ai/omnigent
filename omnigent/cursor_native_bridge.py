@@ -363,6 +363,48 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
     return proc.returncode == 0
 
 
+def capture_cursor_pane(bridge_dir: Path) -> str | None:
+    """
+    Return the visible Cursor pane text, or ``None`` if the TUI is not running.
+
+    Reused by the runner-side approval mirror
+    (:mod:`omnigent.cursor_native_permissions`) to detect cursor-agent's native
+    tool-approval prompts. ``None`` (no advertised tmux target, or a dead pane)
+    is distinct from ``""`` (a live but empty capture) so the caller can skip
+    polling a TUI that has not started yet or has exited.
+
+    :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
+    :returns: The captured pane text, or ``None`` when no live pane exists.
+    """
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        return None
+    socket_path, tmux_target = info["socket_path"], info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        return None
+    return _capture_pane(socket_path, tmux_target)
+
+
+def send_cursor_pane_keys(bridge_dir: Path, *keys: str) -> None:
+    """
+    Send one or more keys to the Cursor pane (tmux ``send-keys``).
+
+    Used by the approval mirror to answer cursor-agent's native prompt from a
+    web verdict, e.g. ``"y"`` to approve or ``"Escape"`` to reject. Each key is
+    a tmux key name/argument (not bracketed-paste data), so multi-byte keys like
+    ``"Escape"`` are interpreted, not typed literally.
+
+    :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
+    :param keys: tmux key arguments, e.g. ``"y"`` or ``"Escape"``.
+    :raises RuntimeError: If the tmux target is not advertised or the
+        ``send-keys`` invocation fails.
+    """
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        raise RuntimeError("cursor-native tmux target not advertised")
+    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], *keys)
+
+
 def _submit_needle(content: str) -> str:
     """A stable single-line substring used to confirm the paste rendered in the pane."""
     for line in content.splitlines():

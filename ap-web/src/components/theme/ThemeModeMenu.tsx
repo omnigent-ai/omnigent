@@ -20,10 +20,10 @@ const themeModeIcons: Record<ThemeMode, typeof SunIcon> = {
 /**
  * Compact sidebar control that cycles system → dark → light on click.
  *
- * A single icon button rather than a dropdown. The icon previews the
- * mode the next click will apply (see {@link nextThemeMode}): a moon
- * when clicking switches to dark, a sun for light, and a laptop for
- * system. The tooltip and aria-label announce the same action.
+ * A single icon button rather than a dropdown. The icon shows the
+ * current mode — a sun for light, a moon for dark, and a laptop for
+ * system — while the tooltip and aria-label announce the mode the next
+ * click will apply (see {@link nextThemeMode}).
  *
  * @returns Theme cycle button.
  */
@@ -31,10 +31,10 @@ export function ThemeModeMenu() {
   // Embedded: the host owns the theme and `embed.tsx` forces light, so a theme
   // switcher would be a no-op. Hide it.
   const isEmbedded = useIsEmbedded();
-  const { theme, setTheme } = useTheme();
+  const { theme, systemTheme, setTheme } = useTheme();
   const mode = normalizeThemeMode(theme);
-  const next = nextThemeMode(mode);
-  const NextIcon = themeModeIcons[next];
+  const next = nextThemeMode(mode, systemTheme);
+  const Icon = themeModeIcons[mode];
   const action = `Switch to ${themeModeLabels[next]}`;
 
   if (isEmbedded) return null;
@@ -51,7 +51,7 @@ export function ThemeModeMenu() {
           className="rounded-full"
           onClick={() => setTheme(next)}
         >
-          <NextIcon className="size-4" />
+          <Icon className="size-4" />
         </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom">{action}</TooltipContent>

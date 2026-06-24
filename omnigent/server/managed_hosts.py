@@ -32,12 +32,18 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         provider: modal          # lakebox|modal|daytona|cwsandbox|islo|openshell
+         provider: modal          # lakebox|modal|daytona|boxlite|cwsandbox|islo|e2b|openshell
          server_url: https://omnigent.example.com
          modal:                   # optional block
            image: docker.io/me/omnigent-host:latest  # default: official image
            secrets: [omnigent-llm]  # Modal secrets injected as sandbox env
                                      # (harness LLM keys, gateway URLs)
+         boxlite:                 # optional block (provider: boxlite)
+           image: docker.io/me/omnigent-host:latest    # shared; default: official
+           env: [OPENAI_API_KEY, GIT_TOKEN]            # shared; SERVER env var NAMES
+           # exactly one mode (mutually exclusive):
+           cloud: {endpoint: https://boxlite.example.com:8100}  # CLOUD; key: BOXLITE_API_KEY env
+           # local: {home_dir: /data/boxlite, registry: {...}}  # LOCAL (default if omitted)
          daytona:                 # optional block (provider: daytona)
            image: docker.io/me/omnigent-host:latest  # default: official image
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES whose
@@ -130,10 +136,10 @@ _logger = logging.getLogger(__name__)
 # ManagedSandboxConfig directly are not constrained by either set —
 # their launcher factory IS the support.)
 SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
-    {"lakebox", "modal", "daytona", "cwsandbox", "islo", "e2b", "openshell"}
+    {"lakebox", "modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell"}
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "cwsandbox", "islo", "e2b", "openshell"}
+    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell"}
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -161,6 +167,13 @@ MODAL_MANAGED_TOKEN_TTL_S = 25 * 3600
 # a fresh token.
 DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
+# Launch-token lifetime for the YAML boxlite path. Boxlite boxes have no
+# platform lifetime cap and persist across restarts, so the bound is policy,
+# not platform: 7 days mirrors Daytona — long enough for a live box to
+# re-authenticate its tunnel across reconnects while still expiring tokens of
+# boxes nobody removed. A relaunch mints a fresh token.
+BOXLITE_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
 # Launch-token lifetime for the YAML islo path. Islo sandboxes are
 # deleted by managed-session teardown; use the same 7-day policy bound
 # as Daytona for long-lived hosts and stale-token cleanup.
@@ -185,11 +198,16 @@ _HOST_LOG_PATH = "/tmp/omnigent-host.log"
 
 # How long a message POST waits for an in-flight managed launch to
 # settle before giving up (see ManagedLaunchTracker). Covers the full
-# launch pipeline: sandbox provision + host registration
-# (MANAGED_HOST_ONLINE_TIMEOUT_S) plus runner spawn/connect, with
-# slack. The wait resolves as soon as the launch settles — this bound
-# only matters when the background launch is itself stuck.
-MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = MANAGED_HOST_ONLINE_TIMEOUT_S + 60
+# launch/wake pipeline ON TOP OF the host-registration wait
+# (MANAGED_HOST_ONLINE_TIMEOUT_S): the provider's provision/resume call
+# (StartSandbox has no fixed upper bound), the host-tunnel reconnect on
+# this replica, and the runner spawn/connect. The 120s slack must cover
+# all of those so a slow cold launch/wake doesn't time the parked message
+# out before the background launch settles — otherwise the first
+# post-dormancy turn is lost even though the wake later succeeds. The wait
+# resolves as soon as the launch settles, so this bound only bites a
+# genuinely slow launch.
+MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = MANAGED_HOST_ONLINE_TIMEOUT_S + 120
 
 # Session label recording the repository-URL workspace a managed
 # session was created with (the raw ``<url>[#<branch>]`` request
@@ -612,6 +630,20 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             _parse_daytona_image(raw), _parse_daytona_env(raw)
         )
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
+    elif provider == "boxlite":
+        section = _boxlite_section(raw)
+        _reject_unknown_boxlite_keys(
+            section, {"image", "env", "local", "cloud"}, "sandbox.boxlite"
+        )
+        endpoint, home_dir, registry = _parse_boxlite_mode(section)
+        launcher_factory = _boxlite_launcher_factory(
+            endpoint,
+            _parse_boxlite_image(section),
+            _parse_boxlite_env(section),
+            home_dir,
+            registry,
+        )
+        token_ttl_s = BOXLITE_MANAGED_TOKEN_TTL_S
     elif provider == "cwsandbox":
         from omnigent.onboarding.sandboxes.cwsandbox import managed_token_ttl_s
 
@@ -839,6 +871,240 @@ def _parse_daytona_env(raw: dict[str, object]) -> list[str] | None:
             "'GIT_TOKEN']"
         )
     return [name.strip() for name in env]
+
+
+def _boxlite_launcher_factory(
+    endpoint: str | None,
+    image: str | None,
+    env: list[str] | None,
+    home_dir: str | None,
+    registry: dict[str, object] | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: boxlite`` path.
+
+    :param endpoint: Remote ``boxlite serve`` URL (cloud mode), or ``None`` for
+        LOCAL mode — boxes run on the omnigent-server host as embedded micro-VMs
+        (no daemon, no ``boxlite serve``).
+    :param image: Registry image reference with omnigent pre-installed, or
+        ``None`` to use the official prebaked host image (env-overridable; see
+        :class:`omnigent.onboarding.sandboxes.boxlite.BoxliteSandboxLauncher`).
+    :param env: Names of server-process environment variables (harness LLM
+        credentials, gateway URLs, ``GIT_TOKEN``) injected into every box, e.g.
+        ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or ``None``.
+    :param home_dir: LOCAL-mode boxlite data directory, or ``None`` for the
+        default (``~/.boxlite``).
+    :param registry: LOCAL-mode private-registry config for the host image
+        (``host`` + optional ``transport`` / ``skip_verify`` / ``*_env``
+        credential names), or ``None`` for anonymous pulls.
+    :returns: A factory producing parameterized boxlite launchers.
+    """
+
+    def _build() -> SandboxLauncher:
+        """Construct the boxlite launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.boxlite import BoxliteSandboxLauncher
+
+        return BoxliteSandboxLauncher(
+            endpoint=endpoint, image=image, env=env, home_dir=home_dir, registry=registry
+        )
+
+    return _build
+
+
+def _boxlite_section(raw: dict[str, object]) -> dict[str, object]:
+    """
+    Return the validated ``sandbox.boxlite`` mapping (empty when absent).
+
+    :raises ValueError: When ``sandbox.boxlite`` is present but not a mapping.
+    """
+    section = raw.get("boxlite")
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        raise ValueError("server config 'sandbox.boxlite' must be a mapping")
+    return section
+
+
+def _reject_unknown_boxlite_keys(mapping: dict[str, object], allowed: set[str], path: str) -> None:
+    """
+    Fail loud on any key outside *allowed* — catches typos and misplaced keys
+    (e.g. ``endpoint`` at the section level instead of under ``cloud:``, or a
+    misspelled ``passwrod_env``) that would otherwise be silently ignored and
+    surface much later as a confusing runtime failure.
+    """
+    unknown = sorted(set(mapping) - allowed)
+    if unknown:
+        raise ValueError(
+            f"server config '{path}' has unknown key(s): {', '.join(unknown)} "
+            f"(allowed: {', '.join(sorted(allowed))})"
+        )
+
+
+def _parse_boxlite_mode(
+    section: dict[str, object],
+) -> tuple[str | None, str | None, dict[str, object] | None]:
+    """
+    Resolve the boxlite runtime MODE from the mutually-exclusive ``local`` /
+    ``cloud`` sub-blocks and return the launcher's ``(endpoint, home_dir,
+    registry)``.
+
+    - ``cloud:`` present → CLOUD mode (a remote ``boxlite serve``).
+      ``cloud.endpoint`` is required; the API key is read from
+      ``BOXLITE_API_KEY`` in the server env (12-factor, not config).
+    - else → LOCAL mode (embedded micro-VMs on the server host). The optional
+      ``local:`` block carries ``home_dir`` / ``registry``.
+
+    Setting both ``local`` and ``cloud`` is rejected — they are two different
+    configurations and a session runs in exactly one mode.
+
+    :returns: ``(endpoint, home_dir, registry)`` — only *endpoint* (cloud) or
+        the *home_dir*/*registry* pair (local) is ever populated.
+    :raises ValueError: On a malformed or ambiguous mode config.
+    """
+    # Test for KEY PRESENCE, not value: a bare `cloud:`/`local:` YAML key
+    # parses to None, which must be rejected as malformed — not silently
+    # fall through to LOCAL mode (a `cloud:` typo would then run locally).
+    local_present = "local" in section
+    cloud_present = "cloud" in section
+    local_block = section.get("local")
+    cloud_block = section.get("cloud")
+    if local_present and cloud_present:
+        raise ValueError(
+            "server config 'sandbox.boxlite' must set at most one of 'local' or "
+            "'cloud' — the two modes are mutually exclusive"
+        )
+    if cloud_present:
+        if not isinstance(cloud_block, dict):
+            raise ValueError("server config 'sandbox.boxlite.cloud' must be a mapping")
+        _reject_unknown_boxlite_keys(cloud_block, {"endpoint"}, "sandbox.boxlite.cloud")
+        endpoint = cloud_block.get("endpoint")
+        if not isinstance(endpoint, str) or not endpoint.strip():
+            raise ValueError(
+                "server config 'sandbox.boxlite.cloud.endpoint' is required — the "
+                "boxlite REST URL, e.g. 'https://boxlite.example.com:8100'"
+            )
+        return endpoint.strip(), None, None
+    # Local mode (the default when neither block is present).
+    if not local_present:
+        return None, None, None
+    if not isinstance(local_block, dict):
+        raise ValueError("server config 'sandbox.boxlite.local' must be a mapping")
+    _reject_unknown_boxlite_keys(local_block, {"home_dir", "registry"}, "sandbox.boxlite.local")
+    return None, _parse_boxlite_home_dir(local_block), _parse_boxlite_registry(local_block)
+
+
+def _parse_boxlite_image(section: dict[str, object]) -> str | None:
+    """
+    Extract the optional shared ``sandbox.boxlite.image`` (default: official
+    host image). Shared by both modes.
+
+    :returns: The validated image reference, or ``None`` to use the default.
+    :raises ValueError: When present but not a non-empty string.
+    """
+    image = section.get("image")
+    if image is None:
+        return None
+    if not isinstance(image, str) or not image.strip():
+        raise ValueError(
+            "server config 'sandbox.boxlite.image' must be a registry image "
+            "reference with omnigent pre-installed, e.g. "
+            "'docker.io/me/omnigent-host:latest' (omit it to use the official image)"
+        )
+    return image.strip()
+
+
+def _parse_boxlite_env(section: dict[str, object]) -> list[str] | None:
+    """
+    Extract the optional shared ``sandbox.boxlite.env`` — SERVER-process
+    environment variable NAMES whose values are injected into every box (names
+    only, so secret values never live in the config file). Shared by both modes.
+
+    :returns: The validated env var names, or ``None`` when not configured.
+    :raises ValueError: When present but not a list of non-empty strings.
+    """
+    env = section.get("env")
+    if env is None:
+        return None
+    if not isinstance(env, list) or not all(
+        isinstance(name, str) and name.strip() for name in env
+    ):
+        raise ValueError(
+            "server config 'sandbox.boxlite.env' must be a list of server "
+            "environment variable NAMES to inject, e.g. ['OPENAI_API_KEY', 'GIT_TOKEN']"
+        )
+    return [name.strip() for name in env]
+
+
+def _parse_boxlite_home_dir(local: dict[str, object]) -> str | None:
+    """
+    Extract the optional ``sandbox.boxlite.local.home_dir`` (boxlite data dir).
+
+    :returns: The validated path, or ``None`` to use boxlite's default.
+    :raises ValueError: When present but not a non-empty string.
+    """
+    home_dir = local.get("home_dir")
+    if home_dir is None:
+        return None
+    if not isinstance(home_dir, str) or not home_dir.strip():
+        raise ValueError(
+            "server config 'sandbox.boxlite.local.home_dir' must be a non-empty path string"
+        )
+    return home_dir.strip()
+
+
+def _parse_boxlite_registry(local: dict[str, object]) -> dict[str, object] | None:
+    """
+    Extract the optional ``sandbox.boxlite.local.registry`` block — private-
+    registry config for pulling the host image in LOCAL mode.
+
+    Shape: ``host`` (required) plus optional ``transport`` / ``skip_verify`` and
+    the credential-NAME keys ``username_env`` / ``password_env`` / ``token_env``
+    (which name server env vars holding the values — 12-factor, so secrets never
+    live in the config file).
+
+    :returns: The validated registry mapping, or ``None`` when not configured.
+    :raises ValueError: When present but malformed.
+    """
+    registry = local.get("registry")
+    if registry is None:
+        return None
+    if not isinstance(registry, dict):
+        raise ValueError("server config 'sandbox.boxlite.local.registry' must be a mapping")
+    _reject_unknown_boxlite_keys(
+        registry,
+        {"host", "transport", "skip_verify", "username_env", "password_env", "token_env"},
+        "sandbox.boxlite.local.registry",
+    )
+    host = registry.get("host")
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError(
+            "server config 'sandbox.boxlite.local.registry.host' is required — the "
+            "registry hostname, e.g. 'ghcr.io'"
+        )
+    out: dict[str, object] = {"host": host.strip()}
+    for key in ("transport", "username_env", "password_env", "token_env"):
+        value = registry.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"server config 'sandbox.boxlite.local.registry.{key}' must be a non-empty string"
+            )
+        out[key] = value.strip()
+    skip_verify = registry.get("skip_verify")
+    if skip_verify is not None:
+        if not isinstance(skip_verify, bool):
+            raise ValueError(
+                "server config 'sandbox.boxlite.local.registry.skip_verify' must be a boolean"
+            )
+        out["skip_verify"] = skip_verify
+    if "token_env" in out and ("username_env" in out or "password_env" in out):
+        raise ValueError(
+            "server config 'sandbox.boxlite.local.registry': token_env is mutually "
+            "exclusive with username_env/password_env — boxlite uses the bearer token "
+            "and silently ignores basic auth, so set exactly one auth method"
+        )
+    return out
 
 
 def _cwsandbox_launcher_factory(
@@ -1581,6 +1847,140 @@ def _launcher_for_teardown(
     if launcher.provider != host.sandbox_provider:
         return None
     return launcher
+
+
+def host_resume_supported(
+    host: Host,
+    config: ManagedSandboxConfig | None,
+) -> bool:
+    """
+    Whether :func:`resume_managed_host` could wake this host in place.
+
+    ``True`` iff the host is bound to a sandbox whose provider has a
+    stop/resume lifecycle with a persistent volume
+    (:attr:`SandboxLauncher.can_resume`) and still matches the deployment's
+    current launcher. This is the SAME gate :func:`resume_managed_host`
+    applies before a wake, exposed so the open-session snapshot
+    (``SessionResponse.host_resumable``) can render a dormant such host as a
+    wakeable "asleep" state instead of the terminal ``host_offline``
+    dead-end.
+
+    :param host: The session's bound managed host.
+    :param config: The deployment's current sandbox config, or ``None``
+        when the ``sandbox:`` section has been removed since launch.
+    :returns: ``True`` when a wake would be attempted; ``False`` for a
+        non-managed / non-resumable provider, a dropped config, or a
+        host with no recorded ``sandbox_id``.
+    """
+    launcher = _launcher_for_teardown(host, config)
+    return launcher is not None and launcher.can_resume and host.sandbox_id is not None
+
+
+# ── Managed-host wake (resume a dormant host on demand) ─────────────────────
+
+# Per-host resume single-flight: one in-flight resume per host_id on this
+# replica, else two host processes flap the tunnel registration. Reused across a
+# host's many idle-stop/resume cycles, so not reaped — a .pop() could also race
+# a resume still holding it; one idle Lock per host woken is negligible.
+_resume_locks: dict[str, asyncio.Lock] = {}
+
+
+async def resume_managed_host(
+    host_id: str,
+    host_store: HostStore,
+    config: ManagedSandboxConfig | None,
+) -> None:
+    """
+    Wake a dormant managed host so a session bound to it can run again.
+
+    The send-message relaunch path calls this when a host-bound session has no
+    live runner. If the host is a *resumable* managed host — a provider whose
+    sandbox idle-stops but retains its persistent volume
+    (:attr:`SandboxLauncher.can_resume`) — and is currently offline, this
+    resumes the sandbox under the SAME sandbox id, re-arms its launch token,
+    re-execs ``omnigent host``, and waits for it to re-register. The caller's
+    existing relaunch then spawns a fresh runner.
+
+    No-op when the host is already online, is unknown, or its provider cannot
+    resume (e.g. Modal — the caller falls through to its normal host-offline
+    behavior, i.e. the user starts a new session). Single-flight and
+    idempotent: concurrent callers serialize on a per-host lock and re-check
+    liveness under it, so only the first wakes the host.
+
+    Unlike a launch, a failed wake does NOT tear the sandbox down — the volume
+    + workspace are the user's and must survive for a retry.
+
+    :param host_id: The session's bound host id, e.g. ``"host_a1b2c3d4..."``.
+    :param host_store: Persistent host registrations (cross-replica liveness).
+    :param config: The deployment's managed-sandbox config, or ``None`` when
+        the ``sandbox:`` section has been removed since launch.
+    :raises HTTPException: 502 when the resume or host restart fails.
+    """
+    if config is None:
+        return
+    # Cross-replica DB liveness (freshness-gated): never trust the per-replica
+    # registry alone. Cheap gate before taking the lock.
+    if await asyncio.to_thread(host_store.is_online, host_id):
+        return
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is None:
+        return
+    # Provider-matched launcher (None if config dropped / provider changed).
+    # Resume needs a reattachable volume; others (e.g. Modal) fall through to
+    # the caller's host-offline path (the user starts a new session).
+    launcher = _launcher_for_teardown(host, config)
+    if launcher is None or not launcher.can_resume or host.sandbox_id is None:
+        return
+    sandbox_id = host.sandbox_id
+    # Single-flight per host (see _resume_locks).
+    resume_lock = _resume_locks.setdefault(host_id, asyncio.Lock())
+    async with resume_lock:
+        # Re-check under the lock: a concurrent waker may have brought the host
+        # online while we waited.
+        if await asyncio.to_thread(host_store.is_online, host_id):
+            return
+        _logger.info(
+            "Waking dormant managed host %s (sandbox %s, provider %s)",
+            host.host_id,
+            sandbox_id,
+            launcher.provider,
+        )
+        try:
+            await asyncio.to_thread(launcher.resume, sandbox_id)
+            # Mint a fresh token: the old one died with the host process's env
+            # (only its hash persists). register_managed_host's relaunch branch
+            # overwrites it in place, keeping the host_id's session bindings.
+            token = secrets.token_urlsafe(32)
+            await asyncio.to_thread(
+                host_store.register_managed_host,
+                host_id=host.host_id,
+                name=host.name,
+                owner=host.owner,
+                token=token,
+                provider=launcher.provider,
+                sandbox_id=sandbox_id,
+                token_expires_at=now_epoch() + config.token_ttl_s,
+            )
+            await asyncio.to_thread(
+                _start_host_in_sandbox,
+                launcher,
+                sandbox_id,
+                token=token,
+                host_id=host.host_id,
+                host_name=host.name,
+                server_url=config.server_url,
+                repo=None,  # the persistent volume already holds the workspace
+            )
+            await _wait_for_host_online(host_store, host.host_id)
+        except Exception as exc:
+            # A failed wake must NOT tear the sandbox down (the volume is the
+            # user's); just surface it.
+            if isinstance(exc, HTTPException):
+                raise
+            message = exc.message if isinstance(exc, click.ClickException) else str(exc)
+            raise HTTPException(
+                status_code=502, detail=f"managed host wake failed: {message}"
+            ) from exc
 
 
 async def terminate_managed_host(

@@ -45,6 +45,7 @@ from omnigent.runner.app import (
     _agent_os_env_from_spec,
     _auto_create_claude_terminal,
     _auto_create_codex_terminal,
+    _auto_create_cursor_terminal,
     _auto_create_pi_terminal,
     _auto_create_repl_terminal,
     _deliver_subagent_wake_post,
@@ -1152,6 +1153,137 @@ async def test_create_session_threads_cursor_bridge_dir_without_dead_guard_env(
         )
     }
     assert "HARNESS_CURSOR_NATIVE_REQUEST_SESSION_ID" not in env
+
+
+@pytest.mark.asyncio
+async def test_create_session_threads_workspace_to_pi_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pi pre-spawn receives the session workspace, not the bundle dir."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    session_id = "conv_pi_worktree"
+    runner_workspace = tmp_path / "runner-workspace"
+    runner_workspace.mkdir()
+    bundle_dir = tmp_path / "runner-specs" / "ag_pi-v1"
+    bundle_dir.mkdir(parents=True)
+    worktree = tmp_path / "repo-worktrees" / "feature-x"
+    worktree.mkdir(parents=True)
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi-worktree-agent",
+        skills_filter="none",
+        executor=ExecutorSpec(config={"harness": "pi"}),
+    )
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    class _SessionWorkspaceClient(NullServerClient):
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            del kwargs
+            if url == f"/v1/sessions/{session_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": session_id,
+                        "agent_id": "ag_pi",
+                        "created_at": 1.0,
+                        "workspace": str(worktree),
+                    },
+                    request=httpx.Request("GET", url),
+                )
+            return await super().get(url)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_SessionWorkspaceClient(),  # type: ignore[arg-type]
+        runner_workspace=runner_workspace,
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "ag_pi"},
+        )
+
+    assert resp.status_code == 201
+    assert pm.get_client_calls
+    conversation_id, harness, env = pm.get_client_calls[-1]
+    assert conversation_id == session_id
+    assert harness == "pi"
+    assert env is not None
+    assert env["HARNESS_PI_CWD"] == str(worktree.resolve())
+    assert env["HARNESS_PI_BUNDLE_DIR"] == str(bundle_dir)
+
+
+@pytest.mark.parametrize("workspace_value", [None, "   "])
+@pytest.mark.asyncio
+async def test_create_session_threads_runner_workspace_to_pi_cwd_when_session_workspace_missing(
+    workspace_value: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pi pre-spawn falls back to runner workspace when session workspace is empty."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    session_id = "conv_pi_runner_workspace"
+    runner_workspace = tmp_path / "runner-workspace"
+    runner_workspace.mkdir()
+    bundle_dir = tmp_path / "runner-specs" / "ag_pi-v1"
+    bundle_dir.mkdir(parents=True)
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi-runner-workspace-agent",
+        skills_filter="none",
+        executor=ExecutorSpec(config={"harness": "pi"}),
+    )
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    class _SessionWorkspaceClient(NullServerClient):
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            del kwargs
+            if url == f"/v1/sessions/{session_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": session_id,
+                        "agent_id": "ag_pi",
+                        "created_at": 1.0,
+                        "workspace": workspace_value,
+                    },
+                    request=httpx.Request("GET", url),
+                )
+            return await super().get(url)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_SessionWorkspaceClient(),  # type: ignore[arg-type]
+        runner_workspace=runner_workspace,
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "ag_pi"},
+        )
+
+    assert resp.status_code == 201
+    assert pm.get_client_calls
+    conversation_id, harness, env = pm.get_client_calls[-1]
+    assert conversation_id == session_id
+    assert harness == "pi"
+    assert env is not None
+    assert env["HARNESS_PI_CWD"] == str(runner_workspace.resolve())
+    assert env["HARNESS_PI_BUNDLE_DIR"] == str(bundle_dir)
 
 
 @pytest.mark.parametrize(
@@ -2663,6 +2795,70 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
     assert closed["client"] is True
     assert closed["app_server"] is True
     assert session_id not in _AUTO_CODEX_APP_SERVERS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exc", "expected_cause"),
+    [
+        (TimeoutError("no thread/started observed"), "startup timed out"),
+        (
+            RuntimeError("event stream ended"),
+            "event stream ended before a thread was created",
+        ),
+    ],
+)
+async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    exc: Exception,
+    expected_cause: str,
+) -> None:
+    """
+    The startup breadcrumb must describe the actual failure mode: a timeout
+    reads as "startup timed out", while a RuntimeError (TUI exited / event
+    stream ended) must NOT be mislabeled as a timeout.
+    """
+    from omnigent import codex_native_forwarder
+    from omnigent.codex_native_bridge import read_bridge_startup_error
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    class _Client:
+        async def close(self) -> None:
+            return None
+
+    class _AppServer:
+        async def close(self) -> None:
+            return None
+
+    async def _raise(*_args: object, **_kwargs: object) -> str:
+        raise exc
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _raise)
+
+    session_id = "conv_codex_startup_error_test"
+    _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
+    try:
+        await _codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=tmp_path / "codex-home",
+            event_client=_Client(),  # type: ignore[arg-type]
+        )
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    recorded = read_bridge_startup_error(tmp_path)
+    assert recorded is not None
+    assert expected_cause in recorded
+    assert type(exc).__name__ in recorded
+    # A RuntimeError must never be described as a timeout.
+    if not isinstance(exc, TimeoutError):
+        assert "timed out" not in recorded
 
 
 @pytest.mark.asyncio
@@ -10470,6 +10666,10 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     spec = captured["spec"]
     assert spec.command == "claude"
     assert spec.env["ENABLE_TOOL_SEARCH"] == "true"
+    # The claude-native terminal must opt into keeping its private tmux server
+    # alive past an inner-CLI exit, so a sub-agent worker whose `claude` exits
+    # early no longer cascades into "no server running" (#540).
+    assert spec.keep_alive_after_exit is True
     args = spec.args
     settings = json.loads(args[args.index("--settings") + 1])
     assert "PermissionRequest" in settings["hooks"]
@@ -11039,6 +11239,171 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     assert "databricks auth token --fake-helper" in " ".join(spec.args)
 
     await fake_client.aclose()
+
+
+async def _run_auto_create_cursor_terminal(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    agent_spec: AgentSpec | None,
+    terminal_launch_args: list[str] | None,
+) -> Any:
+    """Drive ``_auto_create_cursor_terminal`` and return the captured launch spec.
+
+    Stubs the cursor-agent binary lookup, the transcript forwarder, and the
+    runner auth factory so the model-injection branch runs without a real
+    ``cursor-agent`` install or Databricks credentials. The session snapshot
+    (workspace + ``terminal_launch_args``) is served from an in-memory
+    ``httpx.MockTransport``, and a fake registry records the ``spec`` passed to
+    ``launch_required_terminal`` so the test can assert on ``spec.args``.
+    """
+    from omnigent.runner import _entry as _runner_entry
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr("omnigent.cursor_native.resolve_cursor_executable", lambda: "cursor-agent")
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.cursor_native_forwarder.supervise_cursor_forwarder",
+        _no_op_forwarder,
+    )
+    # The forwarder is stubbed, so the auth it would carry is never used — keep
+    # the factory from reaching for ambient Databricks credentials in tests.
+    monkeypatch.setattr(_runner_entry, "_make_auth_token_factory", lambda *a, **k: None)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched terminal spec; no real terminal registry."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec and return a terminal resource view."""
+            del terminal_name, session_key, resource_role, parent_os_env
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_cursor_main",
+                type="terminal",
+                session_id=session_id,
+                name="cursor:main",
+                metadata={"terminal_name": "cursor", "session_key": "main", "running": True},
+            )
+
+    snapshot = {"workspace": str(workspace), "terminal_launch_args": terminal_launch_args}
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json=snapshot)),
+    )
+    try:
+        await _auto_create_cursor_terminal(
+            "conv_cursor_model",
+            _FakeResourceRegistry(),  # type: ignore[arg-type]
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            ensure_comment_relay=None,
+            agent_spec=agent_spec,
+        )
+    finally:
+        await fake_client.aclose()
+    return captured["spec"]
+
+
+@pytest.mark.asyncio
+async def test_auto_create_cursor_terminal_injects_spec_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spec-pinned cursor model is threaded into the cursor-agent launch args.
+
+    The web-UI / daemon path launches ``cursor-agent`` from the runner, so the
+    session's ``executor.model`` (from ``--model`` or config.yaml ``model:``)
+    must reach the TUI as ``--model <id>`` — the regression #933 fixes.
+    """
+    spec = await _run_auto_create_cursor_terminal(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        agent_spec=AgentSpec(
+            spec_version=1, name="cursor", executor=ExecutorSpec(model="sonnet-4-thinking")
+        ),
+        terminal_launch_args=None,
+    )
+    assert spec.command == "cursor-agent"
+    assert "--model" in spec.args
+    assert spec.args[spec.args.index("--model") + 1] == "sonnet-4-thinking"
+
+
+@pytest.mark.parametrize(
+    "passthrough",
+    [
+        # Both the split (``-- --model X``) and joined (``--model=X``) forms a
+        # user can pass through must suppress injection — otherwise cursor-agent
+        # sees two ``--model`` values and selection is ambiguous.
+        ["--model", "gpt-5"],
+        ["--model=gpt-5"],
+        ["-m", "gpt-5"],
+    ],
+    ids=["split", "joined", "short"],
+)
+@pytest.mark.asyncio
+async def test_auto_create_cursor_terminal_user_model_wins(
+    passthrough: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user-pinned passthrough model wins; the spec model is not injected."""
+    spec = await _run_auto_create_cursor_terminal(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        agent_spec=AgentSpec(
+            spec_version=1, name="cursor", executor=ExecutorSpec(model="sonnet-4-thinking")
+        ),
+        terminal_launch_args=passthrough,
+    )
+    # Exactly the user's args survive — no second ``--model`` / spec model added.
+    assert spec.args.count("--model") == passthrough.count("--model")
+    assert "sonnet-4-thinking" not in spec.args
+
+
+@pytest.mark.parametrize(
+    "spec_model",
+    [None, "", "databricks-claude-opus", "databricks/claude-opus"],
+    ids=["none", "empty", "databricks-dash", "databricks-slash"],
+)
+@pytest.mark.asyncio
+async def test_auto_create_cursor_terminal_omits_model_when_unusable(
+    spec_model: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No usable cursor model id → no ``--model`` (cursor-agent keeps its default).
+
+    Gateway-routed ``databricks-*`` ids are not cursor-agent model ids, so they
+    are dropped rather than passed through (which would error on launch).
+    """
+    spec = await _run_auto_create_cursor_terminal(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        agent_spec=AgentSpec(
+            spec_version=1, name="cursor", executor=ExecutorSpec(model=spec_model)
+        ),
+        terminal_launch_args=None,
+    )
+    assert "--model" not in spec.args
 
 
 @pytest.mark.parametrize(

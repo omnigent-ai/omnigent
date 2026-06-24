@@ -14,9 +14,11 @@
 // shells are enumerated and created in the rail's Shells tab.
 
 import { TerminalIcon, XIcon } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import type { CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { TerminalView } from "@/components/blocks/TerminalView";
 import { AGENT_TERMINAL_IDS, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
+import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -40,12 +42,18 @@ interface MainTerminalViewProps {
    * instead. Default false (owner / single-user).
    */
   readOnly?: boolean;
+  /**
+   * Exposes the outer terminal surface so the iOS native shell can show its
+   * server switcher only while this surface is actually frontmost.
+   */
+  onSurfaceElement?: (element: HTMLElement | null) => void;
 }
 
 export function MainTerminalView({
   conversationId,
   initialTerminalKey,
   readOnly = false,
+  onSurfaceElement,
 }: MainTerminalViewProps) {
   const { terminals } = useTerminals(conversationId);
   const terminalFirstCtx = useTerminalFirst();
@@ -63,6 +71,9 @@ export function MainTerminalView({
   const [activeKey, setActiveKey] = useState(initialTerminalKey || "");
   const { getStatus, setTerminalConnectionState, markTerminalActive } =
     useTerminalStatuses(terminals);
+  const keyboardInset = useIOSNativeKeyboardInset();
+  const containerStyle: CSSProperties | undefined =
+    keyboardInset > 0 ? { paddingBottom: `calc(0.375rem + ${keyboardInset}px)` } : undefined;
 
   // Honor a retarget while already open (a rail shell click can point
   // an open view at a different terminal); the validity effect below
@@ -94,19 +105,28 @@ export function MainTerminalView({
     (terminalFirstCtx?.isTerminalFirst ?? false) &&
     activeTerminal !== null &&
     !AGENT_TERMINAL_IDS.has(activeTerminal.id);
+  const setSurfaceElement = useCallback(
+    (element: HTMLDivElement | null) => {
+      onSurfaceElement?.(element);
+    },
+    [onSurfaceElement],
+  );
 
   return (
     // Outer wrapper fills the main column. `pt-16` clears the
-    // absolute-positioned AppShell header; `px-3` gives a 12px gutter on
+    // absolute-positioned AppShell header on desktop; iOS native gets a
+    // safe-area-aware override in index.css. `px-3` gives a 12px gutter on
     // the sides. The card stretches to full width and height of the
     // available area. The ConnectionIndicator pill renders just below
     // this wrapper in ChatPage's MainAgentSurface.
     <div
+      ref={setSurfaceElement}
       data-testid="main-terminal-view"
       // Exposed for e2e assertions that an expand targeted the right
       // terminal (not just that the view opened).
       data-active-terminal={activeKey}
-      className="flex min-h-0 flex-1 flex-col px-3 pt-16 pb-1.5"
+      className="main-terminal-view flex min-h-0 flex-1 flex-col px-3 pt-16 pb-1.5"
+      style={containerStyle}
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-sm">
         {terminals.length === 0 ? (

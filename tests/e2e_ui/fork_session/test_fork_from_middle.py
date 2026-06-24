@@ -26,6 +26,8 @@ import re
 import httpx
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.conftest import configure_mock_llm
+
 # Two distinct code words with no shared substring, so the kept/dropped
 # assertions can't satisfy each other. Only the KEPT word is part of the
 # turn the fork copies; the DROPPED word lives in the turn after the fork
@@ -41,6 +43,7 @@ def test_fork_from_middle_truncates_history(
     page: Page,
     seeded_session: tuple[str, str],
     runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """Fork from the first turn — the clone carries only history up to it.
 
@@ -61,6 +64,17 @@ def test_fork_from_middle_truncates_history(
         clone unbound, so a message would otherwise have no runner).
     """
     base_url, session_id = seeded_session
+
+    # Content-route the recall turn so the mock echoes the kept marker.
+    # Turns 1 & 2 ("reply with just OK") hit the generic fallback ("Mock LLM
+    # response.") which is enough for the fork-point anchor assertions.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": _KEPT_MARKER}],
+        key="fork-recall",
+        match="What code word did I ask you to remember",
+    )
+
     page.goto(f"{base_url}/c/{session_id}")
 
     composer = page.get_by_placeholder("Ask the agent anything…")
