@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1052" height="524" viewBox="0 0 1052 524">
+  <defs>
+    <style>text { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; }</style>
+  </defs>
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="256" y="62" font-size="22" fill="#1971c2" opacity="1"><tspan x="256" dy="0">Python logging → OTel correlation: before vs after</tspan></text>
+  <text x="216" y="108" font-size="14" fill="#868e96" opacity="1"><tspan x="216" dy="0">Before (on main)</tspan></text>
+  <text x="716" y="108" font-size="14" fill="#868e96" opacity="1"><tspan x="716" dy="0">After (this PR)</tspan></text>
+  <rect x="40" y="124" width="472" height="60" rx="8" stroke="#3b5bdb" fill="#3b5bdb" stroke-width="1" opacity="1" />
+  <text x="56" y="147" font-size="13" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">OTel trace active</tspan></text>
+  <text x="56" y="167" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">trace_id = 97dc8a75a09840f99e345fa517a814dc</tspan></text>
+  <rect x="540" y="124" width="472" height="60" rx="8" stroke="#3b5bdb" fill="#3b5bdb" stroke-width="1" opacity="1" />
+  <text x="556" y="147" font-size="13" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">OTel trace active</tspan></text>
+  <text x="556" y="167" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">trace_id = 97dc8a75a09840f99e345fa517a814dc</tspan></text>
+  <rect x="40" y="196" width="472" height="108" rx="8" stroke="#868e96" fill="#868e96" stroke-width="1" opacity="1" />
+  <text x="56" y="219" font-size="13" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">logger.info(&quot;outside span&quot;)</tspan></text>
+  <text x="56" y="247" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">  msg: outside span</tspan></text>
+  <text x="56" y="267" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">  trace_id: (none)</tspan></text>
+  <text x="56" y="287" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">  span_id:  (none)</tspan></text>
+  <rect x="540" y="196" width="472" height="108" rx="8" stroke="#868e96" fill="#868e96" stroke-width="1" opacity="1" />
+  <text x="556" y="219" font-size="13" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">logger.info(&quot;outside span&quot;)</tspan></text>
+  <text x="556" y="247" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  msg: outside span</tspan></text>
+  <text x="556" y="267" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  trace_id: (none)</tspan></text>
+  <text x="556" y="287" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  span_id:  (none)</tspan></text>
+  <rect x="40" y="316" width="472" height="168" rx="8" stroke="#c92a2a" fill="#c92a2a" stroke-width="1" opacity="1" />
+  <text x="56" y="341" font-size="13" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">logger.info(&quot;inside agent span&quot;)</tspan></text>
+  <text x="56" y="371" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">  msg: inside agent span</tspan></text>
+  <text x="56" y="391" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">  trace_id: (none)</tspan></text>
+  <text x="56" y="411" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">  span_id:  (none)</tspan></text>
+  <text x="56" y="448" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">No correlation. Operators have to</tspan></text>
+  <text x="56" y="468" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">cross-reference logs vs traces by timestamp.</tspan></text>
+  <rect x="540" y="316" width="472" height="168" rx="8" stroke="#087f5b" fill="#087f5b" stroke-width="1" opacity="1" />
+  <text x="556" y="341" font-size="13" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">logger.info(&quot;inside agent span&quot;)</tspan></text>
+  <text x="556" y="371" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  msg: inside agent span</tspan></text>
+  <text x="556" y="391" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  trace_id: 97dc8a75a09840f99e345fa517a814dc</tspan></text>
+  <text x="556" y="411" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  span_id:  1000000000000001</tspan></text>
+  <text x="556" y="448" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">Backend joins logs to spans automatically.</tspan></text>
+  <text x="556" y="468" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">No code-site changes needed.</tspan></text>
+</svg>
