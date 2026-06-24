@@ -89,12 +89,14 @@ OMNIGENT_HARNESSES = frozenset(
         "cursor-native",
         "goose",
         "goose-native",
+        "hermes",
         "openai-agents",
         "open-responses",
         "opencode-native",
         "pi",
         "pi-native",
         "qwen",
+        "qwen-native",
     },
 )
 # User-facing aliases accepted in specs and normalized before runtime dispatch.

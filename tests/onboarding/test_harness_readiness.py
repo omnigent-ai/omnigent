@@ -94,6 +94,7 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "native-cursor",
         "goose-native",
         "native-goose",
+        "hermes",
     ],
 )
 def test_cli_harness_configured_only_when_binary_installed(
@@ -157,12 +158,17 @@ def test_configured_harness_map_covers_all_spellings(
         "opencode-native",
         "native-opencode",
         "opencode",
-        # Qwen harnesses
+        # Qwen harnesses — ACP (``qwen`` / ``qwen-code``) + native TUI
+        # (``qwen-native`` / ``native-qwen``); all gate on the qwen CLI.
         "qwen",
         "qwen-code",
+        "qwen-native",
+        "native-qwen",
         # Copilot SDK harness + its user-facing alias.
         "copilot",
         "github-copilot",
+        # Hermes Agent harness — gates on the hermes CLI.
+        "hermes",
     }
     assert set(result) == expected_keys
 
@@ -207,6 +213,7 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "goose-native",
         "native-goose",
         "qwen",
+        "hermes",
     ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
 

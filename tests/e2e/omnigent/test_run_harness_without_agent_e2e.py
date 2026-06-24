@@ -180,6 +180,17 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``goose-native`` is excluded for the same reason as ``claude-native`` /
     ``cursor-native``: it is a terminal-first TUI launched via ``omni goose``
     (tmux pane + bridge dir), not ``omnigent run --harness goose-native``.
+
+    ``qwen-native`` is excluded for the same reason as ``goose-native`` /
+    ``cursor-native``: it is a terminal-first TUI launched via ``omni qwen``
+    (tmux pane + bridge dir, driving qwen's ``--input-file`` / ``--json-file``),
+    not ``omnigent run --harness qwen-native``. Its coverage is the dedicated
+    qwen-native bridge/executor/forwarder unit tests.
+
+    ``hermes`` is excluded because it requires the ``hermes`` CLI binary
+    (installed separately via Nous Research's install script) and authenticates
+    through its own provider config, not the shared gateway/profile probe
+    wiring this matrix drives.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
@@ -191,7 +202,9 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "antigravity",
         "copilot",
         "qwen",
+        "qwen-native",
         "goose",
         "goose-native",
+        "hermes",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

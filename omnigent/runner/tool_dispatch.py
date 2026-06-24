@@ -208,14 +208,35 @@ _SUBAGENT_TOOLS = frozenset({"sys_session_send"})
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 
-# Priority 5f.0: Session query tools — peek/list/close/get_info. The runner
-# has no in-process ConversationStore, so these read/mutate session state via
-# the Omnigent server's existing REST endpoints (GET /items, GET /child_sessions,
-# GET /sessions/{id}, PATCH /sessions/{id}) over server_client — same channel
-# and security posture as _execute_subagent_tool / _execute_comment_tool.
+# Priority 5f.0: Session query tools — peek/list/close/get_info/share. The
+# runner has no in-process ConversationStore, so these read/mutate session
+# state via the Omnigent server's existing REST endpoints (GET /items, GET
+# /child_sessions, GET /sessions/{id}, PATCH /sessions/{id}, PUT
+# /sessions/{id}/permissions) over server_client — same channel and security
+# posture as _execute_subagent_tool / _execute_comment_tool.
 _SESSION_QUERY_TOOLS = frozenset(
-    {"sys_session_get_history", "sys_session_list", "sys_session_close", "sys_session_get_info"}
+    {
+        "sys_session_get_history",
+        "sys_session_list",
+        "sys_session_close",
+        "sys_session_get_info",
+        "sys_session_share",
+    }
 )
+
+# Grantee sentinel for an anonymous, public read-only share. Mirrors the
+# server's RESERVED_USER_PUBLIC; only specs with
+# ``agent_session_sharing: public`` may grant it (enforced in
+# _session_share_via_rest — the server can't see the agent's sharing
+# policy, so the runner is the gate).
+_PUBLIC_USER_SENTINEL = "__public__"
+
+# Spec ``agent_session_sharing:`` policy values
+# (omnigent.spec.types.SharePolicy) that enable the sys_session_share
+# tool. Compared as plain strings since SharePolicy is a str-enum;
+# anything else (incl. "none"/absent) is off.
+_SHARE_ENABLED_POLICIES = frozenset({"non-public", "public"})
+_SHARE_PUBLIC_POLICY = "public"
 
 # Priority 5f.1: web_fetch — translates the LLM-facing query/url
 # arguments into a sys_session_send call against the built-in
@@ -2636,6 +2657,7 @@ async def _execute_session_query_tool(
     *,
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
+    agent_spec: Any | None = None,
 ) -> str:
     """
     Runner-local handler for ``sys_session_get_history`` / ``sys_session_list`` /
@@ -2652,6 +2674,8 @@ async def _execute_session_query_tool(
       best-effort ``GET /v1/runners/{id}/status`` for connectivity)
     - ``sys_session_close`` → ``GET`` the target snapshot then ``PATCH
       /v1/sessions/{target}`` with a tombstoned title
+    - ``sys_session_share`` → ``PUT /v1/sessions/{target}/permissions``
+      with the grantee + numeric level
 
     Output shapes mirror the in-process tools in
     :mod:`omnigent.tools.builtins.spawn` so the LLM sees identical
@@ -2661,13 +2685,19 @@ async def _execute_session_query_tool(
     :func:`_execute_subagent_tool`.
 
     :param tool_name: ``"sys_session_get_history"``, ``"sys_session_list"``,
-        ``"sys_session_close"``, or ``"sys_session_get_info"``.
+        ``"sys_session_close"``, ``"sys_session_get_info"``, or
+        ``"sys_session_share"``.
     :param arguments: JSON-encoded arguments string from the LLM, e.g.
         ``'{"conversation_id": "conv_abc123", "tail_items": 5}'``.
     :param conversation_id: The calling session id, e.g. ``"conv_root1"``;
         used as the parent for ``sys_session_list``.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         if unavailable (returns an error string).
+    :param agent_spec: The session's :class:`AgentSpec`. Used only by
+        ``sys_session_share`` to read the spec's
+        ``agent_session_sharing:`` policy (the server can't see it, so
+        the runner is the gate). ``None`` when no spec is available —
+        sharing then fails closed.
     :returns: Tool output JSON string matching the in-process tool shape.
     """
     if server_client is None:
@@ -2685,6 +2715,8 @@ async def _execute_session_query_tool(
         return await _session_get_history_via_rest(args, server_client)
     if tool_name == "sys_session_get_info":
         return await _session_get_info_via_rest(args, conversation_id, server_client)
+    if tool_name == "sys_session_share":
+        return await _session_share_via_rest(args, conversation_id, server_client, agent_spec)
     return await _session_close_via_rest(args, conversation_id, server_client)
 
 
@@ -2788,6 +2820,147 @@ async def _session_get_info_via_rest(
             "pending_elicitations": pending,
             "pending_elicitation_count": len(pending),
         }
+    )
+
+
+def _omnigent_error_message(resp: httpx.Response) -> str | None:
+    """
+    Extract the human-readable message from an Omnigent error response.
+
+    The server renders :class:`omnigent.errors.OmnigentError` as
+    ``{"error": {"code": ..., "message": ...}}`` (see the exception
+    handler in ``omnigent/server/app.py``). Return that ``message`` so a
+    tool can surface the server's own explanation rather than a bare
+    status code; return ``None`` when the body is not that envelope (a
+    non-JSON body, or a differently-shaped payload) so the caller can
+    fall back to a generic message.
+
+    :param resp: The HTTP response whose body to parse, e.g. a 400 from
+        ``PUT /v1/sessions/{id}/permissions``.
+    :returns: The ``error.message`` string, or ``None`` if absent.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        # Non-JSON error body (e.g. an HTML proxy page) — no detail to surface.
+        return None
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            message = err.get("message")
+            if isinstance(message, str) and message:
+                return message
+    return None
+
+
+async def _session_share_via_rest(
+    args: dict[str, Any],
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+    agent_spec: Any | None,
+) -> str:
+    """
+    Grant a user access to a session via ``PUT /v1/sessions/{id}/permissions``.
+
+    Resolves the target from ``args["session_id"]`` (falling back to the
+    caller's own ``conversation_id`` when omitted), maps the friendly
+    ``level`` name to the server's numeric level, and PUTs the grant.
+    Same channel and security posture as the other session REST tools:
+    the server enforces that ``server_client``'s identity holds
+    manage-level access on the target (the session owner does), and caps
+    public (``__public__``) grants at read.
+
+    The spec's ``agent_session_sharing:`` policy is enforced HERE, in the
+    runner, because the server cannot see it: an ``agent_session_sharing:
+    none`` (or unknown) spec refuses every grant, and an
+    ``agent_session_sharing: non-public`` spec refuses ``__public__``.
+    This is the real gate — tool *advertisement* is gated in the
+    ToolManager, but an unadvertised-yet-named call must still be denied
+    so a prompt-injected agent can't escalate by emitting the tool name.
+
+    Maps 404 to ``session_not_found`` and 401/403 to ``access_denied``;
+    other 4xx/5xx surface the server's own error message when present
+    (e.g. the "public is read-only" rejection of a ``__public__`` grant
+    above read level) instead of a bare status code.
+
+    :param args: Parsed tool arguments. Requires ``user_id`` (grantee
+        email or ``"__public__"``); optional ``level`` (``"read"``
+        default / ``"edit"`` / ``"manage"``) and ``session_id``.
+    :param conversation_id: The caller's own session id, used as the
+        default target when ``session_id`` is omitted.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param agent_spec: The session's :class:`AgentSpec`; its
+        ``agent_session_sharing`` policy gates this call. ``None`` (or
+        ``agent_session_sharing: none``) fails closed — no grant is
+        attempted.
+    :returns: JSON ``{"shared": true, ...}`` on success, or a JSON
+        error object.
+    """
+    target = args.get("session_id") or conversation_id
+    if not isinstance(target, str) or not target:
+        return json.dumps({"error": "sys_session_share requires a non-empty 'session_id' string"})
+    user_id = args.get("user_id")
+    if not isinstance(user_id, str) or not user_id:
+        return json.dumps({"error": "sys_session_share requires a non-empty 'user_id'"})
+    # Enforce the spec's ``agent_session_sharing:`` policy (SharePolicy is
+    # a str-enum, so compare its value directly). ``none``/absent disables
+    # the feature; ``__public__`` requires the ``public`` tier specifically.
+    share_policy = getattr(agent_spec, "agent_session_sharing", None)
+    if share_policy not in _SHARE_ENABLED_POLICIES:
+        return json.dumps(
+            {
+                "error": (
+                    "sys_session_share: session sharing is not enabled for this "
+                    "agent (set agent_session_sharing: non-public or "
+                    "agent_session_sharing: public in the spec)"
+                ),
+                "session_id": target,
+            }
+        )
+    if user_id == _PUBLIC_USER_SENTINEL and share_policy != _SHARE_PUBLIC_POLICY:
+        return json.dumps(
+            {
+                "error": (
+                    "sys_session_share: public ('__public__') sharing is not "
+                    "enabled for this agent (requires agent_session_sharing: "
+                    "public); grant a specific user instead"
+                ),
+                "session_id": target,
+            }
+        )
+    # Friendly level name -> the server's numeric permission level
+    # (GrantPermissionRequest accepts 1=read, 2=edit, 3=manage).
+    level_by_name = {"read": 1, "edit": 2, "manage": 3}
+    level_name = args.get("level", "read")
+    if level_name not in level_by_name:
+        return json.dumps(
+            {"error": f"sys_session_share: level must be one of {sorted(level_by_name)}"}
+        )
+    try:
+        resp = await server_client.put(
+            f"/v1/sessions/{target}/permissions",
+            json={"user_id": user_id, "level": level_by_name[level_name]},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_share failed: {exc}"})
+    if resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "session_id": target})
+    if resp.status_code in (401, 403):
+        return json.dumps({"error": "access_denied", "session_id": target})
+    if resp.status_code >= 400:
+        # Surface the server's own message when present — e.g. the 400
+        # rejecting a __public__ grant above read level carries "Public
+        # access is limited to read-only (level 1)", which is far more
+        # actionable for the agent than a bare status code.
+        detail = _omnigent_error_message(resp)
+        if detail is not None:
+            return json.dumps(
+                {"error": detail, "status_code": resp.status_code, "session_id": target}
+            )
+        return json.dumps({"error": f"sys_session_share returned {resp.status_code}"})
+    return json.dumps(
+        {"shared": True, "session_id": target, "user_id": user_id, "level": level_name}
     )
 
 
@@ -3787,6 +3960,7 @@ async def execute_tool(
                 arguments,
                 conversation_id=conversation_id,
                 server_client=server_client,
+                agent_spec=agent_spec,
             )
         elif tool_name in _WEB_FETCH_TOOLS:
             output = await _execute_web_fetch_tool(
