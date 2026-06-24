@@ -551,7 +551,7 @@ class SysSessionShareTool(Tool):
     """
     Grant another user (or the public) access to a session.
 
-    Enabled by the spec's top-level ``share:`` flag
+    Enabled by the spec's top-level ``agent_session_sharing:`` flag
     (:class:`omnigent.spec.types.SharePolicy`), which is its sole gate:
     ``none`` leaves the tool unregistered, ``non-public`` allows
     granting named users, and ``public`` additionally allows the
@@ -576,14 +576,15 @@ class SysSessionShareTool(Tool):
     for an unknown id.
 
     :param allow_public: Whether ``__public__`` grants are permitted —
-        ``True`` only when the spec's ``share:`` flag is ``public``.
-        Reflected in the schema and hard-enforced by the runner.
+        ``True`` only when the spec's ``agent_session_sharing:`` flag is
+        ``public``. Reflected in the schema and hard-enforced by the runner.
     """
 
     def __init__(self, allow_public: bool) -> None:
         """
-        :param allow_public: ``True`` when the spec's ``share:`` policy
-            is ``public`` — permits granting the ``__public__`` sentinel.
+        :param allow_public: ``True`` when the spec's
+            ``agent_session_sharing:`` policy is ``public`` — permits
+            granting the ``__public__`` sentinel.
             ``False`` for ``non-public`` (named users only).
         """
         self._allow_public = allow_public
