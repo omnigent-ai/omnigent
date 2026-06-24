@@ -32,6 +32,14 @@ Tracks pending work and known limitations for the Qwen Code harness
   `cachedReadTokens` out of `input_tokens` (qwen's `inputTokens` is cache-
   inclusive; cost wants the non-cached portion) — see `_accumulate_usage`.
   Verified end-to-end against a live `qwen --acp` turn.
+- **Context status.** The UI context meter shows used/total for qwen. The
+  numerator (per-turn context consumed) comes from `_meta.usage.totalTokens`
+  via cost/token tracking above; the denominator (the model's context-window
+  *limit*) comes from a curated Qwen lookup in `get_model_context_window`
+  (`_QWEN_CONTEXT_WINDOWS`) — qwen models are absent from litellm and the MLflow
+  catalog, so without it they fell back to the wrong 128K default
+  (qwen3-coder-plus is 1M). A spec's `executor.context_window` still overrides;
+  unrecognized qwen models keep the 128K fallback.
 - **OS sandbox.** When the spec's `os_env.sandbox` is not `none`, the whole
   `qwen` process tree is wrapped in the platform sandbox (bwrap / seatbelt) at
   spawn (`_sandbox_launch_path`), confining qwen's own file/shell tools to the
@@ -49,12 +57,6 @@ comments; this is the *what*, not the *how*.)
   the session is reused across turns, so switching models mid-session (`/model`)
   has no effect. Supporting it means re-creating the ACP session on a model
   change (or passing a per-turn model if qwen accepts one).
-- [ ] **Context status.** Per-turn context *consumed* is now available
-  (qwen's `_meta.usage.totalTokens`, surfaced via cost/token tracking — see
-  What works today), but the executor still overrides no `max_context_tokens`,
-  so the UI's context meter has the numerator without the denominator. Report
-  the model's context-window *limit* (a model-capability lookup, not in the ACP
-  stream) so the meter can show used/total.
 - [ ] **Native TUI variant (`native-qwen`).** Attach to the live `qwen` terminal
   (like `pi-native`) for a fully interactive experience instead of a piped turn.
 

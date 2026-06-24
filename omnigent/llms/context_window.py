@@ -54,6 +54,42 @@ _MODEL_PREFIX_TO_PROVIDER: dict[str, str] = {
 
 _DEFAULT_CONTEXT_WINDOW: int = 128_000
 
+# Curated context windows for the Qwen models the qwen (``qwen --acp``) harness
+# drives. Qwen models are absent from both litellm's bundled registry and the
+# MLflow provider catalog, so without this they fall back to the conservative
+# 128K default — wrong by ~8x for the coding-plan defaults (qwen3-coder-plus is
+# 1M), leaving the UI context meter mis-sized. Keyed by the *normalized* base id
+# (provider prefix and ``:tag`` suffix stripped — see
+# :func:`_qwen_context_window`). Values are the published Alibaba Cloud Model
+# Studio / DashScope maxima; unrecognized qwen models keep the 128K fallback
+# (and a spec's ``executor.context_window`` always overrides this).
+_QWEN_CONTEXT_WINDOWS: dict[str, int] = {
+    "qwen3-coder-plus": 1_048_576,  # DashScope coding-plan default: 1M tokens
+    "qwen3-coder-flash": 1_048_576,  # served flash variant: 1M tokens
+    "qwen3-coder": 262_144,  # 480B open weights: 256K native (1M w/ YaRN)
+    "qwen-plus": 131_072,
+    "qwen-max": 131_072,
+    "qwen-turbo": 1_008_192,
+    "qwen-flash": 1_000_000,
+}
+
+
+def _qwen_context_window(model: str) -> int | None:
+    """Look up a Qwen model's context window from the curated table.
+
+    Normalizes the id the way model strings reach us — a provider prefix
+    (``qwen/qwen3-coder``, ``openrouter/qwen/qwen3-coder``) and an OpenRouter-
+    style ``:tag`` suffix (``qwen3-coder:free``) — down to the bare base id
+    before matching against :data:`_QWEN_CONTEXT_WINDOWS`.
+
+    :param model: The model identifier (any namespacing).
+    :returns: The context window in tokens, or ``None`` when the model isn't a
+        recognized Qwen entry (caller falls back to the 128K default).
+    """
+    bare = model.rsplit("/", 1)[-1].split(":", 1)[0].strip().lower()
+    return _QWEN_CONTEXT_WINDOWS.get(bare)
+
+
 # Fallback cache pricing as a multiple of the plain input rate, used when the
 # catalog publishes no explicit cache rate for a model (e.g. ``databricks-*``
 # entries today omit them). Both providers we serve publish the same ratios:
@@ -247,7 +283,11 @@ def get_model_context_window(model: str) -> int:
     try:
         import litellm
     except ImportError:
-        return _fetch_context_window_from_mlflow(model) or _DEFAULT_CONTEXT_WINDOW
+        return (
+            _fetch_context_window_from_mlflow(model)
+            or _qwen_context_window(model)
+            or _DEFAULT_CONTEXT_WINDOW
+        )
     try:
         info = litellm.get_model_info(model)
         if info:
@@ -265,7 +305,11 @@ def get_model_context_window(model: str) -> int:
                     return int(limit)
         except Exception:
             pass
-    return _fetch_context_window_from_mlflow(model) or _DEFAULT_CONTEXT_WINDOW
+    return (
+        _fetch_context_window_from_mlflow(model)
+        or _qwen_context_window(model)
+        or _DEFAULT_CONTEXT_WINDOW
+    )
 
 
 def resolve_effective_context_window(
