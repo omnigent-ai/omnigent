@@ -2112,6 +2112,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         *,
         title: str | None = None,
         agent_id: str | None = None,
+        cloned_agent_name: str | None = None,
+        cloned_agent_bundle_location: str | None = None,
+        cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
@@ -2146,10 +2149,22 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``, defaults to ``"Fork of <source_title>"``
             (or ``"Fork of <source_id>"`` when the source has no
             title).
-        :param agent_id: Agent ID to bind the fork to. When
-            ``None``, the fork inherits the source's ``agent_id``.
-            Callers that clone the agent row before forking pass
-            the cloned agent's ID here.
+        :param agent_id: Agent ID to bind the fork to. When ``None``,
+            the fork inherits the source's ``agent_id``. With
+            ``cloned_agent_bundle_location`` set, a fresh agent row is
+            created with this id; otherwise it must name an existing
+            agent, whose ``session_id`` is repointed at the fork.
+        :param cloned_agent_name: Name for the cloned agent row.
+            Required when ``cloned_agent_bundle_location`` is set.
+        :param cloned_agent_bundle_location: When set, clone this
+            bundle into a new session-scoped agent row (id
+            ``agent_id``) created atomically in this transaction, so a
+            fork failure rolls it back instead of orphaning a
+            ``session_id IS NULL`` built-in. ``None`` keeps the legacy
+            bind-existing behavior.
+        :param cloned_agent_description: Optional description for the
+            cloned agent row. Ignored unless
+            ``cloned_agent_bundle_location`` is set.
         :param copy_model_settings: When ``True`` (default), copy the
             source's ``model_override`` and ``reasoning_effort``. When
             ``False``, both are left ``None`` so the fork falls back to
@@ -2207,6 +2222,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     else f"Fork of {source_conversation_id[:16]}…"
                 )
             )
+            # Cloning the agent in-transaction: start the conversation with
+            # agent_id=NULL (the row doesn't exist yet — an autoflush would
+            # else break the agent_id FK) and backfill after inserting it.
+            creating_clone = cloned_agent_bundle_location is not None
             new_conv_id = generate_conversation_id()
             new_conv = SqlConversation(
                 id=new_conv_id,
@@ -2218,7 +2237,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # root mirrors its own id (matches the
                 # ``_new_session_conversation_row`` invariant).
                 root_conversation_id=new_conv_id,
-                agent_id=agent_id if agent_id is not None else source.agent_id,
+                agent_id=(
+                    None
+                    if creating_clone
+                    else (agent_id if agent_id is not None else source.agent_id)
+                ),
                 reasoning_effort=source.reasoning_effort if copy_model_settings else None,
                 model_override=source.model_override if copy_model_settings else None,
                 # The brain-harness override is family-bound like the model,
@@ -2297,8 +2320,29 @@ class SqlAlchemyConversationStore(ConversationStore):
             # even when the source predates the counter.
             new_conv.next_position = len(source_items)
 
-            # Bind the cloned agent to the forked session atomically.
-            if agent_id is not None:
+            # Create/bind the fork's session-scoped agent atomically.
+            if creating_clone:
+                # Mint the clone here so it's born with session_id set (never
+                # NULL) and rolls back with the fork on failure — never
+                # leaking as a phantom built-in.
+                assert (
+                    agent_id is not None
+                    and cloned_agent_name is not None
+                    and cloned_agent_bundle_location is not None
+                )
+                session.add(
+                    _new_session_agent_row(
+                        agent_id=agent_id,
+                        agent_name=cloned_agent_name,
+                        agent_bundle_location=cloned_agent_bundle_location,
+                        agent_description=cloned_agent_description,
+                        conversation_id=new_conv.id,
+                        now=now,
+                    )
+                )
+                session.flush()
+                new_conv.agent_id = agent_id
+            elif agent_id is not None:
                 agent_row = session.get(SqlAgent, agent_id)
                 if agent_row is not None:
                     agent_row.session_id = new_conv.id

@@ -126,6 +126,9 @@ class _ConversationStore:
         *,
         title: str | None = None,
         agent_id: str | None = None,
+        cloned_agent_name: str | None = None,
+        cloned_agent_bundle_location: str | None = None,
+        cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
@@ -139,6 +142,11 @@ class _ConversationStore:
         :param title: Optional title for the fork.
         :param agent_id: Agent ID override. When ``None``, inherits
             the source's ``agent_id``.
+        :param cloned_agent_name: Name for the fork's cloned agent row
+            (route supplies ``"<name> (fork <id>)"`` when cloning).
+        :param cloned_agent_bundle_location: Bundle the fork clones into
+            a session-scoped agent row created atomically in the store.
+        :param cloned_agent_description: Optional clone description.
         :param copy_model_settings: Whether the source's model settings
             carry over (route passes ``False`` on a cross-family switch).
         :param carry_history_into_native: Whether to mark the fork for
@@ -163,6 +171,9 @@ class _ConversationStore:
                 "source": source_conversation_id,
                 "title": title,
                 "agent_id": agent_id,
+                "cloned_agent_name": cloned_agent_name,
+                "cloned_agent_bundle_location": cloned_agent_bundle_location,
+                "cloned_agent_description": cloned_agent_description,
                 "copy_model_settings": copy_model_settings,
                 "carry_history_into_native": carry_history_into_native,
                 "resume_source_native_session": resume_source_native_session,
@@ -396,20 +407,33 @@ async def test_fork_session_happy_path() -> None:
     )
     assert body["title"] == "My Fork"
 
-    # Exactly 1 agent clone — more means the route duplicated the clone
-    # step; 0 means it skipped cloning and reused the source agent.
-    assert len(agent_store.create_calls) == 1
-    clone_call = agent_store.create_calls[0]
-    assert clone_call["bundle_location"] == "ag_test/fakehash"
-    assert clone_call["description"] == "A test agent"
-    assert "fork" in clone_call["name"], "Cloned agent name should contain 'fork'"
+    # The agent clone is created INSIDE fork_conversation (atomically), not
+    # via a separate agent_store.create — a pre-created row would leak as a
+    # phantom built-in on a fork failure. So the route must NOT pre-create,
+    # and must hand the clone's bundle/description to the store instead.
+    assert len(agent_store.create_calls) == 0, (
+        "Route must not pre-create the clone; it's created atomically in the fork txn"
+    )
 
     # Exactly 1 store fork — more means the route called fork_conversation
     # multiple times; 0 means it never forked.
     assert len(conv_store.fork_calls) == 1
-    assert conv_store.fork_calls[0]["source"] == "conv_src"
-    assert conv_store.fork_calls[0]["title"] == "My Fork"
-    assert conv_store.fork_calls[0]["agent_id"] == clone_call["agent_id"]
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["source"] == "conv_src"
+    assert fork_call["title"] == "My Fork"
+    # The store receives the clone's bundle/name/description so it can mint
+    # the session-scoped agent row in the same transaction.
+    assert fork_call["cloned_agent_bundle_location"] == "ag_test/fakehash"
+    assert fork_call["cloned_agent_description"] == "A test agent"
+    # The clone keeps the source's ROOT name — no "(fork …)" suffix. Being
+    # session-scoped it's exempt from the unique built-in-name index, so no
+    # disambiguator is needed and the name matches its origin directly.
+    assert fork_call["cloned_agent_name"] == "test-agent", (
+        f"Cloned agent should keep the source's root name, got {fork_call['cloned_agent_name']!r}"
+    )
+    assert fork_call["agent_id"] == body["agent_id"], (
+        "Fork must bind the same cloned agent id it asked the store to create"
+    )
 
 
 @pytest.mark.asyncio
@@ -685,18 +709,20 @@ async def test_fork_switch_binds_target_agent_bundle() -> None:
     )
 
     assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
-    # Exactly one clone, of the TARGET agent's bundle (not ag_test/hash).
-    assert len(agent_store.create_calls) == 1
-    clone_call = agent_store.create_calls[0]
-    assert clone_call["bundle_location"] == "ag_codex_native/hash", (
+    # The clone is minted inside fork_conversation, so the route hands it the
+    # TARGET agent's bundle (not ag_test/hash) — not a separate create call.
+    assert len(agent_store.create_calls) == 0
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["cloned_agent_bundle_location"] == "ag_codex_native/hash", (
         "Switch must clone the target agent's bundle; cloning the source's "
         "bundle would launch the wrong harness."
     )
-    # Clone name derives from the target agent ("codex"), proving the
-    # response reflects the bound (switched) agent.
-    assert "codex" in clone_call["name"]
-    # The fork binds the cloned agent id.
-    assert conv_store.fork_calls[0]["agent_id"] == clone_call["agent_id"]
+    # Clone keeps the TARGET agent's root name ("codex"), proving the
+    # response reflects the bound (switched) agent — not the source.
+    assert fork_call["cloned_agent_name"] == "codex"
+    # The fork binds the cloned agent id it asked the store to create.
+    assert fork_call["agent_id"] is not None
+    assert fork_call["agent_id"] != "ag_test"
 
 
 @pytest.mark.asyncio
@@ -989,4 +1015,33 @@ async def test_fork_reversed_native_spelling_carry_gating(
     assert fork_call["carry_history_into_native"] is expect_carry, (
         f"A {harness} fork should set carry_history_into_native={expect_carry}: "
         "reversed native spellings must be treated like their canonical form."
+    )
+
+
+@pytest.mark.asyncio
+async def test_fork_clone_reuses_source_agent_name_verbatim() -> None:
+    """The fork clone reuses the source agent's name as-is — no suffix added."""
+    conv = _make_conversation(agent_id="ag_src")
+    conv_store = _ConversationStore(
+        conversations={"conv_src": conv},
+        items_by_conv={"conv_src": [_make_item("msg_1", "Hi")]},
+    )
+    agent_store = _AgentStore(
+        agents={
+            "ag_src": Agent(
+                id="ag_src",
+                created_at=1,
+                name="claude-native-ui",
+                bundle_location="ag_claude/hash",
+                version=1,
+            ),
+        }
+    )
+    client = TestClient(_build_app(conv_store, agent_store=agent_store))
+
+    resp = client.post("/v1/sessions/conv_src/fork", json={})
+
+    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    assert conv_store.fork_calls[0]["cloned_agent_name"] == "claude-native-ui", (
+        "Fork clone should reuse the source name verbatim, no '(fork …)' suffix"
     )

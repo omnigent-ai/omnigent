@@ -3292,6 +3292,79 @@ def test_fork_conversation_up_to_unknown_response_raises(
         conversation_store.fork_conversation(source.id, up_to_response_id="resp_nope")
 
 
+def test_fork_clone_agent_is_session_scoped(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A fork that clones an agent creates a session-scoped row, not a built-in.
+
+    The clone must be born with ``session_id`` set so it never appears in
+    the built-in agent list (``session_id IS NULL``) that backs the fork
+    picker — the regression that surfaced as duplicate "Claude Code" /
+    "Codex" entries in the fork dialog.
+    """
+    agent_store.create(
+        agent_id="ag_fork_src",
+        name="claude-native-ui",
+        bundle_location="ag_fork_src/hash",
+    )
+    source = conversation_store.create_conversation(agent_id="ag_fork_src")
+
+    fork = conversation_store.fork_conversation(
+        source.id,
+        agent_id="ag_clone_ok",
+        cloned_agent_name="claude-native-ui (fork ag_clone_o)",
+        cloned_agent_bundle_location="ag_fork_src/hash",
+        cloned_agent_description=None,
+    )
+
+    assert fork.agent_id == "ag_clone_ok"
+    cloned = agent_store.get("ag_clone_ok")
+    assert cloned is not None
+    assert cloned.session_id == fork.id, "clone must be bound to the fork session"
+    # The clone is session-scoped, so it must NOT leak into the built-in
+    # list (the source built-in is the only template-name row).
+    builtin_ids = {a.id for a in agent_store.list(limit=100).data}
+    assert "ag_clone_ok" not in builtin_ids
+    assert "ag_fork_src" in builtin_ids
+
+
+def test_fork_clone_agent_failure_leaves_no_orphan(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A failed clone-fork rolls the agent row back — no orphaned built-in.
+
+    Pre-fix the route pre-created the clone in its own committed
+    transaction, so a fork failure (here a stale ``up_to_response_id``)
+    orphaned a ``session_id IS NULL`` row that polluted the built-in agent
+    catalog. Creating the clone inside the fork transaction means the
+    failure rolls it back too.
+    """
+    agent_store.create(
+        agent_id="ag_fork_src2",
+        name="codex-native-ui",
+        bundle_location="ag_fork_src2/hash",
+    )
+    source = conversation_store.create_conversation(agent_id="ag_fork_src2")
+    _append_three_responses(conversation_store, source.id)
+
+    before = {a.id for a in agent_store.list(limit=100).data}
+    with pytest.raises(ValueError, match="resp_nope"):
+        conversation_store.fork_conversation(
+            source.id,
+            agent_id="ag_clone_orphan",
+            cloned_agent_name="codex-native-ui (fork ag_clone_o)",
+            cloned_agent_bundle_location="ag_fork_src2/hash",
+            up_to_response_id="resp_nope",
+        )
+
+    # The clone must not exist at all, and the built-in list is unchanged.
+    assert agent_store.get("ag_clone_orphan") is None
+    after = {a.id for a in agent_store.list(limit=100).data}
+    assert after == before
+
+
 def test_instance_scoped_label_keys_match_harness_constants() -> None:
     """
     The store's instance-scoped denylist matches the harness label keys.
