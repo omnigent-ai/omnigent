@@ -37,7 +37,7 @@ import logging
 import os
 import tempfile
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
@@ -7036,3 +7036,181 @@ async def test_approval_event_without_content_flattened() -> None:
     assert resp.status_code == 204
     assert captured["body"] == {"type": "approval", "elicitation_id": "e2", "action": "decline"}
     ApprovalEvent.model_validate(captured["body"])
+
+
+# ── #1026: cross-process lifecycle desync recovery ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_setup_cancel_does_not_leave_active_turn() -> None:
+    """P0.5: a cancel during SETUP must not leave ``_active_turns`` stale.
+
+    A ``CancelledError`` raised before the streaming phase escapes
+    ``_run_turn_bg``'s ``except Exception``; without the dedicated
+    ``except asyncio.CancelledError`` clause nothing pops ``_active_turns``
+    and every later message buffers forever (the permanent-wedge mode).
+    """
+    conv = "conv_setup_cancel"
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        started.set()
+        # Park the turn in the SETUP phase (before the streaming phase).
+        await release.wait()
+        return AgentSpec(
+            spec_version=1,
+            name="claude-sdk-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 202
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+
+        active = app.state.active_turns
+        task = active.get(conv)
+        assert isinstance(task, asyncio.Task)
+
+        # Cancel during SETUP.
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+        # The slot was cleared via the P0.5 terminal-cleanup path, not stale.
+        assert conv not in active
+
+
+@pytest.mark.asyncio
+async def test_desync_emits_user_visible_error() -> None:
+    """P2.11: a recovered desync surfaces a distinct, non-retryable error code.
+
+    With no buffered continuation, ``_resync_turn_state`` publishes a
+    ``session.status: failed`` carrying ``runner_turn_context_desync`` — a
+    code intentionally absent from AP's retryable allowlist so the L2
+    classifier treats it as terminal instead of retry-looping.
+    """
+    conv = "conv_desync_visible"
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app):
+        # Drive the recovery entry directly (no live turn, no buffer).
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+        failed_event = await _drain_failed_status_event(conv, timeout=5.0)
+
+    assert conv in app.state.desynced_sessions
+    assert failed_event is not None
+    error = failed_event.get("error")
+    assert isinstance(error, dict)
+    assert error["code"] == "runner_turn_context_desync"
+    assert error["message"]
+
+
+class _SetupBoom(BaseException):
+    """A non-``Exception`` ``BaseException`` to exercise the P0.5 finally floor."""
+
+
+@pytest.mark.asyncio
+async def test_setup_base_exception_does_not_leave_active_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0.5: a BaseException during SETUP must not leave ``_active_turns`` stale.
+
+    A non-``Exception`` ``BaseException`` raised in the BACKGROUND setup phase
+    (here the spawn-env build, the same background-only step the
+    spawn-env-failure test drives) escapes ``_run_turn_bg``'s
+    ``except Exception``. The real ``finally`` floor must still pop the slot —
+    otherwise every later message buffers forever (the permanent-wedge mode).
+    """
+    conv = "conv_setup_base_exc"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="claude-sdk-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    def _raising_build(spec: object, *, workdir: object = None) -> dict[str, str]:
+        del spec, workdir
+        # A BaseException that is NOT an Exception subclass, raised inside the
+        # background setup phase (after the 202).
+        raise _SetupBoom("spawn-env aborted")
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._build_claude_sdk_spawn_env",
+        _raising_build,
+    )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 202
+
+        active = app.state.active_turns
+        # Wait for the background turn task to bind, then finish unwinding
+        # through the finally floor (the BaseException propagates out).
+        deadline = asyncio.get_running_loop().time() + 5.0
+        task: asyncio.Task[None] | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            candidate = active.get(conv)
+            if isinstance(candidate, asyncio.Task):
+                task = candidate
+                if task.done():
+                    break
+            elif task is not None:
+                # Slot already cleared by the finally floor.
+                break
+            await asyncio.sleep(0.02)
+
+        # The finally floor popped the slot despite the BaseException — never
+        # left stale (the permanent-wedge failure mode).
+        assert conv not in active
+        # The BaseException propagated out of the task (finally did not swallow).
+        assert task is not None
+        assert task.done() and not task.cancelled()
+        assert isinstance(task.exception(), _SetupBoom)

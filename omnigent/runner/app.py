@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from omnigent.runner.cost_advisor import AdvisorTurnResult
     from omnigent.terminals.registry import TerminalListEntry
 
+import httpcore
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -186,6 +187,34 @@ _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 # fail-open/retry path. Guarded by tests/test_ask_timeout_infinite.py.
 _ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
 _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
+
+# Transport errors raised by a verdict-delivery POST that mean the harness
+# channel ITSELF is dead — the subprocess was SIGKILL'd, or the connection
+# was reset mid-write — rather than a transient blip. They never self-heal on
+# the parked policy future: the harness's ``evaluate_policy`` await stays
+# parked for ``_POLICY_EVAL_TIMEOUT_S`` (24h) because nothing on the dead
+# channel can deliver the verdict. ``_evaluate_policy_via_omnigent`` retries
+# once on a fresh connection, then signals the desync so the wedged turn is
+# torn down instead of hanging. ``httpx.RemoteProtocolError`` ("peer closed
+# connection without sending complete message body") is the canonical SIGKILL
+# symptom; the httpcore-level read error surfaces when the drop happens below
+# httpx's framing layer.
+_DEAD_HARNESS_CHANNEL_ERRORS: tuple[type[BaseException], ...] = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.StreamClosed,
+    httpcore.ReadError,
+)
+
+# Stable, client-visible error code for a turn-context desync (the harness
+# generation outlived its turn / the verdict-delivery channel died and could
+# not be recovered). Deliberately ABSENT from AP's retryable-harness-error
+# allowlist so the L2 retry classifier treats it as terminal — a desync the
+# runner already tried and failed to deliver into must not retry-loop into the
+# same wedge. Mirrors the structured-error ``code`` the harness adapter's
+# orphaned-callback safe-fail returns.
+_RUNNER_TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
 # Terminal resource hosting the framework's own TUI (the Omnigent REPL,
 # ``omnigent attach``) for runner-hosted SDK sessions — the SDK mirror of
 # the claude-/codex-native embedded terminals. Resource id derives as
@@ -5981,6 +6010,7 @@ async def _evaluate_policy_via_omnigent(
     evaluation_id: str,
     phase: str,
     data: dict[str, Any],
+    on_delivery_failure: Callable[[str], Awaitable[None]] | None = None,
 ) -> None:
     """
     Proxy a policy evaluation request from the harness to the Omnigent server.
@@ -6016,6 +6046,14 @@ async def _evaluate_policy_via_omnigent(
     :param phase: Proto-style phase string, e.g.
         ``"PHASE_LLM_REQUEST"``.
     :param data: Event data dict for the policy engine.
+    :param on_delivery_failure: Optional async callback invoked with
+        *conversation_id* when the verdict cannot be delivered back to the
+        harness because its channel is dead (a transport error that survives
+        one retry on a fresh connection). The parked policy future can never
+        be resolved on a dead channel, so the caller wires this to tear the
+        wedged turn down rather than letting it hang for
+        ``_POLICY_EVAL_TIMEOUT_S`` (24h). ``None`` preserves the legacy
+        log-and-swallow behavior.
     """
     # Default verdict on error / non-200 / timeout. Phase-aware: TOOL_CALL
     # fails CLOSED (this round-trip is the authoritative gate for
@@ -6079,27 +6117,57 @@ async def _evaluate_policy_via_omnigent(
         )
 
     # Post the verdict back to the harness as a policy_verdict event.
-    try:
-        verdict_body: dict[str, Any] = {
-            "type": "policy_verdict",
-            "evaluation_id": evaluation_id,
-            "action": verdict_action,
-        }
-        if verdict_reason is not None:
-            verdict_body["reason"] = verdict_reason
-        if verdict_data is not None:
-            verdict_body["data"] = verdict_data
-        await harness_client.post(
-            f"/v1/sessions/{conversation_id}/events",
-            json=verdict_body,
-            timeout=30.0,
-        )
-    except Exception:  # noqa: BLE001 — best-effort delivery
-        _logger.warning(
-            "Failed to deliver policy verdict %s to harness",
-            evaluation_id,
-            exc_info=True,
-        )
+    verdict_body: dict[str, Any] = {
+        "type": "policy_verdict",
+        "evaluation_id": evaluation_id,
+        "action": verdict_action,
+    }
+    if verdict_reason is not None:
+        verdict_body["reason"] = verdict_reason
+    if verdict_data is not None:
+        verdict_body["data"] = verdict_data
+
+    # A dead-channel transport error here means the parked harness future can
+    # NEVER be resolved (nothing on the dead connection can deliver the
+    # verdict), so the executor would hang for _POLICY_EVAL_TIMEOUT_S. Retry
+    # ONCE on a fresh connection (httpx re-dials a new connection from the
+    # pool after the broken one is discarded); on a second failure, signal the
+    # desync so the caller tears the wedged turn down. We deliberately do NOT
+    # synthesize a verdict on a dead channel — there is no live reader for it.
+    for _attempt in range(2):
+        try:
+            await harness_client.post(
+                f"/v1/sessions/{conversation_id}/events",
+                json=verdict_body,
+                timeout=30.0,
+            )
+            return
+        except _DEAD_HARNESS_CHANNEL_ERRORS as exc:
+            _logger.warning(
+                "Policy verdict %s delivery hit a dead harness channel (attempt %d/2): %s",
+                evaluation_id,
+                _attempt + 1,
+                exc,
+            )
+        except Exception:  # noqa: BLE001 — non-transport: best-effort, no retry
+            _logger.warning(
+                "Failed to deliver policy verdict %s to harness",
+                evaluation_id,
+                exc_info=True,
+            )
+            return
+
+    # Both attempts hit a dead channel: the harness turn is wedged on a future
+    # that can't be resolved. Signal the desync (P0.4 wires this to the
+    # in-process turn cancel / resync) instead of log-and-swallow.
+    _logger.error(
+        "Policy verdict %s delivery failed on a dead harness channel after "
+        "retry; signaling desync for %s",
+        evaluation_id,
+        conversation_id,
+    )
+    if on_delivery_failure is not None:
+        await on_delivery_failure(conversation_id)
 
 
 def _forward_harness_response(resp: httpx.Response) -> Response:
@@ -7599,6 +7667,8 @@ def create_runner_app(
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     # Turn sequencing (SESSION_REARCHITECTURE Step 5 / SESSION_STEERING_MIGRATION Step 1)
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
+    # Exposed on app.state for test inspection (mirrors interrupted/desynced).
+    app.state.active_turns = _active_turns
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
     # Per-conversation message-ingest ordering (RUNNER_MESSAGE_INGEST.md
     # Part A). Each inbound ``message`` event takes a monotonic arrival
@@ -7617,6 +7687,15 @@ def create_runner_app(
     # same process). Exposed on app.state below for test inspection.
     _interrupted_sessions: set[str] = set()
     app.state.interrupted_sessions = _interrupted_sessions
+    # Conversations whose harness↔runner lifecycle desynced this turn — a
+    # verdict-delivery channel died, or a turn ended on transport loss. Marked
+    # by ``_resync_turn_state`` / ``_on_proxy_stream_end`` and cleared when a
+    # fresh turn binds, so a recovered conversation isn't left flagged.
+    # Exposed on app.state for test inspection.
+    _desynced_sessions: set[str] = set()
+    app.state.desynced_sessions = _desynced_sessions
+    # Exposed below (after definition) on app.state for tests that drive the
+    # desync recovery entry directly: app.state.resync_turn_state.
     _background_tasks: set[asyncio.Task[Any]] = set()
     # Parent sessions with an outstanding sub-agent wake POST. Debounces a
     # fan-out's completions: while a parent's wake is outstanding, further
@@ -12139,6 +12218,13 @@ def create_runner_app(
         _active_turns.pop(conv_id, None)
         # Turn ended: clear the live marker so a concurrent forward is skipped.
         _live_response_id.pop(conv_id, None)
+        # A transport-loss ending (harness subprocess died / connection reset
+        # mid-stream) leaves the harness-side lifecycle out of step with the
+        # runner's. Flag the conversation desynced so the next turn binds
+        # clean (the flag is cleared at turn start); ``connection_error`` is
+        # the code the proxy_stream transport handler stamps. P1.7.
+        if error is not None and error.get("code") == "connection_error":
+            _desynced_sessions.add(conv_id)
         # Skip the idle transient when a buffered message will start a
         # continuation turn immediately — `_check_and_start_next_turn`
         # publishes "running" microseconds later, and the in-between idle
@@ -12302,6 +12388,70 @@ def create_runner_app(
                 exc_info=True,
             )
         await _cancel_active_turn(conv_id, expected_task=target)
+
+    async def _resync_turn_state(conv_id: str, reason: str) -> None:
+        """Single ordered recovery entry for a harness↔runner desync.
+
+        Invoked when the runner detects the harness lifecycle has desynced
+        from its own — today: a verdict-delivery channel that died after a
+        retry (P0.4 wires this as ``on_delivery_failure``). Marks the
+        conversation ``desynced``, clears the stale live-response marker so a
+        concurrent forward is skipped, and dispatches to
+        ``_cancel_inprocess_turn`` — which forwards the interrupt to the
+        harness then force-cancels the runner turn task as the floor. The
+        cancellation unwinds ``run_turn`` → the parked policy future is
+        released in milliseconds (instead of hanging for
+        ``_POLICY_EVAL_TIMEOUT_S``), and the harness adapter's abnormal-exit
+        finally interrupts the abandoned inner generation (P0.2).
+
+        Idempotent: ``_cancel_inprocess_turn`` no-ops when no turn is in
+        flight, and ``_interrupted_sessions`` (set inside that call) is the
+        existing idempotency token, so a duplicate signal for the same wedged
+        turn collapses to one recovery.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param reason: Short machine reason for the desync, logged for ops,
+            e.g. ``"verdict_delivery_channel_dead"``.
+        """
+        _logger.error("resyncing turn state for %s: %s", conv_id, reason)
+        _desynced_sessions.add(conv_id)
+        # Clear the live-response marker up front so any concurrent mid-turn
+        # forward sees no live turn and 204s instead of racing the cancel.
+        _live_response_id.pop(conv_id, None)
+        await _cancel_inprocess_turn(conv_id)
+        # P2.11: surface the desync to the user when no continuation will run.
+        # A buffered message starts a clean continuation turn instead (P1.7),
+        # so stay silent there. ``runner_turn_context_desync`` is absent from
+        # AP's retryable-harness-error allowlist, so the L2 classifier treats
+        # it as terminal instead of retry-looping into the same wedge.
+        if not _session_message_buffers.get(conv_id):
+            _publish_turn_status(
+                conv_id,
+                "failed",
+                error={
+                    "code": _RUNNER_TURN_CONTEXT_DESYNC_CODE,
+                    "message": (
+                        "The agent turn was interrupted by a harness desync and "
+                        "could not be recovered. Please send your message again."
+                    ),
+                },
+            )
+
+    async def _resync_turn_state_on_delivery_failure(conv_id: str) -> None:
+        """Single-arg ``on_delivery_failure`` adapter for ``_resync_turn_state``.
+
+        ``_evaluate_policy_via_omnigent`` invokes its callback with just the
+        conversation id; bind the desync reason here so the module-level
+        helper stays agnostic of the closure-local recovery entry.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        """
+        await _resync_turn_state(conv_id, "verdict_delivery_channel_dead")
+
+    # Test seam: drive the desync recovery entry directly (the full
+    # harness→runner verdict-POST-failure round-trip is impractical to script
+    # in-process). Mirrors the active_turns / interrupted_sessions exposures.
+    app.state.resync_turn_state = _resync_turn_state
 
     async def _check_and_start_next_turn(
         session_id: str,
@@ -12941,8 +13091,20 @@ def create_runner_app(
         # during the stale debounce window and strand the result until the
         # human manually nudges the parent.
         _subagent_wake_pending.discard(conv)
+        # A fresh turn is binding: whatever desync the previous turn ended on
+        # is now resolved (this turn rebuilds the harness state clean). Clear
+        # the flag so a recovered conversation isn't left permanently marked
+        # (P1.7).
+        _desynced_sessions.discard(conv)
         try:
             await _run_turn_bg_setup_and_stream(msg_body, conv)
+        except _ContextWindowOverflow:
+            # The streaming phase handles reactive compaction itself; this
+            # guard only catches setup-phase failures (spec resolution,
+            # spawn-env build, instruction/tool assembly). Re-raise so the
+            # streaming path's own handler is never shadowed. The ``finally``
+            # below still guarantees the slot is cleared on the way out.
+            raise
         except asyncio.CancelledError as exc:
             # Task cancellation (e.g. event-loop teardown) must still
             # publish a terminal ``failed`` status so the session never
@@ -12961,9 +13123,8 @@ def create_runner_app(
             # with no resolvable model raising OmnigentError from
             # ``_build_spawn_env_from_spec``) must still end the turn: clear
             # ``_active_turns`` and publish a terminal ``failed`` status via
-            # ``_on_proxy_stream_end``. Without this, the session stays pinned
-            # to "running" forever and the REPL spins on "working" with no
-            # output (the silent-hang failure mode).
+            # ``_on_proxy_stream_end`` so the REPL gets the real error message
+            # rather than spinning on "working" forever (the silent-hang mode).
             _logger.error(
                 "turn setup failed for %s: %s",
                 conv,
@@ -12971,6 +13132,22 @@ def create_runner_app(
                 exc_info=True,
             )
             _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+        finally:
+            # P0.5 (security-critical permanent-wedge floor): GUARANTEE
+            # ``_active_turns`` is never left stale, no matter HOW the body
+            # exits — a clean return, an ``Exception`` handled above, OR a
+            # ``BaseException`` (``CancelledError``/``KeyboardInterrupt``/
+            # ``SystemExit``/``GeneratorExit``) that escapes ``except Exception``.
+            # A setup-phase abnormal exit otherwise leaves the slot set and
+            # every later message buffers forever. The clean path, the
+            # ``except`` branches above, and the streaming-phase cancel handler
+            # in ``_drain_streaming_response`` all pop the slot themselves, so
+            # guard on it still pointing here to stay idempotent: no double
+            # ``idle``, no double continuation. A non-``Exception``
+            # ``BaseException`` still propagates out (``finally`` does not
+            # suppress it) so the task observes its cancellation.
+            if conv in _active_turns:
+                _on_proxy_stream_end(conv)
 
     async def _run_turn_bg_setup_and_stream(
         msg_body: dict[str, Any],
@@ -14059,6 +14236,13 @@ def create_runner_app(
                                                 evaluation_id=_eval_id,
                                                 phase=_eval_phase,
                                                 data=_eval_data,
+                                                # A dead verdict-delivery
+                                                # channel leaves the harness
+                                                # turn parked forever; route
+                                                # the signal to the single
+                                                # recovery entry so the wedged
+                                                # turn is torn down (P0.4/P1.7).
+                                                on_delivery_failure=_resync_turn_state_on_delivery_failure,
                                             )
                                         )
                                     )

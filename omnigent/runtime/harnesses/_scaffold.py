@@ -99,6 +99,15 @@ _SHUTDOWN_GRACE_S = 4.5
 # (DENY), advisory LLM/TOOL_RESULT phases fail OPEN (ALLOW).
 _POLICY_EVAL_TIMEOUT_S = 86400.0
 
+# Stable, client-visible error code for a turn-context desync (the inner SDK
+# generation outlived its turn — an orphaned tool/policy callback, or a turn
+# torn down on a dead harness channel). Deliberately ABSENT from AP's
+# retryable-harness-error allowlist so the L2 retry classifier treats it as
+# terminal rather than retry-looping into the same wedge. Mirrors the runner's
+# ``_RUNNER_TURN_CONTEXT_DESYNC_CODE`` and the harness adapter's orphaned-
+# callback safe-fail ``code``.
+_TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
+
 # Per-turn IDLE watchdog: max gap WITHOUT progress before a wedged
 # ``run_turn`` becomes ``response.failed`` (vs heartbeating forever).
 # Every non-heartbeat ``ctx.emit`` resets the deadline (see
@@ -841,6 +850,16 @@ class HarnessApp:
             so AP-side retry decisions can act on it.
         """
         from omnigent.server.schemas import ErrorDetail
+
+        # P2.11: a turn-context desync (the inner generation outlived its turn)
+        # carries the stable ``runner_turn_context_desync`` code. Surface it
+        # verbatim — it is intentionally absent from AP's retryable-harness-
+        # error allowlist, so the L2 classifier treats it as terminal instead
+        # of retry-looping into the same wedge. Keyed off the exception's
+        # ``code`` attribute so a harness-side raise (vs. the class name) maps
+        # consistently.
+        if getattr(exception, "code", None) == _TURN_CONTEXT_DESYNC_CODE:
+            return ErrorDetail(code=_TURN_CONTEXT_DESYNC_CODE, message=str(exception))
 
         return ErrorDetail(code=type(exception).__name__, message=str(exception))
 

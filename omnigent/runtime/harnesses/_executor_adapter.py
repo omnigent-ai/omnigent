@@ -110,6 +110,22 @@ _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 _MCP_TOOL_NAME_PREFIX = "mcp__"
 
 
+# Hard ceiling on the detached, abnormal-exit ``interrupt_session`` call
+# scheduled from :meth:`ExecutorAdapter.run_turn`'s finally. Bounded so a
+# wedged subprocess (HTTP unresponsive) can't make the interrupt hang and
+# leak the background task forever. The call is best-effort: on expiry we
+# log and move on — the per-conversation watchdog (P1.8) escalates if the
+# orphaned generation keeps flushing callbacks.
+INTERRUPT_TIMEOUT_S = 5.0
+
+# Number of CONSECUTIVE orphaned tool callbacks (a callback that fired with
+# no active turn context — the symptom of a generation that outlived its
+# turn) tolerated before the per-conversation watchdog forces a Tier-1 SDK
+# reset. Reset to zero at the top of every ``run_turn`` so a single late
+# straggler after a clean turn never trips it.
+_ORPHAN_RESYNC_THRESHOLD = 3
+
+
 def _finalize_trace_status(response_id: str) -> None:
     """PATCH the trace status to OK on the MLflow server.
 
@@ -254,6 +270,19 @@ class ExecutorAdapter(HarnessApp):
         # turn when tracing is enabled; reused across turns so the
         # span parent chain stays rooted on the session's executor.
         self._tracing_ctx: TracingContext | None = None
+        # Detached, bounded background tasks (currently the abnormal-exit
+        # ``_safe_interrupt`` scheduled from ``run_turn``'s finally). Kept in
+        # a set with a self-discarding done-callback so they're strongly
+        # referenced until completion and drained on shutdown — never awaited
+        # inline, so a wedged interrupt can't block turn teardown.
+        self._bg_tasks: set[asyncio.Task[None]] = set()
+        # Per-conversation orphan-callback watchdog state (P1.8 / P2.10).
+        # ``_orphan_callback_count`` counts CONSECUTIVE tool callbacks that
+        # fired with no active turn context; it's reset at each ``run_turn``
+        # start. ``_resyncing`` guards the Tier-1 reset so concurrent orphans
+        # trigger exactly one reset.
+        self._orphan_callback_count = 0
+        self._resyncing = False
         # Call ids actually round-tripped through :meth:`_stable_tool_executor`
         # -> ``ctx.dispatch_tool`` this turn. ``dispatch_tool`` emits the paired
         # function_call_output itself, so a ToolCallComplete carrying one of
@@ -353,6 +382,20 @@ class ExecutorAdapter(HarnessApp):
         # previous turn. Clearing makes each turn's correlation
         # window self-contained.
         self._pending_mcp_call_ids.clear()
+        # A fresh turn binding clears the orphan-callback watchdog: whatever
+        # stragglers fired before this turn started are now moot, and the
+        # tier-1 reset condition is "N orphans with NO intervening clean
+        # turn" (P1.8). Reset here so the counter measures only post-bind
+        # orphans.
+        self._orphan_callback_count = 0
+        # Set True immediately before each genuine-completion return so the
+        # finally can distinguish a clean exit (TurnComplete / handled
+        # cancellation) from an abnormal one (CancelledError unwinding the
+        # task, ExecutorError, transport drop). On an abnormal exit the
+        # cached inner-SDK generation may still be live and would later
+        # flush queued tool_use as orphaned callbacks — so we schedule a
+        # bounded interrupt (P0.2).
+        clean_exit = False
         self._dispatched_call_ids.clear()
 
         # --- Tracing setup ------------------------------------------------
@@ -422,7 +465,15 @@ class ExecutorAdapter(HarnessApp):
                             record_cancellation(agent_span)
                             tctx.end_agent_span(agent_span, response=None, status="ERROR")
                             agent_span = None
+                        # Interrupt the inner session inline. Mark the exit
+                        # clean ONLY AFTER the interrupt actually completes — if
+                        # the inline interrupt raises, clean_exit stays False so
+                        # the finally's detached, bounded _safe_interrupt
+                        # fallback still fires (P0.2). Setting clean_exit before
+                        # the await would skip the fallback on a failed inline
+                        # interrupt, leaving the generation abandoned.
                         await executor.interrupt_session(self._session_key)
+                        clean_exit = True
                         return
                     # --- Tracing: emit spans per event ---
                     if tctx is not None:
@@ -458,6 +509,9 @@ class ExecutorAdapter(HarnessApp):
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(agent_span, response=response_text)
                             agent_span = None
+                        # The inner generation reached its natural end — no
+                        # abandoned stream to interrupt.
+                        clean_exit = True
                         return
                     if isinstance(event, TurnCancelled):
                         ctx.cancelled.set()
@@ -466,6 +520,9 @@ class ExecutorAdapter(HarnessApp):
 
                             record_cancellation(agent_span)
                             tctx.end_agent_span(agent_span, response=None, status="ERROR")
+                        # The inner executor reported its own cancellation; the
+                        # generation is already wound down, so treat as clean.
+                        clean_exit = True
                         return
                     if isinstance(event, ExecutorError):
                         if tctx is not None and agent_span is not None:
@@ -515,8 +572,28 @@ class ExecutorAdapter(HarnessApp):
             # (e.g. one fired after the SDK's stream closed) sees
             # ``None`` and returns an explicit error rather than
             # silently dispatching into the just-finished ctx.
-            self._current_ctx = None
-            self._current_agent = None
+            #
+            # Compare-and-clear (identity CAS): only null the slot when it
+            # still points at THIS turn's ctx. A stale finally — e.g. turn A
+            # unwinding late while turn B has already bound ``_current_ctx``
+            # to itself — must NOT clobber B's slot, or B's tool callbacks
+            # would orphan on a None ctx ("no active turn context"). Mirrors
+            # the scaffold's ``if self._active_turn_ctx is ctx`` guards.
+            if self._current_ctx is ctx:
+                self._current_ctx = None
+                self._current_agent = None
+            # P0.2: on an abnormal exit (CancelledError unwinding the task,
+            # ExecutorError, transport drop) the cached inner-SDK generation
+            # may still be live and would later flush queued tool_use as
+            # orphaned callbacks. SCHEDULE a bounded interrupt — never await
+            # it inline, or a wedged subprocess would block turn teardown and
+            # leak the run_task the verdict future is parked under. The task
+            # is strongly referenced via ``_bg_tasks`` (drained on shutdown)
+            # and self-discards on completion.
+            if not clean_exit:
+                interrupt_task = asyncio.ensure_future(self._safe_interrupt(self._session_key))
+                self._bg_tasks.add(interrupt_task)
+                interrupt_task.add_done_callback(self._bg_tasks.discard)
 
     async def _handle_interrupt_event(self) -> Response:
         """Cancel the turn AND drop the inner executor session.
@@ -543,6 +620,92 @@ class ExecutorAdapter(HarnessApp):
         if self._executor is not None:
             await self._executor.interrupt_session(self._session_key)
         return response
+
+    async def _safe_interrupt(self, session_key: str) -> None:
+        """Best-effort, bounded interrupt of an abandoned inner generation.
+
+        Scheduled (never awaited inline) from :meth:`run_turn`'s finally on
+        an abnormal exit so a cached inner-SDK generation that outlived its
+        turn can't later flush queued ``tool_use`` blocks as orphaned
+        callbacks. ``interrupt_session`` drops the live client, which forces
+        the next turn to rebuild fresh.
+
+        Bounded by :data:`INTERRUPT_TIMEOUT_S` so a wedged subprocess (HTTP
+        unresponsive) can't make this hang and leak the background task.
+        Swallows every failure — a failed interrupt is logged, not raised,
+        because there is no turn context left to surface it to and the
+        per-conversation watchdog (P1.8) is the next line of defence.
+
+        :param session_key: The inner executor session key to interrupt.
+        """
+        if self._executor is None:
+            return
+        try:
+            await asyncio.wait_for(
+                self._executor.interrupt_session(session_key),
+                timeout=INTERRUPT_TIMEOUT_S,
+            )
+        except (Exception, asyncio.TimeoutError):  # best-effort: log, never raise
+            _logger.error(
+                "abnormal-exit interrupt of inner session %s failed",
+                session_key,
+                exc_info=True,
+            )
+
+    async def _maybe_resync_on_orphan(self) -> None:
+        """Tier-1 per-conversation SDK reset after repeated orphan callbacks.
+
+        Fires only once the consecutive-orphan counter crosses
+        :data:`_ORPHAN_RESYNC_THRESHOLD` (reset to zero at every ``run_turn``
+        start, so it measures orphans with no intervening clean turn). Drops
+        the cached inner executor — forcing the next turn to rebuild a fresh
+        client — and clears every stale turn slot under :attr:`_lock` so no
+        further callback can dispatch into a dead ctx.
+
+        Idempotent under concurrency: the :attr:`_resyncing` guard plus the
+        threshold check ensure a burst of simultaneous orphans triggers
+        exactly ONE reset (the rest observe ``_resyncing`` or the
+        zeroed counter and no-op).
+
+        Tier-2 (terminating the conversation's subprocess) is intentionally
+        NOT done here: the adapter runs *inside* that subprocess and has no
+        handle on the runner's process manager. The runner owns that
+        escalation via ``_resync_turn_state`` → ``_cancel_inprocess_turn``.
+        """
+        if self._orphan_callback_count < _ORPHAN_RESYNC_THRESHOLD:
+            return
+        if self._resyncing:
+            return
+        self._resyncing = True
+        try:
+            async with self._lock:
+                # Re-check under the lock: a concurrent reset may have already
+                # zeroed the counter while we awaited the lock.
+                if self._orphan_callback_count < _ORPHAN_RESYNC_THRESHOLD:
+                    return
+                _logger.error(
+                    "runner_turn_context_desync: %d consecutive orphan callbacks; "
+                    "forcing Tier-1 SDK reset for session %s",
+                    self._orphan_callback_count,
+                    self._session_key,
+                )
+                executor = self._executor
+                self._executor = None
+                self._current_ctx = None
+                self._current_agent = None
+                self._in_flight.clear()
+                self._active_turn_ctx = None
+                self._orphan_callback_count = 0
+            # Close the dropped executor outside the lock — close_session can
+            # block on subprocess teardown and must not stall route handlers
+            # waiting on _lock. Best-effort: a wedged close must not raise out.
+            if executor is not None:
+                with contextlib.suppress(Exception):
+                    await executor.close_session(self._session_key)
+                with contextlib.suppress(Exception):
+                    await executor.close()
+        finally:
+            self._resyncing = False
 
     async def _watch_injections(self, ctx: TurnContext, executor: Executor) -> None:
         """
@@ -658,11 +821,28 @@ class ExecutorAdapter(HarnessApp):
         ctx = self._current_ctx
         agent = self._current_agent
         if ctx is None or agent is None:
-            _logger.warning(
-                "tool callback fired with no active turn context (tool=%s); returning error",
+            # P2.10: an orphaned tool callback (the cached generation
+            # outlived its turn). SAFE-FAIL — hard-return a structured error,
+            # never rebind into a stale ctx (that would park a Future nobody
+            # can resolve and hang the SDK). The distinct
+            # ``runner_turn_context_desync`` code lets the AP-side L2
+            # classifier treat it as a non-retryable-forever desync (P2.11)
+            # rather than looping.
+            self._orphan_callback_count += 1
+            _logger.error(
+                "runner_turn_context_desync: tool callback fired with no active "
+                "turn context (tool=%s, consecutive_orphans=%d); returning error",
                 tool_name,
+                self._orphan_callback_count,
             )
-            return {"error": "no active turn context for tool dispatch"}
+            # P1.8: after N consecutive orphans with no intervening clean turn,
+            # force a Tier-1 per-conversation SDK reset so the conversation
+            # self-heals instead of flushing orphans until the subprocess dies.
+            await self._maybe_resync_on_orphan()
+            return {
+                "error": "no active turn context for tool dispatch",
+                "code": "runner_turn_context_desync",
+            }
         # Pop the matching ``tool_use_id`` for MCP tools so the
         # dispatch reuses the observed event's call_id. Non-MCP
         # tools and out-of-order edge cases (queue empty when an
@@ -785,21 +965,30 @@ class ExecutorAdapter(HarnessApp):
         """
         ctx = self._current_ctx
         if ctx is None:
-            # Orphaned callback after a turn-context desync (#1026). Blanket
-            # ALLOW here silently bypasses guardrails: for a PHASE_TOOL_CALL this
-            # adapter is the only enforcement point (the call is never re-checked
-            # server-side), so an unevaluable verdict must fail closed. Mirror
-            # the runner's phase-aware default in _evaluate_policy_via_omnigent —
-            # tool calls DENY; advisory LLM phases and the post-execution result
-            # phase ALLOW so a transient desync never needlessly wedges them.
+            # P1.6: a policy evaluator that fires with no active turn context
+            # is a desync (the generation outlived its turn). Fail CLOSED for
+            # the authoritative tool-call gate — for connector-native MCP
+            # tools this round-trip is the ONLY enforcement point, so an
+            # unevaluable verdict must DENY rather than silently let the call
+            # through. Advisory LLM phases and PHASE_TOOL_RESULT (the tool
+            # already ran) stay ALLOW so a stray late callback never wedges.
             fail_closed = phase in FAIL_CLOSED_PHASES
             action = "POLICY_ACTION_DENY" if fail_closed else "POLICY_ACTION_ALLOW"
-            _logger.warning(
-                "policy evaluator fired with no active turn context (phase=%s); "
-                "returning %s by default",
+            # P1.8: a missing-context policy callback is an orphaned None-slot
+            # callback just like the tool-callback case — count it toward the
+            # same consecutive-orphan watchdog so a generation that keeps
+            # flushing policy callbacks after its turn ended triggers the same
+            # Tier-1 SDK reset. The fail-closed DENY above still stands for this
+            # individual call.
+            self._orphan_callback_count += 1
+            _logger.error(
+                "runner_turn_context_desync: policy evaluator fired with no active "
+                "turn context (phase=%s, consecutive_orphans=%d); defaulting to %s",
                 phase,
-                "DENY" if fail_closed else "ALLOW",
+                self._orphan_callback_count,
+                action,
             )
+            await self._maybe_resync_on_orphan()
             return PolicyVerdictPayload(
                 action=action,
                 reason=(
@@ -1105,6 +1294,13 @@ class ExecutorAdapter(HarnessApp):
         processes (e.g. ``claude --output-format``) are reaped
         rather than orphaned.
         """
+        # Drain any scheduled abnormal-exit interrupts BEFORE closing the
+        # executor so they run against a live session; each is bounded by
+        # INTERRUPT_TIMEOUT_S, so this can't hang teardown. ``return_exceptions``
+        # keeps a single failed interrupt from aborting the drain.
+        if self._bg_tasks:
+            await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
+            self._bg_tasks.clear()
         if self._executor is not None:
             await self._executor.close_session(self._session_key)
             await self._executor.close()
