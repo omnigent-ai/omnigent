@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1052" height="504" viewBox="0 0 1052 504">
+  <defs>
+    <style>text { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; }</style>
+  </defs>
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="216" y="62" font-size="22" fill="#1971c2" opacity="1"><tspan x="216" dy="0">GenAI metric instruments emitted via OTel MeterProvider</tspan></text>
+  <text x="216" y="104" font-size="14" fill="#868e96" opacity="1"><tspan x="216" dy="0">Before (on main)</tspan></text>
+  <text x="716" y="104" font-size="14" fill="#868e96" opacity="1"><tspan x="716" dy="0">After (this PR)</tspan></text>
+  <rect x="40" y="124" width="472" height="340" rx="8" stroke="#c92a2a" fill="#c92a2a" stroke-width="1" opacity="1" />
+  <text x="56" y="149" font-size="13" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">MeterProvider configured by telemetry.init()</tspan></text>
+  <text x="56" y="181" font-size="13" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">Instruments emitted: NONE</tspan></text>
+  <text x="56" y="211" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">gen_ai.client.token.usage:       no data points</tspan></text>
+  <text x="56" y="231" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">gen_ai.client.operation.duration: no data points</tspan></text>
+  <text x="56" y="251" font-size="11" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">omnigent.tool.duration:           no data points</tspan></text>
+  <text x="56" y="292" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">Operator can configure OTel metrics export</tspan></text>
+  <text x="56" y="312" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">but nothing flows. Dashboards stay empty.</tspan></text>
+  <text x="56" y="348" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">No way to plot token usage per model,</tspan></text>
+  <text x="56" y="368" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">LLM call latency per provider, or</tspan></text>
+  <text x="56" y="388" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="56" dy="0">tool execution time per tool.</tspan></text>
+  <rect x="540" y="124" width="472" height="340" rx="8" stroke="#087f5b" fill="#087f5b" stroke-width="1" opacity="1" />
+  <text x="556" y="149" font-size="13" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">MeterProvider + 3 GenAI histograms wired in</tspan></text>
+  <text x="556" y="180" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">gen_ai.client.token.usage</tspan></text>
+  <text x="556" y="196" font-size="10" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  keyed: provider.name + request.model + token.type</tspan></text>
+  <text x="556" y="214" font-size="10" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  point: 120  attrs: openai, gpt-5, input</tspan></text>
+  <text x="556" y="232" font-size="10" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  point: 45   attrs: openai, gpt-5, output</tspan></text>
+  <text x="556" y="264" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">gen_ai.client.operation.duration</tspan></text>
+  <text x="556" y="280" font-size="10" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  keyed: provider.name + request.model + operation.name</tspan></text>
+  <text x="556" y="298" font-size="10" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  point: 0.85s   attrs: openai, gpt-5, chat</tspan></text>
+  <text x="556" y="316" font-size="10" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  point: 1.42s   attrs: anthropic, claude-sonnet-4-5, chat</tspan></text>
+  <text x="556" y="348" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">omnigent.tool.duration</tspan></text>
+  <text x="556" y="364" font-size="10" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  keyed: tool.name</tspan></text>
+  <text x="556" y="382" font-size="10" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  point: 0.012s  attrs: calculator</tspan></text>
+  <text x="556" y="400" font-size="10" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">  point: 0.35s   attrs: web_search</tspan></text>
+  <text x="556" y="436" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">Dashboards: token spend per model,</tspan></text>
+  <text x="556" y="456" font-size="12" fill="#f8f9fa" opacity="1"><tspan x="556" dy="0">p95 latency per provider, slow tools.</tspan></text>
+</svg>
