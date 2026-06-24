@@ -178,6 +178,12 @@ omnigent run examples/debby/ --harness openai-agents
 omnigent run examples/polly/ --harness cursor  # Cursor CLI (needs cursor-agent + CURSOR_API_KEY)
 ```
 
+When using the OpenAI Agents SDK harness, set `OPENAI_API_KEY` before launching.
+If you are pointing the SDK at a custom OpenAI-compatible endpoint, such as a
+gateway, also set `OPENAI_BASE_URL`. Databricks-backed OpenAI Agents SDK runs
+should install the SDK path with `uv tool install "omnigent[agents-sdk]"`, which
+includes the Databricks SDK needed for workspace auth.
+
 **🐙 Polly** is a multi-agent coding orchestrator who writes no code herself.
 She's the tech lead: she plans, delegates the work to coding sub-agents
 (Claude Code, Codex, or Pi) in parallel git worktrees, then routes each diff

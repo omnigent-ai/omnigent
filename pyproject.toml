@@ -139,6 +139,7 @@ openshell = ["openshell>=0.0.7,<1"]
 tracing = ["mlflow>=3,<4"]
 agents-sdk = [
     "openai-agents>=0.1,<1",
+    "databricks-sdk>=0.56.0,<1",
     "opentelemetry-instrumentation-openai-agents-v2>=0.1",
 ]
 # Google Antigravity SDK harness (`harness: antigravity`). Optional: the

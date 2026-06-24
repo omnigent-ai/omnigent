@@ -2757,6 +2757,7 @@ dependencies = [
 
 [package.optional-dependencies]
 agents-sdk = [
+    { name = "databricks-sdk" },
     { name = "openai-agents" },
     { name = "opentelemetry-instrumentation-openai-agents-v2" },
 ]
@@ -2849,6 +2850,7 @@ requires-dist = [
     { name = "cursor-sdk", marker = "extra == 'cursor'", specifier = ">=0.1.7" },
     { name = "cwsandbox", marker = "extra == 'cwsandbox'", specifier = ">=0.24,<1" },
     { name = "databricks-mcp", marker = "extra == 'databricks'", specifier = ">=0.1.0" },
+    { name = "databricks-sdk", marker = "extra == 'agents-sdk'", specifier = ">=0.56.0,<1" },
     { name = "databricks-sdk", marker = "extra == 'all'", specifier = ">=0.56.0,<1" },
     { name = "databricks-sdk", marker = "extra == 'databricks'", specifier = ">=0.56.0,<1" },
     { name = "daytona", marker = "extra == 'daytona'", specifier = ">=0.180,<1" },
