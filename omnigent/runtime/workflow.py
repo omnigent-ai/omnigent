@@ -140,7 +140,9 @@ _logger = logging.getLogger(__name__)
 # (hyphen), e.g. ``"claude_sdk"`` → ``"claude-sdk"`` used by ``_HARNESS_MODULES``.
 
 
-AgentHarnessType = Literal["claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "qwen"]
+AgentHarnessType = Literal[
+    "claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "qwen", "goose"
+]
 
 
 @dataclass(frozen=True)
@@ -1225,6 +1227,7 @@ def _build_codex_spawn_env(
 def _build_pi_spawn_env(
     spec: AgentSpec,
     *,
+    cwd: Path | None = None,
     workdir: Path | None = None,
 ) -> dict[str, str]:
     """
@@ -1237,6 +1240,8 @@ def _build_pi_spawn_env(
     pattern from §Step 5a.
 
     :param spec: The agent spec.
+    :param cwd: Runtime working directory for the Pi CLI. This is the
+        session workspace, not the agent bundle workdir.
     :param workdir: The bundle's on-disk path (extracted by the
         agent cache). Threaded through as ``HARNESS_PI_BUNDLE_DIR``
         so the harness wrap's executor can source bundled skills
@@ -1279,6 +1284,8 @@ def _build_pi_spawn_env(
     env["HARNESS_PI_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
     if spec.name:
         env["HARNESS_PI_AGENT_NAME"] = spec.name
+    if cwd is not None:
+        env["HARNESS_PI_CWD"] = str(cwd)
     if workdir is not None:
         env["HARNESS_PI_BUNDLE_DIR"] = str(workdir)
     os_env_payload = _serialize_os_env(spec.os_env)
@@ -1345,6 +1352,38 @@ def _build_qwen_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_QWEN_OS_ENV"] = os_env_payload
+    return env
+
+
+def _build_goose_spawn_env(
+    spec: AgentSpec,
+    *,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """
+    Build the env-var dict the headless goose harness wrap reads.
+
+    Maps spec.executor fields → the ``HARNESS_GOOSE_*`` env vars defined in
+    ``omnigent/inner/goose_harness.py``. Unlike the SDK harnesses, Goose owns its
+    own auth via ``goose configure`` (keyring / ``~/.config/goose/config.yaml``),
+    so this builder wires **no** provider/gateway credential — it forwards only an
+    optional model override and the os_env/sandbox spec. A ``databricks-*`` model
+    is dropped (not a valid Goose model id; the provider/model then come from the
+    user's Goose config), mirroring how the native CLIs handle gateway ids.
+
+    :param spec: The agent spec.
+    :param workdir: The bundle's on-disk path. Accepted for signature parity with
+        the other ``_build_*_spawn_env`` builders; the goose wrap consumes no
+        bundle dir yet (no skills bridge).
+    :returns: A dict of env-var overrides for the harness process spawn.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None and not model.startswith(("databricks-", "databricks/")):
+        env["HARNESS_GOOSE_MODEL"] = model
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_GOOSE_OS_ENV"] = os_env_payload
     return env
 
 

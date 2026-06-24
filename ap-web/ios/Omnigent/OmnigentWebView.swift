@@ -70,150 +70,152 @@ struct OmnigentWebView: UIViewRepresentable {
   }
 
   private static let nativeBridgeScript = """
-  (() => {
-    if (window.omnigentNative && window.omnigentNative.kind === "ios") return;
-    const ensureViewportFit = () => {
-      let meta = document.querySelector('meta[name="viewport"]');
-      if (!meta) {
-        meta = document.createElement("meta");
-        meta.name = "viewport";
-        (document.head || document.documentElement).appendChild(meta);
+    (() => {
+      if (window.omnigentNative && window.omnigentNative.kind === "ios") return;
+      const ensureViewportFit = () => {
+        let meta = document.querySelector('meta[name="viewport"]');
+        if (!meta) {
+          meta = document.createElement("meta");
+          meta.name = "viewport";
+          (document.head || document.documentElement).appendChild(meta);
+        }
+        const content = meta.getAttribute("content") || "width=device-width, initial-scale=1.0";
+        const managedKeys = new Set([
+          "width",
+          "initial-scale",
+          "minimum-scale",
+          "maximum-scale",
+          "user-scalable",
+          "viewport-fit",
+        ]);
+        const preserved = content
+          .split(",")
+          .map((part) => part.trim())
+          .filter((part) => {
+            const key = part.split("=")[0]?.trim().toLowerCase();
+            return key && !managedKeys.has(key);
+          });
+        meta.setAttribute(
+          "content",
+          [
+            "width=device-width",
+            "initial-scale=1.0",
+            "minimum-scale=1.0",
+            "maximum-scale=1.0",
+            "user-scalable=no",
+            "viewport-fit=cover",
+            ...preserved,
+          ].join(", ")
+        );
+      };
+      if (document.head) {
+        ensureViewportFit();
+      } else {
+        document.addEventListener("DOMContentLoaded", ensureViewportFit, { once: true });
       }
-      const content = meta.getAttribute("content") || "width=device-width, initial-scale=1.0";
-      const managedKeys = new Set([
-        "width",
-        "initial-scale",
-        "minimum-scale",
-        "maximum-scale",
-        "user-scalable",
-        "viewport-fit",
-      ]);
-      const preserved = content
-        .split(",")
-        .map((part) => part.trim())
-        .filter((part) => {
-          const key = part.split("=")[0]?.trim().toLowerCase();
-          return key && !managedKeys.has(key);
+      const callbacks = new Set();
+      const viewModeCallbacks = new Set();
+      const defineEmit = (name, fn) => {
+        Object.defineProperty(window, name, {
+          configurable: false,
+          enumerable: false,
+          writable: false,
+          value: fn,
         });
-      meta.setAttribute(
-        "content",
-        [
-          "width=device-width",
-          "initial-scale=1.0",
-          "minimum-scale=1.0",
-          "maximum-scale=1.0",
-          "user-scalable=no",
-          "viewport-fit=cover",
-          ...preserved,
-        ].join(", ")
-      );
-    };
-    if (document.head) {
-      ensureViewportFit();
-    } else {
-      document.addEventListener("DOMContentLoaded", ensureViewportFit, { once: true });
-    }
-    const callbacks = new Set();
-    const viewModeCallbacks = new Set();
-    const defineEmit = (name, fn) => {
-      Object.defineProperty(window, name, {
+      };
+      defineEmit("__omnigentNativeEmitNotificationActivated", (path) => {
+        if (typeof path !== "string" || !path.startsWith("/")) return;
+        for (const callback of callbacks) {
+          try { callback(path); } catch {}
+        }
+      });
+      defineEmit("__omnigentNativeEmitViewModeChanged", (mode) => {
+        if (mode !== "chat" && mode !== "terminal") return;
+        for (const callback of viewModeCallbacks) {
+          try { callback(mode); } catch {}
+        }
+      });
+      const sidebarDragCallbacks = new Set();
+      Object.defineProperty(window, "__omnigentNativeEmitSidebarDrag", {
         configurable: false,
         enumerable: false,
         writable: false,
-        value: fn,
+        value(phase, progress) {
+          if (typeof phase !== "string") return;
+          const fraction =
+            typeof progress === "number" && Number.isFinite(progress)
+              ? Math.max(0, Math.min(1, progress))
+              : 0;
+          for (const callback of sidebarDragCallbacks) {
+            try { callback(phase, fraction); } catch {}
+          }
+        },
       });
-    };
-    defineEmit("__omnigentNativeEmitNotificationActivated", (path) => {
-      if (typeof path !== "string" || !path.startsWith("/")) return;
-      for (const callback of callbacks) {
-        try { callback(path); } catch {}
-      }
-    });
-    defineEmit("__omnigentNativeEmitViewModeChanged", (mode) => {
-      if (mode !== "chat" && mode !== "terminal") return;
-      for (const callback of viewModeCallbacks) {
-        try { callback(mode); } catch {}
-      }
-    });
-    const sidebarDragCallbacks = new Set();
-    Object.defineProperty(window, "__omnigentNativeEmitSidebarDrag", {
-      configurable: false,
-      enumerable: false,
-      writable: false,
-      value(phase, progress) {
-        if (typeof phase !== "string") return;
-        const fraction =
-          typeof progress === "number" && Number.isFinite(progress)
-            ? Math.max(0, Math.min(1, progress))
-            : 0;
-        for (const callback of sidebarDragCallbacks) {
-          try { callback(phase, fraction); } catch {}
-        }
-      },
-    });
-    window.omnigentNative = Object.freeze({
-      kind: "ios",
-      setBadgeCount(count) {
-        window.webkit.messageHandlers.omnigentNative.postMessage({
-          method: "setBadgeCount",
-          count: Number.isFinite(count) ? count : 0,
-        });
-      },
-      notify(params) {
-        window.webkit.messageHandlers.omnigentNative.postMessage({
-          method: "notify",
-          params: {
-            title: params && typeof params.title === "string" ? params.title : "",
-            body: params && typeof params.body === "string" ? params.body : "",
-            navigatePath:
-              params && typeof params.navigatePath === "string" ? params.navigatePath : "",
-          },
-        });
-        return Promise.resolve(true);
-      },
-      onNotificationActivated(callback) {
-        if (typeof callback !== "function") return () => {};
-        callbacks.add(callback);
-        return () => callbacks.delete(callback);
-      },
-      onSidebarDrag(callback) {
-        if (typeof callback !== "function") return () => {};
-        sidebarDragCallbacks.add(callback);
-        return () => sidebarDragCallbacks.delete(callback);
-      },
-      setServerSwitcherHidden(hidden) {
-        window.webkit.messageHandlers.omnigentNative.postMessage({
-          method: "setServerSwitcherHidden",
-          hidden: hidden === true,
-        });
-      },
-      setSidebarOpen(open) {
-        window.webkit.messageHandlers.omnigentNative.postMessage({
-          method: "setServerSwitcherHidden",
-          hidden: open === true,
-        });
-      },
-      setViewMode(params) {
-        const mode = params && params.mode === "terminal" ? "terminal" : "chat";
-        window.webkit.messageHandlers.omnigentNative.postMessage({
-          method: "setViewMode",
-          mode,
-          terminalEnabled: !!(params && params.terminalEnabled),
-          terminalStartingUp: !!(params && params.terminalStartingUp),
-          visible: !!(params && params.visible),
-        });
-      },
-      onViewModeChanged(callback) {
-        if (typeof callback !== "function") return () => {};
-        viewModeCallbacks.add(callback);
-        return () => viewModeCallbacks.delete(callback);
-      },
-    });
-  })();
-  """
+      window.omnigentNative = Object.freeze({
+        kind: "ios",
+        setBadgeCount(count) {
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "setBadgeCount",
+            count: Number.isFinite(count) ? count : 0,
+          });
+        },
+        notify(params) {
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "notify",
+            params: {
+              title: params && typeof params.title === "string" ? params.title : "",
+              body: params && typeof params.body === "string" ? params.body : "",
+              navigatePath:
+                params && typeof params.navigatePath === "string" ? params.navigatePath : "",
+            },
+          });
+          return Promise.resolve(true);
+        },
+        onNotificationActivated(callback) {
+          if (typeof callback !== "function") return () => {};
+          callbacks.add(callback);
+          return () => callbacks.delete(callback);
+        },
+        onSidebarDrag(callback) {
+          if (typeof callback !== "function") return () => {};
+          sidebarDragCallbacks.add(callback);
+          return () => sidebarDragCallbacks.delete(callback);
+        },
+        setServerSwitcherHidden(hidden) {
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "setServerSwitcherHidden",
+            hidden: hidden === true,
+          });
+        },
+        setSidebarOpen(open) {
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "setServerSwitcherHidden",
+            hidden: open === true,
+          });
+        },
+        setViewMode(params) {
+          const mode = params && params.mode === "terminal" ? "terminal" : "chat";
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "setViewMode",
+            mode,
+            terminalEnabled: !!(params && params.terminalEnabled),
+            terminalStartingUp: !!(params && params.terminalStartingUp),
+            visible: !!(params && params.visible),
+          });
+        },
+        onViewModeChanged(callback) {
+          if (typeof callback !== "function") return () => {};
+          viewModeCallbacks.add(callback);
+          return () => viewModeCallbacks.delete(callback);
+        },
+      });
+    })();
+    """
 
   @MainActor
-  final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, UIGestureRecognizerDelegate {
+  final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler,
+    UIGestureRecognizerDelegate
+  {
     var parent: OmnigentWebView
     private weak var webView: WKWebView?
     private(set) var pinnedURL: URL?
@@ -278,10 +280,13 @@ struct OmnigentWebView: UIViewRepresentable {
       webView.load(URLRequest(url: url))
     }
 
-    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+    func userContentController(
+      _ userContentController: WKUserContentController, didReceive message: WKScriptMessage
+    ) {
       guard isTrustedBridgeMessage(message) else { return }
       guard let body = message.body as? [String: Any],
-            let method = body["method"] as? String else { return }
+        let method = body["method"] as? String
+      else { return }
 
       switch method {
       case "setBadgeCount":
@@ -289,8 +294,9 @@ struct OmnigentWebView: UIViewRepresentable {
         NativeNotificationManager.shared.setBadgeCount(count)
       case "notify":
         guard let params = body["params"] as? [String: Any],
-              let title = params["title"] as? String,
-              !title.isEmpty else { return }
+          let title = params["title"] as? String,
+          !title.isEmpty
+        else { return }
         NativeNotificationManager.shared.notify(
           title: title,
           body: params["body"] as? String,
@@ -304,7 +310,8 @@ struct OmnigentWebView: UIViewRepresentable {
         let mode: WebViewMode = (body["mode"] as? String) == "terminal" ? .terminal : .chat
         parent.model.viewMode = mode
         parent.model.terminalEnabled = (body["terminalEnabled"] as? NSNumber)?.boolValue ?? false
-        parent.model.terminalStartingUp = (body["terminalStartingUp"] as? NSNumber)?.boolValue ?? false
+        parent.model.terminalStartingUp =
+          (body["terminalStartingUp"] as? NSNumber)?.boolValue ?? false
         parent.model.bottomBarVisible = (body["visible"] as? NSNumber)?.boolValue ?? false
       default:
         return
@@ -332,7 +339,10 @@ struct OmnigentWebView: UIViewRepresentable {
       }
     }
 
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+    func webView(
+      _ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
+      withError error: Error
+    ) {
       handleLoadFailure(webView, error: error)
     }
 
@@ -350,7 +360,8 @@ struct OmnigentWebView: UIViewRepresentable {
       decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
       guard let url = navigationAction.request.url,
-            let scheme = url.scheme?.lowercased() else {
+        let scheme = url.scheme?.lowercased()
+      else {
         decisionHandler(.cancel)
         return
       }
@@ -396,8 +407,9 @@ struct OmnigentWebView: UIViewRepresentable {
       decisionHandler: @escaping (WKPermissionDecision) -> Void
     ) {
       guard type == .microphone,
-            origin.omnigentOrigin == pinnedOrigin,
-            webView.url?.omnigentOrigin == pinnedOrigin else {
+        origin.omnigentOrigin == pinnedOrigin,
+        webView.url?.omnigentOrigin == pinnedOrigin
+      else {
         decisionHandler(.deny)
         return
       }
@@ -423,7 +435,9 @@ struct OmnigentWebView: UIViewRepresentable {
     private func promptForExternalURL(_ url: URL, scheme: String) {
       let onPinnedServer = pinnedOrigin != nil && webView?.url?.omnigentOrigin == pinnedOrigin
 
-      if let pinnedOrigin, onPinnedServer, parent.settings.isProtocolAllowed(scheme, from: pinnedOrigin) {
+      if let pinnedOrigin, onPinnedServer,
+        parent.settings.isProtocolAllowed(scheme, from: pinnedOrigin)
+      {
         UIApplication.shared.open(url)
         return
       }
@@ -435,15 +449,17 @@ struct OmnigentWebView: UIViewRepresentable {
         preferredStyle: .alert
       )
       alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-      alert.addAction(UIAlertAction(title: "Open", style: .default) { _ in
-        UIApplication.shared.open(url)
-      })
-      if let pinnedOrigin, onPinnedServer {
-        alert.addAction(UIAlertAction(title: "Always Allow", style: .default) { [weak self] _ in
-          guard let self else { return }
-          self.parent.settings.allowProtocol(scheme, from: pinnedOrigin)
+      alert.addAction(
+        UIAlertAction(title: "Open", style: .default) { _ in
           UIApplication.shared.open(url)
         })
+      if let pinnedOrigin, onPinnedServer {
+        alert.addAction(
+          UIAlertAction(title: "Always Allow", style: .default) { [weak self] _ in
+            guard let self else { return }
+            self.parent.settings.allowProtocol(scheme, from: pinnedOrigin)
+            UIApplication.shared.open(url)
+          })
       }
       topViewController()?.present(alert, animated: true)
     }
@@ -511,17 +527,19 @@ private final class AccessoryFreeWebView: WKWebView {
   }
 }
 
-private extension UIViewController {
-  var omnigentTopViewController: UIViewController {
+extension UIViewController {
+  fileprivate var omnigentTopViewController: UIViewController {
     if let presentedViewController {
       return presentedViewController.omnigentTopViewController
     }
     if let navigation = self as? UINavigationController,
-       let visible = navigation.visibleViewController {
+      let visible = navigation.visibleViewController
+    {
       return visible.omnigentTopViewController
     }
     if let tab = self as? UITabBarController,
-       let selected = tab.selectedViewController {
+      let selected = tab.selectedViewController
+    {
       return selected.omnigentTopViewController
     }
     return self

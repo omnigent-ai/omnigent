@@ -27,7 +27,8 @@ struct AppRootView: View {
             mode = .web(nextURL)
           },
           loadFailed: { failedURL, message in
-            mode = .setup(prefill: failedURL.omnigentOrigin ?? failedURL.absoluteString, error: message)
+            mode = .setup(
+              prefill: failedURL.omnigentOrigin ?? failedURL.absoluteString, error: message)
           },
           loadSucceeded: { loadedURL in
             settings.rememberRecentServer(loadedURL)
@@ -37,8 +38,9 @@ struct AppRootView: View {
     }
     .task {
       if case .setup(nil, nil) = mode,
-         let saved = settings.serverURL,
-         let url = URL(string: saved) {
+        let saved = settings.serverURL,
+        let url = URL(string: saved)
+      {
         mode = .web(url)
       }
     }
