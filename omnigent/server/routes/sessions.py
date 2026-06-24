@@ -210,6 +210,8 @@ from omnigent.server.schemas import (
     PaginatedList,
     PermissionObject,
     PolicySummary,
+    ReasoningStartedEvent,
+    ReasoningTextDeltaEvent,
     ResponseObject,
     SandboxStatus,
     ServerStreamEvent,
@@ -323,6 +325,17 @@ _EXTERNAL_CONVERSATION_ITEM_TYPE: str = "external_conversation_item"
 # corresponding completed message still arrives later via
 # ``external_conversation_item``.
 _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE: str = "external_output_text_delta"
+
+# Internal input used by terminal-backed integrations to publish a transient
+# reasoning (chain-of-thought) delta observed before the completed message is
+# available — the reasoning analogue of ``external_output_text_delta``. Nothing
+# is persisted: it publishes ``response.reasoning_text.delta`` (preceded by a
+# single ``response.reasoning.started`` when ``data.started`` is true) so the SPA
+# paints a live reasoning block, matching the in-process executor's wire shape.
+# Reasoning has no completed conversation item; the block is finalized when the
+# assistant message arrives via ``external_conversation_item``. Payload:
+# ``{"delta": "...", "started": true|false}``.
+_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE: str = "external_output_reasoning_delta"
 
 # Internal input used by terminal-backed integrations to publish an
 # explicit ``session.interrupted`` edge observed outside the Omnigent
@@ -683,6 +696,10 @@ def _claude_native_remember_host(tool_name: str, tool_input: Any) -> str | None:
 # any prompt a headless sub-agent left unanswered for >5 minutes.
 _CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S = 86400.0
 
+# Antigravity (agy) elicitation hook wait budget. Same 24-hour cap as
+# Codex: a terminal-side verdict (or agy's own WAITING timeout) ends the
+# wait early, so the long park never blocks native-TUI paths.
+_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S = 86400.0
 # Same one-day park budget for cursor-native tool-approval prompts mirrored
 # from the TUI: a terminal-side answer ends the wait early via
 # ``external_elicitation_resolved`` (posted by the runner-side approval mirror),
@@ -760,6 +777,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+    _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
@@ -3582,6 +3600,48 @@ def _publish_external_output_text_delta(session_id: str, body: SessionEventInput
         index=index,
         final=final,
     )
+    session_stream.publish(session_id, event.model_dump(exclude_none=True))
+
+
+def _publish_external_output_reasoning_delta(session_id: str, body: SessionEventInput) -> None:
+    """
+    Broadcast a terminal-observed reasoning (chain-of-thought) delta.
+
+    The reasoning analogue of :func:`_publish_external_output_text_delta`:
+    terminal-backed integrations (the antigravity-native reader) observe a
+    streaming ``thinking`` block before the completed assistant item exists. This
+    publishes the standard reasoning SSE events the SPA already renders —
+    ``response.reasoning.started`` once (when ``data.started`` is true, marking a
+    new reasoning block) followed by ``response.reasoning_text.delta`` — without
+    persisting anything. Reasoning has no completed conversation item; the block
+    is finalized when the assistant message is persisted via
+    ``external_conversation_item``.
+
+    :param session_id: Session/conversation identifier.
+    :param body: ``POST /events`` body whose type is
+        :data:`_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE`.
+    :returns: None.
+    :raises OmnigentError: If ``data.delta`` is not a string, or ``data.started``
+        is provided with a non-boolean type.
+    """
+    delta = body.data.get("delta")
+    if not isinstance(delta, str):
+        raise OmnigentError(
+            "external_output_reasoning_delta requires string data.delta",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    started = body.data.get("started")
+    if started is not None and not isinstance(started, bool):
+        raise OmnigentError(
+            "external_output_reasoning_delta data.started must be a boolean",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if started:
+        session_stream.publish(
+            session_id,
+            ReasoningStartedEvent(type="response.reasoning.started").model_dump(exclude_none=True),
+        )
+    event = ReasoningTextDeltaEvent(type="response.reasoning_text.delta", delta=delta)
     session_stream.publish(session_id, event.model_dump(exclude_none=True))
 
 
@@ -15001,6 +15061,97 @@ def create_sessions_router(
             media_type="application/json",
         )
 
+    # ── POST /sessions/{session_id}/hooks/antigravity-elicitation-request ──
+
+    @router.post(
+        "/sessions/{session_id}/hooks/antigravity-elicitation-request",
+        response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def antigravity_elicitation_request_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Antigravity (agy) elicitation request endpoint.
+
+        Receives ``{"elicitation_id": <str>, "params": <ElicitationRequestParams>}``
+        from the interaction bridge (Task 8), which POSTs here when it
+        surfaces an agy WAITING interaction for the web UI. Parks the call
+        on the shared harness elicitation registry, emits the standard
+        ``response.elicitation_request`` SSE event, waits for the session
+        ``approval`` verdict, then returns the raw
+        :class:`~omnigent.server.schemas.ElicitationResult` so the bridge
+        can forward it to agy via ``HandleCascadeUserInteraction``.
+
+        This is intentionally simpler than the Codex hook: the bridge
+        (not the endpoint) builds the agy interaction payload via
+        ``to_interaction_payload``, so this endpoint only passes back
+        the verdict as-is.  The body shape is minimal and symmetric:
+        ``elicitation_id`` from the bridge's deterministic id function
+        (``agy_elicitation_id``), ``params`` as an
+        :class:`~omnigent.server.schemas.ElicitationRequestParams` dict.
+
+        :param request: FastAPI request carrying the agy elicitation body.
+        :param session_id: Omnigent conversation id from the URL path.
+        :returns: ``ElicitationResult`` JSON on user verdict; ``200`` with
+            empty body on timeout/disconnect (bridge interprets as ``None``).
+        :raises OmnigentError: 404 if the session does not exist, 400 if
+            the request body is malformed.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in antigravity elicitation hook body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "Antigravity elicitation hook body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        elicitation_id = payload.get("elicitation_id")
+        if not isinstance(elicitation_id, str) or not elicitation_id:
+            raise OmnigentError(
+                "Antigravity elicitation hook body must include a non-empty"
+                " 'elicitation_id' string.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        raw_params = payload.get("params")
+        if not isinstance(raw_params, dict):
+            raise OmnigentError(
+                "Antigravity elicitation hook body must include a 'params' object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            params = ElicitationRequestParams.model_validate(raw_params)
+        except Exception as exc:
+            raise OmnigentError(
+                f"Invalid 'params' in antigravity elicitation hook body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        result = await _publish_and_wait_for_harness_elicitation(
+            request,
+            session_id=session_id,
+            params=params,
+            timeout_s=_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
+            conversation_store=conversation_store,
+            elicitation_id=elicitation_id,
+        )
+        if result is None:
+            return Response(status_code=status.HTTP_200_OK)
+        return Response(
+            content=result.model_dump_json(),
+            media_type="application/json",
+        )
+
     # ── POST /sessions/{session_id}/hooks/cursor-permission-request ─
 
     @router.post(
@@ -16680,6 +16831,11 @@ def create_sessions_router(
           ``response.output_text.delta`` event observed outside the
           Omnigent task runtime, without persisting an item or starting /
           steering a task.
+        - ``"external_output_reasoning_delta"`` publishes a transient
+          ``response.reasoning_text.delta`` event (preceded by one
+          ``response.reasoning.started`` when ``data.started`` is true)
+          observed outside the Omnigent task runtime, without persisting an
+          item or starting / steering a task.
         - ``"external_session_interrupted"`` publishes a
           ``session.interrupted`` event observed outside the Omnigent task
           runtime, without persisting an item or starting / steering a
@@ -16767,6 +16923,7 @@ def create_sessions_router(
             _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             _EXTERNAL_CONVERSATION_ITEM_TYPE,
             _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+            _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
             _EXTERNAL_SESSION_INTERRUPTED_TYPE,
             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
             _EXTERNAL_SESSION_STATUS_TYPE,
@@ -17133,6 +17290,9 @@ def create_sessions_router(
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
             _publish_external_output_text_delta(session_id, body)
+            return {"queued": False}
+        if body.type == _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE:
+            _publish_external_output_reasoning_delta(session_id, body)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_INTERRUPTED_TYPE:
             response_id = body.data.get("response_id")

@@ -80,6 +80,7 @@ OMNIGENT_EXECUTOR_TYPE = "omnigent"
 OMNIGENT_HARNESSES = frozenset(
     {
         "antigravity",
+        "antigravity-native",
         "claude-native",
         "claude-sdk",
         "codex",
@@ -104,6 +105,7 @@ OMNIGENT_HARNESS_ALIASES = frozenset(
     {
         "claude",
         "native-pi",
+        "native-antigravity",
         "native-goose",
         "openai-agents-sdk",
         "agy",

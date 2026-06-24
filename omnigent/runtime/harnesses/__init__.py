@@ -49,6 +49,10 @@ _HARNESS_MODULES: dict[str, str] = {
     "pi": "omnigent.inner.pi_harness",
     # Native Pi TUI bridge used by ``omnigent pi``.
     "pi-native": "omnigent.inner.pi_native_harness",
+    # Native Antigravity (agy) TUI terminal bridge used by
+    # ``omnigent antigravity``. The in-process SDK counterpart is the
+    # canonical ``antigravity`` harness registered below.
+    "antigravity-native": "omnigent.inner.antigravity_native_harness",
     # Step 4e: openai-agents harness wrap. See
     # omnigent/inner/openai_agents_sdk_harness.py. Registry
     # key is the Omnigent-side spelling (``openai-agents``,
