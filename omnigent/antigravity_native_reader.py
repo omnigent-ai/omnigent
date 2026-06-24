@@ -135,6 +135,11 @@ _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 # Session-status edge values (mirror the transcript forwarder's vocabulary).
 _STATUS_RUNNING = "running"
 _STATUS_IDLE = "idle"
+# Terminal-failure session status (a valid ``external_session_status``; see the
+# ``Literal["idle", "running", "failed"]`` schema). Emitted when an agy turn
+# closes on a model/turn ERROR so the web UI shows the turn FAILED instead of a
+# clean idle with a silent empty reply (#6).
+_STATUS_FAILED = "failed"
 
 # RPC step type/status constants needed for the status-transition heuristic. The
 # item-mapping constants live in the mapper; the driver only needs the few it
@@ -1632,9 +1637,27 @@ async def _emit_step(
 
     if _is_turn_close_step(step) and turn_active:
         turn_active = False
-        await _post_event(client, session_id, _status_event(_STATUS_IDLE))
+        # An ERROR planner closes the turn as FAILED, not a clean idle: a model /
+        # safety-policy / rate-limit / provider-overload error must surface as a
+        # failed turn (alongside the error item the mapper now emits), not a
+        # silent empty success that looks identical to a normal reply (#6).
+        close_status = _STATUS_FAILED if _step_is_error_planner(step) else _STATUS_IDLE
+        await _post_event(client, session_id, _status_event(close_status))
 
     return turn_active
+
+
+def _step_is_error_planner(step: dict[str, object]) -> bool:
+    """
+    Return whether a step is a PLANNER_RESPONSE that ended in ERROR.
+
+    Used to close the turn as ``failed`` (not ``idle``) so a model/turn error is
+    not mistaken for a clean empty reply.
+
+    :param step: One RPC step dict.
+    :returns: ``True`` for an ERROR-status planner step.
+    """
+    return step.get("type") == _TYPE_PLANNER_RESPONSE and step.get("status") == _STATUS_ERROR
 
 
 def _maybe_handle_interaction(
