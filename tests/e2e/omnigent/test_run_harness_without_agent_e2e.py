@@ -186,6 +186,12 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     (tmux pane + bridge dir, driving qwen's ``--input-file`` / ``--json-file``),
     not ``omnigent run --harness qwen-native``. Its coverage is the dedicated
     qwen-native bridge/executor/forwarder unit tests.
+
+    ``kiro-native`` is excluded for the same reason as ``goose-native`` /
+    ``qwen-native`` / ``cursor-native``: it is a terminal-first TUI launched via
+    ``omni kiro`` (tmux pane + bridge dir), not ``omnigent run --harness
+    kiro-native``. Its coverage is the dedicated kiro-native bridge/executor/
+    forwarder unit tests plus the ``test_native_kiro_render_parity`` e2e_ui suite.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
@@ -200,5 +206,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "qwen-native",
         "goose",
         "goose-native",
+        "kiro-native",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses
