@@ -376,7 +376,10 @@ _CLI_HARNESSES: dict[str, dict[str, str]] = {
     "claude-sdk": {
         "cli": "claude",
         "display": "Claude Code",
-        "install": "npm install -g @anthropic-ai/claude-code",
+        # Anthropic's recommended native installer (writes to ~/.local/bin and
+        # self-updates), not `npm install -g`. See
+        # https://code.claude.com/docs/en/setup#native-install-recommended
+        "install": "curl -fsSL https://claude.ai/install.sh | bash",
     },
     "codex": {
         "cli": "codex",
