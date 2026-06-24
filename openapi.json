@@ -42,7 +42,7 @@
         "type": "object"
       },
       "AgentObject": {
-        "description": "API representation of a registered agent.\n\n:param id: Unique agent identifier, e.g. ``\"ag_abc123\"``.\n:param object: Fixed resource type, always ``\"agent\"``.\n:param name: Human-readable agent name,\n    e.g. ``\"research-agent\"``.\n:param version: Monotonic version counter. Starts at 1,\n    incremented on each update.\n:param description: Optional free-text description of the\n    agent's purpose.\n:param created_at: Unix epoch timestamp of creation.\n:param updated_at: Unix epoch timestamp of the last update,\n    or ``None`` if never updated.\n:param harness: The agent's harness/kind, e.g. ``\"codex\"``,\n    ``\"codex-native\"``, or ``\"claude-native\"`` for\n    ``executor.type: omnigent`` agents, otherwise the executor\n    type (``\"claude_sdk\"``, ``\"agents_sdk\"``). ``None`` when the\n    bundle cannot be loaded. Lets the Web UI Add Agent picker\n    recognise an agent's kind (Codex vs Claude) without\n    hardcoding by name slug.\n:param mcp_servers: MCP servers the agent is connected to\n    (secret fields omitted). Empty list when the spec\n    declares no MCP servers or when the bundle cannot be\n    loaded.\n:param policies: Guardrails policies declared on the agent.\n    Each entry summarises the policy name, type, and\n    phases. Empty list when the spec declares no policies\n    or when the bundle cannot be loaded.\n:param skills: Skills bundled in the agent spec\n    (``skills/<name>/SKILL.md``). Lets the Web UI's\n    new-session composer offer a slash-command menu before a\n    session (and its runner) exists. Host-discovered skills\n    are runner-owned, so they are NOT listed here \u2014 the\n    session snapshot's ``skills`` field carries the merged\n    set once a runner is bound. Empty list when the spec\n    bundles no skills or when the bundle cannot be loaded.\n:param terminals: Terminal names declared in the spec's\n    ``terminals:`` block, in declaration order, e.g.\n    ``[\"shell\"]``. The Web UI gates its \"new terminal\"\n    affordance on this list (creation is only offered for\n    agents with terminal access) and offers these names as\n    the launchable choices. Empty list when the spec\n    declares no terminals or when the bundle cannot be\n    loaded.",
+        "description": "API representation of a registered agent.\n\n:param id: Unique agent identifier, e.g. ``\"ag_abc123\"``.\n:param object: Fixed resource type, always ``\"agent\"``.\n:param name: Human-readable agent name,\n    e.g. ``\"research-agent\"``.\n:param version: Monotonic version counter. Starts at 1,\n    incremented on each update.\n:param description: Optional free-text description of the\n    agent's purpose.\n:param created_at: Unix epoch timestamp of creation.\n:param updated_at: Unix epoch timestamp of the last update,\n    or ``None`` if never updated.\n:param harness: The agent's harness/kind, e.g. ``\"codex\"``,\n    ``\"codex-native\"``, or ``\"claude-native\"`` for\n    ``executor.type: omnigent`` agents, otherwise the executor\n    type (``\"claude_sdk\"``, ``\"agents_sdk\"``). ``None`` when the\n    bundle cannot be loaded. Lets the Web UI Add Agent picker\n    recognise an agent's kind (Codex vs Claude) without\n    hardcoding by name slug.\n:param mcp_servers: MCP servers the agent is connected to\n    (secret fields omitted). Empty list when the spec\n    declares no MCP servers or when the bundle cannot be\n    loaded.\n:param mcp_servers_editable: Whether the MCP list can be edited\n    through the session UI. Built-in template agents are read-only;\n    session-scoped uploaded agents are editable.\n:param policies: Guardrails policies declared on the agent.\n    Each entry summarises the policy name, type, and\n    phases. Empty list when the spec declares no policies\n    or when the bundle cannot be loaded.\n:param skills: Skills bundled in the agent spec\n    (``skills/<name>/SKILL.md``). Lets the Web UI's\n    new-session composer offer a slash-command menu before a\n    session (and its runner) exists. Host-discovered skills\n    are runner-owned, so they are NOT listed here \u2014 the\n    session snapshot's ``skills`` field carries the merged\n    set once a runner is bound. Empty list when the spec\n    bundles no skills or when the bundle cannot be loaded.\n:param terminals: Terminal names declared in the spec's\n    ``terminals:`` block, in declaration order, e.g.\n    ``[\"shell\"]``. The Web UI gates its \"new terminal\"\n    affordance on this list (creation is only offered for\n    agents with terminal access) and offers these names as\n    the launchable choices. Empty list when the spec\n    declares no terminals or when the bundle cannot be\n    loaded.",
         "properties": {
           "created_at": {
             "title": "Created At",
@@ -80,6 +80,11 @@
             },
             "title": "Mcp Servers",
             "type": "array"
+          },
+          "mcp_servers_editable": {
+            "default": false,
+            "title": "Mcp Servers Editable",
+            "type": "boolean"
           },
           "name": {
             "title": "Name",
@@ -3628,6 +3633,74 @@
         "title": "UpdateSessionRequest",
         "type": "object"
       },
+      "UpsertMCPServerRequest": {
+        "description": "Request body for creating or updating a session agent MCP server.\n\nSecret-bearing fields (``headers`` and ``env``) are intentionally\nnot accepted by the UI route. Existing secrets are preserved when a\nserver is edited without changing transport.",
+        "properties": {
+          "args": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64,
+            "title": "Args",
+            "type": "array"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}$",
+            "title": "Name",
+            "type": "string"
+          },
+          "transport": {
+            "enum": [
+              "http",
+              "stdio"
+            ],
+            "title": "Transport",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "name",
+          "transport"
+        ],
+        "title": "UpsertMCPServerRequest",
+        "type": "object"
+      },
       "Usage": {
         "description": "Token usage statistics for a response.\n\n:param input_tokens: Number of input (prompt) tokens consumed.\n:param output_tokens: Number of output (completion) tokens\n    generated.\n:param output_tokens_details: Breakdown of output token usage\n    (e.g. reasoning tokens).\n:param total_tokens: Sum of input and output tokens across all\n    LLM sub-calls for this turn (billing total).\n:param context_tokens: Context-fill estimate for the next turn \u2014\n    set only by executors that make multiple LLM sub-calls per\n    turn (e.g. ``openai-agents``).  For single-call executors\n    this is absent and ``total_tokens`` serves the same purpose.\n    The toolbar context ring and ``/context`` command use this\n    field when present, falling back to ``total_tokens``.\n:param cache_read_input_tokens: Prompt tokens served from a\n    provider prompt cache (cache hit), billed at a reduced rate.\n    Reported by Anthropic-style providers as a count *separate*\n    from ``input_tokens`` (which carries only the non-cached\n    portion); ``0`` when the provider does not break out cache\n    usage. Consumed by the cache-aware server-side cost path.\n:param cache_creation_input_tokens: Prompt tokens written to the\n    provider prompt cache (cache creation), billed at a premium\n    rate. Like ``cache_read_input_tokens``, this is separate from\n    ``input_tokens``; ``0`` when not reported.\n:param model: The LLM model the harness actually used for this\n    turn, e.g. ``\"claude-opus-4-8\"`` or ``\"databricks-gpt-5-5\"``.\n    Reported by relay executors so the server-side cost path can\n    price the turn even when the agent spec pins no ``llm.model``\n    (e.g. supervisors that delegate / use the harness default).\n    ``None`` when the executor doesn't report it; the cost path\n    then falls back to the session override / spec model.",
         "properties": {
@@ -5148,6 +5221,207 @@
         "summary": "Get Session Agent Contents",
         "tags": [
           "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/agent/mcp-servers": {
+      "get": {
+        "description": "List safe MCP server summaries for a session's bound agent.",
+        "operationId": "list_mcp_servers_v1_sessions__session_id__agent_mcp_servers_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Mcp Servers V1 Sessions  Session Id  Agent Mcp Servers Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Mcp Servers",
+        "tags": [
+          "session_mcp_servers"
+        ]
+      },
+      "post": {
+        "description": "Create one MCP server declaration on a session-scoped agent.",
+        "operationId": "create_mcp_server_v1_sessions__session_id__agent_mcp_servers_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertMCPServerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MCPServerSummary"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Mcp Server",
+        "tags": [
+          "session_mcp_servers"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/agent/mcp-servers/{server_name}": {
+      "delete": {
+        "description": "Delete one MCP server declaration from a session-scoped agent.",
+        "operationId": "delete_mcp_server_v1_sessions__session_id__agent_mcp_servers__server_name__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "server_name",
+            "required": true,
+            "schema": {
+              "title": "Server Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Mcp Server",
+        "tags": [
+          "session_mcp_servers"
+        ]
+      },
+      "put": {
+        "description": "Replace one MCP server declaration on a session-scoped agent.",
+        "operationId": "update_mcp_server_v1_sessions__session_id__agent_mcp_servers__server_name__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "server_name",
+            "required": true,
+            "schema": {
+              "title": "Server Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertMCPServerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MCPServerSummary"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Mcp Server",
+        "tags": [
+          "session_mcp_servers"
         ]
       }
     },

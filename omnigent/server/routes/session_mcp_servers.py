@@ -93,8 +93,7 @@ def create_session_mcp_servers_router(
         return {
             "object": "list",
             "data": [
-                _summary_from_config(server).model_dump()
-                for server in loaded.spec.mcp_servers
+                _summary_from_config(server).model_dump() for server in loaded.spec.mcp_servers
             ],
         }
 
