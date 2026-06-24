@@ -44,11 +44,11 @@ import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import { BUILTIN_AGENTS, sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
 import {
   isNativeCodingAgent,
   nativeAgentHasCapability,
-  nativeAgentSortRank,
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
 import { useHosts, type Host } from "@/hooks/useHosts";
@@ -69,27 +69,6 @@ import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
-
-// Preferred display order for the built-in agent picker. The server
-// returns agents newest-registered first (agent_store.list sorts by
-// created_at desc), so pin the order users expect; any agent not listed
-// here falls after, in server order.
-const AGENT_DISPLAY_ORDER = ["Claude Code", "Codex", "OpenCode", "Cursor", "Pi", "Polly", "Debby"];
-
-// Built-in agents (by name slug) — the long-lived agents the server
-// ships out of the box. The picker groups these first, then a divider,
-// then custom (user-registered) agents. GET /v1/agents doesn't yet
-// distinguish the two, so this is a frontend allowlist for now.
-const BUILTIN_AGENTS = new Set([
-  "claude-native-ui", // Claude Code
-  "codex-native-ui", // Codex
-  "opencode-native-ui", // OpenCode
-  "pi-native-ui", // Pi
-  "cursor-native-ui", // Cursor
-  "goose-native-ui", // Goose
-  "polly",
-  "debby",
-]);
 
 // Hidden on the new-session picker only (superseded by polly; older
 // deployments still carry a seeded nessie row this filter keeps out).
@@ -695,19 +674,11 @@ export function NewChatLandingScreen() {
   // working directory with a live one (see the conflict tooltip below).
   const { data: directorySessions } = useDirectorySessions(true);
 
-  const agentList = useMemo(() => {
-    const displayRank = (name: string) => {
-      const i = AGENT_DISPLAY_ORDER.indexOf(name);
-      return i === -1 ? AGENT_DISPLAY_ORDER.length : i;
-    };
-    return [...(agents ?? [])]
-      .filter((a) => !NEW_SESSION_HIDDEN_AGENTS.has(a.name))
-      .sort(
-        (a, b) =>
-          nativeAgentSortRank(a) - nativeAgentSortRank(b) ||
-          displayRank(a.display_name) - displayRank(b.display_name),
-      );
-  }, [agents]);
+  const agentList = useMemo(
+    () =>
+      sortAgentsForDisplay((agents ?? []).filter((a) => !NEW_SESSION_HIDDEN_AGENTS.has(a.name))),
+    [agents],
+  );
 
   // Split the picker into built-in agents (shipped out of the box) and
   // custom (user-registered) agents so the menu can group them with a
