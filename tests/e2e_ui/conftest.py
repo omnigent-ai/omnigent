@@ -84,7 +84,7 @@ def open_right_rail(page: Page) -> None:
 # Populated by ``live_server`` so test-scoped fixtures can access the
 # server PID and runner id without changing ``live_server``'s return
 # type (which other tests depend on).
-_server_state: dict[str, int | str] = {}
+_server_state: dict[str, Any] = {}
 _AP_WEB_DIR = _REPO_ROOT / "ap-web"
 _BUILD_OUTPUT = _REPO_ROOT / "omnigent" / "server" / "static" / "web-ui"
 
@@ -902,6 +902,7 @@ def live_server(
     _server_state["binding_token"] = binding_token
     _server_state["server_url"] = base_url
     _server_state["mock_llm_url"] = mock_url
+    _server_state["_runner_proc"] = runner_proc
 
     # Set a non-resettable fallback for the policy-classifier LLM queue so
     # every per-test reset leaves the server's guardrails path functional.
@@ -1066,7 +1067,17 @@ def _ensure_runner_online(
             return False
         return resp.status_code == 200 and resp.json().get("online") is True
 
-    if _online():
+    def _runner_process_alive() -> bool:
+        respawned = _server_state.get("_respawned_runner")
+        if isinstance(respawned, subprocess.Popen):
+            return respawned.poll() is None
+        # Check the original runner process (stored by live_server).
+        original = _server_state.get("_runner_proc")
+        if isinstance(original, subprocess.Popen):
+            return original.poll() is None
+        return True  # no process info — trust _online()
+
+    if _online() and _runner_process_alive():
         return None
 
     binding_token = str(_server_state["binding_token"])
@@ -1103,6 +1114,7 @@ def _ensure_runner_online(
                 f"log:\n{log_path.read_text()[-3000:]}"
             )
         if _online():
+            _server_state["_respawned_runner"] = proc
             return proc
         time.sleep(_HEALTH_POLL_INTERVAL_S)
 

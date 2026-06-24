@@ -13,21 +13,20 @@ The LLM calls are served by the in-process mock LLM server rather than a real
 OpenAI endpoint. Before each test run a mock ``openai`` provider config is
 written to ``~/.omnigent/config.yaml`` (see ``native_codex_mock_session`` in
 ``conftest.py``), redirecting the runner's ``OPENAI_BASE_URL`` to the mock
-server. Tokens are pre-generated and queued via content-based routing so the
-mock returns the expected assistant token for each turn regardless of how many
-extra LLM calls Codex makes internally.
+server. Before each turn, a per-turn fallback is set via
+``set_fallback_mock_llm`` so the mock returns the expected assistant token
+regardless of how many extra LLM calls Codex makes internally.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm, set_fallback_mock_llm
+from tests.e2e_ui.conftest import reset_mock_llm, set_fallback_mock_llm
 
 # Reuse the custom-agent suite's helpers — both surfaces render from the same
 # canonical transcript, so parity / dedup / ordering are asserted identically.
@@ -55,9 +54,10 @@ _MOCK_TURN_TIMEOUT_MS = 60_000
 # pre-accept + WS attach can take a while on a cold CI runner.
 _TERMINAL_READY_TIMEOUT_MS = 120_000
 
-# Must match the model set in the mock openai provider config written by the
-# native_codex_mock_session fixture (conftest._CODEX_MOCK_MODEL).
-_CODEX_MOCK_MODEL = "gpt-4o"
+# The Codex CLI sends its own built-in default model in requests (gpt-5.5),
+# ignoring the provider config's models.default. This must match the model
+# the CLI actually uses so the fallback queue routes correctly.
+_CODEX_MOCK_MODEL = "gpt-5.5"
 
 # Two composer turns (the IN direction) + one TUI turn (the OUT direction).
 _COMPOSER_TURNS = 2
@@ -99,10 +99,6 @@ def _type_into_tui(page: Page, text: str) -> None:
     page.keyboard.press("Enter")
 
 
-@pytest.mark.skipif(
-    not os.environ.get("LLM_API_KEY"),
-    reason="Native Codex render-parity needs real OpenAI credentials (LLM_API_KEY).",
-)
 @pytest.mark.timeout(300)
 def test_native_codex_message_render_parity(
     page: Page,
@@ -113,29 +109,26 @@ def test_native_codex_message_render_parity(
     base_url, session_id = native_codex_mock_session
     _log.info("native-codex mock session ready: base_url=%s session_id=%s", base_url, session_id)
 
+    # Set a safe fallback BEFORE the CLI boots so startup LLM calls
+    # (tool schema loading, etc.) get a benign response instead of the
+    # default "Mock LLM response" which may confuse the CLI.
+    reset_mock_llm(mock_llm_server_url)
+    set_fallback_mock_llm(mock_llm_server_url, _CODEX_MOCK_MODEL, "ok")
+
     page.goto(f"{base_url}/c/{session_id}")
     _open_terminal_view(page)
     _wait_terminal_connected(page)
     _log.info("Codex TUI attached (terminal-view connected)")
     _ensure_chat_view(page)
 
-    # Pre-generate tokens for all turns so they can be queued in the mock
-    # before any message is sent. Content-based routing (match=user_marker)
-    # ensures the right token is returned regardless of extra internal calls.
+    # Pre-generate tokens for all turns.  Each turn sets a per-turn fallback
+    # via set_fallback_mock_llm right before sending, so the mock returns the
+    # expected assistant token regardless of extra internal LLM calls.
     nonces = [uuid.uuid4().hex[:8] for _ in range(_COMPOSER_TURNS + 1)]
     turns = [
         (f"usr-{i + 1}-{nonces[i]}", f"ast-{i + 1}-{nonces[i]}")
         for i in range(_COMPOSER_TURNS + 1)
     ]
-    reset_mock_llm(mock_llm_server_url)
-    for user_marker, assistant_token in turns:
-        configure_mock_llm(
-            mock_llm_server_url,
-            [{"text": assistant_token}],
-            key=user_marker,
-            match=user_marker,
-        )
-    set_fallback_mock_llm(mock_llm_server_url, _CODEX_MOCK_MODEL, "")
 
     user_markers: list[str] = []
     assistant_tokens: list[str] = []
@@ -147,6 +140,7 @@ def test_native_codex_message_render_parity(
         _log.info(
             "composer turn %d: sending (marker=%s token=%s)", index, user_marker, assistant_token
         )
+        set_fallback_mock_llm(mock_llm_server_url, _CODEX_MOCK_MODEL, assistant_token)
         _send(page, _turn_prompt(index, user_marker, assistant_token))
         expect(page.locator(_ASSISTANT, has_text=assistant_token).first).to_be_visible(
             timeout=_MOCK_TURN_TIMEOUT_MS
@@ -165,6 +159,7 @@ def test_native_codex_message_render_parity(
     _log.info(
         "TUI turn %d: typing into xterm (marker=%s token=%s)", tui_index, tui_marker, tui_token
     )
+    set_fallback_mock_llm(mock_llm_server_url, _CODEX_MOCK_MODEL, tui_token)
     _type_into_tui(page, _turn_prompt(tui_index, tui_marker, tui_token))
 
     _ensure_chat_view(page)
