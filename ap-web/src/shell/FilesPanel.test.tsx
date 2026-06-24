@@ -12,9 +12,12 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
+import i18n from "@/i18n";
 import { FilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
+
+const t = i18n.getFixedT(null, "nav");
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceAllFiles: vi.fn(),
@@ -197,7 +200,7 @@ describe("FilesPanel working folder directory", () => {
   it("does not render a directory label when workingDir is null", () => {
     renderPanel({ conversationId: "conv_wdir_null", files: [] });
     // "Working folder" label is present but no directory name span
-    expect(screen.getByText("Working folder")).toBeInTheDocument();
+    expect(screen.getByText(t("workingFolder"))).toBeInTheDocument();
     // There should be no element with a title that looks like a path
     expect(screen.queryByTitle("/")).toBeNull();
   });
@@ -387,7 +390,7 @@ describe("FilesPanel changed files search", () => {
 
     const { rerender } = renderPanel({ conversationId: "conv_search_visible", files });
 
-    expect(screen.queryByRole("searchbox", { name: "Search changed files" })).toBeNull();
+    expect(screen.queryByRole("searchbox", { name: t("searchChangedFiles") })).toBeNull();
 
     rerender(
       <MemoryRouter initialEntries={["/c/conv_search_visible"]}>
@@ -410,7 +413,7 @@ describe("FilesPanel changed files search", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByRole("searchbox", { name: "Search changed files" })).toBeInTheDocument();
+    expect(screen.getByRole("searchbox", { name: t("searchChangedFiles") })).toBeInTheDocument();
   });
 
   it("filters already-loaded changed files case-insensitively", () => {
@@ -421,14 +424,14 @@ describe("FilesPanel changed files search", () => {
       changedFiles: [changedFile("src/components/Button.tsx"), changedFile("docs/Guide.md")],
     });
 
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search changed files" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: t("searchChangedFiles") }), {
       target: { value: "BUTTON" },
     });
 
     expect(screen.getByText((text) => text.includes("Button.tsx"))).toBeInTheDocument();
     expect(screen.queryByText("docs/Guide.md")).toBeNull();
 
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search changed files" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: t("searchChangedFiles") }), {
       target: { value: "" },
     });
 
@@ -444,11 +447,11 @@ describe("FilesPanel changed files search", () => {
       changedFiles: [changedFile("src/App.tsx")],
     });
 
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search changed files" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: t("searchChangedFiles") }), {
       target: { value: "App" },
     });
     // Confirm the query is active before switching tabs
-    expect(screen.getByRole("searchbox", { name: "Search changed files" })).toHaveValue("App");
+    expect(screen.getByRole("searchbox", { name: t("searchChangedFiles") })).toHaveValue("App");
 
     // Switch to Explore (tree) view
     rerender(
@@ -495,7 +498,7 @@ describe("FilesPanel changed files search", () => {
     );
 
     // useEffect resets changedSearch when flatView becomes false, so the box should be empty on return
-    expect(screen.getByRole("searchbox", { name: "Search changed files" })).toHaveValue("");
+    expect(screen.getByRole("searchbox", { name: t("searchChangedFiles") })).toHaveValue("");
   });
 
   it("matches changed files by full path, not just filename", () => {
@@ -506,7 +509,7 @@ describe("FilesPanel changed files search", () => {
       changedFiles: [changedFile("src/components/Button.tsx"), changedFile("docs/Guide.md")],
     });
 
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search changed files" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: t("searchChangedFiles") }), {
       target: { value: "src/components" },
     });
 
@@ -526,7 +529,7 @@ describe("FilesPanel changed files search", () => {
       onClose,
     });
 
-    const closeButton = screen.getByRole("button", { name: "Close files" });
+    const closeButton = screen.getByRole("button", { name: t("closeFiles") });
     expect(closeButton).toBeInTheDocument();
 
     fireEvent.click(closeButton);
@@ -702,7 +705,7 @@ describe("FilesPanel changed files search", () => {
     }
     render(<Harness />);
 
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search changed files" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: t("searchChangedFiles") }), {
       target: { value: ".env" },
     });
 
@@ -727,9 +730,9 @@ describe("FilesPanel tree (Explore) search", () => {
       files: [file("src/App.tsx")],
     });
 
-    expect(screen.getByRole("searchbox", { name: "Search all files" })).toBeInTheDocument();
+    expect(screen.getByRole("searchbox", { name: t("searchAllFiles") })).toBeInTheDocument();
     // The changed-files search must not appear in tree mode
-    expect(screen.queryByRole("searchbox", { name: "Search changed files" })).toBeNull();
+    expect(screen.queryByRole("searchbox", { name: t("searchChangedFiles") })).toBeNull();
 
     // Switch to Changed view
     rerender(
@@ -754,8 +757,8 @@ describe("FilesPanel tree (Explore) search", () => {
     );
 
     // Changed view has its own search box; tree search must not be present
-    expect(screen.getByRole("searchbox", { name: "Search changed files" })).toBeInTheDocument();
-    expect(screen.queryByRole("searchbox", { name: "Search all files" })).toBeNull();
+    expect(screen.getByRole("searchbox", { name: t("searchChangedFiles") })).toBeInTheDocument();
+    expect(screen.queryByRole("searchbox", { name: t("searchAllFiles") })).toBeNull();
   });
 
   it("shows search results as a flat list after the debounce fires", () => {
@@ -767,7 +770,7 @@ describe("FilesPanel tree (Explore) search", () => {
       treeSearchResults: [file("abc/test.md"), file("src/main.py")],
     });
 
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search all files" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: t("searchAllFiles") }), {
       target: { value: "test" },
     });
 
@@ -795,7 +798,7 @@ describe("FilesPanel tree (Explore) search", () => {
       treeSearchResults: [file("abc/test.md")],
     });
 
-    const searchBox = screen.getByRole("searchbox", { name: "Search all files" });
+    const searchBox = screen.getByRole("searchbox", { name: t("searchAllFiles") });
 
     fireEvent.change(searchBox, { target: { value: "test" } });
     act(() => {
@@ -896,7 +899,7 @@ describe("FilesPanel tree (Explore) search", () => {
       isSearching: false,
     });
 
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search all files" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: t("searchAllFiles") }), {
       target: { value: "zzznotfound" },
     });
     act(() => {
@@ -915,7 +918,7 @@ describe("FilesPanel tree (Explore) search", () => {
       treeSearchResults: [file("abc/test.md")],
     });
 
-    const searchBox = screen.getByRole("searchbox", { name: "Search all files" });
+    const searchBox = screen.getByRole("searchbox", { name: t("searchAllFiles") });
     fireEvent.change(searchBox, { target: { value: "test" } });
     expect(searchBox).toHaveValue("test");
 
@@ -967,7 +970,7 @@ describe("FilesPanel tree (Explore) search", () => {
     // The search box must be empty — treeSearch was cleared by the useEffect
     // when flatView became true.  Using rerender() (not render()) keeps the
     // same component instance so state mutations are observable across renders.
-    expect(screen.getByRole("searchbox", { name: "Search all files" })).toHaveValue("");
+    expect(screen.getByRole("searchbox", { name: t("searchAllFiles") })).toHaveValue("");
   });
 
   it("hides dotfile search results when showHidden is false", () => {
@@ -980,7 +983,7 @@ describe("FilesPanel tree (Explore) search", () => {
       isSearching: false,
     });
 
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search all files" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: t("searchAllFiles") }), {
       target: { value: "env" },
     });
     act(() => {
@@ -1030,7 +1033,7 @@ describe("FilesPanel tree (Explore) search", () => {
       treeSearchResults: [],
     });
 
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search all files" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: t("searchAllFiles") }), {
       target: { value: "wired" },
     });
 
@@ -1061,13 +1064,13 @@ describe("FilesPanel tree (Explore) search", () => {
     });
 
     // Hidden by default — the toggle starts collapsed.
-    expect(screen.queryByRole("textbox", { name: "files to include" })).toBeNull();
+    expect(screen.queryByRole("textbox", { name: t("filesToInclude") })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Show search filters" }));
 
     // Both glob inputs become visible after the toggle is opened.
-    expect(screen.getByRole("textbox", { name: "files to include" })).toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "files to exclude" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: t("filesToInclude") })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: t("filesToExclude") })).toBeInTheDocument();
   });
 
   it("passes the include glob to useWorkspaceFileSearch alongside the query", () => {
@@ -1079,11 +1082,11 @@ describe("FilesPanel tree (Explore) search", () => {
       treeSearchResults: [file("src/main.py")],
     });
 
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search all files" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: t("searchAllFiles") }), {
       target: { value: "main" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Show search filters" }));
-    fireEvent.change(screen.getByRole("textbox", { name: "files to include" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: t("filesToInclude") }), {
       target: { value: "*.py" },
     });
     act(() => {
@@ -1109,11 +1112,11 @@ describe("FilesPanel tree (Explore) search", () => {
       treeSearchResults: [],
     });
 
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search all files" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: t("searchAllFiles") }), {
       target: { value: "main" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Show search filters" }));
-    fireEvent.change(screen.getByRole("textbox", { name: "files to exclude" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: t("filesToExclude") }), {
       target: { value: "**/node_modules" },
     });
     act(() => {
@@ -1138,14 +1141,14 @@ describe("FilesPanel tree (Explore) search", () => {
     });
 
     fireEvent.click(screen.getByRole("button", { name: "Show search filters" }));
-    fireEvent.change(screen.getByRole("textbox", { name: "files to include" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: t("filesToInclude") }), {
       target: { value: "*.ts" },
     });
-    fireEvent.change(screen.getByRole("textbox", { name: "files to exclude" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: t("filesToExclude") }), {
       target: { value: "**/node_modules" },
     });
-    expect(screen.getByRole("textbox", { name: "files to include" })).toHaveValue("*.ts");
-    expect(screen.getByRole("textbox", { name: "files to exclude" })).toHaveValue(
+    expect(screen.getByRole("textbox", { name: t("filesToInclude") })).toHaveValue("*.ts");
+    expect(screen.getByRole("textbox", { name: t("filesToExclude") })).toHaveValue(
       "**/node_modules",
     );
 
@@ -1194,7 +1197,7 @@ describe("FilesPanel tree (Explore) search", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByRole("textbox", { name: "files to include" })).toHaveValue("");
-    expect(screen.getByRole("textbox", { name: "files to exclude" })).toHaveValue("");
+    expect(screen.getByRole("textbox", { name: t("filesToInclude") })).toHaveValue("");
+    expect(screen.getByRole("textbox", { name: t("filesToExclude") })).toHaveValue("");
   });
 });

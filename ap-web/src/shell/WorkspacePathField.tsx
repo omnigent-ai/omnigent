@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { FolderIcon, FolderOpenIcon } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { isNavigablePath } from "./WorkspacePicker";
@@ -126,6 +127,7 @@ export function WorkspacePathField({
   recent,
   dropdownDisabled = false,
 }: WorkspacePathFieldProps) {
+  const { t } = useTranslation("nav");
   const [open, setOpen] = useState(false);
   // Index into the combined [recent..., matches...] list, or -1 for
   // "nothing highlighted" (typing in the input).
@@ -260,12 +262,12 @@ export function WorkspacePathField({
           }}
           onFocus={() => setOpen(true)}
           onKeyDown={onKeyDown}
-          placeholder="/Users/you/projects/app"
+          placeholder={t("workspacePathPlaceholder")}
           spellCheck={false}
           autoCapitalize="off"
           autoCorrect="off"
           role="combobox"
-          aria-label="Working directory path"
+          aria-label={t("workspacePathLabel")}
           aria-autocomplete="list"
           aria-expanded={dropdownOpen}
           aria-controls="workspace-path-listbox"
@@ -276,7 +278,7 @@ export function WorkspacePathField({
         <button
           type="button"
           onClick={onBrowse}
-          aria-label="Browse directories"
+          aria-label={t("browseDirectories")}
           className="flex size-9 shrink-0 items-center justify-center rounded-md border border-input bg-background text-muted-foreground transition hover:bg-muted hover:text-foreground"
           data-testid="workspace-browse-toggle"
         >
@@ -298,7 +300,7 @@ export function WorkspacePathField({
           {filteredRecent.length > 0 && (
             <>
               <div className="px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-                Recent
+                {t("recent")}
               </div>
               {filteredRecent.map((path, i) => (
                 <PathRow
@@ -314,7 +316,7 @@ export function WorkspacePathField({
           {matches.length > 0 && (
             <>
               <div className="px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-                Matches
+                {t("matches")}
               </div>
               {matches.map((path, j) => (
                 <PathRow
@@ -330,12 +332,14 @@ export function WorkspacePathField({
                   className="px-3 py-2 text-xs text-muted-foreground"
                   data-testid="workspace-match-overflow"
                 >
-                  +{hiddenMatchCount} more — keep typing to narrow
+                  {t("matchOverflow", { count: hiddenMatchCount })}
                 </div>
               )}
             </>
           )}
-          {showLoading && <div className="px-3 py-2 text-xs text-muted-foreground">Loading…</div>}
+          {showLoading && (
+            <div className="px-3 py-2 text-xs text-muted-foreground">{t("loading")}</div>
+          )}
         </div>
       )}
     </div>

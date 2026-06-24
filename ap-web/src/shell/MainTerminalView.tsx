@@ -16,6 +16,7 @@
 import { TerminalIcon, XIcon } from "lucide-react";
 import type { CSSProperties } from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { TerminalView } from "@/components/blocks/TerminalView";
 import { AGENT_TERMINAL_IDS, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
@@ -55,6 +56,7 @@ export function MainTerminalView({
   readOnly = false,
   onSurfaceElement,
 }: MainTerminalViewProps) {
+  const { t } = useTranslation("nav");
   const { terminals } = useTerminals(conversationId);
   const terminalFirstCtx = useTerminalFirst();
   // The agent's own terminal (SDK REPL / native vendor pane) — the
@@ -131,7 +133,7 @@ export function MainTerminalView({
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-sm">
         {terminals.length === 0 ? (
           <div className="flex flex-1 items-center justify-center text-muted-foreground text-sm">
-            No terminals available.
+            {t("noTerminalsAvailable")}
           </div>
         ) : (
           <>
@@ -149,7 +151,7 @@ export function MainTerminalView({
                 <span className="flex-1" />
                 <button
                   type="button"
-                  aria-label="Close shell"
+                  aria-label={t("closeShell")}
                   onClick={() => terminalFirstCtx?.setView("chat")}
                   className="cursor-pointer rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                 >

@@ -13,6 +13,9 @@ import { PoliciesPage } from "./PoliciesPage";
 import * as accountsApi from "@/lib/accountsApi";
 import * as defaultPolicies from "@/hooks/useDefaultPolicies";
 import * as policies from "@/hooks/usePolicies";
+import i18n from "@/i18n";
+
+const t = i18n.getFixedT(null, "common");
 
 const navigateMock = vi.fn();
 const addMutate = vi.fn();
@@ -100,7 +103,7 @@ describe("PoliciesPage gating", () => {
   it("shows a loading state until the identity probe resolves", () => {
     vi.mocked(accountsApi.getMe).mockReturnValue(new Promise(() => {}));
     renderPage();
-    expect(screen.getByText("Loading...")).toBeInTheDocument();
+    expect(screen.getByText(t("loading"))).toBeInTheDocument();
   });
 
   it("blocks non-admins with a permission message", async () => {
@@ -112,7 +115,7 @@ describe("PoliciesPage gating", () => {
     });
     renderPage();
     expect(
-      await screen.findByText("You don't have permission to manage global policies."),
+      await screen.findByText(t("noPermissionGlobalPolicies")),
     ).toBeInTheDocument();
   });
 
@@ -126,7 +129,7 @@ describe("PoliciesPage gating", () => {
 describe("PoliciesPage list", () => {
   it("shows the empty state when no global policies are configured", async () => {
     renderPage();
-    expect(await screen.findByText(/No global policies configured/)).toBeInTheDocument();
+    expect(await screen.findByText(t("noGlobalPoliciesConfigured"))).toBeInTheDocument();
   });
 
   it("renders each policy with its handler, a Disabled badge, and parameters", async () => {
@@ -143,9 +146,9 @@ describe("PoliciesPage list", () => {
 
     expect(await screen.findByText("block_canada")).toBeInTheDocument();
     expect(screen.getByText("omnigent.policies.block_canada")).toBeInTheDocument();
-    expect(screen.getByText("Disabled")).toBeInTheDocument(); // only the disabled one
+    expect(screen.getByText(t("disabled"))).toBeInTheDocument(); // only the disabled one
     // factory_params render as a "Parameters" block.
-    expect(screen.getByText("Parameters")).toBeInTheDocument();
+    expect(screen.getByText(t("parameters"))).toBeInTheDocument();
     expect(screen.getByText("max_per_min:")).toBeInTheDocument();
   });
 });
@@ -155,7 +158,9 @@ describe("PoliciesPage actions", () => {
     setPolicies([policy({ id: "p1", name: "block_canada", enabled: true })]);
     renderPage();
 
-    const toggle = await screen.findByRole("switch", { name: "Toggle block_canada" });
+    const toggle = await screen.findByRole("switch", {
+      name: t("togglePolicy", { name: "block_canada" }),
+    });
     fireEvent.click(toggle);
     expect(updateMutate).toHaveBeenCalledWith({ policyId: "p1", enabled: false });
   });
@@ -165,11 +170,13 @@ describe("PoliciesPage actions", () => {
     renderPage();
 
     await screen.findByText("block_canada");
-    fireEvent.click(screen.getByRole("button", { name: "Remove policy" }));
+    fireEvent.click(screen.getByRole("button", { name: t("removePolicy") }));
 
     const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByText("Remove block_canada?")).toBeInTheDocument();
-    fireEvent.click(within(dialog).getByRole("button", { name: /^Remove$/ }));
+    expect(
+      within(dialog).getByText(t("removePolicyConfirmTitle", { name: "block_canada" })),
+    ).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: t("remove") }));
 
     expect(deleteMutate).toHaveBeenCalledWith("p1", expect.anything());
   });
@@ -187,12 +194,12 @@ describe("PoliciesPage actions", () => {
       ],
     } as never);
     renderPage();
-    await screen.findByText(/No global policies configured/);
+    await screen.findByText(t("noGlobalPoliciesConfigured"));
 
-    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    fireEvent.click(screen.getByRole("button", { name: t("addPolicyButton") }));
     const dialog = await screen.findByRole("dialog");
     fireEvent.click(within(dialog).getByText("Block Canada")); // select the registry entry
-    fireEvent.click(within(dialog).getByRole("button", { name: /^Add$/ }));
+    fireEvent.click(within(dialog).getByRole("button", { name: t("add") }));
 
     expect(addMutate).toHaveBeenCalledWith(
       { name: "block_canada", type: "python", handler: "omnigent.policies.block_canada" },

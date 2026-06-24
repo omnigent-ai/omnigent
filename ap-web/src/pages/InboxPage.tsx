@@ -36,6 +36,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangleIcon,
@@ -64,6 +65,7 @@ type RespondedMap = Record<
 >;
 
 export function InboxPage() {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const conversationsQuery = useConversations("", false, { reconcileWhileConnected: true });
   const [responded, setResponded] = useState<RespondedMap>({});
@@ -188,19 +190,16 @@ export function InboxPage() {
       {/* pt-14 leaves room for the AppShell's absolute-positioned header,
           matching MembersPage / PoliciesPage. */}
       <div className="mb-6 flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Inbox</h1>
+        <h1 className="text-2xl font-semibold">{t("inbox")}</h1>
         {(items.length > 0 || commentInbox.items.length > 0) && (
           <span className="text-sm text-muted-foreground">
             {[
-              items.length > 0 && (items.length === 1 ? "1 approval" : `${items.length} approvals`),
-              commentInbox.items.length > 0 &&
-                (commentInbox.items.length === 1
-                  ? "1 comment"
-                  : `${commentInbox.items.length} comments`),
+              items.length > 0 && t("approval", { count: items.length }),
+              commentInbox.items.length > 0 && t("comment", { count: commentInbox.items.length }),
             ]
               .filter(Boolean)
               .join(" · ")}{" "}
-            waiting
+            {t("waiting")}
           </span>
         )}
       </div>
@@ -212,8 +211,7 @@ export function InboxPage() {
         >
           <AlertTriangleIcon className="size-4 shrink-0 text-destructive" />
           <span className="flex-1">
-            Couldn’t load inbox items from {failedSessionCount}{" "}
-            {failedSessionCount === 1 ? "session" : "sessions"}.
+            {t("couldntLoadInboxItems", { count: failedSessionCount })}
           </span>
           <Button
             variant="outline"
@@ -223,7 +221,7 @@ export function InboxPage() {
               commentInbox.retryFailed();
             }}
           >
-            Retry
+            {t("retry")}
           </Button>
         </div>
       )}
@@ -231,7 +229,7 @@ export function InboxPage() {
       {assembling && items.length === 0 && commentInbox.items.length === 0 && (
         <div className="flex items-center gap-2 py-12 text-sm text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
-          Loading inbox…
+          {t("loadingInbox")}
         </div>
       )}
 
@@ -241,10 +239,8 @@ export function InboxPage() {
         commentInbox.items.length === 0 && (
           <div className="flex flex-col items-center gap-2 py-16 text-center">
             <InboxIcon className="size-8 text-muted-foreground/50" />
-            <p className="text-sm font-medium">Nothing waiting on you</p>
-            <p className="text-xs text-muted-foreground">
-              When an agent needs your input or someone comments on a file, it will show up here.
-            </p>
+            <p className="text-sm font-medium">{t("nothingWaiting")}</p>
+            <p className="text-xs text-muted-foreground">{t("nothingWaitingDesc")}</p>
           </div>
         )}
 
@@ -306,7 +302,7 @@ export function InboxPage() {
                   </span>
                   <Button asChild variant="ghost" size="sm" className="text-xs">
                     <Link to={`/c/${item.row.id}`}>
-                      Open session
+                      {t("openSession")}
                       <ArrowRightIcon className="ml-1 size-3.5" />
                     </Link>
                   </Button>
@@ -360,7 +356,7 @@ export function InboxPage() {
                 <div className="flex items-center gap-2">
                   <span className="min-w-0 truncate text-sm">
                     <span className="font-medium">{author}</span>
-                    <span className="text-muted-foreground"> commented on </span>
+                    <span className="text-muted-foreground"> {t("commentedOn")} </span>
                     <span className="font-mono text-xs">{comment.path}</span>
                   </span>
                   <span className="ml-auto flex shrink-0 items-center gap-2">
@@ -375,7 +371,7 @@ export function InboxPage() {
                       <Link
                         to={`/c/${item.row.id}?file=${encodeURIComponent(comment.path)}&comment=${encodeURIComponent(comment.id)}`}
                       >
-                        Open file
+                        {t("openFile")}
                         <ArrowRightIcon className="ml-1 size-3.5" />
                       </Link>
                     </Button>
@@ -397,7 +393,7 @@ export function InboxPage() {
         {assembling && (items.length > 0 || commentInbox.items.length > 0) && (
           <div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
             <Loader2Icon className="size-3.5 animate-spin" />
-            Checking remaining sessions…
+            {t("checkingRemainingSessions")}
           </div>
         )}
       </div>

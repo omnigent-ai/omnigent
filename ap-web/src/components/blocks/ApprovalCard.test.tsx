@@ -2,6 +2,9 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { ApprovalCard } from "./ApprovalCard";
+import i18n from "@/i18n";
+
+const t = i18n.getFixedT(null, "common");
 
 afterEach(() => {
   cleanup();
@@ -59,8 +62,8 @@ describe("ApprovalCard — binary approve/reject", () => {
       />,
     );
 
-    expect(screen.getByText("Command approval")).toBeDefined();
-    expect(screen.getByText("Codex wants to run this command.")).toBeDefined();
+    expect(screen.getByText(t("commandApproval"))).toBeDefined();
+    expect(screen.getByText(t("codexWantsToRunCommand"))).toBeDefined();
     expect(screen.getByText("Run the focused pytest suite.")).toBeDefined();
     expect(screen.getByText("/bin/zsh -lc '.venv/bin/python -m pytest -q'")).toBeDefined();
     expect(screen.getByText("/Users/example/project")).toBeDefined();
@@ -620,8 +623,8 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       />,
     );
 
-    expect(screen.getByText("Codex needs input")).toBeDefined();
-    expect(screen.queryByText("Claude has questions")).toBeNull();
+    expect(screen.getByText(t("codexNeedsInput"))).toBeDefined();
+    expect(screen.queryByText(t("claudeHasQuestions"))).toBeNull();
   });
 
   it("submits multi-select answers as an array", () => {
@@ -719,13 +722,17 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     );
 
     // Only the first question's fieldset is rendered.
-    expect(screen.getByTestId("ask-user-question-progress").textContent).toBe("Question 1 of 2:");
+    expect(screen.getByTestId("ask-user-question-progress").textContent).toBe(
+      t("questionProgress", { current: 1, total: 2 }),
+    );
     expect(screen.getByText("First?")).toBeDefined();
     expect(screen.queryByText("Second?")).toBeNull();
 
     // Next reveals the second question.
     fireEvent.click(screen.getByTestId("ask-user-question-next"));
-    expect(screen.getByTestId("ask-user-question-progress").textContent).toBe("Question 2 of 2:");
+    expect(screen.getByTestId("ask-user-question-progress").textContent).toBe(
+      t("questionProgress", { current: 2, total: 2 }),
+    );
     expect(screen.queryByText("First?")).toBeNull();
     expect(screen.getByText("Second?")).toBeDefined();
 
@@ -977,7 +984,7 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
       <ApprovalCard elicitationId="elic_plan" status="pending" response={null} {...planProps} />,
     );
 
-    expect(screen.getByText("Plan review")).toBeDefined();
+    expect(screen.getByText(t("planReview"))).toBeDefined();
     // Markdown parsed: the heading text renders as element content
     // (Streamdown parses async — wait for it). If the plan were
     // dumped as preformatted JSON, the literal "# Migration plan"
@@ -1103,7 +1110,7 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
         {...planProps}
       />,
     );
-    expect(screen.getByText("Plan approved · auto mode")).toBeDefined();
+    expect(screen.getByText(t("planApprovedAutoMode"))).toBeDefined();
 
     rerender(
       <ApprovalCard
@@ -1113,7 +1120,7 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
         {...planProps}
       />,
     );
-    expect(screen.getByText("Plan approved")).toBeDefined();
+    expect(screen.getByText(t("planApproved"))).toBeDefined();
 
     rerender(
       <ApprovalCard
@@ -1123,7 +1130,7 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
         {...planProps}
       />,
     );
-    expect(screen.getByText("Plan rejected")).toBeDefined();
+    expect(screen.getByText(t("planRejected"))).toBeDefined();
     expect(screen.getByTestId("plan-rejection-feedback").textContent).toContain(
       "Too risky, split it up.",
     );

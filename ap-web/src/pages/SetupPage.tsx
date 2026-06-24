@@ -23,6 +23,7 @@
  */
 
 import { useEffect, useState, type FormEvent } from "react";
+import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { setup as setupRequest } from "@/lib/accountsApi";
@@ -30,6 +31,7 @@ import { setup as setupRequest } from "@/lib/accountsApi";
 const MIN_PASSWORD_LENGTH = 8;
 
 export function SetupPage() {
+  const { t } = useTranslation("common");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -47,11 +49,11 @@ export function SetupPage() {
     setError(null);
 
     if (password !== confirm) {
-      setError("Passwords don't match.");
+      setError(t("passwordsDontMatch"));
       return;
     }
     if (password.length < MIN_PASSWORD_LENGTH) {
-      setError(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+      setError(t("passwordMinLength", { count: MIN_PASSWORD_LENGTH }));
       return;
     }
 
@@ -75,17 +77,14 @@ export function SetupPage() {
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
       <div className="w-full max-w-sm space-y-6">
         <div className="space-y-1 text-center">
-          <h1 className="text-2xl font-semibold tracking-tight">Create the admin account</h1>
-          <p className="text-sm text-muted-foreground">
-            First run — pick the username and password for this server's admin. You can invite
-            others once you're in.
-          </p>
+          <h1 className="text-2xl font-semibold tracking-tight">{t("createAdminAccount")}</h1>
+          <p className="text-sm text-muted-foreground">{t("createAdminDesc")}</p>
         </div>
 
         <form onSubmit={onSubmit} className="space-y-4">
           <div className="space-y-1.5">
             <label htmlFor="setup-username" className="text-sm font-medium leading-none">
-              Username
+              {t("username")}
             </label>
             <Input
               id="setup-username"
@@ -96,16 +95,14 @@ export function SetupPage() {
               disabled={submitting}
               required
               pattern="[a-z0-9][a-z0-9._\-]{0,63}(@[a-z0-9.\-]+\.[a-z]{2,})?"
-              title="Lowercase letters, digits, dots, hyphens, underscores (or a lowercase email)"
+              title={t("usernamePatternTitle")}
             />
-            <p className="text-xs text-muted-foreground">
-              Lowercase letters, digits, dots, hyphens, underscores — or a lowercase email.
-            </p>
+            <p className="text-xs text-muted-foreground">{t("usernamePatternHint")}</p>
           </div>
 
           <div className="space-y-1.5">
             <label htmlFor="setup-password" className="text-sm font-medium leading-none">
-              Password
+              {t("password")}
             </label>
             <Input
               id="setup-password"
@@ -121,7 +118,7 @@ export function SetupPage() {
 
           <div className="space-y-1.5">
             <label htmlFor="setup-confirm" className="text-sm font-medium leading-none">
-              Confirm password
+              {t("confirmPassword")}
             </label>
             <Input
               id="setup-confirm"
@@ -149,7 +146,7 @@ export function SetupPage() {
             className="w-full"
             disabled={submitting || password.length < MIN_PASSWORD_LENGTH || username.length === 0}
           >
-            {submitting ? "Creating…" : "Create admin"}
+            {submitting ? t("creating") : t("createAdmin")}
           </Button>
         </form>
       </div>

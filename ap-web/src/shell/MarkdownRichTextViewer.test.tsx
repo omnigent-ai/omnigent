@@ -12,7 +12,10 @@
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "@/i18n";
 import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
+
+const t = i18n.getFixedT(null, "common");
 
 // ── Module mocks ──────────────────────────────────────────────────────────
 
@@ -138,7 +141,7 @@ describe("MarkdownRichTextViewer read-only copy button", () => {
     renderViewer("# Hello");
 
     // Button must be present so the user can copy the document.
-    expect(screen.getByTitle("Copy")).toBeDefined();
+    expect(screen.getByTitle(t("copy"))).toBeDefined();
   });
 
   it("calls navigator.clipboard.writeText with the raw content when clicked", async () => {
@@ -147,7 +150,7 @@ describe("MarkdownRichTextViewer read-only copy button", () => {
 
     renderViewer("# Hello\n\nWorld");
 
-    fireEvent.click(screen.getByTitle("Copy"));
+    fireEvent.click(screen.getByTitle(t("copy")));
 
     // The full raw markdown string must be written to the clipboard
     // unchanged so the recipient gets proper markdown.
@@ -162,12 +165,12 @@ describe("MarkdownRichTextViewer read-only copy button", () => {
 
     renderViewer("content");
 
-    fireEvent.click(screen.getByTitle("Copy"));
+    fireEvent.click(screen.getByTitle(t("copy")));
 
     // Visual confirmation that the copy succeeded — the label changes
     // to "Copied!" until the 2-second reset fires.
     await waitFor(() => {
-      expect(screen.getByText("Copied!")).toBeDefined();
+      expect(screen.getByText(t("copiedLink"))).toBeDefined();
     });
   });
 
@@ -180,7 +183,7 @@ describe("MarkdownRichTextViewer read-only copy button", () => {
 
     renderViewer("content");
 
-    expect(screen.queryByTitle("Copy")).toBeNull();
+    expect(screen.queryByTitle(t("copy"))).toBeNull();
   });
 });
 
@@ -193,10 +196,10 @@ describe("MarkdownRichTextViewer dirty banners", () => {
     // "Unsaved changes —", not "Saving…".
     setupEditHooks({ isDirty: true, hasExternalUpdate: false });
     renderViewer("content");
-    expect(screen.getByText(/Unsaved changes — commenting is available once saved/)).toBeDefined();
-    expect(screen.queryByText(/Saving…/)).toBeNull();
-    expect(screen.queryByText(/Runner offline/)).toBeNull();
-    expect(screen.queryByText(/modified externally/)).toBeNull();
+    expect(screen.getByText(t("unsavedCommentingAvailable"))).toBeDefined();
+    expect(screen.queryByText(t("savingCommentingAvailable"))).toBeNull();
+    expect(screen.queryByText(t("runnerOfflineSaveCommenting"))).toBeNull();
+    expect(screen.queryByText(t("fileModifiedExternally"))).toBeNull();
   });
 
   it("shows 'Saving…' in the banner once a write is in flight", () => {
@@ -209,8 +212,8 @@ describe("MarkdownRichTextViewer dirty banners", () => {
       mutateAsync: vi.fn(),
     } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
     renderViewer("content");
-    expect(screen.getByText(/Saving… commenting is available once saved/)).toBeDefined();
-    expect(screen.queryByText(/Unsaved changes/)).toBeNull();
+    expect(screen.getByText(t("savingCommentingAvailable"))).toBeDefined();
+    expect(screen.queryByText(t("unsavedCommentingAvailable"))).toBeNull();
   });
 
   it("shows the offline banner when dirty and the runner is offline", () => {
@@ -219,29 +222,29 @@ describe("MarkdownRichTextViewer dirty banners", () => {
     setupEditHooks({ isDirty: true, hasExternalUpdate: false });
     vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(false);
     renderViewer("content");
-    expect(screen.getByText(/Runner offline/)).toBeDefined();
-    expect(screen.queryByText(/Saving…/)).toBeNull();
+    expect(screen.getByText(t("runnerOfflineSaveCommenting"))).toBeDefined();
+    expect(screen.queryByText(t("savingCommentingAvailable"))).toBeNull();
   });
 
   it("shows external update banner instead when dirty and hasExternalUpdate", () => {
     setupEditHooks({ isDirty: true, hasExternalUpdate: true });
     renderViewer("content");
-    expect(screen.getByText(/modified externally/)).toBeDefined();
+    expect(screen.getByText(t("fileModifiedExternally"))).toBeDefined();
     expect(screen.queryByText("Save your changes to enable commenting on selections.")).toBeNull();
   });
 
   it("shows 'Keep mine' and 'Load latest' buttons in the external update banner", () => {
     setupEditHooks({ isDirty: true, hasExternalUpdate: true });
     renderViewer("content");
-    expect(screen.getByText("Keep mine")).toBeDefined();
-    expect(screen.getByText("Load latest")).toBeDefined();
+    expect(screen.getByText(t("keepMine"))).toBeDefined();
+    expect(screen.getByText(t("loadLatest"))).toBeDefined();
   });
 
   it("calls dismissExternalUpdate when 'Keep mine' is clicked", () => {
     const dismissExternalUpdate = vi.fn();
     setupEditHooks({ isDirty: true, hasExternalUpdate: true, dismissExternalUpdate });
     renderViewer("content");
-    fireEvent.click(screen.getByText("Keep mine"));
+    fireEvent.click(screen.getByText(t("keepMine")));
     expect(dismissExternalUpdate).toHaveBeenCalledOnce();
   });
 
@@ -249,16 +252,16 @@ describe("MarkdownRichTextViewer dirty banners", () => {
     const discardAndApplyExternal = vi.fn();
     setupEditHooks({ isDirty: true, hasExternalUpdate: true, discardAndApplyExternal });
     renderViewer("content");
-    fireEvent.click(screen.getByText("Load latest"));
+    fireEvent.click(screen.getByText(t("loadLatest")));
     expect(discardAndApplyExternal).toHaveBeenCalledOnce();
   });
 
   it("shows no banner when the editor is clean", () => {
     setupEditHooks({ isDirty: false, hasExternalUpdate: false });
     renderViewer("content");
-    expect(screen.queryByText(/commenting is available once saved/)).toBeNull();
+    expect(screen.queryByText(t("unsavedCommentingAvailable"))).toBeNull();
     expect(screen.queryByText(/Runner offline/)).toBeNull();
-    expect(screen.queryByText(/modified externally/)).toBeNull();
+    expect(screen.queryByText(t("fileModifiedExternally"))).toBeNull();
   });
 
   it("shows no banner in read-only mode even when dirty", () => {
@@ -269,9 +272,9 @@ describe("MarkdownRichTextViewer dirty banners", () => {
       makeSyncResult({ isDirty: true, hasExternalUpdate: true }),
     );
     renderViewer("content");
-    expect(screen.queryByText(/modified externally/)).toBeNull();
+    expect(screen.queryByText(t("fileModifiedExternally"))).toBeNull();
     expect(screen.queryByText(/Runner offline/)).toBeNull();
-    expect(screen.queryByText(/commenting is available once saved/)).toBeNull();
+    expect(screen.queryByText(t("unsavedCommentingAvailable"))).toBeNull();
   });
 });
 
@@ -349,7 +352,7 @@ describe("MarkdownRichTextViewer truncated guard", () => {
     expect(screen.getByText(/too large to load fully/)).toBeDefined();
     // canEdit is forced false → the read-only Copy overlay appears instead of
     // the editing toolbar, proving the editor is no longer editable.
-    expect(screen.getByTitle("Copy")).toBeDefined();
+    expect(screen.getByTitle(t("copy"))).toBeDefined();
   });
 
   it("stays editable (no truncated banner) when not truncated", () => {
@@ -360,6 +363,6 @@ describe("MarkdownRichTextViewer truncated guard", () => {
 
     expect(screen.queryByText(/too large to load fully/)).toBeNull();
     // Edit mode → no read-only Copy overlay (toolbar handles copy).
-    expect(screen.queryByTitle("Copy")).toBeNull();
+    expect(screen.queryByTitle(t("copy"))).toBeNull();
   });
 });

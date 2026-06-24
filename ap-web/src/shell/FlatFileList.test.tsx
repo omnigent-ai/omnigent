@@ -1,8 +1,11 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import i18n from "@/i18n";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { FlatFileList } from "./FlatFileList";
+
+const t = i18n.getFixedT(null, "common");
 
 afterEach(cleanup);
 
@@ -34,8 +37,8 @@ describe("FlatFileList runner-offline state", () => {
     // reconnect hint, NOT the generic "Failed to load" branch.
     renderList({ isError: true, error: new RunnerOfflineError(), runnerWentOffline: true });
 
-    expect(screen.getByText(/agent is asleep/i)).toBeInTheDocument();
-    expect(screen.getByText(/send a message in the chat to reconnect/i)).toBeInTheDocument();
+    expect(screen.getByText(t("agentAsleep"))).toBeInTheDocument();
+    expect(screen.getByText(t("sendMessageToReconnect"))).toBeInTheDocument();
     // The raw error text must NOT appear for this recoverable state.
     expect(screen.queryByText(/failed to load/i)).not.toBeInTheDocument();
   });
@@ -46,8 +49,8 @@ describe("FlatFileList runner-offline state", () => {
     // normal empty state, not alarm the user that the agent is asleep.
     renderList({ isError: true, error: new RunnerOfflineError(), runnerWentOffline: false });
 
-    expect(screen.getByText(/no workspace changes yet/i)).toBeInTheDocument();
-    expect(screen.queryByText(/agent is asleep/i)).not.toBeInTheDocument();
+    expect(screen.getByText(t("noWorkspaceChanges"))).toBeInTheDocument();
+    expect(screen.queryByText(t("agentAsleep"))).not.toBeInTheDocument();
     expect(screen.queryByText(/failed to load/i)).not.toBeInTheDocument();
   });
 
@@ -57,6 +60,6 @@ describe("FlatFileList runner-offline state", () => {
     renderList({ isError: true, error: new Error("500 Internal Server Error") });
 
     expect(screen.getByText(/failed to load: 500 internal server error/i)).toBeInTheDocument();
-    expect(screen.queryByText(/agent is asleep/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(t("agentAsleep"))).not.toBeInTheDocument();
   });
 });

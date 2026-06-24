@@ -10,7 +10,12 @@
 
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "@/i18n";
 import { ComposerMicButton } from "./ComposerMicButton";
+
+// Resolve expected copy through the app's own i18n instance (jsdom → en) so
+// assertions track the key, not a hardcoded English literal.
+const t = i18n.getFixedT(null, "common");
 
 /** Captured event handlers keyed by event type, fed by the fake recognition. */
 let handlers: Record<string, (event: unknown) => void>;
@@ -81,13 +86,13 @@ describe("ComposerMicButton", () => {
 
   it("renders an idle, un-pressed dictation button when supported", () => {
     render(<ComposerMicButton onTranscript={vi.fn()} />);
-    const button = screen.getByRole("button", { name: "Voice dictation" });
+    const button = screen.getByRole("button", { name: t("voiceDictation") });
     expect(button).toHaveAttribute("aria-pressed", "false");
   });
 
   it("starts recognition on click and reflects the recording state", () => {
     render(<ComposerMicButton onTranscript={vi.fn()} />);
-    const button = screen.getByRole("button", { name: "Voice dictation" });
+    const button = screen.getByRole("button", { name: t("voiceDictation") });
 
     fireEvent.click(button);
     expect(startSpy).toHaveBeenCalledTimes(1);
@@ -99,7 +104,7 @@ describe("ComposerMicButton", () => {
 
   it("stops recognition on a second click once recording", () => {
     render(<ComposerMicButton onTranscript={vi.fn()} />);
-    const button = screen.getByRole("button", { name: "Voice dictation" });
+    const button = screen.getByRole("button", { name: t("voiceDictation") });
 
     fireEvent.click(button);
     act(() => handlers.start?.({}));
@@ -110,7 +115,7 @@ describe("ComposerMicButton", () => {
   it("delivers the trimmed final transcript via onTranscript", () => {
     const onTranscript = vi.fn();
     render(<ComposerMicButton onTranscript={onTranscript} />);
-    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    fireEvent.click(screen.getByRole("button", { name: t("voiceDictation") }));
     act(() => handlers.start?.({}));
 
     act(() => handlers.result?.(resultEvent("  hello world  ")));
@@ -128,17 +133,17 @@ describe("ComposerMicButton", () => {
 
   it("surfaces a permission-denied error in the button tooltip", () => {
     render(<ComposerMicButton onTranscript={vi.fn()} />);
-    const button = screen.getByRole("button", { name: "Voice dictation" });
+    const button = screen.getByRole("button", { name: t("voiceDictation") });
 
     act(() => handlers.error?.({ error: "not-allowed" }));
-    expect(button).toHaveAttribute("title", "Microphone permission denied");
+    expect(button).toHaveAttribute("title", t("microphonePermissionDenied"));
   });
 
   it("ignores routine no-speech/aborted errors (no tooltip change)", () => {
     render(<ComposerMicButton onTranscript={vi.fn()} />);
-    const button = screen.getByRole("button", { name: "Voice dictation" });
+    const button = screen.getByRole("button", { name: t("voiceDictation") });
 
     act(() => handlers.error?.({ error: "no-speech" }));
-    expect(button).toHaveAttribute("title", "Voice dictation");
+    expect(button).toHaveAttribute("title", t("voiceDictation"));
   });
 });

@@ -5,6 +5,7 @@
 // editor.storage.markdown.getMarkdown() for copy / save.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useEditorState } from "@tiptap/react";
 import {
@@ -83,6 +84,7 @@ export function Divider() {
 }
 
 function TableBtn({ editor }: { editor: Editor | null }) {
+  const { t } = useTranslation("common");
   const [open, setOpen] = useState(false);
   const [hovered, setHovered] = useState({ rows: 0, cols: 0 });
   const MAX = 6;
@@ -90,8 +92,8 @@ function TableBtn({ editor }: { editor: Editor | null }) {
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
-        title="Insert table"
-        aria-label="Insert table"
+        title={t("insertTable")}
+        aria-label={t("insertTable")}
         disabled={!editor}
         onMouseDown={(e) => e.preventDefault()}
         className="min-w-[1.75rem] rounded px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
@@ -104,7 +106,9 @@ function TableBtn({ editor }: { editor: Editor | null }) {
         onMouseLeave={() => setHovered({ rows: 0, cols: 0 })}
       >
         <p className="mb-1.5 text-xs text-muted-foreground">
-          {hovered.rows > 0 ? `${hovered.rows} × ${hovered.cols} table` : "Insert table"}
+          {hovered.rows > 0
+            ? t("tableDimensions", { rows: hovered.rows, cols: hovered.cols })
+            : t("insertTable")}
         </p>
         <div className="flex flex-col gap-0.5">
           {Array.from({ length: MAX }, (_, r) => (
@@ -113,7 +117,7 @@ function TableBtn({ editor }: { editor: Editor | null }) {
                 <button
                   key={c}
                   type="button"
-                  aria-label={`Insert ${r + 1}×${c + 1} table`}
+                  aria-label={t("insertTableSized", { rows: r + 1, cols: c + 1 })}
                   onMouseDown={(e) => e.preventDefault()}
                   onMouseEnter={() => setHovered({ rows: r + 1, cols: c + 1 })}
                   onClick={() => {
@@ -182,6 +186,7 @@ function setColumnAlign(editor: Editor, align: ColumnAlign | null): boolean {
 }
 
 function TableAlignControls({ editor }: { editor: Editor }) {
+  const { t } = useTranslation("common");
   const state = useEditorState({
     editor,
     selector: (ctx) => ({
@@ -202,21 +207,21 @@ function TableAlignControls({ editor }: { editor: Editor }) {
       <Divider />
       <ToolbarBtn
         active={current === "left"}
-        title="Align column left"
+        title={t("alignColumnLeft")}
         onClick={() => setColumnAlign(editor, "left")}
       >
         <AlignLeft className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
         active={current === "center"}
-        title="Align column center"
+        title={t("alignColumnCenter")}
         onClick={() => setColumnAlign(editor, "center")}
       >
         <AlignCenter className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
         active={current === "right"}
-        title="Align column right"
+        title={t("alignColumnRight")}
         onClick={() => setColumnAlign(editor, "right")}
       >
         <AlignRight className="size-3.5" />
@@ -245,6 +250,7 @@ export function ToolbarPlugin({
   // picking Keep mine / Load latest.
   hasExternalUpdate: boolean;
 }) {
+  const { t } = useTranslation("common");
   // Re-render only when the values that drive the toolbar UI actually change.
   const editorState = useEditorState({
     editor,
@@ -330,21 +336,21 @@ export function ToolbarPlugin({
   // dead "Retry" — fall through to "Saved" instead.
   const saveStatus = saveDisabled
     ? {
-        label: "Offline",
-        title: "Runner offline — your changes will save when it reconnects",
+        label: t("editorSaveOffline"),
+        title: t("editorSaveOfflineTitle"),
         tone: "offline" as const,
       }
     : saveError && isDirty
-      ? { label: "Retry", title: "Save failed — click to retry", tone: "error" as const }
+      ? { label: t("retry"), title: t("editorSaveRetryTitle"), tone: "error" as const }
       : isSaving
-        ? { label: "Saving…", title: "Saving…", tone: "pending" as const }
+        ? { label: t("editorSaving"), title: t("editorSaving"), tone: "pending" as const }
         : isDirty
           ? {
-              label: "Unsaved",
-              title: "Unsaved changes — ⌘S to save now",
+              label: t("editorSaveUnsaved"),
+              title: t("editorSaveUnsavedTitle"),
               tone: "pending" as const,
             }
-          : { label: "Saved", title: "All changes saved", tone: "saved" as const };
+          : { label: t("editorSaved"), title: t("editorSavedTitle"), tone: "saved" as const };
   // Clickable only when there are unsaved edits and a write can land: never
   // while offline, mid-conflict, or when there's nothing to persist.
   const saveClickable = !saveDisabled && !hasExternalUpdate && isDirty;
@@ -352,14 +358,14 @@ export function ToolbarPlugin({
   return (
     <div className="flex flex-wrap items-center gap-0.5 border-b border-border bg-card px-2 py-1 shrink-0">
       <ToolbarBtn
-        title="Undo (⌘Z)"
+        title={t("undo")}
         onClick={() => editor?.chain().focus().undo().run()}
         className={!canUndo ? "opacity-30 cursor-default" : ""}
       >
         <Undo2 className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
-        title="Redo (⌘⇧Z)"
+        title={t("redo")}
         onClick={() => editor?.chain().focus().redo().run()}
         className={!canRedo ? "opacity-30 cursor-default" : ""}
       >
@@ -368,35 +374,35 @@ export function ToolbarPlugin({
       <Divider />
       <ToolbarBtn
         active={isParagraph}
-        title="Normal"
+        title={t("normalText")}
         onClick={() => editor?.chain().focus().setParagraph().run()}
       >
         <Pilcrow className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
         active={isH1}
-        title="Heading 1"
+        title={t("heading1")}
         onClick={() => editor?.chain().focus().toggleHeading({ level: 1 }).run()}
       >
         <Heading1 className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
         active={isH2}
-        title="Heading 2"
+        title={t("heading2")}
         onClick={() => editor?.chain().focus().toggleHeading({ level: 2 }).run()}
       >
         <Heading2 className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
         active={isH3}
-        title="Heading 3"
+        title={t("heading3")}
         onClick={() => editor?.chain().focus().toggleHeading({ level: 3 }).run()}
       >
         <Heading3 className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
         active={isBlockquote}
-        title="Quote"
+        title={t("quote")}
         onClick={() => editor?.chain().focus().toggleBlockquote().run()}
       >
         <Quote className="size-3.5" />
@@ -404,48 +410,48 @@ export function ToolbarPlugin({
       <Divider />
       <ToolbarBtn
         active={isBold}
-        title="Bold (⌘B)"
+        title={t("bold")}
         onClick={() => editor?.chain().focus().toggleBold().run()}
       >
         <Bold className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
         active={isItalic}
-        title="Italic (⌘I)"
+        title={t("italic")}
         onClick={() => editor?.chain().focus().toggleItalic().run()}
       >
         <Italic className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
         active={isStrike}
-        title="Strikethrough"
+        title={t("strikethrough")}
         onClick={() => editor?.chain().focus().toggleStrike().run()}
       >
         <Strikethrough className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
         active={isCode}
-        title="Inline code"
+        title={t("inlineCode")}
         onClick={() => editor?.chain().focus().toggleCode().run()}
       >
         <Code className="size-3.5" />
       </ToolbarBtn>
       <Divider />
       <ToolbarBtn
-        title="Bullet list"
+        title={t("bulletList")}
         onClick={() => editor?.chain().focus().toggleBulletList().run()}
       >
         <List className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
-        title="Numbered list"
+        title={t("numberedList")}
         onClick={() => editor?.chain().focus().toggleOrderedList().run()}
       >
         <ListOrdered className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
         active={isTaskList}
-        title="Task list"
+        title={t("taskList")}
         onClick={() => editor?.chain().focus().toggleTaskList().run()}
       >
         <ListTodo className="size-3.5" />
@@ -454,7 +460,7 @@ export function ToolbarPlugin({
       <TableBtn editor={editor} />
       {editor && <TableAlignControls editor={editor} />}
       <div className="ml-auto flex items-center gap-2">
-        <ToolbarBtn title="Copy" onClick={handleCopy}>
+        <ToolbarBtn title={t("copy")} onClick={handleCopy}>
           {isCopied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
         </ToolbarBtn>
         <button

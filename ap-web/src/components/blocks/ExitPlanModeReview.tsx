@@ -20,6 +20,7 @@
 
 import { CheckIcon, XIcon, ZapIcon } from "lucide-react";
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { MessageResponse } from "@/components/ai-elements/message";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -41,6 +42,7 @@ export function ExitPlanModeReview({
   onAccept,
   onReject,
 }: ExitPlanModeReviewProps) {
+  const { t } = useTranslation("common");
   const [rejecting, setRejecting] = useState(false);
   const [feedback, setFeedback] = useState("");
 
@@ -58,7 +60,7 @@ export function ExitPlanModeReview({
         <div className="flex flex-col gap-2 pt-1" data-testid="exit-plan-mode-feedback">
           <Textarea
             autoFocus
-            placeholder="What should change about the plan? (optional)"
+            placeholder={t("planFeedbackPlaceholder")}
             value={feedback}
             onChange={(e) => setFeedback(e.target.value)}
             className="min-h-20 text-sm"
@@ -66,10 +68,10 @@ export function ExitPlanModeReview({
           <div className="flex flex-wrap gap-2">
             <Button size="sm" onClick={() => onReject(feedback)}>
               <XIcon className="mr-1 size-3.5" />
-              Reject plan
+              {t("rejectPlan")}
             </Button>
             <Button size="sm" variant="ghost" onClick={() => setRejecting(false)}>
-              Cancel
+              {t("cancel")}
             </Button>
           </div>
         </div>
@@ -77,15 +79,15 @@ export function ExitPlanModeReview({
         <div className="flex flex-wrap gap-2 pt-1">
           <Button size="sm" onClick={onAcceptAuto}>
             <ZapIcon className="mr-1 size-3.5" />
-            Yes, and use auto mode
+            {t("planApproveAutoMode")}
           </Button>
           <Button size="sm" variant="outline" onClick={onAccept}>
             <CheckIcon className="mr-1 size-3.5" />
-            Yes, manually approve edits
+            {t("planApproveManual")}
           </Button>
           <Button size="sm" variant="outline" onClick={() => setRejecting(true)}>
             <XIcon className="mr-1 size-3.5" />
-            Reject with feedback
+            {t("planRejectWithFeedback")}
           </Button>
         </div>
       )}

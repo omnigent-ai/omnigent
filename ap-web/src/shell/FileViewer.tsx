@@ -42,6 +42,7 @@ import {
   SquareArrowOutUpRightIcon,
   Trash2Icon,
 } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { useSearchParams } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
@@ -317,6 +318,8 @@ function FileViewerBody({
   onCommentsOpenChange,
   sort = "recent",
 }: FileViewerProps) {
+  const { t } = useTranslation("nav");
+  const { t: tc } = useTranslation("common");
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
   // LEVEL_EDIT = 2; levels below 2 are read-only.
   const canEdit = permissionLevel == null || permissionLevel >= 2;
@@ -694,11 +697,11 @@ function FileViewerBody({
     const previewLabel =
       lang === "markdown"
         ? viewMode === "editor"
-          ? "Source view"
-          : "Rich text editor"
+          ? t("sourceView")
+          : t("richTextEditor")
         : viewMode === "preview"
-          ? "View source"
-          : "View preview";
+          ? t("viewSource")
+          : t("viewPreview");
     toolbarActions.push({
       key: "preview",
       label: previewLabel,
@@ -731,14 +734,14 @@ function FileViewerBody({
   if (lang === "html" && fileQuery.data && viewMode !== "diff") {
     toolbarActions.push({
       key: "open-new-tab",
-      label: "Open in new tab",
+      label: t("openInNewTab"),
       icon: <SquareArrowOutUpRightIcon className="size-4" />,
       onSelect: openHtmlInNewTab,
     });
   }
   toolbarActions.push({
     key: "comments",
-    label: commentsOpen ? "Hide comments" : "Show comments",
+    label: commentsOpen ? t("hideComments") : t("showComments"),
     icon: <MessageSquareTextIcon className="size-4" />,
     active: commentsOpen,
     onSelect: () => {
@@ -749,7 +752,7 @@ function FileViewerBody({
   if (isDiffAvailable) {
     toolbarActions.push({
       key: "diff",
-      label: viewMode === "diff" ? "Exit diff view" : "Show diff",
+      label: viewMode === "diff" ? t("exitDiffView") : t("showDiff"),
       icon: <FileDiffIcon className="size-4" />,
       active: viewMode === "diff",
       onSelect: () => guardDirty(() => setDiffActive((prev) => !prev)),
@@ -758,7 +761,7 @@ function FileViewerBody({
   if (viewMode === "diff" && splitToggleAvailable) {
     toolbarActions.push({
       key: "diff-layout",
-      label: diffLayout === "unified" ? "Split view" : "Unified view",
+      label: diffLayout === "unified" ? t("splitView") : t("unifiedView"),
       icon:
         diffLayout === "unified" ? (
           <Columns2Icon className="size-4" />
@@ -770,25 +773,23 @@ function FileViewerBody({
   }
   toolbarActions.push({
     key: "search",
-    label: "Find in file",
+    label: t("findInFile"),
     icon: <SearchIcon className="size-4" />,
     onSelect: openSearch,
   });
   if (!isDeletedFile && fileQuery.data) {
     toolbarActions.push({
       key: "download",
-      label: "Download file",
-      tooltip: fileQuery.data.truncated
-        ? "Download (file was truncated — content may be incomplete)"
-        : "Download",
+      label: t("downloadFile"),
+      tooltip: fileQuery.data.truncated ? t("downloadTruncated") : t("download"),
       icon: <DownloadIcon className="size-4" />,
       onSelect: downloadFile,
     });
   }
   toolbarActions.push({
     key: "copy-link",
-    label: "Copy link to file",
-    tooltip: linkCopied ? "Copied!" : "Copy link",
+    label: t("copyLinkToFile"),
+    tooltip: linkCopied ? tc("copiedLink") : tc("copyLink"),
     icon: linkCopied ? (
       <CheckIcon className="size-4 text-green-500" />
     ) : (
@@ -864,13 +865,13 @@ function FileViewerBody({
                       type="button"
                       variant="ghost"
                       size="icon-sm"
-                      aria-label="Close file viewer"
+                      aria-label={t("closeFileViewer")}
                       onClick={() => guardDirty(onClose)}
                     >
                       <ArrowLeftIcon className="size-4" />
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent>Close</TooltipContent>
+                  <TooltipContent>{tc("close")}</TooltipContent>
                 </Tooltip>
               </TooltipProvider>
             </div>
@@ -881,7 +882,7 @@ function FileViewerBody({
                 type="button"
                 variant="ghost"
                 size="icon-sm"
-                aria-label="Previous file"
+                aria-label={t("previousFile")}
                 disabled={!prevPath}
                 onClick={() => prevPath && guardDirty(() => onNavigateTo(prevPath))}
               >
@@ -894,7 +895,7 @@ function FileViewerBody({
                 type="button"
                 variant="ghost"
                 size="icon-sm"
-                aria-label="Next file"
+                aria-label={t("nextFile")}
                 disabled={!nextPath}
                 onClick={() => nextPath && guardDirty(() => onNavigateTo(nextPath))}
               >
@@ -916,11 +917,7 @@ function FileViewerBody({
             <span
               ref={toolbarChipRef}
               aria-live="polite"
-              title={
-                saveStatus === "offline"
-                  ? "Runner offline — your changes will save when it reconnects"
-                  : undefined
-              }
+              title={saveStatus === "offline" ? t("runnerOfflineSaveHint") : undefined}
               className={cn(
                 "mr-1 flex shrink-0 items-center gap-1 whitespace-nowrap text-[11px]",
                 saveStatus === "error" ? "text-destructive" : "text-muted-foreground",
@@ -929,31 +926,31 @@ function FileViewerBody({
               {saveStatus === "unsaved" && (
                 <>
                   <span className="size-1.5 rounded-full bg-muted-foreground/70" />
-                  Unsaved
+                  {t("unsaved")}
                 </>
               )}
               {saveStatus === "saving" && (
                 <>
                   <Loader2Icon className="size-3 animate-spin" />
-                  Saving…
+                  {t("saving")}
                 </>
               )}
               {saveStatus === "saved" && (
                 <>
                   <CheckIcon className="size-3 text-green-500" />
-                  Saved
+                  {t("saved")}
                 </>
               )}
               {saveStatus === "error" && (
                 <>
                   <AlertTriangleIcon className="size-3" />
-                  Save failed
+                  {t("saveFailed")}
                 </>
               )}
               {saveStatus === "offline" && (
                 <>
                   <CloudOffIcon className="size-3" />
-                  Unsaved
+                  {t("unsaved")}
                 </>
               )}
             </span>
@@ -966,7 +963,7 @@ function FileViewerBody({
             {toolbarCollapsed ? (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <Button type="button" variant="ghost" size="icon-sm" aria-label="More actions">
+                  <Button type="button" variant="ghost" size="icon-sm" aria-label={t("moreActions")}>
                     <MoreHorizontalIcon className="size-4" />
                   </Button>
                 </DropdownMenuTrigger>
@@ -1015,11 +1012,12 @@ function FileViewerBody({
           {isDeletedFile && viewMode !== "diff" ? (
             <div className="flex flex-col items-center justify-center gap-2 p-8 text-sm text-muted-foreground">
               <Trash2Icon className="size-5 opacity-40" />
-              <span>This file has been deleted.</span>
+              <span>{t("fileDeleted")}</span>
               {isDiffAvailable && (
                 <span className="text-xs">
-                  Click <FileDiffIcon className="inline size-3.5 align-text-bottom" /> to view its
-                  previous content.
+                  {t("clickDiffToViewPreviousPrefix")}{" "}
+                  <FileDiffIcon className="inline size-3.5 align-text-bottom" />{" "}
+                  {t("clickDiffToViewPreviousSuffix")}
                 </span>
               )}
             </div>
@@ -1037,7 +1035,7 @@ function FileViewerBody({
               <Suspense
                 fallback={
                   <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
-                    Loading diff…
+                    {t("loadingDiff")}
                   </div>
                 }
               >
@@ -1144,14 +1142,12 @@ function FileViewerBody({
       >
         <DialogContent showCloseButton={false}>
           <DialogHeader>
-            <DialogTitle>Unsaved changes</DialogTitle>
-            <DialogDescription>
-              Your edits will be lost if you leave without saving.
-            </DialogDescription>
+            <DialogTitle>{t("unsavedChanges")}</DialogTitle>
+            <DialogDescription>{t("unsavedChangesDesc")}</DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={() => setPendingAction(null)}>
-              Keep editing
+              {t("keepEditing")}
             </Button>
             <Button
               variant="destructive"
@@ -1161,7 +1157,7 @@ function FileViewerBody({
                 setPendingAction(null);
               }}
             >
-              Discard changes
+              {t("discardChanges")}
             </Button>
           </DialogFooter>
         </DialogContent>

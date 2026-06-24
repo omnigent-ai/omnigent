@@ -18,6 +18,7 @@
  */
 
 import { useEffect, useState, type FormEvent } from "react";
+import { useTranslation } from "react-i18next";
 import { useSearchParams } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -26,6 +27,7 @@ import { register as registerRequest } from "@/lib/accountsApi";
 const MIN_PASSWORD_LENGTH = 8;
 
 export function RegisterPage() {
+  const { t } = useTranslation("common");
   const [params] = useSearchParams();
   const invite = params.get("invite") ?? "";
 
@@ -51,11 +53,11 @@ export function RegisterPage() {
     setError(null);
 
     if (password !== confirm) {
-      setError("Passwords don't match.");
+      setError(t("registerPasswordsMismatch"));
       return;
     }
     if (password.length < MIN_PASSWORD_LENGTH) {
-      setError(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+      setError(t("passwordMinLength", { count: MIN_PASSWORD_LENGTH }));
       return;
     }
 
@@ -73,10 +75,8 @@ export function RegisterPage() {
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
       <div className="w-full max-w-sm space-y-6">
         <div className="space-y-1 text-center">
-          <h1 className="text-2xl font-semibold tracking-tight">Create your account</h1>
-          <p className="text-sm text-muted-foreground">
-            You were invited to join this Omnigent server.
-          </p>
+          <h1 className="text-2xl font-semibold tracking-tight">{t("createYourAccount")}</h1>
+          <p className="text-sm text-muted-foreground">{t("invitedToJoin")}</p>
         </div>
 
         {missingInvite ? (
@@ -84,14 +84,13 @@ export function RegisterPage() {
             role="alert"
             className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
           >
-            This page needs an invite token in the URL — make sure you opened the link your admin
-            sent you.
+            {t("missingInviteToken")}
           </div>
         ) : (
           <form onSubmit={onSubmit} className="space-y-4">
             <div className="space-y-1.5">
               <label htmlFor="register-username" className="text-sm font-medium leading-none">
-                Username
+                {t("username")}
               </label>
               <Input
                 id="register-username"
@@ -102,16 +101,14 @@ export function RegisterPage() {
                 disabled={submitting}
                 required
                 pattern="[a-z0-9][a-z0-9._\-]{0,63}(@[a-z0-9.\-]+\.[a-z]{2,})?"
-                title="Lowercase letters, digits, dots, hyphens, underscores (or a lowercase email)"
+                title={t("usernamePatternTitle")}
               />
-              <p className="text-xs text-muted-foreground">
-                Lowercase letters, digits, dots, hyphens, underscores — or a lowercase email.
-              </p>
+              <p className="text-xs text-muted-foreground">{t("usernamePatternHint")}</p>
             </div>
 
             <div className="space-y-1.5">
               <label htmlFor="register-password" className="text-sm font-medium leading-none">
-                Password
+                {t("password")}
               </label>
               <Input
                 id="register-password"
@@ -127,7 +124,7 @@ export function RegisterPage() {
 
             <div className="space-y-1.5">
               <label htmlFor="register-confirm" className="text-sm font-medium leading-none">
-                Confirm password
+                {t("confirmPassword")}
               </label>
               <Input
                 id="register-confirm"
@@ -157,7 +154,7 @@ export function RegisterPage() {
                 submitting || password.length < MIN_PASSWORD_LENGTH || username.length === 0
               }
             >
-              {submitting ? "Creating…" : "Create account"}
+              {submitting ? t("creating") : t("createAccount")}
             </Button>
           </form>
         )}

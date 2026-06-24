@@ -1,9 +1,12 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "@/i18n";
 import { type TerminalInfo, useTerminals } from "@/hooks/useTerminals";
 import { MainTerminalView } from "./MainTerminalView";
 import type { TerminalFirstContextValue } from "./TerminalFirstContext";
 import { TerminalFirstContextProvider } from "./TerminalFirstContext";
+
+const t = i18n.getFixedT(null, "nav");
 
 vi.mock("@/components/blocks/TerminalView", () => ({
   TerminalView: ({
@@ -172,7 +175,7 @@ describe("MainTerminalView — terminal-first SDK sessions", () => {
 
     // The close X is the way back to chat (the Chat/Terminal pill is
     // hidden in shell view — ConnectionIndicator gates on isShellView).
-    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+    fireEvent.click(screen.getByRole("button", { name: t("closeShell") }));
     expect(setView).toHaveBeenCalledWith("chat");
   });
 });
@@ -225,7 +228,7 @@ describe("MainTerminalView — native wrapper sessions", () => {
       "terminal_bash_s1",
     );
     expect(screen.queryByText("claude")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+    fireEvent.click(screen.getByRole("button", { name: t("closeShell") }));
     expect(setView).toHaveBeenCalledWith("chat");
   });
 });

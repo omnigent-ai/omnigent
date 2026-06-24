@@ -22,6 +22,9 @@ import { Editor } from "@tiptap/core";
 import { Table, TableCell, TableHeader, TableRow } from "@tiptap/extension-table";
 import StarterKit from "@tiptap/starter-kit";
 import { TableHandles } from "./TableBubbleMenu";
+import i18n from "@/i18n";
+
+const t = i18n.getFixedT(null, "common");
 
 /** Minimal 3×3 table: one header row + two body rows. */
 const TABLE_3X3 = `
@@ -79,15 +82,15 @@ function hoverCell(rowIndex: number, colIndex: number): HTMLTableCellElement {
 /** Opens the row grip menu over (rowIndex, colIndex) and returns its items. */
 function openRowMenu(rowIndex: number, colIndex = 0): HTMLElement {
   hoverCell(rowIndex, colIndex);
-  fireEvent.click(screen.getByRole("button", { name: "Row options" }));
-  return screen.getByText("Delete row").closest("[data-table-handle-menu]") as HTMLElement;
+  fireEvent.click(screen.getByRole("button", { name: t("rowOptions") }));
+  return screen.getByText(t("deleteRow")).closest("[data-table-handle-menu]") as HTMLElement;
 }
 
 /** Opens the column grip menu over (rowIndex, colIndex) and returns its items. */
 function openColMenu(rowIndex: number, colIndex: number): HTMLElement {
   hoverCell(rowIndex, colIndex);
-  fireEvent.click(screen.getByRole("button", { name: "Column options" }));
-  return screen.getByText("Delete column").closest("[data-table-handle-menu]") as HTMLElement;
+  fireEvent.click(screen.getByRole("button", { name: t("columnOptions") }));
+  return screen.getByText(t("deleteColumn")).closest("[data-table-handle-menu]") as HTMLElement;
 }
 
 beforeEach(() => {
@@ -104,10 +107,10 @@ describe("TableHandles — grip visibility", () => {
     // WHY: the grips are portaled in only on hover; before any mousemove the
     // toolbar must be absent, and a mousemove over a cell must reveal both.
     renderHandles();
-    expect(screen.queryByRole("button", { name: "Row options" })).toBeNull();
+    expect(screen.queryByRole("button", { name: t("rowOptions") })).toBeNull();
     hoverCell(1, 1);
-    expect(screen.getByRole("button", { name: "Row options" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Column options" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: t("rowOptions") })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: t("columnOptions") })).toBeInTheDocument();
   });
 
   it("opens the row menu on grip click and the column menu on its grip click", () => {
@@ -115,14 +118,14 @@ describe("TableHandles — grip visibility", () => {
     // expected insert/delete items.
     renderHandles();
     const rowMenu = openRowMenu(1);
-    expect(within(rowMenu).getByText("Insert row above")).toBeInTheDocument();
-    expect(within(rowMenu).getByText("Insert row below")).toBeInTheDocument();
-    expect(within(rowMenu).getByText("Delete row")).toBeInTheDocument();
+    expect(within(rowMenu).getByText(t("insertRowAbove"))).toBeInTheDocument();
+    expect(within(rowMenu).getByText(t("insertRowBelow"))).toBeInTheDocument();
+    expect(within(rowMenu).getByText(t("deleteRow"))).toBeInTheDocument();
 
     const colMenu = openColMenu(1, 1);
-    expect(within(colMenu).getByText("Insert column before")).toBeInTheDocument();
-    expect(within(colMenu).getByText("Insert column after")).toBeInTheDocument();
-    expect(within(colMenu).getByText("Delete column")).toBeInTheDocument();
+    expect(within(colMenu).getByText(t("insertColumnBefore"))).toBeInTheDocument();
+    expect(within(colMenu).getByText(t("insertColumnAfter"))).toBeInTheDocument();
+    expect(within(colMenu).getByText(t("deleteColumn"))).toBeInTheDocument();
   });
 });
 
@@ -132,7 +135,7 @@ describe("TableHandles — row menu commands", () => {
     // an empty row at that index and shifting the original down.
     renderHandles();
     const menu = openRowMenu(1);
-    fireEvent.click(within(menu).getByText("Insert row above"));
+    fireEvent.click(within(menu).getByText(t("insertRowAbove")));
     const r = rows();
     expect(r).toHaveLength(4);
     expect(rowText(r[1]).every((t) => t === "")).toBe(true);
@@ -144,7 +147,7 @@ describe("TableHandles — row menu commands", () => {
     // original row 2 (R3C1) down to index 3.
     renderHandles();
     const menu = openRowMenu(1);
-    fireEvent.click(within(menu).getByText("Insert row below"));
+    fireEvent.click(within(menu).getByText(t("insertRowBelow")));
     const r = rows();
     expect(r).toHaveLength(4);
     expect(rowText(r[2]).every((t) => t === "")).toBe(true);
@@ -155,7 +158,7 @@ describe("TableHandles — row menu commands", () => {
     // WHY: deleteRow must drop the gripped row (R2…) and keep header + R3.
     renderHandles();
     const menu = openRowMenu(1);
-    fireEvent.click(within(menu).getByText("Delete row"));
+    fireEvent.click(within(menu).getByText(t("deleteRow")));
     expect(rows()).toHaveLength(2);
     expect(allCellText()).not.toContain("R2C1");
     expect(allCellText()).toContain("R3C1");
@@ -166,8 +169,8 @@ describe("TableHandles — row menu commands", () => {
     // stale menu portal behind.
     renderHandles();
     const menu = openRowMenu(1);
-    fireEvent.click(within(menu).getByText("Insert row above"));
-    expect(screen.queryByText("Delete row")).toBeNull();
+    fireEvent.click(within(menu).getByText(t("insertRowAbove")));
+    expect(screen.queryByText(t("deleteRow"))).toBeNull();
   });
 });
 
@@ -177,7 +180,7 @@ describe("TableHandles — column menu commands", () => {
     // a blank cell at index 1.
     renderHandles();
     const menu = openColMenu(0, 1);
-    fireEvent.click(within(menu).getByText("Insert column before"));
+    fireEvent.click(within(menu).getByText(t("insertColumnBefore")));
     rows().forEach((r) => expect(r.cells).toHaveLength(4));
     expect(rows()[0].cells[1].textContent).toBe("");
   });
@@ -187,7 +190,7 @@ describe("TableHandles — column menu commands", () => {
     // index 2, leaving the original column-1 header (H2) in place.
     renderHandles();
     const menu = openColMenu(0, 1);
-    fireEvent.click(within(menu).getByText("Insert column after"));
+    fireEvent.click(within(menu).getByText(t("insertColumnAfter")));
     rows().forEach((r) => expect(r.cells).toHaveLength(4));
     expect(rows()[0].cells[1].textContent).toBe("H2");
     expect(rows()[0].cells[2].textContent).toBe("");
@@ -198,7 +201,7 @@ describe("TableHandles — column menu commands", () => {
     // the middle column's content (H2 / R2C2 / R3C2).
     renderHandles();
     const menu = openColMenu(0, 1);
-    fireEvent.click(within(menu).getByText("Delete column"));
+    fireEvent.click(within(menu).getByText(t("deleteColumn")));
     rows().forEach((r) => expect(r.cells).toHaveLength(2));
     expect(allCellText()).not.toContain("H2");
     expect(allCellText()).not.toContain("R2C2");
@@ -211,7 +214,7 @@ describe("TableHandles — context menu", () => {
     // click runs deleteTable, leaving no <table> behind.
     renderHandles();
     fireEvent.contextMenu(rows()[1].cells[1], { bubbles: true, clientX: 10, clientY: 10 });
-    const item = screen.getByText("Delete table");
+    const item = screen.getByText(t("deleteTable"));
     fireEvent.click(item);
     expect(editor.view.dom.querySelector("table")).toBeNull();
   });

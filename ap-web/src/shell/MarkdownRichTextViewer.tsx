@@ -17,6 +17,7 @@
 //     offsets to PM positions without bespoke offset-inversion code.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { AlertTriangleIcon, Check, Copy, MessageSquareOffIcon } from "lucide-react";
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
@@ -184,6 +185,7 @@ function MarkdownRichTextViewerInner({
   commentStateRef,
   setContentRef,
 }: InnerProps) {
+  const { t } = useTranslation("common");
   const [isCopied, setIsCopied] = useState(false);
   const copyTimeoutRef = useRef<number>(0);
   useEffect(
@@ -415,12 +417,12 @@ function MarkdownRichTextViewerInner({
         {!canEdit && (
           <button
             type="button"
-            title="Copy"
+            title={t("copy")}
             onClick={handleCopyContent}
             className="absolute top-3 right-3 z-10 flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
           >
             {isCopied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-            {isCopied ? "Copied!" : "Copy"}
+            {isCopied ? t("copiedLink") : t("copy")}
           </button>
         )}
         <EditorContent
@@ -434,34 +436,33 @@ function MarkdownRichTextViewerInner({
       {canEdit && isDirty && hasExternalUpdate && (
         <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-2 border-t border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground backdrop-blur-sm">
           <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
-          <span className="flex-1">This file was modified externally while you were editing.</span>
+          <span className="flex-1">{t("fileModifiedExternally")}</span>
           <button
             type="button"
             className="rounded px-2 py-0.5 font-medium hover:bg-muted transition-colors"
             onClick={dismissExternalUpdate}
           >
-            Keep mine
+            {t("keepMine")}
           </button>
           <button
             type="button"
             className="rounded bg-primary px-2 py-0.5 font-medium text-primary-foreground hover:opacity-90 transition-opacity"
             onClick={discardAndApplyExternal}
           >
-            Load latest
+            {t("loadLatest")}
           </button>
         </div>
       )}
       {canEdit && isDirty && !hasExternalUpdate && saveDisabled && (
         <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground backdrop-blur-sm">
           <MessageSquareOffIcon className="size-3.5 shrink-0 text-warning" />
-          Runner offline — changes save and commenting resumes once it reconnects.
+          {t("runnerOfflineSaveCommenting")}
         </div>
       )}
       {canEdit && isDirty && !hasExternalUpdate && !saveDisabled && (
         <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-muted/50 px-4 py-1.5 text-xs text-muted-foreground backdrop-blur-sm">
           <MessageSquareOffIcon className="size-3.5 shrink-0" />
-          {writeFile.isPending ? "Saving…" : "Unsaved changes —"} commenting is available once
-          saved.
+          {writeFile.isPending ? t("savingCommentingAvailable") : t("unsavedCommentingAvailable")}
         </div>
       )}
       <MarkdownCommentPlugin

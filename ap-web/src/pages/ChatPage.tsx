@@ -32,6 +32,7 @@ import {
   WifiOffIcon,
   XIcon,
 } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
@@ -452,6 +453,7 @@ const sessionDrafts = loadDraftsFromStorage();
  * items fetch (no useConversationItems here).
  */
 export function ChatPage() {
+  const { t } = useTranslation("common");
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
   const navigate = useNavigate();
   // Optional first message handed off by the landing composer through the
@@ -912,7 +914,8 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
-  const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
+  const readOnlyReasonKey = readOnlyReasonForSessionLabels(activeSession, activeConv);
+  const readOnlyReason = readOnlyReasonKey !== null ? t(readOnlyReasonKey) : null;
   // Once present, the live session snapshot is authoritative.
   const capabilitySource = {
     labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
@@ -1052,6 +1055,7 @@ function SelectionPopup({
   containerRef: React.RefObject<HTMLElement | null>;
   onReply: (text: string) => void;
 }) {
+  const { t } = useTranslation("common");
   const [popupPos, setPopupPos] = useState<{ x: number; y: number } | null>(null);
   const selectedTextRef = useRef<string>("");
 
@@ -1138,7 +1142,7 @@ function SelectionPopup({
         }}
       >
         <CornerUpLeftIcon className="size-3.5" />
-        Reply ↵
+        {t("replyShortcut")}
       </Button>
     </div>
   );
@@ -1278,6 +1282,7 @@ function MainAgentSurface({
   costRoutingEligible,
   subAgentLabel,
 }: MainAgentSurfaceProps) {
+  const { t } = useTranslation("common");
   const terminalFirst = useTerminalFirst();
   // Mirrors ChatPage's `sandboxLaunching`: while the managed-sandbox
   // launch runs, the composer must stay sendable — the server parks
@@ -1474,12 +1479,17 @@ function MainAgentSurface({
                 <ConversationEmptyState>
                   <div className="space-y-1.5">
                     <h3 className="text-2xl font-medium tracking-[-0.02em]">
-                      What should we work on?
+                      {t("whatShouldWeWorkOn")}
                     </h3>
                     <p className="text-muted-foreground text-base">
                       {agentsError
-                        ? `Failed to load agents: ${agentsError instanceof Error ? agentsError.message : String(agentsError)}`
-                        : "Send a message to get started."}
+                        ? t("failedToLoadAgentsWithError", {
+                            error:
+                              agentsError instanceof Error
+                                ? agentsError.message
+                                : String(agentsError),
+                          })
+                        : t("sendMessageToGetStarted")}
                     </p>
                   </div>
                 </ConversationEmptyState>
@@ -1522,7 +1532,7 @@ function MainAgentSurface({
                       <div className="flex items-center gap-1.5 py-0.5">
                         <OttoIcon className="otto-working h-4 w-auto shrink-0" />
                         <Shimmer className="text-xs font-mono" duration={1.5}>
-                          Working…
+                          {t("workingEllipsis")}
                         </Shimmer>
                       </div>
                     </MessageContent>
@@ -1615,10 +1625,11 @@ function MainAgentSurface({
 }
 
 function HydratingPlaceholder() {
+  const { t } = useTranslation("common");
   return (
     <div className="flex flex-1 items-center justify-center gap-2 text-muted-foreground text-sm">
       <Loader2Icon className="size-4 animate-spin" />
-      Loading conversation…
+      {t("loadingConversation")}
     </div>
   );
 }
@@ -1638,19 +1649,20 @@ function ConversationLoadError({
   conversationId: string;
   error: Error;
 }) {
+  const { t } = useTranslation("common");
   const navigate = useNavigate();
   return (
     <div className="flex flex-1 items-center justify-center px-6">
       <div className="flex max-w-md flex-col items-center gap-3 text-center">
-        <h1 className="font-medium text-foreground text-lg">Conversation not found</h1>
+        <h1 className="font-medium text-foreground text-lg">{t("conversationNotFound")}</h1>
         <p className="text-muted-foreground text-sm">
-          Couldn't load{" "}
+          {t("couldntLoadConversationPrefix")}{" "}
           <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{conversationId}</code>
           : {error.message}
         </p>
         {/* Route to the home composer ("/"), which owns session creation. */}
         <Button type="button" variant="outline" onClick={() => navigate("/")}>
-          Start a new chat
+          {t("startNewChat")}
         </Button>
       </div>
     </div>
@@ -1681,6 +1693,7 @@ function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageN
  *   the "Working…" tab would otherwise stack on top of it.
  */
 function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?: boolean }) {
+  const { t } = useTranslation("common");
   const { isAtBottom } = useStickToBottomContext();
   const visible = show && !isAtBottom && !suppress;
   return (
@@ -1714,7 +1727,7 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
           >
             <OttoIcon className="otto-working h-4 w-auto shrink-0" />
             <Shimmer className="text-xs font-mono" duration={1.5}>
-              Working…
+              {t("workingEllipsis")}
             </Shimmer>
           </div>
         )}
@@ -1907,6 +1920,7 @@ export function JumpToTopButton({
   scroller: ConversationScroller | null;
   hasMoreHistory: boolean;
 }) {
+  const { t } = useTranslation("nav");
   const [atTop, setAtTop] = useState(true);
   const [hovering, setHovering] = useState(false);
   const [jumping, setJumping] = useState(false);
@@ -2036,7 +2050,7 @@ export function JumpToTopButton({
         size="sm"
         disabled={jumping}
         onClick={() => void jumpToTop()}
-        aria-label="Jump to the first message"
+        aria-label={t("jumpToFirstMessage")}
         // When hidden (opacity-0 / pointer-events-none) keep the button out of
         // the tab order and the accessibility tree so it can't take focus or be
         // announced while invisible.
@@ -2060,7 +2074,7 @@ export function JumpToTopButton({
         ) : (
           <ArrowUpIcon className="size-3.5" aria-hidden />
         )}
-        {jumping ? "Loading history…" : "Jump to top"}
+        {jumping ? t("loadingHistory") : t("jumpToTop")}
       </Button>
     </div>
   );
@@ -2120,11 +2134,11 @@ export function shouldShowWorkingIndicator(showsWorking: boolean, bubbles: Bubbl
  * purpose — `ready` clears the band and `failed` renders its own
  * error band.
  */
-const SANDBOX_STAGE_LABELS: Record<string, string | undefined> = {
-  provisioning: "Provisioning sandbox",
-  cloning: "Cloning repository",
-  starting: "Connecting host",
-  connecting: "Starting agent",
+const SANDBOX_STAGE_LABEL_KEYS: Record<string, string | undefined> = {
+  provisioning: "sandboxStageProvisioning",
+  cloning: "sandboxStageCloning",
+  starting: "sandboxStageConnectingHost",
+  connecting: "sandboxStageStartingAgent",
 };
 
 /**
@@ -2136,6 +2150,7 @@ const SANDBOX_STAGE_LABELS: Record<string, string | undefined> = {
  * one consistent line.
  */
 export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
+  const { t } = useTranslation("common");
   return (
     <div
       data-testid="sandbox-failed-indicator"
@@ -2146,7 +2161,10 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
       )}
     >
       <AlertTriangleIcon className="size-3.5 shrink-0" aria-hidden />
-      <span>Sandbox launch failed{status.error ? `: ${status.error}` : ""}</span>
+      <span>
+        {t("sandboxLaunchFailed")}
+        {status.error ? `: ${status.error}` : ""}
+      </span>
     </div>
   );
 }
@@ -2162,6 +2180,7 @@ export function ConnectionIndicator({
   // the native iOS bar so it doesn't float over an opened sidebar/panel.
   surfaceFrontmost?: boolean;
 }) {
+  const { t } = useTranslation("common");
   const terminalFirst = useTerminalFirst();
   const keyboardVisible = useIOSNativeKeyboardVisible(
     terminalFirst?.isTerminalFirst === true,
@@ -2214,8 +2233,8 @@ export function ConnectionIndicator({
         <WifiOffIcon className="size-3.5 shrink-0" />
         <span>
           {liveness.kind === "host_offline"
-            ? "Host is offline — click to reconnect"
-            : "Agent disconnected — click to reconnect"}
+            ? t("hostOfflineClickToReconnect")
+            : t("agentDisconnectedClickToReconnect")}
         </span>
       </button>
     );
@@ -2269,7 +2288,7 @@ export function ConnectionIndicator({
         )}
       >
         <Loader2Icon className="size-3.5 shrink-0 animate-spin" aria-hidden />
-        <span>Connecting…</span>
+        <span>{t("connecting")}</span>
       </div>
     );
   }
@@ -2299,15 +2318,17 @@ export function ConnectionIndicator({
  * there).
  */
 export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }) {
+  const { t } = useTranslation("common");
   const terminalFirst = useTerminalFirst();
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   // `ready` never reaches the store (cleared) and `failed` renders the
   // destructive band in ConnectionIndicator — only in-flight stages
   // with known copy show here.
-  const sandboxLabel =
+  const sandboxLabelKey =
     sandboxStatus !== null && sandboxStatus.stage !== "failed"
-      ? SANDBOX_STAGE_LABELS[sandboxStatus.stage]
+      ? SANDBOX_STAGE_LABEL_KEYS[sandboxStatus.stage]
       : undefined;
+  const sandboxLabel = sandboxLabelKey !== undefined ? t(sandboxLabelKey) : undefined;
   // `terminalStartingUp` is computed for ALL sessions in AppShell (it does not
   // check isTerminalFirst), so gate on isTerminalFirst too: regular agents
   // (e.g. polly) get the generic ConnectionIndicator "Connecting…" band and
@@ -2319,7 +2340,7 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
     return null;
   }
   const line =
-    sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up… getting your terminal ready.";
+    sandboxLabel !== undefined ? `${sandboxLabel}…` : t("startingUpTerminalReady");
   // role=status + aria-live so assistive tech announces the transient wait;
   // the spinner glyph itself is decorative (aria-hidden).
   if (variant === "hero") {
@@ -2329,11 +2350,9 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
         role="status"
         aria-live="polite"
         icon={<Loader2Icon className="size-7 animate-spin" aria-hidden />}
-        title={sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up…"}
+        title={sandboxLabel !== undefined ? `${sandboxLabel}…` : t("startingUp")}
         description={
-          sandboxLabel !== undefined
-            ? "Setting up your sandbox — this can take a minute."
-            : "Getting your terminal ready — this can take a few seconds."
+          sandboxLabel !== undefined ? t("settingUpSandbox") : t("gettingTerminalReady")
         }
       />
     );
@@ -2424,6 +2443,7 @@ function ConnectedTerminalFirstPill({
   // sources into it. The button is disabled whenever no terminal is
   // reachable: greyed-and-spinning reads as "loading", greyed-and-static as
   // "no terminal / stopped".
+  const { t } = useTranslation("nav");
   const { view, setView, terminalsAvailable, terminalStartingUp } = ctx;
 
   return (
@@ -2435,14 +2455,14 @@ function ConnectedTerminalFirstPill({
     >
       <div
         role="group"
-        aria-label="View mode"
+        aria-label={t("viewMode")}
         className="terminal-first-switcher flex items-center gap-1 rounded-full border border-border bg-card/90 p-1 text-xs shadow-sm"
       >
         <div className="flex items-center gap-0.5">
           <button
             type="button"
             aria-pressed={view === "chat"}
-            aria-label="Chat"
+            aria-label={t("chat")}
             onClick={() => setView("chat")}
             className={cn(
               "terminal-first-switcher-option flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors",
@@ -2452,14 +2472,14 @@ function ConnectedTerminalFirstPill({
             )}
           >
             <MessageSquareIcon className="size-3.5 shrink-0" />
-            <span>Chat</span>
+            <span>{t("chat")}</span>
           </button>
           <button
             type="button"
             aria-pressed={view === "terminal"}
-            aria-label="Terminal"
+            aria-label={t("terminal")}
             disabled={!terminalsAvailable}
-            title={terminalStartingUp ? "Terminal is starting up…" : undefined}
+            title={terminalStartingUp ? t("terminalStartingUp") : undefined}
             onClick={() => setView("terminal")}
             className={cn(
               "terminal-first-switcher-option flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors disabled:cursor-not-allowed disabled:opacity-50",
@@ -2473,7 +2493,7 @@ function ConnectedTerminalFirstPill({
             ) : (
               <TerminalIcon className="size-3.5 shrink-0" />
             )}
-            <span>Terminal</span>
+            <span>{t("terminal")}</span>
           </button>
         </div>
       </div>
@@ -2504,21 +2524,26 @@ export const BubbleView = memo(
   function BubbleView({ bubble }: { bubble: Bubble }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
-      return (
-        <Message from="assistant" data-testid="compacting-indicator">
-          <MessageContent>
-            <Shimmer className="text-xs font-mono" duration={1.5}>
-              Compacting conversation…
-            </Shimmer>
-          </MessageContent>
-        </Message>
-      );
+      return <CompactingBubble />;
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
     return <AssistantBubble bubble={bubble} />;
   },
   (prev, next) => bubblesEqual(prev.bubble, next.bubble),
 );
+
+function CompactingBubble() {
+  const { t } = useTranslation("common");
+  return (
+    <Message from="assistant" data-testid="compacting-indicator">
+      <MessageContent>
+        <Shimmer className="text-xs font-mono" duration={1.5}>
+          {t("compactingConversation")}
+        </Shimmer>
+      </MessageContent>
+    </Message>
+  );
+}
 
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useChatStore((s) => s.conversationId);
@@ -2653,6 +2678,7 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   // assistant-side block exists, so `items` is non-empty here in the
   // common case. The "Working…" shimmer for the empty-items / streaming
   // gap is rendered at the page level, not inside this component.
+  const { t } = useTranslation("common");
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const [isCopied, setIsCopied] = useState(false);
   const copyTimeoutRef = useRef<number>(0);
@@ -2697,12 +2723,12 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
             data-testid="assistant-interrupted-indicator"
           >
             <XIcon className="size-3" aria-hidden="true" />
-            <span>Interrupted</span>
+            <span>{t("interrupted")}</span>
           </p>
         )}
         {markdownText && (
           <MessageActions className="mt-1 opacity-40 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
-            <MessageAction tooltip="Copy" onClick={handleCopy}>
+            <MessageAction tooltip={t("copy")} onClick={handleCopy}>
               {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
             </MessageAction>
             {/* Fork from this response: clone the session with history
@@ -2711,7 +2737,7 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
                 the session can't be forked (sub-agent / isolated mount). */}
             {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
               <MessageAction
-                tooltip="Fork from here"
+                tooltip={t("forkFromHere")}
                 data-testid="fork-from-response"
                 onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
               >
@@ -2723,7 +2749,9 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
       </Message>
 
       {bubble.lifecycle === "failed" && (
-        <p className="text-destructive text-xs">Error: {bubble.error}</p>
+        <p className="text-destructive text-xs">
+          {t("errorPrefix")} {bubble.error}
+        </p>
       )}
     </>
   );
@@ -2890,6 +2918,7 @@ const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
 
 /** Circular progress ring showing how much context window is used, with the used percentage beside it. */
 function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tokensUsed: number }) {
+  const { t } = useTranslation("common");
   const pct = Math.min(tokensUsed / contextWindow, 1);
   // Arc, %, label, and tooltip all encode context USED: a fresh session
   // shows an empty ring at 0% and the ring fills as context is consumed.
@@ -2904,7 +2933,7 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
       <TooltipTrigger asChild>
         <span
           className={cn("flex items-center gap-1.5", color)}
-          aria-label={`${usedPct}% of context used`}
+          aria-label={t("contextUsedAria", { percent: usedPct })}
         >
           <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
             {/* Track */}
@@ -2929,7 +2958,7 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
         </span>
       </TooltipTrigger>
       <TooltipContent side="top" className="max-w-44 text-center text-xs">
-        <p className="tabular-nums">{usedPct}% of context used.</p>
+        <p className="tabular-nums">{t("contextUsedTooltip", { percent: usedPct })}</p>
       </TooltipContent>
     </Tooltip>
   );
@@ -2996,6 +3025,7 @@ export function formatModelEffortStatusLabel(
  * agent-info popover (the "i" button), not here.
  */
 function ComposerStatusLine() {
+  const { t } = useTranslation("common");
   const conversationId = useChatStore((s) => s.conversationId);
   const contextWindow = useChatStore((s) => s.contextWindow);
   const tokensUsed = useChatStore((s) => s.tokensUsed);
@@ -3056,7 +3086,7 @@ function ComposerStatusLine() {
             className="inline-flex items-center gap-1 text-xs font-medium text-foreground"
           >
             <FileTextIcon className="size-3.5 shrink-0" />
-            <span>Plan mode</span>
+            <span>{t("planMode")}</span>
           </span>
         )}
         {modelEffortLabel && (
@@ -3127,6 +3157,7 @@ export function subAgentComposerLabel(
  *   ``"check-account-eligibility"`` (from ``subAgentComposerLabel``).
  */
 function SubagentComposerTray({ label }: { label: string }) {
+  const { t } = useTranslation("nav");
   return (
     <div
       data-testid="composer-subagent-tray"
@@ -3138,7 +3169,7 @@ function SubagentComposerTray({ label }: { label: string }) {
       <BotIcon className="size-3.5 shrink-0" aria-hidden="true" />
       {/* truncate so a long sub-agent name never wraps the tray to two rows */}
       <span className="min-w-0 truncate">
-        Chatting with sub-agent <strong className="font-semibold">{label}</strong>
+        {t("chattingWithSubAgentPrefix")} <strong className="font-semibold">{label}</strong>
       </span>
     </div>
   );
@@ -3180,6 +3211,7 @@ export function Composer({
   costRoutingEligible = false,
   subAgentLabel = null,
 }: ComposerProps) {
+  const { t } = useTranslation("common");
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -3331,7 +3363,11 @@ export function Composer({
       await useChatStore.getState().setCodexPlanMode(!codexPlanMode);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      setCommandError(`Could not ${codexPlanMode ? "exit" : "enter"} Plan mode: ${message}`);
+      setCommandError(
+        codexPlanMode
+          ? t("couldNotExitPlanMode", { error: message })
+          : t("couldNotEnterPlanMode", { error: message }),
+      );
     } finally {
       setPlanModeBusy(false);
     }
@@ -3372,14 +3408,14 @@ export function Composer({
           .getState()
           .compact()
           .catch((err: unknown) => {
-            setCommandError(err instanceof Error ? err.message : "Compact failed");
+            setCommandError(err instanceof Error ? err.message : t("compactFailed"));
           });
         return true;
       case "/effort": {
         if (!showEffort) return false;
         const valid = [...effortLevels, "default"];
         if (!arg || !valid.includes(arg.toLowerCase())) {
-          setCommandError(`Usage: /effort ${valid.join(" | ")}`);
+          setCommandError(t("effortUsage", { options: valid.join(" | ") }));
           return true;
         }
         const level = arg.toLowerCase() === "default" ? null : arg.toLowerCase();
@@ -3390,7 +3426,7 @@ export function Composer({
           .getState()
           .setEffort(level)
           .catch((err: unknown) => {
-            setCommandError(err instanceof Error ? err.message : "Failed to set effort");
+            setCommandError(err instanceof Error ? err.message : t("failedToSetEffort"));
           });
         return true;
       }
@@ -3403,9 +3439,9 @@ export function Composer({
         if (!target) {
           const { sessionModelOverride, llmModel } = useChatStore.getState();
           const current = sessionModelOverride
-            ? `${sessionModelOverride} (override)`
-            : (llmModel ?? "agent default");
-          setCommandError(`Model: ${current}\nUsage: /model <name> · /model default to reset`);
+            ? t("modelOverrideSuffix", { model: sessionModelOverride })
+            : (llmModel ?? t("agentDefaultModel"));
+          setCommandError(`${t("modelLabel", { model: current })}\n${t("modelUsage")}`);
           return true;
         }
         // ``default | off | reset`` clear the override (REPL clear aliases);
@@ -3421,7 +3457,7 @@ export function Composer({
           .getState()
           .setModel(clear ? null : target)
           .catch((err: unknown) => {
-            setCommandError(err instanceof Error ? err.message : "Failed to set model");
+            setCommandError(err instanceof Error ? err.message : t("failedToSetModel"));
           });
         return true;
       }
@@ -3429,8 +3465,11 @@ export function Composer({
         const state = useChatStore.getState();
         const { contextWindow, llmModel, sessionModelOverride, tokensUsed, blocks } = state;
         const lines: string[] = [];
-        if (sessionModelOverride) lines.push(`Model: ${sessionModelOverride} (override)`);
-        else if (llmModel) lines.push(`Model: ${llmModel}`);
+        if (sessionModelOverride)
+          lines.push(
+            t("modelLabel", { model: t("modelOverrideSuffix", { model: sessionModelOverride }) }),
+          );
+        else if (llmModel) lines.push(t("modelLabel", { model: llmModel }));
         // contextWindow > 0 keeps a zero window out of the division (0/0 → "NaN%").
         if (tokensUsed != null && contextWindow != null && contextWindow > 0) {
           const pct = Math.min(tokensUsed / contextWindow, 1);
@@ -3438,16 +3477,20 @@ export function Composer({
           const bar = "█".repeat(filled) + "░".repeat(20 - filled);
           const pctStr = (pct * 100).toFixed(1);
           lines.push(
-            `${tokensUsed.toLocaleString()} / ${contextWindow.toLocaleString()} tokens (${pctStr}%)`,
+            t("contextTokensOfTotal", {
+              used: tokensUsed.toLocaleString(),
+              total: contextWindow.toLocaleString(),
+              percent: pctStr,
+            }),
           );
           lines.push(bar);
         } else if (tokensUsed != null) {
-          lines.push(`${tokensUsed.toLocaleString()} tokens`);
-          lines.push("(Context window size unknown)");
+          lines.push(t("contextTokensCount", { used: tokensUsed.toLocaleString() }));
+          lines.push(t("contextWindowSizeUnknown"));
         } else {
-          lines.push("No usage data yet — send a message first.");
+          lines.push(t("noUsageDataYet"));
         }
-        lines.push(`Items in context: ${blocks.length}`);
+        lines.push(t("itemsInContext", { count: blocks.length }));
         setCommandError(lines.join("\n"));
         return true;
       }
@@ -3458,7 +3501,10 @@ export function Composer({
       }
       default:
         setCommandError(
-          `Unknown command: ${cmd}. Available: ${Object.keys(slashCommands).join(", ")}`,
+          t("unknownCommand", {
+            command: cmd,
+            available: Object.keys(slashCommands).join(", "),
+          }),
         );
         return false;
     }
@@ -3793,7 +3839,7 @@ export function Composer({
       >
         {isDragActive && (
           <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-            <span className="text-sm font-medium text-ring">Drop files here</span>
+            <span className="text-sm font-medium text-ring">{t("dropFilesHere")}</span>
           </div>
         )}
         {/* Slash-command suggestions — floats above the composer box */}
@@ -3819,7 +3865,7 @@ export function Composer({
                   type="button"
                   onClick={() => onRemoveQuote(i)}
                   className="mt-0.5 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
-                  aria-label="Remove quote"
+                  aria-label={t("removeQuote")}
                 >
                   <XIcon className="size-3.5" />
                 </button>
@@ -3878,25 +3924,25 @@ export function Composer({
               // Keep the overlay's scroll position locked to the textarea's.
               if (backdropRef.current) backdropRef.current.scrollTop = e.currentTarget.scrollTop;
             }}
-            aria-label="Message the agent"
+            aria-label={t("messageTheAgent")}
             placeholder={
               readOnlyReason !== null
                 ? readOnlyReason
                 : isReadOnly
-                  ? "You have read-only access to this session"
+                  ? t("composerReadOnlyAccess")
                   : unreachable
-                    ? "Session offline — reconnect below to continue"
+                    ? t("composerSessionOffline")
                     : hasPendingElicitation
-                      ? "Respond to the pending request above to continue"
+                      ? t("composerRespondToPending")
                       : disabled
-                        ? "Waiting for agents…"
+                        ? t("composerWaitingForAgents")
                         : isStreaming
-                          ? "Send a follow-up (queued) — Esc to stop"
+                          ? t("composerSendFollowUp")
                           : sandboxAsleepHint
-                            ? "Current session's host is offline. Next message will resume the sandbox host which can take minutes"
+                            ? t("composerSandboxAsleep")
                             : reconnectHint
-                              ? "Send a message to reconnect this session"
-                              : "Ask the agent anything…"
+                              ? t("composerSendToReconnect")
+                              : t("composerAskAnything")
             }
             rows={1}
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
@@ -3927,7 +3973,7 @@ export function Composer({
                   type="button"
                   onClick={() => removeFile(i)}
                   className="ml-0.5 rounded-full hover:text-foreground"
-                  aria-label={`Remove ${file.name || "image.png"}`}
+                  aria-label={t("removeFile", { name: file.name || "image.png" })}
                 >
                   <XIcon className="size-3" />
                 </button>
@@ -3957,10 +4003,10 @@ export function Composer({
               className="size-9 md:size-8"
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onClick={() => fileInputRef.current?.click()}
-              title="Attach files"
+              title={t("attachFiles")}
             >
               <PaperclipIcon className="size-4" />
-              <span className="sr-only">Attach files</span>
+              <span className="sr-only">{t("attachFiles")}</span>
             </Button>
             <ComposerMicButton
               disabled={disabled || isReadOnly || hasPendingElicitation}
@@ -4003,7 +4049,7 @@ export function Composer({
                     )}
                     disabled={isReadOnly || planModeBusy}
                     aria-pressed={codexPlanMode}
-                    aria-label={codexPlanMode ? "Exit Plan mode" : "Enter Plan mode"}
+                    aria-label={codexPlanMode ? t("exitPlanMode") : t("enterPlanMode")}
                     data-testid="codex-plan-mode-toggle"
                     data-active={codexPlanMode ? "true" : undefined}
                     onClick={() => void toggleCodexPlanMode()}
@@ -4013,11 +4059,11 @@ export function Composer({
                     ) : (
                       <FileTextIcon className="size-3.5" />
                     )}
-                    <span>Plan</span>
+                    <span>{t("plan")}</span>
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>
-                  {codexPlanMode ? "Exit Plan mode" : "Enter Plan mode"}
+                  {codexPlanMode ? t("exitPlanMode") : t("enterPlanMode")}
                 </TooltipContent>
               </Tooltip>
             )}
@@ -4051,15 +4097,15 @@ export function Composer({
                   ? isReadOnly
                   : !hasDraft || disabled || isReadOnly || hasPendingElicitation
               }
-              title={showInterruptButton ? "Interrupt" : "Send"}
-              aria-label={showInterruptButton ? "Interrupt" : "Send"}
+              title={showInterruptButton ? t("interrupt") : t("send")}
+              aria-label={showInterruptButton ? t("interrupt") : t("send")}
             >
               {showInterruptButton ? (
                 <SquareIcon className="size-4 fill-current" />
               ) : (
                 <ArrowUpIcon className="size-4" />
               )}
-              <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
+              <span className="sr-only">{showInterruptButton ? t("interrupt") : t("send")}</span>
             </Button>
           </div>
         </div>
@@ -4244,8 +4290,10 @@ type LabelSource = { labels?: Record<string, string | null> | null } | null | un
  *
  * @param activeSession - Live session snapshot, if loaded.
  * @param activeConv - Sidebar/session-list row fallback.
- * @returns Placeholder text for the composer when the session is
- *   structurally read-only, or ``null`` when normal permissions apply.
+ * @returns A ``common`` translation key for the composer placeholder when
+ *   the session is structurally read-only, or ``null`` when normal
+ *   permissions apply. Callers resolve the key with ``t`` from the
+ *   ``common`` namespace.
  */
 export function readOnlyReasonForSessionLabels(
   activeSession: LabelSource,
@@ -4253,11 +4301,11 @@ export function readOnlyReasonForSessionLabels(
 ): string | null {
   const closed =
     activeSession?.labels?.["omnigent.closed"] ?? activeConv?.labels?.["omnigent.closed"];
-  if (closed === "true") return "This sub-agent session is closed";
+  if (closed === "true") return "composerSubAgentClosed";
   const wrapper =
     activeSession?.labels?.["omnigent.wrapper"] ?? activeConv?.labels?.["omnigent.wrapper"];
   if (wrapper === "claude-code-native-ui-subagent") {
-    return "Claude Code sub-agents are read-only";
+    return "composerSubAgentReadOnly";
   }
   return null;
 }
@@ -4376,6 +4424,7 @@ function AgentPicker({
   disabled = false,
   openNonce = 0,
 }: AgentPickerProps) {
+  const { t } = useTranslation("common");
   // Controlled so bare "/model" in the composer can open the dropdown.
   const [open, setOpen] = useState(false);
   const appliedOpenNonce = useRef(0);
@@ -4418,9 +4467,9 @@ function AgentPicker({
 
   let triggerLabel: string;
   if (isLoading) {
-    triggerLabel = "Loading…";
+    triggerLabel = t("loading");
   } else if (!hasAgents) {
-    triggerLabel = "No agents";
+    triggerLabel = t("noAgents");
   } else if (modelPickerKind === "claude") {
     // Native sessions are always scoped to the bound vendor agent. Show just
     // the vendor name in the pill — model and effort remain selectable in the
@@ -4457,7 +4506,7 @@ function AgentPicker({
       <DropdownMenuContent align="start" className="min-w-64 p-1">
         {showAgents && (
           <>
-            <PickerSectionHeader>Agents</PickerSectionHeader>
+            <PickerSectionHeader>{t("agentsSection")}</PickerSectionHeader>
             {agents?.map((a) => (
               <DropdownMenuItem
                 key={a.id}
@@ -4484,7 +4533,7 @@ function AgentPicker({
         {modelOptions.length > 0 && (
           <>
             {!isNativeModelPicker && <DropdownMenuSeparator className="my-1" />}
-            <PickerSectionHeader>Models</PickerSectionHeader>
+            <PickerSectionHeader>{t("modelsSection")}</PickerSectionHeader>
             {modelOptions.map((m) => {
               const isExplicit = selectedModel === m.id;
               const isImplicit =
@@ -4523,7 +4572,7 @@ function AgentPicker({
         {showEffort && (
           <>
             {(showAgents || modelOptions.length > 0) && <DropdownMenuSeparator className="my-1" />}
-            <PickerSectionHeader>Effort</PickerSectionHeader>
+            <PickerSectionHeader>{t("effortSection")}</PickerSectionHeader>
             {effortLevels.map((level) => (
               <DropdownMenuItem
                 key={level}

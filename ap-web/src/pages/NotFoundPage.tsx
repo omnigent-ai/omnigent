@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { Link } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 
@@ -9,15 +10,14 @@ import { Button } from "@/components/ui/button";
  * after the bundle boots — not on a server-rendered 404.
  */
 export function NotFoundPage() {
+  const { t } = useTranslation("common");
   return (
     <div className="flex flex-1 items-center justify-center px-6">
       <div className="flex max-w-sm flex-col items-center gap-3 text-center">
-        <h1 className="font-medium text-foreground text-lg">Page not found</h1>
-        <p className="text-muted-foreground text-sm">
-          The URL you followed doesn't match any route in this app.
-        </p>
+        <h1 className="font-medium text-foreground text-lg">{t("pageNotFound")}</h1>
+        <p className="text-muted-foreground text-sm">{t("pageNotFoundDesc")}</p>
         <Button asChild variant="outline">
-          <Link to="/">Back to home</Link>
+          <Link to="/">{t("backToHome")}</Link>
         </Button>
       </div>
     </div>

@@ -11,6 +11,7 @@ import {
   AlertTriangleIcon,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
@@ -252,6 +253,7 @@ export function WorkspacePicker({
   initialPath,
   occupancyForPath,
 }: WorkspacePickerProps) {
+  const { t } = useTranslation("nav");
   // "" means home — the server forwards ~ to list_dir. initialPath
   // seeds the start dir (read once at mount).
   const [path, setPath] = useState<string>(initialPath ?? "");
@@ -448,7 +450,7 @@ export function WorkspacePicker({
       setCreateError(null);
       navigateTo(created);
     } catch (err) {
-      setCreateError(err instanceof Error ? err.message : "Failed to create folder");
+      setCreateError(err instanceof Error ? err.message : t("workspacePickerCreateFolderFailed"));
     }
   }
 
@@ -462,8 +464,8 @@ export function WorkspacePicker({
           type="button"
           onClick={() => parent !== null && navigateTo(parent)}
           disabled={parent === null}
-          aria-label="Up one level"
-          title="Up one level"
+          aria-label={t("workspacePickerUpOneLevel")}
+          title={t("workspacePickerUpOneLevel")}
           className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
           data-testid="workspace-picker-up"
         >
@@ -472,8 +474,8 @@ export function WorkspacePicker({
         <button
           type="button"
           onClick={() => navigateTo("")}
-          aria-label="Home"
-          title="Home"
+          aria-label={t("workspacePickerHome")}
+          title={t("workspacePickerHome")}
           className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
           data-testid="workspace-picker-home"
         >
@@ -503,9 +505,9 @@ export function WorkspacePicker({
         <button
           type="button"
           onClick={() => setShowHidden((v) => !v)}
-          aria-label={showHidden ? "Hide hidden" : "Show hidden"}
+          aria-label={showHidden ? t("workspacePickerHideHidden") : t("workspacePickerShowHidden")}
           aria-pressed={showHidden}
-          title={showHidden ? "Hide hidden" : "Show hidden"}
+          title={showHidden ? t("workspacePickerHideHidden") : t("workspacePickerShowHidden")}
           className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
           data-testid="workspace-picker-show-hidden"
         >
@@ -515,8 +517,8 @@ export function WorkspacePicker({
           type="button"
           onClick={openNewFolder}
           disabled={!canCreateFolder}
-          aria-label="New folder"
-          title="New folder"
+          aria-label={t("workspacePickerNewFolder")}
+          title={t("workspacePickerNewFolder")}
           className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
           data-testid="workspace-picker-new-folder"
         >
@@ -528,20 +530,20 @@ export function WorkspacePicker({
             size="sm"
             disabled={currentAbsolute === "" || currentAbsolute === null}
             onClick={handleSelect}
-            title={`Select this folder: ${basename(currentAbsolute)}`}
+            title={t("workspacePickerSelectFolderTitle", { name: basename(currentAbsolute) })}
             className="shrink-0"
             data-testid="workspace-picker-select"
           >
             <CheckIcon className="size-3.5" />
-            Select
+            {t("workspacePickerSelect")}
           </Button>
         )}
         {onClose && (
           <button
             type="button"
             onClick={onClose}
-            aria-label="Close"
-            title="Close"
+            aria-label={t("workspacePickerClose")}
+            title={t("workspacePickerClose")}
             className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
             data-testid="workspace-picker-close"
           >
@@ -575,7 +577,7 @@ export function WorkspacePicker({
                   cancelNewFolder();
                 }
               }}
-              placeholder="New folder name"
+              placeholder={t("workspacePickerNewFolderNamePlaceholder")}
               spellCheck={false}
               autoCapitalize="off"
               autoCorrect="off"
@@ -586,8 +588,8 @@ export function WorkspacePicker({
               type="button"
               disabled={newFolderName.trim() === "" || createDir.isPending}
               onClick={() => void commitNewFolder()}
-              aria-label="Create folder"
-              title="Create folder"
+              aria-label={t("workspacePickerCreateFolder")}
+              title={t("workspacePickerCreateFolder")}
               className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
               data-testid="workspace-picker-new-folder-create"
             >
@@ -596,8 +598,8 @@ export function WorkspacePicker({
             <button
               type="button"
               onClick={cancelNewFolder}
-              aria-label="Cancel new folder"
-              title="Cancel"
+              aria-label={t("workspacePickerCancelNewFolder")}
+              title={t("cancel")}
               className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
               data-testid="workspace-picker-new-folder-cancel"
             >
@@ -620,23 +622,23 @@ export function WorkspacePicker({
           data-testid="workspace-picker-conflict"
         >
           <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
-          <span>
-            {occupiedCount === 1 ? "1 other agent is" : `${occupiedCount} other agents are`} working
-            in this directory. Write operations may conflict — name a git branch to work in an
-            isolated copy.
-          </span>
+          <span>{t("workspacePickerConflict", { count: occupiedCount })}</span>
         </div>
       )}
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {isLoading && <div className="px-3 py-3 text-xs text-muted-foreground">Loading…</div>}
+        {isLoading && (
+          <div className="px-3 py-3 text-xs text-muted-foreground">{t("loading")}</div>
+        )}
         {error !== null && error !== undefined && !isLoading && (
           <div className="px-3 py-3 text-xs text-destructive" data-testid="workspace-picker-error">
-            {error instanceof Error ? error.message : "Failed to load directory"}
+            {error instanceof Error ? error.message : t("workspacePickerLoadDirectoryFailed")}
           </div>
         )}
         {!isLoading && error === null && entries.length === 0 && (
           <div className="px-3 py-3 text-xs text-muted-foreground">
-            {activeFilter !== null ? "No matching entries" : "(empty directory)"}
+            {activeFilter !== null
+              ? t("workspacePickerNoMatchingEntries")
+              : t("workspacePickerEmptyDirectory")}
           </div>
         )}
         {entries.map((entry) => {
@@ -670,7 +672,7 @@ export function WorkspacePicker({
             className="px-3 py-2 text-xs text-muted-foreground"
             data-testid="workspace-picker-truncated"
           >
-            Too many entries to list fully — type a path above to jump directly.
+            {t("workspacePickerTruncated")}
           </div>
         )}
       </div>

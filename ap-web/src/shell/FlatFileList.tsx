@@ -1,4 +1,5 @@
 import { FileIcon } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { RunnerOfflineError, type WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { cn } from "@/lib/utils";
@@ -136,8 +137,9 @@ export function FlatFileList({
    */
   runnerWentOffline?: boolean;
 }) {
+  const { t } = useTranslation();
   if (isLoading) {
-    return <p className="px-2 py-1 text-muted-foreground text-xs">Loading…</p>;
+    return <p className="px-2 py-1 text-muted-foreground text-xs">{t("loading")}</p>;
   }
   if (isError) {
     // Runner not connected. If it went offline after being up (host
@@ -146,16 +148,16 @@ export function FlatFileList({
     // state rather than alarm the user.
     if (error instanceof RunnerOfflineError) {
       if (runnerWentOffline) return <RunnerAsleepHint />;
-      return <p className="px-2 py-1 text-muted-foreground text-xs">No workspace changes yet</p>;
+      return <p className="px-2 py-1 text-muted-foreground text-xs">{t("noWorkspaceChanges")}</p>;
     }
     return (
       <p className="px-2 py-1 text-destructive text-xs">
-        Failed to load: {error instanceof Error ? error.message : String(error)}
+        {t("failedToLoad")} {error instanceof Error ? error.message : String(error)}
       </p>
     );
   }
   if (!files || files.length === 0) {
-    return <p className="px-2 py-1 text-muted-foreground text-xs">No workspace changes yet</p>;
+    return <p className="px-2 py-1 text-muted-foreground text-xs">{t("noWorkspaceChanges")}</p>;
   }
   const normalizedSearchQuery = normalizeSearchQuery(searchQuery);
   const visibleFiles = files.filter(
@@ -173,13 +175,13 @@ export function FlatFileList({
   if (visibleFiles.length === 0) {
     return (
       <p className="px-2 py-1 text-muted-foreground text-xs">
-        All changes are in hidden files.{" "}
+        {t("allChangesInHiddenFiles")}{" "}
         <button
           type="button"
           className="cursor-pointer underline hover:text-foreground"
           onClick={onShowHidden}
         >
-          Click to show
+          {t("clickToShow")}
         </button>
       </p>
     );
@@ -187,7 +189,7 @@ export function FlatFileList({
   if (sorted.length === 0) {
     return (
       <p className="px-2 py-1 text-muted-foreground text-xs">
-        No changed files match "{searchQuery.trim()}"
+        {t("noChangedFilesMatch", { query: searchQuery.trim() })}
       </p>
     );
   }
@@ -195,13 +197,13 @@ export function FlatFileList({
     <>
       {hiddenCount > 0 && (
         <p className="px-2 py-1 text-muted-foreground text-xs">
-          {hiddenCount} file{hiddenCount === 1 ? "" : "s"} hidden.{" "}
+          {t("filesHidden", { count: hiddenCount })}{" "}
           <button
             type="button"
             className="cursor-pointer underline hover:text-foreground"
             onClick={onShowHidden}
           >
-            Click to show
+            {t("clickToShow")}
           </button>
         </p>
       )}

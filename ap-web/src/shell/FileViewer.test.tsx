@@ -113,6 +113,7 @@ vi.mock("@/store/chatStore", () => ({
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
+import i18n from "@/i18n";
 import { useComments } from "@/hooks/useComments";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
@@ -120,6 +121,7 @@ import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
 
+const t = i18n.getFixedT(null, "nav");
 const useCommentsMock = vi.mocked(useComments);
 
 function makeCommentsQuery(data: Comment[] | undefined) {
@@ -280,7 +282,7 @@ describe("FileViewer comments panel open/close semantics", () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     const { rerender } = renderViewer({ open: true, path: "file1.py" });
 
-    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: t("showComments") }));
     expect(screen.getByTestId("comments-panel")).toBeInTheDocument();
 
     // Arrow navigation: same `open=true`, different path, no comments.
@@ -316,7 +318,7 @@ describe("FileViewer comments panel open/close semantics", () => {
     expect(screen.queryByTestId("comments-panel")).toBeNull();
 
     // User manually opens the panel before data arrives.
-    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: t("showComments") }));
     expect(screen.getByTestId("comments-panel")).toBeInTheDocument();
 
     // Data arrives with no comments — must not close the manually-opened panel.
@@ -347,7 +349,7 @@ describe("FileViewer comment seen marking", () => {
     renderViewer({ open: true, path: "file1.py" });
     expect(getSeenCommentIds().has("c1")).toBe(false);
 
-    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: t("showComments") }));
 
     // Panel visible ⇒ the comment bodies are on screen ⇒ seen.
     expect(screen.getByTestId("comments-panel")).toBeInTheDocument();
@@ -392,7 +394,7 @@ describe("FileViewer prev/next navigation order", () => {
       // The index span sits between the prev/next buttons. Its text proves the
       // navigation list was sorted by `sort`; before the fix it was hard-coded
       // alphabetical, so "recent" would wrongly show "2/3" here.
-      const prev = screen.getByRole("button", { name: "Previous file" });
+      const prev = screen.getByRole("button", { name: t("previousFile") });
       const indexSpan = prev.parentElement?.querySelector("span.tabular-nums");
       expect(indexSpan?.textContent).toBe(expected);
     } finally {
@@ -437,7 +439,7 @@ describe("FileViewer URL sync — diff param", () => {
     expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
     expect(screen.getByTestId("url-params").textContent).not.toContain("diff=");
 
-    fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
+    fireEvent.click(screen.getByRole("button", { name: t("showDiff") }));
 
     // After toggle: diff view shown, ?diff=1 added to URL.
     // Failure: diff sync useEffect did not call setSearchParams after diffActive changed.
@@ -511,7 +513,7 @@ describe("FileViewer URL sync — comment param", () => {
     expect(screen.getByTestId("comments-panel")).toBeInTheDocument();
 
     // User manually closes the panel.
-    fireEvent.click(screen.getByRole("button", { name: "Hide comments" }));
+    fireEvent.click(screen.getByRole("button", { name: t("hideComments") }));
     expect(screen.queryByTestId("comments-panel")).toBeNull();
 
     // Comment data refreshes — same comment ID still in deps, effect would
@@ -551,7 +553,7 @@ describe("FileViewer URL sync — comment param (write)", () => {
     renderViewer({ open: true, path: "file1.py" });
 
     // Manually open the panel.
-    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: t("showComments") }));
     expect(screen.getByTestId("comments-panel")).toBeInTheDocument();
 
     // Click the comment via the mock's exposed button.
@@ -574,7 +576,7 @@ describe("FileViewer URL sync — comment param (write)", () => {
     renderViewer({ open: true, path: "file1.py" });
 
     // Manually open the panel.
-    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: t("showComments") }));
 
     fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
     expect(screen.getByTestId("url-params").textContent).toContain("comment=c1");
@@ -595,7 +597,7 @@ describe("FileViewer copy-link button", () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     renderViewer({ open: true });
 
-    expect(screen.getByRole("button", { name: "Copy link to file" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: t("copyLinkToFile") })).toBeInTheDocument();
   });
 });
 
@@ -774,7 +776,7 @@ describe("FileViewer header close affordance", () => {
     // that keeps the back button.
     render(viewerTree({ open: true, onClose }));
 
-    fireEvent.click(screen.getByRole("button", { name: "Close file viewer" }));
+    fireEvent.click(screen.getByRole("button", { name: t("closeFileViewer") }));
 
     // Clicking the back arrow dismisses the mobile overlay. A failure here
     // means the back button was removed from the mobile path too (it should
@@ -796,7 +798,7 @@ describe("FileViewer header close affordance", () => {
     // No back button in the embedded tabbed editor — the absence proves the
     // [aria-label="Close file viewer"] mode toggle is gone on desktop. A
     // failure here means the gating regressed and the button reappeared.
-    expect(screen.queryByRole("button", { name: "Close file viewer" })).toBeNull();
+    expect(screen.queryByRole("button", { name: t("closeFileViewer") })).toBeNull();
   });
 });
 
@@ -809,10 +811,10 @@ describe("FileViewer comments panel", () => {
 
     expect(screen.queryByTestId("comments-panel")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: t("showComments") }));
     expect(screen.getByTestId("comments-panel")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Hide comments" }));
+    fireEvent.click(screen.getByRole("button", { name: t("hideComments") }));
     expect(screen.queryByTestId("comments-panel")).toBeNull();
   });
 });
@@ -831,7 +833,7 @@ describe("FileViewer view-preference persistence across refresh", () => {
     // First instance: user turns diff on and switches to split. The viewer's
     // persist effect writes both to localStorage.
     const first = render(viewerTree({ open: true }));
-    fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
+    fireEvent.click(screen.getByRole("button", { name: t("showDiff") }));
     fireEvent.click(screen.getByRole("button", { name: "Split view" }));
 
     // Simulate a page refresh: tear the tree down and mount a brand-new viewer
@@ -853,7 +855,7 @@ describe("FileViewer view-preference persistence across refresh", () => {
     // First instance: turn diff on then back off so a diff-off preference is
     // written to storage.
     const first = render(viewerTree({ open: true }));
-    fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
+    fireEvent.click(screen.getByRole("button", { name: t("showDiff") }));
     fireEvent.click(screen.getByRole("button", { name: "Exit diff view" }));
     first.unmount();
 

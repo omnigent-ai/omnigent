@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import i18n from "@/i18n";
 import type { RenderItem } from "@/lib/renderItems";
 import type { ToolExecution } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
@@ -74,21 +75,25 @@ describe("Composer permission gating", () => {
 });
 
 describe("Composer structural read-only reasons", () => {
+  // The function returns a `common`-namespace translation key; callers
+  // resolve it with `t`. Assert the key resolves to the expected copy.
+  const t = i18n.getFixedT(null, "common");
+
   it("uses the closed-session reason when the live snapshot is closed", () => {
-    expect(
-      readOnlyReasonForSessionLabels(
-        { labels: { "omnigent.closed": "true" } },
-        { labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" } },
-      ),
-    ).toBe("This sub-agent session is closed");
+    const key = readOnlyReasonForSessionLabels(
+      { labels: { "omnigent.closed": "true" } },
+      { labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" } },
+    );
+    expect(key).toBe("composerSubAgentClosed");
+    expect(t(key!)).toBe("This sub-agent session is closed");
   });
 
   it("falls back to the sidebar wrapper label for native read-only children", () => {
-    expect(
-      readOnlyReasonForSessionLabels(null, {
-        labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
-      }),
-    ).toBe("Claude Code sub-agents are read-only");
+    const key = readOnlyReasonForSessionLabels(null, {
+      labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+    });
+    expect(key).toBe("composerSubAgentReadOnly");
+    expect(t(key!)).toBe("Claude Code sub-agents are read-only");
   });
 
   it("returns null for editable sessions without structural labels", () => {

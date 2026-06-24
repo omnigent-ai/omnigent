@@ -41,6 +41,7 @@ import {
   TerminalIcon,
   XIcon,
 } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
@@ -175,6 +176,7 @@ export function ApprovalCard({
   rememberScope,
   onSubmit,
 }: ApprovalCardProps) {
+  const { t } = useTranslation("common");
   const submit: SubmitApprovalFn =
     onSubmit ??
     ((id, action, content) => {
@@ -247,8 +249,8 @@ export function ApprovalCard({
   const isExternalUrl = typeof url === "string" && url.length > 0 && !url.startsWith("/approve/");
   const askUserQuestionTitle =
     policyName.startsWith("codex_") || phase.startsWith("codex_")
-      ? "Codex needs input"
-      : "Claude has questions";
+      ? t("codexNeedsInput")
+      : t("claudeHasQuestions");
 
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-
@@ -277,19 +279,19 @@ export function ApprovalCard({
   // than letting the short button label imply a narrower scope.
   const rememberTitle = rememberScope
     ? rememberScope.host
-      ? `Won't ask again for ${rememberScope.host} for the rest of this session`
-      : `Won't ask again for any ${rememberScope.tool} call for the rest of this session`
+      ? t("wontAskAgainForHost", { host: rememberScope.host })
+      : t("wontAskAgainForTool", { tool: rememberScope.tool })
     : undefined;
   const binaryButtons = (
     <div className="flex flex-wrap gap-2 pt-1">
       <Button size="sm" onClick={() => submitBinary("accept")}>
         <CheckIcon className="mr-1 size-3.5" />
-        Approve
+        {t("approve")}
       </Button>
       {allowAllEdits && (
         <Button size="sm" variant="outline" onClick={submitAllowAllEdits}>
           <CheckIcon className="mr-1 size-3.5" />
-          Accept & allow all edits
+          {t("acceptAndAllowAllEdits")}
         </Button>
       )}
       {rememberTarget && (
@@ -301,12 +303,12 @@ export function ApprovalCard({
           data-testid="approval-card-remember"
         >
           <CheckIcon className="mr-1 size-3.5" />
-          Approve &amp; don't ask again for {rememberTarget}
+          {t("approveDontAskAgainForTarget", { target: rememberTarget })}
         </Button>
       )}
       <Button size="sm" variant="outline" onClick={() => submitBinary("decline")}>
         <XIcon className="mr-1 size-3.5" />
-        Reject
+        {t("reject")}
       </Button>
     </div>
   );
@@ -314,7 +316,7 @@ export function ApprovalCard({
     <div className="flex flex-wrap items-center gap-2 pt-1" data-testid="codex-command-actions">
       <Button size="sm" onClick={() => submitBinary("accept")}>
         <CheckIcon className="mr-1 size-3.5" />
-        Approve
+        {t("approve")}
       </Button>
       {execPolicyAmendment && (
         <Button
@@ -323,12 +325,12 @@ export function ApprovalCard({
           onClick={() => submitExecPolicyAmendment(execPolicyAmendment)}
         >
           <CheckIcon className="mr-1 size-3.5" />
-          Approve and remember
+          {t("approveAndRemember")}
         </Button>
       )}
       <Button size="sm" variant="outline" onClick={() => submitBinary("decline")}>
         <XIcon className="mr-1 size-3.5" />
-        Reject
+        {t("reject")}
       </Button>
     </div>
   );
@@ -365,7 +367,7 @@ export function ApprovalCard({
         : null;
 
     let icon = <XIcon className="size-4 text-destructive" />;
-    let label = isExitPlanMode ? "Plan rejected" : "Rejected";
+    let label = isExitPlanMode ? t("planRejected") : t("rejected");
     if (autoResolved) {
       // Card was cleared by the chat store when the gated tool's
       // function_call_output arrived without a UI verdict —
@@ -374,27 +376,27 @@ export function ApprovalCard({
       // verdict, so render a neutral pill rather than implying an
       // accept/reject decision the UI never witnessed.
       icon = <InfoIcon className="size-4 text-muted-foreground" />;
-      label = "Resolved elsewhere";
+      label = t("resolvedElsewhere");
     } else if (submittedAnswers !== null) {
       icon = <CheckIcon className="size-4 text-success" />;
-      label = "Submitted";
+      label = t("submitted");
     } else if (selectedAnswer !== null) {
       icon = <CheckIcon className="size-4 text-success" />;
-      label = `Selected: ${selectedAnswer}`;
+      label = t("selectedAnswer", { answer: selectedAnswer });
     } else if (acceptedWithExecPolicy) {
       icon = <CheckIcon className="size-4 text-success" />;
-      label = "Approved and remembered";
+      label = t("approvedAndRemembered");
     } else if (acceptedAllEdits) {
       icon = <CheckIcon className="size-4 text-success" />;
-      label = isExitPlanMode ? "Plan approved · auto mode" : "Approved · auto-accepting edits";
+      label = isExitPlanMode ? t("planApprovedAutoMode") : t("approvedAutoAcceptingEdits");
     } else if (acceptedRemember) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = rememberTarget
-        ? `Approved · won't ask again for ${rememberTarget}`
-        : "Approved · won't ask again";
+        ? t("approvedWontAskAgainForTarget", { target: rememberTarget })
+        : t("approvedWontAskAgain");
     } else if (accepted) {
       icon = <CheckIcon className="size-4 text-success" />;
-      label = isExitPlanMode ? "Plan approved" : "Approved";
+      label = isExitPlanMode ? t("planApproved") : t("approved");
     }
 
     return (
@@ -463,14 +465,14 @@ export function ApprovalCard({
           <MessageCircleQuestionMark className="size-4 text-yellow-600 dark:text-yellow-400" />
         )}
         {isCodexCommandApproval
-          ? "Command approval"
+          ? t("commandApproval")
           : isExitPlanMode
-            ? "Plan review"
+            ? t("planReview")
             : isAskUserQuestion
               ? askUserQuestionTitle
               : isMultiChoice
-                ? "Choose an option"
-                : "Approval required"}
+                ? t("chooseAnOption")
+                : t("approvalRequired")}
         {policyName && !isAskUserQuestion && !isExitPlanMode && (
           <span className="text-muted-foreground text-xs">· {policyName}</span>
         )}
@@ -481,7 +483,7 @@ export function ApprovalCard({
       <AlertDescription className="flex flex-col gap-2">
         {isExitPlanMode ? (
           <>
-            <span>Claude finished planning and wants to proceed.</span>
+            <span>{t("claudeFinishedPlanning")}</span>
             <ExitPlanModeReview
               plan={exitPlanModePlan}
               onAcceptAuto={submitAllowAllEdits}
@@ -497,7 +499,7 @@ export function ApprovalCard({
           />
         ) : isCodexCommandApproval ? (
           <>
-            <span>Codex wants to run this command.</span>
+            <span>{t("codexWantsToRunCommand")}</span>
             {codexCommand.reason && <span className="text-foreground">{codexCommand.reason}</span>}
             <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-xs text-foreground whitespace-pre-wrap">
               {codexCommand.command}
@@ -523,7 +525,7 @@ export function ApprovalCard({
                 <Button size="sm" asChild>
                   <a href={url!} target="_blank" rel="noopener noreferrer">
                     <ExternalLinkIcon className="mr-1 size-3.5" />
-                    Open approval page
+                    {t("openApprovalPage")}
                   </a>
                 </Button>
               </div>

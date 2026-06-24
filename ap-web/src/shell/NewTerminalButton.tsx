@@ -14,6 +14,7 @@
 // dropdown to pick which declared terminal to launch.
 
 import { PlusIcon } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -48,6 +49,7 @@ export function NewTerminalButton({
   onCreated,
   variant = "icon",
 }: NewTerminalButtonProps) {
+  const { t } = useTranslation("nav");
   const { data: agent } = useSessionAgent(conversationId);
   const create = useCreateTerminal(conversationId);
   const declared = agent?.terminals ?? [];
@@ -67,20 +69,20 @@ export function NewTerminalButton({
     variant === "row" ? (
       <button
         type="button"
-        aria-label="New shell"
+        aria-label={t("newShell")}
         disabled={create.isPending}
         className="flex w-full items-center gap-2 px-2 py-1.5 text-left text-muted-foreground hover:bg-accent/60 hover:text-foreground disabled:cursor-default disabled:opacity-50"
         onClick={onTriggerClick}
       >
         <PlusIcon className="size-3.5 shrink-0" />
         <span className="text-xs">
-          {create.isError ? `Failed: ${create.error.message}` : "New shell"}
+          {create.isError ? t("createTerminalFailed", { message: create.error.message }) : t("newShell")}
         </span>
       </button>
     ) : (
       <button
         type="button"
-        aria-label="New shell"
+        aria-label={t("newShell")}
         disabled={create.isPending}
         className="cursor-pointer rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50"
         onClick={onTriggerClick}
@@ -99,7 +101,7 @@ export function NewTerminalButton({
         <Tooltip>
           <TooltipTrigger asChild>{child}</TooltipTrigger>
           <TooltipContent side="bottom">
-            {create.isError ? `Failed: ${create.error.message}` : "New shell"}
+            {create.isError ? t("createTerminalFailed", { message: create.error.message }) : t("newShell")}
           </TooltipContent>
         </Tooltip>
       </TooltipProvider>

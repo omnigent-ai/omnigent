@@ -2,6 +2,7 @@
 // header info-icon popover that displays them.
 
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   CheckIcon,
   CopyIcon,
@@ -111,12 +112,12 @@ function formatTokenCount(tokens: number): string {
  * Token buckets shown per model in the ``usage_by_model`` section, mapping
  * the ``ModelUsage`` field to its row label. Cost is rendered separately.
  */
-const MODEL_TOKEN_ROWS: ReadonlyArray<{ key: keyof ModelUsage; label: string }> = [
-  { key: "inputTokens", label: "Input" },
-  { key: "outputTokens", label: "Output" },
-  { key: "cacheReadInputTokens", label: "Cache read" },
-  { key: "cacheCreationInputTokens", label: "Cache write" },
-  { key: "totalTokens", label: "Total" },
+const MODEL_TOKEN_ROWS: ReadonlyArray<{ key: keyof ModelUsage; labelKey: string }> = [
+  { key: "inputTokens", labelKey: "inputTokens" },
+  { key: "outputTokens", labelKey: "outputTokens" },
+  { key: "cacheReadInputTokens", labelKey: "cacheRead" },
+  { key: "cacheCreationInputTokens", labelKey: "cacheWrite" },
+  { key: "totalTokens", labelKey: "totalTokens" },
 ];
 
 /**
@@ -128,6 +129,7 @@ const MODEL_TOKEN_ROWS: ReadonlyArray<{ key: keyof ModelUsage; label: string }> 
  * @param usageByModel - Map of raw harness model id to its cumulative usage.
  */
 function ModelUsageBreakdown({ usageByModel }: { usageByModel: Record<string, ModelUsage> }) {
+  const { t } = useTranslation("common");
   // Stable display order: most total tokens first, so the dominant model
   // leads. Falls back to 0 for models that haven't recorded a total yet.
   const models = Object.entries(usageByModel).sort(
@@ -138,16 +140,16 @@ function ModelUsageBreakdown({ usageByModel }: { usageByModel: Record<string, Mo
       <summary className="cursor-pointer select-none list-none">
         <SectionLabel>
           <span className="inline-flex items-center gap-1">
-            Token usage
+            {t("tokenUsage")}
             <span className="text-[9px]">▶</span>
           </span>
         </SectionLabel>
       </summary>
       <div className="mt-1.5 flex flex-col gap-2">
         {models.map(([model, usage]) => {
-          const rows = MODEL_TOKEN_ROWS.flatMap(({ key, label }) => {
+          const rows = MODEL_TOKEN_ROWS.flatMap(({ key, labelKey }) => {
             const value = usage[key];
-            return value != null ? [{ label, value }] : [];
+            return value != null ? [{ label: t(labelKey), value }] : [];
           });
           return (
             <div
@@ -171,7 +173,7 @@ function ModelUsageBreakdown({ usageByModel }: { usageByModel: Record<string, Mo
               ))}
               {usage.totalCostUsd != null && (
                 <div className="flex items-baseline justify-between gap-3 pl-2 text-xs">
-                  <span className="text-muted-foreground/70">Cost</span>
+                  <span className="text-muted-foreground/70">{t("cost")}</span>
                   <span className="tabular-nums text-muted-foreground">
                     {formatSessionCostUsd(usage.totalCostUsd)}
                   </span>
@@ -202,6 +204,7 @@ function AddPolicyDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
+  const { t } = useTranslation("common");
   const [selected, setSelected] = useState<string>("");
   const [filter, setFilter] = useState("");
   const [factoryParams, setFactoryParams] = useState<Record<string, string>>({});
@@ -278,8 +281,8 @@ function AddPolicyDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Add Policy</DialogTitle>
-          <DialogDescription>Choose a policy to apply to this session.</DialogDescription>
+          <DialogTitle>{t("addPolicyTitle")}</DialogTitle>
+          <DialogDescription>{t("addPolicySessionDesc")}</DialogDescription>
         </DialogHeader>
         <div className="space-y-3 pt-1">
           {!selected &&
@@ -299,7 +302,7 @@ function AddPolicyDialog({
                     type="text"
                     value={filter}
                     onChange={(e) => setFilter(e.target.value)}
-                    placeholder="Filter policies..."
+                    placeholder={t("filterPolicies")}
                     className="w-full rounded border border-border bg-background px-2 py-1.5 text-sm placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
                     // eslint-disable-next-line jsx-a11y/no-autofocus
                     autoFocus
@@ -323,8 +326,8 @@ function AddPolicyDialog({
                     {filtered.length === 0 && (
                       <p className="py-2 text-center text-xs text-muted-foreground">
                         {available.length === 0
-                          ? "All available policies are already applied."
-                          : "No policies match your filter."}
+                          ? t("allPoliciesApplied")
+                          : t("noPoliciesMatch")}
                       </p>
                     )}
                   </div>
@@ -344,7 +347,7 @@ function AddPolicyDialog({
                   }}
                   className="text-[11px] text-muted-foreground hover:text-foreground"
                 >
-                  Change
+                  {t("change")}
                 </button>
               </div>
               {entry.description && (
@@ -487,7 +490,7 @@ function AddPolicyDialog({
               onClick={() => onOpenChange(false)}
               className="rounded px-3 py-1.5 text-xs hover:bg-muted"
             >
-              Cancel
+              {t("cancel")}
             </button>
             <button
               type="button"
@@ -495,7 +498,7 @@ function AddPolicyDialog({
               disabled={!selected || addPolicy.isPending}
               className="rounded bg-primary px-3 py-1.5 text-xs text-primary-foreground disabled:opacity-50"
             >
-              {addPolicy.isPending ? "Adding..." : "Add"}
+              {addPolicy.isPending ? t("adding") : t("add")}
             </button>
           </div>
         </div>
@@ -509,6 +512,7 @@ function AddPolicyDialog({
 // ---------------------------------------------------------------------------
 
 function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
+  const { t } = useTranslation("common");
   const { data: sessionPolicies = [] } = usePolicies(sessionId);
   const { data: registry = [] } = usePolicyRegistry();
   const deletePolicy = useDeletePolicy(sessionId);
@@ -523,12 +527,12 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
   return (
     <div className="flex flex-col gap-1.5">
       <div className="flex items-center justify-between">
-        <SectionLabel>Policies</SectionLabel>
+        <SectionLabel>{t("policiesSection")}</SectionLabel>
         <button
           type="button"
           onClick={() => setAddOpen(true)}
           className="rounded p-0.5 hover:bg-muted"
-          title="Add policy"
+          title={t("addPolicyButton")}
         >
           <PlusIcon className="size-3 text-muted-foreground" />
         </button>
@@ -569,7 +573,7 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
                       className="flex items-center gap-1 self-end rounded px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
                     >
                       <TrashIcon className="size-3" />
-                      Remove
+                      {t("remove")}
                     </button>
                   </div>
                 </PopoverContent>
@@ -578,7 +582,7 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
           })}
         </div>
       ) : (
-        <p className="text-xs text-muted-foreground">No policies added</p>
+        <p className="text-xs text-muted-foreground">{t("noPoliciesAdded")}</p>
       )}
       <AddPolicyDialog
         sessionId={sessionId}
@@ -617,6 +621,7 @@ export function agentHasInfo(agent: Agent | undefined, sessionId?: string | null
  * mobile header menu's agent-info dialog.
  */
 export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
+  const { t } = useTranslation("common");
   const servers = agent?.mcp_servers ?? [];
   const displayName = agent ? agentDisplayLabel(agent.name) : null;
   const [sessionIdCopied, setSessionIdCopied] = useState(false);
@@ -662,7 +667,7 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
       )}
       {sessionId && (
         <div className="flex flex-col gap-1.5">
-          <SectionLabel>Session ID</SectionLabel>
+          <SectionLabel>{t("sessionId")}</SectionLabel>
           <div className="flex items-center gap-2">
             <code
               className="min-w-0 flex-1 truncate py-1 font-mono text-xs text-muted-foreground"
@@ -675,7 +680,7 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
               type="button"
               variant="ghost"
               size="icon-sm"
-              aria-label={sessionIdCopied ? "Copied session ID" : "Copy session ID"}
+              aria-label={sessionIdCopied ? t("copiedSessionId") : t("copySessionId")}
               data-testid="agent-info-copy-session-id"
               onClick={copySessionId}
               className="shrink-0"
@@ -691,7 +696,7 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
       )}
       {sessionId && sessionCostUsd != null && (
         <div className="flex flex-col gap-1.5">
-          <SectionLabel>Session cost</SectionLabel>
+          <SectionLabel>{t("sessionCost")}</SectionLabel>
           <span
             className="font-mono text-xs tabular-nums text-muted-foreground"
             data-testid="agent-info-session-cost"
@@ -705,7 +710,7 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
       )}
       {servers.length > 0 && (
         <div className="flex flex-col gap-1.5">
-          <SectionLabel>Tools</SectionLabel>
+          <SectionLabel>{t("toolsSection")}</SectionLabel>
           <McpServerList servers={servers} />
         </div>
       )}
@@ -722,6 +727,7 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
  * dialog. Self-hides when the agent has neither tools nor policies.
  */
 export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
+  const { t } = useTranslation("common");
   if (!agentHasInfo(agent, sessionId)) return null;
 
   return (
@@ -733,7 +739,7 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
               type="button"
               variant="ghost"
               size="icon"
-              aria-label="Agent tools and policies"
+              aria-label={t("agentToolsAndPolicies")}
               data-testid="agent-info-trigger"
               className="hidden text-muted-foreground hover:text-foreground md:inline-flex"
             >
@@ -741,7 +747,7 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
             </Button>
           </PopoverTrigger>
         </TooltipTrigger>
-        <TooltipContent>Agent tools &amp; policies</TooltipContent>
+        <TooltipContent>{t("agentToolsAndPolicies")}</TooltipContent>
       </Tooltip>
       <PopoverContent align="end" className="w-80">
         <AgentInfoContent agent={agent} sessionId={sessionId} />

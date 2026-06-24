@@ -12,6 +12,9 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApprovePage } from "./ApprovePage";
 import * as identity from "@/lib/identity";
+import i18n from "@/i18n";
+
+const t = i18n.getFixedT(null, "common");
 
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
@@ -52,7 +55,7 @@ describe("ApprovePage states", () => {
   it("shows a loading state while the elicitation fetch is in flight", () => {
     // WHY: the `loading` branch renders until the GET settles.
     renderPage();
-    expect(screen.getByText("Loading elicitation…")).toBeInTheDocument();
+    expect(screen.getByText(t("loadingElicitation"))).toBeInTheDocument();
   });
 
   it("renders approve/reject controls plus message and preview when pending", async () => {
@@ -81,7 +84,7 @@ describe("ApprovePage states", () => {
     // resolved/timed-out/cancelled — no buttons, just an informational alert.
     vi.mocked(identity.authenticatedFetch).mockResolvedValue(jsonResponse({ status: "resolved" }));
     renderPage();
-    expect(await screen.findByText("Elicitation resolved")).toBeInTheDocument();
+    expect(await screen.findByText(t("elicitationResolved"))).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Approve/ })).not.toBeInTheDocument();
   });
 
@@ -91,14 +94,16 @@ describe("ApprovePage states", () => {
       jsonResponse(null, { ok: false, status: 500 }),
     );
     renderPage();
-    expect(await screen.findByText("Server error: 500")).toBeInTheDocument();
+    expect(await screen.findByText(t("serverError", { status: 500 }))).toBeInTheDocument();
   });
 
   it("surfaces a load error when the GET rejects", async () => {
     // WHY: a thrown fetch (network failure) routes to the `error` branch.
     vi.mocked(identity.authenticatedFetch).mockRejectedValue(new Error("offline"));
     renderPage();
-    expect(await screen.findByText(/Failed to load:/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(`${t("failedToLoad")} Error: offline`),
+    ).toBeInTheDocument();
   });
 });
 
@@ -117,7 +122,7 @@ describe("ApprovePage submission", () => {
     renderPage("sess_a", "eli_a");
     fireEvent.click(await screen.findByRole("button", { name: /Approve/ }));
 
-    await waitFor(() => expect(screen.getByText("Approved")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(t("approved"))).toBeInTheDocument());
     const resolveCall = vi
       .mocked(identity.authenticatedFetch)
       .mock.calls.find(([url]) => String(url).includes("/resolve"));
@@ -132,7 +137,7 @@ describe("ApprovePage submission", () => {
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: /Reject/ }));
 
-    await waitFor(() => expect(screen.getByText("Rejected")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(t("rejected"))).toBeInTheDocument());
     const resolveCall = vi
       .mocked(identity.authenticatedFetch)
       .mock.calls.find(([url]) => String(url).includes("/resolve"));
@@ -146,7 +151,7 @@ describe("ApprovePage submission", () => {
       .mockResolvedValueOnce(jsonResponse(null, { ok: false, status: 409 }));
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: /Approve/ }));
-    expect(await screen.findByText("Resolve failed: 409")).toBeInTheDocument();
+    expect(await screen.findByText(t("resolveFailed", { status: 409 }))).toBeInTheDocument();
   });
 
   it("shows a network error when the resolve POST throws", async () => {
@@ -156,6 +161,8 @@ describe("ApprovePage submission", () => {
       .mockRejectedValueOnce(new Error("boom"));
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: /Reject/ }));
-    expect(await screen.findByText(/Network error:/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(t("networkError", { error: "Error: boom" })),
+    ).toBeInTheDocument();
   });
 });

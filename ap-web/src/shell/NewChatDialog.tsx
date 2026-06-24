@@ -1,4 +1,5 @@
 import { type DragEvent, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -193,6 +194,7 @@ export function ConnectHostInstructions({
   serverUrl: string;
   label?: string;
 }) {
+  const { t } = useTranslation("common");
   // Databricks/internal deployments add the "Databricks Lakebox" connect
   // path; OSS deployments (where the lakebox launcher is excluded) show
   // only the plain `omni host` command. Driven by /v1/info.
@@ -207,10 +209,10 @@ export function ConnectHostInstructions({
         <Tabs defaultValue="local">
           <TabsList className="w-full">
             <TabsTrigger value="local" className="text-xs">
-              Local machine
+              {t("localMachine")}
             </TabsTrigger>
             <TabsTrigger value="lakebox" className="text-xs">
-              Databricks Lakebox
+              {t("databricksLakebox")}
             </TabsTrigger>
           </TabsList>
           <TabsContent value="local">
@@ -549,10 +551,9 @@ function PermissionModeOptions({
   value: string;
   onValueChange: (mode: string) => void;
 }) {
+  const { t } = useTranslation("common");
   const [previewed, setPreviewed] = useState<string | null>(null);
-  const detail = CLAUDE_NATIVE_PERMISSION_MODES.find(
-    (m) => m.value === (previewed ?? value),
-  )?.description;
+  const detail = t(`permMode_${previewed ?? value}_desc`);
   return (
     <>
       <DropdownMenuRadioGroup value={value} onValueChange={onValueChange}>
@@ -568,7 +569,7 @@ function PermissionModeOptions({
             // text-xs matches the other footer-tray menus (host picker).
             className="rounded-sm pl-2 py-1 text-xs"
           >
-            {mode.label}
+            {t(`permMode_${mode.value}`)}
           </DropdownMenuRadioItem>
         ))}
       </DropdownMenuRadioGroup>
@@ -600,10 +601,9 @@ function ApprovalModeOptions({
   value: string;
   onValueChange: (mode: string) => void;
 }) {
+  const { t } = useTranslation("common");
   const [previewed, setPreviewed] = useState<string | null>(null);
-  const detail = CODEX_NATIVE_APPROVAL_MODES.find(
-    (m) => m.value === (previewed ?? value),
-  )?.description;
+  const detail = t(`approvalMode_${previewed ?? value}_desc`);
   return (
     <>
       <DropdownMenuRadioGroup value={value} onValueChange={onValueChange}>
@@ -616,7 +616,7 @@ function ApprovalModeOptions({
             onPointerEnter={() => setPreviewed(mode.value)}
             className="rounded-sm pl-2 py-1 text-xs"
           >
-            {mode.label}
+            {t(`approvalMode_${mode.value}`)}
           </DropdownMenuRadioItem>
         ))}
       </DropdownMenuRadioGroup>
@@ -649,10 +649,11 @@ function BrainHarnessOptions({
   onValueChange: (harness: string) => void;
   host: Host | undefined | null;
 }) {
+  const { t } = useTranslation("common");
   return (
     <>
       <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
-        Agent Harness
+        {t("agentHarness")}
       </div>
       <DropdownMenuRadioGroup value={value} onValueChange={onValueChange}>
         {Object.entries(BRAIN_HARNESS_LABELS).map(([id, label]) => (
@@ -672,7 +673,7 @@ function BrainHarnessOptions({
                 className="border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
                 data-testid={`new-chat-landing-harness-warning-${id}`}
               >
-                needs setup
+                {t("needsSetup")}
               </Badge>
             )}
           </DropdownMenuRadioItem>
@@ -683,6 +684,7 @@ function BrainHarnessOptions({
 }
 
 export function NewChatLandingScreen() {
+  const { t } = useTranslation("common");
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const serverUrl = getCliServerUrl();
@@ -1015,21 +1017,21 @@ export function NewChatLandingScreen() {
   const submitDisabledReason = canSubmit
     ? null
     : sandboxSelected && !sandboxRepoValid
-      ? "Please enter a valid repository URL"
+      ? t("enterValidRepoUrl")
       : !sandboxSelected && (!selectedHostId || !workspaceValid)
-        ? "Please choose a host and working directory"
+        ? t("chooseHostAndDirectory")
         : message.trim().length === 0
-          ? "Enter a message to get started"
+          ? t("enterMessageToStart")
           : null;
 
   // Chip display labels.
   const workspaceLabel = workspaceTrimmed
     ? (workspaceTrimmed.split("/").filter(Boolean).pop() ?? workspaceTrimmed)
-    : "Working directory";
+    : t("workingDirectory");
   const hostLabel = sandboxSelected
     ? sandboxLabel
-    : (selectedHost?.name ?? (onlineHosts.length === 0 ? "No hosts" : "Select host"));
-  const worktreeLabel = branchName.trim() || "No worktree";
+    : (selectedHost?.name ?? (onlineHosts.length === 0 ? t("noHosts") : t("selectHost")));
+  const worktreeLabel = branchName.trim() || t("noWorktree");
   // Sandbox repository chip label: repo name (server's clone-dir rule)
   // plus the pinned branch, e.g. "repo#main"; placeholder when unset.
   const sandboxRepoName = deriveRepoName(sandboxRepoUrl);
@@ -1037,14 +1039,12 @@ export function NewChatLandingScreen() {
     ? sandboxRepoBranch.trim()
       ? `${sandboxRepoName}#${sandboxRepoBranch.trim()}`
       : sandboxRepoName
-    : "Repository";
+    : t("repository");
   // Selected permission mode's display label — appended to the agent picker
   // label (non-default picks only) so a changed mode stays visible while the
   // radios live in the footer tray's Advanced settings menu.
-  const permissionModeLabel =
-    CLAUDE_NATIVE_PERMISSION_MODES.find((m) => m.value === permissionMode)?.label ?? permissionMode;
-  const approvalModeLabel =
-    CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ?? approvalMode;
+  const permissionModeLabel = t(`permMode_${permissionMode}`, { defaultValue: permissionMode });
+  const approvalModeLabel = t(`approvalMode_${approvalMode}`, { defaultValue: approvalMode });
   // Effective brain harness for the selected agent: the user's pick, else
   // the spec's declared harness. null for non-overridable agents (native
   // wrappers, agents whose spec failed to load).
@@ -1064,7 +1064,7 @@ export function NewChatLandingScreen() {
         : pickedHarness != null
           ? `${selectedAgent.display_name} (${BRAIN_HARNESS_LABELS[pickedHarness] ?? pickedHarness})`
           : selectedAgent.display_name
-    : "Select agent";
+    : t("selectAgent");
 
   /**
    * Render one agent row in the picker dropdown.
@@ -1117,7 +1117,7 @@ export function NewChatLandingScreen() {
             className="ml-auto self-center border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
             data-testid={`new-chat-landing-agent-warning-${agent.id}`}
           >
-            needs setup
+            {t("needsSetup")}
           </Badge>
         )}
       </DropdownMenuItem>
@@ -1242,7 +1242,7 @@ export function NewChatLandingScreen() {
       appendPromptHistoryEntry(initialPrompt, data.id);
       navigate(`/c/${data.id}`);
     } catch {
-      setCreateError("Couldn't reach the server. Check your connection and try again.");
+      setCreateError(t("couldntReachServer"));
     } finally {
       setCreating(false);
     }
@@ -1279,7 +1279,7 @@ export function NewChatLandingScreen() {
         <div className="flex flex-col items-center gap-3.5 sm:flex-row">
           <OttoEyes className="h-18 w-auto shrink-0" />
           <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground sm:text-left">
-            What should we do?
+            {t("whatShouldWeDo")}
           </h1>
         </div>
         <div className="relative flex w-full flex-col gap-3">
@@ -1308,7 +1308,7 @@ export function NewChatLandingScreen() {
           >
             {isDragActive && (
               <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-                <span className="text-sm font-medium text-ring">Drop files here</span>
+                <span className="text-sm font-medium text-ring">{t("dropFilesHere")}</span>
               </div>
             )}
             {/* Skill suggestions — floats above the composer box. */}
@@ -1387,8 +1387,8 @@ export function NewChatLandingScreen() {
               }}
               // Suppress the native placeholder when the overlay supplies its
               // own prompt text; aria-label preserves the accessible name.
-              placeholder={pillSkills.length > 0 ? "" : "Describe a task to start a new session…"}
-              aria-label="Describe a task to start a new session"
+              placeholder={pillSkills.length > 0 ? "" : t("describeTask")}
+              aria-label={t("describeTaskAria")}
               rows={1}
               autoFocus
               data-testid="new-chat-landing-input"
@@ -1407,7 +1407,7 @@ export function NewChatLandingScreen() {
             {pillSkills.length > 0 && message.length === 0 && (
               <div className="pointer-events-none absolute inset-x-4 top-4 flex flex-wrap items-center gap-2">
                 <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-sm leading-5 text-muted-foreground">
-                  Describe a task, or try a skill
+                  {t("describeTaskOrSkill")}
                 </span>
                 <SkillPills skills={pillSkills} onPick={applySkillPill} />
               </div>
@@ -1446,7 +1446,7 @@ export function NewChatLandingScreen() {
                       type="button"
                       onClick={() => removeFile(i)}
                       className="ml-0.5 rounded-full hover:text-foreground"
-                      aria-label={`Remove ${file.name || "image.png"}`}
+                      aria-label={t("removeFile", { name: file.name || "image.png" })}
                     >
                       <XIcon className="size-3" />
                     </button>
@@ -1467,11 +1467,11 @@ export function NewChatLandingScreen() {
                   className="size-9 md:size-8"
                   disabled={creating}
                   onClick={() => fileInputRef.current?.click()}
-                  title="Attach files"
+                  title={t("attachFiles")}
                   data-testid="new-chat-landing-attach"
                 >
                   <PaperclipIcon className="size-4" />
-                  <span className="sr-only">Attach files</span>
+                  <span className="sr-only">{t("attachFiles")}</span>
                 </Button>
                 <ComposerMicButton
                   disabled={creating}
@@ -1525,7 +1525,7 @@ export function NewChatLandingScreen() {
                     </DropdownMenuContent>
                   </DropdownMenu>
                 ) : (
-                  <span className="text-xs text-muted-foreground">No agents</span>
+                  <span className="text-xs text-muted-foreground">{t("noAgents")}</span>
                 )}
                 <TooltipProvider>
                   <Tooltip>
@@ -1535,7 +1535,7 @@ export function NewChatLandingScreen() {
                           type="submit"
                           size="icon"
                           disabled={!canSubmit}
-                          aria-label="Start session"
+                          aria-label={t("startSession")}
                           data-testid="new-chat-landing-submit"
                           className="size-8 rounded-full bg-foreground text-card transition-opacity hover:opacity-80 disabled:opacity-50"
                         >
@@ -1610,14 +1610,14 @@ export function NewChatLandingScreen() {
                         >
                           <span className="flex items-center gap-2">
                             <MonitorCloudIcon className="size-4 text-muted-foreground" />
-                            <span className="text-xs">New Sandbox</span>
+                            <span className="text-xs">{t("newSandbox")}</span>
                           </span>
                           <Tooltip>
                             <TooltipTrigger asChild>
                               <button
                                 type="button"
                                 className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/80 hover:text-foreground"
-                                aria-label="Why New Sandbox is unavailable"
+                                aria-label={t("whyNewSandboxUnavailable")}
                                 onClick={(e) => e.stopPropagation()}
                                 onKeyDown={(e) => {
                                   if (e.key === "Enter" || e.key === " ") e.stopPropagation();
@@ -1637,7 +1637,7 @@ export function NewChatLandingScreen() {
                   )}
                   {allHosts.length === 0 && (
                     <div className="px-2 py-1.5 text-xs text-muted-foreground">
-                      No hosts connected yet.
+                      {t("noHostsConnected")}
                     </div>
                   )}
                   {onlineHosts.map((host) => (
@@ -1665,7 +1665,7 @@ export function NewChatLandingScreen() {
                     className="gap-2 text-xs text-muted-foreground"
                   >
                     <PlusIcon className="size-3.5" />
-                    Connect new host
+                    {t("connectNewHost")}
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -1699,7 +1699,7 @@ export function NewChatLandingScreen() {
                           htmlFor="landing-repo-url"
                           className="text-xs font-medium text-foreground"
                         >
-                          Repository (optional)
+                          {t("repositoryOptional")}
                         </label>
                         {databricksGitCredentialsTooltipContent && (
                           <Tooltip>
@@ -1707,7 +1707,7 @@ export function NewChatLandingScreen() {
                               <button
                                 type="button"
                                 className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground"
-                                aria-label="How to set up Databricks git credentials"
+                                aria-label={t("databricksGitCredentialsHelp")}
                               >
                                 <CircleHelpIcon className="size-3.5" />
                               </button>
@@ -1731,15 +1731,12 @@ export function NewChatLandingScreen() {
                         type="text"
                         value={sandboxRepoBranch}
                         onChange={(e) => setSandboxRepoBranch(e.target.value)}
-                        placeholder="Branch (defaults to the repo's default)"
-                        aria-label="Repository branch"
+                        placeholder={t("branchPlaceholderRepo")}
+                        aria-label={t("repositoryBranch")}
                         className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
                         data-testid="new-chat-landing-repo-branch-input"
                       />
-                      <p className="text-xs text-muted-foreground">
-                        Cloned into the sandbox as the session's working directory. Leave blank to
-                        start in an empty workspace.
-                      </p>
+                      <p className="text-xs text-muted-foreground">{t("repoClonedHelp")}</p>
                     </div>
                   </PopoverContent>
                 </Popover>
@@ -1776,7 +1773,7 @@ export function NewChatLandingScreen() {
                         }
                       />
                     ) : (
-                      <p className="p-3 text-xs text-muted-foreground">Select a host first.</p>
+                      <p className="p-3 text-xs text-muted-foreground">{t("selectHostFirst")}</p>
                     )}
                   </PopoverContent>
                 </Popover>
@@ -1807,14 +1804,14 @@ export function NewChatLandingScreen() {
                         htmlFor="landing-branch-name"
                         className="text-xs font-medium text-foreground"
                       >
-                        Git worktree branch (optional)
+                        {t("gitWorktreeBranchOptional")}
                       </label>
                       <input
                         id="landing-branch-name"
                         type="text"
                         value={branchName}
                         onChange={(e) => setBranchName(e.target.value)}
-                        placeholder="feature/my-branch"
+                        placeholder={t("branchPlaceholderExample")}
                         className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
                         data-testid="new-chat-landing-branch-input"
                       />
@@ -1823,16 +1820,13 @@ export function NewChatLandingScreen() {
                           type="text"
                           value={baseBranch}
                           onChange={(e) => setBaseBranch(e.target.value)}
-                          placeholder="Base branch (defaults to current branch)"
-                          aria-label="Base branch"
+                          placeholder={t("baseBranchPlaceholderCurrentNoThe")}
+                          aria-label={t("baseBranch")}
                           className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
                           data-testid="new-chat-landing-base-branch-input"
                         />
                       )}
-                      <p className="text-xs text-muted-foreground">
-                        Creates an isolated git worktree for a new branch. Leave blank to start
-                        directly in the working directory.
-                      </p>
+                      <p className="text-xs text-muted-foreground">{t("gitWorktreeLandingHelp")}</p>
                     </div>
                   </PopoverContent>
                 </Popover>
@@ -1853,7 +1847,7 @@ export function NewChatLandingScreen() {
                       data-testid="new-chat-landing-advanced-chip"
                     >
                       <SettingsIcon className="size-4 shrink-0" />
-                      <span className="truncate">Advanced</span>
+                      <span className="truncate">{t("advanced")}</span>
                       <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </DropdownMenuTrigger>
@@ -1879,7 +1873,7 @@ export function NewChatLandingScreen() {
                       <>
                         {selectedAgentDefaultHarness != null && <DropdownMenuSeparator />}
                         <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
-                          Permission mode
+                          {t("permissionMode")}
                         </div>
                         <PermissionModeOptions
                           value={permissionMode}
@@ -1896,7 +1890,7 @@ export function NewChatLandingScreen() {
                           <DropdownMenuSeparator />
                         )}
                         <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
-                          Approval mode
+                          {t("approvalMode")}
                         </div>
                         <ApprovalModeOptions value={approvalMode} onValueChange={setApprovalMode} />
                       </>
@@ -1919,8 +1913,12 @@ export function NewChatLandingScreen() {
             >
               <TriangleAlertIcon className="size-3.5 shrink-0" />
               <span>
-                {selectedAgent?.display_name} isn&apos;t configured on {harnessWarningHost?.name} —
-                run <code>omnigent setup</code> on that machine.
+                {t("harnessUnconfiguredPrefix", {
+                  agent: selectedAgent?.display_name,
+                  host: harnessWarningHost?.name,
+                })}{" "}
+                <code>omnigent setup</code>
+                {t("harnessUnconfiguredSuffix")}
               </span>
             </p>
           )}
@@ -1938,12 +1936,9 @@ export function NewChatLandingScreen() {
       <Dialog open={connectOpen} onOpenChange={setConnectOpen}>
         <DialogContent className="sm:max-w-lg" data-testid="connect-host-dialog">
           <DialogHeader>
-            <DialogTitle>Connect a host</DialogTitle>
+            <DialogTitle>{t("connectAHost")}</DialogTitle>
           </DialogHeader>
-          <ConnectHostInstructions
-            serverUrl={serverUrl}
-            label="Run this on the machine you want to use, then pick it from the host menu:"
-          />
+          <ConnectHostInstructions serverUrl={serverUrl} label={t("connectHostMenuHint")} />
         </DialogContent>
       </Dialog>
     </div>

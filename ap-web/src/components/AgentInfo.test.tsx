@@ -4,6 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import { useChatStore } from "@/store/chatStore";
+import i18n from "@/i18n";
+
+const t = i18n.getFixedT(null, "common");
 
 // Mock the policies data layer so SessionPoliciesSection and AddPolicyDialog
 // render deterministically without network. The add/delete mutations expose
@@ -169,7 +172,7 @@ describe("AgentInfoButton session id row", () => {
 
     expect(copyTextMock).toHaveBeenCalledTimes(1);
     expect(copyTextMock).toHaveBeenCalledWith("conv_info123");
-    expect(await screen.findByRole("button", { name: "Copied session ID" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: t("copiedSessionId") })).toBeInTheDocument();
   });
 });
 
@@ -279,7 +282,7 @@ describe("SessionPoliciesSection", () => {
     // policy must not count, so the section reads "No policies added".
     policiesData.current = [{ id: "p_spec", name: "spec_one", handler: "h.spec", source: "spec" }];
     renderContent("conv_pol");
-    expect(screen.getByText("No policies added")).toBeInTheDocument();
+    expect(screen.getByText(t("noPoliciesAdded"))).toBeInTheDocument();
   });
 
   it("lists user policies and deletes one via the popover Remove button", () => {
@@ -291,7 +294,7 @@ describe("SessionPoliciesSection", () => {
     renderContent("conv_pol");
 
     fireEvent.click(screen.getByRole("button", { name: /deny_pii/ }));
-    fireEvent.click(screen.getByRole("button", { name: /Remove/ }));
+    fireEvent.click(screen.getByRole("button", { name: new RegExp(t("remove")) }));
     expect(deleteMutate).toHaveBeenCalledWith("p1");
   });
 
@@ -304,15 +307,15 @@ describe("SessionPoliciesSection", () => {
     ];
     renderContent("conv_pol");
 
-    fireEvent.click(screen.getByTitle("Add policy"));
+    fireEvent.click(screen.getByTitle(t("addPolicyButton")));
     const dialog = screen.getByRole("dialog");
     // Filter to just Beta.
-    fireEvent.change(within(dialog).getByPlaceholderText("Filter policies..."), {
+    fireEvent.change(within(dialog).getByPlaceholderText(t("filterPolicies")), {
       target: { value: "beta" },
     });
     expect(within(dialog).queryByText("Alpha Guard")).toBeNull();
     fireEvent.click(within(dialog).getByText("Beta Guard"));
-    fireEvent.click(within(dialog).getByRole("button", { name: "Add" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: t("add") }));
 
     expect(addMutate).toHaveBeenCalledWith(
       expect.objectContaining({ name: "beta_guard", type: "python", handler: "h.beta" }),
@@ -342,14 +345,14 @@ describe("SessionPoliciesSection", () => {
     ];
     renderContent("conv_pol");
 
-    fireEvent.click(screen.getByTitle("Add policy"));
+    fireEvent.click(screen.getByTitle(t("addPolicyButton")));
     const dialog = screen.getByRole("dialog");
     fireEvent.click(within(dialog).getByText("PII Factory"));
 
     // The integer param input is present (number type).
     const numberInput = within(dialog).getByPlaceholderText("5") as HTMLInputElement;
     fireEvent.change(numberInput, { target: { value: "9" } });
-    fireEvent.click(within(dialog).getByRole("button", { name: "Add" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: t("add") }));
 
     expect(addMutate).toHaveBeenCalledTimes(1);
     const payload = addMutate.mock.calls[0][0];
@@ -368,10 +371,10 @@ describe("SessionPoliciesSection", () => {
     ];
     renderContent("conv_pol");
 
-    fireEvent.click(screen.getByTitle("Add policy"));
+    fireEvent.click(screen.getByTitle(t("addPolicyButton")));
     const dialog = screen.getByRole("dialog");
     expect(
-      within(dialog).getByText("All available policies are already applied."),
+      within(dialog).getByText(t("allPoliciesApplied")),
     ).toBeInTheDocument();
   });
 });

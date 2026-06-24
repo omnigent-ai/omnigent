@@ -22,6 +22,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/utils";
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -82,15 +83,16 @@ interface TerminalsCardProps {
 }
 
 function TerminalsCard({ terminals, onExpand }: TerminalsCardProps) {
+  const { t } = useTranslation("nav");
   const [collapsed, setCollapsed] = useState(false);
   return (
     <Card size="sm" data-testid="terminals-card">
       <CardHeader>
-        <CardTitle className="text-sm">Terminals</CardTitle>
+        <CardTitle className="text-sm">{t("terminals")}</CardTitle>
         <CardAction>
           <button
             type="button"
-            aria-label={collapsed ? "Expand terminals" : "Collapse terminals"}
+            aria-label={collapsed ? t("expandTerminals") : t("collapseTerminals")}
             aria-expanded={!collapsed}
             className="cursor-pointer rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
             onClick={() => setCollapsed((v) => !v)}
@@ -107,7 +109,7 @@ function TerminalsCard({ terminals, onExpand }: TerminalsCardProps) {
       {!collapsed && (
         <CardContent>
           {terminals.length === 0 ? (
-            <p className="text-muted-foreground text-xs">No open terminals</p>
+            <p className="text-muted-foreground text-xs">{t("noOpenTerminals")}</p>
           ) : (
             <ul className="flex flex-col gap-0.5">
               {terminals.map((t) => (
@@ -146,15 +148,17 @@ interface ExecutionLogsCardProps {
 }
 
 function ExecutionLogsCard({ childSessions, onExpand }: ExecutionLogsCardProps) {
+  const { t } = useTranslation("nav");
+  const { t: tc } = useTranslation("common");
   const [collapsed, setCollapsed] = useState(false);
   return (
     <Card size="sm" data-testid="execution-logs-card">
       <CardHeader>
-        <CardTitle className="text-sm">Execution logs</CardTitle>
+        <CardTitle className="text-sm">{tc("executionLogsTitle")}</CardTitle>
         <CardAction>
           <button
             type="button"
-            aria-label={collapsed ? "Expand execution logs" : "Collapse execution logs"}
+            aria-label={collapsed ? t("expandExecutionLogs") : t("collapseExecutionLogs")}
             aria-expanded={!collapsed}
             className="cursor-pointer rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
             onClick={() => setCollapsed((v) => !v)}
@@ -172,7 +176,7 @@ function ExecutionLogsCard({ childSessions, onExpand }: ExecutionLogsCardProps) 
         <CardContent>
           <ul className="flex flex-col gap-0.5">
             <ExecutionLogRow
-              label="main"
+              label={t("mainThread")}
               sublabel={null}
               icon={MessageSquareIcon}
               onOpen={() => onExpand(executionLogTabKey(MAIN_EXECUTION_LOG_KEY))}

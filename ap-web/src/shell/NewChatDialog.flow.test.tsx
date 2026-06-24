@@ -9,6 +9,9 @@ import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { NewChatLandingScreen, sanitizeInitialPrompt } from "./NewChatDialog";
+import i18n from "@/i18n";
+
+const t = i18n.getFixedT(null, "common");
 
 // The landing screen drives the real Web-start flow end to end: the host and
 // first agent auto-select, the working directory seeds from the host's most-
@@ -485,7 +488,7 @@ describe("NewChatLandingScreen create flow", () => {
     // A non-default pick is suffixed onto the pill so the changed mode
     // stays visible while the radios live in the Advanced menu.
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-      "Claude Code (Bypass permissions)",
+      `Claude Code (${t("permMode_bypassPermissions", { defaultValue: "bypassPermissions" })})`,
     );
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -539,7 +542,7 @@ describe("NewChatLandingScreen create flow", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-approval-full-access"));
     // A non-default pick is suffixed onto the pill.
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-      "Codex (Full access)",
+      `Codex (${t("approvalMode_full-access", { defaultValue: "full-access" })})`,
     );
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));

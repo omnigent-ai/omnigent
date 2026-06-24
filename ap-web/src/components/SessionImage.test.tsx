@@ -11,6 +11,9 @@
 
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "@/i18n";
+
+const t = i18n.getFixedT(null, "common");
 
 const getOmnigentHostConfig = vi.fn();
 const hostFetch = vi.fn();
@@ -69,7 +72,7 @@ describe("SessionImage (embedded, host fetcher present)", () => {
     // role="status" placeholder (with spinner), not an <img>.
     hostFetch.mockReturnValue(new Promise(() => {}));
     render(<SessionImage path="/p" alt="pic" />);
-    expect(screen.getByRole("status", { name: "Loading image" })).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: t("loadingImage") })).toBeInTheDocument();
     expect(screen.getByTestId("spinner")).toBeInTheDocument();
   });
 

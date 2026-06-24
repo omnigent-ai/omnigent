@@ -24,6 +24,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -92,6 +93,7 @@ export function ExecutionLogsPanel({
   initialKey,
   onClose,
 }: ExecutionLogsPanelProps) {
+  const { t } = useTranslation();
   // No child-sessions poll — status arrives live over the session stream
   // (see chatStore ``session_child_session_updated``).
   const { children } = useChildSessions(open ? conversationId : null);
@@ -152,8 +154,8 @@ export function ExecutionLogsPanel({
         />
       )}
       <header className="flex shrink-0 items-center justify-between border-border border-b px-4 py-3">
-        <h2 className="font-medium text-sm">Execution logs</h2>
-        <Button type="button" variant="ghost" size="icon-sm" aria-label="Close" onClick={onClose}>
+        <h2 className="font-medium text-sm">{t("executionLogsTitle")}</h2>
+        <Button type="button" variant="ghost" size="icon-sm" aria-label={t("close")} onClick={onClose}>
           <XIcon className="size-4" />
         </Button>
       </header>
@@ -219,6 +221,7 @@ function buildLogEntries(conversationId: string, children: ChildSessionInfo[]): 
 }
 
 function SessionItemsList({ sessionId }: { sessionId: string }) {
+  const { t } = useTranslation();
   const sessionActive = useFocusedSessionActive();
   const { items, isLoading, error, hasNextPage, isFetchingNextPage, fetchNextPage } =
     useSessionItems(sessionId, sessionActive ? ITEMS_POLL_MS : null);
@@ -250,13 +253,17 @@ function SessionItemsList({ sessionId }: { sessionId: string }) {
   }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
 
   if (isLoading) {
-    return <div className="text-muted-foreground text-xs">Loading…</div>;
+    return <div className="text-muted-foreground text-xs">{t("loading")}</div>;
   }
   if (error) {
-    return <div className="text-destructive text-xs">Failed to load items: {error.message}</div>;
+    return (
+      <div className="text-destructive text-xs">
+        {t("executionLogsLoadFailed")} {error.message}
+      </div>
+    );
   }
   if (items.length === 0) {
-    return <div className="text-muted-foreground text-xs">No items</div>;
+    return <div className="text-muted-foreground text-xs">{t("executionLogsNoItems")}</div>;
   }
   return (
     <div
@@ -268,7 +275,7 @@ function SessionItemsList({ sessionId }: { sessionId: string }) {
       ))}
       {hasNextPage && (
         <div ref={sentinelRef} className="py-2 text-center text-muted-foreground text-xs">
-          {isFetchingNextPage ? "Loading more…" : ""}
+          {isFetchingNextPage ? t("loadingMore") : ""}
         </div>
       )}
     </div>

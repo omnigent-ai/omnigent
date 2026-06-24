@@ -27,6 +27,9 @@ import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import i18n from "@/i18n";
+
+const t = i18n.getFixedT(null, "common");
 
 // Only authenticatedFetch is stubbed (the create POST under test);
 // the module's other exports stay real for any other consumer in the tree.
@@ -571,7 +574,7 @@ describe("NewChatLandingScreen", () => {
     // The home page offers an inline chat box rather than the old
     // "click New session in the sidebar" placeholder. If it regressed to
     // the placeholder, the composer input would be absent and this fails.
-    expect(screen.getByText("What should we do?")).toBeTruthy();
+    expect(screen.getByText(t("whatShouldWeDo"))).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
   });
 
@@ -608,7 +611,7 @@ describe("NewChatLandingScreen", () => {
     expect((screen.getByTestId("new-chat-landing-submit") as HTMLButtonElement).disabled).toBe(
       true,
     );
-    expect(screen.getByText("No agents")).toBeTruthy();
+    expect(screen.getByText(t("noAgents"))).toBeTruthy();
   });
 
   it("orders Cursor above Pi in the built-in agent picker", () => {
@@ -694,7 +697,7 @@ describe("NewChatLandingScreen", () => {
     mockHosts([]);
     renderLanding();
     // The chip reads the empty state…
-    expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("No hosts");
+    expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(t("noHosts"));
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     // …and the connect item is still present, so a fresh user can unblock.
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
@@ -709,14 +712,14 @@ describe("NewChatLandingScreen", () => {
     // tray surfaces the Advanced chip with the permission-mode radios.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
     const planOption = screen.getByTestId("new-chat-landing-permission-plan");
-    expect(planOption.textContent).toContain("Plan");
+    expect(planOption.textContent).toContain(t("permMode_plan"));
     // The footer line explains the SELECTED mode until a row is hovered —
     // then it follows the hover, so every mode is explained without six
     // two-line rows.
     const detail = screen.getByTestId("new-chat-landing-permission-detail");
-    expect(detail.textContent).toContain("Prompts before edits and commands");
+    expect(detail.textContent).toContain(t("permMode_default_desc"));
     fireEvent.pointerEnter(planOption);
-    expect(detail.textContent).toContain("Plans only; makes no edits");
+    expect(detail.textContent).toContain(t("permMode_plan_desc"));
     // Switch to Codex (a2: codex-native) — the Advanced chip stays visible
     // but now shows approval-mode radios instead of permission-mode radios.
     // Close the Advanced menu first (Escape), then switch agents.
@@ -733,13 +736,13 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
     const fullAccessOption = screen.getByTestId("new-chat-landing-approval-full-access");
-    expect(fullAccessOption.textContent).toContain("Full access");
+    expect(fullAccessOption.textContent).toContain(t("approvalMode_full-access"));
     // The footer line explains the SELECTED mode until a row is hovered.
     const detail = screen.getByTestId("new-chat-landing-approval-detail");
     // Default is selected initially.
-    expect(detail.textContent).toContain("Read/edit/run in workspace");
+    expect(detail.textContent).toContain(t("approvalMode_default_desc"));
     fireEvent.pointerEnter(fullAccessOption);
-    expect(detail.textContent).toContain("Edit any file and access the internet");
+    expect(detail.textContent).toContain(t("approvalMode_full-access_desc"));
   });
 
   it("shows a conflict banner in the file browser for an occupied directory", async () => {
@@ -852,7 +855,7 @@ describe("NewChatLandingScreen", () => {
     expect(disabledRow).toBeTruthy();
     // Disabled helper row replaces the clickable sandbox option.
     expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull();
-    fireEvent.focus(screen.getByLabelText("Why New Sandbox is unavailable"));
+    fireEvent.focus(screen.getByLabelText(t("whyNewSandboxUnavailable")));
     await waitFor(() =>
       expect(
         screen.getAllByText("Managed sandboxes are disabled in this workspace.").length,
@@ -899,7 +902,9 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
     );
-    expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain("No hosts");
+    expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain(
+      t("noHosts"),
+    );
   });
 
   it("switching between a host and the sandbox swaps the workspace chrome", async () => {
@@ -1062,7 +1067,7 @@ describe("NewChatLandingScreen", () => {
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
     );
     fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
-    const helpButton = screen.getByLabelText("How to set up Databricks git credentials");
+    const helpButton = screen.getByLabelText(t("databricksGitCredentialsHelp"));
     expect(helpButton).toBeTruthy();
     fireEvent.focus(helpButton);
     await waitFor(() =>
@@ -1342,7 +1347,9 @@ describe("NewChatLandingScreen attachments", () => {
     // Chip shows the filename — proves the file landed in state, not just
     // that the input fired.
     expect(screen.getByText("notes.txt")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Remove notes.txt" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: t("removeFile", { name: "notes.txt" }) }),
+    );
     expect(screen.queryByText("notes.txt")).toBeNull();
   });
 
@@ -1351,23 +1358,23 @@ describe("NewChatLandingScreen attachments", () => {
     const composer = screen.getByTestId("new-chat-landing-composer");
     // Dragging over the composer lifts the drop-target overlay.
     fireEvent.dragOver(composer, { dataTransfer: { files: [] } });
-    expect(screen.getByText("Drop files here")).toBeTruthy();
+    expect(screen.getByText(t("dropFilesHere"))).toBeTruthy();
     // Dropping a file attaches it (chip proves it reached state) and clears
     // the overlay.
     const file = new File(["hello"], "dropped.txt", { type: "text/plain" });
     fireEvent.drop(composer, { dataTransfer: { files: [file] } });
     expect(screen.getByText("dropped.txt")).toBeTruthy();
-    expect(screen.queryByText("Drop files here")).toBeNull();
+    expect(screen.queryByText(t("dropFilesHere"))).toBeNull();
   });
 
   it("clears the drop overlay when the drag leaves the composer", () => {
     renderLanding();
     const composer = screen.getByTestId("new-chat-landing-composer");
     fireEvent.dragEnter(composer, { dataTransfer: { files: [] } });
-    expect(screen.getByText("Drop files here")).toBeTruthy();
+    expect(screen.getByText(t("dropFilesHere"))).toBeTruthy();
     // relatedTarget defaults to null (outside the composer), so the active
     // state clears rather than sticking when moving between child elements.
     fireEvent.dragLeave(composer, { dataTransfer: { files: [] } });
-    expect(screen.queryByText("Drop files here")).toBeNull();
+    expect(screen.queryByText(t("dropFilesHere"))).toBeNull();
   });
 });

@@ -21,6 +21,7 @@ import {
   useState,
   type RefObject,
 } from "react";
+import { useTranslation } from "react-i18next";
 import {
   ChevronDownIcon,
   ChevronUpIcon,
@@ -198,6 +199,7 @@ export function CodeViewer({
   onSaveStatusChange,
   pendingBodyRef,
 }: CodeViewerProps) {
+  const { t } = useTranslation("nav");
   const canEdit = useCanEdit(conversationId);
 
   const [tokenLines, setTokenLines] = useState<ThemedToken[][] | null>(null);
@@ -473,7 +475,7 @@ export function CodeViewer({
           srcDoc={prepareHtmlPreviewDoc(content)}
           // oxlint-disable-next-line eslint-plugin-react(iframe-missing-sandbox)
           sandbox={HTML_PREVIEW_SANDBOX}
-          title="HTML preview"
+          title={t("htmlPreview")}
           className="w-full h-full border-0"
         />
       );
@@ -564,19 +566,19 @@ export function CodeViewer({
                 }
               }
             }}
-            placeholder="Find…"
+            placeholder={t("findEllipsis")}
             className="min-w-0 flex-1 bg-transparent text-xs outline-none"
           />
           <span className="shrink-0 text-xs text-muted-foreground">
             {searchQuery.trim()
               ? matches.length > 0
                 ? `${safeMatchIdx + 1} / ${matches.length}`
-                : "No results"
+                : t("noResults")
               : ""}
           </span>
           <button
             type="button"
-            aria-label="Previous match"
+            aria-label={t("previousMatch")}
             className="rounded p-0.5 text-muted-foreground hover:bg-muted disabled:opacity-40"
             disabled={matches.length === 0}
             onClick={() => setCurrentMatchIdx((i) => (i - 1 + matches.length) % matches.length)}
@@ -585,7 +587,7 @@ export function CodeViewer({
           </button>
           <button
             type="button"
-            aria-label="Next match"
+            aria-label={t("nextMatch")}
             className="rounded p-0.5 text-muted-foreground hover:bg-muted disabled:opacity-40"
             disabled={matches.length === 0}
             onClick={() => setCurrentMatchIdx((i) => (i + 1) % matches.length)}
@@ -594,7 +596,7 @@ export function CodeViewer({
           </button>
           <button
             type="button"
-            aria-label="Close search"
+            aria-label={t("closeSearch")}
             className="rounded p-0.5 text-muted-foreground hover:bg-muted"
             onClick={() => {
               setSearchOpen(false);

@@ -15,6 +15,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { useTranslation } from "react-i18next";
 import { CheckIcon, LinkIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -54,6 +55,7 @@ interface PermissionsModalProps {
 }
 
 export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsModalProps) {
+  const { t } = useTranslation();
   const { data: permissions, isLoading } = usePermissions(open ? sessionId : null);
   const grant = useGrantPermission(sessionId);
   const revoke = useRevokePermission(sessionId);
@@ -110,17 +112,17 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">Share this session</DialogTitle>
+          <DialogTitle className="flex items-center gap-2">{t("shareThisSession")}</DialogTitle>
           <DialogDescription>
-            Invite others to view or collaborate on this session.
+            {t("shareSessionDesc")}
           </DialogDescription>
         </DialogHeader>
 
         {/* Public toggle */}
         <div className="flex items-center justify-between rounded-lg border px-3 py-2">
           <div>
-            <p className="text-sm font-medium">Public access</p>
-            <p className="text-xs text-muted-foreground">Anyone can view this session</p>
+            <p className="text-sm font-medium">{t("publicAccess")}</p>
+            <p className="text-xs text-muted-foreground">{t("anyoneCanView")}</p>
           </div>
           <Switch
             checked={isPublic}
@@ -132,18 +134,18 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
         {/* Current grants */}
         <div>
           {isLoading ? (
-            <p className="text-sm text-muted-foreground py-2">Loading…</p>
+            <p className="text-sm text-muted-foreground py-2">{t("loading")}</p>
           ) : userGrants.length === 0 ? (
-            <p className="text-sm text-muted-foreground py-2">No grants yet.</p>
+            <p className="text-sm text-muted-foreground py-2">{t("noGrantsYet")}</p>
           ) : (
             <>
               {/* Column headers */}
               <div className="flex items-center gap-2 px-2 pb-0.5">
                 <span className="flex-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Name
+                  {t("nameColumn")}
                 </span>
                 <span className="w-28 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Permission
+                  {t("permissionColumn")}
                 </span>
                 <span className="size-7 shrink-0" aria-hidden="true" />
               </div>
@@ -166,27 +168,27 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
         <form onSubmit={handleGrant} className="flex items-end gap-2">
           <div className="flex-1">
             <label htmlFor="perm-user" className="text-xs font-medium text-muted-foreground">
-              User ID
+              {t("userId")}
             </label>
             <AddUserField value={newUserId} onChange={setNewUserId} />
           </div>
           <div>
             <label htmlFor="perm-level" className="text-xs font-medium text-muted-foreground">
-              Level
+              {t("permissionLevel")}
             </label>
             <Select value={newLevel} onValueChange={setNewLevel}>
               <SelectTrigger className="mt-1 w-24">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="1">Read</SelectItem>
-                <SelectItem value="2">Edit</SelectItem>
+                <SelectItem value="1">{t("read")}</SelectItem>
+                <SelectItem value="2">{t("edit")}</SelectItem>
               </SelectContent>
             </Select>
           </div>
           <Button type="submit" size="sm" disabled={!newUserId.trim() || grant.isPending}>
             <UserPlusIcon className="mr-1 size-3.5" />
-            Grant
+            {t("grant")}
           </Button>
         </form>
 
@@ -195,7 +197,7 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
         <DialogFooter className="flex-row justify-between sm:justify-between">
           <CopyLinkButton sessionId={sessionId} />
           <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Done
+            {t("done")}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -215,6 +217,7 @@ interface AddUserFieldProps {
  * are an aid, not a constraint.
  */
 function AddUserField({ value, onChange }: AddUserFieldProps) {
+  const { t } = useTranslation();
   // Read once: the host installs config eagerly before first render, so the
   // branch is stable for the lifetime of the modal.
   const searchUsers = getOmnigentUserSearch();
@@ -224,7 +227,7 @@ function AddUserField({ value, onChange }: AddUserFieldProps) {
         id="perm-user"
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        placeholder="alice@example.com"
+        placeholder={t("userIdPlaceholder")}
         className="mt-1 h-8"
       />
     );
@@ -246,6 +249,7 @@ function AddUserField({ value, onChange }: AddUserFieldProps) {
 // it inside the scroll-lock's allow-list (wheel works) and lets us own the
 // combobox a11y roles + keyboard handling directly.
 function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
   const { suggestions, isLoading } = useUserSearch(value);
@@ -327,7 +331,7 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
         // preventDefault below, so they don't blur the input before committing.
         onBlur={() => setOpen(false)}
         onKeyDown={handleKeyDown}
-        placeholder="alice@example.com"
+        placeholder={t("userIdPlaceholder")}
         className="mt-1 h-8"
         autoComplete="off"
       />
@@ -335,9 +339,9 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
         // Wider than the (narrow) field so suggested emails aren't truncated.
         <div className="absolute left-0 top-full z-50 mt-1 w-96 rounded-lg border bg-popover p-1 text-popover-foreground shadow-md">
           {isLoading ? (
-            <div className="py-6 text-center text-sm text-muted-foreground">Searching…</div>
+            <div className="py-6 text-center text-sm text-muted-foreground">{t("searching")}</div>
           ) : suggestions.length === 0 ? (
-            <div className="py-6 text-center text-sm text-muted-foreground">No matches</div>
+            <div className="py-6 text-center text-sm text-muted-foreground">{t("noMatches")}</div>
           ) : (
             <div ref={listRef} id={listId} role="listbox" className="max-h-72 overflow-y-auto">
               {suggestions.map((s, index) => (
@@ -388,6 +392,7 @@ function getShareableLink(sessionId: string, rebasePath: (path: string) => strin
 }
 
 function CopyLinkButton({ sessionId }: { sessionId: string }) {
+  const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
   const rebasePath = useRebasePath();
 
@@ -410,7 +415,7 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
   return (
     <Button variant="ghost" size="sm" onClick={handleCopy} className="gap-1.5 text-primary">
       {copied ? <CheckIcon className="size-3.5" /> : <LinkIcon className="size-3.5" />}
-      {copied ? "Copied!" : "Copy link"}
+      {copied ? t("copiedLink") : t("copyLink")}
     </Button>
   );
 }
@@ -426,6 +431,7 @@ function GrantRow({
   onChangeLevel: (userId: string, level: number) => void;
   busy: boolean;
 }) {
+  const { t } = useTranslation();
   const isOwner = permission.level === 4;
   // Manage is not grantable from the UI, so a pre-existing manage grant
   // renders as a fixed label rather than a dropdown choice. Unlike the
@@ -439,7 +445,7 @@ function GrantRow({
       </span>
       {isOwner || isManage ? (
         <span className="flex h-8 w-28 items-center px-3 text-sm text-muted-foreground">
-          {isOwner ? "Owner" : "Manage"}
+          {isOwner ? t("owner") : t("manage")}
         </span>
       ) : (
         <Select
@@ -454,8 +460,8 @@ function GrantRow({
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="1">Read</SelectItem>
-            <SelectItem value="2">Edit</SelectItem>
+            <SelectItem value="1">{t("read")}</SelectItem>
+            <SelectItem value="2">{t("edit")}</SelectItem>
           </SelectContent>
         </Select>
       )}
@@ -470,7 +476,7 @@ function GrantRow({
           className="shrink-0 text-muted-foreground hover:text-destructive"
         >
           <Trash2Icon className="size-3.5" />
-          <span className="sr-only">Revoke</span>
+          <span className="sr-only">{t("revoke")}</span>
         </Button>
       )}
     </div>

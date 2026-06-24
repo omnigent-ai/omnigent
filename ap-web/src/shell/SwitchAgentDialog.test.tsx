@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
+import i18n from "@/i18n";
 import { SwitchAgentDialog } from "./SwitchAgentDialog";
 import { switchSessionAgent } from "@/lib/sessionsApi";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
@@ -11,6 +12,7 @@ vi.mock("@/lib/sessionsApi", () => ({ switchSessionAgent: vi.fn() }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 vi.mock("@/hooks/useAgents", () => ({ useSessionAgent: vi.fn() }));
 
+const t = i18n.getFixedT(null, "common");
 const switchSessionAgentMock = vi.mocked(switchSessionAgent);
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const useSessionAgentMock = vi.mocked(useSessionAgent);
@@ -158,7 +160,7 @@ describe("SwitchAgentDialog", () => {
     renderDialog();
     const current = screen.getByTestId("switch-agent-current");
     expect(current).toHaveTextContent("Claude");
-    expect(current).toHaveTextContent("(current agent)");
+    expect(current).toHaveTextContent(t("currentAgent"));
     // It's a default hint, not a selection — submit stays disabled until the
     // user picks a different agent.
     expect(screen.getByTestId("switch-agent-submit")).toBeDisabled();

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { CheckIcon, ChevronDownIcon, PlusIcon } from "lucide-react";
 import {
   DropdownMenu,
@@ -58,6 +59,7 @@ export function TitleBarServerPicker({
       is selected or it has no title yet (falls back to "Omnigent"). */
   threadTitle?: string | null;
 }) {
+  const { t } = useTranslation("nav");
   const [info, setInfo] = useState<ServerPickerInfo | null>(null);
 
   useEffect(() => {
@@ -87,7 +89,7 @@ export function TitleBarServerPicker({
             "my-1 text-muted-foreground hover:bg-foreground/5 hover:text-foreground",
             "data-[state=open]:bg-foreground/5 data-[state=open]:text-foreground",
           )}
-          title="Switch server"
+          title={t("switchServer")}
         >
           <span className="truncate font-medium">
             {threadTitle || "Omnigent"} — {hostOf(info.currentOrigin)}
@@ -109,7 +111,7 @@ export function TitleBarServerPicker({
           <DropdownMenuSeparator />
           <DropdownMenuItem className="gap-2" onSelect={() => openServerSetup()}>
             <PlusIcon className="size-4 shrink-0" />
-            Connect to new server…
+            {t("connectToNewServer")}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>

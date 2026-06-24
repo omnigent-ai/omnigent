@@ -23,6 +23,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useNavigate } from "@/lib/routing";
 import { CopyIcon, KeyRoundIcon, RefreshCwIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -48,6 +49,7 @@ import {
 } from "@/lib/accountsApi";
 
 export function MembersPage() {
+  const { t } = useTranslation("common");
   const navigate = useNavigate();
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
   const [meId, setMeId] = useState<string | null>(null);
@@ -66,15 +68,13 @@ export function MembersPage() {
   const refresh = useCallback(async () => {
     const list = await listUsers();
     if (list === null) {
-      setLoadError(
-        "Could not load members. You may not have admin permission, or the server is unreachable.",
-      );
+      setLoadError(t("couldNotLoadMembers"));
       setUsers([]);
       return;
     }
     setLoadError(null);
     setUsers(list);
-  }, []);
+  }, [t]);
 
   // Initial load: identity probe + members list. The identity probe
   // gates the UI (non-admins see "no access"); the list is what we
@@ -100,7 +100,7 @@ export function MembersPage() {
   if (meIsAdmin === null) {
     return (
       <div className="flex min-h-full items-center justify-center text-sm text-muted-foreground">
-        Loading…
+        {t("loading")}
       </div>
     );
   }
@@ -109,10 +109,8 @@ export function MembersPage() {
   if (meIsAdmin === false) {
     return (
       <div className="mx-auto w-full max-w-2xl px-6 py-12">
-        <h1 className="mb-2 text-2xl font-semibold">Members</h1>
-        <p className="text-sm text-muted-foreground">
-          You don't have permission to manage members.
-        </p>
+        <h1 className="mb-2 text-2xl font-semibold">{t("members")}</h1>
+        <p className="text-sm text-muted-foreground">{t("noPermissionToManage")}</p>
       </div>
     );
   }
@@ -165,9 +163,9 @@ export function MembersPage() {
           header (sidebar toggle / account menu) so the page title
           isn't tucked under it. */}
       <div className="mb-6 flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Members</h1>
+        <h1 className="text-2xl font-semibold">{t("members")}</h1>
         <Button onClick={() => setShowCreateInvite(true)}>
-          <UserPlusIcon /> Invite member
+          <UserPlusIcon /> {t("inviteMember")}
         </Button>
       </div>
 
@@ -185,10 +183,10 @@ export function MembersPage() {
           <table className="w-full text-sm">
             <thead className="bg-muted/40 text-left text-xs uppercase text-muted-foreground">
               <tr>
-                <th className="px-3 py-2 font-medium">Username</th>
-                <th className="px-3 py-2 font-medium">Role</th>
-                <th className="px-3 py-2 font-medium">Last login</th>
-                <th className="px-3 py-2 text-right font-medium">Actions</th>
+                <th className="px-3 py-2 font-medium">{t("usernameColumn")}</th>
+                <th className="px-3 py-2 font-medium">{t("roleColumn")}</th>
+                <th className="px-3 py-2 font-medium">{t("lastLoginColumn")}</th>
+                <th className="px-3 py-2 text-right font-medium">{t("actionsColumn")}</th>
               </tr>
             </thead>
             <tbody>
@@ -197,39 +195,39 @@ export function MembersPage() {
                   <td className="px-3 py-2 align-middle">
                     <span className="font-medium">{u.id}</span>
                     {u.id === meId && (
-                      <span className="ml-2 text-xs text-muted-foreground">(you)</span>
+                      <span className="ml-2 text-xs text-muted-foreground">{t("youSelf")}</span>
                     )}
                     {!u.has_password && (
                       <Badge variant="outline" className="ml-2">
-                        External
+                        {t("externalBadge")}
                       </Badge>
                     )}
                   </td>
                   <td className="px-3 py-2 align-middle">
-                    {u.is_admin ? <Badge>Admin</Badge> : <Badge variant="secondary">Member</Badge>}
+                    {u.is_admin ? <Badge>{t("adminRole")}</Badge> : <Badge variant="secondary">{t("memberRole")}</Badge>}
                   </td>
                   <td className="px-3 py-2 align-middle text-muted-foreground">
-                    {formatEpoch(u.last_login_at)}
+                    {formatEpoch(u.last_login_at, t("never"))}
                   </td>
                   <td className="px-3 py-2 text-right">
                     <div className="flex justify-end gap-1">
                       <Button
                         variant="ghost"
                         size="xs"
-                        title="Reset password"
+                        title={t("resetPassword")}
                         onClick={() => void onResetPassword(u.id)}
                         disabled={pendingAction || !u.has_password}
                       >
-                        <KeyRoundIcon /> Reset
+                        <KeyRoundIcon /> {t("resetPassword")}
                       </Button>
                       <Button
                         variant="ghost"
                         size="xs"
-                        title="Remove user"
+                        title={t("removeUser")}
                         onClick={() => setDeleteCandidate(u.id)}
                         disabled={pendingAction || u.id === meId}
                       >
-                        <Trash2Icon /> Remove
+                        <Trash2Icon /> {t("removeUser")}
                       </Button>
                     </div>
                   </td>
@@ -241,12 +239,12 @@ export function MembersPage() {
       )}
 
       {users !== null && users.length === 0 && (
-        <p className="text-sm text-muted-foreground">No members yet.</p>
+        <p className="text-sm text-muted-foreground">{t("noMembersYet")}</p>
       )}
 
       <div className="mt-3 flex items-center justify-end">
         <Button variant="ghost" size="sm" onClick={() => void refresh()}>
-          <RefreshCwIcon /> Refresh
+          <RefreshCwIcon /> {t("refresh")}
         </Button>
       </div>
 
@@ -261,11 +259,8 @@ export function MembersPage() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Invite a member</DialogTitle>
-            <DialogDescription>
-              A single-use invite URL will be created. Share it with the person you want to add.
-              They'll choose their own username and password when they redeem it.
-            </DialogDescription>
+            <DialogTitle>{t("inviteMemberTitle")}</DialogTitle>
+            <DialogDescription>{t("inviteDesc")}</DialogDescription>
           </DialogHeader>
           <label className="flex items-center gap-2 text-sm">
             <input
@@ -274,7 +269,7 @@ export function MembersPage() {
               onChange={(e) => setInviteAsAdmin(e.target.checked)}
               disabled={pendingAction}
             />
-            Grant admin privileges
+            {t("grantAdminPrivileges")}
           </label>
           {actionError !== null && (
             <div
@@ -290,10 +285,10 @@ export function MembersPage() {
               onClick={() => setShowCreateInvite(false)}
               disabled={pendingAction}
             >
-              Cancel
+              {t("cancel")}
             </Button>
             <Button onClick={() => void onCreateInvite()} disabled={pendingAction}>
-              {pendingAction ? "Creating…" : "Create invite"}
+              {pendingAction ? t("creating") : t("createInvite")}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -308,16 +303,14 @@ export function MembersPage() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Invite URL</DialogTitle>
+            <DialogTitle>{t("inviteUrl")}</DialogTitle>
             <DialogDescription>
-              Send this URL to the new member. It expires in {formatTtl(inviteResult?.expires_at)}{" "}
-              and is single-use — once they redeem it, it can't be used again. This URL is shown
-              only once.
+              {t("inviteUrlDesc", { expiry: formatTtl(inviteResult?.expires_at) })}
             </DialogDescription>
           </DialogHeader>
           {inviteResult !== null && <CopyableValue value={rebaseUrl(inviteResult.register_url)} />}
           <DialogFooter>
-            <Button onClick={() => setInviteResult(null)}>Done</Button>
+            <Button onClick={() => setInviteResult(null)}>{t("done")}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -331,14 +324,12 @@ export function MembersPage() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>New password for {resetResult?.id}</DialogTitle>
-            <DialogDescription>
-              Send this password to the user out-of-band (e.g. Slack DM). It is shown only once.
-            </DialogDescription>
+            <DialogTitle>{t("newPasswordFor", { user: resetResult?.id })}</DialogTitle>
+            <DialogDescription>{t("resetPasswordDesc")}</DialogDescription>
           </DialogHeader>
           {resetResult !== null && <CopyableValue value={resetResult.new_password} />}
           <DialogFooter>
-            <Button onClick={() => setResetResult(null)}>Done</Button>
+            <Button onClick={() => setResetResult(null)}>{t("done")}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -356,12 +347,8 @@ export function MembersPage() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Remove {deleteCandidate}?</DialogTitle>
-            <DialogDescription>
-              This deletes the user account and revokes all their session permissions. Sessions they
-              own become inaccessible unless another user has manage rights on them. This action
-              cannot be undone.
-            </DialogDescription>
+            <DialogTitle>{t("removeUserConfirmTitle", { user: deleteCandidate })}</DialogTitle>
+            <DialogDescription>{t("removeUserConfirmDesc")}</DialogDescription>
           </DialogHeader>
           {actionError !== null && (
             <div
@@ -377,14 +364,14 @@ export function MembersPage() {
               onClick={() => setDeleteCandidate(null)}
               disabled={pendingAction}
             >
-              Cancel
+              {t("cancel")}
             </Button>
             <Button
               variant="destructive"
               onClick={() => void onConfirmDelete()}
               disabled={pendingAction}
             >
-              {pendingAction ? "Removing…" : "Remove"}
+              {pendingAction ? t("removing") : t("remove")}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -401,6 +388,7 @@ export function MembersPage() {
  * since the user typically pastes them into Slack within seconds.
  */
 function CopyableValue({ value }: { value: string }) {
+  const { t } = useTranslation("common");
   const [copied, setCopied] = useState(false);
   const onCopy = async () => {
     try {
@@ -419,8 +407,8 @@ function CopyableValue({ value }: { value: string }) {
         className="font-mono text-xs"
         onFocus={(e) => e.currentTarget.select()}
       />
-      <Button variant="outline" size="sm" onClick={() => void onCopy()} aria-label="Copy">
-        <CopyIcon /> {copied ? "Copied" : "Copy"}
+      <Button variant="outline" size="sm" onClick={() => void onCopy()} aria-label={t("copy")}>
+        <CopyIcon /> {copied ? t("copied") : t("copy")}
       </Button>
     </div>
   );
@@ -440,8 +428,8 @@ function rebaseUrl(serverUrl: string): string {
   }
 }
 
-function formatEpoch(epoch: number | null): string {
-  if (epoch === null) return "Never";
+function formatEpoch(epoch: number | null, never: string): string {
+  if (epoch === null) return never;
   const d = new Date(epoch * 1000);
   return d.toLocaleString();
 }

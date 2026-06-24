@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { Session } from "@/lib/types";
@@ -207,6 +208,7 @@ export function IntelligentModelControl({
   disabled?: boolean;
   verdict?: CostRoutingVerdict | null;
 }) {
+  const { t } = useTranslation("common");
   const isOn = value === "on";
 
   // Fresh-verdict ping: bumping the key remounts the ring span, replaying
@@ -238,7 +240,7 @@ export function IntelligentModelControl({
             variant="ghost"
             size="icon"
             disabled={disabled}
-            aria-label="Intelligent model router"
+            aria-label={t("intelligentModelRouter")}
             aria-pressed={isOn}
             data-testid="cost-toggle-trigger"
             data-mode={isOn ? "on" : "off"}
@@ -268,11 +270,11 @@ export function IntelligentModelControl({
           className="flex-col items-start gap-0.5 px-3 py-2"
         >
           <span className="font-medium" data-testid="imc-tooltip-title">
-            Intelligent model router
+            {t("intelligentModelRouter")}
           </span>
           {isOn && verdict !== null && (
             <span className="text-muted-foreground" data-testid="imc-verdict-line">
-              {verdict.applied ? "Picked" : "Would pick"}{" "}
+              {verdict.applied ? t("modelRouterPicked") : t("modelRouterWouldPick")}{" "}
               <span className="font-medium text-popover-foreground">
                 {shortModelName(verdict.model)}
               </span>

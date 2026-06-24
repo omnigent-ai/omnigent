@@ -8,6 +8,7 @@
 //   the "Working…" indicator.
 
 import { AlertCircleIcon, RotateCcwIcon, ShieldXIcon, ShrinkIcon } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
 interface ErrorBannerProps {
@@ -22,7 +23,8 @@ interface ErrorBannerProps {
  * panel even when the LLM error payload omits the message).
  */
 export function ErrorBanner({ message, source, code }: ErrorBannerProps) {
-  const display = message || code || "Unknown error";
+  const { t } = useTranslation("common");
+  const display = message || code || t("unknownError");
   return (
     <Alert
       variant="destructive"
@@ -30,7 +32,8 @@ export function ErrorBanner({ message, source, code }: ErrorBannerProps) {
     >
       <AlertCircleIcon />
       <AlertTitle className="min-w-0 break-words [overflow-wrap:anywhere]">
-        Error{source ? ` · ${source}` : ""}
+        {t("errorBanner")}
+        {source ? ` · ${source}` : ""}
         {code && message ? ` · ${code}` : ""}
       </AlertTitle>
       <AlertDescription className="min-w-0 max-w-full overflow-hidden">
@@ -52,10 +55,14 @@ interface PolicyDeniedBannerProps {
  * (amber/warning tone) to distinguish from hard errors (destructive red).
  */
 export function PolicyDeniedBanner({ reason, phase }: PolicyDeniedBannerProps) {
+  const { t } = useTranslation("common");
   return (
     <Alert>
       <ShieldXIcon />
-      <AlertTitle>Blocked by policy{phase ? ` · ${phase}` : ""}</AlertTitle>
+      <AlertTitle>
+        {t("blockedByPolicy")}
+        {phase ? ` · ${phase}` : ""}
+      </AlertTitle>
       <AlertDescription>{reason}</AlertDescription>
     </Alert>
   );
@@ -78,12 +85,13 @@ export function RetryIndicator({
   maxAttempts,
   delaySeconds,
 }: RetryIndicatorProps) {
+  const { t } = useTranslation("common");
   return (
     <div className="flex items-center gap-2 text-muted-foreground text-xs">
       <RotateCcwIcon className="size-3" />
       <span>
-        Retrying {source} · attempt {attempt}/{maxAttempts}
-        {delaySeconds > 0 ? ` · waiting ${delaySeconds.toFixed(1)}s` : ""}
+        {t("retrying", { source, attempt, maxAttempts })}
+        {delaySeconds > 0 ? t("retryingWaiting", { seconds: delaySeconds.toFixed(1) }) : ""}
       </span>
     </div>
   );
@@ -96,10 +104,11 @@ export function RetryIndicator({
  * indicator.
  */
 export function CompactionMarker() {
+  const { t } = useTranslation("common");
   return (
     <div className="flex items-center gap-2 text-muted-foreground text-xs italic">
       <ShrinkIcon className="size-3" />
-      <span>Conversation compacted</span>
+      <span>{t("conversationCompacted")}</span>
     </div>
   );
 }

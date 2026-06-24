@@ -7,7 +7,12 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import i18n from "@/i18n";
 import type { Conversation } from "@/hooks/useConversations";
+
+// Assert against translation keys, not English literals, so the test tracks
+// the key rather than breaking when the en copy is reworded (see ap-web-i18n).
+const t = i18n.getFixedT(null, "common");
 
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
@@ -79,7 +84,7 @@ afterEach(cleanup);
 describe("SettingsPage", () => {
   it("renders the Appearance section and applies a theme on card click", () => {
     renderPage("/settings/appearance");
-    expect(screen.getByRole("heading", { name: "Appearance" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: t("appearanceTitle") })).toBeInTheDocument();
     // System is selected (theme = "system").
     expect(screen.getByTestId("theme-system")).toHaveAttribute("aria-checked", "true");
     fireEvent.click(screen.getByTestId("theme-dark"));
@@ -95,7 +100,7 @@ describe("SettingsPage", () => {
     cleanup();
     mocks.accountsEnabled = false;
     renderPage("/settings");
-    expect(screen.getByRole("heading", { name: "Appearance" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: t("appearanceTitle") })).toBeInTheDocument();
   });
 
   it("renders the Account section at /settings/account when auth is enabled", async () => {
@@ -133,7 +138,7 @@ describe("SettingsPage", () => {
 
     // Trash → confirm dialog → Delete fires the delete mutation.
     fireEvent.click(screen.getByTestId("delete-archived"));
-    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: t("delete") }));
     expect(mocks.deleteMutate).toHaveBeenCalledWith({ id: "conv_archived" });
   });
 });

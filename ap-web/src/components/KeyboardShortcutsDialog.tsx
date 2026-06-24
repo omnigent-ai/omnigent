@@ -10,6 +10,7 @@
 // it without prop-drilling). Mount it once near the app shell.
 
 import { useEffect, useState, type ReactNode } from "react";
+import { useTranslation } from "react-i18next";
 
 import {
   Dialog,
@@ -59,56 +60,64 @@ interface ShortcutGroup {
   items: Shortcut[];
 }
 
+type TFn = ReturnType<typeof useTranslation<"common">>["t"];
+
 // ONLY shortcuts that exist today (see file header). Keep in sync with the
 // composer's `handleKeyDown` and the global hotkey hooks.
-const SHORTCUT_GROUPS: ShortcutGroup[] = [
-  {
-    title: "General",
-    items: [{ label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] }],
-  },
-  {
-    title: "In chats",
-    items: [
-      { label: "Send message", keys: [ENTER] },
-      { label: "New line in message", keys: [SHIFT, ENTER] },
-      { label: "Recall previous prompt", keys: [UP] },
-      { label: "Recall next prompt", keys: [DOWN] },
-      { label: "Accept approval prompt", keys: [MOD_KEY, ENTER] },
-      { label: "Stop response", keys: ["Esc"] },
-    ],
-  },
-  {
-    title: "Navigation",
-    items: [
-      { label: "Previous session", keys: [MOD_KEY, UP] },
-      { label: "Next session", keys: [MOD_KEY, DOWN] },
-    ],
-  },
-  {
-    title: "Slash commands",
-    note: "while the suggestions menu is open",
-    items: [
-      { label: "Navigate suggestions", keys: [UP, DOWN] },
-      { label: "Apply highlighted command", keys: ["Tab"] },
-      { label: "Dismiss menu", keys: ["Esc"] },
-    ],
-  },
-];
+function buildShortcutGroups(t: TFn): ShortcutGroup[] {
+  return [
+    {
+      title: t("shortcutsGroupGeneral"),
+      items: [{ label: t("shortcutShowKeyboardShortcuts"), keys: [MOD_KEY, "/"] }],
+    },
+    {
+      title: t("shortcutsGroupInChats"),
+      items: [
+        { label: t("shortcutSendMessage"), keys: [ENTER] },
+        { label: t("shortcutNewLineInMessage"), keys: [SHIFT, ENTER] },
+        { label: t("shortcutRecallPreviousPrompt"), keys: [UP] },
+        { label: t("shortcutRecallNextPrompt"), keys: [DOWN] },
+        { label: t("shortcutAcceptApprovalPrompt"), keys: [MOD_KEY, ENTER] },
+        { label: t("shortcutStopResponse"), keys: ["Esc"] },
+      ],
+    },
+    {
+      title: t("shortcutsGroupNavigation"),
+      items: [
+        { label: t("shortcutPreviousSession"), keys: [MOD_KEY, UP] },
+        { label: t("shortcutNextSession"), keys: [MOD_KEY, DOWN] },
+      ],
+    },
+    {
+      title: t("shortcutsGroupSlashCommands"),
+      note: t("shortcutsSlashCommandsNote"),
+      items: [
+        { label: t("shortcutNavigateSuggestions"), keys: [UP, DOWN] },
+        { label: t("shortcutApplyHighlightedCommand"), keys: ["Tab"] },
+        { label: t("shortcutDismissMenu"), keys: ["Esc"] },
+      ],
+    },
+  ];
+}
 
 // Desktop-only: Cmd/Ctrl+digit collides with browser tab-switching, so the
 // pinned-session hotkey ships only in the Electron shell (see
 // usePinnedSessionHotkeys). Injected into "Navigation" when running natively.
-const PINNED_SESSION_SHORTCUT: Shortcut = {
-  label: "Jump to pinned session (1–10)",
-  keys: [MOD_KEY, "1…0"],
-};
+function pinnedSessionShortcut(t: TFn): Shortcut {
+  return {
+    label: t("shortcutJumpToPinnedSession"),
+    keys: [MOD_KEY, "1…0"],
+  };
+}
 
 /** Shortcut groups for the current runtime — adds desktop-only rows natively. */
-function shortcutGroupsFor(native: boolean): ShortcutGroup[] {
-  if (!native) return SHORTCUT_GROUPS;
-  return SHORTCUT_GROUPS.map((group) =>
-    group.title === "Navigation"
-      ? { ...group, items: [...group.items, PINNED_SESSION_SHORTCUT] }
+function shortcutGroupsFor(t: TFn, native: boolean): ShortcutGroup[] {
+  const groups = buildShortcutGroups(t);
+  if (!native) return groups;
+  const navigationTitle = t("shortcutsGroupNavigation");
+  return groups.map((group) =>
+    group.title === navigationTitle
+      ? { ...group, items: [...group.items, pinnedSessionShortcut(t)] }
       : group,
   );
 }
@@ -127,8 +136,9 @@ function Kbd({ children }: { children: ReactNode }) {
  * Settings page, which embeds it directly instead of behind a trigger.
  */
 export function KeyboardShortcutsList() {
+  const { t } = useTranslation("common");
   // Feature-based, stable per session; computed at render so tests can vary it.
-  const groups = shortcutGroupsFor(isNativeShell());
+  const groups = shortcutGroupsFor(t, isNativeShell());
   return (
     <>
       {groups.map((group) => (
@@ -161,6 +171,7 @@ export function KeyboardShortcutsList() {
 }
 
 export function KeyboardShortcutsDialog() {
+  const { t } = useTranslation("common");
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
@@ -185,9 +196,9 @@ export function KeyboardShortcutsDialog() {
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Keyboard shortcuts</DialogTitle>
+          <DialogTitle>{t("keyboardShortcuts")}</DialogTitle>
           <DialogDescription className="sr-only">
-            The keyboard shortcuts available in the chat.
+            {t("keyboardShortcutsDescription")}
           </DialogDescription>
         </DialogHeader>
         <div className="max-h-[70vh] overflow-y-auto pr-1">

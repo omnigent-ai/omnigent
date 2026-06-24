@@ -14,6 +14,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { splitTypedPath, WorkspacePathField } from "./WorkspacePathField";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
+import i18n from "@/i18n";
+
+// Resolve expected copy through the app's own i18n instance so the
+// tests assert "this UI shows key X" rather than a hardcoded English
+// literal. Under jsdom the language is en, so the text is unchanged —
+// but it now tracks renames and turns a missing fr key into a parity
+// failure instead of a green test riding the English fallback.
+const t = i18n.getFixedT(null, "nav");
 
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
@@ -145,8 +153,17 @@ describe("WorkspacePathField", () => {
         recent={[]}
       />,
     );
+    // The combobox and browse button expose translated aria-labels;
+    // querying by their key-resolved accessible names proves the
+    // labels render from the translation, not a hardcoded literal.
+    expect(screen.getByRole("combobox", { name: t("workspacePathLabel") })).toBeTruthy();
+    expect(screen.getByRole("button", { name: t("browseDirectories") })).toBeTruthy();
+    // The input placeholder is translated copy too.
+    expect(screen.getByPlaceholderText(t("workspacePathPlaceholder"))).toBeTruthy();
     fireEvent.focus(screen.getByTestId("workspace-path-input"));
     expect(screen.getByTestId("workspace-path-dropdown")).toBeTruthy();
+    // The "Matches" group header is translated copy.
+    expect(screen.getByText(t("matches"))).toBeTruthy();
     expect(screen.getByTestId("workspace-match-0").textContent).toContain("/Users/corey/projects");
     // Files and dot-dirs are filtered out — a workspace must be a
     // visible directory.
@@ -186,6 +203,8 @@ describe("WorkspacePathField", () => {
       />,
     );
     fireEvent.focus(screen.getByTestId("workspace-path-input"));
+    // The "Recent" group header is translated copy.
+    expect(screen.getByText(t("recent"))).toBeTruthy();
     fireEvent.mouseDown(screen.getByTestId("workspace-recent-0"));
     expect(onChange).toHaveBeenCalledWith("/Users/corey/recent-proj");
   });
@@ -278,6 +297,46 @@ describe("WorkspacePathField", () => {
     fireEvent.focus(input);
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onCommit).not.toHaveBeenCalled();
+  });
+
+  it("shows the translated loading text while listing with no matches yet", () => {
+    // isLoading + no matches surfaces the loading row; assert its copy
+    // via the key so the string can't escape translation.
+    mockListing([], { isLoading: true });
+    render(
+      <WorkspacePathField
+        hostId="host_1"
+        value={VALUE}
+        onChange={vi.fn()}
+        onBrowse={vi.fn()}
+        recent={[]}
+      />,
+    );
+    fireEvent.focus(screen.getByTestId("workspace-path-input"));
+    expect(screen.getByText(t("loading"))).toBeTruthy();
+  });
+
+  it("shows the translated overflow notice when matches exceed the display limit", () => {
+    // > 100 directory matches trips the "+N more" overflow row; assert
+    // the interpolated copy via the key with the same count the
+    // component computes (total − 100).
+    const many = Array.from({ length: 130 }, (_, i) =>
+      dir(`proj${i}`, `/Users/corey/proj${i}`),
+    );
+    mockListing(many);
+    render(
+      <WorkspacePathField
+        hostId="host_1"
+        value={VALUE}
+        onChange={vi.fn()}
+        onBrowse={vi.fn()}
+        recent={[]}
+      />,
+    );
+    fireEvent.focus(screen.getByTestId("workspace-path-input"));
+    expect(screen.getByTestId("workspace-match-overflow").textContent).toBe(
+      t("matchOverflow", { count: 30 }),
+    );
   });
 
   it("suppresses the dropdown while the tree browser is open", () => {

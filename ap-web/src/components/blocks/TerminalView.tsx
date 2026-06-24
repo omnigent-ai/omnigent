@@ -10,6 +10,7 @@
 
 import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
 import { resolveWebSocketUrl } from "@/lib/host";
@@ -39,6 +40,8 @@ export const RECONNECT_BACKOFF_MS = [500, 1000, 2000, 4000, 8000] as const;
  * plain reset-on-connect, a connect→drop hot loop would retry forever.
  */
 export const RECONNECT_STABLE_MS = 30_000;
+
+type TFn = ReturnType<typeof useTranslation<"common">>["t"];
 
 interface TerminalViewProps {
   /** Session/conversation identifier, e.g. ``"conv_abc123"``. */
@@ -77,6 +80,7 @@ export function TerminalView({
   onResume,
   resumePending = false,
 }: TerminalViewProps) {
+  const { t } = useTranslation("common");
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
@@ -138,9 +142,9 @@ export function TerminalView({
       disposeActiveSession();
       setConnectAttempt((attempt) => attempt + 1);
     } catch (error) {
-      setResumeError(resumeErrorText(error));
+      setResumeError(resumeErrorText(error, t));
     }
-  }, [onResume, disposeActiveSession]);
+  }, [onResume, disposeActiveSession, t]);
 
   const attachSession = useCallback(
     (node: HTMLDivElement | null) => {
@@ -273,7 +277,7 @@ export function TerminalView({
         data-testid="terminal-selection-hint"
         className="shrink-0 select-none px-2 py-1 text-[10px] text-muted-foreground/70"
       >
-        {selectionHintText(isMacPlatform())}
+        {selectionHintText(isMacPlatform(), t)}
       </div>
       {state.kind !== "connected" && (
         <StatusOverlay
@@ -282,6 +286,7 @@ export function TerminalView({
           onResume={onResume ? handleResume : undefined}
           resumePending={resumePending}
           resumeError={resumeError}
+          t={t}
         />
       )}
     </div>
@@ -326,10 +331,8 @@ export function isMacPlatform(): boolean {
  * :returns: The hint string to render, e.g.
  *     ``"Hold ⌥ and drag to select · ⌘C to copy"``.
  */
-export function selectionHintText(isMac: boolean): string {
-  return isMac
-    ? "Hold ⌥ and drag to select · ⌘C to copy"
-    : "Hold Shift and drag to select · right-click to copy";
+export function selectionHintText(isMac: boolean, t: TFn): string {
+  return isMac ? t("terminalSelectionHintMac") : t("terminalSelectionHintOther");
 }
 
 function StatusOverlay({
@@ -338,6 +341,7 @@ function StatusOverlay({
   onResume,
   resumePending,
   resumeError,
+  t,
 }: {
   state: ConnectionState;
   /** True while an automatic re-dial is scheduled for a closed bridge. */
@@ -345,6 +349,7 @@ function StatusOverlay({
   onResume?: () => void | Promise<void>;
   resumePending: boolean;
   resumeError: string | null;
+  t: TFn;
 }) {
   // Render outside the xterm container so close/error messages don't
   // pollute the scrollback buffer the way ANSI-escape writes would.
@@ -353,7 +358,7 @@ function StatusOverlay({
       {state.kind === "connecting" && (
         <span className="flex items-center gap-2">
           <Loader2Icon className="size-4 animate-spin" />
-          Connecting…
+          {t("connecting")}
         </span>
       )}
       {state.kind === "closed" && reconnectPending && (
@@ -361,12 +366,12 @@ function StatusOverlay({
         // dead-end message, so a transient drop never reads as fatal.
         <span data-testid="terminal-reconnecting" className="flex items-center gap-2">
           <Loader2Icon className="size-4 animate-spin" />
-          Reconnecting…
+          {t("reconnecting")}
         </span>
       )}
       {state.kind === "closed" && !reconnectPending && (
         <div className="flex flex-wrap items-center justify-center gap-2 px-3">
-          <span>Bridge closed: {state.reason}</span>
+          <span>{t("bridgeClosed", { reason: state.reason })}</span>
           {onResume && (
             <Button
               type="button"
@@ -376,7 +381,7 @@ function StatusOverlay({
               disabled={resumePending}
               className="border-zinc-500/50 bg-zinc-100 text-zinc-950 hover:bg-white"
             >
-              {resumePending ? "Resuming…" : "Resume session"}
+              {resumePending ? t("resuming") : t("resumeSession")}
             </Button>
           )}
           {resumeError && (
@@ -384,14 +389,15 @@ function StatusOverlay({
           )}
         </div>
       )}
-      {state.kind === "error" && <span>Bridge error</span>}
+      {state.kind === "error" && <span>{t("bridgeError")}</span>}
     </div>
   );
 }
 
-function resumeErrorText(error: unknown): string {
-  if (error instanceof Error && error.message) return `Couldn't resume session: ${error.message}`;
-  return "Couldn't resume session.";
+function resumeErrorText(error: unknown, t: TFn): string {
+  if (error instanceof Error && error.message)
+    return t("resumeSessionFailedReason", { reason: error.message });
+  return t("resumeSessionFailed");
 }
 
 /**

@@ -2,6 +2,7 @@
 // it reads at a glance; running/unseen stay as compact dots. Verbose copy
 // (incl. the approval count) lives in the tooltip.
 
+import { useTranslation } from "react-i18next";
 import { RunningDot } from "@/components/RunningDot";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -19,25 +20,28 @@ interface Visual {
   render: () => JSX.Element;
 }
 
-function describe(state: SessionState): Visual {
+type TFn = ReturnType<typeof useTranslation<"common">>["t"];
+
+function describe(state: SessionState, t: TFn): Visual {
   switch (state.kind) {
     case "awaiting": {
-      const tooltip =
-        state.count === 1 ? "1 approval prompt waiting" : `${state.count} approval prompts waiting`;
+      const tooltip = t("approvalPromptsWaiting", { count: state.count });
       return {
         kind: state.kind,
         ariaLabel: tooltip,
         tooltip,
         render: () => (
-          <Badge className="border-transparent bg-warning/15 text-warning">Needs response</Badge>
+          <Badge className="border-transparent bg-warning/15 text-warning">
+            {t("needsResponse")}
+          </Badge>
         ),
       };
     }
     case "running":
       return {
         kind: state.kind,
-        ariaLabel: "Session running",
-        tooltip: "Session running",
+        ariaLabel: t("sessionRunning"),
+        tooltip: t("sessionRunning"),
         render: () => <RunningDot />,
       };
     case "unseen":
@@ -45,8 +49,8 @@ function describe(state: SessionState): Visual {
       // indicator, which is the same pink but pulsing.
       return {
         kind: state.kind,
-        ariaLabel: "New messages",
-        tooltip: "New messages",
+        ariaLabel: t("newMessages"),
+        tooltip: t("newMessages"),
         render: () => <Dot tone="bg-brand-accent" />,
       };
   }
@@ -57,7 +61,8 @@ function Dot({ tone }: { tone: string }) {
 }
 
 export function SessionStateBadge({ state }: SessionStateBadgeProps) {
-  const visual = describe(state);
+  const { t } = useTranslation("common");
+  const visual = describe(state, t);
   return (
     <Tooltip>
       <TooltipTrigger asChild>

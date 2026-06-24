@@ -14,11 +14,14 @@ import {
   PanelRightOpenIcon,
   UserCogIcon,
 } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
+
+type TFn = ReturnType<typeof useTranslation<"nav">>["t"];
 
 export type SettingsSectionId = "appearance" | "shortcuts" | "account" | "archived";
 
@@ -41,21 +44,21 @@ interface SettingsNavGroup {
 }
 
 /** Nav groups for the current deploy — the Account section is auth-gated. */
-export function settingsNavGroups(accountsEnabled: boolean): SettingsNavGroup[] {
+export function settingsNavGroups(t: TFn, accountsEnabled: boolean): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
-    { id: "appearance", label: "Appearance", icon: PaletteIcon },
-    { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon },
+    { id: "appearance", label: t("settingsAppearance"), icon: PaletteIcon },
+    { id: "shortcuts", label: t("settingsShortcuts"), icon: KeyboardIcon },
   ];
   if (accountsEnabled) {
     // Account leads the group when present — it's the most-visited section
     // on accounts deploys.
-    general.unshift({ id: "account", label: "Account", icon: UserCogIcon });
+    general.unshift({ id: "account", label: t("settingsAccount"), icon: UserCogIcon });
   }
   return [
-    { title: "General", items: general },
+    { title: t("settingsGroupGeneral"), items: general },
     {
-      title: "Archived",
-      items: [{ id: "archived", label: "Archived sessions", icon: ArchiveIcon }],
+      title: t("archived"),
+      items: [{ id: "archived", label: t("settingsArchivedSessions"), icon: ArchiveIcon }],
     },
   ];
 }
@@ -95,10 +98,11 @@ export function SettingsSidebarBody({
   onNavClick: (e: React.MouseEvent<HTMLAnchorElement>) => void;
   onClose: () => void;
 }) {
+  const { t } = useTranslation("nav");
   const info = useServerInfo();
   const accountsEnabled = info !== "loading" && info.accounts_enabled;
   const { section } = useSettingsRoute();
-  const groups = settingsNavGroups(accountsEnabled);
+  const groups = settingsNavGroups(t, accountsEnabled);
 
   return (
     <>
@@ -106,7 +110,7 @@ export function SettingsSidebarBody({
         <Button asChild variant="ghost" size="sm" className="gap-2 text-muted-foreground">
           <Link to="/" onClick={onNavClick}>
             <ArrowLeftIcon className="size-4" />
-            Back to Omnigent
+            {t("backToOmnigent")}
           </Link>
         </Button>
         <Tooltip>
@@ -115,14 +119,14 @@ export function SettingsSidebarBody({
               type="button"
               variant="ghost"
               size="icon"
-              aria-label="Close sidebar"
+              aria-label={t("closeSidebar")}
               onClick={onClose}
               className="rounded-full"
             >
               <PanelRightOpenIcon className="size-4" />
             </Button>
           </TooltipTrigger>
-          <TooltipContent side="bottom">Collapse sidebar</TooltipContent>
+          <TooltipContent side="bottom">{t("collapseSidebar")}</TooltipContent>
         </Tooltip>
       </div>
       <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-3">

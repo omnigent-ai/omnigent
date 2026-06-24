@@ -9,7 +9,10 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "@/i18n";
 import { NewTerminalButton } from "./NewTerminalButton";
+
+const t = i18n.getFixedT(null, "nav");
 
 function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
   return {
@@ -58,7 +61,7 @@ describe("NewTerminalButton access gate", () => {
     // gate's decision, not just the loading state.
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
     // The iff gate: no declared terminals → no affordance at all.
-    expect(screen.queryByRole("button", { name: /new shell/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: t("newShell") })).toBeNull();
   });
 
   it("creates the single declared terminal on click and focuses it", async () => {
@@ -79,7 +82,7 @@ describe("NewTerminalButton access gate", () => {
 
     renderButton(onCreated);
 
-    const button = await screen.findByRole("button", { name: /new shell/i });
+    const button = await screen.findByRole("button", { name: t("newShell") });
     fireEvent.click(button);
 
     // The created terminal's tab key reaches the host surface so it
@@ -116,8 +119,8 @@ describe("NewTerminalButton access gate", () => {
     // The virtual row carries a visible label (not an icon-only
     // tooltip button) so an empty Shells list reads as a list with one
     // actionable entry.
-    const row = await screen.findByRole("button", { name: /new shell/i });
-    expect(row).toHaveTextContent("New shell");
+    const row = await screen.findByRole("button", { name: t("newShell") });
+    expect(row).toHaveTextContent(t("newShell"));
     fireEvent.click(row);
 
     // Same create + focus contract as the icon variant — a divergence

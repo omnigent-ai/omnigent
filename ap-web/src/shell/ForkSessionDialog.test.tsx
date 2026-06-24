@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
+import i18n from "@/i18n";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
@@ -13,6 +14,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 
+const t = i18n.getFixedT(null, "common");
 const navigateMock = vi.fn();
 vi.mock("react-router-dom", async (importOriginal) => {
   const actual = await importOriginal<typeof import("react-router-dom")>();
@@ -175,7 +177,7 @@ describe("ForkSessionDialog", () => {
     openAdvanced();
     const input = screen.getByTestId("fork-session-title-input");
     expect(input).toHaveValue("");
-    expect(input).toHaveAttribute("placeholder", "Fork of My session");
+    expect(input).toHaveAttribute("placeholder", t("forkOfTitle", { title: "My session" }));
   });
 
   it("falls back to a generic placeholder when the source has no title", () => {
@@ -183,7 +185,7 @@ describe("ForkSessionDialog", () => {
     openAdvanced();
     const input = screen.getByTestId("fork-session-title-input");
     expect(input).toHaveValue("");
-    expect(input).toHaveAttribute("placeholder", "Name the cloned session");
+    expect(input).toHaveAttribute("placeholder", t("nameTheClonedSession"));
   });
 
   it("forks with the edited title, refreshes the list, and navigates into the fork", async () => {
@@ -216,7 +218,7 @@ describe("ForkSessionDialog", () => {
 
     // A truncated fork renames the dialog so the user knows history after
     // the selected response won't be carried over.
-    expect(screen.getByText("Fork from this response")).toBeInTheDocument();
+    expect(screen.getByText(t("forkFromThisResponse"))).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("fork-session-submit"));
 
@@ -385,7 +387,7 @@ describe("ForkSessionDialog", () => {
 
     const sameOption = screen.getByTestId("fork-session-agent-option-same");
     expect(sameOption).toHaveTextContent("Claude");
-    expect(sameOption).toHaveTextContent("(same as original session)");
+    expect(sameOption).toHaveTextContent(t("sameAsOriginalSession"));
   });
 
   describe("coding source (fork + start)", () => {

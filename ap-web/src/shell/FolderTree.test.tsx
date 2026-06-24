@@ -1,7 +1,10 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import i18n from "@/i18n";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { FolderTree } from "./FolderTree";
+
+const t = i18n.getFixedT(null, "common");
 
 afterEach(cleanup);
 
@@ -28,8 +31,8 @@ describe("FolderTree runner-offline state", () => {
     // the Changed tab, not the generic "Failed to load".
     renderTree({ isError: true, error: new RunnerOfflineError(), runnerWentOffline: true });
 
-    expect(screen.getByText(/agent is asleep/i)).toBeInTheDocument();
-    expect(screen.getByText(/send a message in the chat to reconnect/i)).toBeInTheDocument();
+    expect(screen.getByText(t("agentAsleep"))).toBeInTheDocument();
+    expect(screen.getByText(t("sendMessageToReconnect"))).toBeInTheDocument();
     expect(screen.queryByText(/failed to load/i)).not.toBeInTheDocument();
   });
 
@@ -38,8 +41,8 @@ describe("FolderTree runner-offline state", () => {
     // the normal empty state, not the asleep alarm.
     renderTree({ isError: true, error: new RunnerOfflineError(), runnerWentOffline: false });
 
-    expect(screen.getByText(/no files in workspace/i)).toBeInTheDocument();
-    expect(screen.queryByText(/agent is asleep/i)).not.toBeInTheDocument();
+    expect(screen.getByText(t("noFilesInWorkspace"))).toBeInTheDocument();
+    expect(screen.queryByText(t("agentAsleep"))).not.toBeInTheDocument();
     expect(screen.queryByText(/failed to load/i)).not.toBeInTheDocument();
   });
 
@@ -47,6 +50,6 @@ describe("FolderTree runner-offline state", () => {
     renderTree({ isError: true, error: new Error("500 Internal Server Error") });
 
     expect(screen.getByText(/failed to load: 500 internal server error/i)).toBeInTheDocument();
-    expect(screen.queryByText(/agent is asleep/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(t("agentAsleep"))).not.toBeInTheDocument();
   });
 });

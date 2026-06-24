@@ -10,6 +10,9 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SetupPage } from "./SetupPage";
 import * as accountsApi from "@/lib/accountsApi";
+import i18n from "@/i18n";
+
+const t = i18n.getFixedT(null, "common");
 
 vi.mock("@/lib/accountsApi", () => ({ setup: vi.fn() }));
 
@@ -78,7 +81,7 @@ describe("SetupPage", () => {
     fillForm("root", "longenough", "different1");
     fireEvent.click(screen.getByRole("button", { name: /create admin/i }));
 
-    expect(screen.getByRole("alert")).toHaveTextContent("Passwords don't match.");
+    expect(screen.getByRole("alert")).toHaveTextContent(t("passwordsDontMatch"));
     expect(accountsApi.setup).not.toHaveBeenCalled();
   });
 

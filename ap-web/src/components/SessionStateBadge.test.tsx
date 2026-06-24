@@ -3,6 +3,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SessionStateBadge } from "./SessionStateBadge";
 import type { SessionState } from "@/hooks/useSessionState";
+import i18n from "@/i18n";
+
+const t = i18n.getFixedT(null, "common");
 
 function renderBadge(state: SessionState) {
   return render(
@@ -19,17 +22,17 @@ describe("SessionStateBadge — per-state rendering", () => {
     renderBadge({ kind: "awaiting", count: 3 });
     const badge = screen.getByTestId("session-state-badge");
     expect(badge).toHaveAttribute("data-state", "awaiting");
-    expect(badge).toHaveAttribute("aria-label", "3 approval prompts waiting");
+    expect(badge).toHaveAttribute("aria-label", t("approvalPromptsWaiting", { count: 3 }));
     // The approval indicator is a visible text tag (not an icon-only dot), so
     // it reads as "Needs response" at a glance in the row.
-    expect(badge).toHaveTextContent("Needs response");
+    expect(badge).toHaveTextContent(t("needsResponse"));
   });
 
   it("uses singular wording when only one prompt is pending", () => {
     renderBadge({ kind: "awaiting", count: 1 });
     expect(screen.getByTestId("session-state-badge")).toHaveAttribute(
       "aria-label",
-      "1 approval prompt waiting",
+      t("approvalPromptsWaiting", { count: 1 }),
     );
   });
 
@@ -49,7 +52,7 @@ describe("SessionStateBadge — per-state rendering", () => {
   it("renders unseen messages as a solid (non-pulsing) brand-pink dot", () => {
     const { container } = renderBadge({ kind: "unseen" });
     const badge = screen.getByTestId("session-state-badge");
-    expect(badge).toHaveAttribute("aria-label", "New messages");
+    expect(badge).toHaveAttribute("aria-label", t("newMessages"));
     expect(badge).toHaveAttribute("data-state", "unseen");
     // Unread reuses the brand-pink token but stays static; the pulsing
     // variant (running-pulse-dot) is reserved for the running state.

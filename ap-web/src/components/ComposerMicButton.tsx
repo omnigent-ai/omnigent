@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { MicIcon, SquareIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 // Local-only types; speech-input.tsx already augments Window globally.
 interface SpeechRecognitionLike {
@@ -64,6 +65,7 @@ export const ComposerMicButton = ({
   disabled,
   lang = "en-US",
 }: ComposerMicButtonProps) => {
+  const { t } = useTranslation("common");
   // null Ctor → no Web Speech support → render nothing (no server fallback).
   const [Ctor] = useState(getRecognitionCtor);
   const [isListening, setIsListening] = useState(false);
@@ -72,6 +74,10 @@ export const ComposerMicButton = ({
   // Ref so the result handler isn't re-attached on every parent re-render.
   const onTranscriptRef = useRef(onTranscript);
   onTranscriptRef.current = onTranscript;
+  // Synced ref so the mount-time error handler resolves the current
+  // translations without re-attaching listeners on every render.
+  const tRef = useRef(t);
+  tRef.current = t;
   // Synced prop ref so the recognition result handler (closure over the
   // mount-time effect) can drop late events when the composer goes
   // disabled mid-utterance.
@@ -108,9 +114,9 @@ export const ComposerMicButton = ({
       const err = (event as SpeechRecognitionErrorEventLike).error;
       // "no-speech" / "aborted" are routine (silence timeout, user stop).
       if (err === "not-allowed" || err === "service-not-allowed") {
-        setError("Microphone permission denied");
+        setError(tRef.current("microphonePermissionDenied"));
       } else if (err && err !== "no-speech" && err !== "aborted") {
-        setError("Dictation unavailable");
+        setError(tRef.current("dictationUnavailable"));
       }
       setIsListening(false);
     };
@@ -246,7 +252,7 @@ export const ComposerMicButton = ({
 
   // Stable accessible name with aria-pressed signals toggle state to
   // screen readers. Error text takes over the tooltip when set.
-  const a11yLabel = "Voice dictation";
+  const a11yLabel = t("voiceDictation");
   const tooltip = error ?? a11yLabel;
 
   return (

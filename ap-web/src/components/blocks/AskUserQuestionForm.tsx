@@ -31,6 +31,7 @@
 
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
 import { type ChangeEvent, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
 
@@ -83,6 +84,7 @@ function questionKey(question: ClaudeQuestion): string {
 }
 
 export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQuestionFormProps) {
+  const { t } = useTranslation("common");
   // Currently-visible question (carousel index).
   const [currentIndex, setCurrentIndex] = useState(0);
 
@@ -222,7 +224,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
     <div className="flex flex-col gap-2 text-foreground" data-testid="ask-user-question-form">
       <div className="flex items-center gap-2 text-xs text-muted-foreground">
         <span data-testid="ask-user-question-progress">
-          Question {currentIndex + 1} of {questions.length}:
+          {t("questionProgress", { current: currentIndex + 1, total: questions.length })}
         </span>
         {current.header && (
           <span className="text-muted-foreground text-xs rounded bg-muted px-1.5 py-0.5">
@@ -319,7 +321,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
                 scrolling within a fixed single row. */}
             <textarea
               rows={1}
-              placeholder="Type something"
+              placeholder={t("typeSomething")}
               value={customRowValue}
               onChange={(e) => handleCustomInput(currentKey, e)}
               data-testid="ask-user-question-custom-input"
@@ -350,7 +352,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
           data-testid="ask-user-question-prev"
         >
           <ChevronLeftIcon className="mr-1 size-3.5" />
-          Prev
+          {t("prev")}
         </Button>
         {!isLast && (
           <Button
@@ -359,7 +361,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
             onClick={() => setCurrentIndex((i) => i + 1)}
             data-testid="ask-user-question-next"
           >
-            Next
+            {t("next")}
             <ChevronRightIcon className="ml-1 size-3.5" />
           </Button>
         )}
@@ -371,12 +373,12 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
             data-testid="ask-user-question-submit"
           >
             <CheckIcon className="mr-1 size-3.5" />
-            Submit
+            {t("submit")}
           </Button>
         )}
         <Button size="sm" variant="outline" onClick={onReject} className="ml-auto">
           <XIcon className="mr-1 size-3.5" />
-          Cancel
+          {t("cancel")}
         </Button>
       </div>
     </div>

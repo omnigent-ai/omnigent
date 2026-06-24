@@ -26,6 +26,7 @@
  */
 
 import { useEffect, useState, type FormEvent } from "react";
+import { useTranslation } from "react-i18next";
 import { useSearchParams } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -52,6 +53,7 @@ function rememberUsername(value: string): void {
 }
 
 export function LoginPage() {
+  const { t } = useTranslation("common");
   const [params] = useSearchParams();
   // `return_to` is set by both identity.ts (on 401 redirect) and the
   // server-side magic-redeem 302 fallback. Trust only same-origin
@@ -64,9 +66,9 @@ export function LoginPage() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(
     magicError === "expired"
-      ? "That sign-in link has expired. Enter your password to sign in."
+      ? t("signInLinkExpired")
       : magicError === "missing"
-        ? "That sign-in link is no longer valid. Enter your password to sign in."
+        ? t("signInLinkInvalid")
         : null,
   );
 
@@ -121,14 +123,14 @@ export function LoginPage() {
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
       <div className="w-full max-w-sm space-y-6">
         <div className="space-y-1 text-center">
-          <h1 className="text-2xl font-semibold tracking-tight">Sign in</h1>
-          <p className="text-sm text-muted-foreground">Welcome to Omnigent.</p>
+          <h1 className="text-2xl font-semibold tracking-tight">{t("signIn")}</h1>
+          <p className="text-sm text-muted-foreground">{t("welcomeToOmnigent")}</p>
         </div>
 
         <form onSubmit={onSubmit} className="space-y-4">
           <div className="space-y-1.5">
             <label htmlFor="login-username" className="text-sm font-medium leading-none">
-              Username
+              {t("username")}
             </label>
             <Input
               id="login-username"
@@ -140,14 +142,14 @@ export function LoginPage() {
               required
             />
             <p className="text-xs text-muted-foreground">
-              On a fresh install your username is your machine login (the output of{" "}
-              <code className="font-mono">whoami</code>), unless an admin set a different one.
+              {t("usernameHintPrefix")} <code className="font-mono">whoami</code>
+              {t("usernameHintSuffix")}
             </p>
           </div>
 
           <div className="space-y-1.5">
             <label htmlFor="login-password" className="text-sm font-medium leading-none">
-              Password
+              {t("password")}
             </label>
             <Input
               id="login-password"
@@ -170,13 +172,12 @@ export function LoginPage() {
           )}
 
           <Button type="submit" className="w-full" disabled={submitting || password.length === 0}>
-            {submitting ? "Signing in…" : "Sign in"}
+            {submitting ? t("signingIn") : t("signIn")}
           </Button>
         </form>
 
         <p className="text-center text-xs text-muted-foreground">
-          On a fresh install the initial admin password was printed to the server's stderr and saved
-          to{" "}
+          {t("adminPasswordHintPrefix")}{" "}
           <code className="rounded bg-muted px-1 py-0.5 font-mono">
             ~/.omnigent/admin-credentials
           </code>

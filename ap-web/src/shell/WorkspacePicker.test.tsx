@@ -23,6 +23,12 @@ import {
   useHostFilesystem,
   type HostFilesystemEntry,
 } from "@/hooks/useHostFilesystem";
+import i18n from "@/i18n";
+
+// Resolve expected copy through the app's own i18n instance (jsdom → en),
+// so assertions track translation keys rather than hardcoded English and a
+// missing French key surfaces as a parity failure, not a green test.
+const t = i18n.getFixedT(null, "nav");
 
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
@@ -332,8 +338,8 @@ describe("WorkspacePicker conflict banner", () => {
     expect(occupancyForPath).toHaveBeenCalledWith("/Users/corey/repo");
     // The count (2) flows into the copy, proving it's the callback's return
     // value driving the banner, not a hardcoded string.
-    expect(screen.getByTestId("workspace-picker-conflict").textContent).toContain(
-      "2 other agents are",
+    expect(screen.getByTestId("workspace-picker-conflict").textContent).toBe(
+      t("workspacePickerConflict", { count: 2 }),
     );
   });
 
@@ -441,7 +447,7 @@ describe("WorkspacePicker listing filter", () => {
     });
     // Distinct from "(empty directory)" so the user knows it's the filter,
     // not an actually-empty folder.
-    expect(screen.getByText("No matching entries")).toBeTruthy();
+    expect(screen.getByText(t("workspacePickerNoMatchingEntries"))).toBeTruthy();
     expect(screen.queryByTestId("workspace-picker-entry-src")).toBeNull();
   });
 });

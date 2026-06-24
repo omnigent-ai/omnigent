@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   Dialog,
@@ -57,6 +58,7 @@ export function SwitchAgentDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
+  const { t } = useTranslation("common");
   const queryClient = useQueryClient();
   const [agentChoice, setAgentChoice] = useState<string>(NONE_CHOSEN);
   const [submitting, setSubmitting] = useState(false);
@@ -129,7 +131,7 @@ export function SwitchAgentDialog({
       await queryClient.invalidateQueries({ queryKey: ["conversations"] });
       handleOpenChange(false);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Couldn't switch the agent. Try again.");
+      setError(e instanceof Error ? e.message : t("switchAgentError"));
     } finally {
       setSubmitting(false);
     }
@@ -139,11 +141,8 @@ export function SwitchAgentDialog({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent data-testid="switch-agent-dialog" className="flex flex-col gap-4 sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Switch agent</DialogTitle>
-          <DialogDescription>
-            Continue this session on a different agent. The conversation, comments, and files stay;
-            the next message runs on the new agent.
-          </DialogDescription>
+          <DialogTitle>{t("switchAgent")}</DialogTitle>
+          <DialogDescription>{t("switchAgentDesc")}</DialogDescription>
         </DialogHeader>
 
         <div className="flex flex-col gap-1.5">
@@ -151,7 +150,7 @@ export function SwitchAgentDialog({
             htmlFor="switch-agent-select"
             className="text-xs font-medium text-muted-foreground"
           >
-            Agent
+            {t("agent")}
           </label>
           <Select value={agentChoice || undefined} onValueChange={setAgentChoice}>
             <SelectTrigger
@@ -164,10 +163,10 @@ export function SwitchAgentDialog({
                   currentDisplay ? (
                     <span data-testid="switch-agent-current">
                       <span className="text-foreground">{currentDisplay}</span>{" "}
-                      <span className="text-muted-foreground">(current agent)</span>
+                      <span className="text-muted-foreground">{t("currentAgent")}</span>
                     </span>
                   ) : (
-                    "Choose an agent"
+                    t("chooseAnAgent")
                   )
                 }
               />
@@ -189,8 +188,7 @@ export function SwitchAgentDialog({
 
         {resetsModelSettings && (
           <p data-testid="switch-agent-reset-warning" className="text-xs text-muted-foreground">
-            Model &amp; reasoning effort will reset to {chosen?.display_name}'s defaults (different
-            provider).
+            {t("switchAgentResetWarning", { agent: chosen?.display_name })}
           </p>
         )}
 
@@ -202,14 +200,14 @@ export function SwitchAgentDialog({
 
         <DialogFooter>
           <Button variant="ghost" onClick={() => handleOpenChange(false)} disabled={submitting}>
-            Cancel
+            {t("cancel")}
           </Button>
           <Button
             data-testid="switch-agent-submit"
             onClick={handleSwitch}
             disabled={submitting || agentChoice === NONE_CHOSEN}
           >
-            {submitting ? "Switching…" : "Switch"}
+            {submitting ? t("switching") : t("switch")}
           </Button>
         </DialogFooter>
       </DialogContent>

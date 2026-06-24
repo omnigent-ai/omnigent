@@ -16,6 +16,7 @@
 
 import { useState } from "react";
 import type { ComponentType, SVGProps } from "react";
+import { useTranslation } from "react-i18next";
 import {
   BookOpenIcon,
   BotIcon,
@@ -87,6 +88,7 @@ interface SubagentsPanelProps {
 }
 
 export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
+  const { t } = useTranslation();
   // Every list in the tree polls at TREE_POLL_MS as a staleness floor;
   // stream pushes remain the fast path. The stream only carries
   // ``session.child_session.updated`` for the *streamed* (active)
@@ -104,14 +106,14 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   if (isLoading && children.length === 0) {
     return (
       <div className="flex h-full flex-1 items-center justify-center px-4 py-8 text-center text-xs text-muted-foreground bg-card">
-        Loading…
+        {t("loading")}
       </div>
     );
   }
   if (error && children.length === 0) {
     return (
       <div className="flex h-full flex-1 items-center justify-center px-4 py-8 text-center text-xs text-muted-foreground bg-card">
-        Failed to load agents.
+        {t("agentsLoadFailed")}
       </div>
     );
   }
@@ -125,7 +127,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
         className="hidden"
       >
         <PlusIcon className="size-3.5 shrink-0" />
-        Add agent
+        {t("addAgent")}
       </button>
       <ul className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-1">
         <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
@@ -169,37 +171,38 @@ function firstErrorLine(message: string): string {
  * Resolve a child session's display status.
  *
  * @param child - One child-session summary from the poll.
+ * @param t - i18n translation function.
  * @returns The collapsed activity + its label, e.g.
  *   ``{ activity: "working", label: "Working" }``.
  */
-function childStatus(child: ChildSessionInfo): AgentStatus {
+function childStatus(child: ChildSessionInfo, t: (key: string) => string): AgentStatus {
   // Awaiting input outranks ``busy``: a sub-agent parked on an
   // elicitation is still "running" its turn (the future is pending),
   // so checking ``busy`` first would hide the prompt behind a generic
   // "Working" pill — exactly the signal the user needs to act on.
   if (child.pending_elicitations_count > 0) {
-    return { activity: "awaiting", label: "Needs response" };
+    return { activity: "awaiting", label: t("needsResponse") };
   }
   // ``busy`` is the authoritative live flag (queued or in_progress);
   // ``current_task_status`` may be "launching", "completed", "failed",
   // "cancelled", or null when no task has run yet.
   if (child.current_task_status === "launching") {
-    return { activity: "launching", label: "Launching" };
+    return { activity: "launching", label: t("launching") };
   }
-  if (child.busy) return { activity: "working", label: "Working" };
+  if (child.busy) return { activity: "working", label: t("working") };
   if (child.last_task_error) {
     return {
       activity: "failed",
-      label: "Failed",
+      label: t("failed"),
       details: firstErrorLine(child.last_task_error.message),
     };
   }
-  if (child.current_task_status === "failed") return { activity: "failed", label: "Failed" };
-  if (child.current_task_status === "completed") return { activity: "done", label: "Done" };
+  if (child.current_task_status === "failed") return { activity: "failed", label: t("failed") };
+  if (child.current_task_status === "completed") return { activity: "done", label: t("done") };
   if (child.current_task_status) {
     return { activity: "other", label: child.current_task_status };
   }
-  return { activity: "idle", label: "Idle" };
+  return { activity: "idle", label: t("idle") };
 }
 
 /**
@@ -207,13 +210,14 @@ function childStatus(child: ChildSessionInfo): AgentStatus {
  *
  * @param status - ``session.status`` from the snapshot, e.g. ``"running"``,
  *   or ``undefined`` while the snapshot is still loading.
+ * @param t - i18n translation function.
  * @returns The collapsed activity + its label.
  */
-function sessionStatus(status: string | undefined): AgentStatus {
-  if (status === "launching") return { activity: "launching", label: "Launching" };
-  if (status === "running") return { activity: "working", label: "Working" };
-  if (status === "failed") return { activity: "failed", label: "Failed" };
-  return { activity: "idle", label: "Idle" };
+function sessionStatus(status: string | undefined, t: (key: string) => string): AgentStatus {
+  if (status === "launching") return { activity: "launching", label: t("launching") };
+  if (status === "running") return { activity: "working", label: t("working") };
+  if (status === "failed") return { activity: "failed", label: t("failed") };
+  return { activity: "idle", label: t("idle") };
 }
 
 // Dot color per dot-rendered state. Working uses the animated RunningDot
@@ -330,6 +334,7 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
  * @param status - The resolved activity + label to render.
  */
 function StatusIndicator({ activity, label, details }: AgentStatus) {
+  const { t } = useTranslation();
   const title = details ? `${label}: ${details}` : label;
   // Awaiting renders the exact same "Needs response" tag as the sidebar
   // (SessionStateBadge) so the approval affordance reads identically across
@@ -343,7 +348,7 @@ function StatusIndicator({ activity, label, details }: AgentStatus) {
         data-testid="subagent-status-dot"
         className="inline-flex shrink-0 items-center text-xs"
       >
-        <Badge className="border-transparent bg-warning/15 text-warning">Needs response</Badge>
+        <Badge className="border-transparent bg-warning/15 text-warning">{t("needsResponse")}</Badge>
       </span>
     );
   }
@@ -458,6 +463,7 @@ function mainMessagePreview(items: SessionItem[] | undefined): string | null {
 }
 
 function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive: boolean }) {
+  const { t } = useTranslation();
   const { session } = useSession(rootSessionId);
   const search = railLinkSearch(useLocation().search);
   // Same wrapper-label probe used by the sidebar (Sidebar.tsx) and
@@ -510,7 +516,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
           <Icon className="size-3.5 shrink-0 text-muted-foreground" />
           <span className="shrink-0 truncate text-xs font-medium">{label}</span>
           <span className="flex-1" />
-          <StatusIndicator {...sessionStatus(session?.status)} />
+          <StatusIndicator {...sessionStatus(session?.status, t)} />
         </div>
         {preview && (
           // Indented to align with the title text above: 14px icon + 4px gap.
@@ -548,7 +554,8 @@ function SubagentRow({
   /** The conversation currently rendered in main, for row highlighting. */
   conversationId: string;
 }) {
-  const status = childStatus(child);
+  const { t } = useTranslation();
+  const status = childStatus(child, t);
   const search = railLinkSearch(useLocation().search);
   const Icon = brandChildIcon(child) ?? iconForAgentType(child.tool);
   const primary = childPrimaryLabel(child);

@@ -17,6 +17,9 @@ import {
   buildAttachPath,
   selectionHintText,
 } from "./TerminalView";
+import i18n from "@/i18n";
+
+const t = i18n.getFixedT(null, "common");
 
 const terminalSessionMock = vi.hoisted(() => ({
   instances: [] as Array<{
@@ -110,7 +113,7 @@ describe("closed bridge overlay", () => {
       terminalSessionMock.instances[0].onState({ kind: "closed", reason: "stopped", code: 4405 });
     });
 
-    expect(screen.getByText("Bridge closed: stopped")).toBeInTheDocument();
+    expect(screen.getByText(t("bridgeClosed", { reason: "stopped" }))).toBeInTheDocument();
     const button = screen.getByRole("button", { name: /^resume session$/i });
     expect(button).toBeEnabled();
 
@@ -172,7 +175,7 @@ describe("closed bridge overlay", () => {
     // The failing action still fires exactly once; zero would hide the
     // failure, while multiple calls would duplicate a bad resume request.
     await waitFor(() => expect(onResume).toHaveBeenCalledTimes(1));
-    await screen.findByText("Couldn't resume session: host offline");
+    await screen.findByText(t("resumeSessionFailedReason", { reason: "host offline" }));
     // Failed resume must not remount xterm: the original closed bridge stays
     // visible so the user can retry after fixing the host.
     expect(terminalSessionMock.instances).toHaveLength(1);
@@ -248,7 +251,7 @@ describe("automatic reconnect", () => {
     // terminals the server intentionally ended.
     await elapse(60_000);
     expect(terminalSessionMock.instances).toHaveLength(1);
-    expect(screen.getByText("Bridge closed: code 4405")).toBeInTheDocument();
+    expect(screen.getByText(t("bridgeClosed", { reason: "code 4405" }))).toBeInTheDocument();
     expect(screen.queryByTestId("terminal-reconnecting")).toBeNull();
   });
 
@@ -273,7 +276,7 @@ describe("automatic reconnect", () => {
     // Budget exhausted: the final close sticks as the dead-end overlay
     // and no further sessions are constructed.
     expect(terminalSessionMock.instances).toHaveLength(RECONNECT_BACKOFF_MS.length + 1);
-    expect(screen.getByText("Bridge closed: code 1006")).toBeInTheDocument();
+    expect(screen.getByText(t("bridgeClosed", { reason: "code 1006" }))).toBeInTheDocument();
     expect(screen.queryByTestId("terminal-reconnecting")).toBeNull();
   });
 
@@ -344,7 +347,7 @@ describe("selectionHintText", () => {
     // On macOS the force-selection modifier is Option and Cmd+C copies
     // (Cmd isn't forwarded to the shell). Both must appear; a regression
     // to Shift/Ctrl here would print the wrong keys for Mac users.
-    const hint = selectionHintText(true);
+    const hint = selectionHintText(true, t);
     expect(hint).toContain("⌥");
     expect(hint).toContain("⌘C");
   });
@@ -353,7 +356,7 @@ describe("selectionHintText", () => {
     // Elsewhere the modifier is Shift, and Ctrl+C is SIGINT (not copy),
     // so the hint must say Shift and must point at right-click → Copy
     // rather than a Ctrl+C shortcut that would kill the user's process.
-    const hint = selectionHintText(false);
+    const hint = selectionHintText(false, t);
     expect(hint).toContain("Shift");
     expect(hint).toContain("right-click");
     expect(hint).not.toContain("⌘");

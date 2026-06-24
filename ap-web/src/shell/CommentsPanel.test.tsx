@@ -9,9 +9,12 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
+import i18n from "@/i18n";
 import { getCurrentAuthorId } from "@/lib/identity";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { CommentsPanel } from "./CommentsPanel";
+
+const t = i18n.getFixedT(null, "common");
 
 // CommentsPanel reads the current user's identity (getCurrentAuthorId) to
 // decide whose comments expose Edit/Delete. Mock it so author-ownership tests
@@ -75,7 +78,7 @@ describe("CommentsPanel copy-comment-link", () => {
     // Two open comments → two link buttons. Failure means onCopyCommentLink
     // was not wired through CommentsPanel → CommentCard, or the button was not rendered.
     const linkButtons = screen.getAllByRole("button", {
-      name: "Copy link to comment",
+      name: t("copyLinkToComment"),
     });
     expect(linkButtons).toHaveLength(2);
   });
@@ -84,7 +87,7 @@ describe("CommentsPanel copy-comment-link", () => {
     const onCopyCommentLink = vi.fn();
     renderPanel([makeComment("c1")], [], onCopyCommentLink);
 
-    fireEvent.click(screen.getByRole("button", { name: "Copy link to comment" }));
+    fireEvent.click(screen.getByRole("button", { name: t("copyLinkToComment") }));
 
     // Must receive "c1", not undefined or a different ID.
     // Failure: callback not called, or wrong argument passed (e.g. the full Comment object).
@@ -99,13 +102,13 @@ describe("CommentsPanel copy-comment-link", () => {
 
     // The default view is "Open". Addressed comments are hidden until the user
     // clicks the Addressed tab.
-    expect(screen.queryByRole("button", { name: "Copy link to comment" })).toBeNull();
+    expect(screen.queryByRole("button", { name: t("copyLinkToComment") })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: /addressed/i }));
 
     // After switching tabs, the addressed comment is visible and has a link button.
     // Failure: onCopyLink was not passed to CommentCard for addressed comments.
-    const linkButton = screen.getByRole("button", { name: "Copy link to comment" });
+    const linkButton = screen.getByRole("button", { name: t("copyLinkToComment") });
     expect(linkButton).toBeInTheDocument();
 
     // The addressed list is a SEPARATE onCopyLink call site from the open list,
@@ -120,7 +123,7 @@ describe("CommentsPanel copy-comment-link", () => {
     // Failure: button was rendered unconditionally, ignoring the absence of the prop.
     renderPanel([makeComment("c1")], []);
 
-    expect(screen.queryByRole("button", { name: "Copy link to comment" })).toBeNull();
+    expect(screen.queryByRole("button", { name: t("copyLinkToComment") })).toBeNull();
   });
 });
 
@@ -171,26 +174,26 @@ function renderGated(opts: {
 describe("CommentsPanel read-only collaborator gating", () => {
   it("shows the read-only banner when canEdit is false", () => {
     renderGated({ canEdit: false });
-    expect(screen.getByText("You have read-only access to this session.")).toBeInTheDocument();
+    expect(screen.getByText(t("readOnlyAccess"))).toBeInTheDocument();
   });
 
   it("does not show the read-only banner for editors (canEdit true)", () => {
     renderGated({ canEdit: true });
-    expect(screen.queryByText("You have read-only access to this session.")).toBeNull();
+    expect(screen.queryByText(t("readOnlyAccess"))).toBeNull();
   });
 
   it("hides the add-comment form for a fresh selection when read-only", () => {
     // With a fresh selection an editor would get the compose form; a
     // read-only viewer must not, so they cannot create comments at all.
     renderGated({ canEdit: false, activeSelection: FRESH_SELECTION });
-    expect(screen.queryByPlaceholderText("Add a comment…")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Add Comment" })).toBeNull();
+    expect(screen.queryByPlaceholderText(t("addACommentPlaceholder"))).toBeNull();
+    expect(screen.queryByRole("button", { name: t("addComment") })).toBeNull();
   });
 
   it("shows the add-comment form for the same selection when editing is allowed", () => {
     renderGated({ canEdit: true, activeSelection: FRESH_SELECTION });
-    expect(screen.getByPlaceholderText("Add a comment…")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Add Comment" })).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(t("addACommentPlaceholder"))).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: t("addComment") })).toBeInTheDocument();
   });
 
   it("hides per-comment Edit and Delete actions when read-only", () => {
@@ -210,7 +213,7 @@ describe("CommentsPanel read-only collaborator gating", () => {
     // the copy-link affordance remain available.
     renderGated({ canEdit: false, comments: [makeComment("c1")] });
     expect(screen.getByText("Comment c1")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Copy link to comment" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: t("copyLinkToComment") })).toBeInTheDocument();
   });
 });
 
@@ -260,7 +263,7 @@ describe("CommentsPanel author-only edit/delete gating", () => {
     expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
     // Reading and copy-link stay available — gating is on mutation only.
     expect(screen.getByText("Comment c1")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Copy link to comment" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: t("copyLinkToComment") })).toBeInTheDocument();
   });
 
   it("shows Edit/Delete on an authorless (legacy/single-user) comment", () => {
@@ -357,17 +360,17 @@ describe("CommentsPanel show more / less", () => {
       // Collapsed: toggle reads "Show more" and the body carries the clamp class.
       const body = screen.getByText(LONG_BODY);
       expect(body.className).toContain("line-clamp-4");
-      const toggle = screen.getByRole("button", { name: "Show more" });
+      const toggle = screen.getByRole("button", { name: t("showMore") });
 
       // Expand: clamp class drops and the label flips to "Show less".
       fireEvent.click(toggle);
       expect(body.className).not.toContain("line-clamp-4");
-      expect(screen.getByRole("button", { name: "Show less" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: t("showLess") })).toBeInTheDocument();
 
       // Collapse again: back to clamped + "Show more".
-      fireEvent.click(screen.getByRole("button", { name: "Show less" }));
+      fireEvent.click(screen.getByRole("button", { name: t("showLess") }));
       expect(body.className).toContain("line-clamp-4");
-      expect(screen.getByRole("button", { name: "Show more" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: t("showMore") })).toBeInTheDocument();
     } finally {
       restore();
     }
@@ -392,8 +395,8 @@ describe("CommentsPanel show more / less", () => {
         />,
       );
 
-      expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
-      expect(screen.queryByRole("button", { name: "Show less" })).toBeNull();
+      expect(screen.queryByRole("button", { name: t("showMore") })).toBeNull();
+      expect(screen.queryByRole("button", { name: t("showLess") })).toBeNull();
     } finally {
       restore();
     }
@@ -423,7 +426,7 @@ describe("CommentsPanel resize affordance", () => {
       renderPanel([makeComment("c1")], []);
       // No drag handle, and the panel falls back to the w-full class (no inline width).
       expect(screen.queryByRole("separator", { name: "Resize comments panel" })).toBeNull();
-      const panel = screen.getByText("Comments").closest("div")?.parentElement as HTMLElement;
+      const panel = screen.getByText(t("commentsTitle")).closest("div")?.parentElement as HTMLElement;
       expect(panel.style.width).toBe("");
     } finally {
       Object.defineProperty(window, "innerWidth", { configurable: true, value: orig });
