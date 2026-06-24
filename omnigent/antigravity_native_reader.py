@@ -809,6 +809,7 @@ async def supervise_reader(
     stop: StopPredicate | None = None,
     detect_rotation_interval_s: float = _DEFAULT_ROTATION_INTERVAL_S,
     skip_cascade_ids: frozenset[str] = frozenset(),
+    committed_steps_out: list[int] | None = None,
 ) -> str | None:
     """
     Poll agy's RPC for trajectory steps and mirror them into the Omnigent session.
@@ -1017,6 +1018,13 @@ async def supervise_reader(
             with contextlib.suppress(asyncio.CancelledError):
                 await active
 
+    # Report how many committed steps (turns) this run mirrored for the bound
+    # cascade. The caller uses a count of 0 to distinguish "first TUI-minted
+    # cascade adoption" (the cold-start StartCascade phantom never took a turn)
+    # from a genuine ``/clear`` (the bound cascade HAD turns) — see
+    # :func:`run_reader_with_bridge`.
+    if committed_steps_out is not None:
+        committed_steps_out.append(len(state.seen))
     return rotation_holder[0] if rotation_holder else None
 
 
@@ -2074,6 +2082,43 @@ async def _fetch_session_snapshot(client: httpx.AsyncClient, session_id: str) ->
     return payload
 
 
+def _adopt_cascade_in_place(bridge_dir: Path, session_id: str, new_cascade_id: str) -> None:
+    """
+    Rebind the reader to a newly-minted cascade WITHOUT forking the session.
+
+    The cold-start ``StartCascade`` cascade is a headless placeholder the agy TUI
+    never displays; the agy TUI mints its OWN cascade on the first typed turn
+    (web turns are typed into the TUI — see
+    :meth:`omnigent.inner.antigravity_native_executor.AntigravityNativeExecutor._deliver`).
+    The first transition off a never-used bound cascade is therefore the
+    conversation STARTING, not a ``/clear`` — so adopt the new cascade in the
+    SAME Omnigent session by rewriting bridge state's conversation id (the reader
+    rebinds to it on the next :func:`supervise_reader` loop). No new session, no
+    terminal transfer — the user's current session simply starts mirroring the
+    turn they sent, instead of being stranded empty while a forked session fills.
+
+    A genuine ``/clear`` (the bound cascade HAD committed turns) still forks a
+    replacement session via :func:`_rotate_session_for_cascade`.
+
+    :param bridge_dir: The agy bridge directory the reader is using.
+    :param session_id: The Omnigent session to keep mirroring into.
+    :param new_cascade_id: agy's freshly TUI-minted cascade/conversation id.
+    """
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(
+            session_id=session_id,
+            conversation_id=new_cascade_id,
+        ),
+    )
+    _logger.info(
+        "agy reader adopted the first TUI-minted cascade in place (no fork): "
+        "session=%s new_cascade=%s",
+        session_id,
+        new_cascade_id,
+    )
+
+
 async def _rotate_session_for_cascade(
     *,
     client: httpx.AsyncClient,
@@ -2325,19 +2370,33 @@ async def run_reader_with_bridge(
         # so a persistent rotation failure does not hot-loop detect→fail→detect.
         failed_rotations: set[str] = set()
         while True:
+            committed_steps_out: list[int] = []
             new_cascade_id = await supervise_reader(
                 bridge_dir,
                 current["session_id"],
                 client=client,
                 on_pending_interaction=_on_pending,
                 skip_cascade_ids=frozenset(failed_rotations),
+                committed_steps_out=committed_steps_out,
             )
             if new_cascade_id is None:
                 # The reader body ended on its own (cancelled / bounded stop): done.
                 return
-            # A /clear rotation was detected: move Omnigent ownership onto a fresh
-            # conversation bound to the new cascade, then rebind by re-entering
-            # supervise_reader (which rediscovers from the rewritten bridge state).
+            bound_committed_turns = committed_steps_out[0] if committed_steps_out else 0
+            if bound_committed_turns == 0:
+                # FIRST-CASCADE ADOPTION (not a /clear): the bound cascade was the
+                # cold-start StartCascade phantom (or any binding that never
+                # committed a turn), and the agy TUI minted its OWN cascade on the
+                # first typed turn. Adopt that cascade in the SAME Omnigent session
+                # so the user's current session starts mirroring — forking here
+                # would strand the current session empty while the turn filled a
+                # new one (the web/mobile UI watches the current session). The agy
+                # TUI and the web mirror then share ONE cascade (#1156/#1158).
+                _adopt_cascade_in_place(bridge_dir, current["session_id"], new_cascade_id)
+                continue
+            # GENUINE /clear (the bound cascade HAD turns): move Omnigent ownership
+            # onto a fresh conversation bound to the new cascade, then rebind by
+            # re-entering supervise_reader (which rediscovers from bridge state).
             new_session_id = await _rotate_session_for_cascade(
                 client=client,
                 old_session_id=current["session_id"],
