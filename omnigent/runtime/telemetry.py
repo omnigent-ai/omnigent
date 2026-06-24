@@ -450,6 +450,65 @@ def get_traceparent_env() -> dict[str, str]:
     return result
 
 
+# Standard OTel env vars forwarded into executor subprocesses so the
+# child OTLP exporter targets the same collector as the parent. The
+# list is intentionally small: only the knobs needed to point a fresh
+# OTel SDK at the same endpoint with matching transport + auth.
+_OTEL_FORWARDED_ENV_VARS: tuple[str, ...] = (
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_SERVICE_NAME",
+)
+
+
+def get_otel_subprocess_env(*, claude_sdk: bool = False) -> dict[str, str]:
+    """
+    Build the env-var dict an executor subprocess needs to nest its
+    spans under the omnigent parent span.
+
+    Combines :func:`get_traceparent_env` (W3C ``TRACEPARENT`` /
+    ``TRACESTATE`` for parent-context propagation) with the standard
+    OTel exporter knobs (``OTEL_EXPORTER_OTLP_PROTOCOL`` /
+    ``_ENDPOINT`` / ``_HEADERS``, ``OTEL_SERVICE_NAME``) so a child
+    process can spin up its own OTel SDK and ship spans to the same
+    collector. Spawn-env builders merge this dict into the per-spawn
+    env overrides passed to the harness wrap.
+
+    Returns an empty dict when ``OTEL_EXPORTER_OTLP_ENDPOINT`` is
+    unset. Without a configured collector, the child has nowhere to
+    export to and the executor stays on its baked-in defaults — no
+    half-configured OTel state leaks into the subprocess.
+
+    :param claude_sdk: When ``True``, also set
+        ``CLAUDE_CODE_ENABLE_TELEMETRY=1`` and
+        ``OTEL_TRACES_EXPORTER=otlp`` so the Claude Agent SDK's
+        built-in telemetry hooks turn on. These are no-ops in other
+        executor subprocesses, so they're gated.
+    :returns: A dict suitable for merging into the env dict passed to
+        an executor subprocess. Empty when no OTLP endpoint is
+        configured.
+    """
+    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    if not endpoint:
+        return {}
+
+    result: dict[str, str] = {}
+    for name in _OTEL_FORWARDED_ENV_VARS:
+        value = os.environ.get(name)
+        if value is not None:
+            result[name] = value
+    # TRACEPARENT / TRACESTATE come from the active OTel context. With
+    # no active span the propagator emits no carrier entries, so
+    # ``get_traceparent_env`` returns an empty dict — the child still
+    # gets the exporter knobs but has no parent to nest under.
+    result.update(get_traceparent_env())
+    if claude_sdk:
+        result["CLAUDE_CODE_ENABLE_TELEMETRY"] = "1"
+        result["OTEL_TRACES_EXPORTER"] = "otlp"
+    return result
+
+
 def _metrics_exporter_name() -> str:
     """
     Return the configured OpenTelemetry metrics exporter name.
