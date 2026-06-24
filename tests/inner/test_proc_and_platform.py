@@ -201,3 +201,31 @@ def test_posix_default_sandbox_is_not_jobobject() -> None:
     from omnigent.inner import sandbox
 
     assert sandbox._default_sandbox_for_platform().type in {"linux_bwrap", "darwin_seatbelt"}
+
+
+@pytest.mark.windows_only
+def test_helper_env_keeps_systemroot_so_child_can_import_asyncio() -> None:
+    # Regression: a filtered (active-sandbox) helper env that drops SYSTEMROOT
+    # makes any spawned `python -m omnigent...` die at `import asyncio` with
+    # WinError 10106 (Winsock loads providers from %SystemRoot%). The os_env
+    # allowlist must carry the Windows system vars.
+    from omnigent.inner.os_env import build_helper_env
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    policy = SandboxPolicy(
+        backend_type="windows_jobobject",
+        active=True,
+        read_roots=None,
+        write_roots=[],
+        write_files=[],
+        allow_network=True,
+    )
+    env = build_helper_env(os.environ, policy)
+    assert "SYSTEMROOT" in env
+    result = subprocess.run(
+        [__import__("sys").executable, "-c", "import asyncio"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr

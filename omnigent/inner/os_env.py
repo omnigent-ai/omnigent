@@ -131,6 +131,23 @@ _DEFAULT_ENV_PASSTHROUGH: tuple[str, ...] = (
     # way CLAUDE_CODE / CODEX are visible in their agents' shells. Set on
     # the runner via runner.identity.OMNIGENT_SESSION_ENV_VAR.
     OMNIGENT_SESSION_ENV_VAR,
+    # Windows system variables (non-sensitive constants). Python uppercases
+    # env keys on Windows, so these match os.environ as stored. SYSTEMROOT is
+    # MANDATORY: Winsock loads its providers from %SystemRoot%\system32\
+    # mswsock.dll, so a helper spawned without it dies at ``import asyncio``
+    # with WinError 10106 (WSAEPROVIDERFAILEDINIT). The rest let a Windows
+    # process and shell resolve binaries normally. Absent on POSIX, so listing
+    # them here is a no-op there (only present vars are passed through).
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
 )
 
 
