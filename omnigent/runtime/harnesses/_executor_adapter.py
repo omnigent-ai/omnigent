@@ -46,6 +46,7 @@ from typing import Any
 from fastapi import Response
 
 from omnigent.inner.executor import (
+    CompactionComplete,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -990,6 +991,26 @@ class ExecutorAdapter(HarnessApp):
             # payload to populate TurnComplete.usage on the Omnigent side.
             if event.usage is not None:
                 ctx.provider_usage = event.usage
+        elif isinstance(event, CompactionComplete):
+            from omnigent.server.schemas import (
+                CompactionCompletedEvent,
+                CompactionInProgressEvent,
+            )
+
+            ctx.emit(
+                CompactionInProgressEvent(
+                    type="response.compaction.in_progress",
+                )
+            )
+            ctx.emit(
+                CompactionCompletedEvent(
+                    type="response.compaction.completed",
+                    total_tokens=event.token_count,
+                    summary=event.summary,
+                    summary_model=event.model,
+                    compacted_messages=event.compacted_messages,
+                )
+            )
         # ExecutorError handled by the caller (re-raises so the
         # scaffold can build a response.failed terminal event).
 

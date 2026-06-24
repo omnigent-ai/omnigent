@@ -4891,7 +4891,8 @@ class _ContextWindowOverflow(Exception):
     """
     Raised by the proxy_stream when the harness reports a context-window overflow.
 
-    Caught by ``_run_turn_bg`` to trigger reactive compaction and retry.
+    Caught by ``_run_turn_bg_setup_and_stream`` to end the turn with
+    a descriptive error.
 
     :param max_tokens: The model's context window, e.g. ``128000``.
     :param actual_tokens: The prompt size that overflowed, e.g. ``131072``.
@@ -5882,108 +5883,6 @@ def get_session_agent_id(session_id: str) -> str | None:
     return _session_agent_ids_ref.get(session_id)
 
 
-def _should_skip_futile_recompaction(
-    provider_tokens: int | None, last_compacted_provider_tokens: int | None
-) -> bool:
-    """
-    Decide whether a provider-reported compaction trigger should be skipped
-    as futile.
-
-    Runner-side compaction rewrites the runner's own persisted history, but it
-    cannot shrink a harness's *own* session context (a resumed ``claude-sdk``
-    turn is sent only the latest user message; the SDK keeps its full context
-    by ``session_id``). So when the provider-reported fill has not dropped
-    since the last compaction, re-firing achieves nothing but cost and churn —
-    the harness must manage its own context (its own auto-compaction). Only the
-    ``provider_tokens`` path can loop this way; tiktoken-driven compaction of
-    the runner's own history genuinely shrinks it, so this guard never applies
-    there (``provider_tokens is None``).
-
-    :param provider_tokens: The current provider-reported context fill, or
-        ``None`` when no provider usage was reported (tiktoken path).
-    :param last_compacted_provider_tokens: The provider fill recorded at the
-        last successful compaction, or ``None`` if we have not compacted on a
-        provider-reported fill yet.
-    :returns: ``True`` when compaction should be skipped because the fill has
-        not decreased since the last compaction.
-    """
-    if provider_tokens is None or last_compacted_provider_tokens is None:
-        return False
-    return provider_tokens >= last_compacted_provider_tokens
-
-
-def _resolve_compaction_context(
-    cached_cc: dict[str, Any] | None,
-    spec: AgentSpec | None,
-    body_model: str | None,
-    turn_override: str | None,
-) -> dict[str, Any] | None:
-    """
-    Resolve the compaction-budget context entry for the current turn.
-
-    The compaction budget must size against the model the turn will ACTUALLY
-    run on: an active per-turn override (user ``/model`` or the advisor's
-    optimize verdict), else the spec model, else the request-body model. This
-    *effective model* is the cache key — recomputing whenever it changes covers
-    BOTH directions: pinning an override mid-session (override now differs from
-    the cached spec model) AND later clearing it (the effective model reverts to
-    the spec model, which differs from the cached override). The earlier guard
-    only fired while an override was active, so a cleared override kept budgeting
-    against the stale override window indefinitely — under-sizing the budget and
-    over-compacting, the exact failure this path exists to prevent. (The server
-    display ring recomputes from scratch each snapshot, so it self-corrected; the
-    runner cache did not.)
-
-    Mirrors the create-time pre-seed dict shape (``context_window`` / ``model`` /
-    ``config``) and prefers the spec's declared ``executor.context_window`` over
-    the catalog lookup (see :func:`resolve_effective_context_window`), except an
-    active override bypasses the declared window and sizes against the override
-    model's real catalog window.
-
-    :param cached_cc: The currently cached compaction context for the session,
-        or ``None`` when none is cached yet.
-    :param spec: The resolved agent spec, or ``None`` when unavailable.
-    :param body_model: The model carried on the request body (fallback when the
-        spec pins no model).
-    :param turn_override: The active per-turn model override, or ``None``.
-    :returns: The compaction-context entry to store — the unchanged ``cached_cc``
-        when the effective model has not changed (or no usable window resolves),
-        or a freshly computed entry otherwise. ``None`` only when there is no
-        cached entry and no usable window could be resolved.
-    """
-    from omnigent.llms.context_window import resolve_effective_context_window
-    from omnigent.runtime.workflow import _resolve_spec_model
-
-    model: str | None = None
-    spec_ctx_window: int | None = None
-    compaction_cfg = None
-    if spec is not None:
-        model = _resolve_spec_model(spec)
-        spec_ctx_window = spec.executor.context_window
-        compaction_cfg = spec.compaction
-    if not model:
-        model = body_model or "unknown"
-    effective_model = turn_override or model
-
-    if cached_cc is not None and cached_cc.get("model") == effective_model:
-        return cached_cc
-
-    ctx_window = resolve_effective_context_window(
-        spec_ctx_window, model, model_override=turn_override
-    )
-    if ctx_window is None:
-        # No usable window (e.g. no spec window and an unresolvable model):
-        # leave any existing cache as-is rather than dropping it.
-        return cached_cc
-    return {
-        "context_window": ctx_window,
-        # Store the effective model so count_tokens tokenizes against the
-        # model the turn actually runs on.
-        "model": effective_model,
-        "config": compaction_cfg,
-    }
-
-
 def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
@@ -6176,9 +6075,6 @@ def create_runner_app(
     # flow through proxy_stream. Each entry is a harness input
     # item: {type: "message", role: "user"|"assistant", content: [...]}.
     _session_histories = _session_histories_ref
-    # Per-session compaction state: known context window + model.
-    # Populated at session creation from litellm registry lookup.
-    _compaction_contexts: dict[str, dict[str, Any]] = {}
     # Last server-persisted item ID per session — cursor for
     # incremental catch-up scans (Step 8.5 Scenario B).
     _last_server_item_id: dict[str, str] = {}
@@ -7030,31 +6926,6 @@ def create_runner_app(
 
                 spawn_env = build_goose_native_spawn_env(session_id)
             _session_spec_cache[session_id] = spec_entry
-            from omnigent.llms.context_window import resolve_effective_context_window
-            from omnigent.runtime.workflow import _resolve_spec_model
-
-            _model = _resolve_spec_model(spec)
-            # Only pre-seed here when the spec pins a concrete model: the
-            # per-turn dispatch path (below) falls back to ``"unknown"`` for
-            # an unpinned model, and a ``None`` model would crash count_tokens.
-            # Either way the dispatch path honors executor.context_window.
-            if _model:
-                # Prefer the spec's declared executor.context_window over the
-                # model-catalog lookup so a high-window agent (e.g. a 1M Claude
-                # brain) isn't compacted against the 128K catalog default.
-                # No model override is known at create time (it's applied later
-                # via the persisted session / ``/model``), so this pre-seed uses
-                # the spec model; the per-turn dispatch path reconciles the
-                # budget once a turn carries an active override.
-                _ctx_window = resolve_effective_context_window(
-                    spec.executor.context_window, _model, model_override=None
-                )
-                if _ctx_window is not None:
-                    _compaction_contexts[session_id] = {
-                        "context_window": _ctx_window,
-                        "model": _model,
-                        "config": spec.compaction,
-                    }
         else:
             harness_name = "runner-test-default"
             spawn_env = None
@@ -7857,7 +7728,6 @@ def create_runner_app(
         if _relay := _session_comment_relays.pop(session_id, None):
             _relay.close()
         _session_histories.pop(session_id, None)
-        _compaction_contexts.pop(session_id, None)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
@@ -7988,34 +7858,43 @@ def create_runner_app(
         result: list[dict[str, Any]] = []
         if compaction_idx is not None:
             c = items[compaction_idx]
-            result.append(
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": (
-                                "[Automatically generated summary of prior "
-                                "conversation context.]\n\n"
-                                "Please provide a summary of our conversation so far."
-                            ),
-                        }
-                    ],
-                }
-            )
-            result.append(
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": c.get("summary", ""),
-                        }
-                    ],
-                }
-            )
+            # Prefer compacted_messages when available — they carry the
+            # full compacted state (e.g. OpenAI's opaque compaction
+            # tokens) that the harness can replay directly. Fall back
+            # to a synthetic summary pair for older compaction items or
+            # harnesses that don't provide compacted messages.
+            _compacted = c.get("compacted_messages")
+            if _compacted:
+                result.extend(_compacted)
+            else:
+                result.append(
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "[Automatically generated summary of prior "
+                                    "conversation context.]\n\n"
+                                    "Please provide a summary of our conversation so far."
+                                ),
+                            }
+                        ],
+                    }
+                )
+                result.append(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": c.get("summary", ""),
+                            }
+                        ],
+                    }
+                )
             remaining = items[compaction_idx + 1 :]
         else:
             remaining = items
@@ -8095,269 +7974,97 @@ def create_runner_app(
                     return "\n".join(parts) if parts else ""
         return ""
 
-    def _serialize_messages_as_summary(
-        messages: list[dict[str, Any]],
-    ) -> str:
-        """
-        Serialize a compacted message list into a text summary.
-
-        Used as the compaction item's ``summary`` field when Layer 1
-        (LLM summarization) fails and Layer 2 (truncation) produces
-        the result. The serialized text is rougher than an LLM
-        summary but preserves the conversation content so the LLM
-        can pick up context on reload.
-
-        :param messages: The compacted message list from
-            ``compact()``.
-        :returns: A text representation of the messages.
-        """
-        parts: list[str] = []
-        for msg in messages:
-            msg_type = msg.get("type", "")
-            if msg_type == "message":
-                role = msg.get("role", "unknown")
-                content = msg.get("content", [])
-                text_parts: list[str] = []
-                if isinstance(content, str):
-                    text_parts.append(content)
-                elif isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict):
-                            t = block.get("text") or block.get("input_text") or ""
-                            if t:
-                                text_parts.append(str(t))
-                        elif isinstance(block, str):
-                            text_parts.append(block)
-                text = "\n".join(text_parts) if text_parts else "(no text)"
-                parts.append(f"[{role}]: {text}")
-            elif msg_type == "function_call":
-                name = msg.get("name", "unknown")
-                parts.append(f"[tool call]: {name}")
-            elif msg_type == "function_call_output":
-                output = msg.get("output", "")
-                if len(str(output)) > 200:
-                    output = str(output)[:200] + "..."
-                parts.append(f"[tool result]: {output}")
-        return "\n\n".join(parts)
-
-    async def _proactive_compact_if_needed(
+    async def _handle_harness_compaction(
         conv: str,
-        cc: dict[str, Any],
-        spec: Any | None,
-        *,
-        force: bool = False,
+        event: dict[str, Any],
     ) -> None:
+        """Persist a harness-originated compaction to the server.
+
+        Called when the proxy stream observes a
+        ``response.compaction.completed`` event carrying a ``summary``
+        field — indicating the harness compacted its own context.
+        The SSE events (in_progress / completed) are already emitted
+        by the executor adapter and flow to clients directly; this
+        function only persists the compaction item and updates the
+        runner's in-memory history mirror.
+
+        :param conv: Session/conversation identifier.
+        :param event: The ``response.compaction.completed`` SSE
+            payload with ``summary``, ``total_tokens``, and optional
+            ``summary_model`` keys.
         """
-        Run proactive compaction if the history exceeds the token budget.
+        summary: str = event.get("summary", "")
+        token_count: int = event.get("total_tokens") or 0
+        model: str | None = event.get("summary_model")
+        last_item_id = _last_server_item_id.get(conv)
 
-        Checks the estimated token count of ``_session_histories[conv]``
-        against ``trigger_threshold * context_window``. If over budget,
-        runs the layered ``compact()`` function and replaces the
-        in-memory history with the compacted version. Publishes
-        compaction SSE events (in_progress / compaction / completed)
-        to the session event queue.
-
-        :param conv: Session/conversation identifier,
-            e.g. ``"conv_abc123"``.
-        :param cc: Compaction context dict with ``context_window``,
-            ``model``, and ``config`` keys.
-        :param spec: The cached ``AgentSpec``, or ``None``.
-        """
-        from omnigent.runtime.compaction import (
-            CompactionResult,
-            compact,
-            count_tokens,
-        )
-
-        context_window: int = cc["context_window"]
-        model: str = cc["model"]
-        compaction_config = cc.get("config")
-        threshold = compaction_config.trigger_threshold if compaction_config else 0.8
-        budget = int(context_window * threshold)
-        messages = _session_histories[conv]
-        # Prefer provider-reported usage when available — tiktoken
-        # underestimates for harness executors whose internal session
-        # is larger than what the runner persists.
-        provider_tokens: int | None = cc.get("provider_tokens")
-        if provider_tokens is not None:
-            estimated = provider_tokens
-        else:
-            estimated = count_tokens(messages, model)
-        _logger.info(
-            "Compaction check: conv=%s estimated=%d budget=%d msgs=%d provider=%s",
-            conv,
-            estimated,
-            budget,
-            len(messages),
-            provider_tokens,
-        )
-        if estimated <= budget:
-            # Back under budget — re-arm the futile-recompaction guard so a
-            # later genuine growth past budget can compact again.
-            cc.pop("last_compacted_provider_tokens", None)
-            return
-
-        # Don't re-fire on a provider-reported fill that hasn't dropped since
-        # the last compaction: runner-side compaction can't shrink a harness's
-        # own session context, so it would loop every turn. Defer to the
-        # harness's own auto-compaction instead. ``force`` (the reactive
-        # _ContextWindowOverflow path) bypasses this — a confirmed overflow
-        # must always attempt compaction.
-        _last_compacted = cc.get("last_compacted_provider_tokens")
-        if not force and _should_skip_futile_recompaction(provider_tokens, _last_compacted):
-            _logger.info(
-                "Skipping futile re-compaction: conv=%s provider fill %s did not "
-                "drop below last-compacted %s; deferring to harness auto-compaction",
-                conv,
-                provider_tokens,
-                _last_compacted,
-            )
-            return
-
-        _logger.info(
-            "Proactive compaction for session=%s: %d tokens > %d budget",
-            conv,
-            estimated,
-            budget,
-        )
-        _publish_event(
-            conv,
-            {
-                "type": "response.compaction.in_progress",
-                "session_id": conv,
-            },
-        )
-
-        try:
-            from omnigent.entities import ConversationItem, MessageData
-
-            history_items = [
-                ConversationItem(
-                    id=f"synthetic_{i}",
-                    type="message",
-                    status="completed",
-                    response_id="",
-                    created_at=0,
-                    data=MessageData(
-                        role=m.get("role", "user"),
-                        content=m.get("content", []),
-                        **({"agent": cc["model"]} if m.get("role") == "assistant" else {}),
-                    ),
-                )
-                for i, m in enumerate(messages)
-                if m.get("type") == "message"
-            ]
-
-            connection: dict[str, str] | None = None
-            if spec and spec.executor.config.get("connection"):
-                connection = spec.executor.config["connection"]
-
-            if connection is None:
-                connection = _resolve_summarize_connection(conv, model)
-
-            llm_client = _get_runner_llm_client()
-            result: CompactionResult = await compact(
-                messages,
-                history_items,
-                config=compaction_config,
-                context_window=context_window,
-                system_token_budget=0,
-                model=model,
-                task_id=conv,
-                llm_client=llm_client,
-                connection=connection,
-            )
-            _session_histories[conv] = result.messages
-            # Record the provider fill that triggered this compaction so the
-            # next provider-reported turn can detect a futile re-fire (fill
-            # that did not drop because the harness owns its own context).
-            # Persists across the provider_tokens pop below. Only meaningful on
-            # the provider path; None on the tiktoken path.
-            if provider_tokens is not None:
-                cc["last_compacted_provider_tokens"] = provider_tokens
-            # Invalidate stale provider tokens — the context was
-            # just compacted so the old value no longer reflects
-            # reality.  The next response.completed will set a
-            # fresh value.
-            cc.pop("provider_tokens", None)
-
-            # Always persist a compaction item — regardless of
-            # which layer produced the result. If Layer 1 (LLM
-            # summary) succeeded, use the summary text. If it
-            # failed and Layer 2 (truncation) fired, serialize the
-            # truncated messages as the summary so the boundary is
-            # durable across restarts.
-            if result.summary_metadata is not None:
-                meta = result.summary_metadata
-                summary_text = meta.text
-                summary_model = meta.model
-                summary_tokens = meta.token_count
-                last_item_id = meta.last_item_id
-            else:
-                summary_text = _serialize_messages_as_summary(
-                    result.messages,
-                )
-                summary_model = model
-                from omnigent.runtime.compaction import count_tokens
-
-                summary_tokens = count_tokens(
-                    result.messages,
-                    model,
-                )
-                last_item_id = _last_server_item_id.get(conv)
-                if not last_item_id:
-                    # No real server-side item ID available. Skip
-                    # persisting — a compaction item with a synthetic
-                    # or unknown last_item_id would poison the history
-                    # cursor on the server (after="synthetic_N" returns
-                    # nothing, so future turns see empty history and
-                    # compaction never triggers again).
-                    _logger.warning(
-                        "Skipping compaction persist for %s: no server-side "
-                        "last_item_id available (Layer 2 failed, no items "
-                        "fetched from server yet)",
-                        conv,
-                    )
-                    return
-            compaction_event = {
-                "type": "compaction",
-                "summary": summary_text,
-                "last_item_id": last_item_id,
-                "model": summary_model,
-                "token_count": summary_tokens,
-            }
-            # Persist directly to the server — do NOT also
-            # _publish_event with type="compaction" because the
-            # relay would extract and persist a duplicate.
-            try:
-                await server_client.post(
-                    f"/v1/sessions/{conv}/events",
-                    json={
-                        "type": "compaction",
-                        "data": compaction_event,
-                    },
-                    timeout=10.0,
-                )
-            except (httpx.HTTPError, RuntimeError):
-                _logger.warning(
-                    "Failed to persist compaction item for %s",
-                    conv,
-                    exc_info=True,
-                )
-        except Exception:  # noqa: BLE001
+        if not last_item_id:
             _logger.warning(
-                "Proactive compaction failed for session=%s",
+                "Skipping harness compaction persist for %s: no "
+                "server-side last_item_id available",
+                conv,
+            )
+            return
+
+        compacted_messages = event.get("compacted_messages")
+        compaction_event: dict[str, Any] = {
+            "type": "compaction",
+            "summary": summary,
+            "last_item_id": last_item_id,
+            "model": model,
+            "token_count": token_count,
+        }
+        if compacted_messages:
+            compaction_event["compacted_messages"] = compacted_messages
+        try:
+            await server_client.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "compaction",
+                    "data": compaction_event,
+                },
+                timeout=10.0,
+            )
+        except (httpx.HTTPError, RuntimeError):
+            _logger.warning(
+                "Failed to persist harness compaction item for %s",
                 conv,
                 exc_info=True,
             )
-        finally:
-            _publish_event(
-                conv,
+
+        # Replace the in-memory history. When the harness provided
+        # its compacted messages, use those directly — they carry the
+        # full compacted state (including opaque compaction tokens for
+        # OpenAI). Otherwise fall back to a synthetic summary pair.
+        if compacted_messages:
+            _session_histories[conv] = compacted_messages
+        else:
+            _session_histories[conv] = [
                 {
-                    "type": "response.compaction.completed",
-                    "session_id": conv,
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "[Automatically generated summary of prior "
+                                "conversation context.]\n\n"
+                                "Please provide a summary of our conversation so far."
+                            ),
+                        }
+                    ],
                 },
-            )
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": summary,
+                        }
+                    ],
+                },
+            ]
 
     _CANCELLATION_TOOL_OUTPUT = "[Cancelled — tool execution was interrupted.]"
     # Tells the model the prior request was abandoned, not just that the
@@ -10809,12 +10516,6 @@ def create_runner_app(
         _subagent_wake_pending.discard(conv)
         try:
             await _run_turn_bg_setup_and_stream(msg_body, conv)
-        except _ContextWindowOverflow:
-            # The streaming phase handles reactive compaction itself; this
-            # guard only catches setup-phase failures (spec resolution,
-            # spawn-env build, instruction/tool assembly). Re-raise so the
-            # streaming path's own handler is never shadowed.
-            raise
         except Exception as exc:
             # Any failure before the harness stream starts (e.g. a provider
             # with no resolvable model raising OmnigentError from
@@ -10873,7 +10574,6 @@ def create_runner_app(
             _session_spec_cache.pop(conv, None)
             _session_skills_cache.pop(conv, None)
             _session_tool_schemas.pop(conv, None)
-            _compaction_contexts.pop(conv, None)
             # The AP snapshot carries external_session_id + labels, which the
             # switch just changed (cleared id, stamped carry-history); re-fetch.
             _session_snapshot_cache.pop(conv, None)
@@ -11007,30 +10707,6 @@ def create_runner_app(
 
         if conv not in _session_histories:
             _session_histories[conv] = await _load_history_as_input(conv)
-
-        # Per-turn model pin (user /model, or the advisor's optimize verdict)
-        # overrides the spec model, so the compaction budget must size against
-        # the model the turn actually runs on — recomputed whenever that
-        # effective model changes, in BOTH directions (pin set AND cleared).
-        _turn_override = msg_body.get("model_override") or None
-        _cc_entry = _resolve_compaction_context(
-            _compaction_contexts.get(conv),
-            cached_spec,
-            msg_body.get("model"),
-            _turn_override,
-        )
-        if _cc_entry is not None:
-            _compaction_contexts[conv] = _cc_entry
-
-        # Proactive compaction: if the history exceeds the token
-        # budget, compact before sending to the harness.
-        _cc = _compaction_contexts.get(conv)
-        if _cc and _session_histories[conv]:
-            await _proactive_compact_if_needed(
-                conv,
-                _cc,
-                cached_spec,
-            )
 
         harness_body: dict[str, Any] = {
             "type": "message",
@@ -11214,79 +10890,21 @@ def create_runner_app(
                     error={"message": err_detail},
                 )
         except _ContextWindowOverflow as overflow:
-            _logger.info(
-                "Reactive compaction for session=%s: %d > %d",
+            _logger.error(
+                "Context window exceeded for session=%s: %d > %d",
                 conv,
                 overflow.actual_tokens,
                 overflow.max_tokens,
             )
-            _cc = _compaction_contexts.get(conv)
-            if _cc is None:
-                _cc = {
-                    "context_window": overflow.max_tokens,
-                    "model": msg_body.get("model", "unknown"),
-                    "config": (cached_spec.compaction if cached_spec else None),
-                }
-                _compaction_contexts[conv] = _cc
-            else:
-                _cc["context_window"] = overflow.max_tokens
-
-            # force=True: a confirmed context overflow must always attempt
-            # compaction, bypassing the futile-recompaction guard.
-            await _proactive_compact_if_needed(conv, _cc, cached_spec, force=True)
-
-            # The compacted history replaces the body's content wholesale,
-            # which would silently drop the per-turn advisor note — re-merge
-            # it so the retried turn still announces the applied model
-            # (_merge_advisor_note is copy-on-write: the cached history list
-            # must not carry the note). The advisor's
-            # harness_body["model_override"] is a separate key and survives
-            # the content rebuild untouched.
-            if _advisor_result is not None and _advisor_result.note_item is not None:
-                harness_body["content"] = _merge_advisor_note(
-                    _session_histories[conv],
-                    _advisor_result.note_item,
-                )
-            else:
-                harness_body["content"] = _session_histories[conv]
-            try:
-                retry_resp = await _stream_message_to_harness(
-                    harness_body,
-                    conv,
-                    dispatch=ctx,
-                )
-                if isinstance(retry_resp, StreamingResponse):
-                    await _drain_streaming_response(retry_resp, conv)
-                else:
-                    _on_proxy_stream_end(
-                        conv,
-                        error={
-                            "message": ("Context window exceeded after compaction"),
-                        },
-                    )
-            except _ContextWindowOverflow:
-                _logger.error(
-                    "Context window overflow persists after compaction "
-                    "for session=%s; ending turn",
-                    conv,
-                )
-                _on_proxy_stream_end(
-                    conv,
-                    error={
-                        "message": ("Context window exceeded after compaction"),
-                    },
-                )
-            except Exception:
-                _logger.exception(
-                    "Unexpected error on post-compaction retry for session=%s",
-                    conv,
-                )
-                _on_proxy_stream_end(
-                    conv,
-                    error={
-                        "message": ("Unexpected error on post-compaction retry"),
-                    },
-                )
+            _on_proxy_stream_end(
+                conv,
+                error={
+                    "message": (
+                        f"Context window exceeded: {overflow.actual_tokens} tokens "
+                        f"> {overflow.max_tokens} max"
+                    ),
+                },
+            )
 
     async def _drain_streaming_response(
         response: StreamingResponse,
@@ -11675,8 +11293,8 @@ def create_runner_app(
                                 _defer_publish = False
 
                                 # Detect context-window overflow from
-                                # the harness. Raises so _run_turn_bg
-                                # can run reactive compaction and retry.
+                                # the harness. Raises so the caller
+                                # can end the turn with a descriptive error.
                                 _overflow = _is_context_overflow_error(event)
                                 if _overflow is not None:
                                     raise _ContextWindowOverflow(*_overflow)
@@ -11739,22 +11357,6 @@ def create_runner_app(
                                             }
                                         )
                                         _text_acc.clear()
-                                    # Capture provider-reported usage for
-                                    # compaction estimation. More accurate
-                                    # than tiktoken for harness executors
-                                    # whose internal session is larger than
-                                    # what the runner persists.
-                                    _resp = event.get("response")
-                                    if isinstance(_resp, dict):
-                                        _usage = _resp.get("usage")
-                                        if isinstance(_usage, dict):
-                                            _ctx = _usage.get("context_tokens") or _usage.get(
-                                                "total_tokens"
-                                            )
-                                            if isinstance(_ctx, int) and _ctx > 0:
-                                                _cc_ref = _compaction_contexts.get(conv_id)
-                                                if _cc_ref is not None:
-                                                    _cc_ref["provider_tokens"] = _ctx
                                 elif _evt_type == "response.failed":
                                     # Remember the failure so the stream-end
                                     # bookkeeping publishes a terminal
@@ -11794,6 +11396,13 @@ def create_runner_app(
                                                     "output": _item["output"],
                                                 }
                                             )
+                                elif _evt_type == "response.compaction.completed" and event.get(
+                                    "summary"
+                                ):
+                                    # A harness compacted its internal
+                                    # context and is notifying the runner
+                                    # so the compaction can be persisted.
+                                    await _handle_harness_compaction(conv_id, event)
 
                                 if is_action_required(event):
                                     tool_name = get_tool_name(event)
@@ -14742,7 +14351,6 @@ def create_runner_app(
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
-        _compaction_contexts.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
         return JSONResponse(
             status_code=200,
