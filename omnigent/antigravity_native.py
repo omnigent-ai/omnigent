@@ -1272,33 +1272,15 @@ async def _cold_start_agy_conversation(
             cascade_id,
             session_id,
         )
-    # PATCH the real id onto the session so a later ``--resume`` continues this
-    # conversation (best-effort; mirrors the runner cold-start + codex/pi). A
-    # short-lived client suffices for this one call.
-    try:
-        async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=10.0) as client:
-            resp = await client.patch(
-                f"/v1/sessions/{url_component(session_id)}",
-                json={"external_session_id": cascade_id},
-            )
-    except httpx.HTTPError:
-        _logger.warning(
-            "Antigravity cold-start: failed to PATCH external_session_id=%s onto session %s; "
-            "the conversation is mirrored but `--resume` will cold-start fresh.",
-            cascade_id,
-            session_id,
-            exc_info=True,
-        )
-    else:
-        if resp.status_code >= 400:
-            _logger.warning(
-                "Antigravity cold-start: server rejected external_session_id PATCH (%s); "
-                "session=%s cascade=%s — the conversation is mirrored but `--resume` will "
-                "cold-start fresh.",
-                resp.status_code,
-                session_id,
-                cascade_id,
-            )
+    # Do NOT record this cold-start cascade as the session's external_session_id:
+    # it is the headless ``StartCascade`` bootstrap that the agy TUI never shows.
+    # The TUI mints its OWN cascade on the first typed turn, which the read driver
+    # ADOPTS in place and records as external_session_id
+    # (``antigravity_native_reader._record_external_session_id``). Recording the
+    # phantom here used to lose the whole conversation on resume (``--resume``
+    # launched ``--conversation <phantom>`` -> EMPTY conversation); external_session_id
+    # is set-once, so it MUST be left unset here for the reader's adoption to set it.
+    del base_url, headers  # retained for signature parity; no longer PATCH here
     _logger.info(
         "Antigravity cold-start: created conversation %s on port %s for session %s",
         cascade_id,

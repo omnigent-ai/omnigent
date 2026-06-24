@@ -2119,6 +2119,51 @@ def _adopt_cascade_in_place(bridge_dir: Path, session_id: str, new_cascade_id: s
     )
 
 
+async def _record_external_session_id(
+    client: httpx.AsyncClient, session_id: str, cascade_id: str
+) -> None:
+    """
+    Best-effort record the agy cascade id as the session's ``external_session_id``.
+
+    So a later ``omnigent antigravity --resume`` / omnigent server restart
+    relaunches agy with ``--conversation <cascade_id>`` and continues THIS
+    conversation. Called on first-cascade adoption with the TUI-minted cascade.
+
+    The cold-start no longer records its headless ``StartCascade`` phantom (which
+    the agy TUI never displays) — that was the data-loss bug: a resume launched
+    ``--conversation <phantom>`` and loaded an EMPTY conversation, silently losing
+    the entire chat. ``external_session_id`` is set-once in the store; an overwrite
+    attempt (e.g. a second adoption) returns 400 and is logged, not raised — the
+    chat mirror does not depend on it.
+
+    :param client: The reader's Omnigent HTTP client.
+    :param session_id: Omnigent conversation id to record onto.
+    :param cascade_id: agy's adopted (TUI-minted) cascade/conversation id.
+    """
+    try:
+        resp = await client.patch(
+            f"/v1/sessions/{url_component(session_id)}",
+            json={"external_session_id": cascade_id},
+        )
+    except httpx.HTTPError:
+        _logger.warning(
+            "agy adopt: failed to record external_session_id=%s on session %s; "
+            "a later --resume will cold-start fresh.",
+            cascade_id,
+            session_id,
+            exc_info=True,
+        )
+        return
+    if resp.status_code >= 400:
+        _logger.info(
+            "agy adopt: external_session_id PATCH returned %s (likely already set); "
+            "session=%s cascade=%s",
+            resp.status_code,
+            session_id,
+            cascade_id,
+        )
+
+
 async def _rotate_session_for_cascade(
     *,
     client: httpx.AsyncClient,
@@ -2393,6 +2438,17 @@ async def run_reader_with_bridge(
                 # new one (the web/mobile UI watches the current session). The agy
                 # TUI and the web mirror then share ONE cascade (#1156/#1158).
                 _adopt_cascade_in_place(bridge_dir, current["session_id"], new_cascade_id)
+                # Record the adopted (TUI-minted) cascade as the session's
+                # external_session_id so a later --resume / omnigent server
+                # restart relaunches agy with --conversation <this cascade> and
+                # continues THIS conversation — NOT the headless cold-start
+                # StartCascade phantom the cold-start used to record, which a
+                # resume loaded as an EMPTY conversation (the whole chat silently
+                # vanished). external_session_id is set-once; the cold-start no
+                # longer records the phantom, so this first adoption sets it.
+                await _record_external_session_id(
+                    client, current["session_id"], new_cascade_id
+                )
                 continue
             # GENUINE /clear (the bound cascade HAD turns): move Omnigent ownership
             # onto a fresh conversation bound to the new cascade, then rebind by

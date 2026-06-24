@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -939,16 +938,19 @@ def _seed_bridge_state(bridge_dir: Path, conversation_id: str) -> None:
     )
 
 
-async def test_cli_cold_start_mints_and_patches_external_session_id(
+async def test_cli_cold_start_mints_without_patching_external_session_id(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """
-    A placeholder-seeded CLI cold-start mints a real id, writes it, and PATCHes it.
+    A placeholder-seeded CLI cold-start mints a real id + writes it, but does NOT
+    record it as external_session_id.
 
-    The fresh-fallback path: bridge state holds the ``agy_conv_*`` placeholder, so
-    the cold-start ``StartCascade``s a real uuid4, persists it to bridge state
-    (replacing the placeholder), and PATCHes it onto the session as
-    ``external_session_id`` so a later ``--resume`` continues agy's conversation.
+    The cold-start cascade is the headless ``StartCascade`` bootstrap the agy TUI
+    never displays; recording it as ``external_session_id`` lost the whole
+    conversation on resume (a ``--resume`` loaded the empty phantom). The TUI
+    mints its OWN cascade on the first typed turn, which the read driver adopts
+    and records instead. So the cold-start ``StartCascade``s a real uuid4 and
+    persists it to bridge state (for the reader to bind), but issues NO PATCH.
     """
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs")
@@ -989,8 +991,9 @@ async def test_cli_cold_start_mints_and_patches_external_session_id(
     after = read_bridge_state(bridge_dir)
     assert after is not None
     assert after.conversation_id == minted_id
-    # The same id was PATCHed onto the session as external_session_id.
-    assert patches == [("/v1/sessions/conv_cs", {"external_session_id": minted_id})]
+    # NO external_session_id PATCH: the cold-start no longer records the headless
+    # phantom (the reader records the adopted TUI cascade instead) — #2 data-loss.
+    assert patches == []
 
 
 async def test_cli_cold_start_skips_when_conversation_already_real(
@@ -1030,53 +1033,6 @@ async def test_cli_cold_start_skips_when_conversation_already_real(
     after = read_bridge_state(bridge_dir)
     assert after is not None
     assert after.conversation_id == real_id
-
-
-async def test_cli_cold_start_logs_when_patch_rejected(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """
-    A ``>= 400`` PATCH response is logged (best-effort) but never raised.
-
-    ``httpx`` does not raise on a 4xx/5xx response unless asked, so the cold-start
-    inspects ``status_code`` and warns when the server rejects the
-    ``external_session_id`` write — but the cascade id still reaches bridge state
-    (the chat mirror does not depend on the resume-fidelity PATCH).
-    """
-    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
-    bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs_reject")
-    _seed_bridge_state(bridge_dir, "agy_conv_placeholder")
-
-    monkeypatch.setattr(_mod, "resolve_cold_start_agy_rpc_port", lambda _sock, _tgt: 52548)
-    started: list[tuple[int, str]] = []
-    monkeypatch.setattr(_mod, "start_cascade", lambda port, cid: started.append((port, cid)))
-
-    real_async_client = httpx.AsyncClient
-
-    def _reject_handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, json={})
-
-    def _mock_async_client(**kwargs: object) -> httpx.AsyncClient:
-        kwargs.pop("transport", None)
-        return real_async_client(transport=httpx.MockTransport(_reject_handler), **kwargs)
-
-    monkeypatch.setattr(_mod.httpx, "AsyncClient", _mock_async_client)
-
-    with caplog.at_level(logging.WARNING, logger="omnigent.antigravity_native"):
-        await _mod._cold_start_agy_conversation(
-            bridge_dir,
-            "conv_cs",
-            base_url="http://test",
-            headers={},
-            timeout_s=1.0,
-        )
-
-    # The cascade was still minted + persisted; only the resume-fidelity PATCH failed.
-    assert len(started) == 1
-    after = read_bridge_state(bridge_dir)
-    assert after is not None
-    assert after.conversation_id == started[0][1]
-    assert "rejected external_session_id PATCH (404)" in caplog.text
 
 
 async def test_cli_cold_start_scopes_to_pane_agy(
