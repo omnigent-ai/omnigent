@@ -273,6 +273,11 @@ _LOCAL_DAEMON_ENV_PREFIXES: tuple[str, ...] = (
     "OMNIGENT_",
     "OPENAI_",
 )
+# Comma-separated EXTRA env var names to forward CLI -> host daemon, beyond the
+# standard local-daemon allowlists. Mirrors the runner-side passthrough and keeps
+# daemon forwarding opt-in for names like corporate proxy vars that are not safe
+# to universally inherit by default.
+DAEMON_ENV_PASSTHROUGH_ENV_VAR: str = "OMNIGENT_DAEMON_ENV_PASSTHROUGH"
 _HostJsonValue: TypeAlias = (
     str | int | float | bool | None | list["_HostJsonValue"] | dict[str, "_HostJsonValue"]
 )
@@ -2265,6 +2270,12 @@ def _build_host_daemon_env(
         _RUNNER_ENV_ALLOWLIST_PREFIXES,
     )
 
+    extra_names = {
+        name.strip()
+        for name in os.environ.get(DAEMON_ENV_PASSTHROUGH_ENV_VAR, "").split(",")
+        if name.strip()
+    }
+
     if not server_url:
         daemon_env_prefixes = (*_RUNNER_ENV_ALLOWLIST_PREFIXES, *_LOCAL_DAEMON_ENV_PREFIXES)
         env = {
@@ -2272,6 +2283,7 @@ def _build_host_daemon_env(
             for key, value in os.environ.items()
             if key in _RUNNER_ENV_ALLOWLIST
             or key in _LOCAL_DAEMON_ENV_ALLOWLIST
+            or key in extra_names
             or key.startswith(daemon_env_prefixes)
         }
     else:
@@ -2283,7 +2295,9 @@ def _build_host_daemon_env(
         env = {
             key: value
             for key, value in os.environ.items()
-            if key in _RUNNER_ENV_ALLOWLIST or key.startswith(daemon_env_prefixes)
+            if key in _RUNNER_ENV_ALLOWLIST
+            or key in extra_names
+            or key.startswith(daemon_env_prefixes)
         }
     return env
 

@@ -233,6 +233,43 @@ def test_build_host_daemon_env_local_preserves_server_credentials(
     assert empty_string_env["OPENAI_API_KEY"] == "test-key"
 
 
+def test_build_host_daemon_env_local_passthrough_extends_forwarded_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMNIGENT_DAEMON_ENV_PASSTHROUGH opt-in forwards extra daemon vars.
+
+    Covers corporate-proxy style env vars that the local host daemon may need
+    before any runner exists, while keeping unrelated shell secrets blocked by
+    default.
+    """
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("OMNIGENT_DAEMON_ENV_PASSTHROUGH", "HTTPS_PROXY, NO_PROXY")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:3128")
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1")
+    monkeypatch.setenv("UNLISTED_SECRET", "nope")
+
+    env = _build_host_daemon_env(server_url=None)
+
+    assert env["HTTPS_PROXY"] == "http://proxy.example.com:3128"
+    assert env["NO_PROXY"] == "localhost,127.0.0.1"
+    assert "UNLISTED_SECRET" not in env
+
+
+def test_build_host_daemon_env_remote_passthrough_extends_forwarded_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote daemons also honor the explicit daemon passthrough set."""
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("OMNIGENT_DAEMON_ENV_PASSTHROUGH", "HTTPS_PROXY")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:3128")
+    monkeypatch.setenv("UNLISTED_SECRET", "nope")
+
+    env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
+
+    assert env["HTTPS_PROXY"] == "http://proxy.example.com:3128"
+    assert "UNLISTED_SECRET" not in env
+
+
 def test_build_host_daemon_env_remote_strips_provider_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

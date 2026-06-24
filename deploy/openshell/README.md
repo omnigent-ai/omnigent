@@ -258,15 +258,15 @@ network_policies:
 ```
 
 > [!IMPORTANT]
-> **Forward the proxy vars to the runner.** The host inherits the sandbox's
-> `https_proxy`/`http_proxy`, but the runner subprocess it spawns does **not** —
-> so the runner fails with `Temporary failure in name resolution` even though the
-> host connected. Inject `OMNIGENT_RUNNER_ENV_PASSTHROUGH` naming the proxy vars so
-> the host forwards them:
+> **Forward the proxy vars to the daemon and the runner.** The local host daemon
+> may need the proxy before any runner exists (for example, to reach a model
+> backend while booting), and the runner subprocess it spawns does **not** inherit
+> arbitrary proxy vars either. Inject both passthrough knobs naming the proxy vars:
 > ```yaml
 > sandbox:
 >   openshell:
->     env: [OMNIGENT_RUNNER_ENV_PASSTHROUGH, …]   # value set in the server env:
+>     env: [OMNIGENT_DAEMON_ENV_PASSTHROUGH, OMNIGENT_RUNNER_ENV_PASSTHROUGH, …]
+> # OMNIGENT_DAEMON_ENV_PASSTHROUGH=https_proxy,http_proxy,HTTPS_PROXY,HTTP_PROXY,NO_PROXY,no_proxy
 > # OMNIGENT_RUNNER_ENV_PASSTHROUGH=https_proxy,http_proxy,HTTPS_PROXY,HTTP_PROXY,NO_PROXY,no_proxy
 > ```
 
