@@ -7703,6 +7703,19 @@ def create_runner_app(
     # Exposed on app.state for test inspection.
     _desynced_sessions: set[str] = set()
     app.state.desynced_sessions = _desynced_sessions
+    # Publish-once token: a conversation whose desync recovery
+    # (``_resync_turn_state``) OWNS the single terminal ``failed`` status for
+    # the current (no-buffer) wedged turn. The competing terminal-publish sites
+    # — ``_on_proxy_stream_end`` and ``_drain_streaming_response``'s cancel
+    # handler — consult this token and no-op their own ``idle``/terminal
+    # publish so the client never sees a spurious ``idle`` racing the desync
+    # ``failed`` (P2.11 wired ``failed`` as terminal/non-retryable). Set
+    # synchronously before the interrupt/cancel that could wake those sites;
+    # consumed (discarded) by whichever competitor runs, and cleared at the
+    # next ``_run_turn_bg`` start so a stale token can't suppress a later
+    # legitimate publish. Exposed on app.state for test inspection.
+    _desync_terminalized: set[str] = set()
+    app.state.desync_terminalized = _desync_terminalized
     # Exposed below (after definition) on app.state for tests that drive the
     # desync recovery entry directly: app.state.resync_turn_state.
     _background_tasks: set[asyncio.Task[Any]] = set()
@@ -12241,10 +12254,18 @@ def create_runner_app(
         # `failed` is always published so a real error is never swallowed.
         has_buffered = bool(_session_message_buffers.get(conv_id))
         was_interrupted = conv_id in _interrupted_sessions
+        # Publish-once guard: when the desync-recovery path owns this turn's
+        # terminal status (it will publish, or has published, the desync
+        # ``failed``), no-op our own status publish so the client never sees a
+        # competing ``idle``/terminal racing the ``failed``. Consume the token
+        # once; the rest of the bookkeeping (pop, cancellation items, subagent
+        # wake, continuation) still runs.
+        _suppress_status = conv_id in _desync_terminalized
+        _desync_terminalized.discard(conv_id)
         if was_interrupted:
             _interrupted_sessions.discard(conv_id)
             _append_cancellation_items(conv_id)
-            if not has_buffered:
+            if not has_buffered and not _suppress_status:
                 _publish_turn_status(conv_id, "idle")
         elif error is not None:
             # Carry the failure detail so a SETUP-phase failure (no
@@ -12252,9 +12273,10 @@ def create_runner_app(
             # clients instead of ending silently. ``failed`` is published
             # for every harness (including claude-native) — see
             # _publish_turn_status.
-            _publish_turn_status(conv_id, "failed", error=_normalize_turn_error(error))
+            if not _suppress_status:
+                _publish_turn_status(conv_id, "failed", error=_normalize_turn_error(error))
         else:
-            if not has_buffered:
+            if not has_buffered and not _suppress_status:
                 # Emit ``waiting`` instead of ``idle`` when the turn ended
                 # cleanly but sub-agents are still running. This lets the
                 # headless ``-p`` multi-turn loop (``_drain_extra_turns`` in
@@ -12453,6 +12475,18 @@ def create_runner_app(
         # Clear the live-response marker up front so any concurrent mid-turn
         # forward sees no live turn and 204s instead of racing the cancel.
         _live_response_id.pop(conv_id, None)
+        # Claim the single terminal status NOW (synchronously, before the
+        # cancel/interrupt that can wake the competing publish sites) when no
+        # continuation will run: this recovery owns the desync ``failed`` and
+        # ``_on_proxy_stream_end`` / the drain-cancel handler must no-op their
+        # own ``idle``/terminal publish. Snapshot the buffer state once for the
+        # claim; the publish decision below re-reads it and releases the token
+        # if a message buffered during the cancel await (then the continuation
+        # owns the terminal status instead). The token is NOT discarded here —
+        # the competitor consumes it whenever it runs (before OR after our
+        # publish), and a stale token is cleared at the next ``_run_turn_bg``.
+        if not _session_message_buffers.get(conv_id):
+            _desync_terminalized.add(conv_id)
         # Stream-mode floor (SYNCHRONOUS — no await before the pop). A
         # ``stream=true`` turn parks the ``None`` sentinel in ``_active_turns``
         # with no runner Task; ``_cancel_inprocess_turn`` can only forward the
@@ -12489,6 +12523,9 @@ def create_runner_app(
         # AP's retryable-harness-error allowlist, so the L2 classifier treats
         # it as terminal instead of retry-looping into the same wedge.
         if not _session_message_buffers.get(conv_id):
+            # We own the terminal status (token claimed above). Publish exactly
+            # one desync ``failed``; competing publish sites no-op via the token.
+            _desync_terminalized.add(conv_id)
             _publish_turn_status(
                 conv_id,
                 "failed",
@@ -12501,6 +12538,10 @@ def create_runner_app(
                 },
             )
         else:
+            # A message buffered (now or during the cancel await): the
+            # continuation owns the terminal status, so RELEASE the claim so its
+            # own ``_on_proxy_stream_end`` publishes normally.
+            _desync_terminalized.discard(conv_id)
             # A continuation is buffered, so we suppressed the failure publish
             # above (P1.7) — but a background turn cancelled while blocked in
             # ``_drain_streaming_response`` pops ``_active_turns`` and re-raises
@@ -12533,6 +12574,10 @@ def create_runner_app(
     # harness→runner verdict-POST-failure round-trip is impractical to script
     # in-process). Mirrors the active_turns / interrupted_sessions exposures.
     app.state.resync_turn_state = _resync_turn_state
+    # Test seam: simulate ``proxy_stream`` reaching its terminal bookkeeping
+    # (e.g. after a successful interrupt) so tests can assert the publish-once
+    # guard dedupes the desync ``failed`` against a competing ``idle``.
+    app.state.on_proxy_stream_end = _on_proxy_stream_end
 
     async def _check_and_start_next_turn(
         session_id: str,
@@ -13175,8 +13220,11 @@ def create_runner_app(
         # A fresh turn is binding: whatever desync the previous turn ended on
         # is now resolved (this turn rebuilds the harness state clean). Clear
         # the flag so a recovered conversation isn't left permanently marked
-        # (P1.7).
+        # (P1.7). Also clear a stale publish-once token (e.g. left set when a
+        # wedged stream never reached its own ``_on_proxy_stream_end``) so it
+        # can't suppress THIS turn's legitimate terminal publish.
         _desynced_sessions.discard(conv)
+        _desync_terminalized.discard(conv)
         try:
             await _run_turn_bg_setup_and_stream(msg_body, conv)
         except _ContextWindowOverflow:
@@ -13675,7 +13723,13 @@ def create_runner_app(
             # marker here too or the next turn's forward gate goes stale.
             _active_turns.pop(session_id, None)
             _live_response_id.pop(session_id, None)
-            _publish_turn_status(session_id, "idle")
+            # Publish-once guard (same token as _on_proxy_stream_end): when the
+            # desync-recovery path owns this turn's terminal ``failed``, no-op
+            # this ``idle`` so the client never sees ``idle`` racing ``failed``.
+            if session_id in _desync_terminalized:
+                _desync_terminalized.discard(session_id)
+            else:
+                _publish_turn_status(session_id, "idle")
             raise
         except _ContextWindowOverflow:
             raise

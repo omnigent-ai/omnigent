@@ -16877,3 +16877,67 @@ async def test_desync_stream_mode_clears_gate_even_when_interrupt_fails() -> Non
         while loop.time() < deadline and conv in app.state.desynced_sessions:
             await asyncio.sleep(0.02)
         assert conv not in app.state.desynced_sessions
+
+
+class _InterruptEndsStreamHarnessClient(_ScriptedHarnessClient):
+    """Interrupt POST succeeds AND drives proxy_stream's terminal bookkeeping.
+
+    Reproduces the race the publish-once guard must close: a SUCCESSFUL
+    interrupt ends ``proxy_stream``, so its ``_on_proxy_stream_end`` runs
+    DURING ``_resync_turn_state`` (mid-recovery), competing with the desync
+    ``failed`` publish.
+    """
+
+    app: Any = None
+    conv: str = ""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            # Successful interrupt → proxy_stream reaches its terminal
+            # bookkeeping right here, mid-resync.
+            self.app.state.on_proxy_stream_end(self.conv)
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_desync_stream_mode_publishes_single_terminal_status() -> None:
+    """Review (blocking race): stream-mode no-buffer desync publishes ONE terminal.
+
+    Stream-mode None sentinel + no buffer + interrupt SUCCEEDS, so
+    ``proxy_stream`` reaches ``_on_proxy_stream_end`` while ``_resync_turn_state``
+    also runs the no-buffer desync ``failed``. The publish-once token must
+    dedupe: the client sees exactly ONE terminal status — the desync ``failed``
+    — never an ``idle``+``failed`` pair (P2.11 made ``failed`` terminal /
+    non-retryable, so a competing ``idle`` is a correctness bug).
+    """
+    conv = "conv_desync_single_terminal"
+    harness = _InterruptEndsStreamHarnessClient([])
+    pm = _FakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _runner_client(app):
+        # Stream-mode sentinel, no buffered follow-up.
+        app.state.active_turns[conv] = None
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    # Collect every session.status edge published for the conv.
+    from omnigent.runner.app import _session_event_queues_ref
+
+    queue = _session_event_queues_ref.get(conv)
+    statuses: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if isinstance(ev, dict) and ev.get("type") == "session.status":
+            statuses.append(ev)
+
+    # Exactly ONE terminal status, and it is the desync failed — no idle.
+    assert len(statuses) == 1, statuses
+    assert statuses[0]["status"] == "failed"
+    assert statuses[0]["error"]["code"] == "runner_turn_context_desync"
+    # The interrupt was actually forwarded (so the race window was real).
+    assert {"type": "interrupt"} in harness.patched_events
