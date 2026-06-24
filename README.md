@@ -112,6 +112,33 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 </details>
 
 <details>
+<summary>Windows (native)</summary>
+
+Omnigent runs natively on Windows in a degraded mode. The `install_oss.sh`
+bootstrap is POSIX-only, so install with `uv` directly:
+
+```powershell
+uv tool install --python 3.12 omnigent
+# or from the repo:
+uv tool install --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
+```
+
+What works on Windows: `omnigent server`, the web UI, and the SDK-based
+harnesses (`omnigent run <agent.yaml>` with the claude-sdk / cursor / copilot
+/ codex harnesses). Agents run under a Windows **Job Object** for process-tree
+containment.
+
+What is **not** available on Windows (use Linux/macOS, or WSL, for these):
+
+- the native `omnigent claude` / `omnigent codex` / `omnigent cursor`
+  tmux/PTY terminal wrappers (run an SDK harness or the web UI instead);
+- `bwrap`/`seatbelt` filesystem & network sandboxing and the L7 egress proxy
+  — the Job Object backend contains the process tree and enforces resource
+  limits but does **not** isolate the filesystem or network.
+
+</details>
+
+<details>
 <summary>Updating to a new release</summary>
 
 When a newer release is on PyPI, Omnigent shows a one-line notice (once per
