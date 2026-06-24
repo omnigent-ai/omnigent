@@ -22,6 +22,8 @@ import re
 import httpx
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.conftest import configure_mock_llm
+
 # Unique marker so the copied-transcript assertion can't match
 # UI chrome or another test's message.
 _MARKER = "kumquat-clone-marker"
@@ -34,6 +36,7 @@ _XFAM_MARKER = "loquat-xfam-marker"
 def test_clone_session_copies_transcript_and_navigates(
     page: Page,
     seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """Clone a session from a message's Fork action and land in a fork with history.
 
@@ -52,6 +55,16 @@ def test_clone_session_copies_transcript_and_navigates(
         runner-bound session.
     """
     base_url, session_id = seeded_session
+
+    # Route this turn on the mock by marker so an exhausted queue left by
+    # an earlier test in the shard cannot swallow the request.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "OK"}],
+        key="clone-seed",
+        match=_MARKER,
+    )
+
     page.goto(f"{base_url}/c/{session_id}")
 
     # Seed the transcript with a uniquely-marked user turn and wait for
@@ -102,6 +115,7 @@ def test_clone_session_copies_transcript_and_navigates(
 def test_clone_dialog_offers_cross_family_native_target_and_forks(
     page: Page,
     seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """The fork dialog offers a CROSS-FAMILY native target and forks into it.
 
@@ -137,6 +151,13 @@ def test_clone_dialog_offers_cross_family_native_target_and_forks(
     assert claude_native is not None, (
         "claude-native-ui built-in not registered on the test server — it is "
         "seeded unconditionally at startup, so its absence is a server bug"
+    )
+
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "OK"}],
+        key="clone-xfam-seed",
+        match=_XFAM_MARKER,
     )
 
     page.goto(f"{base_url}/c/{session_id}")
