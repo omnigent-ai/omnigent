@@ -15,7 +15,7 @@ import pytest
 from omnigent.llms import context_window
 from omnigent.llms.context_window import (
     ModelPricing,
-    _qwen_context_window,
+    _registry_context_window,
     compute_llm_cost,
     fetch_model_pricing,
     get_model_context_window,
@@ -356,29 +356,57 @@ def test_provider_catalog_caches_fetch_failure(
 
 
 # ---------------------------------------------------------------------------
-# Qwen context-window fallback (models absent from litellm + MLflow catalog)
+# Omnigent's authoritative context-window registry (supersedes litellm/catalog)
 # ---------------------------------------------------------------------------
 
 
-def test_qwen_context_window_normalizes_id() -> None:
-    """The lookup strips provider prefixes and ``:tag`` suffixes before matching."""
-    assert _qwen_context_window("qwen3-coder-plus") == 1_048_576
-    assert _qwen_context_window("qwen/qwen3-coder") == 262_144
-    assert _qwen_context_window("qwen3-coder:free") == 262_144
-    assert _qwen_context_window("openrouter/qwen/qwen3-coder:free") == 262_144
-    assert _qwen_context_window("QWEN3-CODER-PLUS") == 1_048_576  # case-insensitive
-    # Unknown qwen variant → None (caller falls back to the default).
-    assert _qwen_context_window("qwen-nonexistent-xyz") is None
+def test_registry_context_window_normalizes_id() -> None:
+    """The registry strips provider prefixes and ``:tag`` suffixes before matching."""
+    assert _registry_context_window("qwen3-coder-plus") == 1_048_576
+    assert _registry_context_window("qwen/qwen3-coder") == 262_144
+    assert _registry_context_window("qwen3-coder:free") == 262_144
+    assert _registry_context_window("openrouter/qwen/qwen3-coder:free") == 262_144
+    assert _registry_context_window("QWEN3-CODER-PLUS") == 1_048_576  # case-insensitive
+    # A model the registry doesn't own → None (caller falls back to litellm).
+    assert _registry_context_window("qwen-nonexistent-xyz") is None
+    assert _registry_context_window("gpt-5.4") is None
 
 
-def test_get_model_context_window_uses_qwen_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A known qwen model resolves to its curated window, not the 128K default.
+def test_registry_resolves_anthropic_1m_beta_suffix() -> None:
+    """The Anthropic ``[1m]`` beta marker resolves to a 1M window via the registry.
 
-    Catalog lookup is disabled so the resolution is hermetic (no network):
-    litellm has no qwen entry, MLflow is skipped, so the qwen table answers.
+    The suffix *is* the window — we read it, not strip it — so any
+    ``<model>[1m]`` resolves to 1,000,000 while the bare base defers to the
+    upstream backends (which may size it differently).
+    """
+    assert _registry_context_window("claude-opus-4-8[1m]") == 1_000_000
+    assert _registry_context_window("anthropic/claude-opus-4-8[1m]") == 1_000_000
+    assert _registry_context_window("claude-sonnet-4-6[1m]") == 1_000_000
+    assert _registry_context_window("CLAUDE-OPUS-4-8[1M]") == 1_000_000  # case-insensitive
+    # Databricks-hosted Claude (contains "claude") also resolves.
+    assert _registry_context_window("databricks-claude-opus-4-8[1m]") == 1_000_000
+    # Without the suffix the registry defers (None → caller uses litellm/catalog).
+    assert _registry_context_window("claude-opus-4-8") is None
+    # The rule is Claude-scoped: a non-Claude id ending in [1m] is NOT forced to
+    # 1M (it defers to litellm/catalog), so custom/self-hosted ids are safe.
+    assert _registry_context_window("my-local-model[1m]") is None
+    assert _registry_context_window("gpt-5.4[1m]") is None
+
+
+def test_get_model_context_window_uses_registry_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Registry-curated ids resolve to their window with NO network.
+
+    Catalog lookup is disabled to prove hermeticity: the registry is consulted
+    before litellm and the catalog, so qwen models and the Anthropic ``[1m]``
+    beta resolve correctly even offline (the OMNI-142 meter / OMNI-143 overflow
+    bug was that these collapsed to the 128K default).
     """
     monkeypatch.setenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", "1")
     monkeypatch.delenv("AP_CONTEXT_WINDOW_OVERRIDE", raising=False)
+    # Anthropic 1M beta: resolves via the registry, not the 128K default.
+    assert get_model_context_window("claude-opus-4-8[1m]") == 1_000_000
+    assert get_model_context_window("anthropic/claude-opus-4-8[1m]") == 1_000_000
+    # Qwen: curated window, not the default.
     assert get_model_context_window("qwen3-coder-plus") == 1_048_576
-    # An unrecognized qwen model still falls back to the conservative default.
+    # A model the registry doesn't own still falls back to the conservative default.
     assert get_model_context_window("qwen-nonexistent-xyz") == 128_000
