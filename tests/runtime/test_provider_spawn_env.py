@@ -93,6 +93,7 @@ def _make_spec(
     model: str | None = None,
     profile: str | None = None,
     auth: ApiKeyAuth | DatabricksAuth | ProviderAuth | None = None,
+    os_env: object | None = None,
 ) -> AgentSpec:
     """
     Build a minimal :class:`AgentSpec` for a given harness.
@@ -117,6 +118,7 @@ def _make_spec(
         instructions="You are a test agent.",
         executor=ExecutorSpec(type="omnigent", config=config, model=model, auth=auth),
         llm=LLMConfig(model=model) if model is not None else None,
+        os_env=os_env,  # type: ignore[arg-type]
     )
 
 
@@ -1035,3 +1037,56 @@ def test_kimi_ignores_global_default_provider(config_home: Path) -> None:
 
     assert "HARNESS_KIMI_GATEWAY_BASE_URL" not in env
     assert "HARNESS_KIMI_GATEWAY_API_KEY" not in env
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        ApiKeyAuth(api_key="sk-secret"),
+        DatabricksAuth(profile="my-profile"),
+        ProviderAuth(name="vendor-named"),
+    ],
+)
+def test_kimi_declared_auth_raises(
+    config_home: Path,
+    auth: ApiKeyAuth | DatabricksAuth | ProviderAuth,
+) -> None:
+    """A kimi spec that declares any ``executor.auth`` fails loud.
+
+    Upstream kimi has no per-spawn provider override (no ``--config-file`` /
+    ``--mcp-config-file``), so declared auth can't be threaded. Silently
+    launching against whatever ambient ``~/.kimi/config.toml`` resolves to
+    would be a confused-deputy / mis-attribution risk, so the builder raises
+    instead. Regression guard for the originally-dead ``OmnigentError``."""
+    from omnigent.errors import OmnigentError
+
+    _write_config(config_home, {"providers": {}})
+    spec = _make_spec(harness="kimi", auth=auth)
+
+    with pytest.raises(OmnigentError, match=r"kimi.*does not support"):
+        _build_kimi_spawn_env(spec, workdir=None)
+
+
+def test_kimi_os_env_serialized(config_home: Path) -> None:
+    """``spec.os_env`` is serialized into ``HARNESS_KIMI_OS_ENV`` so the wrap
+    can rebuild the sandbox spec and confine kimi's in-process Bash/edit/read
+    tools — parity with every sibling builder. Without this the executor's
+    sandbox launcher never engages and kimi runs unconfined."""
+    import json as _json
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    _write_config(config_home, {"providers": {}})
+    os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=None,
+        sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"),
+        fork=False,
+    )
+    spec = _make_spec(harness="kimi", os_env=os_env)
+
+    env = _build_kimi_spawn_env(spec, workdir=None)
+
+    assert "HARNESS_KIMI_OS_ENV" in env
+    decoded = _json.loads(env["HARNESS_KIMI_OS_ENV"])
+    assert decoded["sandbox"]["type"] == "darwin_seatbelt"

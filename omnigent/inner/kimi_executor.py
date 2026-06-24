@@ -61,12 +61,11 @@ import os
 import re
 import shutil
 import time
-import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 
-from omnigent.inner.datamodel import OSEnvSpec
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,
@@ -84,6 +83,12 @@ from omnigent.inner.executor import (
 )
 
 _logger = logging.getLogger(__name__)
+
+# Per-line cap for the stdout StreamReader. Kimi emits whole messages (not
+# deltas), so a single JSONL line can be large; 16 MiB keeps a big file-read
+# tool result or long assistant message from overrunning asyncio's 64 KiB
+# default and crashing the turn.
+_STREAM_LIMIT = 16 * 1024 * 1024
 
 # Matches the resume hint kimi also prints to stderr / stdout (best-effort
 # fallback for when the ``role:"meta"`` JSON event isn't seen). The session
@@ -219,6 +224,12 @@ class KimiExecutor(Executor):
     def handles_tools_internally(self) -> bool:
         return True
 
+    def forwards_observed_tool_results(self) -> bool:
+        # Kimi runs a fully self-contained tool loop; its tool results never
+        # round-trip through the scaffold's dispatch_tool, so the adapter must
+        # forward the ToolCallComplete events rather than suppress them.
+        return True
+
     def supports_streaming(self) -> bool:
         return True
 
@@ -236,6 +247,59 @@ class KimiExecutor(Executor):
         translated into CLI flags.
         """
         return dict(os.environ)
+
+    def _sandbox_launch_path(self, spawn_env_names: Sequence[str]) -> str:
+        """Return the path to spawn for kimi — sandbox launcher or bare binary.
+
+        Mirrors :meth:`omnigent.inner.qwen_executor.QwenExecutor._sandbox_launch_path`.
+        Upstream kimi has no sandbox flag of its own and runs its built-in
+        Bash / edit / read tools (and any shell child processes) in-process.
+        When the spec's ``os_env.sandbox`` requests confinement, wrap the
+        whole kimi process tree in the platform sandbox
+        (``linux_bwrap`` / ``darwin_seatbelt``) so even an *allowed* tool
+        call can't touch paths outside the spec's read/write roots — the
+        OS-level guarantee kimi's own approval flow can't give.
+
+        Falls back to the bare binary (never blocks startup) when no sandbox
+        is requested, the resolved policy is inactive, or the backend is
+        unavailable on this platform.
+
+        :param spawn_env_names: Env-var names we deliberately set on the
+            subprocess ``env=``; baked into the policy so the launcher prunes
+            anything else it inherits (host-env leak defense).
+        :returns: The path to pass as argv[0] to ``create_subprocess_exec``.
+        """
+        os_env = self._os_env
+        if os_env is None:
+            return self._binary_path
+        sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
+        if sandbox_spec.type == "none":
+            return self._binary_path
+        try:
+            from .sandbox import (
+                create_exec_launcher,
+                resolve_sandbox,
+                with_additional_read_roots,
+                with_additional_write_roots,
+                with_spawn_env_allowlist,
+            )
+
+            cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
+            sandbox = resolve_sandbox(os_env, cwd)
+            if not sandbox.active:
+                return self._binary_path
+            # kimi is a curl-installed single binary: it must read its own
+            # install dir and write its config dir (~/.kimi) and /tmp, or it
+            # can't start inside the jail.
+            resolved_bin = shutil.which(self._binary_path) or self._binary_path
+            bin_dir = Path(resolved_bin).resolve(strict=False).parent
+            sandbox = with_additional_read_roots(sandbox, [bin_dir])
+            sandbox = with_additional_write_roots(sandbox, [Path.home() / ".kimi", Path("/tmp")])
+            sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
+            return create_exec_launcher(resolved_bin, sandbox)
+        except (OSError, ImportError, NotImplementedError) as exc:
+            _logger.warning("Could not apply sandbox for kimi; running unsandboxed: %s", exc)
+            return self._binary_path
 
     def _build_argv(self, *, prompt_text: str) -> list[str]:
         """Assemble the kimi argv for one turn.
@@ -382,6 +446,10 @@ class KimiExecutor(Executor):
 
         argv = self._build_argv(prompt_text=prompt_text)
         env = self._build_spawn_env()
+        # Resolve argv[0]: the bare binary, or a sandbox launcher wrapping it
+        # when the spec's os_env requests confinement (so kimi's in-process
+        # Bash/edit/read tools run inside the spec's read/write roots).
+        argv[0] = self._sandbox_launch_path(tuple(env.keys()))
 
         started_at = time.monotonic()
         process: asyncio.subprocess.Process | None = None
@@ -396,6 +464,12 @@ class KimiExecutor(Executor):
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self._cwd or None,
                 env=env,
+                # Kimi emits whole messages (not deltas) as JSONL: a single
+                # tool result echoing a large file read or a long assistant
+                # message can exceed asyncio's default 64 KiB per-line cap and
+                # raise LimitOverrunError out of the ``async for`` below. Use a
+                # generous 16 MiB limit (parity with the qwen executor).
+                limit=_STREAM_LIMIT,
             )
             self._active_process = process
 
@@ -459,11 +533,11 @@ class KimiExecutor(Executor):
             match = _SESSION_RESUME_RE.search(stderr_text)
             if match:
                 self._session_id = match.group(1)
-        if not self._session_id:
-            # No id surfaced anywhere — mint one so the next turn at least
-            # has a stable handle. ``-S <unknown>`` will start a fresh
-            # session on kimi's side, which is the desired graceful fallback.
-            self._session_id = uuid.uuid4().hex
+        # If no resume hint surfaced anywhere, leave ``_session_id`` as None.
+        # The next turn then omits ``-S`` and starts a fresh kimi session,
+        # which is safer than minting an arbitrary id: an invented value isn't
+        # in kimi's documented ``session_<uuid>`` shape, and passing an
+        # unknown id risks upstream erroring on every subsequent turn.
 
         elapsed_ms = (time.monotonic() - started_at) * 1000.0
         if process is not None and process.returncode not in (None, 0):

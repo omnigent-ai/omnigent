@@ -905,7 +905,16 @@ class ExecutorAdapter(HarnessApp):
             # cards in the Web UI. Suppress for all dispatched
             # tools — the scaffold is the single source of output
             # events for round-tripped calls.
-            if self._current_ctx is not None:
+            #
+            # Exception: executors that run a fully self-contained tool
+            # loop with no scaffold round-trip (the kimi CLI harness)
+            # have no dispatch_tool-emitted output to dedupe against —
+            # their ToolCallComplete is the only carrier of the result.
+            # Forward those instead of dropping them.
+            forwards_observed = (
+                self._executor is not None and self._executor.forwards_observed_tool_results()
+            )
+            if self._current_ctx is not None and not forwards_observed:
                 return
             call_id = _call_id_from_metadata(getattr(event, "metadata", None)) or ""
             item: dict[str, Any] = {

@@ -411,6 +411,9 @@ def test_kimi_executor_capabilities() -> None:
     assert ex.handles_tools_internally() is True
     assert ex.supports_streaming() is True
     assert ex.supports_tool_calling() is True
+    # Kimi's tool results never round-trip through the scaffold's dispatch_tool,
+    # so the adapter must forward its ToolCallComplete events (not suppress).
+    assert ex.forwards_observed_tool_results() is True
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +585,96 @@ def test_run_turn_falls_back_to_stderr_regex_for_session_id(
     asyncio.run(_collect(ex, [{"role": "user", "content": "hi"}]))
 
     assert ex._session_id == "session_fallback-1234"
+
+
+def test_run_turn_no_resume_hint_leaves_session_id_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When neither a meta event nor the stderr footer surfaces a resume id,
+    ``_session_id`` stays ``None`` so the next turn omits ``-S`` and starts a
+    fresh kimi session — never an invented uuid that upstream might reject."""
+    fake = _FakeProcess(
+        [json.dumps({"role": "assistant", "content": "hi"})],
+        b"",  # no resume footer
+        returncode=0,
+    )
+
+    async def _fake_spawn(*_args: Any, **_kwargs: Any) -> _FakeProcess:
+        return fake
+
+    monkeypatch.setattr(kimi_executor, "_create_subprocess_exec", _fake_spawn)
+    monkeypatch.setattr(kimi_executor.shutil, "which", lambda _binary: "/usr/local/bin/kimi")
+
+    ex = KimiExecutor(binary_path="kimi")
+    asyncio.run(_collect(ex, [{"role": "user", "content": "hi"}]))
+
+    assert ex._session_id is None
+    # And the next turn's argv must NOT carry -S.
+    assert "-S" not in ex._build_argv(prompt_text="next")
+
+
+def test_run_turn_passes_generous_stream_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The subprocess is spawned with a large per-line ``limit=`` so a big
+    JSONL line (kimi emits whole messages, not deltas) doesn't overrun
+    asyncio's 64 KiB default and crash the turn."""
+    fake = _FakeProcess([json.dumps({"role": "assistant", "content": "hi"})], b"", returncode=0)
+    captured_kwargs: dict[str, Any] = {}
+
+    async def _fake_spawn(*_args: Any, **kwargs: Any) -> _FakeProcess:
+        captured_kwargs.update(kwargs)
+        return fake
+
+    monkeypatch.setattr(kimi_executor, "_create_subprocess_exec", _fake_spawn)
+    monkeypatch.setattr(kimi_executor.shutil, "which", lambda _binary: "/usr/local/bin/kimi")
+
+    ex = KimiExecutor(binary_path="kimi")
+    asyncio.run(_collect(ex, [{"role": "user", "content": "hi"}]))
+
+    assert captured_kwargs.get("limit", 0) >= 1024 * 1024
+
+
+def test_sandbox_launch_path_bare_binary_when_no_sandbox() -> None:
+    """No os_env (or sandbox=none) → spawn the bare binary, never a launcher."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    assert KimiExecutor(binary_path="kimi")._sandbox_launch_path(()) == "kimi"
+
+    os_env = OSEnvSpec(
+        type="caller_process", cwd=None, sandbox=OSEnvSandboxSpec(type="none"), fork=False
+    )
+    ex = KimiExecutor(binary_path="kimi", os_env=os_env)
+    assert ex._sandbox_launch_path(()) == "kimi"
+
+
+def test_sandbox_launch_path_wraps_when_sandbox_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spec requesting confinement routes the binary through the platform
+    sandbox launcher so kimi's in-process tools run jailed."""
+    from omnigent.inner import sandbox as sandbox_mod
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    class _ActivePolicy:
+        active = True
+
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", lambda *_a, **_k: _ActivePolicy())
+    monkeypatch.setattr(sandbox_mod, "with_additional_read_roots", lambda s, _roots: s)
+    monkeypatch.setattr(sandbox_mod, "with_additional_write_roots", lambda s, _roots: s)
+    monkeypatch.setattr(sandbox_mod, "with_spawn_env_allowlist", lambda s, _names: s)
+    monkeypatch.setattr(
+        sandbox_mod, "create_exec_launcher", lambda target, _policy: f"LAUNCHER::{target}"
+    )
+
+    os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=None,
+        sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"),
+        fork=False,
+    )
+    ex = KimiExecutor(binary_path="kimi", os_env=os_env)
+    launch = ex._sandbox_launch_path(("PATH",))
+
+    assert launch.startswith("LAUNCHER::")
 
 
 def test_run_turn_emits_error_when_kimi_binary_missing(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -16,12 +16,16 @@ has no per-spawn config override flag (no `--config-file`, no
   not exposed to the kimi subprocess. `KimiExecutor.run_turn` accepts
   the `tools` argument for ABI parity and logs a one-time warning per
   session.
-- **Providers.** A spec that declares
-  `executor.auth: {type: provider, name: X}` or
-  `{type: databricks, profile: P}` cannot be threaded through to kimi.
-  `configure_agent_harness_with_provider` for `harness_type="kimi"`
-  raises rather than silently routing through whatever default kimi
+- **Providers.** A spec that declares any `executor.auth`
+  (`{type: provider, name: X}`, `{type: databricks, profile: P}`, or
+  `{type: api_key, ...}`) cannot be threaded through to kimi.
+  `_build_kimi_spawn_env` raises an `OmnigentError` at spawn-env build
+  time rather than silently routing through whatever default kimi
   already had — so users understand why their auth didn't take effect.
+  (The kimi builder never calls
+  `configure_agent_harness_with_provider` — there is no env-var surface
+  to translate a provider into — so the rejection lives in the builder
+  itself.)
 
 For v1, both are managed out-of-band:
 

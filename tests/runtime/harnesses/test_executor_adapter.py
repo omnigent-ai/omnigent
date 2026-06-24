@@ -798,6 +798,10 @@ class _StubExecutor:
         """Match Executor's close_session() signature for completeness."""
         del session_key
 
+    def forwards_observed_tool_results(self) -> bool:
+        """Match Executor's default — tool results round-trip through dispatch."""
+        return False
+
 
 def test_translate_input_to_messages_reconstructs_full_history() -> None:
     """
@@ -1054,6 +1058,59 @@ def test_translate_event_mcp_tool_call_request_emits_observed_with_bare_name() -
         f"lets the SDK client dedupe — losing it brings back "
         f"the duplicate-render bug."
     )
+
+
+def test_tool_call_complete_suppressed_for_dispatched_executor() -> None:
+    """A normal internally-handling executor's ``ToolCallComplete`` is
+    suppressed mid-turn (its tools round-trip through dispatch_tool, which
+    emits the output) — the existing dedup contract."""
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    adapter._executor = _StubExecutor()  # type: ignore[assignment]
+    ctx = _RecordingTurnContext()
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    adapter._translate_event(
+        ToolCallComplete(name="", status=ToolCallStatus.SUCCESS, result="out", metadata={}),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    assert ctx.emitted == []
+
+
+def test_tool_call_complete_forwarded_for_self_contained_executor() -> None:
+    """An executor that runs a self-contained tool loop with no scaffold
+    round-trip (the kimi CLI harness) has its ``ToolCallComplete`` forwarded
+    even mid-turn — without this, kimi tool calls render as perpetual
+    in-progress cards with no output (regression guard for B4)."""
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    class _ForwardingExecutor(_StubExecutor):
+        def forwards_observed_tool_results(self) -> bool:
+            return True
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    adapter._executor = _ForwardingExecutor()  # type: ignore[assignment]
+    ctx = _RecordingTurnContext()
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    adapter._translate_event(
+        ToolCallComplete(
+            name="",
+            status=ToolCallStatus.SUCCESS,
+            result="tool output here",
+            metadata={"call_id": "kimi_call_1"},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    assert len(ctx.emitted) == 1
+    item = ctx.emitted[0].item
+    assert item["type"] == "function_call_output"
+    assert item["call_id"] == "kimi_call_1"
 
 
 def test_translate_event_mcp_request_queues_tool_use_id_for_dispatch() -> None:
