@@ -495,6 +495,12 @@ describe("inventoryTerminals", () => {
     session: "main",
     running: true,
   };
+  const antigravityPane: TerminalInfo = {
+    id: "terminal_antigravity_main",
+    name: "antigravity",
+    session: "main",
+    running: true,
+  };
   const bash: TerminalInfo = {
     id: "terminal_bash_s1",
     name: "bash",
@@ -532,6 +538,16 @@ describe("inventoryTerminals", () => {
     // mode as the pi/cursor/goose panes above.
     expect(inventoryTerminals([qwenPane, bash], true)).toEqual([bash]);
     expect(isAgentTerminalKey("terminal:terminal_qwen_main")).toBe(true);
+  });
+
+  it("drops the antigravity vendor pane for native Antigravity sessions", () => {
+    // Regression (#1157): terminal_antigravity_main was missing from
+    // AGENT_TERMINAL_IDS, so the agy TUI pane leaked into the Shells inventory
+    // and (via isShellView) hid the Chat/Terminal pill in Terminal view —
+    // stranding the user with no way back to Chat. Same failure mode as the
+    // pi/cursor/goose/qwen panes above.
+    expect(inventoryTerminals([antigravityPane, bash], true)).toEqual([bash]);
+    expect(isAgentTerminalKey("terminal:terminal_antigravity_main")).toBe(true);
   });
 
   it("drops the embedded REPL terminal for terminal-first SDK sessions", () => {
