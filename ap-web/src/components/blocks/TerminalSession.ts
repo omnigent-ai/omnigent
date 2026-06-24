@@ -130,6 +130,12 @@ export type ConnectionStateListener = (state: ConnectionState) => void;
 export type TerminalActivityListener = () => void;
 /** Listener for user keyboard input sent to the terminal. */
 export type TerminalInputListener = () => void;
+/**
+ * Listener for an interactive login URL detected in terminal output
+ * (see {@link detectLoginUrl}). Called with the reconstructed URL, never
+ * with ``null`` — clearing is the view's concern (dismiss / supersede).
+ */
+export type TerminalLoginUrlListener = (url: string) => void;
 
 /** Kitty Keyboard Protocol / CSI-u encoding for Shift+Enter. */
 export const SHIFT_ENTER_CSI_U = "\x1b[13;2u";
@@ -275,6 +281,95 @@ export function applyTerminalCopy(
 }
 
 /**
+ * Strip ANSI escape sequences (CSI/SGR, OSC, charset selects) and bare
+ * carriage returns from terminal text, so URL detection sees plain
+ * characters. Not a terminal emulator — just enough to remove the control
+ * bytes that interleave printed output around a login URL.
+ *
+ * Pure helper — exported for direct unit testing.
+ */
+export function stripAnsiSequences(text: string): string {
+  return (
+    text
+      // CSI / SGR / cursor sequences: ESC [ … final byte.
+      // eslint-disable-next-line no-control-regex
+      .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+      // OSC sequences: ESC ] … (BEL | ST).
+      // eslint-disable-next-line no-control-regex
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+      // Charset selection / single-byte escapes: ESC ( B, ESC =, ESC >, …
+      // eslint-disable-next-line no-control-regex
+      .replace(/\x1b[()#][0-9A-Za-z]/g, "")
+      // eslint-disable-next-line no-control-regex
+      .replace(/\x1b[=>]/g, "")
+      .replace(/\r/g, "")
+  );
+}
+
+/**
+ * Detect an interactive login / OAuth-authorize URL in recent terminal
+ * output and return it reconstructed as a single line.
+ *
+ * CLIs built on Ink (Claude Code's ``claude /login`` and
+ * ``claude setup-token``, for example) HARD-wrap their long authorize URL
+ * at the terminal width — inserting real newlines — so the URL arrives
+ * split across several rows. {@link WebLinksAddon} can only linkify a URL
+ * that lives on one logical line, and a manual select-drag pulls in the
+ * wrap breaks: that is the "the login link splits into pieces and won't
+ * copy" papercut. This rejoins the wrapped chunks (consecutive,
+ * whitespace-free lines from the ``https://`` marker, stopping at a blank
+ * or prose line such as "Paste code here") and validates the result is an
+ * OAuth-authorize URL before surfacing it, so arbitrary URLs in scrollback
+ * never raise a false login banner. The last validating URL wins, so a
+ * fresh prompt supersedes a stale one still in the buffer.
+ *
+ * Pure helper — exported for direct unit testing.
+ *
+ * :param text: Recent terminal output (ANSI tolerated; stripped here).
+ * :returns: The reconstructed login URL, or ``null`` when none is found.
+ */
+export function detectLoginUrl(text: string): string | null {
+  const stripped = stripAnsiSequences(text);
+  let found: string | null = null;
+  // eslint-disable-next-line no-control-regex
+  const marker = /https?:\/\//g;
+  let m: RegExpExecArray | null;
+  while ((m = marker.exec(stripped)) !== null) {
+    let url = "";
+    for (const rawLine of stripped.slice(m.index).split("\n")) {
+      const line = rawLine.trim();
+      if (line === "" || /\s/.test(line)) break; // blank or prose ends the URL
+      url += line;
+      if (url.length > 4096) break;
+    }
+    const candidate = sanitizeLoginUrl(url);
+    if (candidate) found = candidate;
+  }
+  return found;
+}
+
+/**
+ * Validate a reconstructed string is an interactive-auth URL worth
+ * surfacing, returning it unchanged (NOT re-serialized — the OAuth flow is
+ * sensitive to the exact ``state`` / ``code_challenge``) or ``null``.
+ */
+function sanitizeLoginUrl(raw: string): string | null {
+  if (!raw || raw.length > 4096) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+  const looksOauth =
+    parsed.pathname.includes("authorize") ||
+    parsed.searchParams.has("code_challenge") ||
+    parsed.searchParams.get("response_type") === "code";
+  return looksOauth ? raw : null;
+}
+
+/**
  * One xterm ↔ tmux WebSocket bridge tied to a single DOM container.
  *
  * The constructor performs all the setup synchronously — open the
@@ -298,6 +393,14 @@ export class TerminalSession {
   private lastUserInputAt = 0;
   /** Guards {@link dispose} so calling it twice is a safe no-op. */
   private disposed = false;
+  /** Surfaces a detected interactive login URL; unset when not wired. */
+  private readonly onLoginUrl?: TerminalLoginUrlListener;
+  /** Rolling, ANSI-bearing tail of recent output, scanned for a login URL. */
+  private loginScanBuf = "";
+  /** Last URL handed to {@link onLoginUrl}; dedupes repeat detections. */
+  private lastLoginUrl: string | null = null;
+  /** Streaming decoder so a URL split across WS frames still reconstructs. */
+  private readonly loginDecoder = new TextDecoder();
 
   /**
    * Construct, attach to the DOM, and open the WebSocket.
@@ -312,6 +415,9 @@ export class TerminalSession {
    *     server. This is a best-effort UI activity signal, not a shell
    *     job-state oracle.
    * :param onInput: Called when user input is sent to the terminal.
+   * :param onLoginUrl: Called with an interactive login URL detected in
+   *     output (see {@link detectLoginUrl}), so the view can offer a
+   *     one-click copy/open instead of fighting Ink's hard-wrapped URL.
    */
   constructor(
     container: HTMLElement,
@@ -320,7 +426,9 @@ export class TerminalSession {
     isDark = false,
     onActivity?: TerminalActivityListener,
     onInput?: TerminalInputListener,
+    onLoginUrl?: TerminalLoginUrlListener,
   ) {
+    this.onLoginUrl = onLoginUrl;
     this.term = new Terminal({
       // Match the system mono stack at the configured base size. The
       // xterm.js defaults (15px, no theme) feel out of place inside the
@@ -524,6 +632,7 @@ export class TerminalSession {
    * off the echo when present.
    */
   private writeOutput(bytes: Uint8Array): void {
+    this.scanForLoginUrl(bytes);
     if (shouldEchoSynchronously(bytes.length, performance.now() - this.lastUserInputAt)) {
       // eslint-disable-next-line no-underscore-dangle
       const core = (this.term as unknown as TerminalCore)._core;
@@ -537,6 +646,29 @@ export class TerminalSession {
       }
     }
     this.term.write(bytes);
+  }
+
+  /**
+   * Tap inbound output for an interactive login URL and hand it to
+   * {@link onLoginUrl} (deduped). Cheap by design on the output hot path:
+   * a streaming decode into a bounded tail, an early ``"http"`` substring
+   * gate, then the {@link detectLoginUrl} rejoin only when that hits. No-op
+   * unless a listener is wired.
+   */
+  private scanForLoginUrl(bytes: Uint8Array): void {
+    if (!this.onLoginUrl) return;
+    this.loginScanBuf += this.loginDecoder.decode(bytes, { stream: true });
+    // The login block is well under 1 KB; keep a generous tail and drop the
+    // rest so scrollback can't grow this without bound.
+    if (this.loginScanBuf.length > 16384) {
+      this.loginScanBuf = this.loginScanBuf.slice(-16384);
+    }
+    if (!this.loginScanBuf.includes("http")) return;
+    const url = detectLoginUrl(this.loginScanBuf);
+    if (url && url !== this.lastLoginUrl) {
+      this.lastLoginUrl = url;
+      this.onLoginUrl(url);
+    }
   }
 
   private sendResize(): void {

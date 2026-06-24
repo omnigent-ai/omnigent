@@ -15,10 +15,12 @@ import {
   SYNC_ECHO_WINDOW_MS,
   TerminalSession,
   applyTerminalCopy,
+  detectLoginUrl,
   isUnexpectedTerminalClose,
   loadWebglRenderer,
   openTerminalLink,
   shouldEchoSynchronously,
+  stripAnsiSequences,
   terminalTheme,
   terminalKeyEventPayload,
 } from "./TerminalSession";
@@ -405,5 +407,63 @@ describe("TerminalSession", () => {
     const observer = FakeResizeObserver.instances[0];
     expect(observer.observed).toContain(container);
     session.dispose();
+  });
+});
+
+describe("stripAnsiSequences", () => {
+  it("removes CSI/SGR sequences but preserves URL query characters", () => {
+    // WHY: the strip must not eat '=' / '&' / '?' — an earlier draft that
+    // matched bare `[=>]` destroyed the query string of the login URL.
+    expect(stripAnsiSequences("\x1b[31mhttps://x/y?a=1&b=2>3\x1b[0m")).toBe(
+      "https://x/y?a=1&b=2>3",
+    );
+  });
+
+  it("strips OSC sequences and bare carriage returns", () => {
+    expect(stripAnsiSequences("\x1b]0;title\x07ok\r\n")).toBe("ok\n");
+  });
+});
+
+describe("detectLoginUrl", () => {
+  // A real Claude Code `/login` URL, hard-wrapped by Ink across rows the way
+  // it arrives in the terminal, framed by the surrounding prompt text.
+  const EXPECTED =
+    "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88" +
+    "ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.co" +
+    "m%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key&code_challenge=ePv5dp5C" +
+    "&code_challenge_method=S256&state=CrzosaLakVpGGnkQbH";
+  const WRAPPED = [
+    "Browser didn't open? Use the url below to sign in (c to copy)",
+    "",
+    "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88",
+    "ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.co",
+    "m%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key&code_challenge=ePv5dp5C",
+    "&code_challenge_method=S256&state=CrzosaLakVpGGnkQbH",
+    "",
+    "Paste code here if prompted >",
+  ].join("\n");
+
+  it("rejoins a hard-wrapped OAuth URL into one line", () => {
+    expect(detectLoginUrl(WRAPPED)).toBe(EXPECTED);
+  });
+
+  it("tolerates ANSI styling around the URL without corrupting it", () => {
+    expect(detectLoginUrl(`\x1b[1m${EXPECTED}\x1b[0m\n\nPaste code here >`)).toBe(EXPECTED);
+  });
+
+  it("ignores non-auth URLs in output", () => {
+    expect(detectLoginUrl("see https://example.com/docs for setup help")).toBeNull();
+    expect(detectLoginUrl("cloning https://github.com/omnigent-ai/omnigent.git")).toBeNull();
+  });
+
+  it("returns the most recent login URL when several are in scrollback", () => {
+    const buf =
+      "https://claude.com/oauth/authorize?response_type=code&state=OLD\n\n" +
+      "https://claude.com/oauth/authorize?response_type=code&state=NEW";
+    expect(detectLoginUrl(buf)).toContain("state=NEW");
+  });
+
+  it("returns null when there is no URL", () => {
+    expect(detectLoginUrl("just some build output\n$ ")).toBeNull();
   });
 });
