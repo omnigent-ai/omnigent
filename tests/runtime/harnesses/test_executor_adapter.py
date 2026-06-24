@@ -1923,3 +1923,39 @@ def test_non_dispatched_id_tool_complete_emits_output() -> None:
         f"{[e.item.get('type') for e in ctx.emitted]}"
     )
     assert fco_items[0].item.get("call_id") == call_id
+
+
+def test_idless_tool_complete_is_suppressed() -> None:
+    """A ToolCallComplete with no usable call_id emits nothing (no ghost card).
+
+    ``ExecutorAdapter`` is shared by every adapter-backed harness, so an inner
+    executor that bridges an id-less ``ToolCallComplete`` mid-turn (e.g. pi)
+    must NOT leak a ``function_call_output`` with ``call_id == ""``: downstream
+    consumers pair STRICTLY by call_id and discard empty ones, so such an output
+    cannot pair and only renders a perpetual "Waiting for output" ghost card.
+    The old blanket ``_current_ctx is not None`` rule swallowed these; the
+    id-scoped suppression must keep doing so (the ``or ""`` coercion alone left
+    this path unguarded).
+    """
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+
+    # No ``metadata.call_id`` at all → the ``or ""`` coercion yields an empty id.
+    adapter._translate_event(
+        ToolCallComplete(
+            name="run_command",
+            status=ToolCallStatus.SUCCESS,
+            result="idless-output",
+            metadata={},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    assert ctx.emitted == [], (
+        f"an id-less ToolCallComplete must be suppressed (it cannot pair "
+        f"downstream and only ghosts a 'Waiting for output' card); got "
+        f"{[e.item.get('type') for e in ctx.emitted]}"
+    )

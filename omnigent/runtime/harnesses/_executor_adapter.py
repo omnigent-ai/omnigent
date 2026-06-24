@@ -918,8 +918,8 @@ class ExecutorAdapter(HarnessApp):
             # here without a real call_id orphans and leaves its request a
             # perpetual in_progress card. Inner executors must stamp a real
             # id (antigravity allocates one positionally for the SDK's
-            # id-less error hook); the ``or ""`` below is only a defensive
-            # fallback.
+            # id-less error hook); an id-less completion is DROPPED below
+            # (it cannot pair) rather than emitted as a ghost card.
             #
             # A tool routed through _stable_tool_executor →
             # ctx.dispatch_tool already has its function_call_output
@@ -941,7 +941,21 @@ class ExecutorAdapter(HarnessApp):
             # antigravity tool call rendering as perpetual in_progress
             # with no paired function_call_output. Emit them.
             call_id = _call_id_from_metadata(getattr(event, "metadata", None)) or ""
-            if call_id and call_id in self._dispatched_call_ids:
+            # Suppress two cases — each would otherwise put a useless or duplicate
+            # function_call_output on the SSE stream:
+            #   1. a DISPATCHED id — _stable_tool_executor already emitted the
+            #      authoritative output via ctx.dispatch_tool (its single source);
+            #      a second one here duplicates it and ghosts a "Waiting for
+            #      output" card.
+            #   2. an EMPTY call_id — downstream consumers pair STRICTLY by call_id
+            #      and discard empty ones, so an id-less completion cannot pair; it
+            #      only renders a perpetual ghost card. This is a shared adapter
+            #      used by every adapter-backed harness, so an inner executor that
+            #      bridges an id-less ToolCallComplete mid-turn (the old blanket
+            #      ``_current_ctx is not None`` rule swallowed these) must not leak
+            #      an empty-id output. Internal-tool executors (antigravity) stamp a
+            #      real positional id, so their legitimate completions still emit.
+            if not call_id or call_id in self._dispatched_call_ids:
                 return
             item: dict[str, Any] = {
                 "id": f"fco_{uuid.uuid4().hex[:12]}",
