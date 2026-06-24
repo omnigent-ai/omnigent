@@ -42,6 +42,12 @@ def format_body(body: str) -> str:
 
     body = _append_section(
         body,
+        "Test Plan",
+        "How was this change tested? Describe the steps, commands, or scenarios "
+        "used to verify it (autoformat added this section — please replace it).",
+    )
+    body = _append_section(
+        body,
         "ELI5",
         "<!-- Optional: explain the change in plain language. -->",
     )
@@ -54,9 +60,9 @@ def format_body(body: str) -> str:
     body = _append_section(body, "Test coverage", _checkbox_block(TEST_LABELS))
     body = _append_section(
         body,
-        "Coverage rationale",
-        "Autoformat added this section; please add commands run or explain why "
-        "coverage is sufficient.",
+        "Coverage notes",
+        "<!-- Optional; required if you checked 'Manual verification completed' "
+        "or 'Not applicable' above. -->",
     )
     return body.rstrip() + "\n"
 
