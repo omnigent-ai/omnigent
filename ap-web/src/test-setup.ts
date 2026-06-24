@@ -10,6 +10,9 @@ vi.mock("@/components/icons/ClaudeIcon", () => ({
 vi.mock("@/components/icons/CodexIcon", () => ({
   CodexIcon: () => null,
 }));
+vi.mock("@/components/icons/OpenCodeIcon", () => ({
+  OpenCodeIcon: () => null,
+}));
 vi.mock("@/components/icons/CursorIcon", () => ({
   CursorIcon: () => null,
 }));

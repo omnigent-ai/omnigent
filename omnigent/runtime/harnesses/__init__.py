@@ -88,6 +88,16 @@ _HARNESS_MODULES: dict[str, str] = {
     # counterpart to the terminal-first ``goose-native`` TUI harness. Tool
     # approvals surface as web elicitation cards via session/request_permission.
     "goose": "omnigent.inner.goose_harness",
+    # Native OpenCode server bridge used by ``omnigent opencode``. The runner
+    # owns ``opencode serve`` + an SSE forwarder and this harness injects each
+    # web-UI turn over loopback HTTP — a native-server harness like
+    # codex-native, so both ``opencode-native`` and its ``native-opencode``
+    # alias are in ``NATIVE_HARNESSES``. See
+    # omnigent/inner/opencode_native_harness.py.
+    "opencode-native": "omnigent.inner.opencode_native_harness",
+    # ``opencode`` is accepted as a friendly alias for the canonical
+    # ``opencode-native`` (there is no separate SDK ``opencode`` harness).
+    "opencode": "omnigent.inner.opencode_native_harness",
 }
 
 __all__ = ["_HARNESS_MODULES"]

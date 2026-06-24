@@ -189,6 +189,9 @@ _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
         "default_agent",
         "harness",
         "model",
+        # OpenCode-specific default model (``provider/model``) the native
+        # ``omni opencode`` TUI launches on; set via `omni setup` → OpenCode.
+        "opencode_model",
         "server",
         _AUTO_OPEN_CONVERSATION_CONFIG_KEY,
     }
@@ -1171,6 +1174,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "host",
         "lakebox",
         "login",
+        "opencode",
         "pane-picker",
         "pane-split",
         "pi",
@@ -4319,6 +4323,105 @@ def codex(
     default=None,
     help=(
         "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch OpenCode, and attaches this TTY. "
+        'Pass --server "" to auto-spawn a persistent local server in the '
+        "background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to opencode-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.option("--model", default=None, help="OpenCode model to use for the native session.")
+@click.argument("opencode_args", nargs=-1, type=click.UNPROCESSED)
+def opencode(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    model: str | None,
+    opencode_args: tuple[str, ...],
+) -> None:
+    # :param server: Remote Omnigent server URL, or None for local.
+    # :param resume: None, picker sentinel, or a conversation id.
+    # :param session_id: Legacy ``--session`` id; mutually exclusive with ``--resume``.
+    # :param model: OpenCode model id pinned on the wrapper spec.
+    # :param opencode_args: Pass-through args persisted for the ``opencode attach`` TUI.
+    """Launch OpenCode TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent opencode
+      omnigent opencode --resume conv_abc123
+      omnigent opencode --resume                  # interactive picker
+      omnigent opencode --server https://<app>.databricksapps.com
+    """
+    from omnigent.opencode_native import run_opencode_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    if model is None:
+        # Prefer the OpenCode-specific default (set in `omni setup` → OpenCode →
+        # "Set default model"); fall back to the shared `model` key for back-compat.
+        model = cfg.get("opencode_model") or cfg.get("model")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    # Validate option combinations before any side effects (see the codex
+    # command): _ensure_backend can spawn the daemon and take the full
+    # local-server-discover timeout, which would mask a bad arg pair as an
+    # outage instead of a usage error.
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+
+    # Ensure the host daemon (local when ``--server`` is omitted/empty, remote
+    # otherwise); the daemon-spawned runner owns ``opencode serve`` + the TUI,
+    # and this CLI attaches to the tmux terminal.
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+    run_opencode_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        opencode_args=opencode_args,
+        model=model,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
         "daemon-spawned runner to launch Pi, and attaches this TTY. "
         'Pass --server "" to auto-spawn a persistent local server in the '
         "background and use that instead of a remote one."
@@ -5153,6 +5256,12 @@ def _dispatch_native_terminal_harness(
         from omnigent.cursor_native import run_cursor_native
 
         run_cursor_native(cursor_args=passthrough, **common)
+    elif native_agent.key == "opencode":
+        from omnigent.opencode_native import run_opencode_native
+
+        # OpenCode pins its model on the wrapper spec (like Codex), so it takes
+        # ``model`` first-class rather than via a ``--model`` passthrough arg.
+        run_opencode_native(opencode_args=(), model=model, **common)
     else:  # pragma: no cover - new native agent added without a dispatch arm
         raise click.ClickException(f"No native terminal launcher wired for harness {harness!r}.")
     return True
@@ -9542,6 +9651,245 @@ def _remove_credential(provider: str) -> str | None:
     return f"✓ Removed {label}"
 
 
+def _launch_opencode_auth_login() -> str | None:
+    """Launch interactive ``opencode auth login``; return a post-login status.
+
+    ``opencode auth login`` is interactive (pick a provider, sign in), so this
+    hands the terminal to ``opencode`` and re-reads the credential state on
+    return. Mirrors :func:`_launch_goose_configure`.
+    """
+    from omnigent.onboarding.harness_install import (
+        OPENCODE_KEY,
+        harness_cli_installed,
+        harness_install_spec,
+    )
+    from omnigent.onboarding.interactive import console
+    from omnigent.onboarding.opencode_auth import opencode_auth_summary
+
+    if not harness_cli_installed(OPENCODE_KEY):
+        return "✗ opencode CLI not found"
+    spec = harness_install_spec(OPENCODE_KEY)
+    assert spec is not None
+    console.print(
+        "  [dim]Launching [bold]opencode auth login[/bold] — pick a provider and "
+        "sign in, then return.[/dim]"
+    )
+    with contextlib.suppress(OSError, KeyboardInterrupt):
+        subprocess.run([spec.binary, "auth", "login"], check=False)
+    summary = opencode_auth_summary()
+    if summary.has_provider:
+        return f"✓ providers: {summary.describe()}"
+    return "No provider detected yet"
+
+
+def _run_opencode_auth_list() -> None:
+    """Show ``opencode auth list`` (stored credentials + detected env providers)."""
+    from omnigent.onboarding.harness_install import OPENCODE_KEY, harness_install_spec
+
+    spec = harness_install_spec(OPENCODE_KEY)
+    if spec is None:
+        return
+    with contextlib.suppress(OSError, KeyboardInterrupt):
+        subprocess.run([spec.binary, "auth", "list"], check=False)
+
+
+def _list_opencode_models() -> list[str]:
+    """Return the ``provider/model`` ids OpenCode can launch (``opencode models``).
+
+    Best-effort: an absent CLI or a failed/empty invocation yields ``[]`` (the
+    caller then tells the user to sign a provider in first).
+    """
+    from omnigent.onboarding.harness_install import OPENCODE_KEY, harness_install_spec
+
+    spec = harness_install_spec(OPENCODE_KEY)
+    if spec is None:
+        return []
+    try:
+        result = subprocess.run(
+            [spec.binary, "models"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _set_opencode_default_model(current: str | None) -> str | None:
+    """Pick OpenCode's default model and persist it as ``opencode_model``.
+
+    The choice is what ``omni opencode`` launches on when no ``--model`` is
+    given — written into the per-session ``opencode.json`` at spawn so the TUI
+    starts on it instead of ``opencode/big-pickle``. Returns a status line for
+    the drill-in, or ``None`` when cancelled.
+
+    :param current: The currently-persisted default model, or ``None``.
+    """
+    from omnigent.onboarding.interactive import console, select
+    from omnigent.onboarding.opencode_auth import reachable_provider_ids
+
+    models = _list_opencode_models()
+    if not models:
+        return "✗ no models — sign in to a provider first (opencode auth login)"
+    # `opencode models` can list hundreds of `provider/model` ids across every
+    # provider on models.dev — too long for the picker (it overflows the
+    # viewport and flickers). Narrow to the providers the user can actually
+    # authenticate (stored auth.json + env keys); fall back to the full list
+    # only if that filter would hide everything.
+    reachable = reachable_provider_ids()
+    if reachable:
+        scoped = [m for m in models if m.split("/", 1)[0] in reachable]
+        models = scoped or models
+    options = list(models)
+    clear_index = -1
+    if current is not None:
+        clear_index = len(options)
+        options.append("Clear default (use OpenCode's own default)")
+    default = models.index(current) if current in models else 0
+    # Even filtered to reachable providers the list can exceed the screen, so
+    # bound the picker to a scrolling viewport sized to the terminal (leaving
+    # room for the title / status / footer / "N more" markers).
+    rows = shutil.get_terminal_size(fallback=(80, 24)).lines
+    idx = select(
+        "Pick OpenCode's default model",
+        options,
+        default=default,
+        clear_on_exit=True,
+        status=f"current: {current}" if current else None,
+        max_visible=max(5, rows - 8),
+    )
+    if idx < 0:
+        return None
+    if idx == clear_index:
+        _save_global_config({}, unset_keys=("opencode_model",))
+        console.print("  [green]✓ default model cleared[/green]")
+        return "✓ default model cleared"
+    chosen = models[idx]
+    _save_global_config({"opencode_model": chosen})
+    console.print(f"  [green]✓ default model set to[/green] [bold]{chosen}[/bold]")
+    return f"✓ default model: {chosen}"
+
+
+def _print_opencode_auth_help() -> None:
+    """Explain where OpenCode's model credentials come from."""
+    from omnigent.onboarding.interactive import console
+
+    console.print(
+        "  OpenCode resolves a model from the provider its agent uses:\n"
+        "    • [bold]opencode auth login[/bold] — sign in to a provider (OpenAI, Anthropic, …);\n"
+        "      stored in ~/.local/share/opencode/auth.json.\n"
+        "    • Provider env vars (OPENAI_API_KEY / ANTHROPIC_API_KEY / …) are auto-detected.\n"
+        "    • Databricks gateway: set an agent ``profile`` (configured under Claude / Codex);\n"
+        "      Omnigent synthesizes opencode's per-session provider config from it.\n"
+        "  Omnigent stores no OpenCode credential of its own.\n"
+        "  [dim]Tip:[/dim] 'Set default model' picks which model `omni opencode` launches on\n"
+        "  (otherwise OpenCode uses its built-in default, opencode/big-pickle)."
+    )
+
+
+def _manage_opencode_harness() -> None:
+    """Run the level-2 drill-in for OpenCode: ensure the CLI, then manage providers.
+
+    OpenCode owns its own provider auth — ``opencode auth login`` (stored in
+    ``~/.local/share/opencode/auth.json``) or ambient provider env vars — so,
+    like the Goose / Qwen drill-ins, this reports which providers OpenCode can
+    reach and offers to launch its native login; it never stores a key through
+    Omnigent. (For the Databricks-gateway path the agent's ``profile`` is
+    synthesized into opencode's per-session config instead — set under
+    Claude / Codex.)
+
+    OpenCode is npm-installable, so a missing CLI gates the drill-in with an
+    install offer.
+
+    :returns: None. Side effect: may ``npm install`` the opencode CLI.
+    """
+    from omnigent.onboarding.harness_install import (
+        OPENCODE_KEY,
+        harness_cli_installed,
+        harness_install_command,
+        install_harness_cli,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    if not harness_cli_installed(OPENCODE_KEY):
+        cmd = " ".join(harness_install_command(OPENCODE_KEY))
+        choice = select(
+            "OpenCode's CLI isn't installed. Install it now?",
+            [
+                f"Yes — install ({cmd})",
+                "No — back to harnesses",
+                "I'll run it myself (show the command)",
+            ],
+            descriptions=[
+                f"Runs `{cmd}` (needs npm).",
+                "Return to the harness picker without installing.",
+                "Print the command so you can install it yourself, then return.",
+            ],
+            default=0,
+            clear_on_exit=True,
+        )
+        if choice == 0:
+            console.print(f"  [dim]Installing OpenCode — running `{cmd}`…[/dim]")
+            if install_harness_cli(OPENCODE_KEY):
+                console.print("  [green]✓ OpenCode installed[/green]")
+            else:
+                console.print(
+                    f"  [red]Install failed.[/red] Run it manually, then re-open: "
+                    f"[bold]{cmd}[/bold]"
+                )
+                return
+        elif choice == 2:  # run it yourself
+            console.print(f"  Install OpenCode with:\n    [bold]{cmd}[/bold]")
+            return
+        else:
+            return
+
+    # OpenCode owns its provider auth (``opencode auth login`` → auth.json) or
+    # ambient env keys; Omnigent stores nothing. Report what's reachable and
+    # offer to run its native login — like the Goose/Qwen drill-ins.
+    status: str | None = None
+    while True:
+        from omnigent.onboarding.opencode_auth import opencode_auth_summary
+
+        summary = opencode_auth_summary()
+        default_model = _load_effective_config().get("opencode_model")
+        header = (
+            f"OpenCode — providers: {summary.describe()}"
+            if summary.has_provider
+            else "OpenCode — no provider configured yet"
+        )
+        model_label = (
+            f"Set default model (current: {default_model})"
+            if default_model
+            else "Set default model"
+        )
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow("Run opencode auth login", action="login"),
+            _HarnessMenuRow(model_label, action="model"),
+            _HarnessMenuRow("List providers & credentials", action="list"),
+            _HarnessMenuRow("Show provider options", action="help"),
+            _HarnessMenuRow("← Back", action="back"),
+        ]
+        idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
+        if idx < 0:  # Esc / q
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "login":
+            status = _launch_opencode_auth_login()
+        elif action == "model":
+            status = _set_opencode_default_model(default_model)
+        elif action == "list":
+            _run_opencode_auth_list()
+            status = None
+        elif action == "help":
+            _print_opencode_auth_help()
+            status = None
+
+
 def _run_configure_harnesses_interactive() -> None:
     """Run the interactive model/credential three-level picker.
 
@@ -9573,6 +9921,7 @@ def _run_configure_harnesses_interactive() -> None:
     from omnigent.onboarding.harness_install import (
         CURSOR_KEY,
         GOOSE_KEY,
+        OPENCODE_KEY,
         QWEN_KEY,
         harness_cli_installed,
         harness_install_command,
@@ -9620,6 +9969,11 @@ def _run_configure_harnesses_interactive() -> None:
     # provider family (its v1 auth is the CLI's own env vars / ``/auth`` flow,
     # not an Omnigent credential), so it dispatches to its own drill-in.
     _QWEN = "\x00qwen"
+    # Sentinel marking the OpenCode row — native-server harness with no Omnigent
+    # credential of its own (it routes through the bound agent's Databricks
+    # gateway profile or ambient provider env), so it dispatches to its own
+    # binary-install/info drill-in.
+    _OPENCODE = "\x00opencode"
     # Sentinel marking the Goose row — like Qwen/Antigravity/Cursor it is not a
     # provider family (Goose owns its own auth via ``goose configure``, not an
     # Omnigent credential), so it dispatches to its own drill-in.
@@ -9754,6 +10108,32 @@ def _run_configure_harnesses_interactive() -> None:
         options.append(f"  {qwen_sub}")
         selectable.append(False)
         row_target.append(None)
+        # OpenCode (native-server harness): readiness is just whether the
+        # ``opencode`` CLI is installed — it has no Omnigent-stored credential,
+        # routing through the bound agent's Databricks gateway profile or
+        # ambient provider env. Its drill-in installs the CLI and explains that.
+        # OpenCode: ready = CLI installed AND a provider reachable (a stored
+        # ``opencode auth login`` credential or a provider env key). Drill-in
+        # manages its native login. (Gateway path uses the agent profile.)
+        from omnigent.onboarding.opencode_auth import opencode_auth_summary
+
+        opencode_summary = opencode_auth_summary()
+        opencode_ready = opencode_summary.ready
+        options.append(f"{'  ' if opencode_ready else '[red]✗[/] '}OpenCode")
+        selectable.append(True)
+        row_target.append(_OPENCODE)
+        if not opencode_summary.installed:
+            from rich.markup import escape as _rich_escape
+
+            opencode_cmd = _rich_escape(" ".join(harness_install_command(OPENCODE_KEY)))
+            opencode_sub = f"[dim]not installed — open to install ({opencode_cmd})[/]"
+        elif opencode_ready:
+            opencode_sub = f"[green]✓[/] {opencode_summary.describe()}"
+        else:
+            opencode_sub = "[dim]installed — open to sign in (opencode auth login)[/]"
+        options.append(f"  {opencode_sub}")
+        selectable.append(False)
+        row_target.append(None)
         # Goose (its own provider config — no provider family, like Cursor /
         # Antigravity / Qwen). Goose owns its auth via ``goose configure``
         # (keyring / ~/.config/goose/config.yaml); Omnigent stores no key, so
@@ -9805,6 +10185,8 @@ def _run_configure_harnesses_interactive() -> None:
             _manage_antigravity_harness()
         elif target == _QWEN:
             _manage_qwen_harness()
+        elif target == _OPENCODE:
+            _manage_opencode_harness()
         elif target == _GOOSE:
             _manage_goose_harness()
         else:  # Quit row (or, defensively, a non-family row)

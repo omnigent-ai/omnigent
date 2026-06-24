@@ -553,6 +553,7 @@ describe("isAgentTerminalKey", () => {
     expect(isAgentTerminalKey("terminal:terminal_tui_main")).toBe(true);
     expect(isAgentTerminalKey("terminal:terminal_claude_main")).toBe(true);
     expect(isAgentTerminalKey("terminal:terminal_codex_main")).toBe(true);
+    expect(isAgentTerminalKey("terminal:terminal_opencode_main")).toBe(true);
     // pi-native: missing here is what hid the Chat/Terminal pill in
     // Terminal view (isShellView wrongly true) for Pi sessions.
     expect(isAgentTerminalKey("terminal:terminal_pi_main")).toBe(true);

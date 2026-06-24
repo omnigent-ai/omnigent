@@ -20,7 +20,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -59,6 +59,7 @@ from omnigent.runner.resource_registry import (
     CURSOR_NATIVE_TERMINAL_ROLE,
     GOOSE_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
+    OPENCODE_NATIVE_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
     TerminalExitEvent,
@@ -350,6 +351,11 @@ _COST_POPUP_REPOP_TASKS: set[asyncio.Task[Any]] = set()
 # Background Codex app-server instances for host-spawned codex-native
 # runners, kept referenced so they aren't garbage-collected mid-run.
 _AUTO_CODEX_APP_SERVERS: dict[str, Any] = {}
+
+# Background OpenCode ``opencode serve`` instances for host-spawned
+# opencode-native runners, kept referenced so they aren't garbage-collected
+# mid-run (mirrors ``_AUTO_CODEX_APP_SERVERS``).
+_AUTO_OPENCODE_SERVERS: dict[str, Any] = {}
 
 # Bound repeated terminal GET miss logs from tight client poll loops.
 _TERMINAL_LOOKUP_MISS_LOG_INTERVAL_S = 10.0
@@ -719,6 +725,475 @@ async def _codex_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class _OpenCodeNativeLaunchConfig:
+    """
+    Persisted launch config for runner-owned OpenCode terminals.
+
+    :param workspace: Workspace cwd for ``opencode serve`` and the TUI.
+    :param policy_server_url: Omnigent server URL for the forwarder.
+    :param terminal_launch_args: User pass-through OpenCode CLI args.
+    :param model_override: Persisted model override, or ``None``.
+    :param external_session_id: Existing OpenCode session id to resume.
+    """
+
+    workspace: Path
+    policy_server_url: str
+    terminal_launch_args: list[str] | None
+    model_override: str | None
+    external_session_id: str | None
+
+
+async def _opencode_native_launch_config(
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+) -> _OpenCodeNativeLaunchConfig:
+    """
+    Fetch and validate persisted OpenCode launch config for a session.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param server_client: Runner Omnigent server client.
+    :returns: Parsed launch config.
+    :raises RuntimeError: If the snapshot or required runner env is missing.
+    """
+    if server_client is None:
+        raise RuntimeError("server_client is required for runner-owned OpenCode terminals.")
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            timeout=10.0,
+        )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Could not fetch OpenCode launch config for {session_id!r}.") from exc
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Could not fetch OpenCode launch config for {session_id!r}: "
+            f"GET /v1/sessions returned {resp.status_code}."
+        )
+    try:
+        snapshot = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Could not fetch OpenCode launch config for {session_id!r}: invalid JSON."
+        ) from exc
+    if not isinstance(snapshot, dict):
+        raise RuntimeError(
+            f"Could not fetch OpenCode launch config for {session_id!r}: "
+            "snapshot was not a JSON object."
+        )
+    terminal_launch_args = snapshot.get("terminal_launch_args")
+    if terminal_launch_args is not None and not (
+        isinstance(terminal_launch_args, list)
+        and all(isinstance(arg, str) for arg in terminal_launch_args)
+    ):
+        raise RuntimeError(f"Invalid terminal_launch_args for OpenCode session {session_id!r}.")
+    model_override = snapshot.get("model_override")
+    if model_override is not None:
+        if not isinstance(model_override, str) or not model_override:
+            raise RuntimeError(f"Invalid model_override for OpenCode session {session_id!r}.")
+        try:
+            validate_model_override(model_override)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid model_override for OpenCode session {session_id!r}: {exc}"
+            ) from exc
+    external_session_id = snapshot.get("external_session_id")
+    if external_session_id is not None and (
+        not isinstance(external_session_id, str) or not external_session_id
+    ):
+        raise RuntimeError(f"Invalid external_session_id for OpenCode session {session_id!r}.")
+    session_workspace = snapshot.get("workspace")
+    if session_workspace is not None and (
+        not isinstance(session_workspace, str) or not session_workspace
+    ):
+        raise RuntimeError(f"Invalid workspace for OpenCode session {session_id!r}.")
+    return _OpenCodeNativeLaunchConfig(
+        workspace=_codex_session_workspace(session_workspace),
+        policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
+        terminal_launch_args=terminal_launch_args,
+        model_override=model_override,
+        external_session_id=external_session_id,
+    )
+
+
+async def _auto_create_opencode_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, Any]], None],
+    *,
+    agent_spec: Any | None = None,
+    server_client: httpx.AsyncClient | None = None,
+) -> SessionResourceView:
+    """
+    Auto-create an OpenCode terminal for an opencode-native session.
+
+    Mirrors :func:`_auto_create_codex_terminal`, substituting ``opencode
+    serve`` / ``opencode attach`` for Codex's app-server/remote transport:
+    boots a per-session ``opencode serve`` process, resumes-or-creates the
+    OpenCode session, persists bridge state + ``external_session_id``,
+    starts the SSE forwarder, then registers the ``opencode attach`` TUI as
+    a streamable terminal resource attached to that server.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param resource_registry: Registry used to launch the terminal.
+    :param publish_event: Per-session SSE emitter for the new terminal.
+    :param agent_spec: Optional resolved agent spec (os_env + model).
+    :param server_client: Runner Omnigent server HTTP client.
+    :returns: The created terminal resource view.
+    """
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.opencode_native_app_server import (
+        OpenCodeNativeServer,
+        build_opencode_attach_args,
+        opencode_terminal_env,
+    )
+    from omnigent.opencode_native_bridge import (
+        OpenCodeNativeBridgeState,
+        clear_bridge_state,
+        prepare_bridge_dir,
+        seed_opencode_auth,
+        write_bridge_state,
+    )
+    from omnigent.opencode_native_forwarder import OpenCodeNativeForwarder
+
+    launch_config = await _opencode_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = str(launch_config.workspace)
+    bridge_dir = prepare_bridge_dir(session_id)
+    # Cancel any surviving forwarder first so its teardown closes the OLD
+    # server, then clear stale bridge state so web injection waits for the
+    # new launch's URL/session instead of a dead one.
+    await _cancel_auto_forwarder_task(session_id)
+    leftover = _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+    if leftover is not None:
+        with contextlib.suppress(Exception):
+            await leftover.close()
+    clear_bridge_state(bridge_dir)
+
+    model_override = launch_config.model_override or _opencode_native_model_from_spec(agent_spec)
+    # Route opencode through the Databricks AI gateway when the spec names a
+    # profile. Unlike codex/claude/pi (which consume HARNESS_*_GATEWAY_* env the
+    # CLI translates), opencode reads provider/auth from its own config file, so
+    # synthesize an opencode.json into the per-session XDG config dir BEFORE the
+    # server boots. Best-effort: if the gateway can't be resolved (no profile,
+    # databricks-sdk absent, auth failure), opencode falls back to whatever
+    # provider config the ambient env/global config already gives it.
+    from omnigent.opencode_native_bridge import xdg_config_home_for_bridge_dir
+    from omnigent.opencode_native_provider import (
+        build_opencode_model_default_config,
+        build_opencode_provider_config,
+        resolve_databricks_gateway,
+        write_opencode_provider_config,
+    )
+
+    gateway = resolve_databricks_gateway(
+        _opencode_native_profile_from_spec(agent_spec), model_id=model_override
+    )
+    if gateway is not None:
+        # Pin the per-prompt model to the synthesized provider/endpoint id, and
+        # write it as opencode's default model too so the TUI launches on it.
+        model_override = gateway.qualified_model
+        config = build_opencode_provider_config(gateway)
+        config["model"] = model_override
+        write_opencode_provider_config(xdg_config_home_for_bridge_dir(bridge_dir), config)
+    elif model_override:
+        # No custom provider, but a model is pinned (``omni opencode --model`` or
+        # the ``omni setup`` OpenCode default): write opencode's default model so
+        # the native TUI and the first turn use it instead of ``opencode/big-pickle``.
+        # OpenCode resolves the provider from the model-id prefix against its own
+        # auth.json, so no provider block is needed.
+        write_opencode_provider_config(
+            xdg_config_home_for_bridge_dir(bridge_dir),
+            build_opencode_model_default_config(model_override),
+        )
+
+    # The server runs with a per-session XDG_DATA_HOME, so copy the user's
+    # `opencode auth login` credentials in — otherwise it can't authenticate
+    # their providers and falls back to the no-auth default model. No-op on a
+    # remote runner (no local auth.json) / Databricks-gateway path.
+    seed_opencode_auth(bridge_dir)
+
+    server = OpenCodeNativeServer(bridge_dir=bridge_dir, workspace=launch_config.workspace)
+    await server.start()
+    _AUTO_OPENCODE_SERVERS[session_id] = server
+
+    try:
+        client = server.client()
+        try:
+            opencode_session_id: str | None = None
+            if launch_config.external_session_id is not None:
+                existing = await client.get_session(launch_config.external_session_id)
+                if existing is not None:
+                    opencode_session_id = existing.id
+            if opencode_session_id is None:
+                created = await client.create_session({"title": f"omnigent:{session_id}"})
+                opencode_session_id = created.id
+                # Persist the OpenCode session id so a later relaunch resumes
+                # it (best effort, like codex-native).
+                if server_client is not None:
+                    with contextlib.suppress(httpx.HTTPError):
+                        await server_client.patch(
+                            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                            json={"external_session_id": opencode_session_id},
+                            timeout=10.0,
+                        )
+        finally:
+            await client.aclose()
+
+        write_bridge_state(
+            bridge_dir,
+            OpenCodeNativeBridgeState(
+                session_id=session_id,
+                server_base_url=server.base_url,
+                opencode_session_id=opencode_session_id,
+                auth_secret=server.auth_secret,
+                xdg_data_home=str(server.xdg_data_home),
+                xdg_config_home=str(server.xdg_config_home),
+                model_override=model_override,
+                workspace=workspace,
+            ),
+        )
+    except Exception:
+        await server.close()
+        _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+        raise
+
+    # Start the SSE forwarder in the background so session creation never
+    # blocks on it. The forwarder owns its OpenCode client for the stream
+    # lifetime; ``server_client`` is the runner's Omnigent client. The
+    # supervisor closes the ``opencode serve`` subprocess when forwarding
+    # ends (cancelled on session teardown), mirroring the codex forwarder's
+    # ``finally`` — else one server orphans per session.
+    if server_client is not None:
+        forwarder = OpenCodeNativeForwarder(
+            session_id=session_id,
+            opencode_session_id=opencode_session_id,
+            opencode_client=server.client(),
+            server_client=server_client,
+            bridge_dir=bridge_dir,
+            workspace=workspace,
+            # Route OpenCode permission requests through the SAME server-side
+            # policy/approval gate codex-native uses. Without this the
+            # forwarder would fall back to its fail-closed ``reject`` default
+            # and deny every tool; with it, policy decides and an ``ask``
+            # parks a human approval card server-side.
+            policy_evaluator=_build_opencode_policy_evaluator(
+                server_client=server_client,
+                conversation_id=session_id,
+            ),
+        )
+        forwarder_task = asyncio.create_task(
+            _supervise_opencode_forwarder(session_id, server, forwarder),
+            name=f"opencode-forwarder-{session_id}",
+        )
+        _register_auto_forwarder_task(session_id, forwarder_task)
+
+    agent_os_env = _agent_os_env_from_spec(agent_spec)
+    try:
+        terminal_view = await resource_registry.launch_auxiliary_terminal(
+            session_id=session_id,
+            terminal_name="opencode",
+            session_key="main",
+            resource_role=OPENCODE_NATIVE_TERMINAL_ROLE,
+            parent_os_env=agent_os_env,
+            spec=TerminalEnvSpec(
+                os_env=OSEnvSpec(
+                    type="caller_process",
+                    cwd=workspace,
+                    sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+                ),
+                command=server.opencode_path,
+                args=build_opencode_attach_args(
+                    server_url=server.base_url,
+                    workspace=workspace,
+                    session_id=opencode_session_id,
+                    opencode_args=tuple(launch_config.terminal_launch_args or ()),
+                ),
+                env=opencode_terminal_env(server),
+                scrollback=100_000,
+                tmux_allow_passthrough=True,
+                tmux_start_on_attach=False,
+            ),
+        )
+        publish_event(
+            session_id,
+            {
+                "type": "session.resource.created",
+                "resource": session_resource_view_to_dict(terminal_view),
+            },
+        )
+    except Exception:
+        await _cancel_auto_forwarder_task(session_id)
+        await server.close()
+        _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+        raise
+
+    _logger.info("Auto-created opencode terminal + forwarder for session %s", session_id)
+    return terminal_view
+
+
+async def _supervise_opencode_forwarder(
+    session_id: str,
+    server: Any,
+    forwarder: Any,
+) -> None:
+    """
+    Run the OpenCode SSE forwarder, closing the server when it ends.
+
+    Mirrors the codex forwarder task's ``finally``: when forwarding stops
+    (the SSE connection dropped or the task was cancelled on session
+    teardown) the per-session ``opencode serve`` subprocess is ours to
+    stop, else it orphans one process per session.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param server: The :class:`OpenCodeNativeServer` to close on exit.
+    :param forwarder: The :class:`OpenCodeNativeForwarder` to run.
+    :returns: None.
+    """
+    try:
+        await forwarder.run()
+    finally:
+        leftover = _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+        if leftover is not None:
+            with contextlib.suppress(Exception):
+                await leftover.close()
+        elif server is not None:
+            with contextlib.suppress(Exception):
+                await server.close()
+
+
+# Permission decisions can park a human approval card server-side
+# (``POLICY_ACTION_ASK``), so the evaluate POST may block until a human
+# resolves it. Match the codex-native policy hook's day-long budget; the
+# server caps the real wait via the deciding policy's ``ask_timeout``.
+_OPENCODE_POLICY_EVALUATE_TIMEOUT_S = 86400.0
+# Map the server's proto verdict onto the forwarder's verdict vocabulary
+# (``map_verdict_to_decision`` reads ``decision``). Anything unknown is
+# treated as ``ask`` → the forwarder fails it closed to ``reject``.
+_OPENCODE_POLICY_ACTION_TO_DECISION = {
+    "POLICY_ACTION_ALLOW": "allow",
+    "POLICY_ACTION_DENY": "deny",
+    "POLICY_ACTION_ASK": "ask",
+}
+
+
+def _build_opencode_policy_evaluator(
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+) -> Callable[[Mapping[str, Any]], Awaitable[Mapping[str, Any] | None]]:
+    """
+    Build the policy evaluator the OpenCode permission forwarder consults.
+
+    Mirrors codex-native's policy hook exactly: every OpenCode
+    ``permission.v2.asked`` request is POSTed to this session's
+    ``/v1/sessions/{id}/policies/evaluate`` endpoint as a
+    ``PHASE_TOOL_CALL`` event. The server evaluates configured policies and
+    — for an ``ASK`` verdict — parks a human approval card and blocks until
+    it is resolved, returning a hard ``ALLOW``/``DENY``. The forwarder turns
+    that into an OpenCode ``once``/``always``/``reject`` reply.
+
+    Fails CLOSED: an unreachable server, a non-200, a malformed body, or an
+    unresolved ``ASK`` all yield a ``deny``/``ask`` verdict the forwarder
+    rejects — never a silent approve. Only an explicit ``ALLOW`` permits the
+    operation.
+
+    :param server_client: Runner's Omnigent server HTTP client.
+    :param conversation_id: Owning Omnigent session id, e.g. ``"conv_abc"``.
+    :returns: An async evaluator returning a verdict mapping, or a deny
+        verdict on failure.
+    """
+    from omnigent.opencode_native_permissions import OPENCODE_NATIVE_HARNESS
+
+    session_component = urllib.parse.quote(conversation_id, safe="")
+    url = f"/v1/sessions/{session_component}/policies/evaluate"
+
+    async def _evaluate(normalized: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        arguments: dict[str, Any] = {
+            key: normalized[key]
+            for key in ("command", "path", "url")
+            if normalized.get(key) is not None
+        }
+        metadata = normalized.get("metadata")
+        if isinstance(metadata, Mapping) and metadata:
+            arguments.setdefault("metadata", dict(metadata))
+        body = {
+            "event": {
+                "type": "PHASE_TOOL_CALL",
+                "target": "",
+                "data": {
+                    "name": normalized.get("action") or "permission",
+                    "arguments": arguments,
+                },
+                "context": {"harness": OPENCODE_NATIVE_HARNESS},
+            },
+        }
+        try:
+            resp = await server_client.post(
+                url, json=body, timeout=_OPENCODE_POLICY_EVALUATE_TIMEOUT_S
+            )
+        except httpx.HTTPError:
+            _logger.warning(
+                "OpenCode policy evaluate POST failed for %s; failing closed",
+                conversation_id,
+                exc_info=True,
+            )
+            return {"decision": "deny"}
+        if resp.status_code != 200 or not resp.content:
+            _logger.warning(
+                "OpenCode policy evaluate returned %s for %s; failing closed",
+                resp.status_code,
+                conversation_id,
+            )
+            return {"decision": "deny"}
+        try:
+            result = resp.json()
+        except ValueError:
+            _logger.warning("OpenCode policy evaluate returned non-JSON; failing closed")
+            return {"decision": "deny"}
+        action = result.get("result") if isinstance(result, Mapping) else None
+        return {"decision": _OPENCODE_POLICY_ACTION_TO_DECISION.get(str(action), "ask")}
+
+    return _evaluate
+
+
+def _opencode_native_model_from_spec(agent_spec: Any | None) -> str | None:
+    """
+    Resolve the OpenCode default model from a resolved agent spec.
+
+    :param agent_spec: Optional resolved agent spec.
+    :returns: The spec's executor model, or ``None``.
+    """
+    if agent_spec is None:
+        return None
+    try:
+        from omnigent.runtime.workflow import _resolve_spec_model
+
+        return _resolve_spec_model(getattr(agent_spec, "spec", agent_spec))
+    except Exception:  # noqa: BLE001 - model resolution is best effort.
+        return None
+
+
+def _opencode_native_profile_from_spec(agent_spec: Any | None) -> str | None:
+    """
+    Resolve the Databricks profile from a resolved agent spec, if any.
+
+    :param agent_spec: Optional resolved agent spec.
+    :returns: The spec's ``executor.config.profile``, or ``None``.
+    """
+    if agent_spec is None:
+        return None
+    try:
+        spec = getattr(agent_spec, "spec", agent_spec)
+        profile = spec.executor.config.get("profile")
+        return str(profile) if profile else None
+    except Exception:  # noqa: BLE001 - profile resolution is best effort.
+        return None
 
 
 def _pi_args_have_session_control(args: list[str]) -> bool:
@@ -4816,6 +5291,7 @@ def create_runner_app(
     _session_comment_relays: dict[str, Any] = {}
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _opencode_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _cursor_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _goose_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     # Per-session lock guarding the claude-native terminal auto-create in
@@ -5676,6 +6152,18 @@ def create_runner_app(
                 from omnigent.pi_native_bridge import build_pi_native_spawn_env
 
                 spawn_env = build_pi_native_spawn_env(session_id)
+            if harness_name == "opencode-native" and spawn_env is None:
+                from omnigent.opencode_native_bridge import (
+                    OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
+                    build_opencode_native_spawn_env,
+                )
+
+                labels = await _session_labels_for_runner_spawn(
+                    server_client=server_client,
+                    session_id=session_id,
+                )
+                bridge_id = labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY)
+                spawn_env = build_opencode_native_spawn_env(session_id, bridge_id=bridge_id)
             if harness_name == "cursor-native" and spawn_env is None:
                 from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
 
@@ -6036,6 +6524,49 @@ def create_runner_app(
                             _publish_event,
                             session_id,
                             "Cursor",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+
+        if harness_name == "opencode-native":
+            # Host/web-UI session-creation path: boot the runner-owned
+            # ``opencode serve`` + SSE forwarder + ``opencode attach`` terminal
+            # so the web UI has a terminal+chat view to embed — the native-server
+            # sibling of the codex-native branch above. (The on-demand
+            # ``ensure_native_terminal`` message path also creates it; the
+            # per-session lock makes the two idempotent.)
+            _opencode_ensure_lock = _opencode_terminal_ensure_locks.setdefault(
+                session_id, asyncio.Lock()
+            )
+            async with _opencode_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_opencode_terminal = (
+                    _tr is not None and _tr.get(session_id, "opencode", "main") is not None
+                )
+                if not _has_opencode_terminal:
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        try:
+                            _opencode_spec = await _resolve_session_agent_spec(session_id)
+                        except OmnigentError:
+                            _opencode_spec = None
+                        await _auto_create_opencode_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            agent_spec=_opencode_spec,
+                            server_client=server_client,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create opencode terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "OpenCode",
                             exc,
                         )
                     finally:
@@ -9892,6 +10423,18 @@ def create_runner_app(
             from omnigent.pi_native_bridge import build_pi_native_spawn_env
 
             spawn_env = build_pi_native_spawn_env(conv_id)
+        if harness_name == "opencode-native" and spawn_env is None:
+            from omnigent.opencode_native_bridge import (
+                OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
+                build_opencode_native_spawn_env,
+            )
+
+            labels = await _session_labels_for_runner_spawn(
+                server_client=server_client,
+                session_id=conv_id,
+            )
+            bridge_id = labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY)
+            spawn_env = build_opencode_native_spawn_env(conv_id, bridge_id=bridge_id)
         if harness_name == "cursor-native" and spawn_env is None:
             from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
 
@@ -11479,6 +12022,42 @@ def create_runner_app(
                         session_id,
                     )
                     return _native_terminal_start_error_response(exc, "Pi")
+            return JSONResponse(
+                status_code=200,
+                content=session_resource_view_to_dict(terminal_view),
+            )
+
+        if (
+            body.get("ensure_native_terminal")
+            and terminal_name == "opencode"
+            and session_key == "main"
+        ):
+            opencode_terminal_id = terminal_resource_id("opencode", "main")
+            ensure_lock = _opencode_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with ensure_lock:
+                existing = await resource_registry.get_terminal_resource(
+                    session_id, opencode_terminal_id
+                )
+                if existing is not None:
+                    return JSONResponse(
+                        status_code=200,
+                        content=session_resource_view_to_dict(existing),
+                    )
+                try:
+                    opencode_agent_spec = await _resolve_session_agent_spec(session_id)
+                    terminal_view = await _auto_create_opencode_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        agent_spec=opencode_agent_spec,
+                        server_client=server_client,
+                    )
+                except Exception as exc:
+                    _logger.exception(
+                        "OpenCode terminal ensure failed for session=%s",
+                        session_id,
+                    )
+                    return _native_terminal_start_error_response(exc, "OpenCode")
             return JSONResponse(
                 status_code=200,
                 content=session_resource_view_to_dict(terminal_view),

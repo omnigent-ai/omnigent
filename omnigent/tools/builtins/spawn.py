@@ -154,6 +154,34 @@ class SysSessionSendTool(Tool):
         return _build_sys_session_send_schema(self._sub_specs)
 
 
+def _spec_opts_into_harness_override(spec: Any) -> bool:
+    """
+    Return ``True`` if a sub-agent spec opts into the ``args.harness`` override.
+
+    The override is allowlist-gated (design D.4): a sub-agent advertises it
+    only when its ``executor.config.allowed_harnesses`` declares a non-empty
+    allowlist. This mirrors the dispatch-side opt-in read in
+    ``omnigent/runner/tool_dispatch.py`` (``_subagent_allowed_harnesses``) so
+    the schema gate and the runtime guard agree on what "opted in" means.
+    Specs without the opt-in keep the base ``{input, purpose, model}`` args
+    contract.
+
+    :param spec: A sub-agent :class:`AgentSpec` (or structural equivalent).
+    :returns: ``True`` when the spec declares a non-empty allowlist.
+    """
+    executor = getattr(spec, "executor", None)
+    config = getattr(executor, "config", None)
+    if isinstance(config, dict):
+        raw_allowed: Any = config.get("allowed_harnesses")
+    elif config is not None:
+        raw_allowed = getattr(config, "allowed_harnesses", None)
+    else:
+        raw_allowed = None
+    if not isinstance(raw_allowed, (list, tuple, set, frozenset)):
+        return False
+    return any(isinstance(entry, str) and entry for entry in raw_allowed)
+
+
 def _build_sys_session_send_schema(
     sub_specs: dict[str, AgentSpec],
 ) -> dict[str, Any]:
@@ -220,6 +248,51 @@ def _build_sys_session_send_schema(
             "the same response — they dispatch concurrently."
         )
     )
+    # ``args.harness`` is allowlist-gated (design D.4): advertise it only when
+    # at least one declared sub-agent opts in via
+    # ``executor.config.allowed_harnesses``. Specs without the opt-in keep the
+    # base {input, purpose, model} args object, so the orchestrator never sees a
+    # harness knob it can't use. The dispatch-side guard in tool_dispatch.py
+    # re-enforces the opt-in per child (and the server create route does too).
+    harness_opt_in = any(_spec_opts_into_harness_override(spec) for spec in sub_specs.values())
+    harness_property: dict[str, Any] = (
+        {
+            "harness": {
+                "type": "string",
+                "description": (
+                    "Optional harness override for "
+                    "this sub-agent session, e.g. "
+                    "'opencode-native'. Applies only "
+                    "when this send CREATES the "
+                    "session AND the sub-agent spec "
+                    "allowlists it via "
+                    "executor.config.allowed_harnesses; "
+                    "otherwise rejected. Omitted = the "
+                    "sub-agent's declared harness."
+                ),
+            }
+        }
+        if harness_opt_in
+        else {}
+    )
+    args_description = (
+        (
+            "The user-input message to send to the sub-agent. The sub-agent "
+            "treats this as the first user turn in its conversation. Pass a "
+            "plain string for the normal contract, or pass "
+            "{input, purpose, model, harness} when a spec-level policy "
+            "requires explicit dispatch metadata, a per-dispatch model "
+            "override, or an allowlisted harness override."
+        )
+        if harness_opt_in
+        else (
+            "The user-input message to send to the sub-agent. The sub-agent "
+            "treats this as the first user turn in its conversation. Pass a "
+            "plain string for the normal contract, or pass "
+            "{input, purpose, model} when a spec-level policy requires "
+            "explicit dispatch metadata or a per-dispatch model override."
+        )
+    )
     return {
         "type": "function",
         "function": {
@@ -274,22 +347,13 @@ def _build_sys_session_send_schema(
                                             "omitted = the harness default."
                                         ),
                                     },
+                                    **harness_property,
                                 },
                                 "required": ["input"],
                                 "additionalProperties": False,
                             },
                         ],
-                        "description": (
-                            "The user-input message to send "
-                            "to the sub-agent. The sub-agent "
-                            "treats this as the first user "
-                            "turn in its conversation. Pass a "
-                            "plain string for the normal contract, "
-                            "or pass {input, purpose, model} when "
-                            "a spec-level policy requires explicit "
-                            "dispatch metadata or a per-dispatch "
-                            "model override."
-                        ),
+                        "description": args_description,
                     },
                 },
                 # Only ``args`` is universally required; the

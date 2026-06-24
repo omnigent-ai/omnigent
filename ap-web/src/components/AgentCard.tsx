@@ -4,6 +4,7 @@ import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
 import { GooseIcon } from "@/components/icons/GooseIcon";
 import { NessieIcon } from "@/components/icons/NessieIcon";
+import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
 import type { ComponentType, SVGProps } from "react";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -28,6 +29,7 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
   if (nativeAgent?.iconKind === "claude") return ClaudeIcon;
   if (nativeAgent?.iconKind === "codex") return CodexIcon;
+  if (nativeAgent?.iconKind === "opencode") return OpenCodeIcon;
   if (nativeAgent?.iconKind === "pi") return PiIcon;
   if (nativeAgent?.iconKind === "cursor") return CursorIcon;
   if (nativeAgent?.iconKind === "goose") return GooseIcon;

@@ -50,6 +50,7 @@ _DEFAULT_WORKSPACE_ROOT = os.path.join(
 CODEX_NATIVE_TERMINAL_ROLE = "codex-native"
 CLAUDE_NATIVE_TERMINAL_ROLE = "claude-native"
 PI_NATIVE_TERMINAL_ROLE = "pi-native"
+OPENCODE_NATIVE_TERMINAL_ROLE = "opencode-native"
 CURSOR_NATIVE_TERMINAL_ROLE = "cursor-native"
 GOOSE_NATIVE_TERMINAL_ROLE = "goose-native"
 # Role marker for the embedded Omnigent REPL terminal auto-created for

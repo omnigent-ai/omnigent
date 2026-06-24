@@ -35,6 +35,9 @@ vi.mock("@/components/icons/ClaudeIcon", () => ({
 vi.mock("@/components/icons/CodexIcon", () => ({
   CodexIcon: (props: Record<string, unknown>) => <svg {...props} data-icon="codex" />,
 }));
+vi.mock("@/components/icons/OpenCodeIcon", () => ({
+  OpenCodeIcon: (props: Record<string, unknown>) => <svg {...props} data-icon="opencode" />,
+}));
 // Same marker treatment for the local pi glyph so selection assertions stay uniform.
 vi.mock("@/components/icons/PiIcon", () => ({
   PiIcon: (props: Record<string, unknown>) => <svg {...props} data-icon="pi" />,
@@ -332,6 +335,11 @@ describe("SubagentsPanel", () => {
       expectedKind: "codex-native",
     },
     {
+      name: "opencode-native wrapper → opencode-native marker",
+      labels: { "omnigent.wrapper": "opencode-native-ui" },
+      expectedKind: "opencode-native",
+    },
+    {
       name: "pi-native wrapper → pi-native marker",
       labels: { "omnigent.wrapper": "pi-native-ui" },
       expectedKind: "pi-native",
@@ -505,7 +513,7 @@ describe("SubagentsPanel", () => {
     expect(within(row).queryByText("thread_child_alpha")).toBeNull();
   });
 
-  it("uses native logos for Claude Code and Codex child rows", () => {
+  it("uses native logos for Claude Code, Codex, and OpenCode child rows", () => {
     mockChildTree({
       conv_root: [
         childInfo({
@@ -514,6 +522,13 @@ describe("SubagentsPanel", () => {
           tool: "codex",
           session_name: "auth-refactor",
           labels: { "omnigent.wrapper": "codex-native-ui" },
+        }),
+        childInfo({
+          id: "conv_opencode",
+          title: "opencode:port-auth-refactor",
+          tool: "opencode",
+          session_name: "port-auth-refactor",
+          labels: { "omnigent.wrapper": "opencode-native-ui" },
         }),
         childInfo({
           id: "conv_claude",
@@ -530,6 +545,10 @@ describe("SubagentsPanel", () => {
     const codexRow = childRow(container, "conv_codex");
     expect(codexRow.querySelector('[data-icon="codex"]')).not.toBeNull();
     expect(codexRow.querySelector(".lucide-code-2")).toBeNull();
+
+    const opencodeRow = childRow(container, "conv_opencode");
+    expect(opencodeRow.querySelector('[data-icon="opencode"]')).not.toBeNull();
+    expect(opencodeRow.querySelector(".lucide-code-2")).toBeNull();
 
     const claudeRow = childRow(container, "conv_claude");
     expect(claudeRow.querySelector('[data-icon="claude"]')).not.toBeNull();

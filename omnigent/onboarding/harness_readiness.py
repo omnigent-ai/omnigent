@@ -30,6 +30,7 @@ from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
 from omnigent.onboarding.harness_install import (
     CURSOR_KEY,
     GOOSE_KEY,
+    OPENCODE_KEY,
     PI_KEY,
     QWEN_KEY,
     harness_cli_installed,
@@ -55,6 +56,11 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
 # ``_HARNESS_FAMILY`` entry — pi uses the ``PI_SURFACE`` sentinel — so they must
 # be gated explicitly or they fail open like an unknown harness.
 _PI_HARNESSES: frozenset[str] = frozenset({PI_SURFACE, "pi-native"})
+
+# Native OpenCode harness. Like pi, it wraps a CLI (``opencode``) with no
+# ``_HARNESS_FAMILY`` entry, so it must be gated explicitly or it would fail
+# open like an unknown harness.
+_OPENCODE_HARNESSES: frozenset[str] = frozenset({"opencode-native"})
 
 # Native Cursor harnesses. These boot the ``cursor-agent`` TUI (``omni cursor``)
 # and so, like the other native CLI harnesses, can't launch without that binary
@@ -100,9 +106,13 @@ def _install_key(canonical: str) -> str:
     :param canonical: A canonical CLI-wrapping harness id keyed in
         ``_HARNESS_FAMILY`` (e.g. ``"codex-native"``), or ``"pi"``.
     :returns: ``"anthropic"`` / ``"openai"`` for the claude/codex CLIs,
-        :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi, or
-        :data:`~omnigent.onboarding.harness_install.QWEN_KEY` for qwen.
+        :data:`~omnigent.onboarding.harness_install.OPENCODE_KEY` for
+        opencode-native,
+        :data:`~omnigent.onboarding.harness_install.QWEN_KEY` for qwen, or
+        :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi.
     """
+    if canonical in _OPENCODE_HARNESSES:
+        return OPENCODE_KEY
     if canonical in _QWEN_HARNESSES:
         return QWEN_KEY
     return _HARNESS_FAMILY.get(canonical) or PI_KEY
@@ -162,6 +172,7 @@ def harness_is_configured(harness: str) -> bool:
     if (
         canonical not in _HARNESS_FAMILY
         and canonical not in _PI_HARNESSES
+        and canonical not in _OPENCODE_HARNESSES
         and canonical not in _QWEN_HARNESSES
     ):
         # Unknown harness — the daemon has no install metadata for it, so
@@ -188,6 +199,7 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_EXECUTOR_TYPE_HARNESS_ALIASES)
     spellings.update(HARNESS_ALIASES)
     spellings.update(_PI_HARNESSES)
+    spellings.update(_OPENCODE_HARNESSES)
     spellings.update(_CURSOR_NATIVE_HARNESSES)
     spellings.update(_GOOSE_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)

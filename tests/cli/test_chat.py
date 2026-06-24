@@ -1935,8 +1935,16 @@ def test_materialize_directory_bundle_with_override_keeps_nested_harness_unpinne
 @pytest.mark.parametrize(
     ("bundle_name", "expected_workers"),
     [
-        ("polly", {"claude_code": "claude-native", "codex": "codex-native", "pi": "pi"}),
-        ("debby", {"claude": "claude-sdk", "gpt": "codex"}),
+        (
+            "polly",
+            {
+                "claude_code": "claude-native",
+                "codex": "codex-native",
+                "pi": "pi",
+                "opencode": "opencode-native",
+            },
+        ),
+        ("debby", {"claude": "claude-sdk", "gpt": "codex", "opencode": "opencode-native"}),
     ],
 )
 def test_materialize_bundle_overrides_brain_harness(

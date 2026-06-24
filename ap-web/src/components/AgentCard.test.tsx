@@ -20,6 +20,7 @@ vi.mock("@/components/icons/CodexIcon", () => ({ CodexIcon: stub("codex") }));
 vi.mock("@/components/icons/CursorIcon", () => ({ CursorIcon: stub("cursor") }));
 vi.mock("@/components/icons/GooseIcon", () => ({ GooseIcon: stub("goose") }));
 vi.mock("@/components/icons/NessieIcon", () => ({ NessieIcon: stub("nessie") }));
+vi.mock("@/components/icons/OpenCodeIcon", () => ({ OpenCodeIcon: stub("opencode") }));
 vi.mock("@/components/icons/PiIcon", () => ({ PiIcon: stub("pi") }));
 vi.mock("lucide-react", () => ({ BotIcon: stub("bot") }));
 
@@ -48,6 +49,7 @@ describe("AgentCard icon selection", () => {
     // "design-reviewer" must still read as Codex, not fall back to bot.
     { name: "design-reviewer", harness: "codex", expected: "codex" },
     { name: "codex-native-ui", harness: "codex-native", expected: "codex" },
+    { name: "opencode-native-ui", harness: "opencode-native", expected: "opencode" },
     { name: "claude-native-ui", harness: "claude-native", expected: "claude" },
     { name: "pi-native-ui", harness: "pi-native", expected: "pi" },
     { name: "cursor-native-ui", harness: "cursor-native", expected: "cursor" },
