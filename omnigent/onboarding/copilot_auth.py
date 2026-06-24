@@ -30,6 +30,11 @@ accepted by Copilot.
 
 from __future__ import annotations
 
+import importlib.util
+import shutil
+import subprocess
+import sys
+
 from omnigent.errors import OmnigentError
 from omnigent.onboarding.provider_config import load_config, resolve_secret
 
@@ -62,6 +67,79 @@ def looks_like_github_copilot_token(value: str) -> bool:
         a classic ``ghp_`` PAT (which Copilot rejects).
     """
     return value.startswith(_GITHUB_TOKEN_PREFIXES)
+
+
+# The OPTIONAL pip extra that ships the Copilot SDK (``github-copilot-sdk``,
+# imported as ``copilot``) — not in the default install, so the ``copilot:``
+# token can be set with no SDK present. Setup surfaces the command verbatim when
+# the extra is missing. Mirrors cursor's ``CURSOR_EXTRA`` / antigravity's
+# ``ANTIGRAVITY_EXTRA``. The name carries literal brackets — markup-rendered
+# surfaces must escape it.
+COPILOT_EXTRA = "copilot"
+COPILOT_EXTRA_INSTALL_COMMAND = 'pip install "omnigent[copilot]"'
+
+
+def copilot_sdk_installed() -> bool:
+    """Return whether the Copilot SDK (the optional extra) is importable.
+
+    The executor imports it lazily on the first turn
+    (:mod:`omnigent.inner.copilot_executor`), so a token can be set with no SDK;
+    setup uses this to detect that and offer to install it. The
+    ``github-copilot-sdk`` package is imported as ``copilot``. Mirrors
+    :func:`omnigent.onboarding.cursor_auth.cursor_sdk_installed` /
+    :func:`omnigent.onboarding.antigravity_auth.antigravity_sdk_installed`:
+    :func:`importlib.util.find_spec` avoids importing the heavy SDK, and the
+    guard catches the ``ModuleNotFoundError`` it raises when a parent package is
+    absent.
+
+    :returns: ``True`` when ``copilot`` is importable.
+    """
+    try:
+        return importlib.util.find_spec("copilot") is not None
+    except ModuleNotFoundError:
+        # Guard like the cursor/antigravity checks: find_spec can raise (not
+        # return None) when a parent package is absent.
+        return False
+
+
+def copilot_install_command() -> list[str]:
+    """Return the argv that installs the ``copilot`` extra into this env.
+
+    Prefers ``uv pip install`` when ``uv`` is on ``PATH``, else this
+    interpreter's own pip (``sys.executable -m pip``) so the package lands in the
+    running install. Carries **no index URL** — pip/uv pick up the user's
+    configured index, so a private proxy is honored without hardcoding one.
+    Mirrors :func:`omnigent.onboarding.cursor_auth.cursor_install_command`.
+
+    :returns: The install argv, e.g.
+        ``["uv", "pip", "install", "omnigent[copilot]"]`` or
+        ``[sys.executable, "-m", "pip", "install", "omnigent[copilot]"]``.
+    """
+    target = f"omnigent[{COPILOT_EXTRA}]"
+    if shutil.which("uv") is not None:
+        return ["uv", "pip", "install", target]
+    return [sys.executable, "-m", "pip", "install", target]
+
+
+def install_copilot_sdk() -> bool:
+    """Install the ``copilot`` extra; return whether the SDK is now present.
+
+    Shells out to :func:`copilot_install_command` and re-checks
+    :func:`copilot_sdk_installed`; pip/uv output is not captured so failures are
+    visible. Mirrors :func:`omnigent.onboarding.cursor_auth.install_cursor_sdk`.
+
+    :returns: ``True`` when ``copilot`` is importable after the attempt;
+        ``False`` if the process failed to spawn, timed out, or the SDK is still
+        absent.
+    """
+    try:
+        subprocess.run(copilot_install_command(), check=False, timeout=600)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # Invalidate import caches so a just-installed package is seen without
+    # restarting the process.
+    importlib.invalidate_caches()
+    return copilot_sdk_installed()
 
 
 def copilot_github_token_ref(config: dict[str, object] | None = None) -> str | None:

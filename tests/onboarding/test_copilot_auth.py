@@ -17,12 +17,17 @@ from pathlib import Path
 import pytest
 import yaml
 
+from omnigent.onboarding import copilot_auth
 from omnigent.onboarding import secrets as secret_store
 from omnigent.onboarding.copilot_auth import (
+    COPILOT_EXTRA_INSTALL_COMMAND,
     COPILOT_SECRET_NAME,
     copilot_github_token_configured,
     copilot_github_token_ref,
     copilot_github_token_settings,
+    copilot_install_command,
+    copilot_sdk_installed,
+    install_copilot_sdk,
     looks_like_github_copilot_token,
     resolve_copilot_github_token,
 )
@@ -131,3 +136,101 @@ def test_settings_shape() -> None:
     assert copilot_github_token_settings("keychain:copilot") == {
         "copilot": {"github_token_ref": "keychain:copilot"}
     }
+
+
+# ---------------------------------------------------------------------------
+# Optional-SDK extra (parity with cursor / antigravity)
+# ---------------------------------------------------------------------------
+
+
+def test_copilot_extra_install_command_shape() -> None:
+    """The surfaced install command targets the optional ``copilot`` extra."""
+    assert COPILOT_EXTRA_INSTALL_COMMAND == 'pip install "omnigent[copilot]"'
+
+
+def test_copilot_sdk_installed_true_when_spec_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Detection returns True when ``find_spec`` resolves ``copilot``."""
+    monkeypatch.setattr(copilot_auth.importlib.util, "find_spec", lambda name: object())
+    assert copilot_sdk_installed() is True
+
+
+def test_copilot_sdk_installed_false_when_spec_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Detection returns False when ``find_spec`` returns ``None`` (extra absent)."""
+    monkeypatch.setattr(copilot_auth.importlib.util, "find_spec", lambda name: None)
+    assert copilot_sdk_installed() is False
+
+
+def test_copilot_sdk_installed_false_when_module_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``ModuleNotFoundError`` from ``find_spec`` reads as not-installed.
+
+    ``find_spec`` can raise (not return ``None``) when a parent package is
+    absent; the guard must swallow that rather than crash setup.
+    """
+
+    def _raise(name: str) -> object:
+        raise ModuleNotFoundError("No module named 'copilot'")
+
+    monkeypatch.setattr(copilot_auth.importlib.util, "find_spec", _raise)
+    assert copilot_sdk_installed() is False
+
+
+def test_copilot_install_command_prefers_uv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With ``uv`` on PATH, the install runs ``uv pip install`` — no index URL."""
+    monkeypatch.setattr(copilot_auth.shutil, "which", lambda name: "/usr/bin/uv")
+    cmd = copilot_install_command()
+    assert cmd == ["uv", "pip", "install", "omnigent[copilot]"]
+    # No hardcoded index / proxy leaks into committed code.
+    assert not any("index" in part or "://" in part for part in cmd)
+
+
+def test_copilot_install_command_falls_back_to_pip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without ``uv``, it falls back to this interpreter's pip — still no index."""
+    monkeypatch.setattr(copilot_auth.shutil, "which", lambda name: None)
+    cmd = copilot_install_command()
+    assert cmd == [
+        copilot_auth.sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "omnigent[copilot]",
+    ]
+    assert not any("index" in part or "://" in part for part in cmd)
+
+
+def test_install_copilot_sdk_runs_command_then_rechecks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shells the install argv, then reports the post-install detection verdict.
+
+    Mocks the subprocess (never really installs): the SDK "appears" only after
+    the install runs, so the function must re-check and return True.
+    """
+    import subprocess
+
+    calls: list[list[str]] = []
+    state = {"installed": False}
+
+    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
+        calls.append(argv)
+        state["installed"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(copilot_auth.shutil, "which", lambda name: None)
+    monkeypatch.setattr(copilot_auth.subprocess, "run", _run)
+    monkeypatch.setattr(copilot_auth, "copilot_sdk_installed", lambda: state["installed"])
+
+    assert install_copilot_sdk() is True
+    assert calls == [[copilot_auth.sys.executable, "-m", "pip", "install", "omnigent[copilot]"]]
+
+
+def test_install_copilot_sdk_false_on_spawn_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A subprocess that can't spawn (OSError) is caught and reported as False."""
+
+    def _boom(*args: object, **kwargs: object) -> object:
+        raise OSError("no pip")
+
+    monkeypatch.setattr(copilot_auth.shutil, "which", lambda name: None)
+    monkeypatch.setattr(copilot_auth.subprocess, "run", _boom)
+    assert install_copilot_sdk() is False

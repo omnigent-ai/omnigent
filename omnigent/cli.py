@@ -9384,6 +9384,62 @@ def _manage_goose_harness() -> None:
             status = None
 
 
+def _prompt_install_copilot() -> str | None:
+    """Offer to install the missing ``copilot`` extra; return a status line.
+
+    Shown atop the Copilot drill-in when the optional-extra ``github-copilot-sdk``
+    is absent. Three-choice ``select`` like :func:`_prompt_install_cursor` /
+    :func:`_prompt_install_antigravity` (install now / set token anyway / show
+    command), and like them does NOT gate token management on the SDK: the
+    ``copilot:`` token is stored independently and is useful once the SDK lands,
+    so declining falls through to the token menu. Install is portable and
+    index-free — see
+    :func:`omnigent.onboarding.copilot_auth.copilot_install_command`.
+
+    :returns: Status string for the drill-in's transient status line, or
+        ``None`` (set-token-anyway / Esc / printed-command, no actionable result).
+    """
+    from rich.markup import escape as _rich_escape
+
+    from omnigent.onboarding.copilot_auth import (
+        COPILOT_EXTRA_INSTALL_COMMAND,
+        install_copilot_sdk,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    cmd = COPILOT_EXTRA_INSTALL_COMMAND
+    # ``select`` renders text through Rich markup; escape the literal
+    # ``[copilot]`` so it renders verbatim.
+    cmd_markup = _rich_escape(cmd)
+    choice = select(
+        "Copilot's SDK (github-copilot-sdk) isn't installed. Install it now?",
+        [
+            f"Install it now ({cmd_markup})",
+            "Set the GitHub token anyway",
+            "I'll run it myself (show the command)",
+        ],
+        descriptions=[
+            f"Runs `{cmd_markup}` (uses uv when available), then continues.",
+            "Skip the install — store the token now; the SDK can be added later.",
+            "Print the command so you can install it yourself, then continue.",
+        ],
+        default=0,
+        clear_on_exit=True,
+    )
+    if choice == 0:
+        console.print(f"  [dim]Installing the copilot extra — running `{cmd_markup}`…[/dim]")
+        if install_copilot_sdk():
+            console.print("  [green]✓ github-copilot-sdk installed[/green]")
+            return "✓ github-copilot-sdk installed"
+        console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
+        return "✗ Install failed — set the token anyway, or install by hand"
+    if choice == 2:  # run it yourself
+        console.print(f"  Install the copilot extra with:\n    [bold]{cmd_markup}[/bold]")
+        return None
+    # choice == 1 (set token anyway) or Esc: fall through to the token menu silently.
+    return None
+
+
 def _manage_copilot_harness() -> None:
     """Run the level-2 loop for Copilot: manage its GitHub token.
 
@@ -9394,8 +9450,15 @@ def _manage_copilot_harness() -> None:
     how cursor / antigravity persist theirs (the secret in the store, a
     ``keychain:``/``env:`` reference in ``~/.omnigent/config.yaml``).
 
-    :returns: None. Side effects: may write the ``copilot:`` block of
-        ``~/.omnigent/config.yaml`` and the secret store.
+    When the optional ``github-copilot-sdk`` is missing, the drill-in first
+    offers to install it (:func:`_prompt_install_copilot`). Unlike the CLI-backed
+    harnesses (which gate on the CLI), declining still drops into the token
+    menu — the ``copilot:`` token is independently storable. Mirrors cursor /
+    antigravity.
+
+    :returns: None. Side effects: may install the ``copilot`` extra, and may
+        write the ``copilot:`` block of ``~/.omnigent/config.yaml`` and the
+        secret store.
     """
     from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.copilot_auth import (
@@ -9403,10 +9466,16 @@ def _manage_copilot_harness() -> None:
         COPILOT_SECRET_NAME,
         copilot_github_token_configured,
         copilot_github_token_ref,
+        copilot_sdk_installed,
     )
     from omnigent.onboarding.interactive import select
 
+    # Offer the install once on entry (not per loop iteration) when the SDK is
+    # absent; the result seeds the menu's status line. Declining falls through
+    # to token management, since the token is SDK-independent.
     status: str | None = None
+    if not copilot_sdk_installed():
+        status = _prompt_install_copilot()
     while True:
         config = _load_global_config()
         token_set = copilot_github_token_configured(config)
@@ -10018,8 +10087,10 @@ def _run_configure_harnesses_interactive() -> None:
     )
     from omnigent.onboarding.configure_models import family_label
     from omnigent.onboarding.copilot_auth import (
+        COPILOT_EXTRA_INSTALL_COMMAND,
         COPILOT_TOKEN_ENV_VARS,
         copilot_github_token_configured,
+        copilot_sdk_installed,
     )
     from omnigent.onboarding.cursor_auth import (
         CURSOR_EXTRA_INSTALL_COMMAND,
@@ -10285,14 +10356,28 @@ def _run_configure_harnesses_interactive() -> None:
         options.append(f"{'  ' if copilot_token_set else '[red]✗[/] '}Copilot")
         selectable.append(True)
         row_target.append(COPILOT_KEY)
-        copilot_sub = (
+        # ``github-copilot-sdk`` ships in an OPTIONAL extra, so the token can be
+        # set with no SDK present. When the extra is missing, lead with that gap
+        # and the install command (parallel to Cursor / Antigravity), then still
+        # report token status. ``[copilot]`` is escaped — sub-lines render through
+        # Rich markup, where bare brackets parse as a tag.
+        copilot_sub_lines: list[str] = []
+        if not copilot_sdk_installed():
+            from rich.markup import escape as _rich_escape
+
+            copilot_sub_lines.append(
+                f"[dim]not installed — open to install "
+                f"({_rich_escape(COPILOT_EXTRA_INSTALL_COMMAND)})[/]"
+            )
+        copilot_sub_lines.append(
             "[green]✓[/] GitHub token configured"
             if copilot_token_set
             else "[dim]no GitHub token yet — open to add one[/]"
         )
-        options.append(f"  {copilot_sub}")
-        selectable.append(False)
-        row_target.append(None)
+        for copilot_sub in copilot_sub_lines:
+            options.append(f"  {copilot_sub}")
+            selectable.append(False)
+            row_target.append(None)
         options.append("Quit")
         selectable.append(True)
         row_target.append(_QUIT)
