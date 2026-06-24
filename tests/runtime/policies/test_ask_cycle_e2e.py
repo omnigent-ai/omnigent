@@ -317,8 +317,10 @@ async def test_ask_cycle_multiple_askers_combined_approval(
 
     result, approved = await _run_ask_cycle(engine, ctx, harness)
     assert approved is True
-    # First-ASKer-in-YAML wins deciding_policy.
+    # deciding_policy is derived from deciding_policies[0].
     assert result.deciding_policy == "first"
+    # All three ASKing policies are captured in deciding_policies.
+    assert result.deciding_policies == ["first", "second", "third"]
     # Combined reason mentions all three policies.
     assert "first:" in result.reason
     assert "second:" in result.reason

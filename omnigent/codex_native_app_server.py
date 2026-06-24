@@ -9,7 +9,6 @@ import logging
 import os
 import re
 import shlex
-import signal
 import sys
 import tempfile
 from collections.abc import AsyncIterator
@@ -23,6 +22,7 @@ if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
 
 from omnigent.codex_native_bridge import write_policy_hook_config
+from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
     _clean_codex_env,
     _codex_cli_version,
@@ -574,7 +574,7 @@ class CodexNativeAppServer:
             stderr=asyncio.subprocess.PIPE,
             env=proc_env,
             cwd=str(self.cwd),
-            start_new_session=(os.name == "posix"),
+            **_proc.spawn_kwargs(),
         )
         self.recent_stderr = []
         self.stderr_task = asyncio.create_task(
@@ -1572,14 +1572,7 @@ def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
     :param process: Subprocess handle to terminate.
     :returns: None.
     """
-    if process.returncode is not None:
-        return
-    if os.name == "posix":
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(process.pid, signal.SIGTERM)
-            return
-    with contextlib.suppress(ProcessLookupError, Exception):
-        process.terminate()
+    _proc.terminate_tree(process)
 
 
 def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
@@ -1589,11 +1582,4 @@ def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
     :param process: Subprocess handle to kill.
     :returns: None.
     """
-    if process.returncode is not None:
-        return
-    if os.name == "posix":
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(process.pid, signal.SIGKILL)
-            return
-    with contextlib.suppress(ProcessLookupError, Exception):
-        process.kill()
+    _proc.kill_tree(process)

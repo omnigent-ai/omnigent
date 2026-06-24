@@ -47,6 +47,10 @@ from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 # first-run ``run`` flow falls back to it, so it has install metadata too.
 PI_KEY = "pi"
 
+# Qwen Code uses npm installation and has login/logout commands similar to
+# other coding CLIs. The binary name is ``qwen``.
+QWEN_KEY = "qwen"
+
 # Cursor authenticates against its own backend (``cursor-agent login`` /
 # ``CURSOR_API_KEY``) with no provider/gateway credential, and ships via a curl
 # installer rather than npm — so it carries an ``install_hint``, not a ``package``.
@@ -55,6 +59,24 @@ CURSOR_KEY = "cursor"
 # Kiro authenticates against its own backend and ships as a standalone native
 # installer, not an npm package managed by ``omnigent setup``.
 KIRO_KEY = "kiro"
+
+# OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
+# installed via the ``opencode-ai`` npm package. No login/logout/status argv
+# is wired yet — readiness is binary-only until an auth check exists.
+OPENCODE_KEY = "opencode"
+
+# Goose authenticates against its own config (``goose configure`` → keyring /
+# ``~/.config/goose/config.yaml``) with no Omnigent-managed credential, and ships
+# via Homebrew / a curl installer rather than npm — so it carries an
+# ``install_hint``, not a ``package``.
+GOOSE_KEY = "goose"
+
+# Copilot runs in-process via the ``github-copilot-sdk`` package, which bundles
+# the Copilot CLI binary it drives — so, like cursor, there is no separately
+# installed CLI to gate on; readiness is whether a GitHub token resolves (see
+# :func:`omnigent.onboarding.harness_readiness.harness_is_configured`). The key
+# is kept here purely as the canonical harness id the readiness layer shares.
+COPILOT_KEY = "copilot"
 
 
 @dataclass(frozen=True)
@@ -118,6 +140,24 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         status_args=("login", "status"),
     ),
     PI_KEY: HarnessInstallSpec("Pi", "pi", "@earendil-works/pi-coding-agent"),
+    # Pin the install to the supported 1.17.x range: opencode-ai's npm ``latest``
+    # is a ``0.0.0-beta-*`` pre-release, so a bare ``opencode-ai`` would install a
+    # version the runtime version-check (``check_opencode_version``,
+    # >=1.17.7,<1.18.0) then rejects. ``~1.17.7`` mirrors that exact range.
+    OPENCODE_KEY: HarnessInstallSpec("OpenCode", "opencode", "opencode-ai@~1.17.7"),
+    QWEN_KEY: HarnessInstallSpec(
+        "Qwen Code",
+        "qwen",
+        "@qwen-code/qwen-code",
+        # NB: deliberately no login/logout/status args. Qwen *removed* its
+        # ``auth`` subcommand and has no CLI login — ``qwen login`` doesn't
+        # exist and ``qwen auth status`` prints "auth has been removed" and
+        # exits 0 (which would make harness_cli_logged_in falsely report a
+        # login via its exit-code fallback). Auth is via OpenAI-compatible env
+        # vars or the interactive ``/auth`` command; the setup wizard handles
+        # that in ``_manage_qwen_harness``. Leaving these None keeps
+        # harness_login/logout/cli_logged_in no-ops for qwen.
+    ),
     CURSOR_KEY: HarnessInstallSpec(
         "Cursor",
         "cursor-agent",
@@ -134,6 +174,12 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         package=None,
         install_hint="curl -fsSL https://cli.kiro.dev/install | bash",
     ),
+    GOOSE_KEY: HarnessInstallSpec(
+        "Goose",
+        "goose",
+        package=None,
+        install_hint="brew install block-goose-cli",
+    ),
 }
 
 
@@ -142,10 +188,12 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # :data:`_HARNESS_INSTALL` family key. Only the CLI-backed harnesses appear
 # here — the ones that cannot launch without a binary on ``PATH``:
 # ``claude-native`` wraps the ``claude`` CLI, ``codex-native`` the ``codex``
-# CLI, ``pi`` / ``pi-native`` the ``pi`` CLI, ``cursor-native`` /
-# ``native-cursor`` the ``cursor-agent`` CLI, and ``kiro-native`` /
-# ``native-kiro`` the ``kiro-cli`` CLI. Cursor and Kiro install out-of-band
-# rather than through npm — see their ``install_hint`` values.
+# CLI, ``pi`` / ``pi-native`` the ``pi`` CLI, ``opencode-native`` the
+# ``opencode`` CLI, ``qwen`` / ``qwen-code`` the ``qwen`` CLI,
+# ``cursor-native`` / ``native-cursor`` the ``cursor-agent`` CLI, and
+# ``kiro-native`` / ``native-kiro`` the ``kiro-cli`` CLI. Cursor and Kiro
+# install out-of-band rather than through npm — see their ``install_hint``
+# values.
 # SDK-based harnesses run in-process and are deliberately absent, so they
 # resolve to "no CLI required": ``claude-sdk``, ``codex``, ``openai-agents-sdk``,
 # and the SDK ``cursor`` harness (which drives the ``cursor-sdk`` Python package
@@ -159,6 +207,17 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "native-cursor": CURSOR_KEY,
     "kiro-native": KIRO_KEY,
     "native-kiro": KIRO_KEY,
+    "goose-native": GOOSE_KEY,
+    "native-goose": GOOSE_KEY,
+    # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same
+    # ``goose`` CLI as the native TUI, so it gates on the same binary.
+    GOOSE_KEY: GOOSE_KEY,
+    QWEN_KEY: QWEN_KEY,
+    "qwen-code": QWEN_KEY,
+    # Native OpenCode (``opencode-native``) wraps the ``opencode`` CLI; its
+    # ``native-opencode`` reversed spelling gates on the same binary.
+    "opencode-native": OPENCODE_KEY,
+    "native-opencode": OPENCODE_KEY,
 }
 
 

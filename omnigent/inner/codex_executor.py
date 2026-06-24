@@ -14,7 +14,6 @@ import logging
 import os
 import re
 import shutil
-import signal
 import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -25,8 +24,10 @@ from typing import Any, Protocol, TypeAlias
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
+from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
+from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
 from .databricks_executor import (
     _read_databrickscfg,
@@ -273,27 +274,11 @@ class _Process(Protocol):
 
 
 def _terminate_process_tree(process: _Process | None) -> None:
-    if process is None or process.returncode is not None:
-        return
-    pid = process.pid
-    if pid is not None:
-        with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGTERM)
-            return
-    with suppress(ProcessLookupError, Exception):
-        process.terminate()
+    _proc.terminate_tree(process)
 
 
 def _kill_process_tree(process: _Process | None) -> None:
-    if process is None or process.returncode is not None:
-        return
-    pid = process.pid
-    if pid is not None:
-        with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGKILL)
-            return
-    with suppress(ProcessLookupError, Exception):
-        process.kill()
+    _proc.kill_tree(process)
 
 
 def _find_codex_cli() -> str | None:
@@ -400,6 +385,7 @@ def _clean_codex_env() -> dict[str, str]:
         "PYTHONUTF8",
         "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
         "DATABRICKS_CODEX_TOKEN",  # env_key referenced by ~/.codex/config.toml's DB provider
+        OMNIGENT_SESSION_ENV_VAR,  # "inside Omnigent" marker (CLAUDE_CODE/CODEX analog)
     }
     for key, value in os.environ.items():
         if key in _CODEX_ENV_DENY_EXACT:
@@ -1181,7 +1167,7 @@ class _CodexAppServerSession:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=proc_env,
-                start_new_session=(os.name == "posix"),
+                **_proc.spawn_kwargs(),
                 cwd=self._cwd or os.getcwd(),
             )
             self._reader_task = asyncio.create_task(self._reader_loop())

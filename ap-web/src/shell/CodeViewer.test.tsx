@@ -31,6 +31,21 @@ function makeFileQuery(content: string, truncated = false): ReturnType<typeof us
   } as unknown as ReturnType<typeof useFileContent>;
 }
 
+// A real (1×1, transparent) PNG, base64-encoded — i.e. exactly what the server
+// returns for a binary file (encoding="base64", content_type="image/png").
+const PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+function makeImageQuery(contentType: string, truncated = false): ReturnType<typeof useFileContent> {
+  return {
+    data: { content: PNG_BASE64, encoding: "base64", content_type: contentType, truncated },
+    isLoading: false,
+    isError: false,
+    isSuccess: true,
+    error: null,
+  } as unknown as ReturnType<typeof useFileContent>;
+}
+
 const noopRef = { current: null };
 
 function renderViewer(
@@ -238,5 +253,70 @@ describe("CodeViewer HTML preview sandbox", () => {
     expect(sandbox).not.toContain("allow-same-origin");
     // #777: every link opens in a new tab via the injected base tag.
     expect(iframe!.getAttribute("srcdoc")).toContain('<base target="_blank">');
+  });
+});
+
+describe("CodeViewer image rendering", () => {
+  // jsdom implements neither URL.createObjectURL nor revokeObjectURL; ImageViewer
+  // calls both, so stub them and capture the blob it encodes.
+  let createdBlob: Blob | null;
+
+  beforeEach(() => {
+    createdBlob = null;
+    vi.stubGlobal("URL", {
+      createObjectURL: vi.fn((blob: Blob) => {
+        createdBlob = blob;
+        return "blob:mock-object-url";
+      }),
+      revokeObjectURL: vi.fn(),
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function renderImage(contentType: string, path = "logo.png", truncated = false) {
+    return render(
+      <CodeViewer
+        conversationId="conv_1"
+        path={path}
+        fileQuery={makeImageQuery(contentType, truncated)}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen={true}
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode="source"
+      />,
+    );
+  }
+
+  it("renders a binary PNG as a blob-backed <img>, not source or placeholder", async () => {
+    renderImage("image/png", "assets/logo.png");
+
+    // alt is the basename; the src is the stubbed object URL — i.e. the image is
+    // shown through a blob, never the base64 placeholder or Monaco/Shiki source.
+    const img = (await screen.findByAltText("logo.png")) as HTMLImageElement;
+    expect(img.getAttribute("src")).toBe("blob:mock-object-url");
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+    expect(screen.queryByText(/binary file/i)).toBeNull();
+
+    // The blob handed to createObjectURL carries the server's MIME type and the
+    // decoded PNG bytes (base64 round-trips through fileContentToBlob's atob path).
+    expect(createdBlob?.type).toBe("image/png");
+    expect(createdBlob?.size).toBe(atob(PNG_BASE64).length);
+  });
+
+  it("shows the truncated banner when a binary image was truncated", () => {
+    renderImage("image/png", "logo.png", true);
+    expect(screen.getByText(/too large to load fully/)).toBeDefined();
+  });
+
+  it("routes by content_type over extension (image MIME on a .txt name)", async () => {
+    renderImage("image/png", "data.txt");
+    expect(await screen.findByAltText("data.txt")).toBeDefined();
   });
 });

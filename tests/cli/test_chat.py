@@ -1964,8 +1964,16 @@ def test_materialize_directory_bundle_with_override_keeps_nested_harness_unpinne
 @pytest.mark.parametrize(
     ("bundle_name", "expected_workers"),
     [
-        ("polly", {"claude_code": "claude-native", "codex": "codex-native", "pi": "pi"}),
-        ("debby", {"claude": "claude-sdk", "gpt": "codex"}),
+        (
+            "polly",
+            {
+                "claude_code": "claude-native",
+                "codex": "codex-native",
+                "pi": "pi",
+                "opencode": "opencode-native",
+            },
+        ),
+        ("debby", {"claude": "claude-sdk", "gpt": "codex", "opencode": "opencode-native"}),
     ],
 )
 def test_materialize_bundle_overrides_brain_harness(
@@ -3299,33 +3307,31 @@ def _fake_sessions_chat_cls(
     :param extra_turns: Optional list of text strings to return from
         successive ``await_turn()`` calls, simulating async orchestrator
         auto-wakes. When exhausted ``await_turn`` returns empty text and
-        ``status`` returns ``"idle"``.
+        ``last_turn_saw_waiting`` returns ``False``.
     :returns: A class usable as a drop-in for ``SessionsChat``.
     """
     _extra = list(extra_turns or [])
 
     class _FakeSessionsChat:
         def __init__(self, **_kwargs: object) -> None:
-            self._status = "waiting" if _extra else "idle"
             self._pending = list(_extra)
 
         @property
         def status(self) -> str:
-            return self._status
+            # Mirrors the real snapshot: "running" while sub-agents are pending
+            # (the runner emits "waiting" → relay collapses to "running"),
+            # "idle" when done.
+            return "running" if self._pending else "idle"
 
         async def refresh(self) -> None:
-            # After await_turn drains a turn, mark idle when nothing left.
-            if not self._pending:
-                self._status = "idle"
+            pass  # status is derived from _pending; no fetch needed.
 
-        async def query(self, prompt: str) -> object:
-            return await query_impl(prompt)
+        async def query(self, prompt: str) -> QueryResult:
+            return await query_impl(prompt)  # type: ignore[return-value]
 
         async def await_turn(self, *, timeout: float | None = None) -> QueryResult:
             if self._pending:
                 text = self._pending.pop(0)
-                if not self._pending:
-                    self._status = "idle"
                 return QueryResult(text=text, files=[])
             return QueryResult(text="", files=[])
 
@@ -3671,3 +3677,94 @@ def test_env_auth_injection_applies_when_nothing_configured(
     # The bake carries the actual key value so the uploaded bundle is
     # self-contained for the secret-less runner.
     assert executor["auth"] == {"type": "api_key", "api_key": "sk-ambient-shell-key"}
+
+
+def test_redirect_native_resume_handles_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cursor-native resume hands off to ``omnigent cursor`` (direct attach).
+
+    Regression: without a cursor branch in ``_redirect_native_resume_if_needed``
+    the resume fell through to the Omnigent REPL, which drove an Omnigent turn
+    per message (persisting its own user item) *while* the cursor forwarder
+    mirrored the same message from the cursor store — recording each user
+    message twice. The redirect keeps the TUI the single source of turns.
+    """
+    from omnigent._wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE
+
+    monkeypatch.setattr(
+        chat_module,
+        "_wrapper_label_for_conversation",
+        lambda **_kw: CURSOR_NATIVE_WRAPPER_VALUE,
+    )
+    captured: dict[str, object] = {}
+
+    def _fake_run_cursor_native(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.cursor_native.run_cursor_native", _fake_run_cursor_native)
+
+    handled = chat_module._redirect_native_resume_if_needed(
+        base_url="https://example.com",
+        conversation_id="conv_abc123",
+        auto_open_conversation=True,
+    )
+
+    assert handled is True
+    assert captured == {
+        "server": "https://example.com",
+        "session_id": "conv_abc123",
+        "cursor_args": (),
+        "auto_open_conversation": True,
+    }
+
+
+def test_cursor_native_resume_never_drives_an_omnigent_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resuming a cursor-native conversation must not enter the turn-driving REPL.
+
+    This is the behavior that makes the user's message appear exactly once. The
+    duplicate had two sources: (1) the Omnigent turn the REPL drives, which
+    persists its own user item, and (2) the cursor forwarder mirroring the same
+    message back from the cursor store. ``_chat_with_server`` must short-circuit
+    on the wrapper redirect *before* either ``_run_repl`` or ``_run_one_shot``
+    is reached, so source (1) never happens and only the forwarder records the
+    turn.
+    """
+    from omnigent._wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE
+
+    monkeypatch.setattr(
+        chat_module,
+        "_wrapper_label_for_conversation",
+        lambda **_kw: CURSOR_NATIVE_WRAPPER_VALUE,
+    )
+    redirected: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.cursor_native.run_cursor_native",
+        lambda **kwargs: redirected.update(kwargs),
+    )
+
+    def _fail_repl(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("_run_repl drove an Omnigent turn for a cursor-native resume")
+
+    def _fail_one_shot(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("_run_one_shot drove an Omnigent turn for a cursor-native resume")
+
+    monkeypatch.setattr(chat_module, "_run_repl", _fail_repl)
+    monkeypatch.setattr(chat_module, "_run_one_shot", _fail_one_shot)
+    # _pick_agent runs only on the non-redirect path; tripping it also signals
+    # the redirect failed to short-circuit.
+    monkeypatch.setattr(
+        chat_module,
+        "_pick_agent",
+        lambda *_a, **_k: pytest.fail("reached the non-redirect path"),
+    )
+
+    # Returns cleanly via the redirect; the AssertionError stubs above fire if
+    # it ever falls through to a turn-driving path.
+    chat_module._chat_with_server(
+        "https://example.com",
+        None,
+        resume_conversation_id="conv_abc123",
+    )
+
+    assert redirected["session_id"] == "conv_abc123"

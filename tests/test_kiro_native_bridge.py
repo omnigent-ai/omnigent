@@ -158,6 +158,38 @@ def test_inject_user_message_chunks_literal_typing(
     assert typed == ["hell", "owor", "ld"]
 
 
+def test_inject_user_message_dash_prefixed_text_is_sent_literally(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message starting with '-' injects as literal text, not a tmux flag.
+
+    ``send-keys -l`` parses a leading ``-`` (e.g. ``-N``) as an option even in
+    literal mode, so the send must pass ``--`` before the content — otherwise a
+    dash-prefixed message (or a 1024-char chunk boundary landing on one) fails
+    to inject silently.
+    """
+    monkeypatch.setattr(bridge, "_TYPE_COMMIT_TIMEOUT_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(monkeypatch)
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    inject_user_message(bridge_dir, content="-N5 dangerous", timeout_s=0.1)
+
+    literal_calls = [call for call in calls if "-l" in call]
+    assert literal_calls, "expected a literal send-keys call"
+    for call in literal_calls:
+        # ``--`` must immediately precede the literal content so a leading '-'
+        # is sent as text, never parsed as a flag.
+        assert "--" in call
+        assert call.index("--") == len(call) - 2
+        assert call[-1] == "-N5 dangerous"
+
+
 def test_inject_user_message_fails_when_resumed_forwarder_is_not_ready(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

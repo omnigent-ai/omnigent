@@ -14,7 +14,6 @@ import logging
 import os
 import secrets
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -56,6 +55,7 @@ from omnigent._wrapper_labels import (
 from omnigent.conversation_browser import open_conversation_link_if_enabled
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
 from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.spec import load as load_spec
@@ -1057,6 +1057,14 @@ def _redirect_native_resume_if_needed(
             progress=progress,
         )
         return True
+    if native_agent.key == "cursor":
+        _run_cursor_native_resume_redirect(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            auto_open_conversation=auto_open_conversation,
+            progress=progress,
+        )
+        return True
     return False
 
 
@@ -1208,6 +1216,46 @@ def _run_kiro_native_resume_redirect(
         server=base_url,
         session_id=conversation_id,
         kiro_args=(),
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+def _run_cursor_native_resume_redirect(
+    *,
+    base_url: str,
+    conversation_id: str,
+    auto_open_conversation: bool,
+    progress: RunnerStartupProgress | None,
+) -> None:
+    """
+    Hand a cursor-native conversation back to ``omnigent cursor``.
+
+    The cursor-native session is driven by the ``cursor-agent`` TUI in a
+    runner-owned tmux pane, and the forwarder mirrors that transcript back
+    into the conversation. Resuming through the Omnigent REPL would instead
+    run an Omnigent turn per message (which persists its own user item) *and*
+    leave the forwarder mirroring the same message from the cursor store —
+    recording each user message twice. Redirecting to ``omnigent cursor``'s
+    direct tmux attach keeps the TUI the single source of turns.
+
+    :param base_url: Omnigent server base URL.
+    :param conversation_id: Omnigent conversation id.
+    :param auto_open_conversation: Browser-open preference for the wrapper.
+    :param progress: Optional Omnigent startup spinner to finish before redirect.
+    :returns: None.
+    """
+    _finish_native_redirect_progress(
+        progress=progress,
+        conversation_id=conversation_id,
+        wrapper_name="cursor-native",
+        native_command="cursor",
+    )
+    from omnigent.cursor_native import run_cursor_native
+
+    run_cursor_native(
+        server=base_url,
+        session_id=conversation_id,
+        cursor_args=(),
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -2290,39 +2338,63 @@ async def _query_sessions_once(
     # sub-agents and are auto-woken by inbox completions across multiple
     # turns.
     #
-    # Fast-exit: refresh() at the TOP of each iteration catches the common
-    # case (single-turn agent, session already idle) with one HTTP round-
-    # trip (~100 ms) instead of waiting up to _PER_TURN_TIMEOUT_S for a
-    # stream subscription to time out.
+    # Why not _collect_query for the fast-exit signal: the runtime emits
+    # ``session.status: waiting`` AFTER ``response.completed`` (the runner
+    # finishes dispatching tools, then enters the async drain). _collect_query
+    # exits at CompletedEvent and never sees the subsequent "waiting".
     #
-    # Race window: a turn MAY complete in the gap between the top-of-loop
-    # refresh() showing "waiting" and await_turn() opening its subscription.
-    # The window is O(ms) in practice (subagents take seconds). If it fires,
-    # await_turn() times out, the bottom refresh() shows "idle", and we exit
-    # — the only cost is one _PER_TURN_TIMEOUT_S wait and possibly missing
-    # that turn's text.
+    # Why not refresh() for the fast-exit signal: the snapshot API collapses
+    # the ``"waiting"`` relay status to ``"idle"`` once the turn loop exits,
+    # even while sub-agents are still running.
     #
-    # Timeouts: 120 s per turn bounds the race-window penalty. A global
-    # 1800 s wall-clock budget caps the loop regardless of turn count.
+    # Probe approach: subscribe to the live stream for a short window after
+    # the first turn. The "waiting" event arrives O(ms–s) after CompletedEvent
+    # (runner dispatches tools, spawns sub-agents, then parks). The probe
+    # catches it before sub-agents have a chance to complete.
+    #
+    # ``await_turn`` resets ``last_turn_saw_waiting`` to False on
+    # ``session.status: running`` (synthesis starting), so the flag cleanly
+    # reflects only the most recent dispatch state after each call.
+    #
+    # Single-turn agents: no "waiting" event ever → probe times out in
+    # _STATUS_PROBE_TIMEOUT_S (~30 s) and the loop exits.
     _MAX_EXTRA_TURNS = 30
-    _PER_TURN_TIMEOUT_S = 120.0
-    _LOOP_TIMEOUT_S = 1800.0
+    # The runner emits session.status:waiting (not idle) when a turn ends with
+    # running sub-agents. The relay cache holds "waiting", which the snapshot
+    # collapses to "running". refresh() is therefore the authoritative signal:
+    # "running" → async orchestrator still waiting for inbox; "idle" → done.
+    #
+    # A short probe await_turn runs first: it catches synthesis text or the
+    # status event if the subscription opens before the event arrives. Both
+    # "waiting" and "idle" break the probe immediately so the generator closes
+    # cleanly without hitting the timeout.
+    #
+    # refresh() is called after every await_turn (probe + loop) — it is correct
+    # even when await_turn times out (sub-agents still running), unlike the
+    # last_turn_saw_waiting flag which would incorrectly exit on timeout.
+    _STATUS_PROBE_TIMEOUT_S = 5.0  # brief window; status events arrive fast
+    _PER_TURN_TIMEOUT_S = 120.0  # race-window guard per synthesis turn
+    _LOOP_TIMEOUT_S = 1800.0  # 30 min total
 
     async def _drain_extra_turns() -> None:
+        # Probe: collect synthesis text or status events that arrive quickly.
+        probe = await chat.await_turn(timeout=_STATUS_PROBE_TIMEOUT_S)
+        if probe.text:
+            all_text_parts.append(probe.text)
+        # refresh() is the authoritative check: "running" means the runner's
+        # relay cache holds "waiting" (sub-agents still running); "idle" means
+        # truly done (single-turn agent, or synthesis completed in the probe).
+        await chat.refresh()
+        if chat.status not in ("running", "launching"):
+            return
+        # Async orchestrator confirmed. Loop, refreshing after each turn.
         for _ in range(_MAX_EXTRA_TURNS):
-            # Fast-exit for single-turn agents.
-            await chat.refresh()
-            if chat.status not in ("waiting", "running", "launching"):
-                return
-            # Session still active; subscribe before the next check to
-            # reduce (not eliminate) the race where a turn completes
-            # between refresh and subscribe.
             extra = await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
             if extra.text:
                 all_text_parts.append(extra.text)
             await chat.refresh()
-            if chat.status not in ("waiting", "running", "launching"):
-                return
+            if chat.status not in ("running", "launching"):
+                return  # Idle: synthesis done or all sub-agents complete.
         logger.warning(
             "headless -p hit the %d-turn guard for session %s; "
             "the orchestrator may still be running",
@@ -3445,7 +3517,7 @@ def _start_local_server(
             env=child_env,
             stdout=log_fh,
             stderr=log_fh,
-            start_new_session=True,
+            **_proc.spawn_kwargs(),
         )
     finally:
         log_fh.close()
@@ -3567,14 +3639,11 @@ def _stop_server(proc: subprocess.Popen[bytes]) -> None:
     :param proc: The server subprocess.
     """
     if proc.poll() is None:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            proc.wait(timeout=5)
+        _proc.terminate_tree(proc, grace=5)
+        if proc.poll() is None:
+            _proc.kill_tree(proc)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
 
 
 def _stop_local_server(server: LocalServer) -> None:

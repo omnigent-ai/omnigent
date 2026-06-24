@@ -88,6 +88,11 @@ _DEFAULT_CURSOR_MODEL = "auto"
 # can run for minutes) but finite, so a wedged tool surfaces a timeout error
 # instead of blocking the SDK's daemon callback thread forever.
 _TOOL_CALL_TIMEOUT_S = 1800.0
+# Maximum time (seconds) Cursor will wait for the preToolUse hook subprocess
+# to return.  Held at one day so the hook stays alive while the human responds
+# to the web-UI approval card — mirrors the server-side ``ask_timeout`` default
+# and the ``read_timeout`` used by ``cursor_policy_hook.py``.
+_HOOK_APPROVAL_TIMEOUT_S = 86400
 
 
 def _resolve_model(model: str | None) -> str:
@@ -417,7 +422,7 @@ def _write_cursor_hooks(cwd: str, hook_script_path: str, server_url: str, sessio
             "preToolUse": [
                 {
                     "command": command,
-                    "timeout": 30,
+                    "timeout": _HOOK_APPROVAL_TIMEOUT_S,
                 }
             ]
         },
@@ -520,49 +525,49 @@ class CursorExecutor(Executor):
     async def _evaluate_native_tool_policy(
         self, name: str, args: dict[str, Any]
     ) -> dict[str, Any]:
-        """Evaluate PHASE_TOOL_CALL policy for a Cursor native tool.
+        """Gate a Cursor native tool call via policy check + user elicitation.
 
         Returns ``{"block": bool, "reason": str}``.
 
-        ASK is treated as DENY (fail-closed) because Cursor native tools
-        execute inside the Cursor process — by the time we observe them the
-        tool has already started, so we cannot pause for human approval.
+        Two-stage gate that mirrors how :class:`claude_sdk_executor
+        <omnigent.inner.claude_sdk_executor.ClaudeSDKExecutor>` exposes
+        tool permission requests natively through ``ctx.elicit()``:
+
+        1. **Policy hard-deny**: if the policy evaluator returns
+           ``POLICY_ACTION_DENY``, block immediately without prompting the
+           user (the admin already decided).
+
+        2. **Native elicitation**: for any other outcome (ALLOW, ASK, or no
+           evaluator wired), invoke ``_elicitation_handler`` so the user can
+           review the call and approve or abort the remainder of the turn
+           from the web-UI approval card.
+
+        Cursor native tools execute inside the Cursor process, so they have
+        already started by the time the executor observes
+        ``ToolCallRequest(status="running")``.  This gate therefore cannot
+        block individual tool executions; it can only cancel the remainder of
+        the turn on denial.
         """
+        # Stage 1 — hard policy deny: block immediately, no elicitation.
         evaluator = self._policy_evaluator
-        if evaluator is None:
-            return {"block": False, "reason": ""}
-        verdict = await evaluator("PHASE_TOOL_CALL", {"name": name, "arguments": args})
-        action = getattr(verdict, "action", None)
-        if action == "POLICY_ACTION_DENY":
-            return {"block": True, "reason": getattr(verdict, "reason", "") or "blocked by policy"}
-        if action == "POLICY_ACTION_ASK":
-            reason = getattr(verdict, "reason", "") or "approval required by policy"
-            # Cursor native tools have already started by the time we see
-            # them, but we still surface the elicitation UI so the human
-            # can decide whether the *rest of the turn* should continue.
-            handler = self._elicitation_handler
-            if handler is not None:
-                logger.info(
-                    "TOOL_CALL policy ASK on native cursor tool %s; "
-                    "prompting user (tool already started): %s",
-                    name,
-                    reason,
-                )
-                approved = await handler(name, args)
-                if approved:
-                    return {"block": False, "reason": ""}
-                return {"block": True, "reason": reason}
-            # No handler → fail closed.
-            logger.warning(
-                "TOOL_CALL policy ASK on native cursor tool %s — no elicitation "
-                "handler; treating as DENY: %s",
-                name,
-                reason,
-            )
-            return {
-                "block": True,
-                "reason": f"approval required (auto-denied — no elicitation handler): {reason}",
-            }
+        if evaluator is not None:
+            verdict = await evaluator("PHASE_TOOL_CALL", {"name": name, "arguments": args})
+            if getattr(verdict, "action", None) == "POLICY_ACTION_DENY":
+                return {
+                    "block": True,
+                    "reason": getattr(verdict, "reason", "") or "blocked by policy",
+                }
+
+        # Stage 2 — native elicitation: surface an approval card so the
+        # user can decide whether the rest of the turn should continue.
+        handler = self._elicitation_handler
+        if handler is not None:
+            logger.info("surfacing elicitation for native cursor tool %s", name)
+            approved = await handler(name, args)
+            if approved:
+                return {"block": False, "reason": ""}
+            return {"block": True, "reason": "turn aborted via web-UI elicitation"}
+
         return {"block": False, "reason": ""}
 
     # -- custom-tool bridge -------------------------------------------------
@@ -681,6 +686,12 @@ class CursorExecutor(Executor):
             local_kwargs: dict[str, Any] = {
                 "cwd": cwd,
                 "custom_tools": self._make_custom_tools(tools, loop) or None,
+                # Bypass cursor's own TUI approval prompts so native tool calls
+                # reach the executor's event stream and can be gated via the
+                # web-UI elicitation card (see _evaluate_native_tool_policy).
+                # Without this cursor may pause internally for its own approval
+                # before emitting a ToolCallRequest event.
+                "auto_review": True,
             }
             # Tell the SDK to read project-level settings (including hooks.json).
             if state.hooks_file is not None:
@@ -803,10 +814,16 @@ class CursorExecutor(Executor):
                         elif isinstance(event, ToolCallRequest):
                             tool_calls += 1
                             separate_next_text = True
-                            # Evaluate PHASE_TOOL_CALL for native tools.
-                            # Bridged tools are already gated by the
-                            # dispatch bridge — skip to avoid double eval.
-                            if not event.metadata.get("is_bridged") and policy_eval is not None:
+                            # Gate non-bridged (native) tool calls through
+                            # policy + elicitation.  Bridged tools are
+                            # already gated by the dispatch bridge.
+                            # Trigger when either the policy evaluator or
+                            # the elicitation handler is wired — the
+                            # latter alone (no server connection) still
+                            # surfaces an approval card natively.
+                            if not event.metadata.get("is_bridged") and (
+                                policy_eval is not None or self._elicitation_handler is not None
+                            ):
                                 gate = await self._evaluate_native_tool_policy(
                                     event.name, event.args if isinstance(event.args, dict) else {}
                                 )
@@ -817,7 +834,7 @@ class CursorExecutor(Executor):
                                         await run.cancel()
                                     yield event  # emit so observers see what was attempted
                                     reason = gate["reason"]
-                                    msg = f"Native tool {event.name!r} denied by policy: {reason}"
+                                    msg = f"Native tool {event.name!r} denied: {reason}"
                                     yield ExecutorError(message=msg)
                                     return
                         elif isinstance(event, ToolCallComplete):

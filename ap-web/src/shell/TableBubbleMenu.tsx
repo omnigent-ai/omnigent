@@ -16,6 +16,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { Editor } from "@tiptap/react";
+// Type-only import: activates @tiptap/extension-table's TypeScript module
+// augmentation so the editor's table commands resolve, without pulling the
+// extension into the runtime bundle.
+// eslint-disable-next-line import/no-empty-named-blocks -- deliberate type-only augmentation trigger, not a stray empty import
 import type {} from "@tiptap/extension-table";
 import { TextSelection } from "@tiptap/pm/state";
 import { Fragment } from "@tiptap/pm/model";

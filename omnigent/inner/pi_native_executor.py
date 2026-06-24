@@ -32,6 +32,15 @@ class PiNativeExecutor(Executor):
     the Omnigent Pi extension loaded. Each turn queues the latest user
     message into the bridge inbox; the extension consumes it and calls
     ``pi.sendUserMessage`` inside the TUI process.
+
+    Policy enforcement for native Pi tool calls is handled entirely by the
+    extension: on each ``tool_call`` event the extension POSTs to
+    ``POST /v1/sessions/{sessionId}/policies/evaluate`` using the server URL
+    and auth headers from its config file. This bypasses the turn-scoped
+    ``_policy_evaluator`` round-trip (which would fail because
+    ``_current_ctx`` is cleared before Pi ever processes the message) and
+    instead routes directly through the same session-level HTTP endpoint that
+    the Claude Code native hook uses.
     """
 
     def __init__(self, bridge_dir: Path | None = None) -> None:

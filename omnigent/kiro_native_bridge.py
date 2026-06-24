@@ -322,13 +322,18 @@ def _wait_for_kiro_input_ready(
 def _type_literal_text(socket_path: str, tmux_target: str, text: str) -> None:
     """Type text into Kiro using literal tmux keystrokes."""
     for start in range(0, len(text), _SEND_KEYS_LITERAL_CHARS_PER_CALL):
+        chunk = text[start : start + _SEND_KEYS_LITERAL_CHARS_PER_CALL]
+        # ``--`` ends option parsing so a chunk starting with ``-`` (or a chunk
+        # boundary that lands on one) is sent as literal text, not parsed as a
+        # tmux flag — which would otherwise fail the send-keys call silently.
         _run_tmux(
             socket_path,
             "send-keys",
             "-l",
             "-t",
             tmux_target,
-            text[start : start + _SEND_KEYS_LITERAL_CHARS_PER_CALL],
+            "--",
+            chunk,
         )
 
 

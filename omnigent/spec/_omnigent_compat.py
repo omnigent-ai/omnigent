@@ -73,6 +73,10 @@ OMNIGENT_EXECUTOR_TYPE = "omnigent"
 # made ``examples/terminal_workers.yaml``
 # fail at spec-load with a "must be one of [...], got
 # 'open-responses'" error.
+#
+# ``opencode-native`` is the native OpenCode server bridge (runner-owned
+# ``opencode serve`` + SSE forwarder); its ``opencode`` / ``native-opencode``
+# spellings are accepted aliases below.
 OMNIGENT_HARNESSES = frozenset(
     {
         "antigravity",
@@ -80,18 +84,35 @@ OMNIGENT_HARNESSES = frozenset(
         "claude-sdk",
         "codex",
         "codex-native",
+        "copilot",
         "cursor",
         "cursor-native",
         "kiro-native",
+        "goose",
+        "goose-native",
         "openai-agents",
         "open-responses",
+        "opencode-native",
         "pi",
         "pi-native",
+        "qwen",
     },
 )
 # User-facing aliases accepted in specs and normalized before runtime dispatch.
 OMNIGENT_HARNESS_ALIASES = frozenset(
-    {"claude", "native-kiro", "native-pi", "openai-agents-sdk", "agy", "google-antigravity"}
+    {
+        "claude",
+        "native-kiro",
+        "native-pi",
+        "native-goose",
+        "openai-agents-sdk",
+        "agy",
+        "google-antigravity",
+        "qwen-code",
+        "opencode",
+        "native-opencode",
+        "github-copilot",
+    }
 )
 _OMNIGENT_ACCEPTED_HARNESSES = OMNIGENT_HARNESSES | OMNIGENT_HARNESS_ALIASES
 

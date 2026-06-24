@@ -261,6 +261,15 @@ def _dispatch_wrapper(
             kiro_args=(),
         )
         return True
+    if native_agent.key == "goose":
+        from omnigent.goose_native import run_goose_native
+
+        run_goose_native(
+            server=server,
+            session_id=session_id,
+            goose_args=(),
+        )
+        return True
     return False
 
 

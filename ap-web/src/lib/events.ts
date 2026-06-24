@@ -8,7 +8,7 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseCreated → "response_created").
 
-import type { ErrorInfo, ModelUsage, Response, SandboxLaunchStage } from "./types";
+import type { ErrorInfo, ModelUsage, RememberScope, Response, SandboxLaunchStage } from "./types";
 
 /** Provider-native tool item types. */
 export const NATIVE_TOOL_TYPES = new Set<string>([
@@ -237,6 +237,22 @@ export interface ElicitationRequest {
    * mode switch is meaningful.
    */
   allowAllEdits?: boolean;
+  /**
+   * Producer-supplied extra (claude-native non-edit tool prompts only):
+   * present when the PermissionRequest endpoint is gating a tool that
+   * supports a persistent "don't ask again" allow rule (everything
+   * except edit tools, ExitPlanMode, and AskUserQuestion). ``tool`` is
+   * the gated tool name; ``host`` is the WebFetch request domain when
+   * present. The UI's ApprovalCard renders an "Approve & don't ask
+   * again for <host|tool>" button that, on accept, asks the server to
+   * install a session-scoped allow rule — the web equivalent of the
+   * native TUI's "don't ask again" permission option.
+   *
+   * Absent/null for every other elicitation (edit tools, ExitPlanMode,
+   * AskUserQuestion, codex, policy ASK), so the button only appears
+   * where the allow rule is meaningful.
+   */
+  rememberScope?: RememberScope | null;
 }
 
 /**

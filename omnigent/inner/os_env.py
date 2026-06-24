@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import atexit
+import base64
+import codecs
 import contextlib
 import json
 import os
@@ -18,7 +20,11 @@ from pathlib import Path
 from typing import Any, TypeAlias, cast
 from urllib.parse import urlparse, urlunparse
 
-from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
+from omnigent.runner.identity import (
+    OMNIGENT_SESSION_ENV_VAR,
+    strip_runner_auth_secrets,
+)
 
 from .async_utils import run_sync_on_thread
 from .credential_proxy import (
@@ -28,6 +34,7 @@ from .credential_proxy import (
 )
 from .datamodel import CredentialProxySpec, OSEnvSpec
 from .sandbox import (
+    ContainmentHandle,
     SandboxPolicy,
     activate_sandbox,
     cleanup_private_tmpdir,
@@ -119,6 +126,14 @@ _DEFAULT_ENV_PASSTHROUGH: tuple[str, ...] = (
     "PYTHONUNBUFFERED",
     "PYTHONDONTWRITEBYTECODE",
     "PYTHONFAULTHANDLER",
+    # Omnigent session marker: always pass the "inside Omnigent" marker
+    # through so an agent's sandboxed shell can detect the session, the
+    # way CLAUDE_CODE / CODEX are visible in their agents' shells. Set on
+    # the runner via runner.identity.OMNIGENT_SESSION_ENV_VAR.
+    OMNIGENT_SESSION_ENV_VAR,
+    # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
+    # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
+    *WINDOWS_ENV_PASSTHROUGH,
 )
 
 
@@ -326,6 +341,10 @@ class _HelperProcessClient:
         # helper itself. Cleared in :meth:`_stop_egress_proxy_locked`.
         self._egress_relay_port: int | None = None
         self._proc: subprocess.Popen[str] | None = None
+        # Parent-held containment handle from the sandbox backend's
+        # post_spawn hook (e.g. a Windows Job Object). Closed in
+        # ``_stop_locked`` to tear down the helper's process tree.
+        self._sandbox_handle: ContainmentHandle | None = None
         self._tmpdir: Path | None = None
         self._egress_proxy: Any | None = None  # EgressProxy when active
         self._egress_loop: Any | None = None  # asyncio event loop for proxy
@@ -528,6 +547,15 @@ class _HelperProcessClient:
             with contextlib.suppress(OSError):
                 os.close(r_fd)
 
+        # Post-spawn containment (parent side). A no-op for the POSIX
+        # launcher backends (they isolate via wrap_launcher_argv before
+        # exec); on Windows this assigns the helper to a kill-on-close
+        # Job Object so the whole tree is torn down in ``_stop_locked``.
+        if sandbox.active and self._proc.pid is not None:
+            self._sandbox_handle = get_backend(sandbox.backend_type).post_spawn(
+                sandbox, self._proc.pid
+            )
+
     def _helper_exit_detail_locked(self) -> str:
         if self._proc is None:
             return "OS environment helper exited unexpectedly"
@@ -571,6 +599,13 @@ class _HelperProcessClient:
                     with contextlib.suppress(Exception):
                         proc.kill()
         finally:
+            # Release the containment handle (Windows Job Object): with
+            # kill-on-close this also reaps any helper descendants that
+            # outlived ``proc.terminate()`` above.
+            if self._sandbox_handle is not None:
+                with contextlib.suppress(Exception):
+                    self._sandbox_handle.close()
+                self._sandbox_handle = None
             self._stop_egress_proxy_locked()
             cleanup_private_tmpdir(self._tmpdir)
             self._tmpdir = None
@@ -743,6 +778,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
         path: str,
         offset: int = 1,
         limit: int | None = None,
+        max_binary_bytes: int | None = None,
     ) -> OpResult:
         if offset < 1:
             return {"error": "offset must be >= 1"}
@@ -755,6 +791,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 "path": path,
                 "offset": offset,
                 "limit": limit,
+                "max_binary_bytes": max_binary_bytes,
             },
         )
         return cast(OpResult, result)
@@ -841,7 +878,11 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
             "os_env.start_in_scratch requires an active sandbox; "
             f"resolved sandbox type {sandbox.backend_type!r} is inactive"
         )
-    shell_path = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+    shell_path = shutil.which("bash") or shutil.which("sh")
+    if shell_path is None:
+        # No POSIX shell on PATH. On Windows fall back to cmd.exe; elsewhere
+        # keep the historical /bin/sh default.
+        shell_path = os.environ.get("COMSPEC", "cmd.exe") if IS_WINDOWS else "/bin/sh"
     egress_rules = spec.sandbox.egress_rules if spec.sandbox else None
     egress_allow_private = (
         spec.sandbox.egress_allow_private_destinations if spec.sandbox else False
@@ -891,10 +932,13 @@ def _handle_helper_request(
             return {"error": str(exc)}
         offset_raw = request.get("offset", 1)
         offset = offset_raw if isinstance(offset_raw, int) else 1
+        max_binary_raw = request.get("max_binary_bytes")
+        max_binary_bytes = max_binary_raw if isinstance(max_binary_raw, int) else None
         return _read_impl(
             path,
             offset,
             request.get("limit"),
+            max_binary_bytes=max_binary_bytes,
         )
 
     if op == "write":
@@ -1014,26 +1058,137 @@ def _assert_write_allowed(policy: SandboxPolicy, path: Path) -> None:
     raise PermissionError(f"Write access to '{path}' is blocked by sandbox.")
 
 
-def _read_impl(path: Path, offset: int, limit: JsonValue) -> OpResult:
+# Bytes sampled to classify a file as text vs binary. A NUL byte or an invalid
+# UTF-8 sequence in this prefix marks the file binary (the same prefix-sniff
+# heuristic git uses), so a multi-MB binary is never read in full just to find
+# out it is not text.
+_BINARY_SNIFF_BYTES = 8192
+
+
+def _is_binary_file(path: Path) -> bool:
+    """Classify *path* as binary by inspecting only its first chunk.
+
+    Reads at most :data:`_BINARY_SNIFF_BYTES` and reports binary when those
+    bytes contain a NUL or are not valid UTF-8. The NUL check matters because
+    ``\x00`` *is* valid UTF-8, so a UTF-16/NUL-laden file would otherwise be
+    misread as text; checking for it explicitly matches git's heuristic. An
+    incremental decoder is used with ``final=False`` so a multi-byte character
+    straddling the chunk boundary is treated as *incomplete* (text), not
+    invalid (binary).
+
+    :param path: Absolute path of the file to classify.
+    :returns: ``True`` if the prefix contains a NUL or is not decodable UTF-8.
     """
-    Read lines from a text file.
+    with path.open("rb") as fh:
+        prefix = fh.read(_BINARY_SNIFF_BYTES)
+    if b"\x00" in prefix:
+        return True
+    try:
+        codecs.getincrementaldecoder("utf-8")("strict").decode(prefix, final=False)
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+def _read_binary_impl(path: Path, max_binary_bytes: int | None) -> OpResult:
+    """Read a binary file as base64, bounded by *max_binary_bytes*.
+
+    Only ``stat`` (for the total size) and at most *max_binary_bytes* are read
+    from disk, so a large file neither saturates memory nor inflates IPC.
+
+    :param path: Absolute path of the binary file.
+    :param max_binary_bytes: Byte cap. ``None`` returns a descriptor only (the
+        agent ``sys_os_read`` path); a positive int inlines up to that many
+        base64-encoded bytes (the filesystem-service path).
+    :returns: An :class:`OpResult` with ``encoding="base64"`` (see
+        :func:`_read_impl`).
+    """
+    total = path.stat().st_size
+    if max_binary_bytes is None:
+        # Agent tool path: return a descriptor only — inlining base64 the
+        # model cannot use would waste (and risk saturating) the context.
+        return {
+            "path": str(path),
+            "encoding": "base64",
+            "content": "",
+            "total_bytes": total,
+            # Not truncated — the content was deliberately not inlined.
+            "truncated": False,
+            "note": (
+                f"Binary file not inlined ({total} bytes). "
+                "View or download it via the file viewer."
+            ),
+        }
+    with path.open("rb") as fh:
+        payload = fh.read(max_binary_bytes)
+    return {
+        "path": str(path),
+        "content": base64.b64encode(payload).decode("ascii"),
+        "encoding": "base64",
+        "total_bytes": total,
+        "returned_bytes": len(payload),
+        "truncated": len(payload) < total,
+    }
+
+
+def _read_impl(
+    path: Path,
+    offset: int,
+    limit: JsonValue,
+    max_binary_bytes: int | None = None,
+) -> OpResult:
+    """
+    Read a file as UTF-8 text, or as base64-encoded bytes when it is binary.
+
+    The file's first chunk is sniffed for UTF-8 validity (see
+    :func:`_is_binary_file`). Files that look like text are read and returned
+    with the usual line-oriented ``offset``/``limit`` windowing. Files that do
+    *not* (images, archives, fonts, …) cannot be line-windowed, so they are
+    capped by *bytes* instead, reading at most ``max_binary_bytes`` from disk.
+
+    For binary files the behaviour depends on ``max_binary_bytes``:
+
+    * ``None`` (the default, used by the agent ``sys_os_read`` tool) — the
+      base64 payload is **not** inlined. A model cannot decode base64, and a
+      multi-MB blob would saturate the context window, so only a descriptor
+      (``total_bytes`` + a ``note``) is returned.
+    * a positive int (used by the filesystem service that feeds the web
+      viewer / downloads) — up to that many raw bytes are base64-encoded and
+      returned, with ``truncated`` set when the file was larger.
 
     :param path: Absolute path of the file to read.
-    :param offset: 1-based line number to start reading from.
+    :param offset: 1-based line number to start reading from (text only).
     :param limit: Maximum number of lines to return, or ``None`` for no
         limit (return all lines from *offset* to end of file).  Callers
         that want the default agent-tool cap should pass
-        :data:`_DEFAULT_READ_LIMIT` explicitly.
-    :returns: An :class:`OpResult` dict with ``path``, ``content``,
-        ``offset``, ``limit``, ``returned_lines``, and ``total_lines``.
+        :data:`_DEFAULT_READ_LIMIT` explicitly.  Ignored for binary files.
+    :param max_binary_bytes: Byte cap for binary files (see above). ``None``
+        returns a descriptor only.
+    :returns: For text, an :class:`OpResult` with ``encoding="utf-8"``,
+        ``content``, ``offset``, ``limit``, ``returned_lines``, and
+        ``total_lines``.  For binary, ``encoding="base64"``, ``total_bytes``,
+        ``truncated`` and either ``content`` (the base64 string, byte-capped
+        callers) or a ``note`` (descriptor-only callers).
     """
     if offset < 1:
         return {"error": "offset must be >= 1"}
     if limit is not None:
         if not isinstance(limit, int) or limit < 1:
             return {"error": "limit must be >= 1"}
+    if max_binary_bytes is not None and max_binary_bytes < 1:
+        return {"error": "max_binary_bytes must be >= 1"}
 
-    text = path.read_text(encoding="utf-8", errors="replace")
+    if _is_binary_file(path):
+        return _read_binary_impl(path, max_binary_bytes)
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="strict")
+    except UnicodeDecodeError:
+        # The sniffed prefix decoded cleanly but bytes further in did not (a
+        # file that is text up front and binary later). Fall back to the binary
+        # path so we never return garbled text.
+        return _read_binary_impl(path, max_binary_bytes)
+
     lines = text.splitlines(keepends=True)
     start = offset - 1
     effective_limit = len(lines) if limit is None else limit
@@ -1042,6 +1197,7 @@ def _read_impl(path: Path, offset: int, limit: JsonValue) -> OpResult:
     return {
         "path": str(path),
         "content": content,
+        "encoding": "utf-8",
         "offset": offset,
         "limit": effective_limit,
         "returned_lines": max(0, resolved_limit - start),
@@ -1230,8 +1386,12 @@ def _is_within(path: Path, root: Path) -> bool:
 
 
 def _shell_argv(shell_path: str, command: str) -> list[str]:
-    shell_name = Path(shell_path).name
-    if shell_name == "bash":
+    shell_name = Path(shell_path).name.lower()
+    if shell_name in ("cmd.exe", "cmd"):
+        return [shell_path, "/c", command]
+    if shell_name in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
+        return [shell_path, "-NoProfile", "-Command", command]
+    if shell_name in ("bash", "bash.exe"):
         return [shell_path, "--noprofile", "--norc", "-c", command]
     return [shell_path, "-c", command]
 

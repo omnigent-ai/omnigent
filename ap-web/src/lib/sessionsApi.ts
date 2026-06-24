@@ -99,6 +99,14 @@ interface SessionResponseWire {
    * other carrier and it's absent for those.
    */
   host_id?: string | null;
+  /**
+   * Whether this session is bound to a dormant managed host the server can
+   * wake in place (its sandbox provider supports resume). Read only when the
+   * host is offline, to tell a recoverable "asleep" state (send a message —
+   * the server resumes the sandbox) from the terminal host_offline dead-end.
+   * Absent/`false` for non-managed/non-resumable hosts.
+   */
+  host_resumable?: boolean;
   status: SessionStatus;
   created_at: number;
   /**
@@ -250,6 +258,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     agentName: wire.agent_name ?? null,
     runnerId: wire.runner_id,
     hostId: wire.host_id ?? null,
+    hostResumable: wire.host_resumable ?? false,
     status: wire.status,
     createdAt: wire.created_at,
     title: wire.title ?? null,

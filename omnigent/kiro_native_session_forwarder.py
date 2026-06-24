@@ -171,7 +171,16 @@ def _read_new_kiro_messages(
     try:
         with jsonl_path.open("rb") as handle:
             handle.seek(byte_offset)
+            # Advance only past newline-terminated lines: Kiro appends to this
+            # JSONL live, so the final line may be a record mid-write (no
+            # trailing ``\n``). Persisting ``handle.tell()`` past such a partial
+            # line would skip the record once Kiro finishes writing it. Hold the
+            # offset at the last complete line and re-read the tail next poll.
+            offset = byte_offset
             for raw_line in handle:
+                if not raw_line.endswith(b"\n"):
+                    break
+                offset += len(raw_line)
                 try:
                     line = raw_line.decode("utf-8")
                 except UnicodeDecodeError:
@@ -179,7 +188,7 @@ def _read_new_kiro_messages(
                 message = _parse_kiro_jsonl_line(line)
                 if message is not None:
                     messages.append(message)
-            return messages, handle.tell()
+            return messages, offset
     except OSError:
         return [], byte_offset
 

@@ -115,6 +115,33 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 </details>
 
 <details>
+<summary>Windows (native)</summary>
+
+Omnigent runs natively on Windows in a degraded mode. The `install_oss.sh`
+bootstrap is POSIX-only, so install with `uv` directly:
+
+```powershell
+uv tool install --python 3.12 omnigent
+# or from the repo:
+uv tool install --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
+```
+
+What works on Windows: `omnigent server`, the web UI, and the SDK-based
+harnesses (`omnigent run <agent.yaml>` with the claude-sdk / cursor / copilot
+/ codex harnesses). Agents run under a Windows **Job Object** for process-tree
+containment.
+
+What is **not** available on Windows (use Linux/macOS, or WSL, for these):
+
+- the native `omnigent claude` / `omnigent codex` / `omnigent cursor`
+  tmux/PTY terminal wrappers (run an SDK harness or the web UI instead);
+- `bwrap`/`seatbelt` filesystem & network sandboxing and the L7 egress proxy
+  — the Job Object backend contains the process tree and enforces resource
+  limits but does **not** isolate the filesystem or network.
+
+</details>
+
+<details>
 <summary>Updating to a new release</summary>
 
 When a newer release is on PyPI, Omnigent shows a one-line notice (once per
@@ -168,18 +195,20 @@ omnigent kiro                        # Kiro CLI
 omnigent run path/to/agent.yaml      # your own agent (see "Write your own agent")
 ```
 
-#### 🐙 Polly and 🟠🔵 Debby
+#### 🐙 Polly, 🟠🔵 Debby, and ✍️ Scribe
 
-Two example agents ship with the repo, and they make good first sessions:
+Three example agents ship with the repo, and they make good first sessions:
 
 ```bash
 omnigent run examples/polly/
 omnigent run examples/debby/
+omnigent run examples/scribe/
 
 # Run an orchestrator on a different harness (sub-agents keep their own):
 omnigent run examples/polly/ --harness pi
 omnigent run examples/debby/ --harness openai-agents
 omnigent run examples/polly/ --harness cursor  # Cursor CLI (needs cursor-agent + CURSOR_API_KEY)
+omnigent run examples/polly/ --harness copilot # GitHub Copilot SDK (needs a GitHub token w/ Copilot, e.g. GH_TOKEN)
 ```
 
 **🐙 Polly** is a multi-agent coding orchestrator who writes no code herself.
@@ -192,6 +221,13 @@ Every question you ask goes to both heads, and she lays the two answers out
 side by side. Type `/debate` and the heads critique each other for a few
 rounds before converging. (She needs both a Claude and an OpenAI credential;
 see step 3.)
+
+**✍️ Scribe** is a documentation orchestrator, the docs counterpart to Polly.
+She turns git diffs, commit history, and PRs into release notes, changelogs, and
+migration guides. She authors the prose herself and delegates only read-only
+code investigation to a researcher sub-agent, then can route a draft through an
+independent different-vendor reviewer to fact-check its claims before it ships.
+(The cross-model fact-check needs an OpenAI credential; the rest runs on one.)
 
 **Prefer the browser?** Start a server and register your machine as a host:
 
@@ -371,8 +407,7 @@ name: my_agent
 prompt: You are a helpful data analyst.
 
 executor:
-  # or: codex, codex-native, claude-native, kiro-native, cursor, openai-agents, pi, antigravity
-  harness: claude-sdk
+  harness: claude-sdk          # or: claude-native, codex, codex-native, cursor, cursor-native, kiro-native, openai-agents, pi, pi-native, antigravity, qwen, copilot
 
 tools:
   # A local Python function (schema auto-generated from the signature)
@@ -403,3 +438,13 @@ Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/e
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md) for how to set up your environment, run the checks, and open a pull request.
+
+
+### Contributors
+
+Thanks to all of our amazing contributors!
+
+<a href="https://github.com/omnigent-ai/omnigent/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=omnigent-ai/omnigent" />
+</a>
+

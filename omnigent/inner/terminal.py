@@ -21,8 +21,10 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeAlias
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.runner.identity import strip_runner_auth_secrets
 
+from . import _proc
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from .egress import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .os_env import (
@@ -94,6 +96,7 @@ def _tmux_managed_option_commands(
     scrollback: int,
     *,
     allow_passthrough: bool = False,
+    keep_alive_after_exit: bool = False,
 ) -> list[list[str]]:
     """
     Build tmux commands for Omnigent-managed global options.
@@ -101,6 +104,11 @@ def _tmux_managed_option_commands(
     :param scrollback: Tmux history limit, e.g. ``10000``.
     :param allow_passthrough: Whether to allow pane programs to send
         passthrough escape sequences to the real attached terminal.
+    :param keep_alive_after_exit: When ``True``, keep the private tmux server
+        alive after the pane's process exits (see
+        :func:`_tmux_session_persistence_commands`). Opt-in because it changes
+        the ``has-session``-means-alive contract that liveness probes rely on;
+        callers that enable it must use pane-dead-aware liveness checks.
     :returns: List of tmux commands to run before ``new-session``.
     """
     commands = [
@@ -108,9 +116,46 @@ def _tmux_managed_option_commands(
         *_tmux_lockdown_commands(),
         *_tmux_status_option_commands(),
     ]
+    if keep_alive_after_exit:
+        commands.extend(_tmux_session_persistence_commands())
     if allow_passthrough:
         commands.append(["set-option", "-g", "allow-passthrough", "on"])
     return commands
+
+
+def _tmux_session_persistence_commands() -> list[list[str]]:
+    """Keep the private tmux server alive when the pane's process exits.
+
+    Each managed terminal runs exactly ONE inner CLI (claude / codex / cursor /
+    pi / a shell) in a private, single-pane tmux server. Under tmux's defaults
+    (``exit-empty on`` + ``remain-on-exit off``) the instant that CLI exits —
+    a crash, ``/exit``, or an environment-specific early exit (issue #540: a
+    claude-native sub-agent on WSL2 that renders its prompt then exits) — the
+    pane closes, the lone session is destroyed, and the server exits on its
+    private socket. Every later control command (send-keys, model / effort
+    change, interrupt, stop) then fails with ``no server running`` and the CLI's
+    final output is gone, so a single child-process exit becomes an
+    unrecoverable, undiagnosable cascade and delegated messages are silently
+    lost.
+
+    ``remain-on-exit on`` keeps the dead pane — and therefore the session and
+    server — present after the inner process exits, so the socket stays usable
+    and the pane's last output stays capturable for diagnostics. The idle
+    watcher then reports the exit deterministically by detecting the dead pane
+    (see :meth:`TerminalInstance._pane_is_dead`) instead of racing the server's
+    disappearance. ``exit-empty off`` is belt-and-suspenders for the case where
+    the session is removed without the server being explicitly killed. Both use
+    ``-q`` so a tmux too old to know the option does not fail launch;
+    :meth:`TerminalInstance.close` still tears the server down unconditionally
+    via ``kill-server``, so nothing leaks.
+
+    :returns: Tmux option commands that keep the server alive past inner-CLI
+        exit.
+    """
+    return [
+        ["set-option", "-gq", "remain-on-exit", "on"],
+        ["set-option", "-sq", "exit-empty", "off"],
+    ]
 
 
 def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
@@ -501,15 +546,7 @@ def _process_alive(pid: int) -> bool:
         e.g. ``48213``.
     :returns: ``True`` when a process with that pid exists.
     """
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return _proc.process_alive(pid)
 
 
 def _terminals_tmp_root() -> Path:
@@ -724,6 +761,13 @@ class TerminalInstance:
     scrollback: int = 10000
     tmux_allow_passthrough: bool = False
     tmux_start_on_attach: bool = False
+    # Keep the private tmux server alive after the pane's inner process exits
+    # (``remain-on-exit`` / ``exit-empty off``). Opt-in per terminal because it
+    # changes the ``has-session``-means-alive contract: with it on, liveness is
+    # decided by ``#{pane_dead}`` (see :meth:`is_alive`), not session existence.
+    # Enabled for the claude-native agent terminal so a single inner-CLI exit no
+    # longer reaps the server and cascades into ``no server running`` (#540).
+    keep_alive_after_exit: bool = False
     running: bool = False
     launch_cwd: str | None = None
     # Owned per-launch egress proxy. ``None`` when the sandbox
@@ -897,6 +941,7 @@ class TerminalInstance:
             *_tmux_managed_option_commands(
                 self.scrollback,
                 allow_passthrough=self.tmux_allow_passthrough,
+                keep_alive_after_exit=self.keep_alive_after_exit,
             ),
             [
                 "set-option",
@@ -1215,6 +1260,14 @@ class TerminalInstance:
                 return
 
             self._remember_pane_snapshot(snapshot)
+            if await self._pane_is_dead_async():
+                # remain-on-exit kept the server alive after the inner CLI
+                # exited; report the exit rather than treating the frozen pane
+                # as an idle agent.
+                self.running = False
+                if on_exit is not None:
+                    await _fire(on_exit, "exit")
+                return
             if detector.tick(snapshot) and not await _fire(on_idle, "idle"):
                 return
 
@@ -1357,6 +1410,16 @@ class TerminalInstance:
                     self._fire_watch_callback(on_exit, "exit")
                 return
             self._remember_pane_snapshot(snapshot)
+            if self._pane_is_dead():
+                # The inner CLI exited but remain-on-exit kept the server, so
+                # capture-pane still succeeds (the snapshot above is the final
+                # frame, now remembered for diagnostics). Report the exit
+                # deterministically instead of mistaking the frozen pane for an
+                # idle agent and leaving the session hung.
+                self.running = False
+                if on_exit is not None:
+                    self._fire_watch_callback(on_exit, "exit")
+                return
             # A pane change that lands within the recent-interaction window
             # is a client-driven repaint (attach/detach reflow, focus,
             # mouse, keystroke — stamped via note_client_interaction), not
@@ -1394,6 +1457,30 @@ class TerminalInstance:
             return self._tmux_output_sync("capture-pane", "-t", self.tmux_target, "-p", "-e")
         except RuntimeError:
             return None
+
+    def _pane_is_dead(self) -> bool:
+        """
+        Report whether the pane's process exited while tmux kept the pane.
+
+        With ``remain-on-exit on`` (see
+        :func:`_tmux_session_persistence_commands`) the private server survives
+        the inner CLI's exit, so a *dead pane* — not a vanished server — is how
+        a normal or early exit now presents. The threaded idle watcher uses this
+        to report the exit deterministically once ``capture-pane`` still
+        succeeds against the surviving server.
+
+        :returns: ``True`` when tmux reports ``#{pane_dead}`` as ``1``.
+            ``False`` when the pane is live, or when the probe itself fails
+            (server already gone) — the caller's capture step already handles
+            the vanished-server path.
+        """
+        try:
+            out = self._tmux_output_sync(
+                "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead}"
+            )
+        except RuntimeError:
+            return False
+        return "1" in out.split()
 
     def _fire_watch_callback(self, callback: Callable[[], None], kind: str) -> bool:
         """
@@ -1445,36 +1532,65 @@ class TerminalInstance:
 
     async def is_alive(self) -> bool:
         """
-        Check if the tmux session is still running.
+        Check if the terminal's inner process is still running.
 
-        When tmux reports the session gone, or the probe cannot start,
-        this method marks ``self.running`` false. That side effect is
-        intentional: subsequent pollers use the in-memory flag as a
-        fast path instead of forking ``tmux has-session`` repeatedly
-        after the server has exited.
+        Probes the pane's ``#{pane_dead}`` flag rather than mere session
+        existence: with ``remain-on-exit on`` (see
+        :func:`_tmux_session_persistence_commands`) the session and server
+        deliberately outlive the inner CLI's exit, so a live session no longer
+        implies a live process. The terminal is alive only when the session
+        exists AND its pane process has not exited.
 
-        :returns: ``True`` when ``tmux has-session`` confirms the
-            session is alive; otherwise ``False``.
+        When the session is gone (probe exits non-zero), the pane is dead, or
+        the probe cannot start, this marks ``self.running`` false. That side
+        effect is intentional: subsequent pollers use the in-memory flag as a
+        fast path instead of re-forking tmux after the process has exited.
+
+        :returns: ``True`` when the session exists and its pane process is
+            still running; otherwise ``False``.
         """
         if not self.running:
             return False
         try:
             proc = await asyncio.create_subprocess_exec(
                 *self._tmux_base_cmd(),
-                "has-session",
+                "list-panes",
                 "-t",
                 self.tmux_target,
-                stdout=asyncio.subprocess.DEVNULL,
+                "-F",
+                "#{pane_dead}",
+                stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await proc.communicate()
-            if proc.returncode != 0:
+            stdout, _ = await proc.communicate()
+            # rc != 0 → session/server gone; a "1" line → the pane process
+            # exited but the session was kept alive by remain-on-exit. Both mean
+            # not-alive. (``list-panes`` errors on an unknown target, unlike
+            # ``display-message``, which silently falls back to another pane.)
+            panes = stdout.decode().split()
+            if proc.returncode != 0 or not panes or "1" in panes:
                 self.running = False
                 return False
             return True
         except OSError:
             self.running = False
             return False
+
+    async def _pane_is_dead_async(self) -> bool:
+        """
+        Async sibling of :meth:`_pane_is_dead` for the asyncio idle watcher.
+
+        :returns: ``True`` when tmux reports ``#{pane_dead}`` as ``1``;
+            ``False`` when the pane is live or the probe fails (server gone,
+            which the caller's capture step handles).
+        """
+        try:
+            out = await self._tmux_output(
+                "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead}"
+            )
+        except RuntimeError:
+            return False
+        return "1" in out.split()
 
     async def _tmux(self, *args: str) -> None:
         """Run a tmux command against this instance's server."""
@@ -1589,6 +1705,12 @@ def create_terminal_instance(
     :returns: A :class:`TerminalCreateResult` carrying the new instance
         and the resolved cwd to pass to ``launch()``.
     """
+    if IS_WINDOWS:
+        raise RuntimeError(
+            "Native terminal harnesses (tmux/PTY) are not supported on Windows. "
+            "Run an SDK-based harness via `omnigent run <agent.yaml>` (e.g. the "
+            "claude-sdk, cursor, copilot, or codex harness) or use the web UI."
+        )
     if not _tmux_available():
         raise RuntimeError("tmux is not installed or not on PATH")
 
@@ -1680,6 +1802,7 @@ def create_terminal_instance(
         scrollback=spec.scrollback,
         tmux_allow_passthrough=spec.tmux_allow_passthrough,
         tmux_start_on_attach=spec.tmux_start_on_attach,
+        keep_alive_after_exit=spec.keep_alive_after_exit,
     )
 
     return TerminalCreateResult(instance=instance, cwd=cwd)

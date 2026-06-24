@@ -1,8 +1,7 @@
 import { renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { livenessRowFromSession, useSessionLiveness } from "./useSessionLiveness";
+import { type LivenessRow, livenessRowFromSession, useSessionLiveness } from "./useSessionLiveness";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
-import type { Conversation } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
 
 // Drive the two split signals directly so the test pins the derivation
@@ -29,16 +28,20 @@ function freshCreatedAt(): number {
 }
 
 /** Build a minimal conv row carrying just the fields the hook reads. */
-function conv(
-  partial: Partial<Pick<Conversation, "host_id" | "permission_level" | "created_at">>,
-): Pick<Conversation, "host_id" | "permission_level" | "created_at"> {
-  return { host_id: null, permission_level: null, created_at: SOME_CREATED_AT, ...partial };
+function conv(partial: Partial<LivenessRow>): LivenessRow {
+  return {
+    host_id: null,
+    permission_level: null,
+    created_at: SOME_CREATED_AT,
+    host_resumable: false,
+    ...partial,
+  };
 }
 
 function derive(
   runner: boolean | undefined,
   host: boolean | null | undefined,
-  c: Pick<Conversation, "host_id" | "permission_level" | "created_at"> | null,
+  c: LivenessRow | null,
   opts?: { turnActive?: boolean },
 ) {
   runnerMock.mockReturnValue(runner);
@@ -114,6 +117,37 @@ describe("useSessionLiveness — derivation truth table", () => {
     expect(derive(false, false, conv({ host_id: "h1", permission_level: 3 }))).toEqual({
       kind: "host_offline",
       isOwner: false,
+    });
+  });
+
+  it("host_asleep when a resumable managed host is down — composer stays open", () => {
+    // A dormant resumable managed host the server wakes on the next message:
+    // NOT the host_offline dead-end. host_resumable flips row 3.
+    expect(derive(false, false, conv({ host_id: "h1", host_resumable: true }))).toEqual({
+      kind: "host_asleep",
+    });
+    // The wake is server-side, not owner-gated: resumable wins the offline
+    // split even when shared (non-owner).
+    expect(
+      derive(false, false, conv({ host_id: "h1", permission_level: 1, host_resumable: true })),
+    ).toEqual({ kind: "host_asleep" });
+  });
+
+  it("starting (NOT host_asleep) while a just-sent turn is waking the resumable host", () => {
+    // turnActive means the send is resuming the sandbox now — show the
+    // "Connecting…" intermediate through the cold wake, not a blank
+    // host_asleep screen.
+    expect(
+      derive(false, false, conv({ host_id: "h1", host_resumable: true }), { turnActive: true }),
+    ).toEqual({ kind: "starting" });
+  });
+
+  it("host_offline (not host_asleep) when the down host is NOT resumable", () => {
+    // The default for an external/non-resumable host: the actionable
+    // reconnect/fork dead-end, unchanged.
+    expect(derive(false, false, conv({ host_id: "h1", host_resumable: false }))).toEqual({
+      kind: "host_offline",
+      isOwner: true,
     });
   });
 
@@ -236,10 +270,15 @@ describe("useSessionLiveness — derivation truth table", () => {
       } as Session;
     }
 
-    it("maps hostId / permissionLevel / createdAt into the snake_case row", () => {
+    it("maps hostId / permissionLevel / createdAt / hostResumable into the snake_case row", () => {
       expect(
         livenessRowFromSession(session({ hostId: "h1", permissionLevel: 1, createdAt: 123 })),
-      ).toEqual({ host_id: "h1", permission_level: 1, created_at: 123 });
+      ).toEqual({ host_id: "h1", permission_level: 1, created_at: 123, host_resumable: false });
+      // hostResumable flows through so an off-sidebar resumable host can
+      // classify host_asleep rather than dead-ending on host_offline.
+      expect(livenessRowFromSession(session({ hostId: "h1", hostResumable: true }))).toMatchObject({
+        host_resumable: true,
+      });
     });
 
     it("returns null for a null/undefined snapshot", () => {

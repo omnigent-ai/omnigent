@@ -127,6 +127,55 @@ def test_read_new_kiro_messages_returns_user_and_assistant_text(tmp_path: Path) 
     assert byte_offset == jsonl_path.stat().st_size
 
 
+def test_read_new_kiro_messages_holds_offset_at_partial_trailing_line(tmp_path: Path) -> None:
+    """A record still mid-write (no trailing newline) is not skipped.
+
+    Kiro appends to the JSONL live, so a poll can catch a partial final line.
+    The reader must hold the offset at the last complete (newline-terminated)
+    line so the partial record is re-read once Kiro finishes it — persisting
+    ``handle.tell()`` past the partial line would drop that record for good.
+    """
+    complete = json.dumps(
+        {
+            "version": "v1",
+            "kind": "Prompt",
+            "data": {"message_id": "user-1", "content": [{"kind": "text", "data": "first"}]},
+        }
+    )
+    partial = json.dumps(
+        {
+            "version": "v1",
+            "kind": "AssistantMessage",
+            "data": {"message_id": "assistant-1", "content": [{"kind": "text", "data": "second"}]},
+        }
+    )
+    jsonl_path = tmp_path / "session.jsonl"
+    # Complete line + a partial second line with NO trailing newline.
+    jsonl_path.write_text(complete + "\n" + partial, encoding="utf-8")
+
+    messages, offset = forwarder._read_new_kiro_messages(jsonl_path, 0)
+
+    # Only the complete record is delivered; the offset stops at its newline,
+    # not at EOF (which would skip the partial record once it's finished).
+    assert messages == [
+        forwarder._KiroConversationMessage(message_id="user-1", role="user", text="first")
+    ]
+    assert offset == len((complete + "\n").encode("utf-8"))
+    assert offset < jsonl_path.stat().st_size
+
+    # Kiro finishes the second record; re-reading from the held offset delivers it.
+    with jsonl_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+    messages, offset = forwarder._read_new_kiro_messages(jsonl_path, offset)
+
+    assert messages == [
+        forwarder._KiroConversationMessage(
+            message_id="assistant-1", role="assistant", text="second"
+        )
+    ]
+    assert offset == jsonl_path.stat().st_size
+
+
 @pytest.mark.asyncio
 async def test_forward_kiro_session_posts_conversation_messages(
     tmp_path: Path,

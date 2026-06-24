@@ -114,6 +114,12 @@ describe("useAvailableAgents", () => {
             harness: "kiro-native",
           },
           {
+            id: "ag_opencode_native",
+            name: "opencode-native-ui",
+            description: null,
+            harness: "opencode-native",
+          },
+          {
             id: "ag_nessie",
             name: "nessie",
             description: "Multi-agent coding orchestrator.",
@@ -174,6 +180,14 @@ describe("useAvailableAgents", () => {
         display_name: "Kiro",
         description: null,
         harness: "kiro-native",
+        skills: [],
+      },
+      {
+        id: "ag_opencode_native",
+        name: "opencode-native-ui",
+        display_name: "OpenCode",
+        description: null,
+        harness: "opencode-native",
         skills: [],
       },
       {

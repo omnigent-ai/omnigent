@@ -816,18 +816,20 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // `POST /v1/sessions/{id}/events {type: "approval"}`.
       yield {
         type: "elicitation",
-        // A REQUEST-phase elicitation gates the user's prompt BEFORE any
-        // turn is forwarded, so no `response_start` has reset
-        // `state.responseId` — it still holds the PREVIOUS turn's response
-        // id. Left as-is, bubble grouping would fold this card into the
-        // prior assistant bubble (a follow-up "Hi again" ASK lands inside
-        // the last answer), defeating the ChatPage reorder that keeps the
-        // prompt above its card. Stamp a unique id off the elicitation so
-        // the card always forms its own standalone bubble. Other phases
-        // (tool_call) keep the active response id so the card renders
+        // Stamp the card with its OWN response id so it forms a standalone
+        // bubble whenever there is no active turn to anchor it to:
+        //   • a REQUEST-phase ASK gates the user's prompt BEFORE any turn is
+        //     forwarded, so `state.responseId` still holds the PREVIOUS turn's
+        //     id; and
+        //   • a terminal-driven harness (e.g. cursor-native) never emits
+        //     `response_created`, so `state.responseId` is still "".
+        // Left as-is, bubble grouping would fold the card into a prior bubble
+        // (or group it under the empty id), defeating the ChatPage reorder that
+        // keeps the gated user message above its card. Other phases WITH an
+        // active turn (tool_call) keep that turn's id so the card renders
         // inline with the turn that triggered it.
         ctx:
-          event.phase === "request"
+          event.phase === "request" || state.responseId === ""
             ? ctx(state, null, `elicit_${event.elicitationId}`)
             : ctx(state),
         elicitationId: event.elicitationId,
@@ -844,6 +846,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         exitPlanMode: event.exitPlanMode,
         codexCommand: event.codexCommand,
         allowAllEdits: event.allowAllEdits,
+        rememberScope: event.rememberScope,
       } satisfies ElicitationBlock;
       return;
     }
