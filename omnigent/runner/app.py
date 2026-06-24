@@ -3117,10 +3117,16 @@ async def _cold_start_agy_conversation(
             cascade_id,
             session_id,
         )
-    # PATCH the real id onto the session so a later ``--resume`` continues this
-    # conversation (best-effort; mirrors codex/pi). A failure leaves the chat
-    # mirrored but loses agy's in-process resume continuity for this session.
-    await _patch_agy_external_session_id(server_client, session_id, cascade_id)
+    # Do NOT record this cold-start cascade as the session's external_session_id:
+    # it is the headless ``StartCascade`` bootstrap that the agy TUI never
+    # displays. The TUI mints its OWN cascade on the first typed turn, which the
+    # read driver ADOPTS in place and records as external_session_id (see
+    # ``antigravity_native_reader._record_external_session_id``). Recording the
+    # phantom here used to lose the whole conversation on resume: a later
+    # ``--resume`` launched ``--conversation <phantom>`` and loaded an EMPTY
+    # conversation. external_session_id is set-once, so it MUST be left unset here
+    # for the reader's adoption PATCH to set the real id.
+    del server_client  # retained for signature parity; no longer PATCHes here
     _logger.info(
         "Antigravity cold-start: created conversation %s on port %s for session %s",
         cascade_id,
@@ -3128,54 +3134,6 @@ async def _cold_start_agy_conversation(
         session_id,
     )
     return cascade_id
-
-
-async def _patch_agy_external_session_id(
-    server_client: httpx.AsyncClient | None,
-    session_id: str,
-    cascade_id: str,
-) -> None:
-    """
-    PATCH a cold-started agy cascade id onto the Omnigent session (best-effort).
-
-    Records ``external_session_id`` so a later ``omnigent antigravity --resume``
-    reads agy's real id back and passes ``--conversation <id>``. Read-path
-    replacement for the retired forwarder's ``_patch_external_session_id``;
-    mirrors the codex/pi recorder PATCH (best-effort — a transport
-    ``httpx.HTTPError`` or a ``>= 400`` rejection is logged, not raised, since the
-    chat mirror does not depend on it). A ``None`` client (no server client
-    available) is a no-op.
-
-    :param server_client: Runner Omnigent server client, or ``None`` to skip.
-    :param session_id: Omnigent conversation id to PATCH.
-    :param cascade_id: agy's real (cold-started) conversation id to record.
-    :returns: None.
-    """
-    if server_client is None:
-        return
-    try:
-        resp = await server_client.patch(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            json={"external_session_id": cascade_id},
-            timeout=10.0,
-        )
-    except httpx.HTTPError:
-        _logger.warning(
-            "Antigravity cold-start: failed to PATCH external_session_id=%s onto session %s; "
-            "the conversation is mirrored but `--resume` will cold-start fresh.",
-            cascade_id,
-            session_id,
-            exc_info=True,
-        )
-        return
-    if resp.status_code >= 400:
-        _logger.warning(
-            "Antigravity cold-start: AP rejected external_session_id PATCH (%s); session=%s "
-            "cascade=%s — the conversation is mirrored but `--resume` will cold-start fresh.",
-            resp.status_code,
-            session_id,
-            cascade_id,
-        )
 
 
 def _terminal_tmux_pane(

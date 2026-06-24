@@ -2939,8 +2939,14 @@ async def test_run_reader_with_bridge_adopts_first_cascade_in_place(
         rotate_calls.append("forked")  # must NOT happen on adopt-in-place
         return "conv_should_not_be_used"
 
+    recorded_external: list[tuple[str, str]] = []
+
+    async def _fake_record_external(client: object, session_id: str, cascade_id: str) -> None:
+        recorded_external.append((session_id, cascade_id))
+
     monkeypatch.setattr(reader, "supervise_reader", _fake_supervise)
     monkeypatch.setattr(reader, "_rotate_session_for_cascade", _fake_rotate)
+    monkeypatch.setattr(reader, "_record_external_session_id", _fake_record_external)
     monkeypatch.setattr(
         "omnigent.antigravity_native_interactions.bridge_interaction",
         lambda *a, **k: None,
@@ -2965,6 +2971,10 @@ async def test_run_reader_with_bridge_adopts_first_cascade_in_place(
     assert state is not None
     assert state.session_id == _SESSION_ID
     assert state.conversation_id == new_cascade
+    # The adopted cascade is recorded as external_session_id so a later --resume /
+    # server restart loads THIS conversation, not the headless cold-start phantom
+    # (#2 data-loss). It is recorded against the SAME session.
+    assert recorded_external == [(_SESSION_ID, new_cascade)]
 
 
 @pytest.mark.asyncio
