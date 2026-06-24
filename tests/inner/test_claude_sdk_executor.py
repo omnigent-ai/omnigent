@@ -3675,8 +3675,86 @@ def test_manual_compact_block_coerced_to_slash_command() -> None:
             ]
         # The bare slash command string reached query() — NOT a content-block list.
         assert seen_prompts == ["/compact"], seen_prompts
-        # And the PreCompact-driven CompactionComplete still fired.
+        # And the compact_boundary-driven CompactionComplete still fired.
         assert any(isinstance(e, CompactionComplete) for e in events)
+
+    _run(_t())
+
+
+def test_manual_compact_reports_none_token_count_when_unmeasured() -> None:
+    """When the /compact turn has no usable usage (no message_start, zero
+    ResultMessage usage), CompactionComplete.token_count is None — NOT 0 — so
+    the client's context ring isn't slammed to 0% and instead corrects on the
+    next turn's usage (matching claude-native)."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete
+
+    class _ResultMessage:
+        def __init__(self, session_id):
+            self.session_id = session_id
+            self.result = "compacted"
+            self.content = []
+            self.model = "claude-test"
+            # Zero usage — the manual /compact turn reports no prompt-side
+            # tokens, so context_tokens resolves to 0 → token_count None.
+            self.usage = type("U", (), {"input_tokens": 0, "output_tokens": 0})()
+
+    class _SystemMessage:
+        def __init__(self, subtype, data, hook_event_name=None):
+            self.subtype = subtype
+            self.data = data
+            self.hook_event_name = hook_event_name
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = _SystemMessage
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+        messages: list = []
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                _FakeSDK.messages = [
+                    _SystemMessage(subtype="compact_boundary", data={}),
+                    _ResultMessage("claude-uuid-none"),
+                ]
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with (
+            patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK),
+            patch("claude_agent_sdk.get_session_messages", return_value=[]),
+        ):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "/compact", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+        compaction = [e for e in events if isinstance(e, CompactionComplete)]
+        assert len(compaction) == 1
+        assert compaction[0].token_count is None, compaction[0].token_count
 
     _run(_t())
 

@@ -218,7 +218,12 @@ class CompactionComplete(ExecutorEvent):
     receive pre-compacted history.
 
     :param summary: Text summary of the compacted conversation.
-    :param token_count: Estimated token count of the summary.
+    :param token_count: Post-compaction context size in tokens, or ``None``
+        when no real measurement is available. ``None`` (not ``0``) must be
+        used for "unknown" so the client's context ring is NOT slammed to 0%
+        — it then holds the prior value and corrects on the next turn's usage,
+        matching the claude-native model (its compaction event carries no token
+        count; the next API call's usage updates the ring).
     :param model: Model used for summarization, or None if truncation-based.
     :param compacted_messages: The compacted message list that replaces
         the pre-compaction history, stored by the runner so a resumed
@@ -228,7 +233,7 @@ class CompactionComplete(ExecutorEvent):
     """
 
     summary: str
-    token_count: int
+    token_count: int | None
     model: str | None = None
     compacted_messages: list[dict[str, Any]] | None = None
 

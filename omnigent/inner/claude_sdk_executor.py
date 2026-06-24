@@ -2642,9 +2642,18 @@ class ClaudeSDKExecutor(Executor):
         if compaction_occurred and claude_session_id:
             from omnigent.inner.executor import CompactionComplete
 
-            _compaction_tokens = 0
+            # Post-compaction context fill, when the turn measured it (the
+            # latest API call's prompt-side tokens — input + cache). A manual
+            # ``/compact`` turn emits no ``message_start`` usage, so this is
+            # often unknown: send ``None`` (NOT 0) so the client's context ring
+            # holds its prior value and corrects on the next turn's usage rather
+            # than blinking to 0%. Mirrors claude-native (whose compaction event
+            # carries no token count; the next API call's usage updates the ring).
+            _compaction_tokens: int | None = None
             if turn_usage is not None:
-                _compaction_tokens = turn_usage.get("context_tokens", 0) or 0
+                _ct = turn_usage.get("context_tokens")
+                if isinstance(_ct, int) and _ct > 0:
+                    _compaction_tokens = _ct
             # Read the post-compaction session messages so the runner
             # can persist them for session resume in ephemeral
             # environments where the CLI's own transcript is lost.
