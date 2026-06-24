@@ -32,6 +32,7 @@ import {
 import { LaptopMinimalIcon, MoonIcon, SunIcon } from "lucide-react";
 import { useTheme } from "next-themes";
 import { Link } from "@/lib/routing";
+import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -62,8 +63,8 @@ import { cn } from "@/lib/utils";
  * Settings content panel. The section nav lives in the sidebar card
  * (SettingsSidebarBody); this renders only the selected section into the
  * AppShell main outlet. The active section is read from the URL so the two
- * stay in sync. pt-14 clears the shell's absolute top-0 h-14 header overlay,
- * matching the Inbox / Members pages.
+ * stay in sync. PageScroll handles clearing the shell's absolute header and
+ * the iOS native bars, matching the Inbox / Members pages.
  */
 export function SettingsPage() {
   const info = useServerInfo();
@@ -71,14 +72,12 @@ export function SettingsPage() {
   const { section } = useSettingsRoute();
 
   return (
-    <div className="flex-1 overflow-y-auto">
-      <div className="mx-auto w-full max-w-3xl px-8 pb-10 pt-14">
-        {section === "appearance" && <AppearanceSection />}
-        {section === "shortcuts" && <ShortcutsSection />}
-        {section === "account" && accountsEnabled && <AccountSection />}
-        {section === "archived" && <ArchivedSection />}
-      </div>
-    </div>
+    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
+      {section === "appearance" && <AppearanceSection />}
+      {section === "shortcuts" && <ShortcutsSection />}
+      {section === "account" && accountsEnabled && <AccountSection />}
+      {section === "archived" && <ArchivedSection />}
+    </PageScroll>
   );
 }
 

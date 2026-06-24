@@ -45,6 +45,7 @@ import {
   Loader2Icon,
 } from "lucide-react";
 import { ApprovalCard, type SubmitApprovalFn } from "@/components/blocks/ApprovalCard";
+import { PageScroll } from "@/components/PageScroll";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
@@ -184,9 +185,7 @@ export function InboxPage() {
   };
 
   return (
-    <div className="mx-auto w-full max-w-3xl overflow-y-auto px-6 py-8 pt-14">
-      {/* pt-14 leaves room for the AppShell's absolute-positioned header,
-          matching MembersPage / PoliciesPage. */}
+    <PageScroll contentClassName="px-6">
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Inbox</h1>
         {(items.length > 0 || commentInbox.items.length > 0) && (
@@ -401,6 +400,6 @@ export function InboxPage() {
           </div>
         )}
       </div>
-    </div>
+    </PageScroll>
   );
 }

@@ -33,7 +33,7 @@ struct WebShellView: View {
           connectToNewServer: connectToNewServer,
           reload: model.reload
         )
-        .padding(.top, 8)
+        .padding(.top, InsetMetrics.serverSwitcherTopPadding)
         .opacity(model.serverSwitcherHidden ? 0 : 1)
         .scaleEffect(model.serverSwitcherHidden ? 0.96 : 1, anchor: .top)
         .allowsHitTesting(!model.serverSwitcherHidden)
@@ -56,7 +56,7 @@ struct WebShellView: View {
             model.emitViewModeChanged(newMode)
           }
         )
-        .padding(.bottom, 6)
+        .padding(.bottom, InsetMetrics.barBottomPadding)
         .opacity(model.bottomBarVisible ? 1 : 0)
         .allowsHitTesting(model.bottomBarVisible)
         .accessibilityHidden(!model.bottomBarVisible)
@@ -67,6 +67,16 @@ struct WebShellView: View {
     .onChange(of: router.pendingNotificationPath) { _, _ in
       if let path = router.consumeNotificationPath() {
         model.emitNotificationActivation(path)
+      }
+    }
+    .onChange(of: model.isLoading) { _, loading in
+      // Re-push the native bar footprints once each load completes; the JS
+      // bridge caches the value so a later-mounting subscriber still gets it.
+      if !loading {
+        model.emitInsets(
+          topBar: InsetMetrics.topBarFootprint,
+          bottomBar: InsetMetrics.bottomBarFootprint
+        )
       }
     }
   }
@@ -141,7 +151,7 @@ private struct ServerSwitcher: View {
       .font(.system(size: 12))
       .foregroundStyle(DesignTokens.foreground(colorScheme))
       .padding(.horizontal, 10)
-      .frame(height: 28)
+      .frame(height: InsetMetrics.serverSwitcherHeight)
       .frame(maxWidth: maxWidth)
       .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
     }
@@ -164,5 +174,27 @@ private struct ServerSwitcher: View {
 private enum ServerSwitcherMetrics {
   static func maxWidth(for containerWidth: CGFloat) -> CGFloat {
     min(172, max(120, containerWidth * 0.38))
+  }
+}
+
+/// Single source of truth for the floating native bars' dimensions. These drive
+/// both the SwiftUI layout (the `.frame`/`.padding` calls above and in
+/// `ChatTerminalBar`) and the footprint pushed to the web layer via
+/// `WebViewModel.emitInsets`, so the web's content insets can never drift from
+/// the bars' real size. Values are CSS points, excluding the OS safe area (the
+/// web layer adds that with `env(safe-area-inset-*)`).
+enum InsetMetrics {
+  // Server switcher — the top floating pill.
+  static let serverSwitcherHeight: CGFloat = 28
+  static let serverSwitcherTopPadding: CGFloat = 8
+  static var topBarFootprint: CGFloat { serverSwitcherHeight + serverSwitcherTopPadding }
+
+  // Chat/Terminal bar — the bottom floating capsule. The capsule wraps the
+  // segment row (`barSegmentHeight`) in `barCapsulePadding` on every side.
+  static let barSegmentHeight: CGFloat = 34
+  static let barCapsulePadding: CGFloat = 4
+  static let barBottomPadding: CGFloat = 6
+  static var bottomBarFootprint: CGFloat {
+    barSegmentHeight + barCapsulePadding * 2 + barBottomPadding
   }
 }

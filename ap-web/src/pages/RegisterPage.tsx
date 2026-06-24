@@ -70,7 +70,15 @@ export function RegisterPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background px-4">
+    <div
+      className="flex min-h-screen items-center justify-center bg-background px-4"
+      // Centered auth page (no header / native bars): just keep the card clear
+      // of the notch + home indicator. 0 off the iOS shell. See index.css.
+      style={{
+        paddingTop: "var(--omnigent-safe-top)",
+        paddingBottom: "var(--omnigent-safe-bottom)",
+      }}
+    >
       <div className="w-full max-w-sm space-y-6">
         <div className="space-y-1 text-center">
           <h1 className="text-2xl font-semibold tracking-tight">Create your account</h1>
