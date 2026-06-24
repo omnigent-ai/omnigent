@@ -496,7 +496,12 @@ const assistantWith = (id: string, items: RenderItem[]): Bubble => ({
   error: null,
   items,
 });
-const textItem = (id: string): RenderItem => ({ kind: "text", itemId: id, text: "hi", final: true });
+const textItem = (id: string): RenderItem => ({
+  kind: "text",
+  itemId: id,
+  text: "hi",
+  final: true,
+});
 const elicitItem = (id: string, status: "pending" | "responded"): RenderItem => ({
   kind: "elicitation",
   itemId: id,
