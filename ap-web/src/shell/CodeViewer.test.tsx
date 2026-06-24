@@ -230,6 +230,59 @@ describe("CodeViewer truncated preview", () => {
   });
 });
 
+describe("CodeViewer markdown preview rendering (issue #970)", () => {
+  // The read-only markdown preview is now the default surface for .md files, so
+  // it must faithfully render the GFM feature set the issue calls out:
+  // headings, lists, tables, code blocks, blockquotes, task lists, emoji.
+  const renderMd = (content: string) =>
+    renderViewer(content, true, "doc.md", { viewMode: "preview" });
+
+  it("renders headings", () => {
+    const { container } = renderMd("# Title\n\n## Subtitle");
+    expect(container.querySelector("h1")?.textContent).toBe("Title");
+    expect(container.querySelector("h2")?.textContent).toBe("Subtitle");
+  });
+
+  it("renders bullet and ordered lists", () => {
+    const { container } = renderMd("- one\n- two\n\n1. first\n2. second");
+    expect(container.querySelectorAll("ul li")).toHaveLength(2);
+    expect(container.querySelectorAll("ol li")).toHaveLength(2);
+  });
+
+  it("renders GFM tables", () => {
+    const { container } = renderMd("| A | B |\n| - | - |\n| 1 | 2 |");
+    expect(container.querySelector("table")).not.toBeNull();
+    expect(container.querySelectorAll("th")).toHaveLength(2);
+    expect(container.querySelectorAll("tbody td")).toHaveLength(2);
+  });
+
+  it("renders fenced code blocks", () => {
+    const { container } = renderMd("```js\nconst x = 1;\n```");
+    expect(container.querySelector("pre code")?.textContent).toContain("const x = 1;");
+  });
+
+  it("renders blockquotes", () => {
+    const { container } = renderMd("> quoted text");
+    expect(container.querySelector("blockquote")?.textContent).toContain("quoted text");
+  });
+
+  it("renders GFM task lists as checkboxes reflecting their checked state", () => {
+    const { container } = renderMd("- [x] done\n- [ ] todo");
+    const boxes = container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
+    expect(boxes).toHaveLength(2);
+    expect(boxes[0].checked).toBe(true);
+    expect(boxes[1].checked).toBe(false);
+  });
+
+  it("renders :shortcode: emoji as their unicode glyphs", () => {
+    // GitHub renders `:tada:` as 🎉; the preview matches that so agent-authored
+    // docs/summaries read the same here as on GitHub.
+    const { container } = renderMd("Ship it :tada: :rocket:");
+    expect(container.textContent).toContain("🎉");
+    expect(container.textContent).toContain("🚀");
+  });
+});
+
 describe("CodeViewer HTML preview sandbox", () => {
   // The HTML preview is the security-load-bearing surface: artifact content is
   // untrusted (agent/user-generated), so these assertions lock in the iframe's

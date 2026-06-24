@@ -32,6 +32,7 @@ import type { BundledLanguage, ThemedToken } from "shiki";
 import { highlightCode } from "@/components/ai-elements/code-block";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkEmoji from "remark-emoji";
 import { type Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
@@ -71,10 +72,15 @@ const MonacoCodeEditor = lazy(() =>
 // Width of the line-number gutter — must match the `w-12` Tailwind class on the gutter div.
 const GUTTER_WIDTH = 48;
 
+// GFM covers tables, task lists, strikethrough, and autolinks; remark-emoji
+// renders GitHub-style `:shortcode:` emoji as their unicode glyphs so docs read
+// the same here as on GitHub (issue #970).
+const MARKDOWN_REMARK_PLUGINS = [remarkGfm, remarkEmoji];
+
 function MarkdownPreview({ content }: { content: string }) {
   return (
     <div className="px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+      <ReactMarkdown remarkPlugins={MARKDOWN_REMARK_PLUGINS}>{content}</ReactMarkdown>
     </div>
   );
 }
