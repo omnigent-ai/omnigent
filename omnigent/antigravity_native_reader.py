@@ -740,7 +740,12 @@ async def _watch_for_rotation(
     ``stop`` predicate, so it never races the bounded body loop's shared
     iteration counter under test. Best-effort: a fetch failure
     (``httpx.HTTPError`` / ``ValueError``) is logged and skipped (the next tick
-    retries) so a transient agy fault never kills the detector.
+    retries) so a transient agy fault never kills the detector. A benign
+    ``httpx.ConnectError`` (connection refused — the port is already gone during
+    teardown/rotation/shutdown before this task is cancelled) is logged at DEBUG
+    rather than WARNING to avoid spamming the log every tick; every other
+    ``httpx.HTTPError`` (e.g. a hung-but-listening port raising ``ReadTimeout``)
+    still WARNs because it signals a real fault.
 
     :param port: Validated connect-RPC port (the bound reader's port).
     :param bound_cascade_id: The cascade id the reader is currently bound to.
@@ -755,6 +760,20 @@ async def _watch_for_rotation(
         await _sleep(interval_s)
         try:
             body = await asyncio.to_thread(get_all_cascade_trajectories, port)
+        except httpx.ConnectError as exc:
+            # Connection refused is benign here: the agy port is gone because the
+            # terminal is being torn down / rotated / shut down before this
+            # detector task is cancelled. No spawn or leak — the next tick retries
+            # and the supervisor cancels us — so log at DEBUG to avoid spam.
+            _logger.debug(
+                "agy rotation detector: GetAllCascadeTrajectories connect refused "
+                "(port likely gone during teardown); retrying: "
+                "bound_cascade=%s port=%s error=%r",
+                bound_cascade_id,
+                port,
+                exc,
+            )
+            continue
         except (httpx.HTTPError, ValueError) as exc:
             _logger.warning(
                 "agy rotation detector: GetAllCascadeTrajectories failed; retrying: "

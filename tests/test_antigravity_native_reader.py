@@ -50,6 +50,7 @@ import asyncio
 import contextlib
 import copy
 import json
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
@@ -2558,6 +2559,110 @@ async def test_supervise_reader_skips_failed_rotation_cascade(
         skip_cascade_ids=frozenset({skipped}),
     )
     assert result is None
+
+
+class _RotationFetchScript:
+    """``get_all_cascade_trajectories`` that raises a scripted exception sequence.
+
+    Each call raises the next exception in ``exceptions``; once exhausted the
+    final exception repeats. A test ends the otherwise-infinite
+    :func:`_watch_for_rotation` loop by scripting a terminal
+    :class:`asyncio.CancelledError` — a ``BaseException`` (not ``Exception``), so
+    the detector's ``httpx``/``ValueError`` arms do not catch it and it
+    propagates out of the worker thread to stop the loop.
+    """
+
+    def __init__(self, exceptions: list[BaseException]) -> None:
+        self._exceptions = exceptions
+        self.calls = 0
+
+    def __call__(self, port: int) -> dict[str, object]:
+        idx = min(self.calls, len(self._exceptions) - 1)
+        self.calls += 1
+        raise self._exceptions[idx]
+
+
+def _fail_rotation(_cid: str) -> None:
+    """``on_rotation`` that must never fire when every fetch fails."""
+    raise AssertionError("on_rotation must not fire when the fetch keeps failing")
+
+
+async def _watch_until_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    first_error: BaseException,
+) -> _RotationFetchScript:
+    """Run :func:`_watch_for_rotation` for one ``first_error`` tick, then cancel.
+
+    Scripts the fetch to raise ``first_error`` then a terminal ``CancelledError``,
+    no-ops the interval sleep, and drives the loop under DEBUG capture until the
+    cancellation propagates out. Returns the script so the caller can assert it
+    reached its second call (i.e. the loop retried past ``first_error``); the
+    per-test log-level assertions read ``caplog.records`` directly.
+    """
+    script = _RotationFetchScript([first_error, asyncio.CancelledError()])
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", script)
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    with caplog.at_level(logging.DEBUG, logger=reader.__name__):
+        with pytest.raises(asyncio.CancelledError):
+            await reader._watch_for_rotation(
+                port=_PORT,
+                bound_cascade_id=_BOUND_CASCADE,
+                interval_s=0.0,
+                skip_cascade_ids=frozenset(),
+                on_rotation=_fail_rotation,
+            )
+    return script
+
+
+@pytest.mark.asyncio
+async def test_watch_for_rotation_connect_error_logs_debug_and_continues(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A benign ``ConnectError`` is logged at DEBUG (not WARNING) and the loop retries.
+
+    When the agy port is force-killed during teardown/rotation/shutdown before this
+    detector is cancelled, every poll tick raises ``httpx.ConnectError`` (connection
+    refused). That is benign (no spawn/leak; the supervisor cancels us), so it must
+    log at DEBUG to avoid per-tick WARNING spam — and the loop must still advance to
+    the next tick (proven here by the script reaching its second call).
+    """
+    script = await _watch_until_cancelled(
+        monkeypatch, caplog, httpx.ConnectError("connection refused")
+    )
+
+    # The loop continued past the ConnectError tick to the terminal stop tick.
+    assert script.calls == 2
+    connect_records = [r for r in caplog.records if "connect refused" in r.getMessage()]
+    assert len(connect_records) == 1
+    assert connect_records[0].levelno == logging.DEBUG
+    # The benign connect failure produced no WARNING (the whole point of the fix).
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.asyncio
+async def test_watch_for_rotation_other_http_error_logs_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-connect ``httpx.HTTPError`` (e.g. ``ReadTimeout``) still logs WARNING.
+
+    A hung-but-listening port that raises ``ReadTimeout`` is a real fault, not the
+    benign connection-refused case, so it must keep WARNING (the broad arm is
+    unchanged) while the loop still retries on the next tick.
+    """
+    script = await _watch_until_cancelled(monkeypatch, caplog, httpx.ReadTimeout("read timed out"))
+
+    assert script.calls == 2
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "GetAllCascadeTrajectories failed" in warnings[0].getMessage()
 
 
 def _rotation_client(
