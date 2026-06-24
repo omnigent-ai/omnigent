@@ -98,6 +98,7 @@ from omnigent.antigravity_native_steps import (
 )
 from omnigent.claude_native_bridge import url_component
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.llms.context_window import get_model_context_window
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 _logger = logging.getLogger(__name__)
@@ -1075,6 +1076,12 @@ class _ReaderState:
     :param cumulative_output_tokens: Running session total of output tokens.
     :param cumulative_cache_read_input_tokens: Running session total of
         cache-read input tokens.
+    :param last_input_tokens: The LATEST per-call ``modelUsage.inputTokens`` seen
+        this run (the current-turn context occupancy, NOT the cumulative sum).
+        Drives ``external_session_usage.context_tokens`` so the web context-
+        occupancy ring renders. Mirrors codex's ``tokenUsage.last.inputTokens``
+        (the per-turn input incl. cache), versus the cumulative accumulators
+        above. ``0`` until the first DONE step carries usage.
     :param interaction_task: The single in-flight interaction-bridge task, or
         ``None`` when none is running. The bridge runs OFF the reader loop so
         streaming/mirroring continues while a human answers (a long-poll can last
@@ -1095,6 +1102,7 @@ class _ReaderState:
     cumulative_input_tokens: int = 0
     cumulative_output_tokens: int = 0
     cumulative_cache_read_input_tokens: int = 0
+    last_input_tokens: int = 0
     interaction_task: asyncio.Task[None] | None = None
 
 
@@ -1729,6 +1737,13 @@ async def _maybe_emit_session_usage(
     thread-wide counter, forwarded as SET values by
     :class:`~omnigent.codex_native_forwarder._SessionUsageCoalescer`).
 
+    Also forwards the context-occupancy ring fields (``context_tokens`` /
+    ``context_window``), mirroring codex-native. Codex reads both off its wire
+    (``tokenUsage.last.inputTokens`` / ``total.contextWindow``); agy's
+    ``modelUsage`` carries neither in ring-ready form, so ``context_tokens`` is
+    the LATEST per-call input (current-turn occupancy, NOT the cumulative sum)
+    and ``context_window`` is resolved from the model catalog (Gemini ⇒ ~1M).
+
     NOTE: ``state.cumulative_*`` accumulators are zeroed at reader-run start; a
     T-G /clear rotation rebinds with a fresh ``_ReaderState`` (``supervise_reader``
     is re-entered), so the new session's cost badge starts from 0 automatically.
@@ -1758,6 +1773,14 @@ async def _maybe_emit_session_usage(
     state.cumulative_cache_read_input_tokens += _int_field(
         per_call, "cumulative_cache_read_input_tokens"
     )
+    # Track the LATEST per-call input tokens for the context-occupancy ring.
+    # ``_model_usage_from_step`` reports ``modelUsage.inputTokens`` under the
+    # ``cumulative_input_tokens`` key (a per-CALL value at the wire, summed into
+    # the running total above) — the latest such value IS the current-turn
+    # context occupancy, mirroring codex's ``tokenUsage.last.inputTokens``.
+    this_call_input = _int_field(per_call, "cumulative_input_tokens")
+    if this_call_input > 0:
+        state.last_input_tokens = this_call_input
     # Resolve the raw model enum to a displayName if the catalog is available.
     model_enum = per_call.get("model")
     display_name: str | None = None
@@ -1774,6 +1797,21 @@ async def _maybe_emit_session_usage(
         payload["cumulative_cache_read_input_tokens"] = state.cumulative_cache_read_input_tokens
     if display_name is not None:
         payload["model"] = display_name
+    # Context-occupancy ring (web composer status line). The ring gate needs
+    # BOTH a numerator (``context_tokens`` = current-turn input occupancy) and a
+    # denominator (``context_window``). agy's ``modelUsage`` carries neither in a
+    # ring-ready shape — unlike codex, whose ``tokenUsage`` ships ``last`` and
+    # ``total.contextWindow`` on the wire — so we synthesize them here:
+    #   - ``context_tokens`` from the latest per-call input (above), and
+    #   - ``context_window`` resolved from the model's catalog window. agy runs
+    #     Gemini (~1M window); the curated Gemini table in ``context_window.py``
+    #     yields 1,048,576 rather than the 128K ``_DEFAULT_CONTEXT_WINDOW``.
+    if state.last_input_tokens > 0:
+        payload["context_tokens"] = state.last_input_tokens
+        if display_name is not None:
+            window = get_model_context_window(display_name)
+            if window > 0:
+                payload["context_window"] = window
     if not payload:
         return
     step_idx = _step_index(step) or 0

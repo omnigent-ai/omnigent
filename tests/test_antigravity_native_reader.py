@@ -1770,6 +1770,96 @@ async def test_planner_done_emits_session_usage(
     assert usage_data["cumulative_output_tokens"] == 100
     assert usage_data["cumulative_cache_read_input_tokens"] == 200
     assert usage_data["model"] == "Gemini 2.5 Flash"
+    # Context-occupancy ring fields (mirrors codex-native). The numerator is the
+    # current-turn input occupancy (the latest per-call inputTokens), and the
+    # denominator is the Gemini catalog window (~1M, not the 128K fallback).
+    assert usage_data["context_tokens"] == 1000
+    assert usage_data["context_window"] > 128_000
+
+
+@pytest.mark.asyncio
+async def test_usage_emits_context_ring_fields_for_web(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """The usage payload carries non-null ``context_tokens`` + a Gemini window.
+
+    Regression guard for the missing context-occupancy ring: the web ring gate
+    needs ``contextWindow > 0 && tokensUsed != null`` and is fed by
+    ``session.usage.contextTokens`` / ``contextWindow``. Before the fix the
+    reader posted only ``cumulative_*`` + ``model``, so the ring stayed gated
+    off. ``context_tokens`` must be the latest per-call input occupancy and
+    ``context_window`` must resolve to Gemini's ~1M window (not the 128K
+    ``_DEFAULT_CONTEXT_WINDOW`` fallback).
+    """
+    planner = _planner_with_model_usage(
+        input_tokens="4096",
+        output_tokens="100",
+        cache_read_tokens="512",
+        model_enum="MODEL_PLACEHOLDER_M20",
+    )
+    frames = [_frame([planner])]
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    usage_events = [(et, d) for et, d in sink.posts if et == "external_session_usage"]
+    assert len(usage_events) == 1, f"expected 1 usage event, got {len(usage_events)}"
+    _, usage_data = usage_events[0]
+    # Numerator: latest per-call input tokens (current-turn occupancy).
+    assert usage_data["context_tokens"] is not None
+    assert usage_data["context_tokens"] == 4096
+    # Denominator: Gemini's published ~1M window, well above the 128K fallback.
+    assert usage_data["context_window"] == 1_048_576
+
+
+@pytest.mark.asyncio
+async def test_context_tokens_tracks_latest_not_cumulative(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Across two turns, ``context_tokens`` follows the LATEST per-call input.
+
+    The cost badge accumulates (``cumulative_input_tokens`` sums to 3000), but
+    the ring must reflect current occupancy, so ``context_tokens`` is turn 2's
+    per-call input (2000), NOT the 3000 cumulative total — mirroring codex's
+    ``tokenUsage.last`` vs ``tokenUsage.total`` split.
+    """
+    planner_turn1 = _planner_with_model_usage(step_index=2, input_tokens="1000")
+    planner_turn2 = _planner_with_model_usage(step_index=6, input_tokens="2000")
+    frames = [
+        _frame([planner_turn1]),
+        _frame([planner_turn1, planner_turn2]),
+    ]
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    usage_events = [(et, d) for et, d in sink.posts if et == "external_session_usage"]
+    assert len(usage_events) == 2, f"expected 2 usage events, got {len(usage_events)}"
+    # Turn 1: per-call == cumulative on the first turn.
+    assert usage_events[0][1]["context_tokens"] == 1000
+    assert usage_events[0][1]["cumulative_input_tokens"] == 1000
+    # Turn 2: ring follows the latest per-call input, cost badge keeps summing.
+    assert usage_events[1][1]["context_tokens"] == 2000
+    assert usage_events[1][1]["cumulative_input_tokens"] == 3000
+    assert usage_events[1][1]["context_window"] == 1_048_576
 
 
 @pytest.mark.asyncio
