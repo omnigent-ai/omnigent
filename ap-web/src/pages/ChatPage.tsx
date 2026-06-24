@@ -2722,7 +2722,12 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
         )}
       </Message>
 
-      {bubble.lifecycle === "failed" && (
+      {/* Live error line for a failed response. Suppressed when the
+          bubble's items already carry a persisted error item — that
+          renders as an `ErrorBanner` above (a friendly one for missing-
+          dependency errors), so repeating the raw text here would
+          duplicate the same error in the transcript. #548 */}
+      {bubble.lifecycle === "failed" && !bubble.items.some((it) => it.kind === "error") && (
         <p className="text-destructive text-xs">Error: {bubble.error}</p>
       )}
     </>

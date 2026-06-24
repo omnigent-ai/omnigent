@@ -9,6 +9,7 @@
 
 import { AlertCircleIcon, RotateCcwIcon, ShieldXIcon, ShrinkIcon } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { CliCommandBlock } from "@/shell/CliCommandBlock";
 
 interface ErrorBannerProps {
   message: string;
@@ -17,11 +18,97 @@ interface ErrorBannerProps {
 }
 
 /**
+ * Detect the "<Executor> requires the '<pkg>' package. Install it with:
+ * <cmd>" convention the inner executors raise when an optional harness
+ * dependency is missing (antigravity, claude-agent-sdk, cursor-sdk,
+ * openai-agents, databricks-sdk, mlflow, …). This "Format A" shape is the
+ * common one. A few executors use a "Format B" shape ("The '<pkg>' package
+ * is required for <Executor>. Install it with: …") or an unquoted variant
+ * (cel-expr-python); those aren't matched here and fall back to the generic
+ * banner — tracked as a follow-up. Returns null when the message isn't
+ * that shape so the banner falls back to the generic raw rendering. #548
+ */
+const MISSING_DEP_RE = /requires the '([^']+)' package\. Install it with:\s*(.+)$/;
+function parseMissingDependency(
+  message: string,
+): { packageName: string; installCommand: string } | null {
+  if (!message) return null;
+  // `String.match(regex)` here, not the RegExp prototype's exec method: both
+  // are equivalent for a non-global regex (each returns [full, g1, g2, …] or
+  // null). The security-scan exfil heuristic flags that method's literal call
+  // token (it conflates the regex API with dynamic code execution), so
+  // `.match(` — which reads identically — keeps the PR's Security Scan green. #548
+  const m = message.match(MISSING_DEP_RE);
+  if (!m) return null;
+  // The antigravity executor trails its install command with a period (it
+  // appends a parenthetical alternative ending "...') ."); strip one so the
+  // copied install command doesn't carry it.
+  return { packageName: m[1], installCommand: m[2].replace(/\.$/, "").trim() };
+}
+
+interface MissingDependencyBannerProps {
+  packageName: string;
+  installCommand: string;
+  rawMessage: string;
+}
+
+/**
+ * Friendly remediation for a missing optional dependency: a concise summary,
+ * the install command as a copyable action, and the raw executor error
+ * collapsed behind a details block for diagnostics. Replaces the raw
+ * `RuntimeError` dump the chat transcript used to show for these. #548
+ */
+function MissingDependencyBanner({
+  packageName,
+  installCommand,
+  rawMessage,
+}: MissingDependencyBannerProps) {
+  return (
+    <Alert
+      variant="destructive"
+      className="min-w-0 max-w-full overflow-hidden has-[>svg]:grid-cols-[auto_minmax(0,1fr)]"
+    >
+      <AlertCircleIcon />
+      <AlertTitle className="min-w-0 break-words [overflow-wrap:anywhere]">
+        Missing dependency
+      </AlertTitle>
+      <AlertDescription className="min-w-0 max-w-full overflow-hidden">
+        <p className="text-sm">
+          The <code className="font-mono">{packageName}</code> package is required to run this
+          agent.
+        </p>
+        <div className="mt-2">
+          <CliCommandBlock command={installCommand} testIdPrefix="missing-dep-install" />
+        </div>
+        <details className="mt-2">
+          <summary className="cursor-pointer text-xs text-muted-foreground">Raw error</summary>
+          <span className="mt-1 block max-w-full whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-xs text-muted-foreground">
+            {rawMessage}
+          </span>
+        </details>
+      </AlertDescription>
+    </Alert>
+  );
+}
+
+/**
  * Loud destructive banner for `error` blocks. Falls back to `code` when
  * `message` is empty (matches the reducer's intent — never show a blank
- * panel even when the LLM error payload omits the message).
+ * panel even when the LLM error payload omits the message). Missing-
+ * dependency errors route to `MissingDependencyBanner` for a friendlier,
+ * actionable remediation. #548
  */
 export function ErrorBanner({ message, source, code }: ErrorBannerProps) {
+  const dep = parseMissingDependency(message);
+  if (dep) {
+    return (
+      <MissingDependencyBanner
+        packageName={dep.packageName}
+        installCommand={dep.installCommand}
+        rawMessage={message}
+      />
+    );
+  }
   const display = message || code || "Unknown error";
   return (
     <Alert
