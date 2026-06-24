@@ -537,6 +537,46 @@ def _is_assistant_text_close_step(step: dict[str, object]) -> bool:
     return not (isinstance(tool_calls, list) and tool_calls)
 
 
+def _is_turn_close_step(step: dict[str, object]) -> bool:
+    """
+    Return whether a step ends the current turn (fire the IDLE edge).
+
+    A turn opens on USER_INPUT and stays open until agy stops working. The
+    canonical close is a DONE PLANNER_RESPONSE that carries assistant text and
+    dispatches no further tool calls (:func:`_is_assistant_text_close_step`).
+    But a turn can also END without that clean closing text step, and those
+    paths must fire IDLE too — otherwise ``turn_active`` sticks True forever:
+    the spinner never clears AND the next turn's USER_INPUT can't re-open
+    RUNNING (it is gated on ``not turn_active``). The additional closes:
+
+    * a terminal-ERROR PLANNER_RESPONSE — agy's model step failed, so no tool
+      result or recovery planner follows; and
+    * a DONE PLANNER_RESPONSE that dispatches no tool call and carries no usable
+      text — a degenerate end with nothing more to do.
+
+    A PLANNER_RESPONSE that DOES dispatch a tool call is never a close: the tool
+    result (and possibly more planner steps) follow. Non-planner steps never
+    close a turn here (a tool result is followed by a recovery/answer planner;
+    closing on it would pre-empt that planner).
+
+    :param step: One RPC step dict.
+    :returns: ``True`` when this step ends the turn.
+    """
+    if _is_assistant_text_close_step(step):
+        return True
+    if step.get("type") != _TYPE_PLANNER_RESPONSE:
+        return False
+    status = step.get("status")
+    if status == _STATUS_ERROR:
+        return True
+    if status != _STATUS_DONE:
+        return False
+    # A DONE planner that dispatches a tool call is a continuation, not a close.
+    planner = step.get("plannerResponse")
+    tool_calls = planner.get("toolCalls") if isinstance(planner, dict) else None
+    return not (isinstance(tool_calls, list) and tool_calls)
+
+
 def _status_event(status: str) -> OutboundEvent:
     """
     Build an ``external_session_status`` edge.
@@ -1563,7 +1603,7 @@ async def _emit_step(
     for event in map_step_to_events(step, conversation_id=cascade_id, allocator=allocator):
         await _post_event(client, session_id, event)
 
-    if _is_assistant_text_close_step(step) and turn_active:
+    if _is_turn_close_step(step) and turn_active:
         turn_active = False
         await _post_event(client, session_id, _status_event(_STATUS_IDLE))
 

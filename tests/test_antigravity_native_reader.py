@@ -815,6 +815,39 @@ async def test_status_not_idle_while_tools_running(
     assert sink.statuses() == ["running"]
 
 
+@pytest.mark.asyncio
+async def test_status_idle_on_error_planner_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A turn that ends in a terminal-ERROR planner still emits IDLE.
+
+    Regression for the stuck-spinner bug: previously IDLE fired only on a DONE
+    planner with closing text, so a turn ending in an ERROR planner left
+    ``turn_active`` True forever (spinner stuck; next turn could not re-open
+    RUNNING). The IDLE here comes from the ERROR-terminal rule, not the
+    text-close rule (the planner carries no closing text).
+    """
+    user = _load("user_input")
+    error_planner = _load("planner_response_text")
+    error_planner["status"] = "CORTEX_STEP_STATUS_ERROR"
+    # No closing text — prove the IDLE is from the ERROR-terminal rule.
+    error_planner["plannerResponse"] = {}
+    script = _StepScript([[user], [user, error_planner], [user, error_planner]])
+    sink = _PostSink()
+
+    await _run(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        steps=script,
+        monkeypatch=monkeypatch,
+        iterations=3,
+    )
+
+    assert sink.statuses() == ["running", "idle"]
+
+
 # ---------------------------------------------------------------------------
 # Error handling: a transient RPC failure does not crash the loop
 # ---------------------------------------------------------------------------
@@ -2116,6 +2149,70 @@ def test_close_step_false_for_done_planner_with_tool_calls() -> None:
         },
     }
     assert reader._is_assistant_text_close_step(done_with_tool) is False
+
+
+# ---------------------------------------------------------------------------
+# _is_turn_close_step: also closes on a terminal-ERROR or degenerate-DONE
+# planner so the turn never sticks open (the stuck-spinner regression)
+# ---------------------------------------------------------------------------
+
+
+def test_turn_close_true_for_error_planner() -> None:
+    """A terminal-ERROR planner closes the turn even with no closing text.
+
+    Regression: without this the IDLE edge never fires when a turn ends in an
+    ERROR planner — ``turn_active`` sticks True, the spinner never clears, and
+    the next USER_INPUT can't re-open RUNNING (it is gated on ``not
+    turn_active``). The text-close predicate (which requires DONE + text) does
+    NOT catch this case.
+    """
+    error_planner = {
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": "CORTEX_STEP_STATUS_ERROR",
+        "plannerResponse": {},
+    }
+    assert reader._is_assistant_text_close_step(error_planner) is False
+    assert reader._is_turn_close_step(error_planner) is True
+
+
+def test_turn_close_true_for_done_planner_no_text_no_tools() -> None:
+    """A DONE planner with neither text nor tool calls is a degenerate close."""
+    empty_done = {
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": "CORTEX_STEP_STATUS_DONE",
+        "plannerResponse": {},
+    }
+    assert reader._is_turn_close_step(empty_done) is True
+
+
+def test_turn_close_false_for_done_planner_with_tool_calls() -> None:
+    """A DONE planner that dispatches a tool call is a continuation, not a close."""
+    done_with_tool = {
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": "CORTEX_STEP_STATUS_DONE",
+        "plannerResponse": {"toolCalls": [{"id": "call_1"}]},
+    }
+    assert reader._is_turn_close_step(done_with_tool) is False
+
+
+def test_turn_close_false_for_generating_planner() -> None:
+    """A GENERATING planner never closes the turn (mid-stream)."""
+    generating = {
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": "CORTEX_STEP_STATUS_GENERATING",
+        "plannerResponse": {"modifiedResponse": "partial"},
+    }
+    assert reader._is_turn_close_step(generating) is False
+
+
+def test_turn_close_false_for_tool_result_step() -> None:
+    """A tool-result step never closes the turn (a recovery planner follows)."""
+    tool_result = {
+        "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+        "status": "CORTEX_STEP_STATUS_DONE",
+        "metadata": {"toolCall": {"id": "cbawg2v8"}},
+    }
+    assert reader._is_turn_close_step(tool_result) is False
 
 
 # ---------------------------------------------------------------------------
