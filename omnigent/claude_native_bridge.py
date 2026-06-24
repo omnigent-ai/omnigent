@@ -4527,6 +4527,18 @@ def _assistant_transcript_items_from_entry(
     return response_id if items else current_response_id, items
 
 
+_CONTEXT_OVERFLOW_RE = re.compile(
+    r"^prompt is too long",
+    re.IGNORECASE,
+)
+
+_CONTEXT_OVERFLOW_REPLACEMENT = (
+    "Context limit reached — the conversation has grown too long for "
+    "the model’s context window. Use /compact to summarize and free up "
+    "space, or /clear to start a new conversation."
+)
+
+
 def _assistant_message_item(
     *,
     source_key: str,
@@ -4545,13 +4557,16 @@ def _assistant_message_item(
     :param text: Assistant text block.
     :returns: Parsed transcript item.
     """
+    display_text = text
+    if _CONTEXT_OVERFLOW_RE.match(text.strip()):
+        display_text = _CONTEXT_OVERFLOW_REPLACEMENT
     return ClaudeTranscriptItem(
         source_id=_source_id(source_key, item_index, "message"),
         item_type="message",
         data={
             "role": "assistant",
             "agent": agent_name,
-            "content": [{"type": "output_text", "text": text}],
+            "content": [{"type": "output_text", "text": display_text}],
         },
         response_id=response_id,
     )

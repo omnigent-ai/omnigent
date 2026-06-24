@@ -4401,6 +4401,7 @@ _CONTEXT_OVERFLOW_PATTERNS = (
     "context_length_exceeded",
     "context window",
     "maximum context length",
+    "prompt is too long",
 )
 
 
