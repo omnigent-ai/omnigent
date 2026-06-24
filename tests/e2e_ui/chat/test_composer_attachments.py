@@ -28,10 +28,14 @@ from playwright.sync_api import Page, expect
 _COMPOSER = "Ask the agent anything…"
 # Composer accepts image/*,application/pdf,text/*,application/json (the hidden
 # input's accept attr); a .txt file is in-scope and keeps the fixture trivial.
-# ``set_input_files`` bypasses the accept filter anyway — ``addFiles`` does no
-# client-side filtering.
+# ``set_input_files`` bypasses the accept filter, but ``addFiles`` now validates
+# every file (type + size, via lib/attachments.ts) — a .txt passes both.
 _ATTACH_NAME = "attach_sample.txt"
 _ATTACH_BODY = "composer attachment e2e sample\n"
+
+# An unsupported binary type: ``addFiles`` rejects it (no chip) and shows an
+# inline error. Used by ``test_reject_unsupported_type``.
+_PPTX_NAME = "deck.pptx"
 
 # JSON is its own MIME (``application/json``), which is NOT covered by the
 # ``text/*`` wildcard, so it has to be listed in the ``accept`` attr explicitly
@@ -101,3 +105,31 @@ def test_attach_json_file(page: Page, seeded_session: tuple[str, str], tmp_path:
     remove_button = page.get_by_role("button", name=f"Remove {_JSON_NAME}")
     expect(remove_button).to_be_visible(timeout=10_000)
     expect(page.get_by_text(_JSON_NAME, exact=True)).to_be_visible()
+
+
+def test_reject_unsupported_type(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """An unsupported type (pptx) is rejected client-side: no chip, inline error.
+
+    Covers the validation ``addFiles`` gained (``validateAttachments`` in
+    lib/attachments.ts): only images, PDF, and text/code files attach; office /
+    binary formats are rejected before upload with a per-file message. Driving
+    the hidden input with a ``.pptx`` (``set_input_files`` bypasses the accept
+    filter, so the file reaches ``addFiles``) must yield NO chip and a visible
+    rejection error.
+    """
+    base_url, session_id = seeded_session
+    sample = tmp_path / _PPTX_NAME
+    sample.write_bytes(b"PK\x03\x04 not a real pptx, just an unsupported binary")
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+
+    file_input = page.locator('input[type="file"][accept*="image/"]')
+    file_input.set_input_files(str(sample))
+
+    # Rejected: no chip / remove control for the file.
+    expect(page.get_by_role("button", name=f"Remove {_PPTX_NAME}")).to_have_count(0)
+    # And the inline rejection error is shown.
+    expect(page.get_by_text("can't be attached", exact=False)).to_be_visible(timeout=10_000)
