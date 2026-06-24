@@ -6136,6 +6136,11 @@ def create_runner_app(
                 harness_name,
                 workdir=_resolved_spec_workdir(spec_entry),
                 cwd=await _session_runtime_cwd(session_id),
+                # Issue #1128: forward the persisted /model override at session
+                # start so the harness spawns with the selected model. Without
+                # this, only the per-turn path carried it — leaving a brief
+                # Opus spawn (and, on recovery/sub-agent paths, a lasting one).
+                model_override=body.get("model_override"),
             )
             if harness_name == "claude-native" and spawn_env is None:
                 from omnigent.claude_native_bridge import (
@@ -6676,6 +6681,12 @@ def create_runner_app(
                     "agent_id": agent_id,
                     "model": body.get("model", agent_id),
                 }
+                # Issue #1128: carry the persisted /model override into the
+                # recovered turn so a crash-recovery respawn doesn't drop the
+                # selection and fall back to the Databricks Opus default.
+                _recover_override = body.get("model_override")
+                if _recover_override:
+                    msg_body["model_override"] = _recover_override
                 _turn_task = asyncio.create_task(
                     _run_turn_bg(msg_body, session_id),
                     name=f"turn-recover-{session_id}",
@@ -14249,7 +14260,18 @@ def _build_spawn_env_from_spec(
         )
 
         if harness == "claude-sdk":
-            env = _build_claude_sdk_spawn_env(spec, workdir=workdir)
+            # Issue #1128: thread the override INTO the builder (as
+            # resolved_model) so it sets HARNESS_CLAUDE_SDK_MODEL before the
+            # ucode Databricks default could fire, and records the source so the
+            # inner executor fails closed on a lost selection rather than
+            # silently routing to Opus. The post-build overlay below is for the
+            # other env-keyed harnesses, which this PR does not touch.
+            env = _build_claude_sdk_spawn_env(
+                spec,
+                workdir=workdir,
+                resolved_model=model_override or None,
+                model_source="session-override" if model_override else None,
+            )
         elif harness == "codex":
             env = _build_codex_spawn_env(spec, workdir=workdir)
         elif harness == "pi":
@@ -14274,8 +14296,10 @@ def _build_spawn_env_from_spec(
 
     # Per-session ``/model`` override wins over everything the builder baked
     # into HARNESS_<H>_MODEL. Without this, `/model` is recorded in the
-    # readout but the turn still uses the provider/catalog default.
-    if model_override:
+    # readout but the turn still uses the provider/catalog default. claude-sdk
+    # threads the override into its builder above (with a source tag), so skip
+    # the bare overlay here to avoid clobbering the recorded source contract.
+    if model_override and harness != "claude-sdk":
         model_key = _HARNESS_MODEL_ENV_KEY.get(harness)
         if model_key is not None:
             env[model_key] = model_override

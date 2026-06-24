@@ -1357,6 +1357,11 @@ def test_build_spawn_env_applies_model_override(
     assert base["HARNESS_CLAUDE_SDK_MODEL"] != "claude-sonnet-4-6"
     # … and the override wins, landing in the model env var the SDK reads.
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+    # Issue #1128: the override is threaded into the builder with a source tag
+    # (not a bare post-build overlay) so the inner executor can fail closed on
+    # a lost selection. The requested model is recorded for the error message.
+    assert overridden["HARNESS_CLAUDE_SDK_MODEL_SOURCE"] == "session-override"
+    assert overridden["HARNESS_CLAUDE_SDK_REQUESTED_MODEL"] == "claude-sonnet-4-6"
 
 
 @pytest.mark.asyncio

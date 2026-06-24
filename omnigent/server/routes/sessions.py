@@ -6209,6 +6209,38 @@ async def _run_managed_wake(
 _RUNNER_SESSION_INIT_TIMEOUT_S = 10.0
 
 
+def _runner_session_init_body(
+    *,
+    session_id: str,
+    agent_id: str,
+    sub_agent_name: str | None,
+    model_override: str | None,
+) -> dict[str, Any]:
+    """Build the ``POST /v1/sessions`` runner-init handshake body.
+
+    Forwards the persisted per-session ``/model`` override so the runner
+    spawns the harness with the selected model (issue #1128). Every
+    runner-init call site routes through this builder so none silently drops
+    the override — the bug was that only the per-turn message path forwarded
+    it, so a fresh agent-start, recovery, rebind, or reconnect spawned against
+    the provider/Databricks default instead.
+
+    :param session_id: Session/conversation id.
+    :param agent_id: Agent id for the session.
+    :param sub_agent_name: Sub-agent display name, or ``None``.
+    :param model_override: Persisted ``conv.model_override``, or ``None``.
+    :returns: The JSON body for the handshake POST.
+    """
+    body: dict[str, Any] = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "sub_agent_name": sub_agent_name,
+    }
+    if model_override is not None:
+        body["model_override"] = model_override
+    return body
+
+
 async def _ensure_runner_session_initialized(
     session_id: str,
     conv: Conversation,
@@ -6256,11 +6288,12 @@ async def _ensure_runner_session_initialized(
     try:
         resp = await runner_client.post(
             "/v1/sessions",
-            json={
-                "session_id": session_id,
-                "agent_id": conv.agent_id,
-                "sub_agent_name": conv.sub_agent_name,
-            },
+            json=_runner_session_init_body(
+                session_id=session_id,
+                agent_id=conv.agent_id,
+                sub_agent_name=conv.sub_agent_name,
+                model_override=conv.model_override,
+            ),
             timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
         )
         # httpx only raises on transport errors; a 4xx/5xx means create_session
@@ -11536,14 +11569,19 @@ async def _notify_runner_of_bundled_child(
     runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
         return
+    # Issue #1128: forward the persisted /model override for the bundled path too.
+    _bundled_conv = conversation_store.get_conversation(session_id)
     try:
         await runner_client.post(
             "/v1/sessions",
-            json={
-                "session_id": session_id,
-                "agent_id": agent_id,
-                "sub_agent_name": None,
-            },
+            json=_runner_session_init_body(
+                session_id=session_id,
+                agent_id=agent_id,
+                sub_agent_name=None,
+                model_override=(
+                    _bundled_conv.model_override if _bundled_conv is not None else None
+                ),
+            ),
             timeout=10.0,
         )
     except httpx.HTTPError:
@@ -12643,11 +12681,12 @@ def create_sessions_router(
             try:
                 await _rc.post(
                     "/v1/sessions",
-                    json={
-                        "session_id": resp.id,
-                        "agent_id": conv.agent_id,
-                        "sub_agent_name": conv.sub_agent_name,
-                    },
+                    json=_runner_session_init_body(
+                        session_id=resp.id,
+                        agent_id=conv.agent_id,
+                        sub_agent_name=conv.sub_agent_name,
+                        model_override=conv.model_override,
+                    ),
                     timeout=10.0,
                 )
             except httpx.HTTPError:
@@ -13754,11 +13793,12 @@ def create_sessions_router(
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",
-                            json={
-                                "session_id": session_id,
-                                "agent_id": conv.agent_id,
-                                "sub_agent_name": conv.sub_agent_name,
-                            },
+                            json=_runner_session_init_body(
+                                session_id=session_id,
+                                agent_id=conv.agent_id,
+                                sub_agent_name=conv.sub_agent_name,
+                                model_override=conv.model_override,
+                            ),
                             timeout=10.0,
                         )
                         if runner_init_resp.status_code < 400:

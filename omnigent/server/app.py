@@ -1720,13 +1720,21 @@ def create_app(
                     conv.id,
                 )
             else:
+                # Issue #1128: include sub_agent_name (was dropped here, unlike
+                # the other init paths) and forward the persisted /model
+                # override so a reconnect respawn keeps the selected model
+                # instead of falling back to the provider/Databricks default.
+                _reconnect_body: dict[str, Any] = {
+                    "session_id": conv.id,
+                    "agent_id": conv.agent_id,
+                    "sub_agent_name": conv.sub_agent_name,
+                }
+                if conv.model_override is not None:
+                    _reconnect_body["model_override"] = conv.model_override
                 try:
                     await routed.client.post(
                         "/v1/sessions",
-                        json={
-                            "session_id": conv.id,
-                            "agent_id": conv.agent_id,
-                        },
+                        json=_reconnect_body,
                         timeout=10.0,
                     )
                 except Exception:
