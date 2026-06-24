@@ -30,8 +30,9 @@ process is assigned to a job only after it exists. The backend therefore keeps
 from __future__ import annotations
 
 import ctypes
+import ctypes.wintypes as wintypes
+import functools
 import logging
-from ctypes import wintypes
 from pathlib import Path
 from types import TracebackType
 
@@ -49,9 +50,20 @@ _LOGGER = logging.getLogger(__name__)
 _JobObjectExtendedLimitInformation = 9
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 
-# Emitted once per process so operators understand the Windows guarantees
-# without spamming a line per spawned helper.
-_warned_no_fs_isolation = False
+
+@functools.cache
+def _warn_no_fs_isolation_once() -> None:
+    """Log the Windows no-filesystem-isolation caveat once per process.
+
+    ``functools.cache`` memoizes the (argument-free) call so operators see the
+    warning a single time rather than once per spawned helper.
+    """
+    _LOGGER.warning(
+        "windows_jobobject provides process-tree containment + resource "
+        "limits only; it does NOT isolate the filesystem or network. "
+        "read_paths/write_paths/allow_network in os_env.sandbox are not "
+        "enforced on Windows. Run on Linux/macOS for full sandboxing."
+    )
 
 
 class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
@@ -147,8 +159,6 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
         :returns: A populated :class:`SandboxPolicy`.
         :raises OSError: If the host is not Windows.
         """
-        global _warned_no_fs_isolation
-
         if os_name() != "nt":
             raise OSError(
                 "windows_jobobject sandbox is only available on Windows. "
@@ -157,15 +167,7 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
             )
 
         sandbox_spec = spec.sandbox or OSEnvSandboxSpec(type=self.type_name)
-
-        if not _warned_no_fs_isolation:
-            _warned_no_fs_isolation = True
-            _LOGGER.warning(
-                "windows_jobobject provides process-tree containment + resource "
-                "limits only; it does NOT isolate the filesystem or network. "
-                "read_paths/write_paths/allow_network in os_env.sandbox are not "
-                "enforced on Windows. Run on Linux/macOS for full sandboxing."
-            )
+        _warn_no_fs_isolation_once()
 
         read_roots: list[Path] | None = None
         if sandbox_spec.read_paths is not None:
