@@ -445,12 +445,19 @@
  * bridge marker so normal iOS Safari keeps its existing browser-safe layout. */
 @media (width < 48rem) {
   [data-ios-native].app-shell {
-    height: 100vh;
+    /* Lock the shell to the live visual viewport so the soft keyboard can never
+       pan the whole document (which hides the header). --omnigent-viewport-
+       height is published by useIOSViewportLock from visualViewport.height; it
+       shrinks when the keyboard opens so inputs stay above it and only inner
+       panes scroll. Falls back to the large viewport before JS runs / on older
+       WebKit. The two-line pattern keeps the lvh fallback for browsers without
+       the var. */
     height: 100lvh;
-    min-height: 100vh;
+    height: var(--omnigent-viewport-height, 100lvh);
     min-height: 100lvh;
-    max-height: 100vh;
+    min-height: var(--omnigent-viewport-height, 100lvh);
     max-height: 100lvh;
+    max-height: var(--omnigent-viewport-height, 100lvh);
     overflow: hidden;
   }
 
