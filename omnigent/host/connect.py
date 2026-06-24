@@ -20,7 +20,6 @@ from pathlib import Path
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
 
-from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
@@ -291,9 +290,6 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # ANTHROPIC_BASE_URL. Safe to propagate: not a secret.
         "CLAUDE_CODE_USE_BEDROCK",
     }
-    # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
-    # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
-    | set(WINDOWS_ENV_PASSTHROUGH)
 )
 # Locale family (``LC_ALL``, ``LC_CTYPE``, …) — allowed by prefix.
 _RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_")

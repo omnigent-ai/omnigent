@@ -39,7 +39,6 @@ from typing import Any
 import httpx
 from cachetools import TTLCache
 
-from omnigent._platform import default_shell_argv
 from omnigent.model_override import model_family_mismatch
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
@@ -858,7 +857,7 @@ def _resolve_bearer_token(provider: ResolvedModelProvider) -> str:
         # Same trust model as the harness executors, which run the
         # user-configured auth_command to mint gateway tokens.
         result = subprocess.run(
-            default_shell_argv(provider.auth_command),
+            ["/bin/sh", "-c", provider.auth_command],
             capture_output=True,
             text=True,
             timeout=_AUTH_COMMAND_TIMEOUT_S,

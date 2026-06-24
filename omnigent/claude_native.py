@@ -20,14 +20,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import termios
+import tty
 import uuid
-
-# termios/tty are POSIX-only and drive the native (tmux/PTY) Claude terminal,
-# which is disabled on Windows. Guard the import (special-cased by mypy, which
-# type-checks on Linux) so importing this module never crashes the CLI there.
-if sys.platform != "win32":
-    import termios
-    import tty
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
