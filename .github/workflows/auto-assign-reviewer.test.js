@@ -71,10 +71,10 @@ function assert(name, cond, detail) {
   r = await run({
     files: ["README.md"],
     load: { PattaraS: 9, "serena-ruan": 9, dhruv0811: 9, TomeHirata: 9, SabhyaC26: 9,
-            "daniellok-db": 9, hzub: 0, dbczumar: 1, fanzeyi: 9, "ckcuslife-source": 9,
+            "daniellok-db": 9, dbczumar: 0, fanzeyi: 9, "ckcuslife-source": 9,
             bbqiu: 9, Edwinhe03: 9 },
   });
-  assert("unowned -> lowest from full pool", JSON.stringify(r.added) === JSON.stringify(["hzub"]), JSON.stringify(r));
+  assert("unowned -> lowest from full pool", JSON.stringify(r.added) === JSON.stringify(["dbczumar"]), JSON.stringify(r));
 
   // 3. db area (fanzeyi, SabhyaC26) -> the lower-load one selected.
   r = await run({ files: ["omnigent/db/x.py"], load: { SabhyaC26: 1 } });

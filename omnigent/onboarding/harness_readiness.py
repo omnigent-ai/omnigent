@@ -28,8 +28,11 @@ import os
 
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
 from omnigent.onboarding.harness_install import (
+    COPILOT_KEY,
     CURSOR_KEY,
+    GOOSE_KEY,
     KIMI_KEY,
+    OPENCODE_KEY,
     PI_KEY,
     QWEN_KEY,
     harness_cli_installed,
@@ -61,6 +64,11 @@ _PI_HARNESSES: frozenset[str] = frozenset({PI_SURFACE, "pi-native"})
 # member of the anthropic/openai families that :data:`_HARNESS_FAMILY` keys.
 KIMI_SURFACE = "kimi"
 
+# Native OpenCode harness. Like pi, it wraps a CLI (``opencode``) with no
+# ``_HARNESS_FAMILY`` entry, so it must be gated explicitly or it would fail
+# open like an unknown harness.
+_OPENCODE_HARNESSES: frozenset[str] = frozenset({"opencode-native"})
+
 # Native Cursor harnesses. These boot the ``cursor-agent`` TUI (``omni cursor``)
 # and so, like the other native CLI harnesses, can't launch without that binary
 # on ``PATH`` — gate them on it. Distinct from the SDK ``cursor`` harness
@@ -68,6 +76,12 @@ KIMI_SURFACE = "kimi"
 # a ``CURSOR_API_KEY`` instead. Without these entries they'd fail open like an
 # unknown harness, letting a binary-less launch die inside the executor.
 _CURSOR_NATIVE_HARNESSES: frozenset[str] = frozenset({"cursor-native", "native-cursor"})
+
+# Native Goose harnesses. Boot the ``goose session`` TUI (``omni goose``) and
+# can't launch without the ``goose`` binary on ``PATH`` — gate on it, like the
+# other native CLI harnesses. Goose owns its own auth (``goose configure``), so
+# there is no SDK variant or key to gate on.
+_GOOSE_NATIVE_HARNESSES: frozenset[str] = frozenset({"goose-native", "native-goose"})
 
 # CLI-wrapping qwen harnesses. Both ``qwen`` and ``qwen-code`` resolve to the
 # same ``qwen`` binary (canonicalize_harness folds ``qwen-code`` → ``qwen``).
@@ -100,12 +114,16 @@ def _install_key(canonical: str) -> str:
         ``_HARNESS_FAMILY`` (e.g. ``"codex-native"``), ``"pi"``, or
         ``"kimi"``.
     :returns: ``"anthropic"`` / ``"openai"`` for the claude/codex CLIs,
-        :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi,
-        :data:`~omnigent.onboarding.harness_install.KIMI_KEY` for kimi, or
-        :data:`~omnigent.onboarding.harness_install.QWEN_KEY` for qwen.
+        :data:`~omnigent.onboarding.harness_install.KIMI_KEY` for kimi,
+        :data:`~omnigent.onboarding.harness_install.OPENCODE_KEY` for
+        opencode-native,
+        :data:`~omnigent.onboarding.harness_install.QWEN_KEY` for qwen, or
+        :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi.
     """
     if canonical == KIMI_SURFACE:
         return KIMI_KEY
+    if canonical in _OPENCODE_HARNESSES:
+        return OPENCODE_KEY
     if canonical in _QWEN_HARNESSES:
         return QWEN_KEY
     return _HARNESS_FAMILY.get(canonical) or PI_KEY
@@ -138,6 +156,13 @@ def harness_is_configured(harness: str) -> bool:
         # state surfaces at run time; the daemon gates only on binary presence,
         # mirroring the other native harnesses.)
         return harness_cli_installed(CURSOR_KEY)
+    if canonical in _GOOSE_NATIVE_HARNESSES or canonical == GOOSE_KEY:
+        # Goose — both the native TUI (``goose-native`` / ``native-goose``, via
+        # ``omni goose``) and the headless ACP harness (``goose``, drives
+        # ``goose acp``) — wraps the ``goose`` CLI, so gate on that binary.
+        # Auth/provider state surfaces at run time via Goose's own config; the
+        # daemon gates only on binary presence.
+        return harness_cli_installed(GOOSE_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -155,10 +180,27 @@ def harness_is_configured(harness: str) -> bool:
         from omnigent.onboarding.cursor_auth import cursor_api_key_configured
 
         return cursor_api_key_configured() or bool(os.environ.get("CURSOR_API_KEY"))
+    if canonical == COPILOT_KEY:
+        # Copilot runs in-process via the ``github-copilot-sdk`` package (the
+        # SDK bundles the CLI binary it drives, so there is no separate binary to
+        # gate on) and authenticates against GitHub's Copilot backend with a
+        # GitHub token. So, like cursor, readiness is whether a token is
+        # resolvable — one stored by ``omnigent setup`` (the ``copilot:`` config
+        # block — see :mod:`omnigent.onboarding.copilot_auth`) or inherited from
+        # the environment. A bad / Copilot-less token surfaces at run time.
+        from omnigent.onboarding.copilot_auth import (
+            COPILOT_TOKEN_ENV_VARS,
+            copilot_github_token_configured,
+        )
+
+        return copilot_github_token_configured() or any(
+            os.environ.get(var) for var in COPILOT_TOKEN_ENV_VARS
+        )
     if (
         canonical not in _HARNESS_FAMILY
         and canonical not in _PI_HARNESSES
         and canonical != KIMI_SURFACE
+        and canonical not in _OPENCODE_HARNESSES
         and canonical not in _QWEN_HARNESSES
     ):
         # Unknown harness — the daemon has no install metadata for it, so
@@ -185,8 +227,12 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_EXECUTOR_TYPE_HARNESS_ALIASES)
     spellings.update(HARNESS_ALIASES)
     spellings.update(_PI_HARNESSES)
+    spellings.update(_OPENCODE_HARNESSES)
     spellings.update(_CURSOR_NATIVE_HARNESSES)
+    spellings.update(_GOOSE_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(KIMI_SURFACE)
+    spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
+    spellings.add(COPILOT_KEY)
     return {spelling: harness_is_configured(spelling) for spelling in spellings}

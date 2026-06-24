@@ -190,6 +190,63 @@ async def test_permission_request_hook_allow_round_trip(
     }
 
 
+async def test_cursor_permission_request_hook_allow_round_trip(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    cursor-native TUI prompt → web ApprovalCard → accept → verdict.
+
+    The runner-side mirror (``omnigent.cursor_native_permissions``) POSTs a
+    detected cursor TUI approval prompt to
+    ``/hooks/cursor-permission-request``; the route publishes a
+    ``response.elicitation_request`` (phase ``pre_tool_use``, policy
+    ``cursor_native_permission``, carrying the runner-minted elicitation id and
+    the rendered command preview) and parks on the same harness-elicitation
+    registry the Claude hook uses, then returns the MCP ``ElicitationResult``
+    once the UI answers. This is the cursor-native analog of
+    ``test_permission_request_hook_allow_round_trip``.
+
+    Catches: the SSE event never emitted (the card never renders); the
+    runner-minted id not preserved (the runner can't correlate its verdict); the
+    park/resolve plumbing not wired (the POST never wakes on the UI verdict).
+    """
+    agent = await create_test_agent(client, "test-cursor-permission-allow")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_cursor_{session_id}_deadbeef"
+    payload = {
+        "elicitation_id": elicitation_id,
+        "operation_type": "shell",
+        "message": "Run this command?",
+        "content_preview": "echo hi > out.txt",
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/cursor-permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    # The runner-minted id is preserved end-to-end, and the card carries the
+    # cursor-native rendering extras.
+    assert event["elicitation_id"] == elicitation_id
+    params = event["params"]
+    assert params["message"] == "Run this command?"
+    assert params["phase"] == "pre_tool_use"
+    assert params["policy_name"] == "cursor_native_permission"
+    assert params["content_preview"] == "echo hi > out.txt"
+
+    verdict = await _post_approval(client, session_id, elicitation_id, "accept")
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"action": "accept"}
+
+
 async def test_top_level_elicitations_route_is_not_mounted(
     client: httpx.AsyncClient,
 ) -> None:
@@ -715,9 +772,13 @@ async def test_permission_request_hook_forwards_cwd_and_permission_mode(
     Note: ``tool_use_id`` is intentionally absent — the fixtures omit
     it because Claude Code's PermissionRequest payload doesn't carry one
     (the id is only minted when the tool call is emitted, AFTER
-    the permission check). The UI's auto-clear falls back to a
-    "first pending" heuristic instead — see
-    :file:`ap-web/src/store/chatStore.ts`'s ``tool_call`` case.
+    the permission check). With no id, the terminal-resolved fast path
+    correlates a mirrored tool result to a parked prompt by exact
+    ``(tool_name, tool_input)`` (see
+    :func:`omnigent.server.routes.sessions._signal_terminal_resolved_harness_elicitation`),
+    and the web UI clears a card strictly by ``elicitation_id`` on the
+    server's ``response.elicitation_resolved`` event — never by a
+    "first pending" heuristic.
     """
     agent = await create_test_agent(client, "test-permission-extras")
     session_id = await _create_session(client, agent["id"])

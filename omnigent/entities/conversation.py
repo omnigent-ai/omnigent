@@ -121,9 +121,13 @@ class Conversation:
         first turn, so a later switch would orphan the running
         process. Only valid for ``executor.type: omnigent`` agents;
         the create route validates against ``OMNIGENT_HARNESSES``.
-        Sub-agent sessions never inherit it (their own rows stay
-        ``None``), so e.g. polly's workers keep their declared
-        harnesses when the brain is overridden.
+        Sub-agent sessions never *inherit* the parent brain's override,
+        so e.g. polly's workers keep their declared harnesses when the
+        brain is overridden. A sub-agent session MAY, however, carry its
+        own create-time override when ``sys_session_send`` supplied an
+        allowlisted ``args.harness`` (gated by the sub-agent spec's
+        ``executor.config.allowed_harnesses``); that value is set on the
+        child's own row, not inherited.
     :param sub_agent_name: For sub-agent sessions (``kind="sub_agent"``),
         the sub-agent type name within the parent's spec tree,
         e.g. ``"summarizer"``. The runner uses this to resolve the
@@ -400,8 +404,9 @@ class CompactionData(BaseModel):
 
     summary: str
     last_item_id: str
-    model: str
+    model: str | None = None
     token_count: int
+    compacted_messages: list[dict[str, Any]] | None = None
 
 
 class NativeToolData(BaseModel):

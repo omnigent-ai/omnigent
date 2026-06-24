@@ -40,6 +40,7 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
 )
+from omnigent.harness_aliases import canonicalize_harness
 from omnigent.model_override import (
     harness_supports_model_override,
     model_family_mismatch,
@@ -829,6 +830,61 @@ def _subagent_harness(sub_agent_name: str, agent_spec: Any | None) -> str | None
     return spec_harness(sub_spec) if sub_spec is not None else None
 
 
+def _subagent_harness_override_from_args(args: dict[str, Any]) -> str | None:
+    """
+    Extract a per-dispatch harness override from ``sys_session_send`` args.
+
+    The optional ``harness`` field lives in the object form of ``args``
+    (``{"input": ..., "harness": "opencode-native"}``). Returned raw (not
+    yet canonicalized) so the caller can validate it against the sub-agent
+    allowlist and quote the original spelling in errors.
+
+    :param args: Parsed ``sys_session_send`` arguments.
+    :returns: The raw harness override, or ``None`` when absent.
+    :raises ValueError: If ``harness`` is present but not a string.
+    """
+    raw_message = args.get("args")
+    if not isinstance(raw_message, dict):
+        return None
+    raw_harness = raw_message.get("harness")
+    if raw_harness is None:
+        return None
+    if not isinstance(raw_harness, str) or not raw_harness:
+        raise ValueError("'harness' must be a non-empty string when provided")
+    return raw_harness
+
+
+def _subagent_allowed_harnesses(sub_agent_name: str, agent_spec: Any | None) -> frozenset[str]:
+    """
+    Resolve the canonical harness allowlist a sub-agent opts into.
+
+    Reads ``executor.config.allowed_harnesses`` from the named sub-agent's
+    spec — the explicit opt-in that gates ``args.harness``. Each entry is
+    canonicalized so a user-facing alias still matches.
+
+    :param sub_agent_name: Name of the sub-agent, e.g. ``"opencode"``.
+    :param agent_spec: Parent agent's spec.
+    :returns: Canonical allowlisted harness ids (empty when none declared).
+    """
+    sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
+    if sub_spec is None:
+        return frozenset()
+    executor = getattr(sub_spec, "executor", None)
+    config = getattr(executor, "config", None)
+    raw_allowed: Any = None
+    if isinstance(config, dict):
+        raw_allowed = config.get("allowed_harnesses")
+    elif config is not None:
+        raw_allowed = getattr(config, "allowed_harnesses", None)
+    if not isinstance(raw_allowed, (list, tuple, set, frozenset)):
+        return frozenset()
+    return frozenset(
+        canonicalize_harness(str(entry)) or str(entry)
+        for entry in raw_allowed
+        if isinstance(entry, str) and entry
+    )
+
+
 def _normalize_subagent_model(
     model: str,
     *,
@@ -952,6 +1008,11 @@ async def _execute_subagent_tool(
     except ValueError as exc:
         return f"Error: sys_session_send invalid 'model': {exc}"
 
+    try:
+        harness_override = _subagent_harness_override_from_args(args)
+    except ValueError as exc:
+        return f"Error: sys_session_send invalid 'harness': {exc}"
+
     # By-session-id mode: post to an existing direct child instead of
     # spawning/continuing a named (agent, title) sub-agent.
     target_session_id = args.get("session_id")
@@ -969,6 +1030,13 @@ async def _execute_subagent_tool(
                 "Error: sys_session_send 'model' applies only when a "
                 "sub-agent session is first created; it cannot change an "
                 "existing session. Re-send without 'model' to continue "
+                f"session {target_session_id!r}."
+            )
+        if harness_override is not None:
+            return (
+                "Error: sys_session_send 'harness' applies only when a "
+                "sub-agent session is first created; it cannot change an "
+                "existing session. Re-send without 'harness' to continue "
                 f"session {target_session_id!r}."
             )
         return await _send_to_existing_session(
@@ -1053,6 +1121,42 @@ async def _execute_subagent_tool(
             )
     else:
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
+        # Apply an allowlisted per-dispatch harness override. The sub-agent
+        # spec must explicitly opt in via executor.config.allowed_harnesses,
+        # and the requested harness must canonicalize into OMNIGENT_HARNESSES.
+        # NOTE: the server create route (``_validated_harness_override`` in
+        # server/routes/sessions.py) independently re-validates a session-create
+        # override against the GLOBAL ``OMNIGENT_HARNESSES`` (plus the omnigent
+        # executor-type rule), but it does NOT re-check the per-spec
+        # ``allowed_harnesses`` allowlist. So this orchestrator-dispatch check is
+        # the sole enforcement of that per-spec allowlist; a direct
+        # ``POST /v1/sessions`` harness_override is bounded only by the global
+        # allowlist.
+        harness_override_canonical: str | None = None
+        if harness_override is not None:
+            from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
+
+            canonical = canonicalize_harness(harness_override) or harness_override
+            allowed = _subagent_allowed_harnesses(str(sub_agent_name), agent_spec)
+            if not allowed:
+                return (
+                    f"Error: sys_session_send 'harness' override is not "
+                    f"permitted for sub-agent {sub_agent_name!r}: its spec "
+                    "declares no executor.config.allowed_harnesses allowlist."
+                )
+            if canonical not in allowed:
+                return (
+                    f"Error: sys_session_send 'harness' {harness_override!r} is "
+                    f"not allowlisted for sub-agent {sub_agent_name!r}: allowed "
+                    f"harnesses are {sorted(allowed)}."
+                )
+            if canonical not in OMNIGENT_HARNESSES:
+                return (
+                    f"Error: sys_session_send 'harness' {harness_override!r} is "
+                    f"not a known harness; must be one of {sorted(OMNIGENT_HARNESSES)}."
+                )
+            harness_override_canonical = canonical
+            child_harness = canonical
         # Fail loud at dispatch when the child's harness needs a CLI binary
         # that isn't on PATH. Otherwise a missing CLI surfaces only as a lazy
         # first-turn failure (e.g. the pi harness raises ImportError, which the
@@ -1089,6 +1193,8 @@ async def _execute_subagent_tool(
             "title": f"{sub_agent_name}:{session_name}",
             "sub_agent_name": sub_agent_name,
         }
+        if harness_override_canonical is not None:
+            create_body["harness_override"] = harness_override_canonical
         if model is not None:
             # Reject up front when the child harness would silently
             # ignore the persisted override — no silent drops.

@@ -4,7 +4,8 @@ enum WorkspaceURLExpander {
   static let workspaceUIPath = "/ml/omnigents"
 
   static func expandIfNeeded(_ url: URL, session: URLSession = .shared) async -> URL {
-    guard url.scheme?.lowercased() == "https", isBareRoot(url), let origin = originURL(for: url) else {
+    guard url.scheme?.lowercased() == "https", isBareRoot(url), let origin = originURL(for: url)
+    else {
       return url
     }
 
@@ -19,7 +20,10 @@ enum WorkspaceURLExpander {
       guard (http.value(forHTTPHeaderField: "server") ?? "").lowercased() == "databricks" else {
         return url
       }
-      return URL(string: "\(origin.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")))\(workspaceUIPath)") ?? url
+      return URL(
+        string:
+          "\(origin.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")))\(workspaceUIPath)"
+      ) ?? url
     } catch {
       return url
     }

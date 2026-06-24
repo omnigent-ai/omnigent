@@ -51,6 +51,7 @@ import {
   MessageContent,
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
+import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
 import { CompactionMarker } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
@@ -58,6 +59,7 @@ import { parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
+import { validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
 import {
   isIOSShell,
@@ -104,6 +106,7 @@ import { useSession } from "@/hooks/useSession";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
+  type LivenessRow,
   type SessionLiveness,
   livenessRowFromSession,
   useSessionLiveness,
@@ -245,11 +248,22 @@ export function buildPendingBubbles(
 // bubble. Used by `mergePendingBubbles` and
 // `reorderCommittedRequestElicitations` to keep the prompt above the card
 // that asks about it, both before and after approval.
-function isRequestElicitationBubble(bubble: Bubble): boolean {
+function isStandaloneElicitationBubble(bubble: Bubble): boolean {
+  // A committed assistant bubble that is ENTIRELY an elicitation card with no
+  // turn to anchor to, so it must sit BELOW the user message it gated:
+  //   • REQUEST-phase policy ASKs (gate the prompt before any turn), and
+  //   • terminal-driven harness gates such as cursor-native `pre_tool_use`,
+  //     which never emit `response_created` (blockStream stamps these with
+  //     their own `elicit_*` id, so they land as standalone bubbles).
+  // A `tool_call` card inside an active SDK turn renders inline — it is grouped
+  // WITH the turn, so it is never an all-elicitation standalone bubble — and is
+  // intentionally excluded here.
   return (
     bubble.kind === "assistant" &&
     bubble.items.length > 0 &&
-    bubble.items.every((it) => it.kind === "elicitation" && it.phase === "request")
+    bubble.items.every(
+      (it) => it.kind === "elicitation" && (it.phase === "request" || it.phase === "pre_tool_use"),
+    )
   );
 }
 
@@ -269,7 +283,7 @@ function isRequestElicitationBubble(bubble: Bubble): boolean {
 export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble[] {
   let result: Bubble[] | null = null;
   for (let i = 0; i < committed.length - 1; i += 1) {
-    if (isRequestElicitationBubble(committed[i]!) && committed[i + 1]!.kind === "user") {
+    if (isStandaloneElicitationBubble(committed[i]!) && committed[i + 1]!.kind === "user") {
       if (result === null) result = [...committed];
       const card = result[i]!;
       result[i] = result[i + 1]!;
@@ -293,11 +307,56 @@ export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble
 export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
   if (pending.length === 0) return committed;
   let insertAt = committed.length;
-  while (insertAt > 0 && isRequestElicitationBubble(committed[insertAt - 1]!)) {
+  while (insertAt > 0 && isStandaloneElicitationBubble(committed[insertAt - 1]!)) {
     insertAt -= 1;
   }
   if (insertAt === committed.length) return [...committed, ...pending];
   return [...committed.slice(0, insertAt), ...pending, ...committed.slice(insertAt)];
+}
+
+type ElicitationItem = Extract<RenderItem, { kind: "elicitation" }>;
+
+// A pending elicitation is unanswered — only these float to the bottom.
+function isPendingElicitation(item: RenderItem): item is ElicitationItem {
+  return item.kind === "elicitation" && item.status === "pending";
+}
+
+// Pending elicitation cards float to the bottom of the chat: lifted out of
+// their inline position and re-rendered as the last items in the scroll flow,
+// so stick-to-bottom keeps an outstanding question in view no matter how much
+// text the agent streams after it (otherwise the card scrolls up off the top
+// of the viewport). Collect them in document order — oldest first, so the
+// newest sits last, closest to the composer. Once answered, a card drops out
+// of this list (status flips to "responded") and stays inline at its natural
+// spot (it is no longer removed by `stripPendingElicitations`).
+export function collectPendingElicitations(bubbles: Bubble[]): ElicitationItem[] {
+  const pending: ElicitationItem[] = [];
+  for (const bubble of bubbles) {
+    if (bubble.kind !== "assistant") continue;
+    for (const item of bubble.items) {
+      if (isPendingElicitation(item)) pending.push(item);
+    }
+  }
+  return pending;
+}
+
+// Drop the pending elicitation cards from the transcript bubbles so they
+// don't render twice — once at the bottom, once inline. Only clones the
+// assistant bubbles that actually carry a pending card; every other bubble
+// keeps its reference so `BubbleView`'s memo holds. An assistant bubble left
+// with no items renders nothing (`AssistantBubble` returns null), so a
+// standalone elicitation bubble collapses cleanly while its gating user
+// message stays put. Returns the input array unchanged when nothing is
+// pending, so the memo stays stable.
+export function stripPendingElicitations(bubbles: Bubble[]): Bubble[] {
+  let result: Bubble[] | null = null;
+  for (let i = 0; i < bubbles.length; i += 1) {
+    const bubble = bubbles[i]!;
+    if (bubble.kind !== "assistant" || !bubble.items.some(isPendingElicitation)) continue;
+    if (result === null) result = [...bubbles];
+    result[i] = { ...bubble, items: bubble.items.filter((it) => !isPendingElicitation(it)) };
+  }
+  return result ?? bubbles;
 }
 
 // Whether a user bubble should carry the author's avatar badge (and the
@@ -734,7 +793,15 @@ export function ChatPage() {
   // so `host_id` still reaches the hook — otherwise a host-bound, host-down
   // session misclassifies as `local_stranded` and shows the wrong reconnect
   // path. See `livenessRowFromSession`.
-  const livenessRow = activeConv ?? livenessRowFromSession(activeSession);
+  //
+  // Always source `host_resumable` from the session snapshot — the sidebar
+  // `Conversation` row doesn't carry it. activeSession is loaded for the open
+  // session, so a host-bound, host-down session whose host is a resumable
+  // managed host classifies as `host_asleep` (composer open, send wakes it)
+  // instead of dead-ending on `host_offline`.
+  const livenessRow: LivenessRow | null = activeConv
+    ? { ...activeConv, host_resumable: activeSession?.hostResumable ?? false }
+    : livenessRowFromSession(activeSession);
   const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
     turnActive: status === "streaming",
   });
@@ -1243,6 +1310,19 @@ function MainAgentSurface({
   );
   const nav = useUserMessageNav(userMessageIds);
 
+  // Pending elicitation cards float to the bottom of the chat: rendered as the
+  // last items in the scroll flow and removed from their inline position so
+  // they don't render twice. Stick-to-bottom then keeps an outstanding
+  // question in view instead of letting trailing text scroll it off the top.
+  // Answered cards stay inline at their natural spot. `streamBubbles` keeps
+  // `bubbles`' reference when nothing is pending, so the common case allocates
+  // nothing.
+  const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
+  const streamBubbles = useMemo(
+    () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
+    [bubbles, pendingElicitations.length],
+  );
+
   // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — guarded so the composer's
   // own unmodified ArrowUp/Down history-recall still works.
   useEffect(() => {
@@ -1406,8 +1486,29 @@ function MainAgentSurface({
               )
             ) : (
               <>
-                {bubbles.map((bubble) => (
+                {streamBubbles.map((bubble) => (
                   <BubbleView key={bubbleKey(bubble)} bubble={bubble} />
+                ))}
+                {/* Pending elicitation cards, floated to the bottom of the
+                    chat so an outstanding question stays in view (stick-to-
+                    bottom) no matter how much text the agent streamed after
+                    it. Wrapped in an assistant Message so each matches an
+                    inline card's look; removed from their inline slot by
+                    `stripPendingElicitations`. Newest renders last, nearest
+                    the composer. Rendered ABOVE the Working… indicator so the
+                    card sits closest to the prompt and the shimmer stays the
+                    last thing in the flow. */}
+                {pendingElicitations.map((item) => (
+                  <Message
+                    key={item.elicitationId}
+                    from="assistant"
+                    className="max-w-full"
+                    data-testid="bottom-elicitation"
+                  >
+                    <MessageContent className="w-full">
+                      <ElicitationCard item={item} />
+                    </MessageContent>
+                  </Message>
                 ))}
                 {/* Working… shimmer between send and first rendered block.
                     Suppressed when the last bubble is a compaction spinner —
@@ -1490,7 +1591,8 @@ function MainAgentSurface({
         showCodexPlanMode={showCodexPlanMode}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
-        reconnectHint={liveness.kind === "runner_asleep"}
+        reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
+        sandboxAsleepHint={liveness.kind === "host_asleep"}
         unreachable={
           !sandboxLaunching &&
           (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
@@ -2068,7 +2170,8 @@ export function ConnectionIndicator({
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   // Genuinely-unreachable states get the reconnect banner, for
   // both terminal-first and regular sessions. `runner_asleep` (host up,
-  // runner relaunches on the next message) and `unknown` (pre-poll) are
+  // runner relaunches on the next message), `host_asleep` (resumable managed
+  // host the server wakes on the next message), and `unknown` (pre-poll) are
   // NOT unreachable — they're handled below.
   const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
 
@@ -2172,8 +2275,8 @@ export function ConnectionIndicator({
   }
 
   // `online`/`unknown` for a non-terminal-first session and
-  // `runner_asleep` for any session: status lives in the sidebar / the
-  // composer stays open, so render nothing here.
+  // `runner_asleep`/`host_asleep` for any session: status lives in the
+  // sidebar / the composer stays open, so render nothing here.
   return null;
 }
 
@@ -2697,6 +2800,14 @@ interface ComposerProps {
    */
   reconnectHint?: boolean;
   /**
+   * The session is host-bound to a dormant resumable managed host that is
+   * offline (`host_asleep`): the composer stays enabled, and the placeholder
+   * tells the user their next message will resume the sandbox host (which can
+   * take a few minutes) so the wake latency is expected, not surprising.
+   * Ignored once a turn is streaming.
+   */
+  sandboxAsleepHint?: boolean;
+  /**
    * The session is unreachable (`host_offline` / `local_stranded`): a message
    * can't wake it. The composer is blocked (disabled) and the reconnect
    * banner below is the only affordance.
@@ -3063,6 +3174,7 @@ export function Composer({
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
+  sandboxAsleepHint = false,
   unreachable = false,
   costRoutingVerdict = null,
   costRoutingEligible = false,
@@ -3070,6 +3182,7 @@ export function Composer({
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<File[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
   // Index of the highlighted item in the slash-command suggestions menu.
@@ -3386,8 +3499,15 @@ export function Composer({
   const [isDragActive, setIsDragActive] = useState(false);
 
   const addFiles = (incoming: File[]) => {
-    setFiles((prev) => [...prev, ...incoming]);
-    dirtyRef.current = true;
+    // Reject unsupported types (only images, PDF, and text/code) and
+    // oversized files up front — before the upload — with a friendly
+    // message. The server enforces the same limits authoritatively.
+    const { accepted, errors } = validateAttachments(incoming);
+    if (accepted.length > 0) {
+      setFiles((prev) => [...prev, ...accepted]);
+      dirtyRef.current = true;
+    }
+    setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   };
 
   const handleDrop = (e: DragEvent<HTMLDivElement>) => {
@@ -3420,6 +3540,7 @@ export function Composer({
 
   const removeFile = (index: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
+    setAttachmentError(null);
     dirtyRef.current = true;
   };
 
@@ -3502,6 +3623,7 @@ export function Composer({
     dirtyRef.current = true;
     setValue("");
     setFiles([]);
+    setAttachmentError(null);
     onClearAllQuotes();
   };
 
@@ -3770,9 +3892,11 @@ export function Composer({
                         ? "Waiting for agents…"
                         : isStreaming
                           ? "Send a follow-up (queued) — Esc to stop"
-                          : reconnectHint
-                            ? "Send a message to reconnect this session"
-                            : "Ask the agent anything…"
+                          : sandboxAsleepHint
+                            ? "Current session's host is offline. Next message will resume the sandbox host which can take minutes"
+                            : reconnectHint
+                              ? "Send a message to reconnect this session"
+                              : "Ask the agent anything…"
             }
             rows={1}
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
@@ -3809,6 +3933,12 @@ export function Composer({
                 </button>
               </span>
             ))}
+          </div>
+        )}
+        {/* Rejected-attachment feedback: unsupported type or too large */}
+        {attachmentError !== null && (
+          <div className="px-4 pb-2 text-xs text-destructive whitespace-pre-wrap">
+            {attachmentError}
           </div>
         )}
         {/* Inline slash-command feedback: errors and /help output */}

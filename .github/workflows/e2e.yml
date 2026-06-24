@@ -8,23 +8,18 @@ name: E2E Tests
 #   schedule            09:00 UTC daily (alongside nightly.yml).
 #   workflow_dispatch   manual run. Inputs: `branch` (non-main ref) and
 #                       `parallelism` (pytest `-n` worker count).
-#   pull_request        PR gate for SAME-REPO PRs only. Fork PRs skip
-#                       here (no secrets) and run via the fork-e2e/**
-#                       push after a maintainer approves the PR and
-#                       fork-e2e-mirror.yml mirrors them. The four shard
-#                       checks are required by merge-ready.yml.
-#   push (fork-e2e/**)  e2e run for mirrored fork PRs (trusted branch,
-#                       so secrets flow).
+#   pull_request        PR gate for ALL PRs -- same-repo AND fork. This suite
+#                       runs entirely against the in-process mock LLM (no
+#                       secrets), so fork PRs run it directly here just like
+#                       ci.yml, with no fork-e2e/** mirror (#802 removed the
+#                       credential setup). The four shard checks are required by
+#                       merge-ready.yml.
 
 on:
   schedule:
     - cron: "0 9 * * *"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
-    paths-ignore: ['ap-web/**', 'tests/e2e_ui/**']
-  push:
-    branches:
-      - 'fork-e2e/**'
     paths-ignore: ['ap-web/**', 'tests/e2e_ui/**']
   workflow_dispatch:
     inputs:
@@ -38,8 +33,8 @@ on:
         default: "2"
 
 concurrency:
-  # PRs key by number, dispatch by branch (so re-runs cancel); push /
-  # schedule key by SHA so each merge to `main` gets its own run.
+  # PRs key by number, dispatch by branch (so re-runs cancel); schedule keys
+  # by SHA so each merge to `main` gets its own run.
   group: e2e-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.branch || github.sha }}
   cancel-in-progress: true
 
@@ -62,9 +57,8 @@ jobs:
   gate:
     uses: ./.github/workflows/security-gate.yml
 
-  # Compute the shard matrix once. A skipped run (draft / fork pull_request)
-  # yields an EMPTY matrix -> zero shard jobs -> no skipped placeholder check.
-  # Shared with e2e-ui.yml via e2e-shard-matrix.sh (only NUM_SHARDS differs).
+  # Shard matrix (e2e-shard-matrix.sh, shared with e2e-ui.yml). Fork PRs run by
+  # default; draft PRs resolve to an empty matrix.
   setup:
     name: setup
     needs: gate
@@ -85,7 +79,6 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
-          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
           NUM_SHARDS: "4"
         run: bash .github/scripts/ci/e2e-shard-matrix.sh
 
@@ -96,8 +89,8 @@ jobs:
     # -n 2 per shard => 4 x 2 = 8 concurrent gateway calls, below the
     # nightly's 429 pain point; drop -n before max-parallel if rate-limited.
     name: E2E Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
-    # Draft / fork pull_request events resolve to an EMPTY matrix in `setup`
-    # (forks run via the fork-e2e/** mirror push), so no shard runs for them.
+    # Draft PRs resolve to an EMPTY matrix in `setup`, so no shard runs for
+    # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
     needs: setup
     runs-on: ubuntu-latest
     # Job-level cap (composite-action run steps can't set timeout-minutes):
@@ -114,9 +107,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          # Same-repo PRs test the merge result (refs/pull/N/merge -- absent
-          # when the PR conflicts, so a conflicted PR fails checkout by design).
-          # Push (fork-e2e/**) and dispatch fall back to the branch / ref.
+          # PRs (same-repo and fork) test the merge result (refs/pull/N/merge --
+          # absent when the PR conflicts, so a conflicted PR fails checkout by
+          # design). Schedule / dispatch fall back to the branch / ref.
           ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.event.inputs.branch || github.ref }}
 
       # Steps below are shared verbatim with server-compat.yml's backcompat-e2e
@@ -130,8 +123,11 @@ jobs:
           parallelism: ${{ github.event.inputs.parallelism || '2' }}
           nightly_full: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
 
-  # Explicitly re-dispatch Merge Ready (same-repo PR or fork-e2e push): the
-  # workflow_run hop is brittle and was dropped on #751/#792. No checkout,
+  # Explicitly re-dispatch Merge Ready for same-repo PRs: the workflow_run hop
+  # is brittle and was dropped on #751/#792. Fork PRs are NOT re-dispatched here
+  # -- their pull_request GITHUB_TOKEN is read-only (actions:write is not
+  # granted), so `gh workflow run` would 403; they re-evaluate via
+  # merge-ready.yml's own workflow_run trigger instead. No checkout,
   # actions:write only; GITHUB_TOKEN workflow_dispatch is exempt from recursion.
   merge-ready-rerun:
     name: Merge Ready rerun
@@ -139,12 +135,8 @@ jobs:
     if: >-
       always()
       && needs.e2e.result != 'skipped'
-      && (
-        (github.event_name == 'pull_request'
-          && github.event.pull_request.head.repo.full_name == github.repository)
-        || (github.event_name == 'push'
-          && startsWith(github.ref_name, 'fork-e2e/pr-'))
-      )
+      && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -152,16 +144,14 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
-      REF_NAME: ${{ github.ref_name }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
       - name: Re-dispatch Merge Ready
         run: |
           set -euo pipefail
-          # same-repo PR -> event number; fork-e2e push -> parse fork-e2e/pr-<N>
-          PR="${PR_NUMBER:-${REF_NAME##*/pr-}}"
+          PR="$PR_NUMBER"
           if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
-            echo "::notice::could not resolve PR number (ref='$REF_NAME'); nothing to do."
+            echo "::notice::could not resolve PR number; nothing to do."
             exit 0
           fi
           echo "Re-dispatching merge-ready.yml for PR #$PR after $GITHUB_WORKFLOW."

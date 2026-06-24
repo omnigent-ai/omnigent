@@ -16,15 +16,19 @@ from omnigent.onboarding.harness_readiness import (
 
 @pytest.fixture(autouse=True)
 def _isolate_cursor_credential(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Isolate cursor's API-key sources so its readiness is deterministic.
+    """Isolate cursor + copilot credential sources so their readiness is deterministic.
 
-    Cursor readiness keys off a configured ``CURSOR_API_KEY`` (the ``cursor:``
-    config block or the environment), so point the config home at an empty tmp
-    dir and clear any ambient ``CURSOR_API_KEY`` — otherwise a developer's real
-    key would flip cursor's verdict under these tests.
+    Cursor readiness keys off a configured ``CURSOR_API_KEY`` and copilot off a
+    GitHub token (the ``cursor:`` / ``copilot:`` config blocks or the
+    environment), so point the config home at an empty tmp dir and clear any
+    ambient ``CURSOR_API_KEY`` / ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` /
+    ``GITHUB_TOKEN`` — otherwise a developer's real key would flip their verdict
+    under these tests.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
 
 
 def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -88,6 +92,8 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "pi",
         "cursor-native",
         "native-cursor",
+        "goose-native",
+        "native-goose",
     ],
 )
 def test_cli_harness_configured_only_when_binary_installed(
@@ -138,6 +144,11 @@ def test_configured_harness_map_covers_all_spellings(
         # Native Cursor (``omni cursor``) — gates on the cursor-agent CLI.
         "cursor-native",
         "native-cursor",
+        # Goose — native TUI (``omni goose``) + headless ACP harness; both gate
+        # on the goose CLI.
+        "goose",
+        "goose-native",
+        "native-goose",
         # Antigravity SDK harness + its user-facing aliases.
         "antigravity",
         "agy",
@@ -145,9 +156,16 @@ def test_configured_harness_map_covers_all_spellings(
         # Kimi Code CLI + alias.
         "kimi",
         "kimi-code",
+        # Native OpenCode harness + its user-facing aliases.
+        "opencode-native",
+        "native-opencode",
+        "opencode",
         # Qwen harnesses
         "qwen",
         "qwen-code",
+        # Copilot SDK harness + its user-facing alias.
+        "copilot",
+        "github-copilot",
     }
     assert set(result) == expected_keys
 
@@ -190,6 +208,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "kimi",
         "cursor-native",
         "native-cursor",
+        "goose-native",
+        "native-goose",
         "qwen",
     ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
@@ -198,14 +218,16 @@ def test_configured_harness_map_gates_only_cli_harnesses(
 def test_configured_harness_map_all_true_with_clis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Every spelling reads True once the CLIs are installed and cursor has a key.
+    """Every spelling reads True once the CLIs are installed and the key/token-
+    gated harnesses are satisfied.
 
     The CLI harnesses pass their binary check, the SDK harnesses are ungated,
-    and cursor (key-gated) is satisfied by a ``CURSOR_API_KEY`` — so nothing is
-    reported unconfigured.
+    cursor (key-gated) is satisfied by a ``CURSOR_API_KEY`` and copilot
+    (token-gated) by a ``GH_TOKEN`` — so nothing is reported unconfigured.
     """
     _all_clis_installed(monkeypatch)
     monkeypatch.setenv("CURSOR_API_KEY", "crsr_ready")
+    monkeypatch.setenv("GH_TOKEN", "gho_ready")
     result = configured_harness_map()
     assert all(result.values())
 

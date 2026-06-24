@@ -516,6 +516,193 @@ async def test_run_turn_yields_text_chunks_and_turn_complete() -> None:
     assert turn_completes[0].response == "Hello!"
 
 
+# ---------------------------------------------------------------------------
+# Token usage — parsed from qwen's _meta.usage and emitted on TurnComplete
+# ---------------------------------------------------------------------------
+
+
+def test_accumulate_usage_maps_and_splits_cached() -> None:
+    """_meta.usage maps to wire keys; cached tokens split out of input_tokens.
+
+    qwen's inputTokens (Gemini promptTokenCount) is inclusive of cached tokens,
+    but compute_llm_cost wants the non-cached portion in input_tokens.
+    """
+    acc: dict[str, int] = {}
+    QwenExecutor._accumulate_usage(
+        acc,
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": ""},
+            "_meta": {
+                "usage": {
+                    "inputTokens": 1000,
+                    "outputTokens": 200,
+                    "totalTokens": 1200,
+                    "cachedReadTokens": 300,
+                    "thoughtTokens": 50,
+                }
+            },
+        },
+    )
+    assert acc == {
+        "input_tokens": 700,  # 1000 - 300 cached
+        "output_tokens": 200,
+        "total_tokens": 1200,
+        "cache_read_input_tokens": 300,
+    }
+
+
+def test_accumulate_usage_sums_across_calls_and_ignores_non_usage() -> None:
+    """Multiple emissions sum; updates without _meta.usage are ignored."""
+    acc: dict[str, int] = {}
+    # A plain text chunk carries no usage — must not perturb the accumulator.
+    QwenExecutor._accumulate_usage(acc, {"content": {"type": "text", "text": "hi"}})
+    assert acc == {}
+    for _ in range(2):
+        QwenExecutor._accumulate_usage(
+            acc,
+            {"_meta": {"usage": {"inputTokens": 100, "outputTokens": 10, "totalTokens": 110}}},
+        )
+    # Summed across the two calls; no cached key when cachedReadTokens absent.
+    assert acc == {"input_tokens": 200, "output_tokens": 20, "total_tokens": 220}
+
+
+def test_accumulate_usage_clamps_negative_input() -> None:
+    """A malformed cached > input never drives input_tokens negative."""
+    acc: dict[str, int] = {}
+    QwenExecutor._accumulate_usage(
+        acc,
+        {"_meta": {"usage": {"inputTokens": 100, "cachedReadTokens": 500, "totalTokens": 100}}},
+    )
+    assert acc["input_tokens"] == 0
+    assert acc["cache_read_input_tokens"] == 500
+
+
+@pytest.mark.asyncio
+async def test_run_turn_emits_usage_on_turn_complete(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A usage-bearing chunk surfaces as TurnComplete.usage and notifies cost."""
+    notified: list[dict] = []
+    monkeypatch.setattr(
+        "omnigent.inner.qwen_executor._notify_usage_from_dict",
+        lambda model, usage: notified.append({"model": model, "usage": usage}),
+    )
+
+    executor = QwenExecutor(model="qwen/qwen3-coder")
+    executor._initialized = True
+    executor._session_id = "sess-usage"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    session_id = executor._session_id
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            base = {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {"sessionId": session_id},
+            }
+            # 1. Real text chunk.
+            await executor._queue.put(
+                {
+                    **base,
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "done"},
+                        },
+                    },
+                }
+            )
+            # 2. Usage-bearing chunk (empty text + _meta.usage).
+            await executor._queue.put(
+                {
+                    **base,
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": ""},
+                            "_meta": {
+                                "usage": {
+                                    "inputTokens": 500,
+                                    "outputTokens": 80,
+                                    "totalTokens": 580,
+                                    "cachedReadTokens": 100,
+                                }
+                            },
+                        },
+                    },
+                }
+            )
+            fut = executor._pending.get(msg["id"])
+            if fut and not fut.done():
+                fut.set_result(
+                    {"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}}
+                )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completes) == 1
+    assert completes[0].response == "done"
+    assert completes[0].usage == {
+        "input_tokens": 400,  # 500 - 100 cached
+        "output_tokens": 80,
+        "total_tokens": 580,
+        "cache_read_input_tokens": 100,
+    }
+    # Cost observer was notified with the same usage + the configured model.
+    assert notified == [{"model": "qwen/qwen3-coder", "usage": completes[0].usage}]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_usage_none_when_unreported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No usage chunk → TurnComplete.usage is None and the observer isn't called."""
+    notified: list[dict] = []
+    monkeypatch.setattr(
+        "omnigent.inner.qwen_executor._notify_usage_from_dict",
+        lambda model, usage: notified.append({"model": model, "usage": usage}),
+    )
+
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-no-usage"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    session_id = executor._session_id
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            await executor._queue.put(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "hi"},
+                        },
+                    },
+                }
+            )
+            fut = executor._pending.get(msg["id"])
+            if fut and not fut.done():
+                fut.set_result(
+                    {"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}}
+                )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completes) == 1
+    assert completes[0].usage is None
+    assert notified == []
+
+
 @pytest.mark.asyncio
 async def test_run_turn_drains_all_chunks_before_completing() -> None:
     """All buffered chunks are yielded even if the future resolves first.
@@ -890,19 +1077,169 @@ async def test_run_turn_resends_system_prompt_after_session_reset() -> None:
 
 
 # ---------------------------------------------------------------------------
+# History replay on a fresh session (model switch / reset doesn't drop context)
+# ---------------------------------------------------------------------------
+
+
+def test_history_prefix_serializes_prior_turns() -> None:
+    """_history_prefix renders prior turns as labeled role: content lines."""
+    prior = [
+        {"role": "user", "content": "what is 2+2"},
+        {"role": "assistant", "content": "4"},
+        {"role": "user", "content": [{"type": "input_text", "text": "and 3+3"}]},
+        {"role": "assistant", "content": [{"type": "output_text", "text": "6"}]},
+    ]
+    out = QwenExecutor._history_prefix(prior)
+    assert out.startswith("Conversation so far:")
+    assert "user: what is 2+2" in out
+    assert "assistant: 4" in out
+    assert "user: and 3+3" in out  # list content folded via _text_from_blocks
+    assert "assistant: 6" in out
+    assert out.rstrip().endswith("using the conversation above as context.")
+
+
+@pytest.mark.asyncio
+async def test_run_turn_replays_history_on_fresh_session() -> None:
+    """A fresh session folds prior turns into the prompt (e.g. after /model respawn).
+
+    qwen normally only sees the latest user turn; on a brand-new subprocess
+    (a ``/model`` switch respawns it) that would drop everything before the
+    switch. The first turn must replay the transcript so context survives.
+    """
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-fresh"  # session exists, but no prior turns sent
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    loop = asyncio.get_event_loop()
+
+    sent_prompts: list[str] = []
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            sent_prompts.append(msg["params"]["prompt"][0]["text"])
+            req_id = msg["id"]
+
+            def _resolve() -> None:
+                fut = executor._pending.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(
+                        {"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}}
+                    )
+
+            loop.call_soon(_resolve)
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    messages = [
+        {"role": "user", "content": "remember the number 42"},
+        {"role": "assistant", "content": "Got it, 42."},
+        {"role": "user", "content": "what number did I say?"},
+    ]
+    async for _ in executor.run_turn(messages, [], "SYS"):
+        pass
+
+    prompt = sent_prompts[0]
+    # System prompt first, then replayed history, then the latest turn.
+    assert prompt.startswith("SYS\n\n")
+    assert "Conversation so far:" in prompt
+    assert "user: remember the number 42" in prompt
+    assert "assistant: Got it, 42." in prompt
+    assert prompt.rstrip().endswith("user: what number did I say?")
+
+
+@pytest.mark.asyncio
+async def test_run_turn_no_replay_on_continuing_session() -> None:
+    """A continuing session sends only the latest turn (qwen retains context)."""
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-cont"
+    executor._system_prompt_sent = True  # not a fresh session
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    loop = asyncio.get_event_loop()
+
+    sent_prompts: list[str] = []
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            sent_prompts.append(msg["params"]["prompt"][0]["text"])
+            req_id = msg["id"]
+
+            def _resolve() -> None:
+                fut = executor._pending.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(
+                        {"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}}
+                    )
+
+            loop.call_soon(_resolve)
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    messages = [
+        {"role": "user", "content": "earlier turn"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "latest turn"},
+    ]
+    async for _ in executor.run_turn(messages, [], "SYS"):
+        pass
+
+    # No history prefix, no system-prompt re-fold — just the latest message.
+    assert sent_prompts[0] == "latest turn"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_no_replay_on_genuine_first_turn() -> None:
+    """A brand-new conversation (single user turn) has nothing to replay."""
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-first"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    loop = asyncio.get_event_loop()
+
+    sent_prompts: list[str] = []
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            sent_prompts.append(msg["params"]["prompt"][0]["text"])
+            req_id = msg["id"]
+
+            def _resolve() -> None:
+                fut = executor._pending.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(
+                        {"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}}
+                    )
+
+            loop.call_soon(_resolve)
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    async for _ in executor.run_turn([{"role": "user", "content": "hello"}], [], "SYS"):
+        pass
+
+    assert sent_prompts[0] == "SYS\n\nhello"  # system prompt only, no replay
+    assert "Conversation so far:" not in sent_prompts[0]
+
+
+# ---------------------------------------------------------------------------
 # Server-initiated requests: permission, unsupported methods (incl. fs/*)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_respond_to_fs_read_text_file_is_unsupported() -> None:
-    """fs/* is intentionally unsupported (no clientCapabilities.fs advertised).
+async def test_respond_to_fs_read_text_file_unsupported_without_os_env() -> None:
+    """fs/* is method-not-found when fs delegation isn't advertised.
 
-    qwen never delegates file ops to us, so the handlers were removed; an
-    ``fs/read_text_file`` request must get a JSON-RPC method-not-found error
+    With no os_env configured, ``_fs_delegation`` is False and we never
+    advertise ``clientCapabilities.fs``, so qwen uses its own file tools. A
+    stray ``fs/read_text_file`` must get a JSON-RPC method-not-found error
     rather than a fabricated (and dangerous) empty/real-file response.
     """
-    executor = QwenExecutor()
+    executor = QwenExecutor()  # no os_env → delegation off
+    assert executor._fs_delegation is False
     sent: list[dict] = []
     executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
 
@@ -913,6 +1250,228 @@ async def test_respond_to_fs_read_text_file_is_unsupported() -> None:
     assert sent[0]["id"] == 7
     assert sent[0]["error"]["code"] == -32601
     assert "result" not in sent[0]
+
+
+# ---------------------------------------------------------------------------
+# Filesystem delegation (fs/read_text_file, fs/write_text_file)
+# ---------------------------------------------------------------------------
+
+
+class _FakeOSEnv:
+    """Minimal OSEnvironment stand-in capturing read/write calls."""
+
+    def __init__(self, read_result: dict | None = None, write_result: dict | None = None) -> None:
+        self._read_result = read_result if read_result is not None else {}
+        self._write_result = write_result if write_result is not None else {}
+        self.read_calls: list[tuple] = []
+        self.write_calls: list[tuple] = []
+        self.closed = False
+
+    async def read(self, path: str, offset: int = 1, limit: int | None = None) -> dict:
+        self.read_calls.append((path, offset, limit))
+        return self._read_result
+
+    async def write(self, path: str, content: str) -> dict:
+        self.write_calls.append((path, content))
+        return self._write_result
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_fs_delegation_flag_tracks_os_env() -> None:
+    """Delegation is on with an os_env, off without one or for a fork env."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    assert QwenExecutor()._fs_delegation is False  # no os_env
+    assert QwenExecutor(os_env=OSEnvSpec(type="caller_process"))._fs_delegation is True
+    # A fork env operates on a copied tree → path would diverge from the qwen
+    # subprocess cwd, so delegation must stay off.
+    assert QwenExecutor(os_env=OSEnvSpec(type="caller_process", fork=True))._fs_delegation is False
+
+
+@pytest.mark.asyncio
+async def test_initialize_advertises_fs_capability_per_delegation() -> None:
+    """initialize advertises clientCapabilities.fs matching the delegation flag."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    init_result = {"result": {"agentCapabilities": {"promptCapabilities": {}}}}
+
+    # Delegation ON (os_env configured).
+    on = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    on._rpc = AsyncMock(return_value=init_result)  # type: ignore[method-assign]
+    await on._ensure_initialized()
+    caps = on._rpc.call_args.args[1]["clientCapabilities"]["fs"]
+    assert caps == {"readTextFile": True, "writeTextFile": True}
+
+    # Delegation OFF (no os_env).
+    off = QwenExecutor()
+    off._rpc = AsyncMock(return_value=init_result)  # type: ignore[method-assign]
+    await off._ensure_initialized()
+    caps = off._rpc.call_args.args[1]["clientCapabilities"]["fs"]
+    assert caps == {"readTextFile": False, "writeTextFile": False}
+
+
+@pytest.mark.asyncio
+async def test_fs_read_returns_content_and_maps_window() -> None:
+    """fs/read_text_file reads through the OSEnvironment; line/limit → offset/limit."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(read_result={"content": "hello\nworld\n", "encoding": "utf-8"})
+    executor._os_environment = fake  # type: ignore[assignment]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "fs/read_text_file",
+            "params": {"path": "a.txt", "line": 2, "limit": 5},
+        }
+    )
+
+    assert sent[0]["result"] == {"content": "hello\nworld\n"}
+    assert fake.read_calls == [("a.txt", 2, 5)]  # line→offset, limit→limit
+
+
+@pytest.mark.asyncio
+async def test_fs_read_whole_file_when_no_window() -> None:
+    """Absent line/limit reads the whole file (offset=1, limit=None)."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(read_result={"content": "x", "encoding": "utf-8"})
+    executor._os_environment = fake  # type: ignore[assignment]
+    executor._send = AsyncMock()  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "fs/read_text_file", "params": {"path": "a.txt"}}
+    )
+
+    assert fake.read_calls == [("a.txt", 1, None)]
+
+
+@pytest.mark.asyncio
+async def test_fs_read_missing_file_maps_to_enoent() -> None:
+    """A 'no such file' read error maps to qwen's ENOENT code (-32002)."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        read_result={"error": "[Errno 2] No such file or directory: 'gone.txt'"}
+    )
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 5, "method": "fs/read_text_file", "params": {"path": "gone.txt"}}
+    )
+
+    assert sent[0]["error"]["code"] == -32002
+    assert "result" not in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_fs_read_binary_file_is_rejected() -> None:
+    """A non-utf-8 (binary) file is refused rather than returned as bytes."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        read_result={"content": "AAAA", "encoding": "base64", "total_bytes": 3}
+    )
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 6, "method": "fs/read_text_file", "params": {"path": "img.png"}}
+    )
+
+    assert sent[0]["error"]["code"] == -32603
+    assert "text file" in sent[0]["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_fs_write_writes_through_os_env() -> None:
+    """fs/write_text_file writes via the OSEnvironment and returns an empty result."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(write_result={"path": "out.txt", "bytes": 3})
+    executor._os_environment = fake  # type: ignore[assignment]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "abc"},
+        }
+    )
+
+    assert sent[0]["result"] == {}
+    assert fake.write_calls == [("out.txt", "abc")]
+
+
+@pytest.mark.asyncio
+async def test_fs_write_error_surfaces_as_internal_error() -> None:
+    """A write failure surfaces as a JSON-RPC internal error (-32603)."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        write_result={"error": "Permission denied"}
+    )
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "abc"},
+        }
+    )
+
+    assert sent[0]["error"]["code"] == -32603
+    assert "Permission denied" in sent[0]["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_fs_write_rejects_missing_args() -> None:
+    """Missing path / non-string content is an invalid-params error (-32602)."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv()  # type: ignore[assignment]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 10, "method": "fs/write_text_file", "params": {"path": "out.txt"}}
+    )
+
+    assert sent[0]["error"]["code"] == -32602
+
+
+@pytest.mark.asyncio
+async def test_close_releases_fs_os_environment() -> None:
+    """close() tears down a lazily-created fs-delegation OSEnvironment."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv()
+    executor._os_environment = fake  # type: ignore[assignment]
+
+    await executor.close()
+
+    assert fake.closed is True
+    assert executor._os_environment is None
 
 
 # Realistic qwen session/request_permission payload (from the ACP probe).

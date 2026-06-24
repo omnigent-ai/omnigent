@@ -50,7 +50,9 @@ _DEFAULT_WORKSPACE_ROOT = os.path.join(
 CODEX_NATIVE_TERMINAL_ROLE = "codex-native"
 CLAUDE_NATIVE_TERMINAL_ROLE = "claude-native"
 PI_NATIVE_TERMINAL_ROLE = "pi-native"
+OPENCODE_NATIVE_TERMINAL_ROLE = "opencode-native"
 CURSOR_NATIVE_TERMINAL_ROLE = "cursor-native"
+GOOSE_NATIVE_TERMINAL_ROLE = "goose-native"
 # Role marker for the embedded Omnigent REPL terminal auto-created for
 # runner-hosted SDK sessions (``omnigent attach`` in a tmux pane — the
 # SDK mirror of the native terminals above). The attach WebSocket uses
@@ -961,6 +963,9 @@ class SessionResourceRegistry:
             # after the paste), so — like pi/claude — the PTY watcher is its only
             # status source. Without this the web "Working…" badge never clears.
             CURSOR_NATIVE_TERMINAL_ROLE,
+            # goose-native injects then returns (its forwarder only mirrors the
+            # transcript, not status), so the PTY watcher is its status source too.
+            GOOSE_NATIVE_TERMINAL_ROLE,
         }
         if activity_publisher is None and not emit_status and exit_publisher is None:
             return

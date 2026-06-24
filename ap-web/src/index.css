@@ -661,6 +661,27 @@
   font-size: 0.875em;
 }
 
+/* Word-wrap toggle for chat code blocks (see ChatCodeBlockPre in message.tsx).
+ * Streamdown renders the body with `overflow-x-auto` and the <code> with
+ * `white-space: pre`, so long lines scroll horizontally. When `.chat-code-wrap`
+ * is set we soft-wrap instead so everything fits the column width. */
+.chat-code-wrap [data-streamdown="code-block-body"] {
+  overflow-x: hidden;
+}
+.chat-code-wrap [data-streamdown="code-block-body"] pre,
+.chat-code-wrap [data-streamdown="code-block-body"] code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Hang-indent wrapped continuation lines past the line-number gutter so they
+ * align with the code, not under the numbers. Gutter = before:w-6 (1.5rem) +
+ * before:mr-4 (1rem) = 2.5rem; the negative text-indent pulls the first line
+ * (and its ::before number) back to the left edge. */
+.chat-code-wrap [data-streamdown="code-block-body"] code > span {
+  padding-left: 2.5rem;
+  text-indent: -2.5rem;
+}
+
 /* Streamdown's <button> link-safety-modal variant and wrap-anywhere reset can
  * leave the default arrow cursor on links — force pointer to signal affordance. */
 [data-streamdown="link"] {
@@ -679,6 +700,22 @@
 }
 [data-streamdown="heading-4"] {
   font-size: 1em;
+}
+
+/* GitHub task lists in chat messages (Streamdown + remark-gfm). remark-gfm tags
+   each task item `task-list-item` with a disabled <input type="checkbox">, but
+   Streamdown also applies Tailwind `list-disc`, so a disc renders right next to
+   the checkbox (bullet + checkbox). Drop the marker per ITEM (not on the whole
+   `.contains-task-list` list) so a list mixing task and plain items only loses
+   the bullet on the task items — matching GitHub. `list-style-type` is
+   inherited, so setting it on the <li> overrides the list's `list-disc`. Space
+   the checkbox from its label. */
+[data-streamdown="list-item"].task-list-item {
+  list-style: none;
+}
+[data-streamdown="list-item"].task-list-item > input[type="checkbox"] {
+  margin-right: 0.4em;
+  vertical-align: -0.075em;
 }
 
 /* Flash highlight on nav jump. Duration must match FLASH_DURATION_MS in chatStore.ts. */

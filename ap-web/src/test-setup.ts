@@ -10,8 +10,14 @@ vi.mock("@/components/icons/ClaudeIcon", () => ({
 vi.mock("@/components/icons/CodexIcon", () => ({
   CodexIcon: () => null,
 }));
+vi.mock("@/components/icons/OpenCodeIcon", () => ({
+  OpenCodeIcon: () => null,
+}));
 vi.mock("@/components/icons/CursorIcon", () => ({
   CursorIcon: () => null,
+}));
+vi.mock("@/components/icons/GooseIcon", () => ({
+  GooseIcon: () => null,
 }));
 
 // Radix UI primitives (DropdownMenu, etc.) call these pointer-capture and
