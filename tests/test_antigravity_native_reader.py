@@ -783,7 +783,13 @@ async def test_status_running_then_idle_on_transition(
     monkeypatch: pytest.MonkeyPatch,
     patched_discovery: None,
 ) -> None:
-    """USER_INPUT emits RUNNING; a closing assistant-text step emits IDLE; once each."""
+    """USER_INPUT emits RUNNING; a closing assistant-text step emits IDLE; once each.
+
+    The assistant-text planner here is the snapshot's LAST step (a genuine final
+    answer), so it closes the turn — see
+    :func:`test_status_stays_running_through_narration_then_tools` for why a
+    text planner that is NOT last (mid-turn narration) must not close.
+    """
     user = _load("user_input")
     text = _load("planner_response_text")
     script = _StepScript(
@@ -805,6 +811,106 @@ async def test_status_running_then_idle_on_transition(
 
     # RUNNING (user turn) then IDLE (assistant answered, no tool calls), deduped.
     assert sink.statuses() == ["running", "idle"]
+
+
+@pytest.mark.asyncio
+async def test_status_stays_running_through_narration_then_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Mid-turn narration must NOT prematurely close the turn (#5 premature idle).
+
+    agy splits NARRATION and tool dispatch into separate planner steps: a
+    "Let me check the files first…" is a DONE PLANNER_RESPONSE with text and NO
+    ``toolCalls`` — byte-for-byte indistinguishable in shape from a final answer
+    (both ``stopReason STOP_REASON_STOP_PATTERN``). Before the fix the reader
+    treated that narration step as a turn close and dropped the spinner to idle
+    while the tool call, tool output, and the real answer still streamed behind
+    it. The turn must stay RUNNING until the authoritative end — the final
+    answer that is genuinely the last step.
+    """
+    user = _load("user_input")
+    narration = _done_planner("Let me check the files first", step_index=2)
+    tool_call = _load("planner_response_tool_call_run_command")
+    final = _done_planner("Here is the answer.", step_index=6)
+    # The trajectory grows USER_INPUT → narration → tool dispatch → final answer.
+    script = _StepScript(
+        [
+            [user],
+            [user, narration, tool_call, final],
+            [user, narration, tool_call, final],
+        ]
+    )
+    sink = _PostSink()
+
+    await _run(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        steps=script,
+        monkeypatch=monkeypatch,
+        iterations=3,
+    )
+
+    # RUNNING on the user turn, then a SINGLE IDLE only at the genuine final
+    # answer — no premature idle on the mid-turn narration step.
+    assert sink.statuses() == ["running", "idle"]
+
+
+@pytest.mark.asyncio
+async def test_status_waiting_never_idle_while_approval_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A turn blocked on a WAITING approval reads ``waiting``, never ``idle`` (#5).
+
+    The acute sub-case: agy parks the turn behind an ASK_QUESTION/permission
+    card (a WAITING step). A preceding narration planner must NOT close the turn
+    (idle while an approval still blocks it); the session reads ``waiting``
+    instead, then resumes ``running`` once the human answers and the WAITING
+    step is gone.
+    """
+    user = _load("user_input")
+    narration = _done_planner("I'll need to run a command", step_index=2)
+    waiting = _load("ask_question_waiting")
+
+    async def _block(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        await asyncio.Event().wait()  # human is still deciding — never completes
+
+    # Snapshot 1: turn opens, narrates, then blocks on the approval card.
+    # Snapshot 2: the human answered — WAITING gone, agy resumes with a tool call.
+    # Snapshot 3: the final answer settles the turn.
+    tool_call = _load("planner_response_tool_call_run_command")
+    final = _done_planner("Done.", step_index=8)
+    script = _StepScript(
+        [
+            [user, narration, waiting],
+            [user, narration, tool_call, final],
+            [user, narration, tool_call, final],
+        ]
+    )
+    sink = _PostSink()
+
+    await asyncio.wait_for(
+        _run(
+            bridge_dir=_bridge_dir(tmp_path),
+            sink=sink,
+            steps=script,
+            monkeypatch=monkeypatch,
+            iterations=3,
+            on_pending=_block,
+        ),
+        timeout=5.0,
+    )
+
+    statuses = sink.statuses()
+    # The WAITING approval blocked the turn: it read running → waiting (the card),
+    # then running again on resume, then idle at the real end. Never idle while
+    # the approval was pending.
+    assert statuses == ["running", "waiting", "running", "idle"]
+    # The acute invariant: idle never appears before the approval is resolved.
+    assert "idle" not in statuses[: statuses.index("running", 1)]
 
 
 @pytest.mark.asyncio
@@ -2192,17 +2298,45 @@ def test_turn_close_true_for_error_planner() -> None:
         "plannerResponse": {},
     }
     assert reader._is_assistant_text_close_step(error_planner) is False
-    assert reader._is_turn_close_step(error_planner) is True
+    # A terminal ERROR closes regardless of position — agy emits no recovery step
+    # after it, so it closes even when it is NOT the snapshot's last step.
+    assert reader._is_turn_close_step(error_planner, is_last_step=False) is True
+    assert reader._is_turn_close_step(error_planner, is_last_step=True) is True
 
 
-def test_turn_close_true_for_done_planner_no_text_no_tools() -> None:
-    """A DONE planner with neither text nor tool calls is a degenerate close."""
+def test_turn_close_true_for_done_planner_no_text_no_tools_when_last() -> None:
+    """A DONE planner with neither text nor tool calls is a degenerate close.
+
+    Gated on being the snapshot's last step (premature-idle fix): an identical
+    planner with later steps after it is mid-turn, not a close.
+    """
     empty_done = {
         "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
         "status": "CORTEX_STEP_STATUS_DONE",
         "plannerResponse": {},
     }
-    assert reader._is_turn_close_step(empty_done) is True
+    assert reader._is_turn_close_step(empty_done, is_last_step=True) is True
+    # NOT the last step → mid-turn, not a close.
+    assert reader._is_turn_close_step(empty_done, is_last_step=False) is False
+
+
+def test_turn_close_false_for_text_planner_when_not_last() -> None:
+    """A text-only DONE planner that is NOT the snapshot's last step is mid-turn
+    narration ("Let me check the files first…"), not the closing answer — it must
+    NOT close the turn (the premature-idle bug)."""
+    text_planner = {
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": "CORTEX_STEP_STATUS_DONE",
+        "plannerResponse": {
+            "response": "Let me check the files first",
+            "modifiedResponse": "Let me check the files first",
+        },
+    }
+    # Identical in shape to a final answer (the close predicate agrees)…
+    assert reader._is_assistant_text_close_step(text_planner) is True
+    # …but only closes when it is the last step in the snapshot.
+    assert reader._is_turn_close_step(text_planner, is_last_step=True) is True
+    assert reader._is_turn_close_step(text_planner, is_last_step=False) is False
 
 
 def test_turn_close_false_for_done_planner_with_tool_calls() -> None:
@@ -2212,7 +2346,9 @@ def test_turn_close_false_for_done_planner_with_tool_calls() -> None:
         "status": "CORTEX_STEP_STATUS_DONE",
         "plannerResponse": {"toolCalls": [{"id": "call_1"}]},
     }
-    assert reader._is_turn_close_step(done_with_tool) is False
+    # A tool-dispatch planner never closes, last step or not.
+    assert reader._is_turn_close_step(done_with_tool, is_last_step=True) is False
+    assert reader._is_turn_close_step(done_with_tool, is_last_step=False) is False
 
 
 def test_turn_close_false_for_generating_planner() -> None:
@@ -2222,7 +2358,7 @@ def test_turn_close_false_for_generating_planner() -> None:
         "status": "CORTEX_STEP_STATUS_GENERATING",
         "plannerResponse": {"modifiedResponse": "partial"},
     }
-    assert reader._is_turn_close_step(generating) is False
+    assert reader._is_turn_close_step(generating, is_last_step=True) is False
 
 
 def test_turn_close_false_for_tool_result_step() -> None:
@@ -2232,7 +2368,7 @@ def test_turn_close_false_for_tool_result_step() -> None:
         "status": "CORTEX_STEP_STATUS_DONE",
         "metadata": {"toolCall": {"id": "cbawg2v8"}},
     }
-    assert reader._is_turn_close_step(tool_result) is False
+    assert reader._is_turn_close_step(tool_result, is_last_step=True) is False
 
 
 # ---------------------------------------------------------------------------
