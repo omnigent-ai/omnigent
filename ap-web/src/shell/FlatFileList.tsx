@@ -15,8 +15,20 @@ function fileExtension(name: string): string {
   return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
 }
 
+/**
+ * Minimal file shape the comparator needs. Both `WorkspaceChangedFile`
+ * (Changed list) and `WorkspaceFile` (All tree) satisfy it, so the two views
+ * order files identically for a given sort.
+ */
+export interface SortableFile {
+  name: string;
+  path: string;
+  bytes: number | null;
+  modified_at: number | null;
+}
+
 export function compareChangedFiles(sort: ChangedSort) {
-  return (a: WorkspaceChangedFile, b: WorkspaceChangedFile): number => {
+  return (a: SortableFile, b: SortableFile): number => {
     if (sort === "recent") {
       const am = a.modified_at;
       const bm = b.modified_at;

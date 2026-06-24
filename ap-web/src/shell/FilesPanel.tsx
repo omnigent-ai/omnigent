@@ -505,6 +505,7 @@ export function FilesPanel({
                       <span className="size-1.5 rounded-full bg-primary" aria-hidden />
                     )}
                   </button>
+                  <SortSelector sort={changedSort} onChange={onSortChange} />
                 </div>
               </div>
               {showSearchFilters && (
@@ -557,6 +558,7 @@ export function FilesPanel({
                 showHidden={showHidden}
                 onShowHidden={() => onShowHiddenChange(true)}
                 changedFiles={changedQuery.data?.data}
+                sort={changedSort}
                 runnerWentOffline={runnerWentOffline}
                 searchQuery={debouncedTreeSearch}
                 searchResults={treeSearchQuery.data}
