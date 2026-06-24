@@ -623,6 +623,125 @@ class SysSessionGetInfoTool(Tool):
         }
 
 
+class SysSessionShareTool(Tool):
+    """
+    Grant another user (or the public) access to a session.
+
+    Enabled by the spec's top-level ``agent_session_sharing:`` flag
+    (:class:`omnigent.spec.types.SharePolicy`), which is its sole gate:
+    ``none`` leaves the tool unregistered, ``non-public`` allows
+    granting named users, and ``public`` additionally allows the
+    ``__public__`` sentinel (anonymous read of the full transcript).
+    ``allow_public`` carries that last tier into the tool so it can
+    both advertise and refuse public grants when the policy is
+    ``non-public``.
+
+    ``session_id`` is optional — when omitted, the caller's own session
+    is shared, which is the common case ("share this session with X").
+    ``user_id`` is the grantee's email, or (when ``allow_public``) the
+    sentinel ``"__public__"`` for anonymous read-only access. ``level``
+    is ``"read"`` (default), ``"edit"``, or ``"manage"``; the server
+    caps public grants at read.
+
+    Runner-dispatched: the runner proxies ``PUT
+    /v1/sessions/{id}/permissions`` using its authenticated server
+    client, so the grant runs with the session user's own identity and
+    is subject to the server's permission checks (the caller needs
+    manage-level access — which the session owner has). Returns
+    ``access_denied`` when the server refuses and ``session_not_found``
+    for an unknown id.
+
+    :param allow_public: Whether ``__public__`` grants are permitted —
+        ``True`` only when the spec's ``agent_session_sharing:`` flag is
+        ``public``. Reflected in the schema and hard-enforced by the runner.
+    """
+
+    def __init__(self, allow_public: bool) -> None:
+        """
+        :param allow_public: ``True`` when the spec's
+            ``agent_session_sharing:`` policy is ``public`` — permits
+            granting the ``__public__`` sentinel.
+            ``False`` for ``non-public`` (named users only).
+        """
+        self._allow_public = allow_public
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_session_share"``."""
+        return "sys_session_share"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Share a session with another user by granting them access "
+            "(level 'read' default, 'edit', or 'manage'). Omit "
+            "session_id to share the calling session itself, or pass it "
+            "to share another session you manage. Requires manage-level "
+            "access (the session owner has it)."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """
+        Return the OpenAI-format tool schema.
+
+        The ``user_id`` description reflects ``allow_public``: it only
+        advertises the ``__public__`` sentinel when public grants are
+        permitted, so the model isn't told about an option the runner
+        would reject.
+
+        :returns: Dict with ``"type": "function"`` and a ``"function"``
+            sub-dict; ``user_id`` is required, ``level`` and
+            ``session_id`` optional.
+        """
+        if self._allow_public:
+            user_id_desc = (
+                "Grantee's email, e.g. 'alice@example.com', or the "
+                "sentinel '__public__' for anonymous read-only access "
+                "(anyone with the link)."
+            )
+        else:
+            user_id_desc = (
+                "Grantee's email, e.g. 'alice@example.com'. "
+                "Public/anonymous sharing is not enabled for this agent."
+            )
+        return {
+            "type": "function",
+            "function": {
+                "name": SysSessionShareTool.name(),
+                "description": SysSessionShareTool.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "user_id": {
+                            "type": "string",
+                            "description": user_id_desc,
+                        },
+                        "level": {
+                            "type": "string",
+                            "enum": ["read", "edit", "manage"],
+                            "description": (
+                                "Permission level to grant. Defaults to "
+                                "'read'. Public grants are capped at "
+                                "'read' regardless of this value."
+                            ),
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": (
+                                "The session (conversation_id) to share, "
+                                "e.g. 'conv_abc123'. Omit to share the "
+                                "calling session itself."
+                            ),
+                        },
+                    },
+                    "required": ["user_id"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+
 class SysSessionCreateTool(Tool):
     """
     Create a child session from an existing agent or a local bundle.

@@ -15,6 +15,7 @@ from omnigent.spec.types import (
     LLMConfig,
     LocalToolInfo,
     MCPServerConfig,
+    SharePolicy,
     SkillSpec,
     ToolRuntime,
     ToolsConfig,
@@ -53,7 +54,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # Read-only session discovery tools are registered for every
         # agent (a user-added agent that declares no sub-agents still
         # needs to list/peek/get-info on its session-mates); the
-        # spawn-lifecycle writes (sys_session_send/close/create) are
+        # mutating tools (sys_session_send/close/create/share) are
         # opt-in via tools.agents or the top-level ``spawn: true``.
         "sys_session_get_history",
         "sys_session_list",
@@ -300,11 +301,13 @@ def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     ``sys_session_list`` / ``sys_session_get_info``) is registered for
     **every** agent, even one that declares no sub-agents — so a
     user-added agent can read its session-mates for context. The
-    spawn-lifecycle writes (``sys_session_send`` /
-    ``sys_session_close`` / ``sys_session_create``) are NOT registered
-    without an opt-in (``tools.agents`` or top-level ``spawn: true``).
-    A regression that registered the writes by default would expose
-    the child-session spawn surface to every custom agent.
+    mutating session tools (``sys_session_send`` /
+    ``sys_session_close`` / ``sys_session_create`` /
+    ``sys_session_share``) are NOT registered without an opt-in
+    (``tools.agents`` or top-level ``spawn: true``). A regression that
+    registered the writes by default would expose the child-session
+    spawn surface — and, for share, the ability to expose the session
+    to a third party or ``__public__`` — to every custom agent.
     """
     mgr = ToolManager(_make_spec([]))
     names = {s["function"]["name"] for s in mgr.get_tool_schemas()}
@@ -318,6 +321,11 @@ def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     assert "sys_session_send" not in names
     assert "sys_session_close" not in names
     assert "sys_session_create" not in names
+    # Sharing has its OWN dedicated `share:` flag (default `none`), so it
+    # is absent here even though this spec also lacks spawn/agents. A
+    # regression registering it by default would let any prompt-injected
+    # agent expose its session (incl. via __public__).
+    assert "sys_session_share" not in names
     # Model awareness pairs with the dispatch grant — without send there
     # is no args.model to pick, so the listing tool must stay gated too.
     assert "sys_list_models" not in names
@@ -342,6 +350,11 @@ def test_spawn_flag_registers_write_tools_without_sub_agents() -> None:
     assert "sys_session_create" in names
     # The dispatch grant brings model awareness along with it.
     assert "sys_list_models" in names
+    # Sharing is DECOUPLED from spawn — its own `share:` flag governs it,
+    # so `spawn: true` alone (share defaulting to `none`) does NOT
+    # register it. A regression coupling them would re-expose sharing to
+    # every spawn-capable agent.
+    assert "sys_session_share" not in names
 
 
 def test_session_send_schema_drops_named_mode_without_sub_agents() -> None:
@@ -399,6 +412,51 @@ def test_declared_agents_grant_send_close_but_not_create() -> None:
     assert "sys_session_create" not in names
     # Model awareness rides the same grant as send.
     assert "sys_list_models" in names
+    # Declaring sub-agents does NOT enable sharing — that is the separate
+    # `share:` flag's job, decoupled from the spawn/agents grant.
+    assert "sys_session_share" not in names
+
+
+def test_share_non_public_registers_share_tool_without_public() -> None:
+    """
+    ``agent_session_sharing: non-public`` alone (no spawn / declared
+    agents) registers ``sys_session_share`` — proving the flag is
+    independently sufficient AND does not drag in the spawn-lifecycle
+    tools. The advertised ``user_id`` schema must NOT mention
+    ``__public__``, so the model is not offered a grantee the runner
+    would reject. If the gating regressed to the spawn opt-in, share
+    would be absent here.
+    """
+    mgr = ToolManager(AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC))
+    schemas = {s["function"]["name"]: s for s in mgr.get_tool_schemas()}
+    assert "sys_session_share" in schemas
+    # Sharing is decoupled from spawn — none of the spawn writes ride along.
+    assert "sys_session_send" not in schemas
+    assert "sys_session_close" not in schemas
+    assert "sys_session_create" not in schemas
+    # non-public must not advertise the public sentinel.
+    user_id_desc = schemas["sys_session_share"]["function"]["parameters"]["properties"]["user_id"][
+        "description"
+    ]
+    assert "__public__" not in user_id_desc
+
+
+def test_share_public_registers_share_tool_advertising_public() -> None:
+    """
+    ``agent_session_sharing: public`` registers ``sys_session_share``
+    and the advertised ``user_id`` schema DOES mention ``__public__`` —
+    the only tier where anonymous-read grants are permitted. If
+    ``allow_public`` weren't threaded from the flag into the tool, the
+    public option would be hidden (or, worse, advertised under
+    non-public).
+    """
+    mgr = ToolManager(AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.PUBLIC))
+    schemas = {s["function"]["name"]: s for s in mgr.get_tool_schemas()}
+    assert "sys_session_share" in schemas
+    user_id_desc = schemas["sys_session_share"]["function"]["parameters"]["properties"]["user_id"][
+        "description"
+    ]
+    assert "__public__" in user_id_desc
 
 
 def test_both_grants_compose() -> None:
