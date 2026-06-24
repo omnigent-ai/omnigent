@@ -23,6 +23,15 @@ Tracks pending work and known limitations for the Qwen Code harness
   Verified end-to-end against an OpenAI-compatible endpoint. **Caveat:** this is
   authoritative only when qwen has no conflicting ambient `~/.qwen/settings.json`
   — see Pending work for the precedence limitation.
+- **Cost / token tracking.** Per-turn token usage is parsed from qwen's ACP
+  stream and emitted on `TurnComplete.usage` (and fed to the cost observer).
+  qwen rides usage out-of-band on an `agent_message_chunk` whose text is empty
+  and whose `_meta.usage` carries `{inputTokens, outputTokens, totalTokens,
+  thoughtTokens, cachedReadTokens}` (qwen-code `emitUsageMetadata`). The
+  executor sums these across a turn's internal model calls and splits
+  `cachedReadTokens` out of `input_tokens` (qwen's `inputTokens` is cache-
+  inclusive; cost wants the non-cached portion) — see `_accumulate_usage`.
+  Verified end-to-end against a live `qwen --acp` turn.
 - **OS sandbox.** When the spec's `os_env.sandbox` is not `none`, the whole
   `qwen` process tree is wrapped in the platform sandbox (bwrap / seatbelt) at
   spawn (`_sandbox_launch_path`), confining qwen's own file/shell tools to the
@@ -40,13 +49,12 @@ comments; this is the *what*, not the *how*.)
   the session is reused across turns, so switching models mid-session (`/model`)
   has no effect. Supporting it means re-creating the ACP session on a model
   change (or passing a per-turn model if qwen accepts one).
-- [ ] **Cost / token tracking.** `TurnComplete.usage` is never populated for
-  qwen (the executor yields a turn with no token counts), so per-turn token and
-  cost reporting is blank. Parse usage from qwen's ACP stream (if it reports
-  token counts) and emit it on `TurnComplete`.
-- [ ] **Context status.** The executor surfaces no context-window usage and
-  overrides no `max_context_tokens`, so the UI's context meter stays empty.
-  Report the model's context limit and per-turn context consumed.
+- [ ] **Context status.** Per-turn context *consumed* is now available
+  (qwen's `_meta.usage.totalTokens`, surfaced via cost/token tracking — see
+  What works today), but the executor still overrides no `max_context_tokens`,
+  so the UI's context meter has the numerator without the denominator. Report
+  the model's context-window *limit* (a model-capability lookup, not in the ACP
+  stream) so the meter can show used/total.
 - [ ] **Native TUI variant (`native-qwen`).** Attach to the live `qwen` terminal
   (like `pi-native`) for a fully interactive experience instead of a piped turn.
 

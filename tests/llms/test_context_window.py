@@ -17,7 +17,84 @@ from omnigent.llms.context_window import (
     ModelPricing,
     compute_llm_cost,
     fetch_model_pricing,
+    resolve_effective_context_window,
 )
+
+
+def test_resolve_effective_context_window_prefers_declared_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A spec-declared ``executor.context_window`` wins over the catalog lookup.
+
+    Regression for the runner over-compaction bug: an agent that declares a
+    1M window (e.g. Polly) must be budgeted against 1M, not the 128K catalog
+    default. If the resolver fell back to the catalog here, the compaction
+    budget would be ~8x too small and fire constantly.
+    """
+
+    def _boom(_model: str) -> int:
+        raise AssertionError("catalog lookup must not run when a window is declared")
+
+    monkeypatch.setattr(context_window, "get_model_context_window", _boom)
+    assert resolve_effective_context_window(1_000_000, "claude-opus-4-8") == 1_000_000
+    # Declared window applies even when the spec pins no model.
+    assert resolve_effective_context_window(1_000_000, None) == 1_000_000
+
+
+def test_resolve_effective_context_window_falls_back_to_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no declared window, resolve via the model catalog lookup."""
+    monkeypatch.setattr(context_window, "get_model_context_window", lambda model: 200_000)
+    assert resolve_effective_context_window(None, "claude-opus-4-8") == 200_000
+
+
+def test_resolve_effective_context_window_none_when_no_window_and_no_model() -> None:
+    """No declared window and no model → ``None`` (caller skips budgeting)."""
+    assert resolve_effective_context_window(None, None) is None
+
+
+def test_resolve_effective_context_window_override_bypasses_declared_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An active model override sizes against the override model's catalog window,
+    NOT the spec-declared window.
+
+    Matches the server ring: ``executor.context_window`` describes only the
+    spec model, so overriding a 1M-window agent down to a 200K model must
+    budget against 200K — otherwise the runner under-compacts past the real
+    model's limit.
+    """
+    seen: list[str] = []
+
+    def _catalog(model: str) -> int:
+        seen.append(model)
+        return 200_000
+
+    monkeypatch.setattr(context_window, "get_model_context_window", _catalog)
+    result = resolve_effective_context_window(
+        1_000_000, "claude-opus-4-8", model_override="small-200k-model"
+    )
+    assert result == 200_000
+    # The override model — not the spec model — drives the catalog lookup.
+    assert seen == ["small-200k-model"]
+
+
+def test_resolve_effective_context_window_declared_window_wins_without_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``model_override=None`` keeps the declared-window fast path."""
+
+    def _boom(_model: str) -> int:
+        raise AssertionError("catalog lookup must not run when no override is active")
+
+    monkeypatch.setattr(context_window, "get_model_context_window", _boom)
+    assert (
+        resolve_effective_context_window(1_000_000, "claude-opus-4-8", model_override=None)
+        == 1_000_000
+    )
 
 
 def test_compute_llm_cost_prices_cache_tokens_at_their_own_rates() -> None:

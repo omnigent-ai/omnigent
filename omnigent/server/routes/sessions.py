@@ -18813,28 +18813,33 @@ async def _get_session_snapshot(
                     if spec.name:
                         agent_name = spec.name
                     llm_model = spec.executor.model
-                    # Size the context ring against whatever the next turn
-                    # will actually run. spec.executor.context_window only
-                    # applies to spec.model, so it's bypassed when an
-                    # override is active.
-                    effective_model = (
-                        conv.model_override if conv.model_override is not None else llm_model
+                    from omnigent.llms.context_window import (
+                        resolve_effective_context_window,
                     )
-                    spec_cw = spec.executor.context_window
-                    if spec_cw is not None and conv.model_override is None:
-                        context_window = spec_cw
-                    elif effective_model is not None:
-                        from omnigent.llms.context_window import get_model_context_window
 
-                        # Offload to a worker thread: on a cache-cold
-                        # provider catalog this does a blocking HTTP fetch
-                        # (and litellm registry lookups are CPU-bound), so
-                        # running it inline would stall the single-worker
-                        # event loop and serialize every concurrent request
-                        # behind this snapshot.
-                        context_window = await asyncio.to_thread(
-                            get_model_context_window, effective_model
-                        )
+                    # Size the context ring against whatever the next turn will
+                    # actually run, using the SAME resolver the runner uses to
+                    # budget compaction. That makes the UI ring and the runner's
+                    # compaction trigger a single source of truth — computed by
+                    # one function — so they can't drift even though they run in
+                    # different processes at different times. (They previously
+                    # each inlined this rule and silently fell out of step; see
+                    # PR #769 review. Sharing the function removes the manual
+                    # sync.) spec.executor.context_window describes only the spec
+                    # model, so an active override bypasses it — the resolver
+                    # makes that decision from the spec model + override.
+                    #
+                    # Offload to a worker thread: an active override (or an
+                    # undeclared window) can trigger a cache-cold provider
+                    # catalog fetch (blocking HTTP / CPU-bound litellm) inside
+                    # the resolver, which would otherwise stall the single-worker
+                    # event loop and serialize every concurrent snapshot.
+                    context_window = await asyncio.to_thread(
+                        resolve_effective_context_window,
+                        spec.executor.context_window,
+                        llm_model,
+                        model_override=conv.model_override,
+                    )
         except Exception:  # noqa: BLE001 — best-effort; missing agent must not break session fetch
             pass
     # Skills are runner-owned: the bound runner discovers them against its

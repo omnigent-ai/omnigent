@@ -20,6 +20,7 @@ import {
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
+import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   DropdownMenu,
@@ -287,7 +288,7 @@ export function FilesPanel({
   const runnerWentOffline = useChatStore(
     (s) => s.conversationId === conversationId && s.sessionStatus === "failed",
   );
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => readFilesPanelPreferences().collapsed);
   const [changedSearch, setChangedSearch] = useState("");
   const [treeSearch, setTreeSearch] = useState("");
   const [debouncedTreeSearch, setDebouncedTreeSearch] = useState("");
@@ -389,7 +390,13 @@ export function FilesPanel({
             <button
               type="button"
               className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
-              onClick={() => setCollapsed((v) => !v)}
+              onClick={() =>
+                setCollapsed((v) => {
+                  const next = !v;
+                  writeFilesPanelPreferences({ ...readFilesPanelPreferences(), collapsed: next });
+                  return next;
+                })
+              }
               aria-expanded={!collapsed}
             >
               <span className="shrink-0 font-medium text-sm">Working folder</span>
