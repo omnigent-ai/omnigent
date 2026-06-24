@@ -205,6 +205,17 @@ kubectl apply -k deploy/kubernetes/overlays/sandbox-runners
 # then create the omnigent-creds harness Secret (see the overlay README)
 ```
 
+**Credentials & auth** — two separate concerns, don't conflate:
+
+- **Server auth.** Front the server with `header`/`oidc` auth or run single-user;
+  the built-in `accounts` mode refuses the per-session runner dial-back (`403`),
+  a framework-level limit shared by all sandbox providers — see [Auth](../README.md#auth).
+- **Model keys** (`ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / `OPENAI_API_KEY`
+  / `GIT_TOKEN` / …) ride the `omnigent-creds` Secret projected into every runner Pod.
+
+Both are detailed in
+[`overlays/sandbox-runners/README.md`](overlays/sandbox-runners/README.md#server-auth-managed-hosts).
+
 ## Verify the deployment
 
 Check the rollout and reach the server without a public domain:
