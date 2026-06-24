@@ -50,6 +50,34 @@ def test_stable_user_id_is_stable_and_path_safe() -> None:
     assert uid and not set(uid) & set("/\\: ")
 
 
+@pytest.mark.windows_only
+def test_resolve_repo_symlink_dereferences_git_stub(tmp_path: Path) -> None:
+    # Real target the Git symlink points at.
+    target = tmp_path / "examples" / "polly"
+    target.mkdir(parents=True)
+    (target / "config.yaml").write_text("name: polly\n", encoding="utf-8")
+    # Stub file Git leaves on a no-symlink Windows checkout: content is the
+    # relative link target, no trailing newline.
+    stub = tmp_path / "resources" / "polly"
+    stub.parent.mkdir(parents=True)
+    stub.write_text("../examples/polly", encoding="utf-8")
+
+    resolved = _platform.resolve_repo_symlink(stub)
+    assert resolved == target.resolve()
+
+
+@pytest.mark.windows_only
+def test_resolve_repo_symlink_leaves_real_specs_untouched(tmp_path: Path) -> None:
+    # A genuine single-file YAML spec must not be mistaken for a symlink stub.
+    spec = tmp_path / "agent.yaml"
+    spec.write_text("name: hello\nharness: claude-sdk\n", encoding="utf-8")
+    assert _platform.resolve_repo_symlink(spec) == spec
+    # A real directory is returned unchanged.
+    d = tmp_path / "bundle"
+    d.mkdir()
+    assert _platform.resolve_repo_symlink(d) == d
+
+
 # --------------------------------------------------------------------------
 # _proc
 # --------------------------------------------------------------------------

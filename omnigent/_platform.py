@@ -18,6 +18,7 @@ import getpass
 import hashlib
 import os
 import sys
+from pathlib import Path
 
 #: True on native Windows (cmd/PowerShell), i.e. ``os.name == "nt"``. This is
 #: *not* true under WSL, where Python reports a Linux platform.
@@ -74,3 +75,42 @@ def stable_user_id() -> str:
     except (OSError, KeyError, ModuleNotFoundError):
         name = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
     return hashlib.sha1(name.encode("utf-8")).hexdigest()[:12]
+
+
+def resolve_repo_symlink(path: Path) -> Path:
+    """
+    Follow a Git symlink that a no-symlink Windows checkout left as a text file.
+
+    On Windows with ``core.symlinks=false`` (the default when Developer Mode is
+    off and Git was not run elevated), Git materializes a repository symlink as a
+    *regular file* whose entire content is the link target — e.g. the checked-out
+    ``omnigent/resources/examples/polly`` is a 23-byte file containing
+    ``../../../examples/polly`` rather than a link to that directory. Code that
+    expects to open the linked directory then reads this stub instead (the
+    symptom: ``expected YAML mapping at top level, got str``).
+
+    Detect that exact shape — a small, single-line regular file whose content,
+    resolved relative to the stub's parent, names an existing path — and return
+    the real target. Everything else (real directories, real symlinks, genuine
+    single-file specs, multi-line or unresolvable content) is returned
+    unchanged. No-op off Windows, where the symlink is followed natively.
+
+    :param path: The path as resolved from packaged resources.
+    :returns: The dereferenced target on Windows when *path* is a Git-symlink
+        stub, otherwise *path* unchanged.
+    """
+    if not IS_WINDOWS:
+        return path
+    try:
+        if not path.is_file() or path.stat().st_size > 4096:
+            return path
+        body = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return path
+    target = body.strip()
+    if not target or "\n" in target:
+        return path
+    candidate = path.parent / target
+    if candidate.exists():
+        return candidate.resolve()
+    return path

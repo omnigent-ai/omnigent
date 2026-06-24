@@ -19,6 +19,7 @@ from starlette.responses import Response
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from omnigent._platform import resolve_repo_symlink
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native_coding_agents import (
     CLAUDE_NATIVE_CODING_AGENT,
@@ -115,8 +116,10 @@ _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 # omnigent.resources.examples (see pyproject package-data), so they resolve
 # in both a repo checkout and an installed wheel. The presence check in each
 # seeder is a safety net.
-_DEBBY_BUNDLE_SOURCE = Path(_examples_resources.__file__).parent / "debby"
-_POLLY_BUNDLE_SOURCE = Path(_examples_resources.__file__).parent / "polly"
+# resolve_repo_symlink dereferences the packaged symlink on a no-symlink
+# Windows checkout (where Git leaves it as a stub text file); a no-op elsewhere.
+_DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
+_POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
 
 
 class _FastAPICallNext(Protocol):

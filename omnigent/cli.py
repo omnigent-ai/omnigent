@@ -29,7 +29,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
-from omnigent._platform import IS_WINDOWS
+from omnigent._platform import IS_WINDOWS, resolve_repo_symlink
 from omnigent._startup_profile import StartupProfiler
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
@@ -455,7 +455,10 @@ def _bundled_example_path(name: str) -> str:
     """
     import importlib.resources
 
-    return str(importlib.resources.files("omnigent.resources.examples").joinpath(name))
+    resource = importlib.resources.files("omnigent.resources.examples").joinpath(name)
+    # On a no-symlink Windows checkout the packaged symlink is a stub text file;
+    # dereference it to the real examples/<name> directory.
+    return str(resolve_repo_symlink(Path(str(resource))))
 
 
 def _pick_first_run_harness() -> _FirstRunPlan | None:
