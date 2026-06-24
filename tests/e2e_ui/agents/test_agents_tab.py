@@ -25,6 +25,27 @@ _SUBAGENT_MAIN_ROW = '[data-testid="subagent-main-row"]'
 _SUBAGENT_ROW = '[data-testid="subagent-row"]'
 
 
+def _create_child_session(
+    page: Page,
+    base_url: str,
+    agent_id: str,
+    parent_id: str,
+    sub_agent_name: str,
+) -> str:
+    """Create a child session without spending an LLM turn."""
+    child = page.request.post(
+        f"{base_url}/v1/sessions",
+        data={
+            "agent_id": agent_id,
+            "parent_session_id": parent_id,
+            "sub_agent_name": sub_agent_name,
+        },
+        timeout=30_000,
+    )
+    assert child.ok, f"child session create failed: {child.status} {child.status_text}"
+    return str(child.json()["id"])
+
+
 def test_agents_tab_lists_lone_agent(
     page: Page,
     seeded_session: tuple[str, str],
@@ -52,3 +73,46 @@ def test_agents_tab_lists_lone_agent(
     # and a lone agent has no sub-agent rows beneath it.
     expect(rail.locator(_SUBAGENT_MAIN_ROW)).to_be_visible(timeout=30_000)
     expect(rail.locator(_SUBAGENT_ROW)).to_have_count(0)
+
+
+def test_agents_badge_counts_nested_agents(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The closed Agents-tab badge counts nested coordinator children up to 7."""
+    base_url, root_id = seeded_session
+    parent = page.request.get(f"{base_url}/v1/sessions/{root_id}", timeout=10_000)
+    assert parent.ok, f"root session read failed: {parent.status} {parent.status_text}"
+    agent_id = str(parent.json()["agent_id"])
+    created_ids: list[str] = []
+
+    try:
+        coordinator_ids = [
+            _create_child_session(page, base_url, agent_id, root_id, "coordinator_alpha"),
+            _create_child_session(page, base_url, agent_id, root_id, "coordinator_beta"),
+        ]
+        created_ids.extend(coordinator_ids)
+        worker_ids = [
+            _create_child_session(
+                page, base_url, agent_id, coordinator_ids[0], "platform_preflight"
+            ),
+            _create_child_session(
+                page, base_url, agent_id, coordinator_ids[0], "platform_preflight_retry"
+            ),
+            _create_child_session(page, base_url, agent_id, coordinator_ids[1], "story_worker"),
+            _create_child_session(
+                page, base_url, agent_id, coordinator_ids[1], "story_worker_retry"
+            ),
+        ]
+        created_ids.extend(worker_ids)
+
+        page.goto(f"{base_url}/c/{root_id}")
+        open_right_rail(page)
+        rail = page.get_by_role("complementary", name="Workspace")
+        agents_tab = rail.get_by_role("tab", name=re.compile("^Agents"))
+
+        # Main + two coordinators + four workers nested under the coordinators.
+        expect(agents_tab).to_contain_text("7", timeout=30_000)
+    finally:
+        for child_id in reversed(created_ids):
+            page.request.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10_000)
