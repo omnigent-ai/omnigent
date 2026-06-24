@@ -141,5 +141,5 @@ def _build_cursor_executor() -> Executor:
 
 def create_app() -> FastAPI:
     """Build the cursor harness's FastAPI app (required entry point)."""
-    adapter = ExecutorAdapter(executor_factory=_build_cursor_executor)
+    adapter = ExecutorAdapter(executor_factory=_build_cursor_executor, harness_label="Cursor")
     return adapter.build()

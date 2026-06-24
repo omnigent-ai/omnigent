@@ -483,6 +483,18 @@ describe("inventoryTerminals", () => {
     session: "main",
     running: true,
   };
+  const goosePane: TerminalInfo = {
+    id: "terminal_goose_main",
+    name: "goose",
+    session: "main",
+    running: true,
+  };
+  const qwenPane: TerminalInfo = {
+    id: "terminal_qwen_main",
+    name: "qwen",
+    session: "main",
+    running: true,
+  };
   const bash: TerminalInfo = {
     id: "terminal_bash_s1",
     name: "bash",
@@ -502,6 +514,24 @@ describe("inventoryTerminals", () => {
     // same failure mode as the pi pane above — leaked into Shells and hid
     // the Chat/Terminal pill in Terminal view.
     expect(inventoryTerminals([cursorPane, bash], true)).toEqual([bash]);
+  });
+
+  it("drops the goose vendor pane for native Goose sessions", () => {
+    // Regression: terminal_goose_main was missing from AGENT_TERMINAL_IDS, so
+    // the goose TUI pane leaked into the Shells inventory and (via isShellView)
+    // opened as a plain shell while hiding the Chat/Terminal pill — same failure
+    // mode as the pi/cursor panes above.
+    expect(inventoryTerminals([goosePane, bash], true)).toEqual([bash]);
+    expect(isAgentTerminalKey("terminal:terminal_goose_main")).toBe(true);
+  });
+
+  it("drops the qwen vendor pane for native Qwen sessions", () => {
+    // Regression: terminal_qwen_main was missing from AGENT_TERMINAL_IDS, so
+    // clicking Terminal opened the qwen TUI pane as a plain shell (shell-header
+    // chrome) while hiding the Chat/Terminal pill via isShellView — same failure
+    // mode as the pi/cursor/goose panes above.
+    expect(inventoryTerminals([qwenPane, bash], true)).toEqual([bash]);
+    expect(isAgentTerminalKey("terminal:terminal_qwen_main")).toBe(true);
   });
 
   it("drops the embedded REPL terminal for terminal-first SDK sessions", () => {
@@ -538,11 +568,15 @@ describe("isAgentTerminalKey", () => {
     expect(isAgentTerminalKey("terminal:terminal_tui_main")).toBe(true);
     expect(isAgentTerminalKey("terminal:terminal_claude_main")).toBe(true);
     expect(isAgentTerminalKey("terminal:terminal_codex_main")).toBe(true);
+    expect(isAgentTerminalKey("terminal:terminal_opencode_main")).toBe(true);
     // pi-native: missing here is what hid the Chat/Terminal pill in
     // Terminal view (isShellView wrongly true) for Pi sessions.
     expect(isAgentTerminalKey("terminal:terminal_pi_main")).toBe(true);
     // cursor-native: same regression class as pi above.
     expect(isAgentTerminalKey("terminal:terminal_cursor_main")).toBe(true);
+    // goose-/qwen-native: same regression class as pi/cursor above.
+    expect(isAgentTerminalKey("terminal:terminal_goose_main")).toBe(true);
+    expect(isAgentTerminalKey("terminal:terminal_qwen_main")).toBe(true);
   });
 
   it("treats a user shell as not-the-agent-terminal", () => {

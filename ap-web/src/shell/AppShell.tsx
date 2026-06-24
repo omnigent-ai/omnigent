@@ -8,7 +8,7 @@ import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
-import { isMacElectronShell } from "@/lib/nativeBridge";
+import { isIOSShell, isMacElectronShell, onNativeSidebarDrag } from "@/lib/nativeBridge";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
   Dialog,
@@ -49,7 +49,7 @@ import { FileViewerContext } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
-import { Sidebar } from "./Sidebar";
+import { isMobileViewport, Sidebar } from "./Sidebar";
 import { TitleBarServerPicker } from "./TitleBarServerPicker";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
@@ -61,6 +61,7 @@ import { TerminalsPanel } from "./TerminalsPanel";
 import { TodoPanel } from "./TodoPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
+import { Toaster } from "@/components/ui/toast";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { WorkspacePanel } from "./WorkspacePanel";
@@ -126,6 +127,27 @@ export function AppShell() {
     useResizableInlinePanel(conversationId ?? null, inlinePanelMinWidth);
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
+  // Live open fraction (0→1) while the iOS edge-swipe drags the sidebar; null
+  // when not dragging. Drives the mobile overlay's finger-tracking transform.
+  const [sidebarDragProgress, setSidebarDragProgress] = useState<number | null>(null);
+  // The iOS shell repurposes the left-edge swipe (normally back-navigation) to
+  // drive the sidebar as an interactive drawer, streaming it over the native
+  // bridge. begin/move track the finger (mobile overlay only — the desktop
+  // width-based sidebar can't be partially slid, so it just settles); open/close
+  // are the settle decision on release. No-op outside the iOS shell.
+  useEffect(
+    () =>
+      onNativeSidebarDrag((phase, progress) => {
+        if (phase === "open" || phase === "close") {
+          setSidebarDragProgress(null);
+          setSidebarOpen(phase === "open");
+          return;
+        }
+        if (!isMobileViewport()) return;
+        setSidebarDragProgress(progress);
+      }),
+    [],
+  );
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedFilePath ?? null) : null,
   );
@@ -602,7 +624,7 @@ export function AppShell() {
   const handleFilesFlatViewChange = useCallback((v: boolean) => {
     filesPanelScopePrefRef.current = v;
     setFilesPanelFlatView(v);
-    writeFilesPanelPreferences({ changedOnly: v });
+    writeFilesPanelPreferences({ ...readFilesPanelPreferences(), changedOnly: v });
   }, []);
 
   const openFileViewer = useCallback(
@@ -946,6 +968,7 @@ export function AppShell() {
           <div
             className="app-shell relative flex h-dvh bg-sidebar text-foreground"
             data-electron-mac={isMacElectronShell() ? "true" : undefined}
+            data-ios-native={isIOSShell() ? "true" : undefined}
           >
             {/* Frameless-window titlebar stand-in (macOS Electron only): the
           sidebar's electron top margin (see index.css) frees this strip of
@@ -958,7 +981,11 @@ export function AppShell() {
             {isMacElectronShell() && (
               <TitleBarServerPicker threadTitle={activeSession?.title ?? activeConv?.title} />
             )}
-            <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+            <Sidebar
+              open={sidebarOpen}
+              dragProgress={sidebarDragProgress}
+              onClose={() => setSidebarOpen(false)}
+            />
 
             {/* Content region (everything right of the sidebar): a relative
           flex row holding the chat+workspace group and the push panels
@@ -1225,6 +1252,9 @@ export function AppShell() {
           {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
               ⌘/Ctrl+/ opener); ungated so it works on every route. */}
           <KeyboardShortcutsDialog />
+          {/* Transient toasts (e.g. "session archived"). Mounted once here so
+              any surface can fire one via showToast(). */}
+          <Toaster />
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>
     </FileViewerContext.Provider>

@@ -1,13 +1,14 @@
 name: UI Snapshot Update
 
-# Label-driven baseline update for the empty "/" landing snapshot
-# (tests/e2e_ui/visual/test_landing_snapshot.py).
+# Label-driven baseline update for the visual-snapshot suite
+# (tests/e2e_ui/visual/test_*_snapshot.py).
 #
-# Add the `update-ui-snapshot` label to a PR and this regenerates the baseline
-# with --update-snapshots in the SAME digest-pinned Playwright image the compare
-# gate (ui-snapshot.yml) renders in, then commits the new PNG back to the PR
-# branch. Replaces the admin-only workflow_dispatch + manual download-and-commit
-# dance.
+# Add the `update-ui-snapshot` label to a PR and this regenerates only the
+# baselines that DON'T match (or are missing) in the SAME digest-pinned Playwright
+# image the compare gate (ui-snapshot.yml) renders in, then commits the changed
+# PNGs back to the PR branch. Baselines that already pass are left byte-for-byte
+# untouched, so labeling to fix one page never churns the others. Replaces the
+# admin-only workflow_dispatch + manual download-and-commit dance.
 #
 # Two-job split (token isolation): the `render` job runs PR-controlled code (the
 # npm build + the test) in the container with NO push token anywhere on the
@@ -43,7 +44,7 @@ jobs:
   # 1) Render in the pinned image with NO token on the runner. PR-controlled
   #    code runs only here; its sole output is the PNG artifact.
   render:
-    name: Regenerate landing baseline (no token)
+    name: Regenerate visual baselines (no token)
     permissions:
       contents: read
     # Same-repo only: a fork's read-only token can't push to the fork branch.
@@ -109,21 +110,31 @@ jobs:
           npm ci --legacy-peer-deps --no-audit --no-fund
           npm run build
 
-      - name: Regenerate the landing baseline
-        # --update-snapshots rewrites the committed PNG; the run "fails" by
-        # design under the plugin, so don't gate on its exit code.
+      - name: Compare the baselines (no --update-snapshots)
+        # Deliberately NOT --update-snapshots: that rewrites EVERY PNG, churning
+        # baselines that already pass (a sub-threshold re-render still changes the
+        # bytes). In plain compare mode the plugin leaves passing baselines
+        # untouched and rewrites only the drift: under GitHub Actions it updates a
+        # mismatching baseline IN PLACE (and creates a MISSING one) under
+        # snapshots/, so the tree below already holds exactly the changed PNGs.
+        # The run "fails" by design on any drift, so don't gate on its exit code.
         run: |
           uv run pytest tests/e2e_ui/visual -m visual \
             -v --tb=long --log-level=INFO -r a \
             -p no:rerunfailures \
-            --ui-skip-build \
-            --update-snapshots || true
+            --ui-skip-build || true
 
-      - name: Upload regenerated baseline
+      # Tar the snapshots tree (paths intact) so the commit job can restore it
+      # wholesale. Only genuinely-changed/created PNGs differ from the committed
+      # tree, so git add in the commit job stages exactly those.
+      - name: Package baselines
+        run: tar -czf "$RUNNER_TEMP/ui-snapshots.tgz" tests/e2e_ui/visual/snapshots
+
+      - name: Upload regenerated baselines
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ui-snapshot-update-${{ github.run_id }}
-          path: tests/e2e_ui/visual/snapshots/**
+          path: ${{ runner.temp }}/ui-snapshots.tgz
           if-no-files-found: error
           retention-days: 1
 
@@ -131,7 +142,7 @@ jobs:
   #    branch, drops in the rendered PNG, and pushes -- so it is safe to hold the
   #    App token here. `git`/`gh` are preinstalled on ubuntu-latest.
   commit:
-    name: Commit + push landing baseline
+    name: Commit + push visual baselines
     needs: render
     # Run even if render failed, so we can still report on the PR + drop the
     # label; individual steps gate on the render outcome. (Skipped render =>
@@ -142,8 +153,6 @@ jobs:
       pull-requests: write # comment the result + drop the trigger label
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      BASELINE: tests/e2e_ui/visual/snapshots/test_landing_snapshot/test_empty_landing_matches_baseline/test_empty_landing_matches_baseline[chromium][linux].png
     steps:
       - name: Checkout PR branch
         if: needs.render.result == 'success'
@@ -154,24 +163,27 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
           persist-credentials: false
 
-      - name: Download regenerated baseline
+      - name: Download regenerated baselines
         if: needs.render.result == 'success'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: ui-snapshot-update-${{ github.run_id }}
           path: _ui_snapshot_artifact
 
-      - name: Place the regenerated PNG over the baseline
+      - name: Restore the regenerated baselines
         if: needs.render.result == 'success'
         run: |
-          src=$(find _ui_snapshot_artifact -type f \
-            -name 'test_empty_landing_matches_baseline*.png' | head -n1)
-          if [ -z "$src" ]; then
-            echo "error: no regenerated PNG in the render artifact." >&2
+          tgz=$(find _ui_snapshot_artifact -type f -name 'ui-snapshots.tgz' | head -n1)
+          if [ -z "$tgz" ]; then
+            echo "error: no baseline archive in the render artifact." >&2
             exit 1
           fi
-          mkdir -p "$(dirname "$BASELINE")"
-          cp "$src" "$BASELINE"
+          # The archive holds the full tests/e2e_ui/visual/snapshots tree, so
+          # extracting it over the checkout replaces EVERY baseline at its
+          # committed path (a removed baseline drops out too). git add below
+          # then stages whatever actually changed.
+          rm -rf tests/e2e_ui/visual/snapshots
+          tar -xzf "$tgz"
           rm -rf _ui_snapshot_artifact
 
       # Mint the App token in this no-PR-code job. Skipped when the App isn't
@@ -203,7 +215,7 @@ jobs:
             echo "Baseline already matches this PR's render — nothing to commit."
             exit 0
           fi
-          git commit -m "test(e2e-ui): regenerate landing visual baseline"
+          git commit -m "test(e2e-ui): regenerate visual baselines"
           git push "https://x-access-token:${PUSH_TOKEN}@github.com/${REPO}.git" "HEAD:$HEAD_REF"
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
@@ -220,7 +232,7 @@ jobs:
           APP_USED: ${{ steps.app-token.conclusion == 'success' }}
         run: |
           if [ "$CHANGED" = "true" ]; then
-            base="✅ Regenerated the landing visual baseline in the pinned Playwright image and pushed it to this PR."
+            base="✅ Regenerated the visual baseline(s) in the pinned Playwright image and pushed to this PR."
             if [ "$APP_USED" = "true" ]; then
               body="$base CI will re-run on the new commit."
             else

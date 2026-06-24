@@ -65,6 +65,7 @@ describe("Composer status line (branch + context ring)", () => {
       selectedEffort: null,
       codexModelOptions: [],
       codexPlanMode: false,
+      nativeVendorOwnsModel: false,
     });
   });
 
@@ -142,6 +143,20 @@ describe("Composer status line (branch + context ring)", () => {
       "databricks-gpt-5-5 Medium",
     );
     expect(screen.queryByLabelText(/context used/)).toBeNull();
+  });
+
+  it("hides the model/effort label for vendor-owned native sessions (e.g. Qwen)", () => {
+    // qwen/goose/cursor/pi/opencode pick their model inside the vendor TUI, so
+    // Omnigent's bound llmModel is just an unused default — showing it (e.g.
+    // "claude-sonnet-4-6") on a Qwen session is misleading, so it's hidden.
+    useChatStore.setState({
+      llmModel: "claude-sonnet-4-6",
+      selectedEffort: "medium",
+      nativeVendorOwnsModel: true,
+    });
+    renderComposer();
+
+    expect(screen.queryByTestId("composer-model-effort")).toBeNull();
   });
 
   it("draws the ring arc as what's used, not what's left", () => {

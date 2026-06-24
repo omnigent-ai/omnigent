@@ -221,6 +221,33 @@ def _pi_native_agents_body() -> str:
     )
 
 
+def _opencode_native_agents_body() -> str:
+    """Stub body for ``GET /v1/agents``: the native OpenCode agent.
+
+    ``name: "opencode-native-ui"`` + ``harness: "opencode-native"`` is what the
+    frontend maps (via ``nativeCodingAgents``) to the display label
+    **"OpenCode"** and the opencode-native wrapper labels. As with the Pi stub,
+    the wire ``display_name`` is deliberately the raw ``"opencode-native-ui"``
+    to prove the picker derives "OpenCode" itself (the harness→display mapping
+    wins) rather than echoing the server's raw value. Sole agent, so it
+    auto-selects and no explicit pick is needed.
+    """
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_opencode_e2e",
+                    "name": "opencode-native-ui",
+                    "display_name": "opencode-native-ui",
+                    "description": "OpenCode coding agent",
+                    "harness": "opencode-native",
+                    "skills": [],
+                }
+            ]
+        }
+    )
+
+
 def _hosts_body() -> str:
     """Stub body for ``GET /v1/hosts``: one online host the composer picks."""
     return json.dumps(
@@ -607,6 +634,98 @@ async def _drive_pi_native_start(base_url: str, session_id: str) -> None:
             assert body.get("labels") == {
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "pi-native-ui",
+            }, body
+        finally:
+            await browser.close()
+
+
+def test_start_session_opencode_native_picker_and_wrapper_labels(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Native OpenCode: the picker shows "OpenCode" and create carries labels.
+
+    Covers the user-facing OpenCode native-agent flow this PR adds (mirrors
+    the Codex / Pi native rows):
+
+    1. **Picker label/icon** — the agent chip renders the harness-derived
+       display label **"OpenCode"** (via ``nativeCodingAgents``), NOT the raw
+       agent name ``"opencode-native-ui"`` the server sends.
+    2. **Session-creation wrapper labels** — selecting OpenCode and sending
+       must POST ``/v1/sessions`` with the terminal-first wrapper labels
+       (``omnigent.ui: terminal`` + ``omnigent.wrapper: opencode-native-ui``)
+       that make the runner launch the OpenCode TUI and the web UI render the
+       Chat/Terminal view.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_opencode_native_start(base_url, session_id))
+
+
+async def _drive_opencode_native_start(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_opencode_native_agents_body(),
+            )
+
+            # Neutralize agent discovery so the picker shows ONLY the stubbed
+            # built-in OpenCode. The landing picker merges `/v1/agents` with
+            # agents found by scanning the caller's sessions
+            # (`/v1/sessions?kind=any`); on the shared e2e_ui server, sessions
+            # other tests left behind (e.g. a claude-native fork) would
+            # otherwise leak in and — ranking ahead of OpenCode — auto-select,
+            # so the chip would read the wrong label. Registered after
+            # _register_common_routes so it wins for the kind=any scan; the
+            # bare POST /v1/sessions create still falls through to the
+            # capturing handler.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            # Seed a recent working directory so the working-directory chip
+            # auto-fills and Send can enable without touching the file browser.
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # OpenCode auto-selects (sole agent). The chip shows the derived
+            # label "OpenCode" — and crucially NOT "...native...": the raw
+            # agent name "opencode-native-ui" must never surface.
+            agent_chip = page.get_by_test_id("new-chat-landing-agent-select")
+            await expect(agent_chip).to_contain_text("OpenCode")
+            await expect(agent_chip).not_to_contain_text("native")
+
+            await page.get_by_test_id("new-chat-landing-input").fill("explore the repo")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_opencode_e2e", body
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/work/repo", body
+            # The terminal-first wrapper labels are the contract that drives the
+            # runner-owned OpenCode TUI and the web UI's Chat/Terminal view.
+            assert body.get("labels") == {
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "opencode-native-ui",
             }, body
         finally:
             await browser.close()
@@ -1018,8 +1137,9 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_forkfork")).to_have_count(
                 0
             )
-            # Exactly two options total: the built-in + the one custom agent —
-            # no duplicate "Claude Code" sneaks in via a leaked clone.
-            await expect(page.get_by_role("menuitem")).to_have_count(2)
+            # Three options total: the built-in + the one custom agent +
+            # the "Create custom agent" action — no duplicate "Claude Code"
+            # sneaks in via a leaked clone.
+            await expect(page.get_by_role("menuitem")).to_have_count(3)
         finally:
             await browser.close()

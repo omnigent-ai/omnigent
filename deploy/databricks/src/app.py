@@ -1,190 +1,228 @@
-"""Databricks Apps entrypoint for the Omnigent server.
+"""Databricks Apps entry point for omnigent.
 
-A thin shim over the generic Docker entrypoint
-(``deploy/docker/entrypoint.py``): it bridges the Databricks-Apps runtime
-contract onto the environment-variable contract that entrypoint already
-speaks, then reuses its ``_resolve_config`` / ``build_app`` to wire and serve
-the exact same FastAPI app every other platform runs. Nothing here forks the
-server's boot logic — only the *inputs* to it.
-
-Two Databricks-specific bridges happen in :func:`configure_databricks_env`:
-
-* **Port.** Databricks Apps tell the app which port to bind via
-  ``DATABRICKS_APP_PORT`` (defaults to 8000). We surface it as ``PORT`` — the
-  variable the generic entrypoint reads.
-
-* **Lakebase database URL.** Binding a Lakebase (managed Postgres) resource
-  injects ``PGHOST`` / ``PGUSER`` / ``PGDATABASE`` / ``PGPORT`` (and a
-  short-lived ``PGPASSWORD`` OAuth token). We compose a ``DATABASE_URL`` from
-  those parts **without** the password and rely on the token-aware engine in
-  :mod:`omnigent.db.utils` to mint a fresh OAuth token per connection — keyed
-  on ``OMNIGENT_LAKEBASE_INSTANCE`` (set in ``app.yaml``). Baking the injected
-  ``PGPASSWORD`` into the URL would break the server after the token's ~1h
-  expiry; minting per connection keeps a long-lived server connected across
-  rotations.
-
-Migrations run through the token-aware :func:`get_or_create_engine` rather
-than the generic entrypoint's raw ``sqlalchemy.create_engine`` migration
-engine, so the Alembic upgrade also authenticates with a freshly minted token.
-
-Single replica by design: the runner registry lives in server process memory,
-so all traffic must land on one instance. Databricks Apps run a single
-container per app — do not add any scale-out. See README.md.
-
-Importing this module has no side effects; all work lives in ``main()``.
+Starts omnigent with Lakebase (managed PostgreSQL) as the
+database and UC Volumes as the artifact store.
 """
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
 import logging
 import os
 import sys
+import threading
+import time
 import traceback
-from collections.abc import MutableMapping
-from pathlib import Path
-from types import ModuleType
-from typing import TYPE_CHECKING
-from urllib.parse import quote
-
-if TYPE_CHECKING:
-    from omnigent.stores.artifact_store import ArtifactStore  # noqa: F401
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
-logger = logging.getLogger("omnigent-databricks")
+logger = logging.getLogger("omnigent-app")
 
-# Databricks Apps inject the bind port here (defaults to 8000); the app MUST
-# listen on it. Mirrors the generic entrypoint's PORT default.
-_APP_PORT_ENV = "DATABRICKS_APP_PORT"
-# Lakebase resource binding injects these standard libpq variables.
-_PG_HOST_ENV = "PGHOST"
-_PG_USER_ENV = "PGUSER"
-_PG_DATABASE_ENV = "PGDATABASE"
-_PG_PORT_ENV = "PGPORT"
-# Names the Lakebase instance whose OAuth token omnigent.db.utils mints per
-# connection. Its presence also flips the engine into token-refresh mode.
-_LAKEBASE_INSTANCE_ENV = "OMNIGENT_LAKEBASE_INSTANCE"
+# ── Lakebase token cache ──────────────────────────────────
+#
+# Lakebase tokens are valid for ~60 minutes. The previous design
+# minted a fresh token on every new physical Postgres connection
+# inside SQLAlchemy's ``do_connect`` event hook — a synchronous
+# Databricks SDK HTTPS round-trip costing 100–300 ms per call.
+# Under the 200-runner load test that meant ~20 mints/minute as
+# the pool churned overflow connections, with each mint blocking
+# whatever thread (sometimes the asyncio event-loop thread) was
+# establishing the connection.
+#
+# This cache mints once per endpoint and reuses the token across
+# all subsequent ``do_connect`` calls until the TTL expires. 50
+# minutes leaves a 10-minute safety margin before Lakebase rejects
+# the token. Concurrent first-time mints are NOT serialized — we
+# release the lock around the SDK call so a thundering herd of
+# initial connections all mints once each (worst case) rather than
+# waiting on a single in-flight mint. The cache is then populated
+# atomically with whichever mint finishes first; the late losers
+# just overwrite with their own (equally-valid) token.
+_TOKEN_TTL_SECONDS = 50 * 60
+_token_cache: dict[str, tuple[str, float]] = {}
+_token_cache_lock = threading.Lock()
 
+try:
+    import sqlalchemy
+    from databricks.sdk import WorkspaceClient
 
-def configure_databricks_env(env: MutableMapping[str, str]) -> None:
-    """Translate the Databricks-Apps runtime contract into Omnigent's env vars.
+    # ── Configuration ──────────────────────────────────────────
 
-    Idempotent and non-destructive: anything the operator set explicitly
-    (``PORT``, ``DATABASE_URL``, ``OMNIGENT_AUTH_PROVIDER``) is left untouched,
-    so this is safe to run unconditionally at boot.
+    # Required env vars — injected by Databricks Apps runtime from
+    # the resources declared in databricks.yml / app.yaml.
+    LAKEBASE_ENDPOINT = os.environ["AP_LAKEBASE_ENDPOINT"]
+    VOLUME_PATH = os.environ["AP_ARTIFACT_VOLUME_PATH"]
+    PGHOST = os.environ["PGHOST"]
+    PGDATABASE = os.environ["PGDATABASE"]
+    PGUSER = os.environ["PGUSER"]
 
-    :param env: The mutable process environment (``os.environ``), modified
-        in place.
-    :raises RuntimeError: If a passwordless Lakebase ``DATABASE_URL`` is
-        composed but ``OMNIGENT_LAKEBASE_INSTANCE`` is unset — that would leave
-        the server with no way to authenticate to Postgres.
-    """
-    # ── Port ──────────────────────────────────────────────────
-    app_port = env.get(_APP_PORT_ENV)
-    if app_port and not env.get("PORT"):
-        env["PORT"] = app_port
+    # Optional with documented defaults.
+    # Databricks Apps expects the app to listen on DATABRICKS_APP_PORT
+    # (8000 by convention) — deliberately decoupled from the CLI's
+    # local-server default (6767 in host/local_server.py).
+    PORT = int(os.environ.get("DATABRICKS_APP_PORT", "8000"))
+    PGPORT = os.environ.get("PGPORT", "5432")
+    PGSSLMODE = os.environ.get("PGSSLMODE", "require")
+    # Recycle DB connections before Lakebase 60-min token expiry.
+    # 300s (5 min) is conservative — well under the 60-min token TTL.
+    POOL_RECYCLE_SECONDS = int(os.environ.get("AP_POOL_RECYCLE_SECONDS", "300"))
+    logger.info(
+        "Config: PGHOST=%s PGDATABASE=%s PGUSER=%s VOLUME=%s PORT=%d",
+        PGHOST,
+        PGDATABASE,
+        PGUSER,
+        VOLUME_PATH,
+        PORT,
+    )
 
-    # ── Lakebase DATABASE_URL (password-less; token minted per connection) ──
-    if not env.get("DATABASE_URL"):
-        host = env.get(_PG_HOST_ENV)
-        user = env.get(_PG_USER_ENV)
-        database = env.get(_PG_DATABASE_ENV)
-        port = env.get(_PG_PORT_ENV, "5432")
-        if host and user and database:
-            # No password in the URL: omnigent.db.utils injects a fresh OAuth
-            # token as the password on every new connection. sslmode=require is
-            # mandatory for Lakebase.
-            env["DATABASE_URL"] = (
-                f"postgresql+psycopg://{quote(user, safe='')}@{host}:{port}"
-                f"/{database}?sslmode=require"
-            )
-            if not env.get(_LAKEBASE_INSTANCE_ENV):
-                raise RuntimeError(
-                    "A Lakebase DATABASE_URL was composed from the injected PG* "
-                    "variables, but OMNIGENT_LAKEBASE_INSTANCE is not set. Set it "
-                    "to the Lakebase database instance name (in app.yaml) so the "
-                    "server can mint a per-connection OAuth token; otherwise the "
-                    "password-less URL cannot authenticate."
-                )
+    # ── Lakebase token injection ──────────────────────────────
 
-    # ── Auth ──────────────────────────────────────────────────
-    # Databricks fronts the app with an identity-aware proxy that forwards the
-    # authenticated user in X-Forwarded-Email — exactly what header auth reads.
-    env.setdefault("OMNIGENT_AUTH_PROVIDER", "header")
+    _workspace_client = WorkspaceClient()
 
+    def _get_cached_token(endpoint: str) -> str:
+        """Return a cached Lakebase token for ``endpoint``, minting if needed.
 
-def _load_server_entrypoint() -> ModuleType:
-    """Import the generic Docker entrypoint module.
+        Fast path: cached token whose expiry is in the future is returned
+        without contacting the workspace. Slow path: mint a new token via
+        the Databricks SDK (synchronous HTTPS). The mint runs OUTSIDE the
+        cache lock so multiple concurrent first-time mints don't serialize
+        behind one another — the last winner writes the cache, which is
+        safe since every minted token is independently valid for ~60 min.
 
-    Prefers a copy vendored next to this file by ``deploy.py`` (the deployed
-    app source only contains this directory), then falls back to importing the
-    canonical ``deploy.docker.entrypoint`` from a repo checkout (used by the
-    test suite and local dev).
+        :param endpoint: Lakebase endpoint resource name, e.g.
+            ``"projects/foo/branches/production/endpoints/primary"``.
+        :returns: A Lakebase database credential token.
+        :raises RuntimeError: If the SDK returns a credential with no token.
+        """
+        now = time.monotonic()
+        with _token_cache_lock:
+            cached = _token_cache.get(endpoint)
+            if cached is not None and cached[1] > now:
+                return cached[0]
+        credential = _workspace_client.postgres.generate_database_credential(
+            endpoint=endpoint,
+        )
+        if credential.token is None:
+            raise RuntimeError("Lakebase credential response did not include a token")
+        with _token_cache_lock:
+            _token_cache[endpoint] = (credential.token, now + _TOKEN_TTL_SECONDS)
+        return credential.token
 
-    :returns: The imported entrypoint module exposing ``_resolve_config`` and
-        ``build_app``.
-    """
-    here = Path(__file__).resolve().parent
-    vendored = here / "_omnigent_entrypoint.py"
-    if vendored.exists():
-        spec = importlib.util.spec_from_file_location("_omnigent_entrypoint", vendored)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    # Dev / test fallback: the repo root is deploy/databricks/src → up 3.
-    repo_root = here.parents[2]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    return importlib.import_module("deploy.docker.entrypoint")
+    # SQLAlchemy fixes the signature of do_connect; the dialect /
+    # conn_rec / cargs args aren't used here, but they have to be
+    # named so the hook accepts them. Underscore prefix tells the
+    # linter we know they're unused.
+    @sqlalchemy.event.listens_for(sqlalchemy.engine.Engine, "do_connect")
+    def _inject_lakebase_credentials(_dialect, _conn_rec, _cargs, cparams):
+        if cparams.get("host") != PGHOST:
+            return
+        cparams["password"] = _get_cached_token(LAKEBASE_ENDPOINT)
+        cparams["sslmode"] = PGSSLMODE
 
+    # ── Start omnigent ─────────────────────────────────────
 
-def main() -> None:
-    """Boot the Omnigent server on Databricks Apps.
+    import tempfile
+    from pathlib import Path
 
-    Wraps the whole boot in a catch-all so any failure lands in the app logs
-    (``databricks apps logs``) and the process lingers briefly for log capture
-    before exiting non-zero.
-    """
+    import uvicorn
+
+    from omnigent.runtime import init as init_runtime
+    from omnigent.runtime import telemetry
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.runtime.caps import RuntimeCaps
+    from omnigent.server.app import create_app
+    from omnigent.server.auth import create_auth_provider
+
+    # OTel: the Databricks Apps platform auto-injects
+    # OTEL_EXPORTER_OTLP_ENDPOINT when `telemetry_export_destinations`
+    # is set on the app — telemetry.init() picks that up and routes
+    # OTLP to the platform collector, which writes to the configured
+    # UC tables. No-op if neither OTEL nor MLflow env vars are set.
+    telemetry.init()
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.databricks_volumes import (
+        DatabricksVolumesArtifactStore,
+    )
+    from omnigent.stores.comment_store.sqlalchemy_store import (
+        SqlAlchemyCommentStore,
+    )
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+    from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+
+    DB_URI = f"postgresql+psycopg://{PGUSER}@{PGHOST}:{PGPORT}/{PGDATABASE}"
+    ARTIFACT_URI = f"dbfs:{VOLUME_PATH}"
+    CACHE_DIR = Path(tempfile.mkdtemp(prefix="ap_cache_"))
+
+    logger.info("DB_URI: %s", DB_URI[:80])
+    logger.info("ARTIFACT_URI: %s", ARTIFACT_URI)
+
+    # The app SP owns the tables — run any pending Alembic upgrades
+    # before the stores boot, since the verify-schema check refuses
+    # to start a stale DB. Idempotent: a no-op when the DB is at head.
+    from omnigent.db.utils import _run_migrations as _run_alembic_upgrade
+
+    _migration_engine = sqlalchemy.create_engine(DB_URI)
     try:
-        configure_databricks_env(os.environ)
+        _run_alembic_upgrade(_migration_engine, DB_URI)
+    finally:
+        _migration_engine.dispose()
 
-        entrypoint = _load_server_entrypoint()
-        resolved = entrypoint._resolve_config()
+    agent_store = SqlAlchemyAgentStore(DB_URI)
+    file_store = SqlAlchemyFileStore(DB_URI)
+    conversation_store = SqlAlchemyConversationStore(DB_URI)
+    artifact_store = DatabricksVolumesArtifactStore(ARTIFACT_URI)
+    file_comment_store = SqlAlchemyCommentStore(DB_URI)
+    permission_store = SqlAlchemyPermissionStore(DB_URI)
+    policy_store = SqlAlchemyPolicyStore(DB_URI)
+    host_store = HostStore(DB_URI)
 
-        # Run migrations through the TOKEN-AWARE engine builder (the generic
-        # entrypoint's run_migrations uses a raw engine with no token listener,
-        # which cannot authenticate to Lakebase). get_or_create_engine runs
-        # _initialize_or_verify_schema on first creation and caches the engine,
-        # so the stores built by build_app reuse this very engine.
-        from omnigent.db.utils import get_or_create_engine
+    agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=CACHE_DIR)
 
-        logger.info("Running database migrations (token-aware engine)...")
-        get_or_create_engine(resolved.database_url)
+    init_runtime(
+        agent_cache=agent_cache,
+        caps=RuntimeCaps(),
+        agent_store=agent_store,
+        file_store=file_store,
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        comment_store=file_comment_store,
+        policy_store=policy_store,
+    )
 
-        built = entrypoint.build_app(resolved)
+    # The Databricks Apps proxy injects ``X-Forwarded-Email`` on
+    # every request, so we run in header mode. Header is the
+    # framework default, but pin it explicitly so the hosted product
+    # keeps its existing behavior regardless of any ambient
+    # OMNIGENT_AUTH_ENABLED in the deploy env (an explicit
+    # provider always wins over the enable switch).
+    os.environ.setdefault("OMNIGENT_AUTH_PROVIDER", "header")
+    auth_provider = create_auth_provider()
+    app = create_app(
+        agent_store=agent_store,
+        file_store=file_store,
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        agent_cache=agent_cache,
+        comment_store=file_comment_store,
+        permission_store=permission_store,
+        policy_store=policy_store,
+        host_store=host_store,
+        auth_provider=auth_provider,
+    )
 
-        import uvicorn
+    if __name__ == "__main__":
+        logger.info("Starting omnigent on 0.0.0.0:%d", PORT)
+        uvicorn.run(app, host="0.0.0.0", port=PORT)
 
-        from omnigent.runner.transports.ws_tunnel.limits import (
-            RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-        )
+except Exception:  # noqa: BLE001 — startup catch-all; we want every failure logged
+    logger.error("FATAL: omnigent failed to start:\n%s", traceback.format_exc())
+    # Keep the process alive briefly so logs can be captured
+    import time
 
-        logger.info("Starting omnigent server on %s:%d", built.host, built.port)
-        uvicorn.run(
-            built.app,
-            host=built.host,
-            port=built.port,
-            ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-        )
-    except Exception:  # noqa: BLE001 — startup catch-all so failures land in logs
-        logger.error("FATAL: omnigent server failed to start:\n%s", traceback.format_exc())
-        import time  # deferred — keeps module inert
-
-        time.sleep(30)
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+    time.sleep(30)
+    sys.exit(1)

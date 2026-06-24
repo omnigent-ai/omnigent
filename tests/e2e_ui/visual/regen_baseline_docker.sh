@@ -9,8 +9,11 @@
 #
 # Only Docker is required (no local Node/Python/uv). It:
 #   1. builds the ap-web SPA in a Node 20 container, then
-#   2. renders the landing with --update-snapshots in the pinned Playwright image
-#      (installs the project + Chromium-from-the-image, no browser download).
+#   2. compares the whole visual suite in the pinned Playwright image and
+#      rewrites only the baselines that drift (or are missing) -- baselines that
+#      already match are left byte-for-byte untouched, mirroring the label-driven
+#      CI flow (installs the project + Chromium-from-the-image, no browser
+#      download).
 #
 # Usage:
 #   tests/e2e_ui/visual/regen_baseline_docker.sh [--skip-build]
@@ -33,7 +36,7 @@ PLATFORM="linux/amd64"
 # produces is identical to the one the gate renders.
 NPM_VERSION="11.12.1"
 BUILD_OUTPUT="omnigent/server/static/web-ui"
-BASELINE="tests/e2e_ui/visual/snapshots/test_landing_snapshot/test_empty_landing_matches_baseline/test_empty_landing_matches_baseline[chromium][linux].png"
+SNAP_ROOT="tests/e2e_ui/visual/snapshots"
 
 SKIP_BUILD=false
 while [ $# -gt 0 ]; do
@@ -59,13 +62,18 @@ else
     bash -c "npm install -g npm@${NPM_VERSION} && npm ci --legacy-peer-deps --no-audit --no-fund && npm run build"
 fi
 
-echo "Rendering + rewriting the baseline in the pinned Playwright image ..."
-# --update-snapshots makes the plugin rewrite the PNG and then "fail" the run by
-# design, so `|| true` is expected -- the git diff below is the real signal.
-# UV_PROJECT_ENVIRONMENT lives in the container (not the mounted repo) so no
-# root-owned .venv leaks onto the host.
+echo "Rendering + comparing the baselines in the pinned Playwright image ..."
+# Deliberately NOT --update-snapshots: that rewrites every PNG, churning
+# baselines that still pass (a sub-threshold re-render changes the bytes). Plain
+# compare leaves passing baselines alone and rewrites only the drift. GITHUB_ACTIONS
+# is set so the plugin behaves exactly as the CI gate does: it updates a mismatching
+# baseline IN PLACE (and creates a missing one) under snapshots/, so the git diff
+# below is the real signal. The run "fails" by design on any drift, so `|| true` is
+# expected. UV_PROJECT_ENVIRONMENT lives in the container (not the mounted repo) so
+# no root-owned .venv leaks out.
 docker run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work \
   -e CI=1 \
+  -e GITHUB_ACTIONS=true \
   -e OMNIGENT_PW_NO_SANDBOX=1 \
   -e OMNIGENT_SKIP_WEB_UI=true \
   -e UV_PYTHON_PREFERENCE=only-system \
@@ -74,7 +82,7 @@ docker run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work \
     pip install --quiet uv &&
     uv sync --extra all --extra dev &&
     uv run pytest tests/e2e_ui/visual -m visual \
-      -p no:rerunfailures --ui-skip-build --update-snapshots
+      -p no:rerunfailures --ui-skip-build
   ' || true
 
 # Files Docker wrote are root-owned; hand them back so git add works unprivileged.
@@ -83,12 +91,12 @@ docker run --rm --platform "$PLATFORM" -v "$PWD":/work "$PW_IMAGE" \
   chown -R "$(id -u):$(id -g)" /work/tests/e2e_ui/visual /work/"$BUILD_OUTPUT" /work/ap-web 2>/dev/null || true
 
 echo
-if git diff --quiet -- "$BASELINE"; then
-  echo "Baseline unchanged — it already matches this render (or the render failed; check the output above)."
+if git diff --quiet -- "$SNAP_ROOT"; then
+  echo "Baselines unchanged — they already match this render (or the render failed; check the output above)."
 else
-  git --no-pager diff --stat -- "$BASELINE" || true
+  git --no-pager diff --stat -- "$SNAP_ROOT" || true
   echo
-  echo "Updated baseline: $BASELINE"
-  echo "Next: review the image, then commit + push:"
-  echo "  git add \"$BASELINE\" && git commit -m 'test(ui-snapshot): update landing baseline' && git push"
+  echo "Updated baseline(s) under: $SNAP_ROOT"
+  echo "Next: review the image(s), then commit + push:"
+  echo "  git add \"$SNAP_ROOT\" && git commit -m 'test(ui-snapshot): update visual baselines' && git push"
 fi

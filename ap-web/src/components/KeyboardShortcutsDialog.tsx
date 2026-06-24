@@ -18,6 +18,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { isNativeShell } from "@/lib/nativeBridge";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
 // account menu) can open it without threading state through the tree.
@@ -94,11 +95,68 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   },
 ];
 
+// Desktop-only: Cmd/Ctrl+digit collides with browser tab-switching, so the
+// pinned-session hotkey ships only in the Electron shell (see
+// usePinnedSessionHotkeys). Injected into "Navigation" when running natively.
+const PINNED_SESSION_SHORTCUT: Shortcut = {
+  label: "Jump to pinned session (1–10)",
+  keys: [MOD_KEY, "1…0"],
+};
+
+/** Shortcut groups for the current runtime — adds desktop-only rows natively. */
+function shortcutGroupsFor(native: boolean): ShortcutGroup[] {
+  if (!native) return SHORTCUT_GROUPS;
+  return SHORTCUT_GROUPS.map((group) =>
+    group.title === "Navigation"
+      ? { ...group, items: [...group.items, PINNED_SESSION_SHORTCUT] }
+      : group,
+  );
+}
+
 function Kbd({ children }: { children: ReactNode }) {
   return (
     <kbd className="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-border bg-muted px-1.5 font-sans text-xs font-medium text-muted-foreground">
       {children}
     </kbd>
+  );
+}
+
+/**
+ * The shortcut reference, grouped, as plain inline content (no dialog
+ * chrome). Shared by the {@link KeyboardShortcutsDialog} overlay and the
+ * Settings page, which embeds it directly instead of behind a trigger.
+ */
+export function KeyboardShortcutsList() {
+  // Feature-based, stable per session; computed at render so tests can vary it.
+  const groups = shortcutGroupsFor(isNativeShell());
+  return (
+    <>
+      {groups.map((group) => (
+        <section key={group.title} className="mb-4 last:mb-0">
+          <h3 className="mb-1 text-xs font-medium text-muted-foreground">
+            {group.title}
+            {group.note ? (
+              <span className="ml-1.5 font-normal text-muted-foreground/70">· {group.note}</span>
+            ) : null}
+          </h3>
+          <ul>
+            {group.items.map((item) => (
+              <li
+                key={item.label}
+                className="flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0"
+              >
+                <span className="text-sm text-foreground">{item.label}</span>
+                <span className="flex shrink-0 items-center gap-1">
+                  {item.keys.map((key) => (
+                    <Kbd key={`${item.label}-${key}`}>{key}</Kbd>
+                  ))}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ))}
+    </>
   );
 }
 
@@ -133,33 +191,7 @@ export function KeyboardShortcutsDialog() {
           </DialogDescription>
         </DialogHeader>
         <div className="max-h-[70vh] overflow-y-auto pr-1">
-          {SHORTCUT_GROUPS.map((group) => (
-            <section key={group.title} className="mb-4 last:mb-0">
-              <h3 className="mb-1 text-xs font-medium text-muted-foreground">
-                {group.title}
-                {group.note ? (
-                  <span className="ml-1.5 font-normal text-muted-foreground/70">
-                    · {group.note}
-                  </span>
-                ) : null}
-              </h3>
-              <ul>
-                {group.items.map((item) => (
-                  <li
-                    key={item.label}
-                    className="flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0"
-                  >
-                    <span className="text-sm text-foreground">{item.label}</span>
-                    <span className="flex shrink-0 items-center gap-1">
-                      {item.keys.map((key) => (
-                        <Kbd key={`${item.label}-${key}`}>{key}</Kbd>
-                      ))}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          ))}
+          <KeyboardShortcutsList />
         </div>
       </DialogContent>
     </Dialog>

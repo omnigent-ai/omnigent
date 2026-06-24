@@ -57,6 +57,24 @@ def _make_spec(*, model: str | None = None, profile: str | None = None) -> Agent
     )
 
 
+def test_pi_spawn_env_threads_cwd_separately_from_bundle_dir(tmp_path: Path) -> None:
+    """
+    Pi gets the session workspace as ``HARNESS_PI_CWD``.
+
+    ``workdir`` is the extracted agent bundle, not the user's project
+    workspace. If these are conflated, Pi launches in the wrong repository.
+    """
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    bundle_dir = tmp_path / "runner-specs" / "ag_pi-v1"
+    bundle_dir.mkdir(parents=True)
+
+    env = _build_pi_spawn_env(_make_spec(), cwd=workspace, workdir=bundle_dir)
+
+    assert env["HARNESS_PI_CWD"] == str(workspace)
+    assert env["HARNESS_PI_BUNDLE_DIR"] == str(bundle_dir)
+
+
 def _ucode_state_for_pi(
     monkeypatch: pytest.MonkeyPatch, *, model: str | None, with_pi_entry: bool
 ):

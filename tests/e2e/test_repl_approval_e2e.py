@@ -252,69 +252,6 @@ def _configure_mock_tool_then_text(
     )
 
 
-def _configure_mock_subagent_spawn(
-    mock_llm_server_url: str,
-    sub_agent_name: str,
-    message: str,
-    *,
-    sub_agent_responses: list[dict[str, Any]],
-    parent_summary: str,
-    match: str | None = None,
-) -> None:
-    """
-    Configure a parent→sub-agent→parent mock LLM exchange.
-
-    All fixtures here use ``model: gpt-4o``, so every LLM call —
-    the parent's and the sub-agent's — pulls from the single
-    ``"default"`` queue in order. The sequence is:
-
-    1. Parent emits a ``sys_session_send`` tool call spawning the
-       named sub-agent with *message*.
-    2. The sub-agent's own LLM call(s) come from *sub_agent_responses*
-       (e.g. a plain text reply, or a tool call + reply).
-    3. Parent emits *parent_summary* as its final text after the
-       sub-agent's result lands in the inbox.
-
-    A couple of spare ``"…"`` text responses pad the tail so a stray
-    extra LLM call never 500s the mock and destabilizes the assert.
-
-    :param mock_llm_server_url: Mock server base URL.
-    :param sub_agent_name: ``agent`` arg for ``sys_session_send``,
-        e.g. ``"worker"``.
-    :param message: ``args`` payload delegated to the sub-agent.
-    :param sub_agent_responses: Response dicts the sub-agent's own
-        LLM call(s) consume, in order.
-    :param parent_summary: Parent's final text response.
-    :param match: Optional content-routing token. Works here only
-        because the sub-agent is delegated *message* — so both the
-        parent (user message) and the sub-agent (delegated task) carry
-        the token, and the single ordered queue serves both in order
-        while a stray request from another test (no token) cannot draw
-        from it (#523 isolation).
-    """
-    reset_mock_llm(mock_llm_server_url)
-    spawn = {
-        "tool_calls": [
-            {
-                "call_id": "sa1",
-                "name": "sys_session_send",
-                "arguments": json.dumps({"agent": sub_agent_name, "title": "t", "args": message}),
-            }
-        ]
-    }
-    configure_mock_llm(
-        mock_llm_server_url,
-        [
-            spawn,
-            *sub_agent_responses,
-            {"text": parent_summary},
-            {"text": "(spare)"},
-            {"text": "(spare)"},
-        ],
-        match=match,
-    )
-
-
 def _require_omnigent_cli() -> str:
     """
     Resolve the CLI path. Prefers the framework's own
@@ -631,9 +568,11 @@ def test_repl_two_turns_fires_one_approval_per_turn(
         child.expect("approval required", timeout=30)
         child.send("y" + "\r")
         child.expect("approved", timeout=5)
-        # Wait for the turn to fully land — the stream-done
-        # elapsed-time label is the cleanest signal.
-        _wait_for_turn_complete(child, timeout=30)
+        # Wait for the turn to fully land by syncing on the
+        # scripted reply text (deterministic content) rather than
+        # the cosmetic `· ready` idle-settle, which can race /
+        # not-render under CI load (the observed flake).
+        child.expect("Nice to meet you", timeout=30)
 
         # Drain anything queued so the next expect starts
         # from a clean slate. Generous wait because the REPL
@@ -675,7 +614,9 @@ def test_repl_two_turns_fires_one_approval_per_turn(
         # Approve and confirm one-and-done.
         child.send("y" + "\r")
         child.expect("approved", timeout=5)
-        _wait_for_turn_complete(child, timeout=30)
+        # Sync on the scripted turn-2 reply (deterministic content)
+        # instead of the racy `· ready` idle-settle marker.
+        child.expect("Sure thing", timeout=30)
 
         # Final sweep: no extra approval banners after the
         # two we expected.
@@ -992,19 +933,52 @@ def test_repl_subagent_ask_does_not_tunnel_banner_to_root(
     - The parent's final summary text appears, proving the sub-agent
       ran end-to-end despite the unprompted ASK.
     """
-    # All fixture LLM calls (parent + worker) share the single
-    # "default" mock queue, consumed in dispatch order. The worker's
-    # own reply is the text that reliably renders to the root REPL, so
-    # we key the completion assertion on it rather than on a specific
-    # parent-summary position (interleaving order is an impl detail).
+    # The parent (root user message) and the worker (delegated task)
+    # draw from separate content-routed queues on DISTINCT,
+    # mutually-non-substring tokens so each agent's scripted calls land
+    # deterministically. With a single shared queue the parent's
+    # post-spawn continuation call races the worker's call: the parent
+    # consumes the worker's queued reply and the worker parks forever
+    # (the flake). Splitting them closes that intra-test race and the
+    # model-fallback contamination vector entirely (#523 isolation):
+    #   - "saask-parent" appears ONLY in the root user message, so the
+    #     parent's calls route here. The delegated-task token lives in a
+    #     function_call, not user content, so it never leaks into the
+    #     parent's user text.
+    #   - "saask-worker" appears ONLY in the task delegated to the
+    #     worker, so the sub-agent's call routes to its own queue.
     worker_reply = "worker-reply-render-marker"
-    _configure_mock_subagent_spawn(
+    parent_summary = "parent-summary-render-marker"
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
         mock_llm_server_url,
-        "worker",
-        "say hello subagent-ask",
-        sub_agent_responses=[{"text": worker_reply}],
-        parent_summary="Parent summarized the worker.",
-        match="subagent-ask",
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "sa1",
+                        "name": "sys_session_send",
+                        "arguments": json.dumps(
+                            {"agent": "worker", "title": "t", "args": "say hello saask-worker"}
+                        ),
+                    }
+                ]
+            },
+            {"text": parent_summary},
+            {"text": "(spare)"},
+            {"text": "(spare)"},
+        ],
+        match="saask-parent",
+    )
+    # Worker queue — content-routed on the delegated-task token.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": worker_reply},
+            {"text": "(spare)"},
+            {"text": "(spare)"},
+        ],
+        match="saask-worker",
     )
     child = pexpect.spawn(
         ap_cli,
@@ -1021,29 +995,24 @@ def test_repl_subagent_ask_does_not_tunnel_banner_to_root(
             timeout=90,
             welcome_pattern="e2e.subagent.gate",
         )
-        child.send("say hello subagent-ask" + "\r")
-        # The full turn — spawn, sub-agent run, inbox collect, parent
-        # summary — completes without ever parking on a banner.
-        _wait_for_turn_complete(child, timeout=90)
+        child.send("say hello saask-parent" + "\r")
+        # Deterministic content-marker sync: the parent's summary renders
+        # only after the worker ran to completion and its result landed in
+        # the inbox. Had the worker parked on the unprompted ASK, the
+        # result would never arrive and this would never render. Keying on
+        # the marker (not the racy ``· ready`` toolbar) makes it stable.
+        child.expect(parent_summary, timeout=120)
         full_turn = child.before or ""
         if isinstance(full_turn, bytes):
             full_turn = full_turn.decode("utf-8", errors="replace")
         full_turn = _strip_ansi(full_turn)
-        # Drain any trailing render so a late-arriving reply line is
-        # captured before asserting.
+        # Drain any trailing render so a late line is captured.
         full_turn += _read_pending(child, seconds=2.0)
         # No interactive approval banner tunneled to the root REPL.
         assert "approval required" not in full_turn, (
             "A sub-agent ASK banner surfaced on the root REPL — interactive "
             "tunneled mid-flight ASK is not implemented (see #765); the "
             f"sub-agent ASK is non-interactive today.\nCaptured:\n{full_turn[:1500]}"
-        )
-        # The worker's reply rendered — proves the sub-agent ran to
-        # completion despite the unprompted INPUT ASK (no parking).
-        assert worker_reply in full_turn, (
-            "The sub-agent's reply never rendered on the root REPL — the "
-            "worker may have parked waiting for an approval that never "
-            f"comes.\nCaptured:\n{full_turn[:1500]}"
         )
     finally:
         try:

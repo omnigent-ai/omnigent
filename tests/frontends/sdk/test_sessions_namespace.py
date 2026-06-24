@@ -1156,3 +1156,148 @@ async def test_fork_404_raises() -> None:
             await ns.fork("conv_nonexistent")
     finally:
         await client.aclose()
+
+
+# ── child_sessions_tree() / subtree_busy() ───────────────────────────
+
+
+def _tree_handler(
+    tree: dict[str, list[dict[str, Any]]],
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Serve ``GET …/{id}/child_sessions`` from an in-memory parent→children map.
+
+    The recursion helper queries each node's children with a fresh request, so
+    the map keys are parent ids and the values are the ``ChildSessionSummary``
+    rows that parent returns. Unknown parents return an empty page.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        parts = request.url.path.split("/")
+        # …/v1/sessions/<id>/child_sessions
+        assert parts[-1] == "child_sessions"
+        parent_id = parts[-2]
+        return httpx.Response(200, json={"data": tree.get(parent_id, [])})
+
+    return handler
+
+
+def _child(sid: str, **fields: Any) -> dict[str, Any]:
+    return {"id": sid, **fields}
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_recurses_and_tags_parent() -> None:
+    """The tree helper walks every level and stamps each row with its parent.
+
+    Failure means the SDK rollup (and the CLI tree it now feeds) loses
+    grandchildren or mis-attaches the hierarchy.
+    """
+    tree = {
+        "root": [_child("a"), _child("b")],
+        "a": [_child("a1")],
+        "a1": [_child("a1x")],
+        "b": [],
+    }
+    ns, client = _make_namespace(_tree_handler(tree))
+    try:
+        nodes = await ns.child_sessions_tree("root")
+    finally:
+        await client.aclose()
+
+    by_id = {n["id"]: n for n in nodes}
+    assert set(by_id) == {"a", "b", "a1", "a1x"}  # root itself excluded
+    assert by_id["a"]["parent_id"] == "root"
+    assert by_id["a1"]["parent_id"] == "a"
+    assert by_id["a1x"]["parent_id"] == "a1"
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_respects_max_depth() -> None:
+    """``max_depth`` caps descent — depth 1 returns direct children only."""
+    tree = {
+        "root": [_child("a")],
+        "a": [_child("a1")],
+    }
+    ns, client = _make_namespace(_tree_handler(tree))
+    try:
+        nodes = await ns.child_sessions_tree("root", max_depth=1)
+    finally:
+        await client.aclose()
+
+    assert [n["id"] for n in nodes] == ["a"]  # a1 is one level too deep
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_cycle_guard() -> None:
+    """A child pointing back at an ancestor is visited once, not forever."""
+    tree = {
+        "root": [_child("a")],
+        "a": [_child("root"), _child("a1")],  # 'root' is a back-edge
+    }
+    ns, client = _make_namespace(_tree_handler(tree))
+    try:
+        nodes = await ns.child_sessions_tree("root")
+    finally:
+        await client.aclose()
+
+    # 'root' is the seed (already seen) so the back-edge is dropped; 'a1' stays.
+    assert [n["id"] for n in nodes] == ["a", "a1"]
+
+
+@pytest.mark.asyncio
+async def test_subtree_busy_true_when_deep_descendant_busy() -> None:
+    """A busy grandchild makes the whole subtree read busy.
+
+    This is the rollup #444 asks for: the parent's own status is idle but a
+    descendant is still working.
+    """
+    tree = {
+        "root": [_child("a", busy=False, current_task_status="completed")],
+        "a": [_child("a1", busy=True, current_task_status=None)],
+    }
+    ns, client = _make_namespace(_tree_handler(tree))
+    try:
+        assert await ns.subtree_busy("root") is True
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subtree_busy_false_when_all_terminal() -> None:
+    """All descendants settled → subtree not busy (safe to inject 'your turn')."""
+    tree = {
+        "root": [
+            _child("a", busy=False, current_task_status="completed"),
+            _child("b", busy=False, current_task_status="failed"),
+        ],
+        "a": [_child("a1", busy=False, current_task_status="cancelled")],
+    }
+    ns, client = _make_namespace(_tree_handler(tree))
+    try:
+        assert await ns.subtree_busy("root") is False
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subtree_busy_false_when_no_children() -> None:
+    ns, client = _make_namespace(_tree_handler({"root": []}))
+    try:
+        assert await ns.subtree_busy("root") is False
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subtree_busy_counts_awaiting_input_as_busy() -> None:
+    """A descendant parked on an elicitation keeps the subtree busy (web parity)."""
+    tree = {
+        "root": [
+            _child("a", busy=False, current_task_status="completed", pending_elicitations_count=1)
+        ],
+    }
+    ns, client = _make_namespace(_tree_handler(tree))
+    try:
+        assert await ns.subtree_busy("root") is True
+    finally:
+        await client.aclose()
