@@ -34,6 +34,7 @@ from omnigent.onboarding.configure_models import (
 )
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
+    GEMINI_FAMILY,
     LOCAL_KIND,
     OPENAI_FAMILY,
     SUBSCRIPTION_KIND,
@@ -43,8 +44,11 @@ from omnigent.onboarding.provider_config import (
     set_default_provider,
 )
 
-# The families auto-default resolution walks, in a stable order.
-_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
+# The families auto-default resolution walks, in a stable order. ``gemini``
+# is included so a detected-only GEMINI_API_KEY (the antigravity-sdk harness's
+# credential) auto-becomes the gemini-family default in the read-time merge,
+# matching how a detected anthropic / openai key auto-defaults.
+_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY)
 
 # Top-level config key listing detection names the user has dismissed by
 # removing the adopted entry. A detection whose backing credential cannot be
@@ -118,8 +122,8 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
     :param det: A credential found by
         :func:`omnigent.onboarding.ambient.detect_providers`.
     :returns: A raw provider entry body (config shape), or ``None`` when the
-        detection maps to no omnigent harness surface (e.g. a Gemini key,
-        whose ``family`` is ``None``).
+        detection maps to no omnigent harness surface (a ``family``-less
+        ``key`` detection).
     """
     if det.kind == "subscription":
         # ``det.name`` is the CLI login (``"claude"`` / ``"codex"``).
@@ -141,7 +145,8 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
         return build_subscription_provider_entry("claude")
 
     if det.family is None:
-        # An env key we detect but can't route to a harness (e.g. Gemini).
+        # An env key we detect but can't route to a harness (a detection
+        # whose provider maps to no omnigent family).
         return None
 
     if det.kind == "key":
@@ -197,8 +202,12 @@ def synthesize_detected_entries(
         order.
     :returns: Raw provider entries keyed by the detection name, e.g.
         ``{"anthropic": {"kind": "key", ...}, "codex": {"kind":
-        "subscription", "cli": "codex"}}``. Detections with no harness
-        surface (Gemini) are omitted. The mapping preserves detection order.
+        "subscription", "cli": "codex"}}``. A detected GEMINI_API_KEY is
+        adopted as a ``gemini``-family ``key`` provider (the antigravity-sdk
+        surface) — see :data:`omnigent.onboarding.ambient._ENV_KEY_FAMILY`.
+        Only detections that map to no omnigent family at all (a ``family``-less
+        :class:`DetectedProvider`) are skipped. The mapping preserves detection
+        order.
     """
     entries: dict[str, dict[str, object]] = {}
     for det in detected:
