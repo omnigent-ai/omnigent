@@ -18,6 +18,7 @@ export const BUILTIN_AGENTS = new Set([
   "pi-native-ui", // Pi
   "cursor-native-ui", // Cursor
   "goose-native-ui", // Goose
+  "qwen-native-ui", // Qwen Code
   "polly",
   "debby",
 ]);
@@ -32,6 +33,7 @@ export const AGENT_DISPLAY_ORDER = [
   "OpenCode",
   "Cursor",
   "Pi",
+  "Qwen Code",
   "Polly",
   "Debby",
 ];

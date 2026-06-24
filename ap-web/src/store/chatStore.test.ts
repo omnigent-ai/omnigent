@@ -948,33 +948,43 @@ describe("chatStore — switchTo", () => {
   // whether to clear the optimistic bubble on idle (see that handler's
   // test). It must be true for every registered native wrapper and false otherwise,
   // or the host-restart "bubble disappears" fix mis-fires.
+  // ``isNativeTerminalSession`` gates the optimistic-bubble clear; the companion
+  // ``nativeVendorOwnsModel`` hides the composer model/effort chip for native
+  // wrappers whose model is chosen inside the vendor TUI (qwen/goose/pi/cursor/
+  // opencode) — claude/codex keep it (they expose an Omnigent model picker).
   it.each([
-    ["claude-code-native-ui", true],
-    ["codex-native-ui", true],
-    ["pi-native-ui", true],
-    ["some-other-wrapper", false],
-    [null, false],
-  ])("switchTo derives isNativeTerminalSession from wrapper=%s", async (wrapper, expected) => {
-    seedSession("conv_wrap", []);
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url.split("?")[0] === "/v1/sessions/conv_wrap" && (init?.method ?? "GET") === "GET") {
-        return mockResponse({
-          id: "conv_wrap",
-          agent_id: "agent_xyz",
-          status: "idle",
-          created_at: 0,
-          items: [],
-          labels: wrapper === null ? {} : { "omnigent.wrapper": wrapper },
-        });
-      }
-      return defaultFetchHandler(input, init);
-    });
+    ["claude-code-native-ui", true, false],
+    ["codex-native-ui", true, false],
+    ["pi-native-ui", true, true],
+    ["qwen-native-ui", true, true],
+    ["goose-native-ui", true, true],
+    ["some-other-wrapper", false, false],
+    [null, false, false],
+  ])(
+    "switchTo derives native flags from wrapper=%s",
+    async (wrapper, expectedNative, expectedVendorOwnsModel) => {
+      seedSession("conv_wrap", []);
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.split("?")[0] === "/v1/sessions/conv_wrap" && (init?.method ?? "GET") === "GET") {
+          return mockResponse({
+            id: "conv_wrap",
+            agent_id: "agent_xyz",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            labels: wrapper === null ? {} : { "omnigent.wrapper": wrapper },
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
 
-    await useChatStore.getState().switchTo("conv_wrap");
+      await useChatStore.getState().switchTo("conv_wrap");
 
-    expect(useChatStore.getState().isNativeTerminalSession).toBe(expected);
-  });
+      expect(useChatStore.getState().isNativeTerminalSession).toBe(expectedNative);
+      expect(useChatStore.getState().nativeVendorOwnsModel).toBe(expectedVendorOwnsModel);
+    },
+  );
 
   it("refetches the session snapshot even when a stale cached session exists", async () => {
     client.setQueryData(["session", "conv_abc"], {

@@ -3008,11 +3008,17 @@ function ComposerStatusLine() {
   // alongside contextWindow — so the branch reads from the same store as
   // the other status-line values rather than a separate fetch.
   const gitBranch = useChatStore((s) => s.gitBranch);
+  // qwen/goose/cursor/pi/opencode native sessions pick their model inside the
+  // vendor TUI, so Omnigent's bound `llmModel` is just an unused default
+  // (it would read e.g. "claude-sonnet-4-6" on a Qwen session). Hide the
+  // model/effort label for them; claude-/codex-native keep it (real picker).
+  const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
 
   const showBranch = !!conversationId && !!gitBranch;
-  const modelEffortLabel = conversationId
-    ? formatModelEffortStatusLabel(selectedModel ?? llmModel, selectedEffort, codexModelOptions)
-    : null;
+  const modelEffortLabel =
+    conversationId && !nativeVendorOwnsModel
+      ? formatModelEffortStatusLabel(selectedModel ?? llmModel, selectedEffort, codexModelOptions)
+      : null;
   const showPlanMode = !!conversationId && codexPlanMode;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =

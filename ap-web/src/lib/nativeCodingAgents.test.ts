@@ -16,6 +16,18 @@ describe("nativeCodingAgentForHarness", () => {
     expect(nativeCodingAgentForHarness("opencode-native")?.key).toBe("opencode");
   });
 
+  it("resolves the canonical qwen-native harness", () => {
+    const agent = nativeCodingAgentForHarness("qwen-native");
+    expect(agent?.key).toBe("qwen");
+    expect(agent?.displayName).toBe("Qwen Code");
+  });
+
+  it("folds the reversed native-qwen alias to the qwen-native spec", () => {
+    expect(nativeCodingAgentForHarness("native-qwen")).toBe(
+      nativeCodingAgentForHarness("qwen-native"),
+    );
+  });
+
   // The server's harness_kind returns the raw executor.config.harness, so a
   // `native-pi` agent must fold to the same spec — else fork/switch into it
   // would miss the terminal-first wrapper labels and render as chat.

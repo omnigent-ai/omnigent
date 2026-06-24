@@ -61,6 +61,7 @@ from omnigent.runner.resource_registry import (
     OMNIGENT_REPL_TERMINAL_ROLE,
     OPENCODE_NATIVE_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
+    QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
     TerminalExitEvent,
     TerminalLifecycle,
@@ -1701,6 +1702,220 @@ async def _auto_create_goose_terminal(
     _register_auto_forwarder_task(session_id, _forwarder_task)
     _logger.info(
         "Auto-created goose terminal + forwarder for session %s; forwarder_task=%s",
+        session_id,
+        _forwarder_task.get_name(),
+    )
+    return terminal_view
+
+
+async def _persist_qwen_external_session_id(
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+    qwen_session_id: str,
+) -> None:
+    """Record the qwen session id on the Omnigent session as ``external_session_id``.
+
+    Mirrors claude-/codex-/pi-native: the persisted id is what a later resume
+    reads back from the session snapshot to restore the vendor TUI, and what
+    ``fork_conversation`` stamps as ``omnigent.fork.source_external_session_id``
+    so a fork can carry history. Best-effort — a transient failure only degrades
+    resume/fork carry-over, never the live turn (the deterministic id +
+    on-disk-recording check still let the *next* launch resume).
+
+    :param server_client: Runner Omnigent server client (``None`` skips the write).
+    :param session_id: Omnigent session/conversation id.
+    :param qwen_session_id: The qwen ``--session-id`` to persist.
+    """
+    if server_client is None:
+        return
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            json={"external_session_id": qwen_session_id},
+            timeout=10.0,
+        )
+    except httpx.HTTPError:
+        _logger.warning(
+            "Could not record qwen external_session_id for %s; resume/fork will start fresh",
+            session_id,
+            exc_info=True,
+        )
+        return
+    if resp.status_code >= 400:
+        _logger.warning(
+            "AP rejected qwen external_session_id PATCH (%s); session=%s",
+            resp.status_code,
+            session_id,
+        )
+
+
+async def _auto_create_qwen_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, Any]], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+) -> SessionResourceView:
+    """
+    Auto-create the qwen TUI terminal for a qwen-native session.
+
+    Launches the interactive ``qwen`` TUI in a runner-owned tmux pane, pointed at
+    the bridge dir's ``--input-file`` (web-UI turns are appended here as JSONL
+    ``submit`` commands) and ``--json-file`` (qwen streams structured events here
+    for the forwarder to mirror). Auth is qwen's own configuration (OpenAI-compat
+    env vars or ``~/.qwen`` from ``/auth``), so HOME is inherited and Omnigent
+    writes no vendor config. Mirrors :func:`_auto_create_goose_terminal`, with a
+    file-based bridge instead of tmux ``send-keys``.
+
+    :param session_id: Session/conversation identifier.
+    :param resource_registry: Session resource registry for launching the terminal.
+    :param publish_event: Runner session event publisher.
+    :param server_client: Runner Omnigent server client.
+    :returns: Created terminal resource view.
+    """
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.qwen_native import resolve_qwen_executable
+
+    # Tear down any forwarder left from a prior terminal for this session before
+    # re-creating, so old and new tasks can't both mirror (double-posting), and
+    # drop the prior terminal's stale forward cursor + queued input.
+    await _cancel_auto_forwarder_task(session_id)
+    from omnigent.qwen_native_bridge import (
+        bridge_dir_for_session_id,
+        events_file_path,
+        input_file_path,
+        prepare_bridge_files,
+        qwen_session_id_for_conversation,
+        qwen_session_recording_exists,
+        write_tmux_target,
+    )
+    from omnigent.qwen_native_forwarder import clear_qwen_bridge_state
+
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    clear_qwen_bridge_state(bridge_dir)
+    # Create fresh, empty input + event files before launch: qwen ``watchFile``\\s
+    # the ``--input-file`` (it must exist) and a relaunched terminal must not
+    # replay a prior process's queued commands or events.
+    prepare_bridge_files(bridge_dir)
+    in_path = input_file_path(bridge_dir)
+    out_path = events_file_path(bridge_dir)
+
+    # ``_pi_native_launch_config`` is a generic session-snapshot reader
+    # (workspace + terminal_launch_args); reused here, not Pi-specific.
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = os.path.realpath(str(launch_config.workspace))
+    qwen_command = resolve_qwen_executable()
+    # Resume the qwen TUI's own history on re-launch (resume / runner restart) so
+    # the embedded pane shows the prior conversation, not a blank prompt. Uses the
+    # same ``external_session_id`` convention as claude-/codex-/pi-native: the id
+    # is persisted on the Omnigent session and read back from the snapshot
+    # (``launch_config.external_session_id``), which also lets a fork carry history
+    # (``omnigent.fork.source_external_session_id``). qwen is cleaner than
+    # claude/codex here — it lets us *assign* the id via ``--session-id``, so we
+    # mint a deterministic per-conversation one up front instead of capturing a
+    # vendor-generated id off the event stream (and a failed persist self-heals,
+    # since the id is recomputable).
+    #
+    # ``--resume`` on an id qwen never recorded shows its blocking "No saved
+    # session found" screen, so the actual resume guard is the on-disk recording
+    # check (also covers the never-messaged edge and pre-convention sessions →
+    # clean fresh launch). qwen restores history into the TUI from its own
+    # checkpoint and emits only NEW events to ``--json-file`` on resume (verified),
+    # so the forwarder never re-mirrors the prior transcript — no duplicate bubbles.
+    existing_session_id = launch_config.external_session_id
+    qwen_session_id = existing_session_id or qwen_session_id_for_conversation(session_id)
+    # Scope the recording check to THIS workspace's qwen project slug: qwen
+    # resolves ``--resume`` per-project (cwd), so a recording made under another
+    # workspace must not pick ``--resume`` here (→ blocking "No saved session").
+    if qwen_session_recording_exists(qwen_session_id, workspace):
+        resume_args = ["--resume", qwen_session_id]
+    else:
+        resume_args = ["--session-id", qwen_session_id]
+    if existing_session_id != qwen_session_id:
+        # First launch (or a prior persist that didn't land): record the id so the
+        # next resume reads it from the snapshot and forks can carry history.
+        await _persist_qwen_external_session_id(server_client, session_id, qwen_session_id)
+    # The dual-output + input-file flags wire qwen to the bridge; any user
+    # ``terminal_launch_args`` (e.g. ``-m <model>``) precede them. Approval stays
+    # the default in-terminal prompt (the embedded pane shows it) — Omnigent-side
+    # gating via ``confirmation_response`` is a follow-up (see design doc).
+    qwen_args = [
+        *(launch_config.terminal_launch_args or []),
+        *resume_args,
+        "--input-file",
+        str(in_path),
+        "--json-file",
+        str(out_path),
+    ]
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="qwen",
+        session_key="main",
+        resource_role=QWEN_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            command=qwen_command,
+            args=qwen_args,
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    # Advertise the tmux socket+target so interrupt (Escape) / stop (kill) can
+    # reach this pane — message injection itself is file-based, not tmux.
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "qwen", "main")
+        if instance is not None and instance.running:
+            write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+
+    # Mirror the qwen TUI's conversation back into the Omnigent session so the
+    # chat view tracks the embedded terminal. Host-spawned sessions have no CLI
+    # client to start this, so the runner owns it — reusing the runner's own
+    # server URL + refresh-capable auth.
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
+    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+
+    from omnigent.qwen_native_forwarder import supervise_qwen_forwarder
+
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
+
+    _forwarder_task = asyncio.create_task(
+        supervise_qwen_forwarder(
+            base_url=server_url,
+            headers={},
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            agent_name="qwen-native-ui",
+            auth=_runner_auth,
+        ),
+        name=f"qwen-forwarder-{session_id}",
+    )
+    _register_auto_forwarder_task(session_id, _forwarder_task)
+    _logger.info(
+        "Auto-created qwen terminal + forwarder for session %s; forwarder_task=%s",
         session_id,
         _forwarder_task.get_name(),
     )
@@ -5295,6 +5510,7 @@ def create_runner_app(
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _cursor_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _goose_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _qwen_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     # Per-session lock guarding the claude-native terminal auto-create in
     # ``create_session``. Two ``POST /v1/sessions`` calls can land
     # concurrently on a host-launched runner — ``_on_runner_connect``
@@ -5716,6 +5932,27 @@ def create_runner_app(
             },
         )
         if event.lifecycle != TerminalLifecycle.REQUIRED:
+            return
+
+        # qwen-native: the user drives the qwen TUI directly, so quitting it
+        # (Ctrl+C / /quit) is a normal end-of-session, not a crash. The
+        # ``session_was_idle`` guard below is meant to catch a clean exit, but
+        # qwen's "powering down" redraw on quit trips the PTY-activity watcher
+        # and flips the status to ``running`` in the instant before the process
+        # exits — so the quit is misclassified as a crash and the scary
+        # ``required_terminal_exited`` card renders. Treat the qwen terminal's
+        # exit as a clean shutdown: genuine *boot* failures never reach here
+        # (they surface via ``_auto_create_qwen_terminal``'s error handler →
+        # ``_publish_native_terminal_start_error``), so a qwen required-terminal
+        # exit is always post-boot, i.e. user-initiated.
+        if event.terminal_name == "qwen" and event.session_key == "main":
+            # Publish a final ``idle`` to clear the web "Working…" spinner: the
+            # powering-down redraw may have left the PTY watcher's last edge on
+            # ``running``, and the watcher is gone once the pane dies, so without
+            # this the session spins forever. Then release the harness (no
+            # ``failed`` card — the user quit).
+            _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
+            _release_required_terminal_session(event.session_id)
             return
 
         # Exit while idle = the turn already finished and the pane shut down
@@ -6183,6 +6420,10 @@ def create_runner_app(
                 from omnigent.goose_native_bridge import build_goose_native_spawn_env
 
                 spawn_env = build_goose_native_spawn_env(session_id)
+            if harness_name == "qwen-native" and spawn_env is None:
+                from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
+
+                spawn_env = build_qwen_native_spawn_env(session_id)
             _session_spec_cache[session_id] = spec_entry
         else:
             harness_name = "runner-test-default"
@@ -6604,6 +6845,37 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        if harness_name == "qwen-native":
+            _qwen_ensure_lock = _qwen_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with _qwen_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_qwen_terminal = (
+                    _tr is not None and _tr.get(session_id, "qwen", "main") is not None
+                )
+                if not _has_qwen_terminal:
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        await _auto_create_qwen_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create qwen terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "qwen",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+
         # Auto-bootstrap the Omnigent REPL terminal for non-native
         # (SDK-harness) top-level sessions: host the framework's own TUI
         # (``omnigent attach``) in a tmux pane so the web UI can embed it
@@ -6873,6 +7145,7 @@ def create_runner_app(
         _pi_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
         _goose_terminal_ensure_locks.pop(session_id, None)
+        _qwen_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         # Stop any TUI→web transcript forwarder (cursor-/goose-native) for this
@@ -7483,6 +7756,7 @@ def create_runner_app(
             "pi-native",
             "cursor-native",
             "goose-native",
+            "qwen-native",
         }:
             return
         if status == "idle" and harness == "codex-native":
@@ -8259,6 +8533,78 @@ def create_runner_app(
         ):
             _logger.warning(
                 "Goose-native stop succeeded but sub-agent delivery was "
+                "not confirmed; session=%s reason=%s",
+                conv_id,
+                delivery_ack.reason,
+            )
+        return Response(status_code=204)
+
+    async def _handle_qwen_native_interrupt(conv_id: str) -> Response:
+        """Cancel the in-flight qwen turn by sending ``Escape`` to its TUI pane.
+
+        qwen-native turns run inside the ``qwen`` TUI; the runner harness task
+        returns right after appending the input-file submit, so the in-process
+        cancel floor has nothing to cancel. qwen's input-file protocol has no
+        interrupt command, so — like goose-native — Stop drives Escape through
+        the display pane.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 when Escape was sent; 503 if the tmux target is unavailable.
+        """
+        from omnigent.qwen_native_bridge import bridge_dir_for_session_id, inject_interrupt
+
+        try:
+            await asyncio.to_thread(
+                inject_interrupt, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "qwen_native_interrupt_failed",
+                    "detail": _client_safe_error_detail(exc, context="qwen-native interrupt"),
+                },
+            )
+        _wake_parent_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _handle_qwen_native_stop(conv_id: str) -> Response:
+        """Hard-stop a qwen-native session by killing its tmux session.
+
+        Mirrors :func:`_handle_goose_native_stop`: kill the pane (ends ``qwen``),
+        tear the terminal resource down, cancel the forwarder, publish ``idle``,
+        and reclaim any sub-agent work entry.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 on success; 503 if the tmux target is unavailable.
+        """
+        from omnigent.qwen_native_bridge import bridge_dir_for_session_id, kill_session
+
+        try:
+            await asyncio.to_thread(
+                kill_session, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "qwen_native_stop_failed",
+                    "detail": _client_safe_error_detail(exc, context="qwen-native stop"),
+                },
+            )
+        await _teardown_session_terminals(conv_id)
+        await _cancel_auto_forwarder_task(conv_id)
+        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        delivery_ack = _mark_subagent_terminal_and_wake(
+            conv_id,
+            status="cancelled",
+            output="[System: sub-agent stopped]",
+        )
+        if not delivery_ack.delivered and (
+            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
+        ):
+            _logger.warning(
+                "qwen-native stop succeeded but sub-agent delivery was "
                 "not confirmed; session=%s reason=%s",
                 conv_id,
                 delivery_ack.reason,
@@ -10216,6 +10562,10 @@ def create_runner_app(
             from omnigent.goose_native_bridge import build_goose_native_spawn_env
 
             spawn_env = build_goose_native_spawn_env(conv_id)
+        if harness_name == "qwen-native" and spawn_env is None:
+            from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
+
+            spawn_env = build_qwen_native_spawn_env(conv_id)
 
         agent_version = dispatch.agent_version if dispatch else body.get("agent_version")
         if agent_version is not None and conv_id in _version_cache:
@@ -11126,6 +11476,9 @@ def create_runner_app(
             if _harness == "goose-native":
                 # goose turn lives in the goose session TUI; send Escape to stop it.
                 return await _handle_goose_native_interrupt(conversation_id)
+            if _harness == "qwen-native":
+                # qwen turn lives in the qwen TUI; send Escape to stop it.
+                return await _handle_qwen_native_interrupt(conversation_id)
             # In-process harness: mark interrupted, forward an interrupt to the
             # harness, and force-cancel the runner turn task so the turn ends
             # promptly even if the harness can't honor the interrupt in time.
@@ -11199,6 +11552,9 @@ def create_runner_app(
             if _harness == "goose-native":
                 # Hard-kill the goose session tmux pane (the TUI is the runtime).
                 return await _handle_goose_native_stop(conversation_id)
+            if _harness == "qwen-native":
+                # Hard-kill the qwen tmux pane (the TUI is the runtime).
+                return await _handle_qwen_native_stop(conversation_id)
             await _cancel_inprocess_turn(conversation_id)
             return Response(status_code=204)
 
@@ -11900,6 +12256,41 @@ def create_runner_app(
                         session_id,
                     )
                     return _native_terminal_start_error_response(exc, "Goose")
+            return JSONResponse(
+                status_code=200,
+                content=session_resource_view_to_dict(terminal_view),
+            )
+
+        if (
+            body.get("ensure_native_terminal")
+            and terminal_name == "qwen"
+            and session_key == "main"
+        ):
+            qwen_terminal_id = terminal_resource_id("qwen", "main")
+            ensure_lock = _qwen_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with ensure_lock:
+                existing = await resource_registry.get_terminal_resource(
+                    session_id, qwen_terminal_id
+                )
+                if existing is not None:
+                    return JSONResponse(
+                        status_code=200,
+                        content=session_resource_view_to_dict(existing),
+                    )
+                try:
+                    terminal_view = await _auto_create_qwen_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        server_client=server_client,
+                        ensure_comment_relay=_ensure_comment_relay_started,
+                    )
+                except Exception as exc:
+                    _logger.exception(
+                        "qwen terminal ensure failed for session=%s",
+                        session_id,
+                    )
+                    return _native_terminal_start_error_response(exc, "qwen")
             return JSONResponse(
                 status_code=200,
                 content=session_resource_view_to_dict(terminal_view),
@@ -13381,6 +13772,7 @@ def create_runner_app(
         _pi_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
         _goose_terminal_ensure_locks.pop(session_id, None)
+        _qwen_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
         return JSONResponse(
@@ -13435,6 +13827,7 @@ def create_runner_app(
         _pi_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
         _goose_terminal_ensure_locks.pop(session_id, None)
+        _qwen_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         # Close terminals with ``session.resource.deleted`` events BEFORE
         # cleanup_session — cleanup_conversation would silently pop them

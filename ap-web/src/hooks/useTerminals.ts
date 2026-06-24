@@ -50,8 +50,8 @@ export const PANEL_NO_TERMINAL_KEY = "";
  * connection pill's Terminal view, runner-created per session shape:
  * the embedded Omnigent REPL (``tui``/``main``) for SDK sessions,
  * and the vendor pane (``claude``/``main``, ``codex``/``main``,
- * ``pi``/``main``, or ``cursor``/``main``) for native-wrapper sessions.
- * These are plumbing, not
+ * ``pi``/``main``, ``cursor``/``main``, ``goose``/``main``, or
+ * ``qwen``/``main``) for native-wrapper sessions. These are plumbing, not
  * part of the session's shell inventory, and at most one exists per session.
  *
  * Missing an entry here makes that pane read as a *user shell*: the
@@ -67,6 +67,7 @@ export const AGENT_TERMINAL_IDS: ReadonlySet<string> = new Set([
   "terminal_pi_main",
   "terminal_cursor_main",
   "terminal_goose_main",
+  "terminal_qwen_main",
 ]);
 
 /**

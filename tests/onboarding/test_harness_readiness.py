@@ -157,9 +157,12 @@ def test_configured_harness_map_covers_all_spellings(
         "opencode-native",
         "native-opencode",
         "opencode",
-        # Qwen harnesses
+        # Qwen harnesses — ACP (``qwen`` / ``qwen-code``) + native TUI
+        # (``qwen-native`` / ``native-qwen``); all gate on the qwen CLI.
         "qwen",
         "qwen-code",
+        "qwen-native",
+        "native-qwen",
         # Copilot SDK harness + its user-facing alias.
         "copilot",
         "github-copilot",
