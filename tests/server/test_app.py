@@ -561,6 +561,54 @@ def test_ensure_default_polly_agent_seeds_card(seed_stores: _SeedStores) -> None
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
 
+def test_ensure_default_antigravity_agent_seeds_card(seed_stores: _SeedStores) -> None:
+    """
+    Seeding registers antigravity-native-ui as a built-in the picker renders.
+
+    This is what makes "Antigravity" launchable from the web-UI new-session
+    picker next to Claude Code and Codex. The agent must be session-scope
+    NULL (a built-in) and carry the ``antigravity-native`` harness so the
+    runner boots the agy native terminal rather than an SDK harness.
+    """
+    server_app._ensure_default_antigravity_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    seeded = seed_stores.agent_store.get_by_name(server_app._ANTIGRAVITY_NATIVE_AGENT_NAME)
+    assert seeded is not None, "antigravity-native-ui was not registered"
+    assert seeded.name == "antigravity-native-ui"
+    # Built-ins are session-scope NULL so ``GET /v1/agents`` (which filters on
+    # ``session_id IS NULL``) returns them to the picker.
+    assert seeded.session_id is None
+    # The bundle must be retrievable, not just referenced.
+    assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+    # The materialized spec must carry the native harness — the contract the
+    # server's _native_terminal_runtime + runner auto-create key off.
+    loaded = seed_stores.agent_cache.load(seeded.id, seeded.bundle_location, expand_env=False)
+    assert loaded.spec.executor.config.get("harness") == "antigravity-native"
+
+
+def test_ensure_default_agents_includes_antigravity(seed_stores: _SeedStores) -> None:
+    """
+    The startup seeder registers the antigravity built-in alongside the others.
+
+    ``_ensure_default_agents`` is the single call the server lifespan makes; a
+    regression that drops the antigravity line would silently remove it from the
+    picker even though its helper still works.
+    """
+    server_app._ensure_default_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    assert (
+        seed_stores.agent_store.get_by_name(server_app._ANTIGRAVITY_NATIVE_AGENT_NAME) is not None
+    )
+
+
 def test_ensure_default_polly_agent_is_idempotent(seed_stores: _SeedStores) -> None:
     """
     A second seed call is a no-op — it must not register a duplicate.

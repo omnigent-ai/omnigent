@@ -3131,6 +3131,147 @@ async def test_post_external_output_text_delta_rejects_malformed_delta(
     assert published == []
 
 
+async def test_post_external_output_reasoning_delta_started_publishes_started_then_delta(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``external_output_reasoning_delta`` with ``started`` emits started + delta.
+
+    The antigravity-native reader uses this for a Gemini Thinking-model
+    ``plannerResponse.thinking`` stream. The first delta of a block sets
+    ``started`` so the route precedes the ``response.reasoning_text.delta`` with
+    one ``response.reasoning.started`` (the SPA new-block marker). Both events
+    must be visible on the SSE stream and nothing persisted to history (reasoning
+    has no completed item).
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def capture_publish(session_id: str, event: dict[str, Any]) -> None:
+        """
+        Capture session-stream events emitted by the route.
+
+        :param session_id: Session id passed to ``session_stream``.
+        :param event: Event payload published to the stream.
+        :returns: None.
+        """
+        published.append((session_id, event))
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        capture_publish,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_output_reasoning_delta",
+            "data": {"delta": "Let me think", "started": True},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+
+    assert published == [
+        (session["id"], {"type": "response.reasoning.started"}),
+        (
+            session["id"],
+            {"type": "response.reasoning_text.delta", "delta": "Let me think"},
+        ),
+    ]
+
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.status_code == 200, snap.text
+    assert snap.json()["items"] == []
+
+
+async def test_post_external_output_reasoning_delta_continuation_publishes_delta_only(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A continuation reasoning delta (``started`` false/omitted) emits delta only.
+
+    Only the first delta of a reasoning block opens it with
+    ``response.reasoning.started``; later deltas publish a bare
+    ``response.reasoning_text.delta``.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def capture_publish(session_id: str, event: dict[str, Any]) -> None:
+        """
+        Capture session-stream events emitted by the route.
+
+        :param session_id: Session id passed to ``session_stream``.
+        :param event: Event payload published to the stream.
+        :returns: None.
+        """
+        published.append((session_id, event))
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        capture_publish,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_output_reasoning_delta",
+            "data": {"delta": " more thought", "started": False},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    assert published == [
+        (
+            session["id"],
+            {"type": "response.reasoning_text.delta", "delta": " more thought"},
+        )
+    ]
+
+
+async def test_post_external_output_reasoning_delta_rejects_malformed_delta(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``external_output_reasoning_delta`` fails loud on a non-string delta.
+
+    Mirrors the text-delta validation: a malformed payload must not publish a
+    non-conforming ``response.reasoning_text.delta`` that strict SDK clients drop.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def capture_publish(session_id: str, event: dict[str, Any]) -> None:
+        """
+        Capture any accidental stream publish before validation fails.
+
+        :param session_id: Session id passed to ``session_stream``.
+        :param event: Event payload published to the stream.
+        :returns: None.
+        """
+        published.append((session_id, event))
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        capture_publish,
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_output_reasoning_delta", "data": {"delta": 123}},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "external_output_reasoning_delta requires string data.delta" in resp.text
+    assert published == []
+
+
 async def test_post_external_session_interrupted_publishes_session_interrupted(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

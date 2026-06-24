@@ -94,6 +94,7 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "native-cursor",
         "goose-native",
         "native-goose",
+        "hermes",
     ],
 )
 def test_cli_harness_configured_only_when_binary_installed(
@@ -153,6 +154,9 @@ def test_configured_harness_map_covers_all_spellings(
         "antigravity",
         "agy",
         "google-antigravity",
+        # Native Antigravity (agy) CLI-wrapping harness, both spellings.
+        "antigravity-native",
+        "native-antigravity",
         # Native OpenCode harness + its user-facing aliases.
         "opencode-native",
         "native-opencode",
@@ -166,6 +170,8 @@ def test_configured_harness_map_covers_all_spellings(
         # Copilot SDK harness + its user-facing alias.
         "copilot",
         "github-copilot",
+        # Hermes Agent harness — gates on the hermes CLI.
+        "hermes",
     }
     assert set(result) == expected_keys
 
@@ -198,6 +204,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
     # package and gates on a configured ``CURSOR_API_KEY``, not a binary —
     # covered separately. Native Cursor (``cursor-native`` / ``native-cursor``)
     # wraps the ``cursor-agent`` CLI, so it IS gated on the binary.)
+    # antigravity-native is also gated (it wraps the ``agy`` CLI); with no
+    # binary it reads False before its credential check is even reached.
     for cli in (
         "claude-native",
         "native-claude",
@@ -207,9 +215,12 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "pi",
         "cursor-native",
         "native-cursor",
+        "antigravity-native",
+        "native-antigravity",
         "goose-native",
         "native-goose",
         "qwen",
+        "hermes",
     ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
 
@@ -221,11 +232,17 @@ def test_configured_harness_map_all_true_with_clis(
     gated harnesses are satisfied.
 
     The CLI harnesses pass their binary check, the SDK harnesses are ungated,
-    cursor (key-gated) is satisfied by a ``CURSOR_API_KEY`` and copilot
-    (token-gated) by a ``GH_TOKEN`` — so nothing is reported unconfigured.
+    cursor (key-gated) is satisfied by a ``CURSOR_API_KEY``, copilot
+    (token-gated) by a ``GH_TOKEN``, and antigravity-native (binary + credential
+    gated) by a detected Gemini OAuth credential — so nothing is reported
+    unconfigured.
     """
+    import omnigent.onboarding.gemini_auth as _ga
+
     _all_clis_installed(monkeypatch)
     monkeypatch.setenv("CURSOR_API_KEY", "crsr_ready")
+    # antigravity-native also needs a credential (not just the ``agy`` binary).
+    monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
     monkeypatch.setenv("GH_TOKEN", "gho_ready")
     result = configured_harness_map()
     assert all(result.values())

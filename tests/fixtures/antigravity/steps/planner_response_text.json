@@ -1,0 +1,54 @@
+{
+  "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+  "status": "CORTEX_STEP_STATUS_DONE",
+  "metadata": {
+    "stepGenerationVersion": 1,
+    "createdAt": "2026-06-22T23:57:36.274762Z",
+    "viewableAt": "2026-06-22T23:57:37.464072Z",
+    "finishedGeneratingAt": "2026-06-22T23:57:37.623554Z",
+    "startedAt": "2026-06-22T23:57:37.623554Z",
+    "completedAt": "2026-06-22T23:57:37.623554Z",
+    "source": "CORTEX_STEP_SOURCE_MODEL",
+    "modelUsage": {
+      "model": "MODEL_PLACEHOLDER_M20",
+      "inputTokens": "17161",
+      "outputTokens": "65",
+      "thinkingOutputTokens": "44",
+      "responseOutputTokens": "21",
+      "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+      "responseHeader": {
+        "sessionID": "-3750763034362895579"
+      },
+      "responseId": "8Ms5asGCOprWz7IPuKvgkQ0"
+    },
+    "generatorModel": "MODEL_PLACEHOLDER_M20",
+    "requestedModel": {
+      "model": "MODEL_PLACEHOLDER_M20"
+    },
+    "executionId": "1df76a5f-0318-4c71-b31d-7e3b51a3d981",
+    "sourceTrajectoryStepInfo": {
+      "trajectoryId": "efb134b2-d69f-43de-bb54-c9ece346d8a3",
+      "stepIndex": 2,
+      "cascadeId": "2399249c-4a48-40f1-bf3b-4c6e5d3a5a0e"
+    },
+    "internalMetadata": {
+      "statusTransitions": [
+        {
+          "updatedStatus": "CORTEX_STEP_STATUS_GENERATING",
+          "timestamp": "2026-06-22T23:57:37.464300Z"
+        },
+        {
+          "updatedStatus": "CORTEX_STEP_STATUS_DONE",
+          "timestamp": "2026-06-22T23:57:37.623608Z"
+        }
+      ]
+    }
+  },
+  "plannerResponse": {
+    "response": "Hello! I am Antigravity, your AI coding assistant, ready to help you with your tasks.",
+    "modifiedResponse": "Hello! I am Antigravity, your AI coding assistant, ready to help you with your tasks.",
+    "thinkingSignature": "ErMCCrACAQw51sfJJYOCom5QDufrxzldT56oNEDhK1f/hmDI/LG1kmutzhw3+aiVbnKCNvw/BbfejFPRit94YF736kUsWkOWLqMaX8OuTmgbhABsYWTckkvg9s94E6LtRnFZVVRctEpvSod72Txy+gzNpFsf20IP7euzjW4kajn5mMrwoibjcGC+tvCCPpBGNXAYZFNLIbqMD28sjlh6Z/BS2aZwdIJso9EQiaYqpHMu7+vxbfm3R1BCAfPhttSpp4EPEcEttBo4b4bUAgVTTOZOzc1i9AUSvjDhvA2J8b42NLfLiwlda3eiWdJQFX/GfTVfWNMtBty39gqkSUwZrNO3BjWHq7xUlRF8iMBYbNj5vEU6XLLylGblvYZlIyuSyTCked8rR7nrnVIMYiUUPU9tEzjpJA==",
+    "messageId": "bot-643b4808-363a-4943-bcd2-bb6a7a29f2fd",
+    "stopReason": "STOP_REASON_STOP_PATTERN"
+  }
+}

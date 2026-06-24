@@ -32,4 +32,5 @@ def test_preserves_existing_sections_and_adds_missing_optional_context() -> None
     assert formatted.count("## Type of change") == 1
     assert "## ELI5" in formatted
     assert "## Diagram" in formatted
-    assert "## Coverage rationale" in formatted
+    assert "## Test Plan" in formatted
+    assert "## Coverage notes" in formatted

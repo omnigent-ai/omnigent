@@ -131,6 +131,11 @@ e2b = ["e2b>=2.26,<3"]
 # Self-hosted gRPC gateway; the SDK pulls grpcio + protobuf. Same
 # lazy-import posture as above. Pre-1.0 SDK: pin minor.
 openshell = ["openshell>=0.0.7,<1"]
+# On-demand Kubernetes runner Pod launcher (server-managed
+# `sandbox.provider: kubernetes`). The launcher module ships in the base
+# package and imports the official client lazily, so only users of the
+# provider need this extra.
+kubernetes = ["kubernetes>=36,<37"]
 # MLflow tracing is opt-in: tracing is disabled by default and the
 # server degrades gracefully when mlflow is absent, so the (heavy) mlflow
 # dependency only installs for users who want it (`omnigent[tracing]`).
@@ -301,6 +306,7 @@ pythonpath = [".", "sdks/python-client", "sdks/ui"]
 markers = [
     "live: end-to-end tests requiring real LLM API key (run with --llm-api-key)",
     "live_app: end-to-end tests requiring a deployed Databricks App server",
+    "databricks: requires the `databricks` extra (psycopg / databricks-sdk / mlflow). Deselected on the standard lanes via -m 'not databricks'; runs only in the Pytest (databricks) lane, which installs the extra. Use for tests that build a postgresql+psycopg engine or call the Databricks SDK.",
     "model(name, ...): one arg pins this test to that model overriding the suite-wide --model CLI default; multiple args fan the test out across all listed models via indirect parametrize.",
     "model_pinned: opt out of tests/_model_pools.py spreading and retry rotation; literal model strings are used as written.",
     "flaky(reruns=2, reruns_delay=0): rerun a nondeterministic test on failure (pytest-rerunfailures). Use for tests flaky due to timing/scheduling races (e.g. PTY drain timing), NOT real-LLM nondeterminism — those use llm_flaky, which rotates models per attempt.",
@@ -446,6 +452,13 @@ known-first-party = ["omnigent"]
 "omnigent/tools/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
+# The native Antigravity (agy) transcript forwarder / supervisor is a
+# long-lived boundary loop that must restart on ANY non-cancellation
+# Exception (a crash there silently stops the web transcript mirror), so its
+# top-level catch is a deliberate, documented boundary catch — BLE001 is
+# waived for these top-level antigravity_native modules (see the inline
+# comments at each catch site).
+"omnigent/antigravity_native*.py" = ["BLE001"]
 "sdks/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
@@ -544,6 +557,12 @@ ignore_missing_imports = true
 # as modal above.
 [[tool.mypy.overrides]]
 module = "boxlite.*"
+ignore_missing_imports = true
+
+# kubernetes is an optional dep (the `kubernetes` extra); same lazy-import
+# posture as modal above. urllib3 rides in via the kubernetes client.
+[[tool.mypy.overrides]]
+module = "kubernetes.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
