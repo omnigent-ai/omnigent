@@ -404,8 +404,9 @@ class CompactionData(BaseModel):
 
     summary: str
     last_item_id: str
-    model: str
+    model: str | None = None
     token_count: int
+    compacted_messages: list[dict[str, Any]] | None = None
 
 
 class NativeToolData(BaseModel):

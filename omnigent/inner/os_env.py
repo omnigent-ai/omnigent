@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, TypeAlias, cast
 from urllib.parse import urlparse, urlunparse
 
+from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
@@ -33,6 +34,7 @@ from .credential_proxy import (
 )
 from .datamodel import CredentialProxySpec, OSEnvSpec
 from .sandbox import (
+    ContainmentHandle,
     SandboxPolicy,
     activate_sandbox,
     cleanup_private_tmpdir,
@@ -129,6 +131,9 @@ _DEFAULT_ENV_PASSTHROUGH: tuple[str, ...] = (
     # way CLAUDE_CODE / CODEX are visible in their agents' shells. Set on
     # the runner via runner.identity.OMNIGENT_SESSION_ENV_VAR.
     OMNIGENT_SESSION_ENV_VAR,
+    # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
+    # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
+    *WINDOWS_ENV_PASSTHROUGH,
 )
 
 
@@ -336,6 +341,10 @@ class _HelperProcessClient:
         # helper itself. Cleared in :meth:`_stop_egress_proxy_locked`.
         self._egress_relay_port: int | None = None
         self._proc: subprocess.Popen[str] | None = None
+        # Parent-held containment handle from the sandbox backend's
+        # post_spawn hook (e.g. a Windows Job Object). Closed in
+        # ``_stop_locked`` to tear down the helper's process tree.
+        self._sandbox_handle: ContainmentHandle | None = None
         self._tmpdir: Path | None = None
         self._egress_proxy: Any | None = None  # EgressProxy when active
         self._egress_loop: Any | None = None  # asyncio event loop for proxy
@@ -538,6 +547,15 @@ class _HelperProcessClient:
             with contextlib.suppress(OSError):
                 os.close(r_fd)
 
+        # Post-spawn containment (parent side). A no-op for the POSIX
+        # launcher backends (they isolate via wrap_launcher_argv before
+        # exec); on Windows this assigns the helper to a kill-on-close
+        # Job Object so the whole tree is torn down in ``_stop_locked``.
+        if sandbox.active and self._proc.pid is not None:
+            self._sandbox_handle = get_backend(sandbox.backend_type).post_spawn(
+                sandbox, self._proc.pid
+            )
+
     def _helper_exit_detail_locked(self) -> str:
         if self._proc is None:
             return "OS environment helper exited unexpectedly"
@@ -581,6 +599,13 @@ class _HelperProcessClient:
                     with contextlib.suppress(Exception):
                         proc.kill()
         finally:
+            # Release the containment handle (Windows Job Object): with
+            # kill-on-close this also reaps any helper descendants that
+            # outlived ``proc.terminate()`` above.
+            if self._sandbox_handle is not None:
+                with contextlib.suppress(Exception):
+                    self._sandbox_handle.close()
+                self._sandbox_handle = None
             self._stop_egress_proxy_locked()
             cleanup_private_tmpdir(self._tmpdir)
             self._tmpdir = None
@@ -853,7 +878,11 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
             "os_env.start_in_scratch requires an active sandbox; "
             f"resolved sandbox type {sandbox.backend_type!r} is inactive"
         )
-    shell_path = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+    shell_path = shutil.which("bash") or shutil.which("sh")
+    if shell_path is None:
+        # No POSIX shell on PATH. On Windows fall back to cmd.exe; elsewhere
+        # keep the historical /bin/sh default.
+        shell_path = os.environ.get("COMSPEC", "cmd.exe") if IS_WINDOWS else "/bin/sh"
     egress_rules = spec.sandbox.egress_rules if spec.sandbox else None
     egress_allow_private = (
         spec.sandbox.egress_allow_private_destinations if spec.sandbox else False
@@ -1357,8 +1386,12 @@ def _is_within(path: Path, root: Path) -> bool:
 
 
 def _shell_argv(shell_path: str, command: str) -> list[str]:
-    shell_name = Path(shell_path).name
-    if shell_name == "bash":
+    shell_name = Path(shell_path).name.lower()
+    if shell_name in ("cmd.exe", "cmd"):
+        return [shell_path, "/c", command]
+    if shell_name in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
+        return [shell_path, "-NoProfile", "-Command", command]
+    if shell_name in ("bash", "bash.exe"):
         return [shell_path, "--noprofile", "--norc", "-c", command]
     return [shell_path, "-c", command]
 

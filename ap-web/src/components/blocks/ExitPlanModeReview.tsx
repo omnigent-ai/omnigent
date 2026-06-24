@@ -46,7 +46,12 @@ export function ExitPlanModeReview({
 
   return (
     <div className="flex flex-col gap-2" data-testid="exit-plan-mode-review">
-      <div className="text-sm">
+      {/* text-foreground: the plan body is the card's primary content, so it
+          renders in normal text color like a regular assistant message —
+          escaping AlertDescription's muted default (which otherwise washes
+          the whole plan out). The short lead-in caption above stays muted
+          for hierarchy, matching the Codex command card. */}
+      <div className="text-sm text-foreground">
         <MessageResponse>{plan}</MessageResponse>
       </div>
       {rejecting ? (

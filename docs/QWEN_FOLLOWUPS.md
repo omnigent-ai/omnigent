@@ -60,6 +60,18 @@ Tracks pending work and known limitations for the Qwen Code harness
   spawn (`_sandbox_launch_path`), confining qwen's own file/shell tools to the
   spec's read/write roots — an OS-level guarantee independent of the per-tool
   permission gate.
+- **File I/O delegation (`fs/*`).** When an `os_env` is configured, the executor
+  advertises `clientCapabilities.fs` in `initialize`, so qwen routes its file
+  reads/writes back to us as `fs/read_text_file` / `fs/write_text_file` requests
+  (qwen's `AcpFileSystemService` swaps in only when the capability is set). The
+  handlers execute the I/O through the Omnigent `OSEnvironment`, so the spec's
+  sandbox read/write roots are enforced at the Python layer — and the bytes flow
+  through Omnigent rather than qwen touching disk directly. Disabled (qwen uses
+  its own tools) when there's no `os_env` or it's a `fork` env (a forked tree's
+  path would diverge from the qwen subprocess cwd). Binary/non-UTF-8 reads are
+  refused; missing-file reads map to qwen's ENOENT code. (Same fix applied to
+  the goose ACP harness.) See the Pending item below for what's still out of
+  scope (event recording / TOOL_RESULT-phase content policy).
 
 ## Pending work
 
@@ -100,15 +112,14 @@ comments; this is the *what*, not the *how*.)
 - [ ] **Omnigent tools.** Qwen can only call its own built-in tools; tools
   defined by Omnigent aren't exposed to it (so they can't be invoked or
   recorded). Permission gating on qwen's *own* tool calls already works.
-- [ ] **File I/O execution / content recording.** Qwen performs file reads and
-  writes with its own tools (we don't advertise `clientCapabilities.fs`), so
-  Omnigent never executes the I/O and can't record the file content or run
-  TOOL_RESULT-phase content policy on it. Note the gaps that are *already*
-  closed: the TOOL_CALL request is gated (permission + policy) when qwen asks,
-  and the ops are confined when `os_env.sandbox` is set (see What works today).
-  What's missing is Omnigent-side execution/recording of the I/O itself —
-  advertise `clientCapabilities.fs` + re-add `fs/read_text_file` /
-  `fs/write_text_file` handlers to route it through Omnigent.
+- [ ] **File I/O recording / content policy.** Omnigent now *executes* delegated
+  file reads/writes through the `OSEnvironment` (see "File I/O delegation" in
+  What works today), so the bytes flow through Omnigent and the sandbox roots are
+  enforced. Still missing on top of that: (a) emitting the I/O into Omnigent's
+  event stream (ToolCall-style records) so it shows in history, and (b) running
+  TOOL_RESULT-phase content policy on the read/written content. Both build on the
+  `_handle_fs_read` / `_handle_fs_write` handlers — the byte-level hook now
+  exists; this is wiring the recording/policy layers onto it.
 
 > LLM-phase policy (`PHASE_LLM_REQUEST` / `PHASE_LLM_RESPONSE`) is intentionally
 > out of scope: qwen's model calls happen internally over ACP and are opaque to

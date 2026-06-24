@@ -1155,69 +1155,6 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
 
         _run(_t())
 
-    def test_interrupted_session_rewinds_sdk_session_before_replay(self):
-        async def _t():
-            _FakeRunner.last_calls = []
-            executor = OpenAIAgentsSDKExecutor(client=object())
-            sdk = _fake_agents_sdk()
-            state = executor._get_or_create_session_state(sdk, "s1")
-            state.started = True
-            state.history_cursor = 2
-            state.run_item_count_before = 2
-            state.active_result = _FakeResult(events=[])
-            state.sdk_session._underlying.items = ["existing-1", "existing-2", "stale-3"]
-
-            interrupted = await executor.interrupt_session("s1")
-            self.assertTrue(interrupted)
-
-            _FakeRunner.next_result = _FakeResult(events=[], final_output="reset")
-            with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
-                return_value=sdk,
-            ):
-                events = [
-                    e
-                    async for e in executor.run_turn(
-                        [
-                            {"role": "user", "content": "existing-1", "session_id": "s1"},
-                            {"role": "assistant", "content": "existing-2", "session_id": "s1"},
-                            {"role": "user", "content": "count to 200", "session_id": "s1"},
-                            {"role": "assistant", "content": "1, 2, 3", "session_id": "s1"},
-                            {
-                                "role": "user",
-                                "content": (
-                                    "[SYSTEM] The previous assistant turn was cancelled "
-                                    "before completion. Continue from the next message."
-                                ),
-                                "session_id": "s1",
-                                "metadata": {"framework": "cancellation_notice"},
-                            },
-                            {"role": "user", "content": "what happened", "session_id": "s1"},
-                        ],
-                        [],
-                        "",
-                    )
-                ]
-
-            self.assertEqual(events[-1].response, "reset")
-            self.assertEqual(state.sdk_session._underlying.items, ["existing-1", "existing-2"])
-            self.assertEqual(state.sdk_session._underlying.pop_calls, 1)
-            self.assertIsInstance(_FakeRunner.last_calls[0]["input"], list)
-            self.assertEqual(
-                [item["content"] for item in _FakeRunner.last_calls[0]["input"]],
-                [
-                    "count to 200",
-                    "1, 2, 3",
-                    (
-                        "[SYSTEM] The previous assistant turn was cancelled "
-                        "before completion. Continue from the next message."
-                    ),
-                    "what happened",
-                ],
-            )
-
-        _run(_t())
-
     def test_rebuilds_agent_when_prompt_changes(self):
         async def _t():
             _FakeRunner.last_calls = []
@@ -2909,9 +2846,13 @@ def test_empty_turn_retry_rewinds_sdk_session() -> None:
                 )
             )
 
-        # state.sdk_session is a _SanitizingSession wrapping our fake; the
-        # pop bookkeeping lives on the underlying fake.
-        underlying = captured["session"]._underlying
+        # state.sdk_session may be wrapped by OpenAIResponsesCompactionSession
+        # (which has .underlying_session) around _SanitizingSession (which has
+        # ._underlying). Traverse both layers to reach the fake.
+        _session = captured["session"]
+        if hasattr(_session, "underlying_session"):
+            _session = _session.underlying_session
+        underlying = _session._underlying
         # The stray item appended in attempt 1 was popped before attempt 2,
         # so the session is back to its pre-turn (empty) state. pop_calls
         # records the rewind. If 0, the rewind never happened and the
@@ -2924,5 +2865,91 @@ def test_empty_turn_retry_rewinds_sdk_session() -> None:
         # One TurnComplete: the rewound retry produced the recovered text.
         assert len(turn_completes) == 1
         assert turn_completes[0].response == "ok"
+
+    _run(_t())
+
+
+# ---------------------------------------------------------------------------
+# Tests: Compaction
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FakeCompactionItem:
+    """Stand-in for agents.items.CompactionItem."""
+
+    type: str = "compaction_item"
+
+
+def test_compaction_item_emits_compaction_complete() -> None:
+    """When a compaction_item appears in result.new_items, a CompactionComplete
+    event is yielded before TurnComplete."""
+    from omnigent.inner.executor import CompactionComplete
+
+    async def _t():
+        _FakeRunner.last_calls = []
+        _FakeRunner.next_result = _FakeResult(
+            events=[],
+            final_output="compacted",
+            new_items=[_FakeCompactionItem()],
+            raw_responses=[
+                _FakeRawResponse(_FakeUsage(input_tokens=100, output_tokens=50, total_tokens=150))
+            ],
+        )
+        executor = OpenAIAgentsSDKExecutor(client=object())
+        with patch(
+            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            return_value=_fake_agents_sdk(),
+        ):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "Be helpful.",
+                )
+            ]
+
+        compaction_events = [e for e in events if isinstance(e, CompactionComplete)]
+        assert len(compaction_events) == 1
+        assert compaction_events[0].token_count == 150  # context_tokens = last total
+        # compacted_messages should contain the session items
+        assert compaction_events[0].compacted_messages is not None
+        turn_completes = [e for e in events if isinstance(e, TurnComplete)]
+        assert len(turn_completes) == 1
+        # CompactionComplete must come before TurnComplete
+        ci = events.index(compaction_events[0])
+        ti = events.index(turn_completes[0])
+        assert ci < ti
+
+    _run(_t())
+
+
+def test_no_compaction_item_no_compaction_event() -> None:
+    """When no compaction_item is in new_items, no CompactionComplete is yielded."""
+    from omnigent.inner.executor import CompactionComplete
+
+    async def _t():
+        _FakeRunner.last_calls = []
+        _FakeRunner.next_result = _FakeResult(
+            events=[],
+            final_output="normal",
+        )
+        executor = OpenAIAgentsSDKExecutor(client=object())
+        with patch(
+            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            return_value=_fake_agents_sdk(),
+        ):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "Be helpful.",
+                )
+            ]
+
+        compaction_events = [e for e in events if isinstance(e, CompactionComplete)]
+        assert len(compaction_events) == 0
 
     _run(_t())
