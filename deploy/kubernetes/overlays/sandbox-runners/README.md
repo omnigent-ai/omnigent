@@ -71,6 +71,11 @@ git credentials — see [Model credentials](#model-credentials-llm-keys) and
 [Git credentials](#git-credentials-private-repositories) below for which keys to
 set (and a sealed-secret / external-secrets operator for production).
 
+> **The `secret_name` Secret must exist before the first managed launch.** Its
+> `envFrom` is non-optional, so a runner Pod whose Secret is missing never starts
+> — it stalls in `CreateContainerConfigError` rather than launching without
+> credentials. Create it (step 2) right after the `kubectl apply -k` in step 1.
+
 ## Server auth (managed hosts)
 
 There are two kinds of credential here: the **server-connection** auth below, and
@@ -143,6 +148,9 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
   for the clone step).
 - **403 on launch:** the server SA is missing the Role — re-apply this overlay
   and confirm the cross-namespace RoleBinding subject namespace is `omnigent`.
+- **Runner Pod stuck in `CreateContainerConfigError`:** the `secret_name` Secret
+  (`omnigent-creds`) doesn't exist in the runner namespace — its `envFrom` is
+  non-optional, so the Pod can't start. Create it (see [Apply](#apply)).
 - **Host comes online but the session hangs / 403s on the first message:** the
   server is using the built-in `accounts` provider, which doesn't support the
   managed runner dial-back — see [Server auth](#server-auth-managed-hosts) (use
