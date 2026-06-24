@@ -240,8 +240,24 @@
         "type": "object"
       },
       "CompactionCompletedEvent": {
-        "description": "Conversation history compaction has finished.\n\nEmitted by ``omnigent/server/routes/sessions.py`` after\n``compact_conversation_now()`` returns successfully. Clients\nthat rendered a \"Compacting\u2026\" spinner on\n:class:`CompactionInProgressEvent` should upgrade it to the\npermanent \"Conversation compacted\" marker on this event.\n\n:param type: Always ``\"response.compaction.completed\"``.\n:param total_tokens: Tiktoken estimate of the post-compaction\n    message context size, e.g. ``8421``. Used by clients to\n    update the context-ring immediately without waiting for the\n    next ``response.completed`` usage report. ``None`` when\n    token counting is unavailable.",
+        "description": "Conversation history compaction has finished.\n\nEmitted after compaction completes \u2014 either by the server after\n``compact_conversation_now()`` (explicit ``/compact``), or by a\nharness that compacted its own internal context. Clients that\nrendered a \"Compacting\u2026\" spinner on\n:class:`CompactionInProgressEvent` should upgrade it to the\npermanent \"Conversation compacted\" marker on this event.\n\nWhen emitted by a harness, ``summary`` and ``summary_model``\nare populated so the runner can persist a compaction item for\nsession resume. When emitted by the server's explicit\n``/compact`` path, those fields are ``None``.\n\n:param type: Always ``\"response.compaction.completed\"``.\n:param total_tokens: Tiktoken estimate of the post-compaction\n    message context size, e.g. ``8421``. Used by clients to\n    update the context-ring immediately without waiting for the\n    next ``response.completed`` usage report. ``None`` when\n    token counting is unavailable.\n:param summary: Text summary of the compacted conversation,\n    or ``None`` for server-side compaction (already persisted).\n:param summary_model: Model used for summarization, or ``None``\n    if truncation-based or server-side.",
         "properties": {
+          "compacted_messages": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Compacted Messages"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -253,6 +269,30 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Summary"
+          },
+          "summary_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Summary Model"
           },
           "total_tokens": {
             "anyOf": [

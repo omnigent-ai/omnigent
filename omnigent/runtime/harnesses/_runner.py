@@ -50,6 +50,9 @@ from types import FrameType
 import uvicorn
 from fastapi import FastAPI
 
+from omnigent._platform import IS_WINDOWS
+from omnigent.inner import _proc
+
 # uvicorn log level for harness subprocesses. ``"warning"`` keeps
 # the per-process noise low (AP and the harness wrap both emit
 # their own structured logs); set to ``"info"`` if you need to
@@ -227,19 +230,21 @@ def _start_parent_watchdog(parent_pid: int) -> threading.Thread:
     def _watch() -> None:
         while True:
             time.sleep(_PARENT_POLL_INTERVAL_S)
-            if os.getppid() != parent_pid:
+            # On POSIX a changed getppid (reparented to init) is a PID-reuse-
+            # proof death signal. On Windows there is no reparenting and
+            # os.getppid() is unreliable (the venv launcher breaks the parent
+            # link), so it would falsely report the parent gone the instant
+            # the watchdog starts; rely solely on the explicit liveness probe.
+            if not IS_WINDOWS and os.getppid() != parent_pid:
                 _request_shutdown_with_hard_exit("parent process exit")
                 return
-            try:
-                os.kill(parent_pid, 0)
-            except ProcessLookupError:
+            # Not ``os.kill(parent_pid, 0)``: on Windows that maps to
+            # TerminateProcess and would kill the parent. ``process_alive``
+            # treats a not-introspectable process as alive (same semantics
+            # as the old PermissionError branch).
+            if not _proc.process_alive(parent_pid):
                 _request_shutdown_with_hard_exit("parent process exit")
                 return
-            except PermissionError:
-                # Process exists but we can't signal it — treat
-                # as alive (same semantics as ``_pid_alive`` in
-                # ``process_manager.py``).
-                pass
 
     t = threading.Thread(target=_watch, name="harness-parent-watchdog", daemon=True)
     t.start()
@@ -288,8 +293,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--socket",
-        required=True,
-        help="Absolute Unix socket path to bind.",
+        default=None,
+        help="Absolute Unix socket path to bind (POSIX). Mutually exclusive with --bind.",
+    )
+    parser.add_argument(
+        "--bind",
+        default=None,
+        help=(
+            "TCP loopback endpoint 'host:port' to bind (Windows, which has no "
+            "usable filesystem UDS). Mutually exclusive with --socket."
+        ),
     )
     parser.add_argument(
         "--conversation-id",
@@ -333,16 +346,23 @@ def main(argv: list[str] | None = None) -> None:
     if args.parent_pid is not None:
         _set_pdeathsig()
         _start_parent_watchdog(args.parent_pid)
-    # ``uds=`` binds to the Unix socket path Omnigent allocated for this
-    # conversation. ``log_level`` keeps per-process noise low — see
-    # ``_UVICORN_LOG_LEVEL`` constant.
-    # ``timeout_graceful_shutdown`` bounds how long uvicorn waits
-    # for active connections after SIGTERM before force-exiting.
+    # Bind the endpoint Omnigent allocated for this conversation: a Unix socket
+    # path (``--socket``, POSIX) or a TCP loopback host:port (``--bind``,
+    # Windows). ``log_level`` keeps per-process noise low — see
+    # ``_UVICORN_LOG_LEVEL``. ``timeout_graceful_shutdown`` bounds how long
+    # uvicorn waits for active connections after SIGTERM before force-exiting.
+    if args.socket:
+        bind_kwargs: dict[str, object] = {"uds": args.socket}
+    elif args.bind:
+        host, _, port = args.bind.rpartition(":")
+        bind_kwargs = {"host": host, "port": int(port)}
+    else:
+        sys.exit("runner: exactly one of --socket or --bind is required")
     config = uvicorn.Config(
         app,
-        uds=args.socket,
         log_level=_UVICORN_LOG_LEVEL,
         timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        **bind_kwargs,
     )
     _HardExitServer(config).run()
 
