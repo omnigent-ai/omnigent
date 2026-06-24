@@ -50,6 +50,7 @@ from types import FrameType
 import uvicorn
 from fastapi import FastAPI
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.inner import _proc
 
 # uvicorn log level for harness subprocesses. ``"warning"`` keeps
@@ -229,7 +230,12 @@ def _start_parent_watchdog(parent_pid: int) -> threading.Thread:
     def _watch() -> None:
         while True:
             time.sleep(_PARENT_POLL_INTERVAL_S)
-            if os.getppid() != parent_pid:
+            # On POSIX a changed getppid (reparented to init) is a PID-reuse-
+            # proof death signal. On Windows there is no reparenting and
+            # os.getppid() is unreliable (the venv launcher breaks the parent
+            # link), so it would falsely report the parent gone the instant
+            # the watchdog starts; rely solely on the explicit liveness probe.
+            if not IS_WINDOWS and os.getppid() != parent_pid:
                 _request_shutdown_with_hard_exit("parent process exit")
                 return
             # Not ``os.kill(parent_pid, 0)``: on Windows that maps to

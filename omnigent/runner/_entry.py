@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, cast
 import httpx
 from fastapi import FastAPI
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
 
@@ -433,17 +434,25 @@ def _parent_process_is_alive(parent_pid: int) -> bool:
 def _parent_is_orphaned(parent_pid: int) -> bool:
     """Return whether this process has been orphaned by *parent_pid*.
 
-    The runner is launched as a direct child of ``parent_pid``, so
+    The runner is launched as a direct child of ``parent_pid``, so on POSIX
     ``getppid()`` equals it until the parent dies — at which point the OS
     reparents us to init / a subreaper and ``getppid()`` changes. That
     reparent signal is immune to PID reuse, which can otherwise make the
-    ``os.kill(pid, 0)`` liveness probe succeed against an unrelated process
-    that recycled the dead parent's pid (seen on busy CI hosts).
+    liveness probe succeed against an unrelated process that recycled the
+    dead parent's pid (seen on busy CI hosts).
+
+    Windows has no reparenting, AND ``os.getppid()`` is unreliable there: the
+    interpreter launcher in a venv breaks the parent link, so ``getppid()``
+    does not match the spawning process. Using it would report the runner
+    orphaned the instant it starts, tearing it down immediately. So on Windows
+    rely solely on an explicit liveness probe of the passed-in ``parent_pid``.
 
     :param parent_pid: The launcher's process id, e.g. ``12345``.
     :returns: ``True`` once the parent is gone, otherwise ``False``.
     """
-    return os.getppid() != parent_pid or not _parent_process_is_alive(parent_pid)
+    if not IS_WINDOWS and os.getppid() != parent_pid:
+        return True
+    return not _parent_process_is_alive(parent_pid)
 
 
 def _run_parent_death_killer(

@@ -232,6 +232,18 @@ def test_helper_env_keeps_systemroot_so_child_can_import_asyncio() -> None:
 
 
 @pytest.mark.windows_only
+def test_parent_death_watchdog_does_not_false_fire_on_windows() -> None:
+    # Regression: on Windows os.getppid() does not match the spawner (the venv
+    # launcher breaks the parent link), so the getppid-based orphan check
+    # reported the runner orphaned the instant it started and tore it down
+    # (clean exit 0). With a live parent_pid the runner must NOT be orphaned.
+    from omnigent.runner._entry import _parent_is_orphaned
+
+    assert _parent_is_orphaned(os.getpid()) is False
+    assert _parent_is_orphaned(2_000_000_000) is True
+
+
+@pytest.mark.windows_only
 def test_host_runner_env_lets_child_import_asyncio_and_resolve_home() -> None:
     # Regression: the host->runner env allowlist dropped SYSTEMROOT (asyncio /
     # WinError 10106) and USERPROFILE (Path.home() -> "Could not determine home
