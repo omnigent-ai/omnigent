@@ -323,6 +323,108 @@ async def test_run_turn_streams_text_and_usage() -> None:
     assert completes[0].usage == {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
 
 
+def test_history_prefix_serializes_prior_turns() -> None:
+    """_history_prefix renders prior turns as labeled role: content lines."""
+    prior = [
+        {"role": "user", "content": "what is 2+2"},
+        {"role": "assistant", "content": [{"type": "output_text", "text": "4"}]},
+    ]
+    out = GooseExecutor._history_prefix(prior)
+    assert out.startswith("Conversation so far:")
+    assert "user: what is 2+2" in out
+    assert "assistant: 4" in out
+    assert out.rstrip().endswith("using the conversation above as context.")
+
+
+@pytest.mark.asyncio
+async def test_run_turn_replays_history_on_fresh_session() -> None:
+    """A fresh Goose session folds prior turns into the prompt (e.g. /model respawn).
+
+    Goose normally only sees the latest user turn; on a brand-new subprocess
+    that would drop everything before the switch, so the first turn replays
+    the transcript to keep context.
+    """
+    executor = GooseExecutor()
+    executor._initialized = True
+    executor._session_id = "20260623_fresh"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    loop = asyncio.get_event_loop()
+
+    sent_prompts: list[str] = []
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            sent_prompts.append(msg["params"]["prompt"][0]["text"])
+            req_id = msg["id"]
+
+            def _resolve() -> None:
+                fut = executor._pending.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(
+                        {"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}}
+                    )
+
+            loop.call_soon(_resolve)
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    messages = [
+        {"role": "user", "content": "remember 42"},
+        {"role": "assistant", "content": "ok, 42"},
+        {"role": "user", "content": "what number?"},
+    ]
+    async for _ in executor.run_turn(messages, [], "SYS"):
+        pass
+
+    prompt = sent_prompts[0]
+    assert prompt.startswith("SYS\n\n")
+    assert "Conversation so far:" in prompt
+    assert "user: remember 42" in prompt
+    assert "assistant: ok, 42" in prompt
+    assert prompt.rstrip().endswith("user: what number?")
+
+
+@pytest.mark.asyncio
+async def test_run_turn_no_replay_on_continuing_session() -> None:
+    """A continuing Goose session sends only the latest turn (it retains context)."""
+    executor = GooseExecutor()
+    executor._initialized = True
+    executor._session_id = "20260623_cont"
+    executor._system_prompt_sent = True  # not a fresh session
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    loop = asyncio.get_event_loop()
+
+    sent_prompts: list[str] = []
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            sent_prompts.append(msg["params"]["prompt"][0]["text"])
+            req_id = msg["id"]
+
+            def _resolve() -> None:
+                fut = executor._pending.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(
+                        {"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}}
+                    )
+
+            loop.call_soon(_resolve)
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    messages = [
+        {"role": "user", "content": "earlier"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "latest"},
+    ]
+    async for _ in executor.run_turn(messages, [], "SYS"):
+        pass
+
+    assert sent_prompts[0] == "latest"
+
+
 @pytest.mark.asyncio
 async def test_close_with_no_process_is_a_noop() -> None:
     await GooseExecutor().close()  # must not raise
