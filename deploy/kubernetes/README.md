@@ -243,6 +243,34 @@ security contexts:
 kubectl kustomize deploy/kubernetes/overlays/openshift-postgres/ | oc apply -f -
 ```
 
+## On-demand sandbox runners
+
+The `overlays/sandbox-runners/` overlay turns on the **`kubernetes`** managed
+sandbox provider: a `host_type: managed` session spawns one runner Pod that runs
+`omnigent host` as its entrypoint and dials back over the launch-token tunnel. It
+adds a dedicated runner namespace, a least-privilege server SA (scoped Pod +
+Secret rights, **no `pods/exec`**), and the `sandbox:` server config. The server
+image must be built with the `kubernetes` extra
+(`--build-arg OMNIGENT_EXTRAS=kubernetes`). See
+`overlays/sandbox-runners/README.md` for the full guide.
+
+```bash
+# set the server image in overlays/sandbox-runners/kustomization.yaml first
+kubectl apply -k deploy/kubernetes/overlays/sandbox-runners
+# then create the omnigent-creds harness Secret (see the overlay README)
+```
+
+**Credentials & auth** — two separate concerns, don't conflate:
+
+- **Server auth.** Front the server with `header`/`oidc` auth or run single-user;
+  the built-in `accounts` mode refuses the per-session runner dial-back (`403`),
+  a framework-level limit shared by all sandbox providers — see [Auth](../README.md#auth).
+- **Model keys** (`ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / `OPENAI_API_KEY`
+  / `GIT_TOKEN` / …) ride the `omnigent-creds` Secret projected into every runner Pod.
+
+Both are detailed in
+[`overlays/sandbox-runners/README.md`](overlays/sandbox-runners/README.md#server-auth-managed-hosts).
+
 ## Verify the deployment
 
 Check the rollout and reach the server without a public domain:

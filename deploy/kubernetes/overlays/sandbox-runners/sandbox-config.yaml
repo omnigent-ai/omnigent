@@ -1,0 +1,39 @@
+---
+# ConfigMap supplying the server's `sandbox:` section. The managed-sandbox backend
+# is read from the OMNIGENT_CONFIG file (not the env-based omnigent-config
+# ConfigMap); deployment-patch.yaml mounts this at /etc/omnigent and points
+# OMNIGENT_CONFIG at it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: omnigent-sandbox-config
+  namespace: omnigent # mounted by the server Pod
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: server
+data:
+  config.yaml: |
+    sandbox:
+      provider: kubernetes
+      # URL the runner Pod's host dials back to. In-cluster service DNS (the base
+      # Service listens on port 80) is simplest; use your ingress URL if runner
+      # Pods must reach the server through it.
+      server_url: http://omnigent.omnigent.svc.cluster.local
+      kubernetes:
+        # Runner-Pod namespace (secret_name / service_account resolve here).
+        namespace: omnigent-sandboxes
+        # Harness LLM/git creds projected into every Pod via envFrom. Created out
+        # of band (see README "Apply") — separate from the per-Pod launch-token Secret.
+        secret_name: omnigent-creds
+        # ServiceAccount the runner Pods run as (deliberately powerless).
+        service_account: omnigent-runner
+        # ── all optional below ──
+        # image: ghcr.io/your-org/omnigent-host:latest  # default: official amd64 host image
+        # env: [PROXY_URL]           # SERVER env vars injected as literal Pod env (prefer secret_name for creds)
+        # node_selector:             # extra node labels, merged with the mandatory kubernetes.io/arch: amd64
+        #   disktype: ssd
+        # resources:                 # runner Pod sizing (defaults: 0.5-2 cpu / 1-4Gi)
+        #   requests: {cpu: "500m", memory: "1Gi"}
+        #   limits: {cpu: "2", memory: "4Gi"}
+        # in_cluster: true           # config source: true=in-cluster SA only, false=kubeconfig only, omit=try both
+        # kubeconfig: /path/to/config  # out-of-cluster kubeconfig (env: OMNIGENT_KUBERNETES_KUBECONFIG)

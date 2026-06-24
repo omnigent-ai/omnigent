@@ -1,0 +1,24 @@
+---
+# Dedicated namespace for the on-demand agent-runner Pods.
+# Kept SEPARATE from the server namespace (`omnigent`) so the server SA's Pod
+# create/get/delete + Secret create/delete rights — scoped to this namespace via
+# role.yaml + rolebinding.yaml — can never reach the server/DB Pods or the
+# server's Secrets. The runner SA, the harness-credentials Secret, the Role and
+# the RoleBinding all live here; only the omnigent-server SA stays in `omnigent`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: omnigent-sandboxes
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: runner
+    # Pod Security Admission: enforce the `restricted` standard in the runner
+    # namespace. Defense-in-depth — even though the server SA holds pods/create
+    # here, it cannot create a privileged / hostPath / host-namespace Pod. The
+    # launcher's generated runner Pod is already restricted-compliant
+    # (runAsNonRoot, drop ALL caps, seccompProfile RuntimeDefault, no privilege
+    # escalation), so enforcement does not reject legitimate runners.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
