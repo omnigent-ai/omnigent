@@ -287,8 +287,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--socket",
-        required=True,
-        help="Absolute Unix socket path to bind.",
+        default=None,
+        help="Absolute Unix socket path to bind (POSIX). Mutually exclusive with --bind.",
+    )
+    parser.add_argument(
+        "--bind",
+        default=None,
+        help=(
+            "TCP loopback endpoint 'host:port' to bind (Windows, which has no "
+            "usable filesystem UDS). Mutually exclusive with --socket."
+        ),
     )
     parser.add_argument(
         "--conversation-id",
@@ -332,16 +340,23 @@ def main(argv: list[str] | None = None) -> None:
     if args.parent_pid is not None:
         _set_pdeathsig()
         _start_parent_watchdog(args.parent_pid)
-    # ``uds=`` binds to the Unix socket path Omnigent allocated for this
-    # conversation. ``log_level`` keeps per-process noise low — see
-    # ``_UVICORN_LOG_LEVEL`` constant.
-    # ``timeout_graceful_shutdown`` bounds how long uvicorn waits
-    # for active connections after SIGTERM before force-exiting.
+    # Bind the endpoint Omnigent allocated for this conversation: a Unix socket
+    # path (``--socket``, POSIX) or a TCP loopback host:port (``--bind``,
+    # Windows). ``log_level`` keeps per-process noise low — see
+    # ``_UVICORN_LOG_LEVEL``. ``timeout_graceful_shutdown`` bounds how long
+    # uvicorn waits for active connections after SIGTERM before force-exiting.
+    if args.socket:
+        bind_kwargs: dict[str, object] = {"uds": args.socket}
+    elif args.bind:
+        host, _, port = args.bind.rpartition(":")
+        bind_kwargs = {"host": host, "port": int(port)}
+    else:
+        sys.exit("runner: exactly one of --socket or --bind is required")
     config = uvicorn.Config(
         app,
-        uds=args.socket,
         log_level=_UVICORN_LOG_LEVEL,
         timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        **bind_kwargs,
     )
     _HardExitServer(config).run()
 

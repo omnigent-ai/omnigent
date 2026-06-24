@@ -25,13 +25,16 @@ import logging
 import os
 import shutil
 import signal
+import socket
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.runner.identity import strip_runner_auth_secrets
@@ -185,23 +188,24 @@ def _resolve_module_path(harness: str) -> str:
     )
 
 
-async def _wait_for_socket_bind(
+async def _wait_for_bind(
     process: asyncio.subprocess.Process,
-    socket_path: Path,
+    endpoint: _HarnessEndpoint,
     harness: str,
     conversation_id: str,
 ) -> None:
     """
     Poll until the runner subprocess is accepting connections.
 
-    Probes ``connect()`` rather than just ``socket_path.exists()``
-    to close the bind/listen gap: uvicorn's ``bind()`` creates
-    the file before ``listen()`` wires the accept loop, so a
-    caller racing that window hits ``ECONNREFUSED``.
+    Probes ``connect()`` rather than just existence to close the
+    bind/listen gap: uvicorn's ``bind()`` readies the endpoint
+    before ``listen()`` wires the accept loop, so a caller racing
+    that window hits ``ECONNREFUSED``. Works for both the UDS
+    (POSIX) and TCP-loopback (Windows) endpoints.
 
     :param process: The just-spawned runner subprocess handle.
-    :param socket_path: Absolute Unix socket path the runner is
-        expected to bind.
+    :param endpoint: The transport endpoint the runner is expected
+        to bind.
     :param harness: Human-readable harness name, used for the
         failure message.
     :param conversation_id: AP-allocated conversation id, used
@@ -221,20 +225,20 @@ async def _wait_for_socket_bind(
                 f"{conversation_id!r} exited with "
                 f"{process.returncode} during spawn (see Omnigent stderr)"
             )
-        if socket_path.exists() and await _can_connect_uds(socket_path):
-            # Lock down the socket file's permissions defensively;
-            # the parent dir is already 0o700 so this is
+        if await endpoint.can_connect():
+            # Lock down the socket file's permissions defensively
+            # (UDS only); the parent dir is already 0o700 so this is
             # belt-and-suspenders against an unusual umask.
-            os.chmod(socket_path, _SOCKET_MODE)
+            endpoint.harden()
             return
         if loop.time() >= deadline:
-            # Process never bound the socket — kill it and fail
-            # loud rather than wait forever.
+            # Process never bound — kill it and fail loud rather
+            # than wait forever.
             process.kill()
             await process.wait()
             raise RuntimeError(
                 f"harness {harness!r} for conversation "
-                f"{conversation_id!r} did not bind socket "
+                f"{conversation_id!r} did not bind its endpoint "
                 f"within {_SPAWN_READY_TIMEOUT_S:.0f}s"
             )
         await asyncio.sleep(_SPAWN_POLL_INTERVAL_S)
@@ -257,6 +261,99 @@ async def _can_connect_uds(socket_path: Path) -> bool:
     with contextlib.suppress(Exception):
         await writer.wait_closed()
     return True
+
+
+def _pick_free_tcp_port() -> int:
+    """Bind 127.0.0.1:0 to let the OS choose a free port, then release it.
+
+    The standard allocation trick: the OS guarantees the port is free at the
+    moment of bind. A small TOCTOU window exists before the runner re-binds it,
+    but loopback collisions are vanishingly rare and ``_wait_for_bind`` fails
+    loud if the child cannot bind.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+async def _can_connect_tcp(host: str, port: int) -> bool:
+    """Probe whether the loopback TCP listener is accepting connections.
+
+    The Windows analog of :func:`_can_connect_uds`: a successful connect proves
+    the runner reached ``listen()``, not merely ``bind()``.
+    """
+    try:
+        _, writer = await asyncio.open_connection(host, port)
+    except OSError:
+        return False
+    writer.close()
+    with contextlib.suppress(Exception):
+        await writer.wait_closed()
+    return True
+
+
+@dataclass
+class _HarnessEndpoint:
+    """How the parent reaches a harness subprocess.
+
+    POSIX uses a Unix domain socket (a filesystem path under the per-instance
+    dir). Windows has no usable filesystem UDS in asyncio's Proactor loop, so it
+    uses a TCP listener on loopback. Exactly one of ``socket_path`` /
+    (``host``, ``port``) is set. This object encapsulates the per-transport
+    differences — spawn flags, readiness probe, httpx wiring, cleanup — so
+    :class:`HarnessProcessManager` stays transport-agnostic.
+    """
+
+    socket_path: Path | None = None
+    host: str | None = None
+    port: int | None = None
+
+    @classmethod
+    def create(cls, instance_dir: Path, conversation_id: str) -> _HarnessEndpoint:
+        """Allocate the platform-appropriate endpoint for a conversation."""
+        if IS_WINDOWS:
+            return cls(host="127.0.0.1", port=_pick_free_tcp_port())
+        return cls(socket_path=_socket_path(instance_dir, conversation_id))
+
+    @property
+    def is_uds(self) -> bool:
+        return self.socket_path is not None
+
+    def spawn_args(self) -> list[str]:
+        """The ``_runner`` CLI flags selecting this transport."""
+        if self.socket_path is not None:
+            return ["--socket", str(self.socket_path)]
+        return ["--bind", f"{self.host}:{self.port}"]
+
+    def make_transport(self) -> httpx.AsyncBaseTransport:
+        """An httpx transport routed at this endpoint."""
+        if self.socket_path is not None:
+            return httpx.AsyncHTTPTransport(uds=str(self.socket_path))
+        return httpx.AsyncHTTPTransport()
+
+    @property
+    def base_url(self) -> str:
+        """The httpx base URL. Under UDS the host is cosmetic; under TCP it routes."""
+        if self.socket_path is not None:
+            return "http://harness.local"
+        return f"http://{self.host}:{self.port}"
+
+    async def can_connect(self) -> bool:
+        """Whether the runner is accepting connections at this endpoint yet."""
+        if self.socket_path is not None:
+            return self.socket_path.exists() and await _can_connect_uds(self.socket_path)
+        assert self.host is not None and self.port is not None
+        return await _can_connect_tcp(self.host, self.port)
+
+    def harden(self) -> None:
+        """Post-bind hardening. Lock down the UDS file mode; no-op for TCP."""
+        if self.socket_path is not None:
+            os.chmod(self.socket_path, _SOCKET_MODE)
+
+    def cleanup(self) -> None:
+        """Best-effort removal of any on-disk artifact (the UDS file)."""
+        if self.socket_path is not None and self.socket_path.exists():
+            self.socket_path.unlink()
 
 
 class _SubprocessEntry:
@@ -287,13 +384,13 @@ class _SubprocessEntry:
         self,
         process: asyncio.subprocess.Process,
         client: httpx.AsyncClient,
-        socket_path: Path,
+        endpoint: _HarnessEndpoint,
         harness: str,
         model: str | None = None,
     ) -> None:
         self.process = process
         self.client = client
-        self.socket_path = socket_path
+        self.endpoint = endpoint
         self.harness = harness
         self.model = model
         self.last_used_at: float = 0.0
@@ -783,12 +880,11 @@ class HarnessProcessManager:
             ``_SPAWN_READY_TIMEOUT_S``.
         """
         module_path = _resolve_module_path(harness)
-        socket_path = _socket_path(self._instance_dir, conversation_id)
+        endpoint = _HarnessEndpoint.create(self._instance_dir, conversation_id)
         # Defensive: a stale socket file from a previous spawn
         # (released but not cleaned up because of an OS quirk)
-        # would block uvicorn binding. Best-effort delete.
-        if socket_path.exists():
-            socket_path.unlink()
+        # would block uvicorn binding. Best-effort delete (UDS only).
+        endpoint.cleanup()
 
         # Always build an explicit env dict (never ``None``): the
         # subprocess inherits AP's env (PATH, HOME, PYTHONPATH, provider
@@ -818,8 +914,7 @@ class HarnessProcessManager:
             harness,
             "--module",
             module_path,
-            "--socket",
-            str(socket_path),
+            *endpoint.spawn_args(),
             "--conversation-id",
             conversation_id,
             "--parent-pid",
@@ -828,7 +923,7 @@ class HarnessProcessManager:
             stderr=None,
             env=effective_env,
         )
-        await _wait_for_socket_bind(process, socket_path, harness, conversation_id)
+        await _wait_for_bind(process, endpoint, harness, conversation_id)
 
         # ``base_url`` is required for relative-URL routing; the
         # actual host portion is irrelevant under uds transport,
@@ -839,8 +934,8 @@ class HarnessProcessManager:
         # call_tool → PATCH → resume); use a generous fixed
         # timeout that still surfaces a genuinely-stuck harness.
         client = httpx.AsyncClient(
-            transport=httpx.AsyncHTTPTransport(uds=str(socket_path)),
-            base_url="http://harness.local",
+            transport=endpoint.make_transport(),
+            base_url=endpoint.base_url,
             # See the comment above the constant for rationale.
             # Connect/write/pool keep the 5s default so a vanished
             # harness still surfaces quickly; read=None defers
@@ -850,7 +945,7 @@ class HarnessProcessManager:
         return _SubprocessEntry(
             process=process,
             client=client,
-            socket_path=socket_path,
+            endpoint=endpoint,
             harness=harness,
             # Record the model this subprocess was spawned with so a later
             # turn requesting a different model (e.g. after ``/model``)
@@ -881,9 +976,8 @@ class HarnessProcessManager:
         close_subprocess_transport(entry.process)
         # Best-effort socket cleanup. uvicorn's atexit usually
         # handles this when SIGTERM lands cleanly, but a
-        # hard-killed runner won't.
-        if entry.socket_path.exists():
-            entry.socket_path.unlink()
+        # hard-killed runner won't. No-op for TCP endpoints.
+        entry.endpoint.cleanup()
 
     async def _idle_reaper_loop(self) -> None:
         """
