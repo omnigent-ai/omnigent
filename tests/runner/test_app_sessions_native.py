@@ -10087,6 +10087,168 @@ async def test_events_compact_on_non_native_session_is_204_noop(
 
 
 @pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_drives_hidden_turn_and_relays() -> None:
+    """claude-sdk /compact drives a HIDDEN ``/compact`` turn and relays the
+    terminal compaction event to the UI stream, returning 200 so the server
+    skips its AP-side fallback."""
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    sdk_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return sdk_spec
+
+    hc = _ScriptedHarnessClient(
+        [
+            _sse(
+                {
+                    "type": "response.compaction.completed",
+                    "session_id": "conv_sdk_compact",
+                    "summary": "compacted summary",
+                    "total_tokens": 4321,
+                    "summary_model": "claude-test",
+                }
+            )
+        ]
+    )
+    pm = _FakeProcessManager(hc)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_sdk_compact", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get("conv_sdk_compact"))
+
+        resp = await client.post(
+            "/v1/sessions/conv_sdk_compact/events",
+            json={"type": "compact"},
+        )
+        # 200 = handled by the runner (server skips its erroring AP-side path).
+        assert resp.status_code == 200, resp.text
+
+        # The hidden compaction turn runs as a background task; wait for the
+        # relayed terminal event on the session stream.
+        queue = _session_event_queues_ref.get("conv_sdk_compact")
+        got: list[dict[str, Any]] = []
+        for _ in range(500):  # event-driven wait, no fixed sleep
+            while queue is not None and not queue.empty():
+                item = queue.get_nowait()
+                if isinstance(item, dict):
+                    got.append(item)
+            if any(e.get("type") == "response.compaction.completed" for e in got):
+                break
+            await asyncio.sleep(0.01)
+
+    types = [e.get("type") for e in got]
+    assert "response.compaction.in_progress" in types, types
+    completed = next((e for e in got if e.get("type") == "response.compaction.completed"), None)
+    assert completed is not None, types
+    assert completed.get("total_tokens") == 4321
+    assert "response.compaction.failed" not in types, types
+    # The hidden turn POSTed a bare ``/compact`` message to the harness.
+    assert hc.posted_bodies, "no message reached the harness"
+    body = hc.posted_bodies[0]
+    assert body.get("type") == "message"
+    assert body["content"][0]["text"] == "/compact"
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_busy_turn_resolves_failed() -> None:
+    """When the harness is mid-turn (204 to the hidden /compact), the runner
+    resolves the spinner as failed — in_progress then failed, no completed —
+    never silent, and still returns 200."""
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    sdk_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return sdk_spec
+
+    class _BusyHarnessClient(_ScriptedHarnessClient):
+        """Stream returns 204 — the harness injected the message as steering
+        because a turn is already in flight."""
+
+        def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+            del method, url, timeout
+            self.posted_bodies.append(json)
+
+            class _BusyHandle:
+                status_code = 204
+
+                async def aiter_text(self) -> AsyncIterator[str]:
+                    return
+                    yield  # pragma: no cover — empty async generator
+
+            class _Ctx:
+                status_code = 204
+
+                async def __aenter__(self) -> Any:
+                    return _BusyHandle()
+
+                async def __aexit__(self, *_: Any) -> None:
+                    return None
+
+            return _Ctx()
+
+    hc = _BusyHarnessClient([])
+    pm = _FakeProcessManager(hc)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_sdk_busy", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get("conv_sdk_busy"))
+
+        resp = await client.post(
+            "/v1/sessions/conv_sdk_busy/events",
+            json={"type": "compact"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        queue = _session_event_queues_ref.get("conv_sdk_busy")
+        got: list[dict[str, Any]] = []
+        for _ in range(500):
+            while queue is not None and not queue.empty():
+                item = queue.get_nowait()
+                if isinstance(item, dict):
+                    got.append(item)
+            if any(e.get("type") == "response.compaction.failed" for e in got):
+                break
+            await asyncio.sleep(0.01)
+
+    types = [e.get("type") for e in got]
+    assert "response.compaction.in_progress" in types, types
+    assert "response.compaction.failed" in types, types
+    assert "response.compaction.completed" not in types, types
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "event_payload,inject_attr",
     # ``/fork`` creates a new conversation that reuses the

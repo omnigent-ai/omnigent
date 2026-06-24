@@ -8883,6 +8883,167 @@ def create_runner_app(
         # Submit.
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
 
+    async def _handle_claude_sdk_compact(conv_id: str) -> Response:
+        """
+        Compact a claude-sdk session in place via the harness — fire-and-ack.
+
+        The claude-sdk harness owns its own context, so — like claude-native
+        injecting ``/compact`` into the tmux pane — explicit compaction must run
+        inside the harness, not as the Omnigent server's transcript-side summary
+        (which can't shrink the SDK's real context and errors when the agent
+        pins no model). There is no tmux pane, though: the only way to send a
+        slash command to the SDK is a ``query("/compact")`` turn. So we drive a
+        HIDDEN ``/compact`` turn, relay only the ``response.compaction.*``
+        indicators (the executor emits them when the CLI fires its PreCompact
+        hook and compacts), and hide everything else — the /compact turn never
+        lands in the transcript, only the spinner shows.
+
+        The SDK ``/compact`` runs a summarization LLM call (tens of seconds), but
+        the Omnigent server forwards this control with a short (~5s) timeout. So
+        we **acknowledge immediately** (200, so the server records the control as
+        handled and skips its AP-side fallback) and run the actual compaction in
+        a background task, reporting progress via the compaction SSE.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :returns: 200 (ack) — the compaction result is reported via SSE/logs.
+        """
+        if process_manager is None:
+            return Response(status_code=204)
+        if conv_id in _active_turns:
+            # A turn is in flight; the SDK client is busy. Don't drive a
+            # /compact turn concurrently with a real one — but don't go silent:
+            # show the spinner and immediately resolve it as failed (nothing was
+            # compacted). Mirrors the 204 "busy" path below, which covers the
+            # case where the runner's _active_turns has desynced from the
+            # harness's in-flight state.
+            _logger.info("claude-sdk /compact skipped for %s: turn in flight", conv_id)
+            _publish_event(
+                conv_id,
+                {"type": "response.compaction.in_progress", "session_id": conv_id},
+            )
+            _publish_event(
+                conv_id,
+                {"type": "response.compaction.failed", "session_id": conv_id},
+            )
+            return Response(status_code=200)
+
+        async def _run_compact() -> None:
+            import json as _json
+
+            # Acknowledge immediately so the UI is never silent: show the spinner
+            # up front, then resolve it below (a terminal event always follows —
+            # relayed from the harness, or the backstop in ``finally``).
+            _publish_event(
+                conv_id,
+                {"type": "response.compaction.in_progress", "session_id": conv_id},
+            )
+            _terminal_published = False  # a completed/failed reached the stream
+            _failed = False  # busy / error → resolve as failed, not completed
+            try:
+                client = await process_manager.get_client(conv_id, "claude-sdk")
+                # MessageEvent requires a non-empty ``model`` (the agent name,
+                # threaded into the synthesized request). Reuse the session's
+                # agent id like a normal turn; fall back to the harness name so
+                # the turn is never rejected for a missing model.
+                _agent = _session_agent_ids.get(conv_id) or "claude-sdk"
+                compact_msg = {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "/compact"}],
+                    "model": _agent,
+                }
+                async with client.stream(
+                    "POST",
+                    f"/v1/sessions/{conv_id}/events",
+                    json=compact_msg,
+                    timeout=None,
+                ) as resp:
+                    if resp.status_code == 204:
+                        # 204 = the harness injected the message instead of
+                        # starting a turn, i.e. a turn is already in flight. We
+                        # can't compact mid-turn; resolve as failed (don't claim
+                        # success). The runner's _active_turns can desync from the
+                        # harness's in-flight state, so this is the reliable
+                        # "busy" signal.
+                        _failed = True
+                        _logger.info(
+                            "claude-sdk /compact deferred for %s: a turn is in flight (204)",
+                            conv_id,
+                        )
+                        return
+                    if resp.status_code != 200:
+                        _failed = True
+                        _logger.warning(
+                            "claude-sdk /compact turn rejected for %s: status=%s",
+                            conv_id,
+                            resp.status_code,
+                        )
+                        return
+                    # Drain the hidden turn's stream (drives the SDK compaction in
+                    # the harness's owning task). Relay only the TERMINAL
+                    # compaction indicators (the up-front in_progress already
+                    # covers the spinner) and persist a completed-with-summary —
+                    # this hidden turn bypasses ``proxy_stream``, where
+                    # ``_handle_harness_compaction`` normally runs. Frame on the
+                    # SSE record boundary like proxy_stream.
+                    _buf = ""
+                    async for chunk in resp.aiter_text():
+                        _buf += chunk
+                        while "\n\n" in _buf:
+                            frame, _, _buf = _buf.partition("\n\n")
+                            if "response.compaction." not in frame:
+                                continue
+                            for line in frame.splitlines():
+                                if not line.startswith("data:"):
+                                    continue
+                                try:
+                                    evt = _json.loads(line[len("data:") :].strip())
+                                except (ValueError, TypeError):
+                                    continue
+                                _etype = str(evt.get("type", "")) if isinstance(evt, dict) else ""
+                                if _etype == "response.compaction.completed":
+                                    _publish_event(conv_id, evt)
+                                    _terminal_published = True
+                                    if evt.get("summary"):
+                                        await _handle_harness_compaction(conv_id, evt)
+                                elif _etype == "response.compaction.failed":
+                                    _publish_event(conv_id, evt)
+                                    _terminal_published = True
+                _logger.info(
+                    "claude-sdk /compact for %s: terminal_relayed=%s",
+                    conv_id,
+                    _terminal_published,
+                )
+            except Exception:
+                _failed = True
+                _logger.exception("claude-sdk /compact failed for %s", conv_id)
+            finally:
+                # Always resolve the up-front spinner so the UI is never left
+                # hanging on "Compacting…". If the harness already relayed a
+                # terminal event, nothing to do. Otherwise emit one: ``failed``
+                # for busy/error, else ``completed`` (a real compaction the
+                # harness didn't surface a terminal for, or a no-op that had
+                # nothing to compact).
+                if not _terminal_published:
+                    _publish_event(
+                        conv_id,
+                        {
+                            "type": (
+                                "response.compaction.failed"
+                                if _failed
+                                else "response.compaction.completed"
+                            ),
+                            "session_id": conv_id,
+                        },
+                    )
+
+        task = asyncio.create_task(_run_compact())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+        # Ack within the server's control-forward timeout; the hidden compaction
+        # turn runs async and reports via the compaction SSE.
+        return Response(status_code=200)
+
     async def _handle_claude_native_cost_popup(
         conv_id: str,
         elicitation_id: str,
@@ -11652,6 +11813,8 @@ def create_runner_app(
                 return await _handle_claude_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "codex-native":
                 return await _handle_codex_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "claude-sdk":
+                return await _handle_claude_sdk_compact(conversation_id)
             return Response(status_code=204)
 
         if body_type == "cost_approval_popup":

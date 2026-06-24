@@ -327,6 +327,42 @@ _QUERY_START_TIMEOUT_SECONDS = 30.0
 # the stream far longer than any fixed deadline.
 _STREAM_IDLE_WARN_SECONDS = 600.0
 
+# A manual ``/compact`` turn is driven by the runner as a hidden turn. On a
+# real context the CLI fires its PreCompact hook, streams the summary, and ends
+# with a ResultMessage well within this deadline. But on a near-empty context
+# ``/compact`` is a no-op that emits no PreCompact and no ResultMessage — so
+# without a bound the turn would wait out the harness idle watchdog and wedge
+# the single turn slot. We poll every ``_COMPACT_POLL_SECONDS`` and end the turn
+# once it exceeds ``_COMPACT_TURN_TIMEOUT_SECONDS`` without terminating.
+_COMPACT_TURN_TIMEOUT_SECONDS = 90.0
+_COMPACT_POLL_SECONDS = 5.0
+
+
+def _is_bare_compact_prompt(prompt: object) -> bool:
+    """
+    Return ``True`` when *prompt* is a bare ``/compact`` slash command.
+
+    The runner drives manual compaction as a hidden turn whose content is a
+    single ``{"type": "input_text", "text": "/compact"}`` block. ``_build_prompt``
+    turns that into a structured content list, which the CLI treats as literal
+    text — never invoking the slash command. Detecting that case lets the caller
+    coerce it back to the bare string ``"/compact"`` so ``query("/compact")``
+    actually compacts.
+
+    :param prompt: The built prompt — a string or a list of content-block dicts.
+    :returns: ``True`` for the string ``"/compact"`` or a single text/input_text
+        block whose text is ``"/compact"``.
+    """
+    if isinstance(prompt, str):
+        return prompt.strip() == "/compact"
+    if isinstance(prompt, list) and len(prompt) == 1:
+        block = prompt[0]
+        if isinstance(block, dict) and block.get("type") in ("text", "input_text"):
+            text = block.get("text")
+            return isinstance(text, str) and text.strip() == "/compact"
+    return False
+
+
 # ── Multimodal content block conversion ──────────────────────
 
 
@@ -1860,11 +1896,23 @@ class ClaudeSDKExecutor(Executor):
             messages,
             resume_session=session_key in self._clients,
         )
+        # A manual ``/compact`` arrives as a single ``input_text`` block, which
+        # ``_build_prompt`` turns into a structured content list — and the CLI
+        # treats structured content as literal text, never invoking the slash
+        # command. Coerce that single-"/compact" case back to the bare string so
+        # ``query("/compact")`` actually compacts.
+        if _is_bare_compact_prompt(prompt):
+            prompt = "/compact"
         if not prompt:
             # Resumed sessions can have nothing new to say; signal turn
             # completion with no assistant text instead of an empty string.
             yield TurnComplete(response=None)
             return
+        # A bare ``/compact`` turn is special: on a near-empty context it is a
+        # no-op that emits no PreCompact and no ResultMessage, so bound it (see
+        # the receive loop) to avoid waiting out the harness idle watchdog.
+        _is_compact_turn = isinstance(prompt, str) and prompt.strip() == "/compact"
+        _compact_turn_started = time.monotonic()
 
         # Build MCP tools from Omnigent tool schemas
         mcp_tools = _build_mcp_tools(tools, self._tool_executor) if tools else []
@@ -2137,7 +2185,13 @@ class ClaudeSDKExecutor(Executor):
         # If the executor adapter installed a ``_policy_evaluator``
         # callback, call it with the request data so the Omnigent server
         # can evaluate LLM_REQUEST policies before the LLM call.
-        _policy_eval = getattr(self, "_policy_evaluator", None)
+        #
+        # A bare ``/compact`` is a CLI control command, not a user LLM request:
+        # there is no user-authored prompt content to scan, and it is driven as
+        # a hidden turn whose stream the runner drains directly (bypassing the
+        # proxy that answers ``policy_evaluation.requested``), so evaluating here
+        # would park on a verdict that never arrives and stall the turn. Skip it.
+        _policy_eval = None if _is_compact_turn else getattr(self, "_policy_evaluator", None)
         if _policy_eval is not None:
             # Extract the user prompt text for PII scanning.
             _last_user_msg = ""
@@ -2183,27 +2237,72 @@ class ClaudeSDKExecutor(Executor):
             message_stream = client.receive_response()
             try:
                 while True:
+                    # Bound a manual ``/compact`` turn on total elapsed time so a
+                    # no-op (tiny context: no PreCompact, no ResultMessage) ends
+                    # promptly instead of waiting out the harness idle watchdog.
+                    # A real compaction streams its summary and a ResultMessage
+                    # well within the deadline, so this never cuts it short.
+                    if (
+                        _is_compact_turn
+                        and time.monotonic() - _compact_turn_started
+                        >= _COMPACT_TURN_TIMEOUT_SECONDS
+                    ):
+                        logger.info(
+                            "Claude SDK /compact did not terminate within %ss "
+                            "(session %s); treating as a no-op and ending the turn.",
+                            int(_COMPACT_TURN_TIMEOUT_SECONDS),
+                            session_key,
+                        )
+                        break
                     next_task = asyncio.ensure_future(anext(message_stream))
                     idle_seconds = 0.0
+                    _compact_noop = False
                     try:
                         while True:
-                            done, _ = await asyncio.wait(
-                                {next_task}, timeout=_STREAM_IDLE_WARN_SECONDS
+                            # While bounding a /compact turn, poll frequently so
+                            # the total-elapsed deadline above is enforced even if
+                            # the stream is continuously quiet.
+                            _wait_timeout = (
+                                _COMPACT_POLL_SECONDS
+                                if _is_compact_turn
+                                else _STREAM_IDLE_WARN_SECONDS
                             )
+                            done, _ = await asyncio.wait({next_task}, timeout=_wait_timeout)
                             if next_task in done:
                                 break
-                            idle_seconds += _STREAM_IDLE_WARN_SECONDS
-                            logger.warning(
-                                "Claude SDK response stream has been idle for "
-                                "%ds (session %s); still waiting.",
-                                int(idle_seconds),
-                                session_key,
-                            )
+                            if (
+                                _is_compact_turn
+                                and time.monotonic() - _compact_turn_started
+                                >= _COMPACT_TURN_TIMEOUT_SECONDS
+                            ):
+                                _compact_noop = True
+                                break
+                            if not _is_compact_turn:
+                                idle_seconds += _wait_timeout
+                                logger.warning(
+                                    "Claude SDK response stream has been idle for "
+                                    "%ds (session %s); still waiting.",
+                                    int(idle_seconds),
+                                    session_key,
+                                )
                     except BaseException:
                         next_task.cancel()
                         with suppress(BaseException):
                             await next_task
                         raise
+                    if _compact_noop:
+                        # No-op /compact: cancel the pending receive and end the
+                        # turn (falls through to TurnComplete below).
+                        next_task.cancel()
+                        with suppress(BaseException):
+                            await next_task
+                        logger.info(
+                            "Claude SDK /compact did not terminate within %ss "
+                            "(session %s); treating as a no-op and ending the turn.",
+                            int(_COMPACT_TURN_TIMEOUT_SECONDS),
+                            session_key,
+                        )
+                        break
                     try:
                         message = next_task.result()
                     except StopAsyncIteration:
@@ -2475,6 +2574,15 @@ class ClaudeSDKExecutor(Executor):
                         elif getattr(system_msg, "hook_event_name", None) == "PreCompact":
                             compaction_occurred = True
                             logger.info("Claude SDK compaction detected (PreCompact hook)")
+                        elif subtype == "compact_boundary":
+                            # The CLI emits a ``compact_boundary`` system message
+                            # at the point context was compacted. AUTO compaction
+                            # also fires the PreCompact hook (above), but a MANUAL
+                            # ``/compact`` does NOT — its only signal is this
+                            # boundary marker. Detect it so manual compaction
+                            # surfaces a CompactionComplete just like auto.
+                            compaction_occurred = True
+                            logger.info("Claude SDK compaction detected (compact_boundary)")
                         else:
                             logger.info("Claude CLI system message: %s", data)
             finally:
