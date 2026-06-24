@@ -13,7 +13,7 @@
 // the last choice instead of the hardcoded default. A deep-link ?view= URL
 // param overrides the stored preference transiently without mutating it.
 
-import { type ChangedSort, isValidSort } from "@/shell/FlatFileList";
+import { type ChangedSort, isValidSort } from "@/lib/changedSort";
 
 export interface FilesPanelPreferences {
   /** true = changed-files-only flat list, false = full folder tree ("All"). */

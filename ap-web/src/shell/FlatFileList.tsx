@@ -7,23 +7,12 @@ import { formatBytes, gitStatusLabel, gitStatusLetter } from "./fileStatusUtils"
 import { FileDownloadButton } from "./FileDownloadButton";
 import { useCursorTooltip } from "./useCursorTooltip";
 
-export type ChangedSort = "alpha" | "recent" | "size" | "type";
+export type { ChangedSort } from "@/lib/changedSort";
+import type { ChangedSort } from "@/lib/changedSort";
 
-const VALID_SORTS = new Set<ChangedSort>(["alpha", "recent", "size", "type"]);
-
-/**
- * Comparator for the changed-files list. Shared between the displayed list
- * (`FlatFileList`) and the prev/next navigation in `FileViewer` so the two
- * orderings never diverge — a file shown 1st in the list must also be 1st
- * when stepping through with the arrows.
- */
 function fileExtension(name: string): string {
   const dot = name.lastIndexOf(".");
   return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
-}
-
-export function isValidSort(value: string): value is ChangedSort {
-  return VALID_SORTS.has(value as ChangedSort);
 }
 
 export function compareChangedFiles(sort: ChangedSort) {
