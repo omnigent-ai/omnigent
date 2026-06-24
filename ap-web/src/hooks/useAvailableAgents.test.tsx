@@ -131,6 +131,9 @@ describe("useAvailableAgents", () => {
             name: "databricks_coding_agent",
             description: "A coding agent",
             harness: "codex",
+            // os_env.cwd pass-through (#509): the new-session picker
+            // defaults the workspace field to this value.
+            default_workspace: "/opt/custom",
           },
         ],
         has_more: false,
@@ -159,6 +162,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "claude-native",
         skills: [],
+        default_workspace: null,
       },
       {
         id: "ag_pi_native",
@@ -167,6 +171,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "pi-native",
         skills: [],
+        default_workspace: null,
       },
       {
         id: "ag_opencode_native",
@@ -183,6 +188,7 @@ describe("useAvailableAgents", () => {
         description: "Multi-agent coding orchestrator.",
         harness: "nessie",
         skills: [{ name: "review-pr", description: "Review a pull request" }],
+        default_workspace: null,
       },
       {
         id: "ag_debby",
@@ -191,6 +197,7 @@ describe("useAvailableAgents", () => {
         description: "A two-headed brainstorming partner.",
         harness: "claude-sdk",
         skills: [],
+        default_workspace: null,
       },
       {
         id: "ag_yaml",
@@ -199,6 +206,7 @@ describe("useAvailableAgents", () => {
         description: "A coding agent",
         harness: "codex",
         skills: [],
+        default_workspace: "/opt/custom",
       },
     ]);
   });
@@ -332,6 +340,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "claude-native",
         skills: [],
+        default_workspace: null,
       },
       {
         id: "ag_doc",
@@ -340,6 +349,7 @@ describe("useAvailableAgents", () => {
         description: "Documentation specialist",
         harness: "claude-sdk",
         skills: [{ name: "humanizer", description: "Remove AI writing patterns" }],
+        default_workspace: null,
       },
     ]);
     // The enrich fetch ran once, against the newest session the agent
@@ -408,6 +418,7 @@ describe("useAvailableAgents", () => {
         description: "Elise's agent",
         harness: "claude-sdk",
         skills: [],
+        default_workspace: null,
       },
       {
         id: "ag_doc",
@@ -416,6 +427,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "codex",
         skills: [],
+        default_workspace: null,
       },
     ]);
   });

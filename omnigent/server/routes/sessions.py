@@ -18063,6 +18063,9 @@ def create_sessions_router(
         # Harness/kind for the UI; None until the spec loads (mirrors the
         # GET /v1/agents catalog so both endpoints report it consistently).
         harness: str | None = None
+        # Default working directory from os_env.cwd (mirrors the
+        # GET /v1/agents catalog); None until the spec loads.
+        default_workspace: str | None = None
         # Prefer the stored entity's description; fall back to the spec's
         # top-level description when the stored value is unset (single-file
         # YAML agents don't persist it at registration today). Lets the
@@ -18079,6 +18082,11 @@ def create_sessions_router(
                 # Declared terminal names, in spec order — the Web UI
                 # gates its "new terminal" affordance on this list.
                 terminals = list(loaded.spec.terminals or {})
+                # The agent's configured working directory, if any —
+                # mirrors GET /v1/agents so both endpoints report it
+                # consistently (#509).
+                if loaded.spec.os_env is not None:
+                    default_workspace = loaded.spec.os_env.cwd
                 # Bundled skills only (mirrors GET /v1/agents); the merged
                 # bundled + host-discovered set lives on the session snapshot.
                 skills = [
@@ -18129,6 +18137,7 @@ def create_sessions_router(
             policies=policies,
             skills=skills,
             terminals=terminals,
+            default_workspace=default_workspace,
         )
 
     @router.get("/sessions/{session_id}/agent")

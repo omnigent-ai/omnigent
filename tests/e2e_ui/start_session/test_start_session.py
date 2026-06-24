@@ -463,6 +463,109 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_defaults_workspace_from_agent_cwd(seeded_session: tuple[str, str]) -> None:
+    """Selecting an agent defaults the workspace to its os_env.cwd (#509).
+
+    Two custom agents, each with a different ``default_workspace``
+    (exposed from ``spec.os_env.cwd``), are offered. The auto-selected
+    first agent's cwd must win over the host's seeded recent workspace
+    as the working-directory default, and switching to the second agent
+    must follow its cwd — without the user ever opening the file browser.
+    On Send the second agent's cwd reaches ``POST /v1/sessions`` as
+    ``workspace``. Mirrors the issue's example: selecting ``custom_agent``
+    defaults to ``/opt/custom``; selecting ``another_custom_agent``
+    defaults to ``/home/path``.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_default_workspace_from_agent_cwd(base_url, session_id))
+
+
+async def _drive_default_workspace_from_agent_cwd(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=json.dumps(
+                    {
+                        "data": [
+                            {
+                                "id": "ag_custom",
+                                "name": "custom_agent",
+                                "display_name": "Custom",
+                                "description": "An agent bound to /opt/custom",
+                                "harness": None,
+                                "skills": [],
+                                "default_workspace": "/opt/custom",
+                            },
+                            {
+                                "id": "ag_another",
+                                "name": "another_custom_agent",
+                                "display_name": "Another",
+                                "description": "An agent bound to /home/path",
+                                "harness": None,
+                                "skills": [],
+                                "default_workspace": "/home/path",
+                            },
+                        ]
+                    }
+                ),
+            )
+
+            # Neutralize agent discovery so only the two stubbed agents
+            # feed the picker.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            # Seed a recent workspace for the stubbed host. The agent's
+            # os_env.cwd must OVERRIDE this as the default — the chip
+            # showing "custom" (not "repo") proves the override (#509).
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            # custom_agent auto-selects (first in stub order); its cwd
+            # /opt/custom is the workspace default, not the seeded /work/repo.
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "custom"
+            )
+
+            # Switch to the second agent — the workspace must follow its cwd.
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-agent-ag_another").click()
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "path"
+            )
+
+            await page.get_by_test_id("new-chat-landing-input").fill("work in the agent's dir")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_another", body
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/home/path", body
+        finally:
+            await browser.close()
+
+
 def test_start_session_select_harness(seeded_session: tuple[str, str]) -> None:
     """For a bundle agent (Polly/Debby), Advanced offers an agent-harness pick.
 

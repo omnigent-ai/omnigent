@@ -53,6 +53,9 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     skills: list[SkillSummary] = []
     terminals: list[str] = []
     harness: str | None = None
+    # Default working directory from os_env.cwd (None until the spec
+    # loads); the new-session picker defaults the workspace field to it.
+    default_workspace: str | None = None
     # Prefer the stored entity's description; fall back to the spec's
     # top-level description when the stored value is unset (single-file
     # YAML agents don't persist it at registration today). Lets the
@@ -89,6 +92,11 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # Kind for the Add Agent picker (Codex vs Claude). Stays None
         # when the bundle can't be loaded (the except below).
         harness = loaded.spec.executor.harness_kind
+        # The agent's configured working directory, if any — the
+        # new-session picker defaults the workspace field to it so the
+        # user need not already know the agent's required path (#509).
+        if loaded.spec.os_env is not None:
+            default_workspace = loaded.spec.os_env.cwd
     except Exception:  # noqa: BLE001 — spec load failure must not break the list
         _logger.debug(
             "Failed to load spec for agent %s; mcp_servers/skills will be empty",
@@ -106,6 +114,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         mcp_servers=mcp_servers,
         skills=skills,
         terminals=terminals,
+        default_workspace=default_workspace,
     )
 
 

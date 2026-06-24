@@ -848,6 +848,73 @@ describe("NewChatLandingScreen create flow", () => {
   });
 });
 
+describe("NewChatLandingScreen agent cwd default workspace (#509)", () => {
+  // beforeEach always seeds host_1's recent workspace, so these tests prove
+  // the selected agent's os_env.cwd overrides that recent as the default.
+  function waitForWorkspaceValue(basename: string): Promise<void> {
+    return waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(basename),
+    );
+  }
+
+  it("defaults the workspace to the selected agent's cwd and carries it to the create call", async () => {
+    setAgents([agent({ id: "ag_custom", name: "custom_agent", default_workspace: "/opt/custom" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    // The chip shows the agent-cwd basename ("custom"), NOT the seeded
+    // recent ("foo") — the agent's os_env.cwd is the default workspace.
+    await waitForWorkspaceValue("custom");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.agent_id).toBe("ag_custom");
+    expect(body.workspace).toBe("/opt/custom");
+  });
+
+  it("updates the workspace when switching to an agent with a different cwd", async () => {
+    setAgents([
+      agent({
+        id: "ag_first",
+        name: "custom_agent",
+        display_name: "Custom",
+        default_workspace: "/opt/custom",
+      }),
+      agent({
+        id: "ag_second",
+        name: "another_custom_agent",
+        display_name: "Another",
+        default_workspace: "/home/path",
+      }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceValue("custom");
+    // Switch to the second agent — the workspace must follow its cwd.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_second"));
+    await waitForWorkspaceValue("path");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.agent_id).toBe("ag_second");
+    expect(body.workspace).toBe("/home/path");
+  });
+});
+
 describe("sanitizeInitialPrompt", () => {
   it.each([
     ["trims surrounding whitespace", "  hello  ", "hello"],

@@ -205,6 +205,55 @@ async def test_list_builtin_agents_exposes_declared_terminals_from_spec(
     assert entry["terminals"] == ["shell", "py"]
 
 
+async def test_list_builtin_agents_exposes_default_workspace_from_spec_os_env_cwd(
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    agents_client: httpx.AsyncClient,
+) -> None:
+    """
+    ``GET /v1/agents`` reports ``default_workspace`` from
+    ``spec.os_env.cwd`` so the new-session picker can default the
+    workspace field to the agent's required path (#509).
+
+    Absent ``os_env:`` (or a null ``cwd``) reports ``None`` — the
+    picker then leaves any host-seeded value in place instead of
+    blanking it.
+    """
+    bundle = build_agent_bundle(
+        name="cwd-agent",
+        os_env={"cwd": "/opt/custom", "sandbox": {"type": "none"}},
+    )
+    _register_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_id="ag_cwd",
+        name="cwd-agent",
+        bundle=bundle,
+    )
+    # A bundle with no os_env block — the field must read back as None,
+    # not absent, so the picker's `?? null` normalisation is exercised.
+    bare_bundle = build_agent_bundle(name="bare-agent")
+    _register_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_id="ag_bare",
+        name="bare-agent",
+        bundle=bare_bundle,
+    )
+
+    resp = await agents_client.get("/v1/agents")
+
+    assert resp.status_code == 200, resp.text
+    cwd_entry = next(a for a in resp.json()["data"] if a["id"] == "ag_cwd")
+    # The cwd traversed spec → AgentObject verbatim; the picker defaults
+    # the workspace field to this when the agent is selected.
+    assert cwd_entry["default_workspace"] == "/opt/custom"
+    bare_entry = next(a for a in resp.json()["data"] if a["id"] == "ag_bare")
+    # No os_env → None (not missing), so the picker's host-seeded value
+    # is left untouched.
+    assert bare_entry["default_workspace"] is None
+
+
 async def test_list_builtin_agents_exposes_bundled_skills_from_spec(
     agent_store: SqlAlchemyAgentStore,
     artifact_store: LocalArtifactStore,
