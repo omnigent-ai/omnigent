@@ -123,6 +123,9 @@ _HARNESS_FAMILY: dict[str, str] = {
     "native-claude": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
     "codex-native": OPENAI_FAMILY,
+    "cursor": OPENAI_FAMILY,
+    "cursor-native": OPENAI_FAMILY,
+    "native-cursor": OPENAI_FAMILY,
     "native-codex": OPENAI_FAMILY,
     "openai-agents": OPENAI_FAMILY,
     # The workflow's AgentHarnessType spells this "openai-agents-sdk" and
@@ -722,7 +725,7 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
         served = (
             {ANTHROPIC_FAMILY}
             if cli_raw == "claude"
-            else ({OPENAI_FAMILY} if cli_raw == "codex" else set())
+            else ({OPENAI_FAMILY} if cli_raw in {"codex", "cursor"} else set())
         )
         return ProviderEntry(
             name=name,

@@ -77,6 +77,17 @@ _LLM_TASK_TOKENS = ("chat", "completion")
 _SUBSCRIPTION_STATIC_MODELS: dict[str, tuple[str, ...]] = {
     "claude": ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"),
     "codex": ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
+    "cursor": (
+        "auto",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+        "gemini-3.1-pro",
+        "composer-2.5",
+    ),
 }
 
 # Harness spellings -> the workflow harness whose provider resolution they
@@ -90,6 +101,9 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
     "codex": "codex",
     "codex-native": "codex",
     "native-codex": "codex",
+    "cursor": "cursor",
+    "cursor-native": "cursor",
+    "native-cursor": "cursor",
     "pi": "pi",
     "pi-native": "pi",
     "native-pi": "pi",
@@ -105,6 +119,7 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
 _KEY_AUTH_FAMILY: dict[str, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
+    "cursor": OPENAI_FAMILY,
     "openai-agents-sdk": OPENAI_FAMILY,
     "antigravity": OPENAI_FAMILY,
 }

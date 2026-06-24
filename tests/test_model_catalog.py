@@ -707,6 +707,37 @@ def test_anthropic_api_listing_uses_api_key_headers(
     assert [m.id for m in listing.models] == ["claude-opus-4-8", "claude-sonnet-4-6"]
 
 
+def test_cursor_native_subscription_listing_is_static_and_multifamily(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cursor-native uses a curated static listing rather than source ``none``.
+
+    Regression for #998: ``cursor-native`` was missing from the subscription
+    listing map, so ``sys_list_models`` reported it as an unusable worker even
+    though a logged-in Cursor CLI can launch it.
+    """
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n  cursor:\n    kind: subscription\n    cli: cursor\n    default: true\n",
+    )
+    listing = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
+    assert listing.source == "static"
+    assert listing.verified is False
+    assert [m.id for m in listing.models] == [
+        "auto",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+        "gemini-3.1-pro",
+        "composer-2.5",
+    ]
+    assert "Cursor" not in listing.note
+    assert "cursor" in listing.note.lower()
+
 def test_subscription_listing_is_static_and_unverified(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
