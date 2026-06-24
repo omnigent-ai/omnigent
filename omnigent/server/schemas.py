@@ -154,6 +154,13 @@ class AgentObject(BaseModel):
         bundle cannot be loaded. Lets the Web UI Add Agent picker
         recognise an agent's kind (Codex vs Claude) without
         hardcoding by name slug.
+    :param model: The agent's configured default LLM model identifier
+        (provider-prefixed, e.g. ``"databricks-gpt-5-5"``), resolved
+        from the spec's ``llm.model`` (the parser syncs ``executor.model``
+        into it). ``None`` when the bundle cannot be loaded or no model
+        is declared. Lets the Web UI show / override the agent's model
+        when adding it as a child session (flowed as ``model_override``
+        on session create).
     :param mcp_servers: MCP servers the agent is connected to
         (secret fields omitted). Empty list when the spec
         declares no MCP servers or when the bundle cannot be
@@ -188,6 +195,7 @@ class AgentObject(BaseModel):
     created_at: int
     updated_at: int | None = None
     harness: str | None = None
+    model: str | None = None
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
     policies: list[PolicySummary] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)

@@ -383,6 +383,10 @@ function postEventResponseFromWire(wire: {
  * @param options.subAgentName - Sub-agent name for parent-spec-tree
  *   resolution; null/omitted for user-added agents.
  * @param options.title - Child title, e.g. "ui:claude-native-ui:1".
+ * @param options.modelOverride - Per-session model override (provider-prefixed
+ *   id, e.g. "databricks-gpt-5-5"), pre-filled from the agent's declared
+ *   `llm.model` so a custom agent launches on its own model by default. null
+ *   clears it (harness default). Only sent when provided.
  */
 export async function createSession(
   agentId: string,
@@ -391,6 +395,7 @@ export async function createSession(
     parentSessionId?: string;
     subAgentName?: string | null;
     title?: string;
+    modelOverride?: string | null;
   } = {},
 ): Promise<Session> {
   const body: {
@@ -399,6 +404,7 @@ export async function createSession(
     parent_session_id?: string;
     sub_agent_name?: string | null;
     title?: string;
+    model_override?: string | null;
   } = { agent_id: agentId, initial_items: initialItems };
   if (options.parentSessionId !== undefined) {
     body.parent_session_id = options.parentSessionId;
@@ -408,6 +414,9 @@ export async function createSession(
   }
   if (options.title !== undefined) {
     body.title = options.title;
+  }
+  if (options.modelOverride !== undefined) {
+    body.model_override = options.modelOverride;
   }
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",

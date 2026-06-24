@@ -52,13 +52,22 @@ export function AddAgentDialog({
   const agentList = agents ?? [];
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [name, setName] = useState("");
+  // Pre-filled from the selected agent's declared ``llm.model`` and
+  // forwarded as ``model_override`` on session create. Empty (or an
+  // agent with no declared model) → harness default (no override sent).
+  const [model, setModel] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const selectedAgent = agentList.find((a) => a.id === selectedAgentId) ?? null;
 
   function selectAgent(agentId: string): void {
+    const agent = agentList.find((a) => a.id === agentId) ?? null;
     setSelectedAgentId(agentId);
+    // Pre-fill the model input with the agent's declared default so the
+    // user can accept it as-is or edit it; agents without a declared
+    // model start empty (harness default).
+    setModel(agent?.model ?? "");
     setError(null);
   }
 
@@ -66,6 +75,7 @@ export function AddAgentDialog({
     if (!next) {
       setSelectedAgentId(null);
       setName("");
+      setModel("");
       setError(null);
       setSubmitting(false);
     }
@@ -79,6 +89,7 @@ export function AddAgentDialog({
       setError("Enter a name for the agent.");
       return;
     }
+    const trimmedModel = model.trim();
     const title = `${UI_ADDED_TITLE_PREFIX}:${selectedAgent.name}:${trimmed}`;
     setSubmitting(true);
     setError(null);
@@ -87,6 +98,8 @@ export function AddAgentDialog({
         parentSessionId,
         subAgentName: null,
         title,
+        // Empty model → null → harness default (no override).
+        modelOverride: trimmedModel || null,
       });
       // Refresh the rail so the new child appears immediately, then jump
       // into it for the first message.
@@ -136,23 +149,50 @@ export function AddAgentDialog({
           </div>
 
           {selectedAgent !== null && (
-            <div className="flex flex-col gap-1.5">
-              <label htmlFor="add-agent-name" className="text-xs font-medium text-muted-foreground">
-                Name
-              </label>
-              {/* Raw input matching NewChatDialog's "Name" field for a
+            <>
+              <div className="flex flex-col gap-1.5">
+                <label
+                  htmlFor="add-agent-name"
+                  className="text-xs font-medium text-muted-foreground"
+                >
+                  Name
+                </label>
+                {/* Raw input matching NewChatDialog's "Name" field for a
                   consistent look (rounded-md + border-tint focus, no
                   heavy ring). */}
-              <input
-                id="add-agent-name"
-                data-testid="add-agent-name-input"
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Name this agent"
-                className="rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none transition-colors focus-visible:border-ring"
-              />
-            </div>
+                <input
+                  id="add-agent-name"
+                  data-testid="add-agent-name-input"
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="Name this agent"
+                  className="rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none transition-colors focus-visible:border-ring"
+                />
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <label
+                  htmlFor="add-agent-model"
+                  className="text-xs font-medium text-muted-foreground"
+                >
+                  Model
+                </label>
+                {/* Pre-filled from the agent's declared default (llm.model).
+                  Empty → harness default. Raw input matching the Name field
+                  for a consistent look. A richer dropdown picker backed by
+                  a models-list endpoint is a documented follow-up. */}
+                <input
+                  id="add-agent-model"
+                  data-testid="add-agent-model-input"
+                  type="text"
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  placeholder="Harness default"
+                  className="rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none transition-colors focus-visible:border-ring"
+                />
+              </div>
+            </>
           )}
 
           {error !== null && (

@@ -171,6 +171,46 @@ async def test_list_builtin_agents_exposes_harness_from_spec(
     assert entry["harness"] == harness
 
 
+async def test_list_builtin_agents_exposes_model_from_spec(
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    agents_client: httpx.AsyncClient,
+) -> None:
+    """
+    ``GET /v1/agents`` reports each agent's resolved default ``model``
+    from its spec's ``llm.model``.
+
+    The Web UI Add Agent picker pre-fills this into an editable model
+    field and forwards it as ``model_override`` on session create, so a
+    custom agent with its own declared model is launched on that model
+    by default instead of the harness default. A ``None`` here would
+    mean the bundle failed to load (degrading like ``harness``); a
+    wrong value would mean the route read the wrong spec field. The
+    value mirrors the spec's ``llm.model`` (the parser syncs
+    ``executor.model`` into it), so asserting it equals the declared
+    model proves the load → AgentObject path.
+    """
+    bundle = build_agent_bundle(
+        name="custom-reviewer",
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    _register_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_id="ag_model",
+        name="custom-reviewer",
+        bundle=bundle,
+    )
+
+    resp = await agents_client.get("/v1/agents")
+
+    assert resp.status_code == 200, resp.text
+    entry = next(a for a in resp.json()["data"] if a["id"] == "ag_model")
+    # build_agent_bundle writes llm.model = name, so this proves the
+    # spec's llm.model traversed the load → AgentObject path verbatim.
+    assert entry["model"] == "custom-reviewer"
+
+
 async def test_list_builtin_agents_exposes_declared_terminals_from_spec(
     agent_store: SqlAlchemyAgentStore,
     artifact_store: LocalArtifactStore,

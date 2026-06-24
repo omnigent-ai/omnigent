@@ -31,6 +31,7 @@ function agent(overrides: Partial<AvailableAgent> = {}): AvailableAgent {
     display_name: "Some Agent",
     description: null,
     harness: null,
+    model: null,
     skills: [],
     ...overrides,
   };

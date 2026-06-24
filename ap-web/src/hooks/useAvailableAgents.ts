@@ -17,6 +17,11 @@ export interface AvailableAgent {
   // the agent's spec. Lets the picker recognise Codex vs Claude agents
   // by kind rather than by name slug.
   harness: string | null;
+  // Resolved default LLM model from GET /v1/agents (spec's llm.model).
+  // null when the server couldn't load the spec or no model is declared.
+  // Pre-fills the Add Agent model input and is forwarded as
+  // model_override on session create. Absent on older servers.
+  model: string | null;
   // Skills bundled in the agent spec (name + one-line description).
   // Feeds the landing composer's "/" menu before a session exists;
   // host-discovered skills only resolve once a runner is bound, so
@@ -46,6 +51,7 @@ interface BuiltinAgentWire {
   name: string;
   description?: string | null;
   harness?: string | null;
+  model?: string | null;
   skills?: { name: string; description: string }[];
 }
 
@@ -70,6 +76,7 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
     display_name: displayNameForAgent(a.name, a.harness),
     description: a.description ?? null,
     harness: a.harness ?? null,
+    model: a.model ?? null,
     skills: a.skills ?? [],
   }));
 }
@@ -120,6 +127,7 @@ interface AgentObjectWire {
   name: string;
   description?: string | null;
   harness?: string | null;
+  model?: string | null;
   skills?: { name: string; description: string }[];
 }
 
@@ -138,6 +146,7 @@ async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<Availab
     display_name: displayNameForAgent(scanned.agentName),
     description: null,
     harness: null,
+    model: null,
     skills: [],
   };
   try {
@@ -151,6 +160,7 @@ async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<Availab
       display_name: displayNameForAgent(json.name, json.harness),
       description: json.description ?? null,
       harness: json.harness ?? null,
+      model: json.model ?? null,
       skills: json.skills ?? [],
     };
   } catch {
