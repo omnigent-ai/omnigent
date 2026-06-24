@@ -4,9 +4,8 @@
 Part of the single contributor Security Scan (.github/workflows/security-scan.yml),
 the companion to secret-scan.py: that one flags secrets a PR *commits*, this one
 flags code a PR adds to *steal* the CI secrets it runs with (the test-gateway
-token, GITHUB_TOKEN). It is the detector the fork-e2e mirror relied on before the
-scan was unified -- the mirror runs contributor code with the gateway secret, so
-an env-secret read piped to the network is the shape that matters there.
+token, GITHUB_TOKEN) -- an env-secret read piped to the network is the shape that
+matters.
 
 It reads diff TEXT only -- it never checks out or executes the PR's code -- so it
 is safe on any event. It is defense-in-depth + a reviewer aid, NOT a guarantee:
