@@ -50,6 +50,8 @@ from types import FrameType
 import uvicorn
 from fastapi import FastAPI
 
+from omnigent.inner import _proc
+
 # uvicorn log level for harness subprocesses. ``"warning"`` keeps
 # the per-process noise low (AP and the harness wrap both emit
 # their own structured logs); set to ``"info"`` if you need to
@@ -230,16 +232,13 @@ def _start_parent_watchdog(parent_pid: int) -> threading.Thread:
             if os.getppid() != parent_pid:
                 _request_shutdown_with_hard_exit("parent process exit")
                 return
-            try:
-                os.kill(parent_pid, 0)
-            except ProcessLookupError:
+            # Not ``os.kill(parent_pid, 0)``: on Windows that maps to
+            # TerminateProcess and would kill the parent. ``process_alive``
+            # treats a not-introspectable process as alive (same semantics
+            # as the old PermissionError branch).
+            if not _proc.process_alive(parent_pid):
                 _request_shutdown_with_hard_exit("parent process exit")
                 return
-            except PermissionError:
-                # Process exists but we can't signal it — treat
-                # as alive (same semantics as ``_pid_alive`` in
-                # ``process_manager.py``).
-                pass
 
     t = threading.Thread(target=_watch, name="harness-parent-watchdog", daemon=True)
     t.start()

@@ -32,6 +32,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.harnesses import _HARNESS_MODULES
@@ -1040,29 +1041,22 @@ class HarnessProcessManager:
                 pid,
             )
             with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 
 
 def _pid_alive(pid: int) -> bool:
     """
     Return True if ``pid`` corresponds to a live process.
 
-    Implementation: ``os.kill(pid, 0)`` is the cross-platform
-    "does this PID exist" probe — it sends no actual signal but
-    raises ProcessLookupError if the PID is gone.
+    Delegates to :func:`omnigent.inner._proc.process_alive`, a psutil-based
+    probe. ``os.kill(pid, 0)`` cannot be used cross-platform: on Windows it
+    maps to ``TerminateProcess`` and would *kill* the target rather than probe
+    it.
 
     :param pid: OS process id to check.
     :returns: True if the process exists, False otherwise.
     """
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # PID exists but we can't signal it — for the orphan
-        # sweep's purposes that means "live, leave alone."
-        return True
-    return True
+    return _proc.process_alive(pid)
 
 
 async def _pids_holding_socket(socket_path: Path) -> list[int]:
