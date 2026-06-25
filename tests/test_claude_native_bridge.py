@@ -545,9 +545,7 @@ def test_read_transcript_rewrites_prompt_too_long(tmp_path: Path, raw_text: str)
         encoding="utf-8",
     )
 
-    _, _, items = read_transcript_items_since(
-        transcript_path, 0, agent_name="claude-native-ui"
-    )
+    _, _, items = read_transcript_items_since(transcript_path, 0, agent_name="claude-native-ui")
 
     assert len(items) == 1
     text = items[0].data["content"][0]["text"]
