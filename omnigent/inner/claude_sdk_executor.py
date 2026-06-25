@@ -47,6 +47,7 @@ from omnigent._platform import stable_user_id
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.llms.context_window import claude_model_supports_1m
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 from omnigent.spec.types import RetryPolicy
@@ -556,6 +557,39 @@ def _best_effort_close(resource: _Stream | _Process) -> None:
 # supplied directly), used when no spec/cfg model is set. On the ucode-cached
 # path the Omnigent producer resolves the model instead (see workflow.py).
 _DATABRICKS_CLAUDE_DEFAULT_MODEL = DATABRICKS_CLAUDE_DEFAULT_MODEL
+
+# Claude Code's "[1m]" model-id suffix opts a model into Anthropic's 1M-token
+# context window. The Agent SDK spawns the same `claude` CLI, which strips the
+# suffix from the wire model id (so a name-validating gateway still accepts the
+# bare name) and sends the "context-1m" beta. Without "[1m]" the CLI does NOT
+# send "context-1m", so first-party Anthropic caps the turn at the 200K base.
+# Verified through ClaudeSDKClient against a request-capture server, and it holds
+# under CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 (context-1m is not among the
+# betas that flag strips). The Databricks gateway serves 1M regardless (#1299),
+# so the suffix is harmless there. The 1M model set lives in
+# ``omnigent.llms.context_window`` (shared with the window override).
+_CLAUDE_1M_MODEL_SUFFIX = "[1m]"
+
+
+def _maybe_enable_1m_window(model: str | None) -> str | None:
+    """
+    Append the ``[1m]`` window suffix for a known 1M-context Claude model.
+
+    Makes the Claude CLI request the real 1M window instead of the 200K base.
+    Applied only to the id handed to ``options.model`` (the CLI ``--model``); the
+    bare id is kept for usage/pricing/window resolution. Idempotent; only known
+    1M Claude models (see :func:`claude_model_supports_1m`) are upgraded; ``None``
+    passes through.
+
+    :param model: Model id, e.g. ``"databricks-claude-opus-4-8"``, or ``None``.
+    :returns: ``model`` with ``[1m]`` appended when it is a known 1M Claude model
+        and not already suffixed; otherwise ``model`` unchanged.
+    """
+    if model is None or _CLAUDE_1M_MODEL_SUFFIX in model or not claude_model_supports_1m(model):
+        return model
+    logger.info("Claude SDK: requesting 1M context window for model %r", model)
+    return f"{model}{_CLAUDE_1M_MODEL_SUFFIX}"
+
 
 _CLAUDE_API_KEY_HELPER_ENV_KEY = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 
@@ -2033,7 +2067,10 @@ class ClaudeSDKExecutor(Executor):
         if self._cli_path:
             options.cli_path = self._cli_path
         if model:
-            options.model = model
+            # Request the 1M window for known 1M Claude models (the CLI strips
+            # the [1m] suffix on the wire and sends context-1m). The bare `model`
+            # is kept for usage/pricing; only the CLI --model carries the suffix.
+            options.model = _maybe_enable_1m_window(model)
         if self._cwd:
             options.cwd = self._cwd
         # Install the unified can_use_tool gate. It runs the TOOL_CALL

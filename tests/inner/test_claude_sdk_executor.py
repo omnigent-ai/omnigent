@@ -3564,3 +3564,96 @@ def test_no_precompact_no_compaction_event() -> None:
         assert len(compaction_events) == 0
 
     _run(_t())
+
+
+# ---------------------------------------------------------------------------
+# Tests: 1M context-window opt-in ([1m] model suffix)
+# ---------------------------------------------------------------------------
+
+
+def test_claude_sdk_maybe_enable_1m_window() -> None:
+    """`_maybe_enable_1m_window` appends [1m] for known 1M models only."""
+    from omnigent.inner.claude_sdk_executor import _maybe_enable_1m_window as m
+
+    assert m("databricks-claude-opus-4-8") == "databricks-claude-opus-4-8[1m]"
+    assert m("claude-opus-4-8") == "claude-opus-4-8[1m]"
+    assert m("claude-sonnet-4-6") == "claude-sonnet-4-6[1m]"
+    assert m("claude-opus-4-8[1m]") == "claude-opus-4-8[1m]"  # idempotent
+    assert m("claude-sonnet-4-5") == "claude-sonnet-4-5"  # non-1M untouched
+    assert m("databricks-gpt-5-5") == "databricks-gpt-5-5"
+    assert m(None) is None
+
+
+def _run_turn_capture_options_model(model: str) -> str | None:
+    """Run one turn with cfg.model=*model*; return the ``options.model`` the
+    executor handed Claude Code (captured at connect)."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorConfig
+
+    captured: list = []
+
+    class _ResultMessage:
+        def __init__(self, session_id):
+            self.session_id = session_id
+            self.result = "ok"
+            self.content = []
+            self.model = "claude-test"
+            self.usage = type("U", (), {"input_tokens": 1, "output_tokens": 1})()
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = type("SystemMessage", (), {})
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+        messages: list = []
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                captured.append(getattr(self.options, "model", None))
+
+            async def query(self, prompt, session_id="default"):
+                _FakeSDK.messages = [_ResultMessage(f"claude-{session_id}")]
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+            async for _ in executor.run_turn(
+                [{"role": "user", "content": "hi", "session_id": "s1"}],
+                [],
+                "",
+                ExecutorConfig(model=model),
+            ):
+                pass
+
+    _run(_t())
+    return captured[0] if captured else None
+
+
+def test_run_turn_appends_1m_suffix_for_known_model() -> None:
+    """A known 1M model is handed to Claude Code with the [1m] suffix."""
+    assert _run_turn_capture_options_model("databricks-claude-opus-4-8") == (
+        "databricks-claude-opus-4-8[1m]"
+    )
+
+
+def test_run_turn_keeps_bare_model_for_non_1m() -> None:
+    """A non-1M model is handed to Claude Code unchanged (no spurious 1M)."""
+    assert _run_turn_capture_options_model("databricks-claude-sonnet-4-5") == (
+        "databricks-claude-sonnet-4-5"
+    )

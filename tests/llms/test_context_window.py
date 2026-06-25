@@ -429,3 +429,24 @@ def test_get_model_context_window_uses_qwen_fallback(monkeypatch: pytest.MonkeyP
     assert get_model_context_window("qwen3-coder-plus") == 1_048_576
     # An unrecognized qwen model still falls back to the conservative default.
     assert get_model_context_window("qwen-nonexistent-xyz") == 128_000
+
+
+def test_claude_model_supports_1m_shared_helper() -> None:
+    """The shared 1M-model predicate (used by the harnesses' [1m]-append)
+    recognizes the same set as the window override, across all id namings."""
+    from omnigent.llms.context_window import CLAUDE_1M_MODELS, claude_model_supports_1m
+
+    assert "claude-opus-4-8" in CLAUDE_1M_MODELS
+    for ident in (
+        "claude-opus-4-8",
+        "databricks-claude-opus-4-8",
+        "anthropic/claude-opus-4-8",
+        "claude-opus-4-8[1m]",
+        "Claude-Opus-4-8",
+        "claude-opus-4-8:beta",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6",
+    ):
+        assert claude_model_supports_1m(ident) is True, ident
+    for ident in ("claude-sonnet-4-5", "claude-haiku-4-5", "databricks-gpt-5-5"):
+        assert claude_model_supports_1m(ident) is False, ident

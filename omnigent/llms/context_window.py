@@ -87,34 +87,65 @@ _QWEN_CONTEXT_WINDOWS: dict[str, int] = {
 # Aligns with the bundled model catalog's 1M Claude entries; a spec's
 # ``executor.context_window`` always overrides this.
 _CLAUDE_1M_TOKENS: int = 1_000_000
-_CLAUDE_CONTEXT_WINDOW_OVERRIDES: dict[str, int] = {
-    "claude-opus-4-8": _CLAUDE_1M_TOKENS,
-    "claude-opus-4-6": _CLAUDE_1M_TOKENS,
-    "claude-sonnet-4-6": _CLAUDE_1M_TOKENS,
-}
+# Canonical (bare, normalized) set of Claude models that serve a 1M context. The
+# single source of truth shared by the window override below AND the claude-sdk /
+# claude-native harnesses, which append Claude Code's ``[1m]`` model suffix for
+# these so the CLI requests 1M (it strips the suffix on the wire and sends the
+# ``context-1m`` beta). Aligns with the bundled model catalog's 1M Claude entries.
+CLAUDE_1M_MODELS: frozenset[str] = frozenset(
+    {"claude-opus-4-8", "claude-opus-4-6", "claude-sonnet-4-6"}
+)
+
+
+def _normalize_claude_model_id(model: str) -> str:
+    """Reduce a model id to its bare base form for 1M-set matching.
+
+    Strips a provider prefix (``anthropic/claude-opus-4-8``), the gateway
+    ``databricks-`` prefix, an OpenRouter-style ``:tag`` suffix, and a Claude
+    Code ``[1m]`` bracket alias; lowercased.
+
+    :param model: The model identifier (any namespacing).
+    :returns: The bare base id, e.g. ``"claude-opus-4-8"``.
+    """
+    bare = model.rsplit("/", 1)[-1].split(":", 1)[0].split("[", 1)[0].strip().lower()
+    if bare.startswith("databricks-"):
+        bare = bare[len("databricks-") :]
+    return bare
+
+
+def claude_model_supports_1m(model: str) -> bool:
+    """Whether *model* (any namespacing) is a known 1M-context Claude model.
+
+    Shared by the harnesses that opt a model into its 1M window via the ``[1m]``
+    suffix; mirrors :func:`_claude_context_window_override`'s own membership test.
+
+    :param model: The model identifier.
+    :returns: ``True`` if it normalizes to a member of :data:`CLAUDE_1M_MODELS`.
+    """
+    return _normalize_claude_model_id(model) in CLAUDE_1M_MODELS
 
 
 def _claude_context_window_override(model: str) -> int | None:
     """Return a curated context window for a known under-reported Claude model.
 
-    Normalizes the id the way model strings reach us — a provider prefix
-    (``anthropic/claude-opus-4-8``), the gateway ``databricks-`` prefix
-    (``databricks-claude-opus-4-8``), an OpenRouter-style ``:tag`` suffix, and a
-    Claude Code ``[1m]`` bracket alias (``claude-opus-4-8[1m]``) — down to the
-    bare base id before matching :data:`_CLAUDE_CONTEXT_WINDOW_OVERRIDES`.
+    The 1M-context Claude models are served at 1M through the Databricks AI
+    gateway, but litellm's bundled registry (and, for newer ids, the MLflow
+    catalog) report the 200K Anthropic base — which left the UI context meter
+    mis-sized and triggered proactive compaction ~5x too early. Empirically
+    verified against the gateway: a 375K-token ``databricks-claude-opus-4-8``
+    request is accepted (HTTP 200, ``input_tokens=375019``) with and without the
+    ``context-1m`` beta — so 1M is not gateway-gated here.
 
     Applied BEFORE litellm / the MLflow catalog (unlike :func:`_qwen_context_window`,
     a post-lookup fallback) because those backends actively return the wrong (200K
-    base) value for these models, so a fallback would never be reached.
+    base) value for these models, so a fallback would never be reached. A spec's
+    ``executor.context_window`` always overrides this.
 
     :param model: The model identifier (any namespacing).
-    :returns: The override window in tokens, or ``None`` when the model isn't a
-        recognized entry (caller continues the normal resolution chain).
+    :returns: 1M when *model* is a known 1M Claude model, else ``None`` (caller
+        continues the normal resolution chain).
     """
-    bare = model.rsplit("/", 1)[-1].split(":", 1)[0].split("[", 1)[0].strip().lower()
-    if bare.startswith("databricks-"):
-        bare = bare[len("databricks-") :]
-    return _CLAUDE_CONTEXT_WINDOW_OVERRIDES.get(bare)
+    return _CLAUDE_1M_TOKENS if claude_model_supports_1m(model) else None
 
 
 def _qwen_context_window(model: str) -> int | None:
