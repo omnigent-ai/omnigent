@@ -435,6 +435,50 @@ async def test_session_skills_cached_per_session(tmp_path: Path) -> None:
     assert resolver_calls == ["ag_x"]
 
 
+@pytest.mark.asyncio
+async def test_session_skills_cache_ttl_expiry_rediscovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The per-session cache honors a TTL: once it elapses, the next request
+    re-walks the filesystem and picks up a skill installed mid-session.
+
+    With the TTL pinned to 0 every cached entry is immediately stale, so a
+    host skill created AFTER the first request must appear in the second —
+    proof the walk reran rather than serving the stale cache (the converse of
+    ``test_session_skills_cached_per_session``, which proves the cache holds
+    within the window).
+    """
+    home = tmp_path / "home"
+    (home / ".claude" / "skills").mkdir(parents=True)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setattr("omnigent.runner.app._SESSION_SKILLS_CACHE_TTL_SECONDS", 0.0)
+
+    workspace = tmp_path / "workspace"
+    first_skill = workspace / ".claude" / "skills" / "first"
+    first_skill.mkdir(parents=True)
+    (first_skill / "SKILL.md").write_text(_skill_md("first", "Present from the start."))
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    app = _make_app(bundle, [], "all", workspace=workspace)
+
+    async for c in _client(app):
+        first = await c.get("/v1/sessions/conv_ttl/skills")
+        # Install a second host skill only AFTER the first response is served.
+        second_skill = workspace / ".claude" / "skills" / "second"
+        second_skill.mkdir(parents=True)
+        (second_skill / "SKILL.md").write_text(_skill_md("second", "Installed mid-session."))
+        second = await c.get("/v1/sessions/conv_ttl/skills")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert {s["name"] for s in first.json()["skills"]} == {"first"}
+    # TTL=0 ⇒ the second request re-walked and discovered the new skill.
+    assert {s["name"] for s in second.json()["skills"]} == {"first", "second"}
+
+
 def _seed_claude_plugin(home: Path) -> None:
     """Seed a fake ~/.claude with one enabled plugin exposing one skill."""
     install = home / ".claude" / "plugins" / "cache" / "mkt" / "superpowers" / "1.0.0"

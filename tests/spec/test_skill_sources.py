@@ -161,6 +161,62 @@ def test_claude_provider_excludes_disabled_plugin(
     assert "superpowers:using-superpowers" not in [s.name for s in out]
 
 
+def test_claude_managed_plugin_surfaces_when_absent_from_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A plugin force-enabled only via ``managed_plugins.json`` — with no
+    ``enabledPlugins`` entry in any settings file — is still surfaced.
+    Claude Code's managed (policy) tier enables it regardless of settings.
+    """
+    home = tmp_path / "home"
+    install = home / ".claude" / "plugins" / "cache" / "mkt" / "secrev" / "1.0.0"
+    _write_skill(install / "skills", "do-review")
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
+    (home / ".claude" / "settings.json").write_text(json.dumps({"enabledPlugins": {}}))
+    (home / ".claude" / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {
+                    "secrev@mkt": [
+                        {"scope": "user", "installPath": str(install), "version": "1.0.0"}
+                    ]
+                },
+            }
+        )
+    )
+    (home / ".claude" / "plugins" / "managed_plugins.json").write_text(
+        json.dumps({"managed_plugins": ["secrev@mkt"]})
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-sdk")
+    assert "secrev:do-review" in [s.name for s in out]
+
+
+def test_claude_managed_plugin_overrides_settings_disable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``managed_plugins.json`` force-enables even when ``enabledPlugins``
+    explicitly disables the same plugin: the managed tier is highest
+    precedence in Claude Code and cannot be overridden by a settings toggle.
+    """
+    home = _claude_home_with_plugin(
+        tmp_path / "home",
+        plugin="secrev",
+        marketplace="mkt",
+        skill="do-review",
+        enabled=False,
+    )
+    (home / ".claude" / "plugins" / "managed_plugins.json").write_text(
+        json.dumps({"managed_plugins": ["secrev@mkt"]})
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-sdk")
+    assert "secrev:do-review" in [s.name for s in out]
+
+
 def test_claude_provider_tolerates_missing_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

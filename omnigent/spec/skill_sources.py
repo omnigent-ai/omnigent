@@ -156,19 +156,46 @@ def _enabled_plugin_settings_files(ctx: SkillSourceContext) -> list[Path]:
     return files
 
 
+def _managed_plugin_keys(ctx: SkillSourceContext) -> set[str]:
+    """
+    Plugin keys force-enabled by Claude Code's managed (policy) tier.
+
+    ``~/.claude/plugins/managed_plugins.json`` carries a ``managed_plugins``
+    list of ``<plugin>@<marketplace>`` keys that an organization's policy
+    force-installs. Claude Code treats the managed tier as the highest
+    precedence — it cannot be overridden by a user/project ``enabledPlugins``
+    toggle — so a managed plugin is enabled even when it carries no
+    ``enabledPlugins`` entry (or an explicit ``false``) in any settings file.
+
+    :param ctx: Session discovery context.
+    :returns: The set of managed ``<plugin>@<marketplace>`` keys, empty when
+        the file is absent, unreadable, or malformed.
+    """
+    data = _read_json(ctx.home / ".claude" / "plugins" / "managed_plugins.json")
+    if data is None:
+        return set()
+    managed = data.get("managed_plugins")
+    if not isinstance(managed, list):
+        return set()
+    return {key for key in managed if isinstance(key, str) and key}
+
+
 def _enabled_plugin_keys(ctx: SkillSourceContext) -> set[str]:
     """
-    Resolve which plugins are enabled, honoring scope + local precedence.
+    Resolve which plugins are enabled, honoring scope + local precedence
+    and the managed (policy) tier.
 
     Merges ``enabledPlugins`` across the settings files from
     :func:`_enabled_plugin_settings_files` in increasing-precedence order
     (last-wins per key), so a plugin enabled globally but explicitly
     disabled in a project's ``settings.local.json`` is correctly excluded
-    (and vice-versa).
+    (and vice-versa). The managed tier (:func:`_managed_plugin_keys`) is then
+    unioned on top: it force-enables at the highest precedence and so cannot
+    be overridden by a settings disable.
 
     :param ctx: Session discovery context.
     :returns: The set of ``<plugin>@<marketplace>`` keys whose effective
-        enablement is truthy.
+        enablement is truthy, unioned with the managed (policy) keys.
     """
     state: dict[str, bool] = {}
     for path in _enabled_plugin_settings_files(ctx):
@@ -184,7 +211,11 @@ def _enabled_plugin_keys(ctx: SkillSourceContext) -> set[str]:
                 # real bool from a weaker-precedence tier).
                 if isinstance(value, bool):
                     state[key] = value
-    return {key for key, on in state.items() if on}
+    enabled = {key for key, on in state.items() if on}
+    # Managed (policy) plugins are force-enabled at the highest precedence and
+    # cannot be overridden by a user/project enabledPlugins toggle, so union
+    # them on top of the settings-derived set (force-enable, never disable).
+    return enabled | _managed_plugin_keys(ctx)
 
 
 def _plugin_install_paths(ctx: SkillSourceContext, enabled: set[str]) -> dict[str, Path]:
