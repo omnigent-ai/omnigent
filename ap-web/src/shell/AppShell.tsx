@@ -398,10 +398,10 @@ export function AppShell() {
     // fall back one hop until the walk resolves the true root.
     return activeSession?.parentSessionId ?? conversationId;
   }, [conversationId, activeSession, walkedRoot, queryClient]);
-  // One-shot fetch (no polling) for the Subagents tab's count badge.
+  // One-shot bounded tree fetch (no polling) for the Agents tab's count badge.
   // SubagentsPanel mounts its own polling usage of the hook against
   // the same rootSessionId, so the cache is shared.
-  const { children: childSessions } = useChildSessions(rootSessionId);
+  const { children: childSessions } = useChildSessions(rootSessionId, null, true);
   // Remember the resolved root so a later click into one of its tree
   // members can hold it steady (see ``rootSessionId`` above).
   useEffect(() => {
@@ -820,8 +820,8 @@ export function AppShell() {
         return next;
       });
     },
-    [setSearchParams],
-  ); // eslint-disable-line react-hooks/exhaustive-deps
+    [clearFileViewerUrl, setSearchParams],
+  );
 
   // Switch the workspace rail's tab. The side effect (closing any open
   // file + its comments + URL) lives here, not in WorkspacePanel, so the
