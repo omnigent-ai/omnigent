@@ -15,7 +15,7 @@ from collections.abc import Iterable
 import pytest
 from omnigent_client import child_summary_busy
 from omnigent_ui_sdk.terminal._formatter import StreamingText
-from omnigent_ui_sdk.terminal._host import TerminalHost
+from omnigent_ui_sdk.terminal._host import _BOTTOM_RESERVED_ROWS, TerminalHost
 from prompt_toolkit.output import DummyOutput
 from rich.text import Text
 
@@ -975,7 +975,7 @@ def test_live_region_capped_to_viewport_ceiling(
     # Fake a tiny terminal: 10 rows → ceiling = 10 - 5 = 5.
     monkeypatch.setattr(
         "omnigent_ui_sdk.terminal._host._term_height",
-        lambda: 10,
+        lambda: 20,
     )
 
     # Render 20 lines — well above the ceiling of 5.
@@ -986,13 +986,36 @@ def test_live_region_capped_to_viewport_ceiling(
     # full rendered height (~20). If uncapped, the next StreamLive's
     # cursor-up would try to clear 20 lines but only reach 5 — the
     # other 15 would be stranded in scrollback as stale duplicates.
-    ceiling = 10 - 5  # _term_height() - _BOTTOM_RESERVED_ROWS
+    ceiling = 20 - _BOTTOM_RESERVED_ROWS
     assert host._live_line_count <= ceiling, (
         f"Expected _live_line_count <= {ceiling} (viewport ceiling), "
         f"got {host._live_line_count}. Uncapped live regions cause "
         f"the scrollback duplication bug — cursor-up can't reach "
         f"lines that scrolled past the viewport top."
     )
+
+
+def test_streaming_wrap_does_not_overshoot_viewport_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A wrapped streaming line is skipped if all rows would exceed the ceiling.
+
+    The overflow-render regression can recur when the gate checks only
+    current line count before printing text that wraps into multiple rows.
+    """
+    host = TerminalHost(model_name="test")
+    writes: list[str] = []
+    monkeypatch.setattr(sys.stdout, "write", lambda data: (writes.append(data), len(data))[1])
+    monkeypatch.setattr(sys.stdout, "flush", lambda: None)
+    monkeypatch.setattr("omnigent_ui_sdk.terminal._host._term_height", lambda: 15)
+    monkeypatch.setattr("omnigent_ui_sdk.terminal._host._term_width", lambda: 32)
+
+    host._streamed_line_count = 3
+    host.output(StreamingText(text="word " * 20 + "\n"))
+
+    assert host._streamed_line_count == 3
+    assert writes == []
 
 
 _CURSOR_UP_ERASE = "\033[A\033[2K"

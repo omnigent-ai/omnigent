@@ -35,6 +35,18 @@ def _run(coro):
         loop.close()
 
 
+def test_claude_temp_namespace_does_not_require_getuid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows lacks ``os.getuid()``; Claude temp roots still need a stable namespace."""
+    from omnigent.inner import claude_sdk_executor
+
+    monkeypatch.delattr(os, "getuid", raising=False)
+    monkeypatch.setenv("USERNAME", "claude-user")
+
+    namespace = claude_sdk_executor._claude_temp_namespace()
+
+    assert namespace.startswith("win-")
+
+
 # ---------------------------------------------------------------------------
 # Tests: Prompt extraction
 # ---------------------------------------------------------------------------

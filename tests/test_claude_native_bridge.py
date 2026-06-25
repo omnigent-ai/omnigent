@@ -73,7 +73,7 @@ def subprocess_bridge_root() -> Iterator[Path]:
         ``python -m omnigent.claude_native_bridge`` accepts bridge
         writes without inheriting pytest monkeypatches.
     """
-    production_root = Path("/tmp") / f"omnigent-{os.getuid()}" / "claude-native"
+    production_root = claude_native_bridge._default_bridge_root()
     production_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(production_root.parent, 0o700)
     os.chmod(production_root, 0o700)
@@ -267,6 +267,24 @@ def test_prepare_bridge_dir_preserves_permission_hook_config(
     config = read_permission_hook_config(bridge_dir)
     assert config["ap_server_url"] == "http://127.0.0.1:8787"
     assert config["ap_auth_headers"] == {"Authorization": "Bearer xyz"}
+
+
+def test_default_bridge_root_does_not_require_getuid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Windows lacks ``os.getuid()``; importing/building bridge roots must still work.
+    """
+    monkeypatch.delattr(os, "getuid", raising=False)
+    monkeypatch.setenv("USERNAME", "bridge-user")
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+
+    root = claude_native_bridge._default_bridge_root()
+
+    assert root.parent.name.startswith("omnigent-win-")
+    assert root.parent.parent == tmp_path
+    assert root.name == "claude-native"
 
 
 def test_prepare_bridge_dir_restricts_filesystem_permissions(
