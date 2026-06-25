@@ -3,24 +3,30 @@
 ``omnigent antigravity`` runs the Antigravity ``agy`` CLI in a runner-owned tmux
 terminal and mirrors its transcript into the Omnigent session via the RPC read
 driver (the read path). This executor is the **write path**: when a turn is
-submitted from the Omnigent web/mobile UI it delivers the user's message to the
-running agy over its connect-RPC ``SendUserCascadeMessage``
-(:func:`omnigent.antigravity_native_rpc.send_user_cascade_message`). agy then
-runs a real model turn and its reply flows back through the read driver — exactly
-like the **claude**/**codex** native bridges (whose web turns also reach the
-agent over its own protocol, not by faking a transcript entry).
+submitted from the Omnigent web/mobile UI it delivers the user's message by
+TYPING IT INTO the agy TUI pane over tmux
+(:func:`omnigent.antigravity_native_bridge.inject_user_message_via_tui`), exactly
+like the **claude**/**codex** native bridges drive their vendor panes. agy then
+runs a real model turn and its reply flows back through the read driver.
 
-**Why ``SendUserCascadeMessage``, not ``SendAgentMessage`` or tmux send-keys.**
-agy exposes a connect-RPC ``SendAgentMessage``, but a turn delivered that way is
-recorded as a ``SYSTEM_MESSAGE`` ("not actually sent by the user"), NOT a
-``USER_INPUT`` step — so the read driver (which mirrors user turns from
-``USER_INPUT``) would never commit the user's message. ``SendUserCascadeMessage``
-records a real ``CORTEX_STEP_TYPE_USER_INPUT`` step with
-``metadata.source == CORTEX_STEP_SOURCE_USER_EXPLICIT`` (byte-for-byte what the
-read driver keys on), matching claude/codex native (both commit the user message
-before its assistant reply) — and replaces the legacy tmux send-keys path and its
-attended-TUI swallow hazard (verified against agy 1.0.10; see design §10.1). The
-same path serves mid-turn steering.
+**Why typing into the TUI, not headless ``SendUserCascadeMessage`` RPC
+(#1156/#1158).** Typing into the TUI gives true parity with claude/codex native:
+the turn RENDERS in the agy TUI AND lands on the SAME cascade the TUI displays,
+so the agy TUI and the Omnigent web mirror share ONE conversation in both
+directions. The prior headless RPC path delivered onto a separate
+``StartCascade`` cascade the TUI never showed — so the agy TUI never echoed web
+turns (#1156) and TUI-typed turns never mirrored to the web (#1158). agy records
+a TUI-typed turn as a real ``CORTEX_STEP_TYPE_USER_INPUT`` step (what the read
+driver keys on); the careful inject (draft-clear + bracketed paste +
+footer-verified submit) handles the attended-TUI race. RPC remains the
+read/control transport only (``StreamAgentStateUpdates`` /
+``GetAllCascadeTrajectories`` / ``CancelCascadeSteps`` /
+``HandleCascadeUserInteraction``). The same path serves mid-turn steering.
+
+.. note:: The now-unused RPC-delivery helpers below
+   (``_resolve_ready_cascade_id`` / ``_resolve_plan_model`` / ``_wait_for_state``
+   and the model-resolution module functions) are retained pending a focused
+   follow-up cleanup; the live write path is :meth:`_deliver` → the TUI inject.
 
 Because agy owns its own model loop and emits output via the read path, this
 executor:
@@ -47,8 +53,9 @@ stay informational on this write path — agy's own model selection determines t
 turn's model and thinking budget and cannot be overridden from here.
 
 Attachment note: the RPC turn text takes plain text, so an image/file attachment
-on a web turn is reduced to its text part (any prose the user typed). Inline
-image/file bytes are not forwarded to agy through this path.
+on a web turn is materialized to a file under the bridge dir and referenced by
+absolute path (``[Attached: <path>]``) so agy can open it with its Read tool —
+mirroring cursor-native. Any prose the user typed is sent alongside the marker.
 """
 
 from __future__ import annotations
@@ -66,16 +73,15 @@ from omnigent.antigravity_native_bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR,
     ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     AntigravityNativeBridgeState,
+    inject_user_message_via_tui,
     is_placeholder_conversation_id,
     read_bridge_state,
 )
 from omnigent.antigravity_native_rpc import (
-    AntigravityRpcError,
     cancel_cascade_steps,
     get_available_models,
     get_trajectory_steps,
     resolve_language_server_port,
-    send_user_cascade_message,
 )
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -148,7 +154,7 @@ class AntigravityNativeExecutor(Executor):
             when there was no text to send or delivery failed.
         """
         del session_key
-        text = _content_to_text(content)
+        text = _content_to_text(content, self._bridge_dir)
         if not text:
             return False
         outcome = await self._deliver(text)
@@ -245,7 +251,7 @@ class AntigravityNativeExecutor(Executor):
             except PermanentLLMError as exc:
                 yield ExecutorError(message=str(exc))
                 return
-        text = _latest_user_text(messages)
+        text = _latest_user_text(messages, self._bridge_dir)
         if not text:
             yield ExecutorError(message="Antigravity native turn had no user text to send")
             return
@@ -257,19 +263,36 @@ class AntigravityNativeExecutor(Executor):
 
     async def _deliver(self, text: str) -> str | None:
         """
-        Deliver one message to agy over ``SendUserCascadeMessage``.
+        Deliver one message to agy by typing it into the agy TUI.
 
         Shared by :meth:`run_turn` (initiating message) and
-        :meth:`enqueue_session_message` (mid-turn steering): agy records either as
-        a real ``USER_INPUT`` turn, so the two need no special-casing. Resolves
-        the cascade id (waiting for the runner to mint it on a fresh session —
-        see :meth:`_resolve_ready_cascade_id`), the connect-RPC port, and the
-        per-turn model (:meth:`_resolve_plan_model`), then sends.
+        :meth:`enqueue_session_message` (mid-turn steering). The turn is injected
+        into the agy TUI pane over tmux (bracketed paste + Enter — see
+        :func:`omnigent.antigravity_native_bridge.inject_user_message_via_tui`)
+        rather than delivered over headless ``SendUserCascadeMessage`` RPC.
+
+        Typing into the TUI is what gives antigravity-native true parity with
+        claude/codex native (#1156/#1158): the turn renders in the agy TUI AND
+        lands on the SAME cascade the TUI displays, so the read driver mirrors a
+        single, unified conversation in both directions. The headless RPC path,
+        by contrast, delivered onto a separate ``StartCascade`` cascade the TUI
+        never showed — splitting the TUI and the web mirror into two cascades
+        (the agy TUI never echoed web turns; TUI-typed turns never mirrored).
+        agy records a TUI-typed turn as a real ``CORTEX_STEP_TYPE_USER_INPUT``
+        step, exactly what the read driver keys on; the careful inject
+        (draft-clear + bracketed paste + footer-verified submit) handles the
+        attended-TUI race. RPC remains the read/control transport
+        (``StreamAgentStateUpdates`` / ``GetAllCascadeTrajectories`` /
+        ``CancelCascadeSteps`` / ``HandleCascadeUserInteraction``).
+
+        Unlike the RPC path, this needs no cascade id, port, or per-turn model
+        resolution up front: the TUI owns its cascade and its selected model, and
+        agy mints the cascade on the first typed turn (which the read driver then
+        discovers/binds — see :mod:`omnigent.antigravity_native_reader`).
 
         :param text: User message text to deliver.
-        :returns: ``None`` on success, or a human-readable error string
-            describing why the message could not be delivered (including agy's own
-            message on a model/validation error).
+        :returns: ``None`` on success, or a human-readable error string when the
+            turn could not be delivered to the TUI (e.g. the agy pane exited).
         """
         async with self._send_lock:
             # The runner seeds bridge state before launching the terminal, so a
@@ -280,46 +303,20 @@ class AntigravityNativeExecutor(Executor):
                 return "Antigravity native bridge state is missing"
             if not _session_is_active(state.session_id, self._request_session_id):
                 return "Antigravity native session is no longer active"
-            cascade_id = await self._resolve_ready_cascade_id(state)
-            if cascade_id is None:
-                # The runner mints agy's real conversation on cold-start (Task
-                # 11); until it lands there is no live cascade to RPC. Pure-RPC
-                # turn-send no longer types into the TUI to trigger minting, so a
-                # fresh session's first turn waits then errors "not ready" rather
-                # than delivering to the ``agy_conv_*`` placeholder.
-                return (
-                    "Antigravity native conversation is not ready yet "
-                    "(agy has not registered a conversation — is the agy terminal "
-                    "attached and running?)"
-                )
-            port = await asyncio.to_thread(resolve_language_server_port, cascade_id)
-            if port is None:
-                return (
-                    "Could not reach the agy connect-RPC server for conversation "
-                    f"{cascade_id} (is the agy terminal still running?)"
-                )
-            plan_model = await self._resolve_plan_model(port, cascade_id)
-            if plan_model is None:
-                return (
-                    "Could not resolve an agy model for the turn "
-                    "(no current model to echo and no recommended model available)"
-                )
             try:
                 await asyncio.to_thread(
-                    send_user_cascade_message,
-                    port,
-                    cascade_id,
-                    text,
-                    plan_model=plan_model,
+                    inject_user_message_via_tui,
+                    self._bridge_dir,
+                    content=text,
                 )
-            except AntigravityRpcError as exc:
-                # Surface agy's own message (e.g. a model/validation error) rather
-                # than a fake success — the read driver mirrors only real turns.
-                return f"agy rejected the turn: {exc}"
+            except RuntimeError as exc:
+                # The TUI pane is gone / never advertised / the submit never
+                # started a turn. Surface it so the UI can prompt a restart
+                # rather than reporting a fake success the mirror never fills.
+                return f"Could not deliver the turn to the agy TUI: {exc}"
             _logger.info(
-                "antigravity native delivered turn via RPC: conversation=%s model=%s",
-                cascade_id,
-                plan_model,
+                "antigravity native delivered turn via TUI injection (session=%s)",
+                state.session_id,
             )
             return None
 
@@ -540,47 +537,60 @@ def _dig(obj: object, *keys: str) -> object:
     return current
 
 
-def _latest_user_text(messages: list[Message]) -> str:
+def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     """
     Extract the latest user message's text from the executor message list.
 
     :param messages: Executor message list.
+    :param bridge_dir: Bridge directory; image/file attachments are
+        materialized underneath it and referenced by path.
     :returns: The user's text (string + content-block shapes flattened), or
         ``""`` when there is no user text to send.
     """
     for message in reversed(messages):
         if message.get("role") == "user":
-            return _content_to_text(message.get("content"))
+            return _content_to_text(message.get("content"), bridge_dir)
     return ""
 
 
-def _content_to_text(content: EnqueuedContent) -> str:
+def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
     """
     Flatten executor message content into plain text for the agy turn-send.
 
-    The RPC turn text carries only text, so this extracts the textual parts and
-    drops attachments. A plain string passes through. A list of content blocks
-    contributes every ``input_text`` / ``text`` block, joined by newlines;
-    ``input_image`` / ``input_file`` blocks are skipped (their bytes cannot be
-    sent through this path — at minimum the typed text is sent).
+    The RPC turn text carries only text. A plain string passes through. A list
+    of content blocks contributes every ``input_text`` / ``text`` block;
+    ``input_image`` / ``input_file`` blocks carrying a base64 data URI are
+    materialized to the bridge dir and referenced by absolute path
+    (``[Attached: <path>]``) so agy can open them with its Read tool — otherwise
+    web-UI attachments are silently dropped. Mirrors cursor-native.
 
     :param content: Message content — a string, a list of content blocks like
         ``{"type": "input_text", "text": "..."}``, or other.
+    :param bridge_dir: Bridge directory; attachments are materialized underneath
+        it and referenced by path.
     :returns: The flattened text, stripped of leading/trailing whitespace, or
         ``""`` when no text is present.
     """
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
-        parts: list[str] = []
+        from omnigent.inner.native_attachments import materialize_attachment
+
+        attachment_lines: list[str] = []
+        text_parts: list[str] = []
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") in {"input_text", "text"}:
+            block_type = block.get("type", "")
+            if block_type in ("input_text", "text"):
                 text = block.get("text")
                 if isinstance(text, str) and text:
-                    parts.append(text)
-        return "\n".join(parts).strip()
+                    text_parts.append(text)
+            elif block_type in ("input_image", "input_file"):
+                path = materialize_attachment(block, bridge_dir)
+                if path is not None:
+                    attachment_lines.append(f"[Attached: {path}]")
+        return "\n".join(attachment_lines + text_parts).strip()
     if content is None:
         return ""
     return json.dumps(content, ensure_ascii=True)

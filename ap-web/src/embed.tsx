@@ -105,6 +105,7 @@ const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   databricks_features: false,
   managed_sandboxes_enabled: false,
   sandbox_provider: null,
+  smart_routing_enabled: false,
 };
 
 /**

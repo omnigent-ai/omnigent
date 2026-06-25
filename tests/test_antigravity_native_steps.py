@@ -73,29 +73,46 @@ def _assert_no_delta(events: list[OutboundEvent]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# USER_INPUT → [] (user-dup fix)
+# USER_INPUT → committed user message (#1155)
 # ---------------------------------------------------------------------------
 
 
-class TestUserInputSkipped:
-    """USER_INPUT steps must produce no events (fixes user message duplication)."""
+class TestUserInputCommitted:
+    """
+    USER_INPUT steps commit the user's turn as a ``message`` item.
 
-    def test_user_input_returns_empty(self) -> None:
-        """
-        USER_INPUT step → empty event list.
+    The pure-RPC write path fires no "direct POST /events" to persist the user
+    turn, so the read path must mirror it (parity with claude/codex/cursor
+    native). Without it the web UI's optimistic bubble has no committed
+    counterpart and renders below the assistant reply (#1155).
+    """
 
-        The user turn is already persisted by the direct POST /events; emitting
-        it again from the RPC stream would duplicate the user message in the UI.
-        """
+    def test_user_input_commits_user_message(self) -> None:
+        """USER_INPUT step → exactly one committed user ``message`` item."""
         step = _load("user_input")
         events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        assert events == []
+        assert len(events) == 1
+        ev = events[0]
+        assert ev.event_type == "external_conversation_item"
+        assert ev.data["item_type"] == "message"
+        assert ev.data["item_data"]["role"] == "user"
+        assert ev.data["item_data"]["content"] == [
+            {"type": "input_text", "text": "Say hello in one short sentence."}
+        ]
+        # A user turn carries no response_id (not an assistant response).
+        assert "response_id" not in ev.data
 
     def test_user_input_no_delta(self) -> None:
-        """USER_INPUT step produces no delta events (belt-and-suspenders)."""
+        """USER_INPUT commits a message but emits no streaming delta events."""
         step = _load("user_input")
         events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
         _assert_no_delta(events)
+
+    def test_user_input_without_text_is_skipped(self) -> None:
+        """A USER_INPUT step with no recoverable text emits nothing (no empty bubble)."""
+        step = {"type": "CORTEX_STEP_TYPE_USER_INPUT", "userInput": {}}
+        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        assert events == []
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +195,39 @@ class TestPlannerResponseText:
         step = _load("planner_response_text")
         events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
         assert events[0].data["response_id"] == f"agy_{_CID}_2"
+
+
+class TestPlannerResponseError:
+    """An ERROR PLANNER_RESPONSE emits a visible error item (not a silent drop)."""
+
+    def test_error_planner_emits_one_error_message(self) -> None:
+        """A terminal-ERROR planner yields one assistant ``message`` error marker.
+
+        Regression for #6: previously an ERROR planner returned ``[]`` (the branch
+        committed only at DONE), so a model/turn error looked identical to a normal
+        empty reply. It must surface a visible item.
+        """
+        step = _load("planner_response_text")
+        step["status"] = "CORTEX_STEP_STATUS_ERROR"
+        step["plannerResponse"] = {}  # no text/error detail -> generic marker
+        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        assert len(events) == 1
+        ev = events[0]
+        assert ev.event_type == "external_conversation_item"
+        assert ev.data["item_type"] == "message"
+        item = ev.data["item_data"]
+        assert isinstance(item, dict)
+        assert item["role"] == "assistant"
+        text = item["content"][0]["text"]
+        assert "status ERROR" in text
+
+    def test_error_planner_includes_error_detail_when_present(self) -> None:
+        """Any ``plannerResponse.error`` text is folded into the marker."""
+        step = _load("planner_response_text")
+        step["status"] = "CORTEX_STEP_STATUS_ERROR"
+        step["plannerResponse"] = {"error": "model overloaded (503)"}
+        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        assert "model overloaded (503)" in events[0].data["item_data"]["content"][0]["text"]
 
 
 # ---------------------------------------------------------------------------

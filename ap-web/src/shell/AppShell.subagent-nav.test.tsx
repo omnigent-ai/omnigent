@@ -65,6 +65,9 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
+  useCreateMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
+  useUpdateMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
+  useDeleteMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
 }));
 vi.mock("./Sidebar", () => ({ Sidebar: () => <div data-testid="sidebar" /> }));
 vi.mock("./FilesPanel", () => ({

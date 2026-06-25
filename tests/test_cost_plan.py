@@ -222,3 +222,22 @@ def test_describe_verdict_is_model_and_tier() -> None:
     """The one-line summary names the model and its tier."""
     text = describe_verdict(_verdict(tier="expensive", model="databricks-claude-opus-4-8"))
     assert text == "databricks-claude-opus-4-8 (expensive)"
+
+
+def test_label_value_caps_long_rationale_at_column_limit() -> None:
+    """An oversized judge rationale must trim to fit the varchar(256)
+    labels column — Postgres rejects the whole write otherwise (the
+    haiku-shows/opus-doesn't bug)."""
+    verdict = AdvisorVerdict(
+        tier="expensive",
+        model="databricks-claude-opus-4-8",
+        applied=True,
+        rationale="x" * 600,
+        turn_anchor="2026-06-11T05:30:45.670436+00:00",
+    )
+    value = verdict_to_label_value(verdict)
+    assert len(value) <= 256
+    parsed = parse_verdict({COST_CONTROL_PLAN_LABEL: value})
+    assert parsed is not None
+    assert parsed.model == verdict.model
+    assert parsed.rationale is not None and parsed.rationale.endswith("...")

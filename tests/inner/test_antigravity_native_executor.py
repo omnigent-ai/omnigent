@@ -1,20 +1,14 @@
 """Tests for the native Antigravity (agy) executor bridge (web-turn injection).
 
-These pin the write path: a web/mobile turn is delivered to the running agy over
-its connect-RPC ``SendUserCascadeMessage`` (``send_user_cascade_message``, mocked
-here), which agy records as a real ``USER_INPUT`` step; agy's reply is mirrored
-back by the read driver — so the executor yields a ``TurnComplete`` with no text
-rather than fabricating a reply. Delivery is RPC for EVERY turn (the old tmux
-send-keys path is retired). The RPC wire shapes are exercised in
-``test_antigravity_native_rpc``; here the RPC client is stubbed so the tests
-assert the executor's wiring — what text + resolved model it delivers, how it
-resolves the cascade id / port, and how it maps success/failure to events.
-
-Model resolution (two-tier, see design §10.1/§10.4): the executor echoes agy's
-CURRENT model from the latest ``USER_INPUT`` step's
-``userInput.userConfig.plannerConfig.planModel`` (via ``get_trajectory_steps``);
-on the first turn / when not yet observable it falls back to the ``recommended``
-entry from ``get_available_models``.
+These pin the write path: a web/mobile turn is delivered to the running agy by
+TYPING IT INTO the agy TUI pane over tmux (``inject_user_message_via_tui``,
+mocked here), which agy records as a real ``USER_INPUT`` step on the cascade the
+TUI displays; agy's reply is mirrored back by the read driver — so the executor
+yields a ``TurnComplete`` with no text rather than fabricating a reply. Typing
+into the TUI (not headless ``SendUserCascadeMessage`` RPC) is what unifies the
+agy TUI and the web mirror onto ONE cascade, giving claude/codex-native parity
+(#1156/#1158). Here the inject is stubbed so the tests assert the executor's
+wiring — what text it delivers and how it maps success/failure to events.
 """
 
 from __future__ import annotations
@@ -29,7 +23,6 @@ from omnigent.antigravity_native_bridge import (
     AntigravityNativeBridgeState,
     write_bridge_state,
 )
-from omnigent.antigravity_native_rpc import AntigravityRpcError
 from omnigent.inner.antigravity_native_executor import AntigravityNativeExecutor
 from omnigent.inner.executor import ExecutorError, ExecutorEvent, TurnComplete
 
@@ -93,80 +86,38 @@ def _steps_with_model(model: str) -> list[dict[str, object]]:
 
 
 @pytest.fixture
-def sent(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+def injected(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     """
-    Stub the RPC turn-send + discovery, recording what the executor delivers.
+    Stub the agy TUI inject, recording each turn the executor delivers.
 
-    Wires the executor's whole RPC surface to in-memory fakes:
-
-    * ``resolve_language_server_port`` -> ``rec["port"]`` (``None`` models "no
-      agy resolvable").
-    * ``get_trajectory_steps`` -> ``rec["steps"]`` (the model-echo source).
-    * ``get_available_models`` -> ``rec["models"]`` (the recommended fallback).
-    * ``send_user_cascade_message`` records each ``{cascade_id, text,
-      plan_model}`` call; set ``rec["send_raise"]`` to raise it.
+    The write path types the turn into the agy TUI pane via
+    ``inject_user_message_via_tui``; this records every ``{bridge_dir, content}``
+    call and, when ``rec["raise"]`` is set, raises it (modeling a dead/unavailable
+    TUI pane).
 
     :param monkeypatch: pytest monkeypatch fixture.
-    :returns: A mutable dict of fakes + recordings (see keys above).
+    :returns: A mutable dict: ``calls`` (recorded injects) + ``raise`` (optional).
     """
-    rec: dict[str, object] = {
-        "port": _PORT,
-        "steps": _steps_with_model(_ECHOED_MODEL),
-        "models": {
-            "models": {
-                "k1": {"model": _RECOMMENDED_MODEL, "displayName": "Rec", "recommended": True},
-                "k2": {"model": "MODEL_OTHER", "displayName": "Other", "recommended": False},
-            }
-        },
-        "send_raise": None,
-        "sends": [],
-        "trajectory_calls": [],
-        "models_calls": 0,
-    }
+    rec: dict[str, object] = {"calls": [], "raise": None}
 
-    def _resolve_port(conversation_id: str) -> int | None:
-        del conversation_id
-        port = rec["port"]
-        return port if isinstance(port, int) else None
-
-    def _get_steps(port: int, cascade_id: str) -> list[dict[str, object]]:
-        calls = rec["trajectory_calls"]
+    def _inject(bridge_dir: Path, *, content: str, **_kw: object) -> None:
+        calls = rec["calls"]
         assert isinstance(calls, list)
-        calls.append({"port": port, "cascade_id": cascade_id})
-        steps = rec["steps"]
-        return steps if isinstance(steps, list) else []
-
-    def _get_models(port: int) -> dict[str, object]:
-        del port
-        prior = rec["models_calls"]
-        assert isinstance(prior, int)
-        rec["models_calls"] = prior + 1  # running tally
-        models = rec["models"]
-        return models if isinstance(models, dict) else {}
-
-    def _send(port: int, cascade_id: str, text: str, *, plan_model: str) -> None:
-        sends = rec["sends"]
-        assert isinstance(sends, list)
-        sends.append(
-            {"port": port, "cascade_id": cascade_id, "text": text, "plan_model": plan_model}
-        )
-        exc = rec["send_raise"]
+        calls.append({"bridge_dir": bridge_dir, "content": content})
+        exc = rec["raise"]
         if exc is not None:
             assert isinstance(exc, BaseException)
             raise exc
 
-    monkeypatch.setattr(executor_mod, "resolve_language_server_port", _resolve_port)
-    monkeypatch.setattr(executor_mod, "get_trajectory_steps", _get_steps)
-    monkeypatch.setattr(executor_mod, "get_available_models", _get_models)
-    monkeypatch.setattr(executor_mod, "send_user_cascade_message", _send)
+    monkeypatch.setattr(executor_mod, "inject_user_message_via_tui", _inject)
     return rec
 
 
-def _sends(rec: dict[str, object]) -> list[dict[str, object]]:
-    """Return the recorded ``send_user_cascade_message`` calls, in order."""
-    sends = rec["sends"]
-    assert isinstance(sends, list)
-    return sends
+def _injected(rec: dict[str, object]) -> list[dict[str, object]]:
+    """Return the recorded TUI inject calls, in order."""
+    calls = rec["calls"]
+    assert isinstance(calls, list)
+    return calls
 
 
 async def _run(executor: AntigravityNativeExecutor, text: str) -> list[ExecutorEvent]:
@@ -215,74 +166,34 @@ def test_supports_live_message_queue(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# run_turn — delivery (RPC turn-send)
+# run_turn — delivery (TUI injection)
 # ---------------------------------------------------------------------------
 
 
-def test_run_turn_sends_via_rpc_and_completes(tmp_path: Path, sent: dict[str, object]) -> None:
+def test_run_turn_delivers_via_tui_and_completes(
+    tmp_path: Path, injected: dict[str, object]
+) -> None:
     """
-    ``run_turn`` sends the user text over RPC and yields a text-less TurnComplete.
+    ``run_turn`` types the user text into the agy TUI and yields a text-less TurnComplete.
 
-    The executor resolves the cascade id (bridge state) + port, resolves the
-    model (echoing the latest USER_INPUT step), calls
-    ``send_user_cascade_message``, and yields ``TurnComplete`` with
-    ``response=None`` — the read driver mirrors agy's actual reply, so
-    fabricating text here would duplicate it.
+    The turn is injected into the TUI pane (#1156/#1158) — agy records it as a
+    real USER_INPUT on the cascade the TUI displays and the read driver mirrors
+    the reply, so the executor yields ``TurnComplete`` with ``response=None``
+    (fabricating text here would duplicate the mirrored reply).
     """
     _seed_state(tmp_path)
     events = asyncio.run(_run(_executor(tmp_path), "what is 2+2?"))
-    assert _sends(sent) == [
-        {
-            "port": _PORT,
-            "cascade_id": _CONVERSATION_ID,
-            "text": "what is 2+2?",
-            "plan_model": _ECHOED_MODEL,
-        }
-    ]
+    calls = _injected(injected)
+    assert len(calls) == 1
+    assert calls[0]["content"] == "what is 2+2?"
+    assert calls[0]["bridge_dir"] == tmp_path
     assert len(events) == 1
     assert isinstance(events[0], TurnComplete)
     assert events[0].response is None
 
 
-def test_run_turn_echoes_current_model_from_trajectory(
-    tmp_path: Path, sent: dict[str, object]
-) -> None:
-    """
-    The plan model is echoed from the latest USER_INPUT step (tier-1 resolution).
-
-    The executor must reflect the user's current TUI/session model without new
-    plumbing, so it reads the most recent USER_INPUT step's ``planModel`` and
-    does NOT consult the catalog when that is available.
-    """
-    _seed_state(tmp_path)
-    asyncio.run(_run(_executor(tmp_path), "hi"))
-    assert _sends(sent)[0]["plan_model"] == _ECHOED_MODEL
-    assert sent["models_calls"] == 0, "must not hit the catalog when the model echoes"
-
-
-def test_run_turn_falls_back_to_recommended_model(tmp_path: Path, sent: dict[str, object]) -> None:
-    """
-    With no observable current model, the recommended catalog entry is used (tier-2).
-
-    On a first turn there is no prior USER_INPUT step to echo, so the executor
-    must resolve the model from ``get_available_models`` by picking the
-    ``recommended`` entry — agy rejects a turn with no ``planModel``.
-    """
-    _seed_state(tmp_path)
-    sent["steps"] = []  # no USER_INPUT step yet -> nothing to echo
-    asyncio.run(_run(_executor(tmp_path), "first turn"))
-    assert _sends(sent)[0]["plan_model"] == _RECOMMENDED_MODEL
-    assert sent["models_calls"] == 1
-
-
-def test_run_turn_flattens_content_blocks(tmp_path: Path, sent: dict[str, object]) -> None:
-    """
-    Content-block user messages are flattened to text before delivery.
-
-    A web turn arrives as ``input_text`` blocks; the executor must join their
-    text (and drop image/file blocks the text turn cannot carry) so agy receives
-    the typed prompt.
-    """
+def test_run_turn_flattens_content_blocks(tmp_path: Path, injected: dict[str, object]) -> None:
+    """Content-block user messages are flattened to text before injection."""
     _seed_state(tmp_path)
 
     async def _drive() -> list[ExecutorEvent]:
@@ -294,7 +205,8 @@ def test_run_turn_flattens_content_blocks(tmp_path: Path, sent: dict[str, object
                         "role": "user",
                         "content": [
                             {"type": "input_text", "text": "line one"},
-                            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                            # malformed data URI (no comma) -> not materialized
+                            {"type": "input_image", "image_url": "data:image/png;base64"},
                             {"type": "input_text", "text": "line two"},
                         ],
                     }
@@ -305,17 +217,12 @@ def test_run_turn_flattens_content_blocks(tmp_path: Path, sent: dict[str, object
         ]
 
     events = asyncio.run(_drive())
-    assert _sends(sent)[0]["text"] == "line one\nline two"
+    assert _injected(injected)[0]["content"] == "line one\nline two"
     assert isinstance(events[0], TurnComplete)
 
 
-def test_run_turn_uses_latest_user_message(tmp_path: Path, sent: dict[str, object]) -> None:
-    """
-    Only the latest user message is delivered (history is not replayed).
-
-    agy already holds the conversation history; re-sending older turns would
-    duplicate them. The executor must pick the most recent user message.
-    """
+def test_run_turn_uses_latest_user_message(tmp_path: Path, injected: dict[str, object]) -> None:
+    """Only the latest user message is delivered (history is not replayed)."""
     _seed_state(tmp_path)
 
     async def _drive() -> list[ExecutorEvent]:
@@ -333,16 +240,11 @@ def test_run_turn_uses_latest_user_message(tmp_path: Path, sent: dict[str, objec
         ]
 
     asyncio.run(_drive())
-    assert _sends(sent)[0]["text"] == "new question"
+    assert _injected(injected)[0]["content"] == "new question"
 
 
-def test_run_turn_no_user_text_errors(tmp_path: Path, sent: dict[str, object]) -> None:
-    """
-    A turn with no user text yields an ExecutorError without sending.
-
-    Guards against sending an empty message to agy; there is nothing to send, so
-    the executor reports an error instead.
-    """
+def test_run_turn_no_user_text_errors(tmp_path: Path, injected: dict[str, object]) -> None:
+    """A turn with no user text yields an ExecutorError without injecting."""
     _seed_state(tmp_path)
 
     async def _drive() -> list[ExecutorEvent]:
@@ -356,78 +258,79 @@ def test_run_turn_no_user_text_errors(tmp_path: Path, sent: dict[str, object]) -
         ]
 
     events = asyncio.run(_drive())
-    assert _sends(sent) == []
+    assert _injected(injected) == []
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
 
 
-# ---------------------------------------------------------------------------
-# run_turn — first-turn (placeholder) readiness (Option A: pure RPC)
-# ---------------------------------------------------------------------------
+# a tiny valid base64 PNG data URI (1x1 pixel), materialized to disk + referenced
+_PNG_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
 
 
-def test_run_turn_first_turn_waits_for_discovered_id(
-    tmp_path: Path, sent: dict[str, object], monkeypatch: pytest.MonkeyPatch
+def test_run_turn_image_attachment_materialized(
+    tmp_path: Path, injected: dict[str, object]
 ) -> None:
-    """
-    On a placeholder (fresh) session, the turn waits for the real id, then sends.
+    """An image block is written to the bridge dir and referenced by path."""
+    _seed_state(tmp_path)
 
-    Under pure-RPC turn-send the executor never types into the TUI to mint the
-    conversation (the runner does that — Task 11). It instead waits for the
-    forwarder/runner to overwrite the ``agy_conv_*`` placeholder with agy's real
-    id, then sends to that id. Modeled here by flipping bridge state to the real
-    id after the first read.
-    """
-    _seed_state(tmp_path, conversation_id=_PLACEHOLDER_ID)
-    monkeypatch.setattr(executor_mod, "_STATE_WAIT_INTERVAL_S", 0.0)
-    flip = {"done": False}
-
-    def _read(bridge_dir: Path) -> AntigravityNativeBridgeState | None:
-        del bridge_dir
-        # First read returns the placeholder; subsequent reads return the real id
-        # (as if the runner discovered + persisted it).
-        if not flip["done"]:
-            flip["done"] = True
-            return AntigravityNativeBridgeState(
-                session_id="conv_test", conversation_id=_PLACEHOLDER_ID
+    async def _drive() -> list[ExecutorEvent]:
+        return [
+            event
+            async for event in _executor(tmp_path).run_turn(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_image", "image_url": _PNG_DATA_URI},
+                            {"type": "input_text", "text": "describe this"},
+                        ],
+                    }
+                ],
+                tools=[],
+                system_prompt="",
             )
-        return AntigravityNativeBridgeState(
-            session_id="conv_test", conversation_id=_CONVERSATION_ID
-        )
+        ]
 
-    monkeypatch.setattr(executor_mod, "read_bridge_state", _read)
-    events = asyncio.run(_run(_executor(tmp_path), "first hello"))
-    assert _sends(sent) == [
-        {
-            "port": _PORT,
-            "cascade_id": _CONVERSATION_ID,
-            "text": "first hello",
-            "plan_model": _ECHOED_MODEL,
-        }
-    ]
-    assert len(events) == 1
+    events = asyncio.run(_drive())
+    content = _injected(injected)[0]["content"]
+    assert isinstance(content, str)
+    # attachment marker is prepended ahead of the typed text
+    assert content.startswith("[Attached: ")
+    assert str(tmp_path) in content
+    assert content.endswith("describe this")
     assert isinstance(events[0], TurnComplete)
 
 
-def test_run_turn_first_turn_not_ready_errors(
-    tmp_path: Path, sent: dict[str, object], monkeypatch: pytest.MonkeyPatch
+def test_run_turn_attachment_only_no_longer_errors(
+    tmp_path: Path, injected: dict[str, object]
 ) -> None:
-    """
-    If the real id never lands, the turn surfaces a clear "not ready" error.
+    """An attachment-only turn injects the marker instead of hard-erroring."""
+    _seed_state(tmp_path)
 
-    Pure-RPC turn-send cannot deliver to the ``agy_conv_*`` placeholder, so when
-    the runner has not yet minted agy's real conversation within the wait window
-    the executor errors gracefully (no crash, no send) rather than RPC-ing a
-    placeholder. The wait is shortened so the test does not block.
-    """
-    _seed_state(tmp_path, conversation_id=_PLACEHOLDER_ID)
-    monkeypatch.setattr(executor_mod, "_STATE_WAIT_ATTEMPTS", 1)
-    monkeypatch.setattr(executor_mod, "_STATE_WAIT_INTERVAL_S", 0.0)
-    events = asyncio.run(_run(_executor(tmp_path), "hi"))
-    assert _sends(sent) == []
-    assert len(events) == 1
-    assert isinstance(events[0], ExecutorError)
-    assert "not ready" in events[0].message
+    async def _drive() -> list[ExecutorEvent]:
+        return [
+            event
+            async for event in _executor(tmp_path).run_turn(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_image", "image_url": _PNG_DATA_URI}],
+                    }
+                ],
+                tools=[],
+                system_prompt="",
+            )
+        ]
+
+    events = asyncio.run(_drive())
+    content = _injected(injected)[0]["content"]
+    assert isinstance(content, str)
+    assert content.startswith("[Attached: ")
+    assert isinstance(events[0], TurnComplete)
+    assert not any(isinstance(event, ExecutorError) for event in events)
 
 
 # ---------------------------------------------------------------------------
@@ -435,71 +338,43 @@ def test_run_turn_first_turn_not_ready_errors(
 # ---------------------------------------------------------------------------
 
 
-def test_run_turn_missing_state_errors(tmp_path: Path, sent: dict[str, object]) -> None:
-    """
-    With no bridge state, ``run_turn`` yields an ExecutorError (no send).
-
-    The runner seeds bridge state before launching the terminal, so a missing
-    state file means broken wiring and the executor reads it once and errors
-    immediately (no polling, no send).
-    """
+def test_run_turn_missing_state_errors(tmp_path: Path, injected: dict[str, object]) -> None:
+    """With no bridge state, ``run_turn`` yields an ExecutorError (no inject)."""
     events = asyncio.run(_run(_executor(tmp_path), "hi"))
-    assert _sends(sent) == []
+    assert _injected(injected) == []
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert "bridge state is missing" in events[0].message
 
 
 def test_run_turn_inactive_session_errors(
-    tmp_path: Path, sent: dict[str, object], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, injected: dict[str, object], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """
-    A mismatched request session id blocks delivery with an ExecutorError.
-
-    The harness only steers the conversation it was spawned for; if the bridge
-    state names a different session, delivery must be refused.
-    """
+    """A mismatched request session id blocks delivery with an ExecutorError."""
     _seed_state(tmp_path)
     executor = _executor(tmp_path)
     monkeypatch.setattr(executor, "_request_session_id", "conv_other")
     events = asyncio.run(_run(executor, "hi"))
-    assert _sends(sent) == []
+    assert _injected(injected) == []
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert "no longer active" in events[0].message
 
 
-def test_run_turn_no_port_errors(tmp_path: Path, sent: dict[str, object]) -> None:
+def test_run_turn_tui_inject_error_surfaces(tmp_path: Path, injected: dict[str, object]) -> None:
     """
-    When no agy connect-RPC port resolves, ``run_turn`` errors (no send).
+    A ``RuntimeError`` from the TUI inject surfaces as an ExecutorError.
 
-    The turn cannot be delivered to an agy that cannot be located on the loopback
-    socket table, so the executor reports a clear error rather than a false
-    success.
-    """
-    _seed_state(tmp_path)
-    sent["port"] = None
-    events = asyncio.run(_run(_executor(tmp_path), "hi"))
-    assert _sends(sent) == []
-    assert len(events) == 1
-    assert isinstance(events[0], ExecutorError)
-
-
-def test_run_turn_rpc_error_surfaces(tmp_path: Path, sent: dict[str, object]) -> None:
-    """
-    An ``AntigravityRpcError`` from the turn-send surfaces as an ExecutorError.
-
-    A model/validation error (e.g. "neither PlanModel nor RequestedModel
-    specified") or a transport failure from ``send_user_cascade_message`` must be
-    propagated — carrying agy's message — not silently swallowed into a fake
-    success.
+    The inject raises when the agy pane is gone / never advertised / the submit
+    never started a turn; the executor must surface it (so the UI can prompt a
+    restart) rather than report a fake success the mirror never fills.
     """
     _seed_state(tmp_path)
-    sent["send_raise"] = AntigravityRpcError("neither PlanModel nor RequestedModel specified")
+    injected["raise"] = RuntimeError("the agy terminal is no longer running (the TUI exited)")
     events = asyncio.run(_run(_executor(tmp_path), "hi"))
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
-    assert "neither PlanModel nor RequestedModel specified" in events[0].message
+    assert "the agy TUI" in events[0].message
 
 
 # ---------------------------------------------------------------------------
@@ -507,44 +382,30 @@ def test_run_turn_rpc_error_surfaces(tmp_path: Path, sent: dict[str, object]) ->
 # ---------------------------------------------------------------------------
 
 
-def test_enqueue_session_message_delivers(tmp_path: Path, sent: dict[str, object]) -> None:
-    """
-    ``enqueue_session_message`` sends the steer via the same RPC path and returns True.
-
-    Mid-turn web steering reuses the RPC turn-send, so a successful enqueue must
-    deliver the content and report success.
-    """
+def test_enqueue_session_message_delivers(tmp_path: Path, injected: dict[str, object]) -> None:
+    """``enqueue_session_message`` injects the steer via the same TUI path and returns True."""
     _seed_state(tmp_path)
     result = asyncio.run(_executor(tmp_path).enqueue_session_message("main", "steer me"))
     assert result is True
-    assert _sends(sent)[0]["text"] == "steer me"
+    assert _injected(injected)[0]["content"] == "steer me"
 
 
 def test_enqueue_session_message_empty_returns_false(
-    tmp_path: Path, sent: dict[str, object]
+    tmp_path: Path, injected: dict[str, object]
 ) -> None:
-    """
-    Enqueuing empty content returns False without sending.
-
-    There is nothing to steer with, so the executor reports it did nothing.
-    """
+    """Enqueuing empty content returns False without injecting."""
     _seed_state(tmp_path)
     result = asyncio.run(_executor(tmp_path).enqueue_session_message("main", ""))
     assert result is False
-    assert _sends(sent) == []
+    assert _injected(injected) == []
 
 
-def test_enqueue_session_message_rpc_failure_returns_false(
-    tmp_path: Path, sent: dict[str, object]
+def test_enqueue_session_message_inject_failure_returns_false(
+    tmp_path: Path, injected: dict[str, object]
 ) -> None:
-    """
-    A failed RPC send during enqueue returns False.
-
-    Mid-turn steering is best-effort; a failed turn-send must be reported as not
-    delivered.
-    """
+    """A failed TUI inject during enqueue returns False."""
     _seed_state(tmp_path)
-    sent["send_raise"] = AntigravityRpcError("boom")
+    injected["raise"] = RuntimeError("boom")
     result = asyncio.run(_executor(tmp_path).enqueue_session_message("main", "steer"))
     assert result is False
 
@@ -760,23 +621,6 @@ def test_recommended_model_none_when_absent() -> None:
     assert _recommended_model({}) is None
 
 
-def test_run_turn_no_model_resolvable_errors(tmp_path: Path, sent: dict[str, object]) -> None:
-    """
-    When neither tier yields a model, ``run_turn`` errors without sending.
-
-    agy requires a ``planModel`` per turn; if the trajectory has no model to echo
-    AND the catalog has no recommended entry, the executor cannot construct a
-    valid turn and must surface an error rather than send an invalid request.
-    """
-    _seed_state(tmp_path)
-    sent["steps"] = []
-    sent["models"] = {"models": {}}
-    events = asyncio.run(_run(_executor(tmp_path), "hi"))
-    assert _sends(sent) == []
-    assert len(events) == 1
-    assert isinstance(events[0], ExecutorError)
-
-
 # ---------------------------------------------------------------------------
 # construction
 # ---------------------------------------------------------------------------
@@ -802,17 +646,17 @@ def test_init_requires_bridge_dir_env_when_unset(monkeypatch: pytest.MonkeyPatch
 
 @pytest.mark.parametrize("effort", ["low", "medium", "high"])
 def test_run_turn_valid_effort_is_accepted(
-    tmp_path: Path, sent: dict[str, object], effort: str
+    tmp_path: Path, injected: dict[str, object], effort: str
 ) -> None:
     """
     A valid Antigravity effort level (low/medium/high) does not block delivery.
 
     agy's Gemini backend supports these three levels. A valid effort in the
     config must not surface as an error — the executor validates it and proceeds
-    to send.
+    to inject the turn into the TUI.
 
     :param tmp_path: Bridge directory (injected by pytest).
-    :param sent: Stub recording RPC turn-sends.
+    :param injected: Stub recording TUI injects.
     :param effort: One valid effort level to test.
     :returns: None.
     """
@@ -838,7 +682,7 @@ def test_run_turn_valid_effort_is_accepted(
 
 @pytest.mark.parametrize("bad_effort", ["xhigh", "max", "none", "minimal"])
 def test_run_turn_unsupported_effort_surfaces_error(
-    tmp_path: Path, sent: dict[str, object], bad_effort: str
+    tmp_path: Path, injected: dict[str, object], bad_effort: str
 ) -> None:
     """
     An effort level unsupported by Antigravity/Gemini yields an ExecutorError.
@@ -849,7 +693,7 @@ def test_run_turn_unsupported_effort_surfaces_error(
     mismatch.
 
     :param tmp_path: Bridge directory.
-    :param sent: Stub recording RPC turn-sends.
+    :param injected: Stub recording TUI injects.
     :param bad_effort: An effort level that is invalid for Antigravity.
     :returns: None.
     """
@@ -869,7 +713,7 @@ def test_run_turn_unsupported_effort_surfaces_error(
         ]
 
     events = asyncio.run(_drive())
-    assert _sends(sent) == [], "delivery must not happen on bad effort"
+    assert _injected(injected) == [], "delivery must not happen on bad effort"
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert bad_effort in events[0].message
@@ -880,28 +724,30 @@ def test_run_turn_unsupported_effort_surfaces_error(
 # ---------------------------------------------------------------------------
 
 
-def test_content_to_text_handles_string_blocks_none_and_other() -> None:
+def test_content_to_text_handles_string_blocks_none_and_other(tmp_path: Path) -> None:
     """
     Flattening covers every content shape the executor may receive.
 
     A plain string passes through; ``input_text``/``text`` blocks join by newline
-    while image/file blocks are dropped (the text turn is text-only); ``None``
+    while an unmaterializable image/file block contributes nothing; ``None``
     yields ``""``; any other shape falls back to a JSON encoding rather than
     crashing.
     """
     from omnigent.inner.antigravity_native_executor import _content_to_text
 
-    assert _content_to_text("  hello  ") == "hello"
+    assert _content_to_text("  hello  ", tmp_path) == "hello"
     assert (
         _content_to_text(
             [
                 {"type": "input_text", "text": "a"},
-                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                # malformed data URI (no comma) -> not materialized
+                {"type": "input_image", "image_url": "data:image/png;base64"},
                 {"type": "text", "text": "b"},
-            ]
+            ],
+            tmp_path,
         )
         == "a\nb"
     )
-    assert _content_to_text(None) == ""
+    assert _content_to_text(None, tmp_path) == ""
     # Defensive fallback for an unexpected shape: encoded, not crashed.
-    assert _content_to_text(123) == "123"
+    assert _content_to_text(123, tmp_path) == "123"

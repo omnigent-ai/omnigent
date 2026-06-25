@@ -31,6 +31,7 @@ import type {
   SessionTodosEvent,
   SessionUsageEvent,
   SlashCommand,
+  RoutingDecision,
   StreamEvent,
 } from "./events";
 import { parseEventLines } from "./sse";
@@ -452,6 +453,36 @@ describe("response.output_item.done (message)", () => {
   });
 });
 
+describe("response.output_item.done (error)", () => {
+  it("lifts persisted error items for live transcript rendering", () => {
+    const out = parse("response.output_item.done", {
+      type: "response.output_item.done",
+      item: {
+        id: "err_kiro",
+        type: "error",
+        status: "completed",
+        response_id: "resp_kiro_failed_input",
+        source: "execution",
+        code: "kiro_native_prompt_not_recorded",
+        message: "Kiro did not accept this web message.",
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    expect(out[0]).toEqual({
+      type: "error",
+      source: "execution",
+      toolName: null,
+      error: {
+        code: "kiro_native_prompt_not_recorded",
+        message: "Kiro did not accept this web message.",
+      },
+      itemId: "err_kiro",
+      responseId: "resp_kiro_failed_input",
+    });
+  });
+});
+
 describe("response.output_item.done (slash_command)", () => {
   // parseOutputItem returns null for unknown item.types; without
   // these cases the live UI silently drops every Skill invocation.
@@ -547,6 +578,92 @@ describe("response.output_item.done (slash_command)", () => {
     });
     const ev = out[0] as SlashCommand;
     expect(ev.kind).toBe("skill");
+  });
+});
+
+describe("response.output_item.done (routing_decision)", () => {
+  // parseOutputItem returns null for unknown item.types; without this
+  // case the live UI silently drops the intelligent-model-router chip.
+  it("lifts an applied routing decision with its verdict fields + id", () => {
+    const out = parse("response.output_item.done", {
+      type: "response.output_item.done",
+      item: {
+        id: "rd_1",
+        type: "routing_decision",
+        status: "completed",
+        response_id: "routing_1",
+        model: "databricks-claude-opus-4-8",
+        tier: "expensive",
+        applied: true,
+        rationale: "multi-file refactor needs deep reasoning",
+      },
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as RoutingDecision;
+    expect(ev.type).toBe("routing_decision");
+    expect(ev.model).toBe("databricks-claude-opus-4-8");
+    expect(ev.tier).toBe("expensive");
+    expect(ev.applied).toBe(true);
+    expect(ev.rationale).toBe("multi-file refactor needs deep reasoning");
+    // The id (server re-publishes the persisted id) threads onto the event
+    // so live and snapshot copies dedup by itemId — no double chip.
+    expect(ev.itemId).toBe("rd_1");
+    expect(ev.responseId).toBe("routing_1");
+  });
+
+  it("carries applied=false for a shadow verdict", () => {
+    const out = parse("response.output_item.done", {
+      type: "response.output_item.done",
+      item: {
+        id: "rd_shadow",
+        type: "routing_decision",
+        status: "completed",
+        response_id: "routing_2",
+        model: "databricks-claude-haiku-4-5",
+        tier: "cheap",
+        applied: false,
+        rationale: "trivial",
+      },
+    });
+    const ev = out[0] as RoutingDecision;
+    expect(ev.applied).toBe(false);
+    expect(ev.tier).toBe("cheap");
+  });
+
+  it("drops a malformed routing decision (empty model)", () => {
+    // A bad frame must not render a chip with no model — the parser drops
+    // it so the live UI shows nothing rather than a broken chip.
+    const out = parse("response.output_item.done", {
+      type: "response.output_item.done",
+      item: {
+        id: "rd_bad",
+        type: "routing_decision",
+        status: "completed",
+        response_id: "routing_3",
+        model: "",
+        tier: "expensive",
+        applied: true,
+        rationale: "x",
+      },
+    });
+    expect(out).toEqual([]);
+  });
+
+  it("drops a routing decision with an unknown tier", () => {
+    const out = parse("response.output_item.done", {
+      type: "response.output_item.done",
+      item: {
+        id: "rd_bad_tier",
+        type: "routing_decision",
+        status: "completed",
+        response_id: "routing_4",
+        model: "databricks-claude-opus-4-8",
+        tier: "gigantic",
+        applied: true,
+        rationale: "x",
+      },
+    });
+    expect(out).toEqual([]);
   });
 });
 

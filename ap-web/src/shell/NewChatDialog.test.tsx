@@ -544,6 +544,7 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}) {
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    smart_routing_enabled: false,
     ...infoOverrides,
   };
   return render(
@@ -611,7 +612,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByText("No agents")).toBeTruthy();
   });
 
-  it("orders Cursor above Pi in the built-in agent picker", () => {
+  it("orders native built-ins together in the agent picker", () => {
     mockAgents([
       {
         id: "a_pi",
@@ -619,6 +620,14 @@ describe("NewChatLandingScreen", () => {
         display_name: "Pi",
         description: null,
         harness: "pi-native",
+        skills: [],
+      },
+      {
+        id: "a_kiro",
+        name: "kiro-native-ui",
+        display_name: "Kiro",
+        description: null,
+        harness: "kiro-native",
         skills: [],
       },
       {
@@ -645,12 +654,24 @@ describe("NewChatLandingScreen", () => {
         harness: "claude-native",
         skills: [],
       },
+      {
+        id: "a_polly",
+        name: "polly",
+        display_name: "Polly",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      },
     ]);
     renderLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     const cursor = screen.getByTestId("new-chat-landing-agent-a_cursor");
     const pi = screen.getByTestId("new-chat-landing-agent-a_pi");
+    const kiro = screen.getByTestId("new-chat-landing-agent-a_kiro");
+    const polly = screen.getByTestId("new-chat-landing-agent-a_polly");
     expect(cursor.compareDocumentPosition(pi) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(pi.compareDocumentPosition(kiro) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(kiro.compareDocumentPosition(polly) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("seeds the working directory from the host's most-recent path", async () => {

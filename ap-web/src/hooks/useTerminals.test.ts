@@ -483,6 +483,12 @@ describe("inventoryTerminals", () => {
     session: "main",
     running: true,
   };
+  const kiroPane: TerminalInfo = {
+    id: "terminal_kiro_main",
+    name: "kiro",
+    session: "main",
+    running: true,
+  };
   const goosePane: TerminalInfo = {
     id: "terminal_goose_main",
     name: "goose",
@@ -492,6 +498,24 @@ describe("inventoryTerminals", () => {
   const qwenPane: TerminalInfo = {
     id: "terminal_qwen_main",
     name: "qwen",
+    session: "main",
+    running: true,
+  };
+  const kimiPane: TerminalInfo = {
+    id: "terminal_kimi_main",
+    name: "kimi",
+    session: "main",
+    running: true,
+  };
+  const hermesPane: TerminalInfo = {
+    id: "terminal_hermes_main",
+    name: "hermes",
+    session: "main",
+    running: true,
+  };
+  const antigravityPane: TerminalInfo = {
+    id: "terminal_antigravity_main",
+    name: "antigravity",
     session: "main",
     running: true,
   };
@@ -516,6 +540,13 @@ describe("inventoryTerminals", () => {
     expect(inventoryTerminals([cursorPane, bash], true)).toEqual([bash]);
   });
 
+  it("drops the kiro vendor pane for native Kiro sessions", () => {
+    // Regression: terminal_kiro_main was missing from AGENT_TERMINAL_IDS,
+    // so Kiro's Terminal pill opened a shell view with an X close button
+    // instead of preserving the Chat/Terminal toggle.
+    expect(inventoryTerminals([kiroPane, bash], true)).toEqual([bash]);
+  });
+
   it("drops the goose vendor pane for native Goose sessions", () => {
     // Regression: terminal_goose_main was missing from AGENT_TERMINAL_IDS, so
     // the goose TUI pane leaked into the Shells inventory and (via isShellView)
@@ -532,6 +563,33 @@ describe("inventoryTerminals", () => {
     // mode as the pi/cursor/goose panes above.
     expect(inventoryTerminals([qwenPane, bash], true)).toEqual([bash]);
     expect(isAgentTerminalKey("terminal:terminal_qwen_main")).toBe(true);
+  });
+
+  it("drops the kimi vendor pane for native Kimi sessions", () => {
+    // Regression: terminal_kimi_main was missing from AGENT_TERMINAL_IDS,
+    // same failure mode as the pi/cursor panes above — leaked into Shells
+    // and hid the Chat/Terminal pill in Terminal view.
+    expect(inventoryTerminals([kimiPane, bash], true)).toEqual([bash]);
+    expect(isAgentTerminalKey("terminal:terminal_kimi_main")).toBe(true);
+  });
+
+  it("drops the hermes vendor pane for native Hermes sessions", () => {
+    // Regression: terminal_hermes_main was missing from AGENT_TERMINAL_IDS, so
+    // the hermes TUI pane leaked into the Shells inventory and (via isShellView)
+    // opened as a plain shell while hiding the Chat/Terminal pill — same failure
+    // mode as the pi/cursor/goose/qwen panes above.
+    expect(inventoryTerminals([hermesPane, bash], true)).toEqual([bash]);
+    expect(isAgentTerminalKey("terminal:terminal_hermes_main")).toBe(true);
+  });
+
+  it("drops the antigravity vendor pane for native Antigravity sessions", () => {
+    // Regression (#1157): terminal_antigravity_main was missing from
+    // AGENT_TERMINAL_IDS, so the agy TUI pane leaked into the Shells inventory
+    // and (via isShellView) hid the Chat/Terminal pill in Terminal view —
+    // stranding the user with no way back to Chat. Same failure mode as the
+    // pi/cursor/goose/qwen panes above.
+    expect(inventoryTerminals([antigravityPane, bash], true)).toEqual([bash]);
+    expect(isAgentTerminalKey("terminal:terminal_antigravity_main")).toBe(true);
   });
 
   it("drops the embedded REPL terminal for terminal-first SDK sessions", () => {
@@ -574,7 +632,8 @@ describe("isAgentTerminalKey", () => {
     expect(isAgentTerminalKey("terminal:terminal_pi_main")).toBe(true);
     // cursor-native: same regression class as pi above.
     expect(isAgentTerminalKey("terminal:terminal_cursor_main")).toBe(true);
-    // goose-/qwen-native: same regression class as pi/cursor above.
+    // kiro-/goose-/qwen-native: same regression class as cursor/pi above.
+    expect(isAgentTerminalKey("terminal:terminal_kiro_main")).toBe(true);
     expect(isAgentTerminalKey("terminal:terminal_goose_main")).toBe(true);
     expect(isAgentTerminalKey("terminal:terminal_qwen_main")).toBe(true);
   });

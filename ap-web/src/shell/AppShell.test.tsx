@@ -48,6 +48,9 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
 // both stay hidden — tests that exercise the agent-info path set a return.
 vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
+  useCreateMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
+  useUpdateMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
+  useDeleteMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
 }));
 
 vi.mock("./Sidebar", () => ({
@@ -2084,7 +2087,7 @@ describe("Files scope default and persistence", () => {
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
     // The choice was written to localStorage — that's what makes it sticky.
     expect(localStorage.getItem(PREF_KEY)).toBe(
-      JSON.stringify({ changedOnly: true, collapsed: false }),
+      JSON.stringify({ changedOnly: true, sort: "recent", collapsed: false }),
     );
 
     // Re-enter a *different* session fresh: it must open on the remembered

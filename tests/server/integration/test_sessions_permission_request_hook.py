@@ -192,6 +192,44 @@ async def test_permission_request_hook_allow_round_trip(
     }
 
 
+async def test_permission_request_hook_accepts_kimi_namespaced_elicitation_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A kimi-native hook supplies ``_omnigent_elicitation_id = elicit_kimi_…`` on
+    every POST (stable re-attach id). The shared endpoint must accept any
+    ``elicit_<harness>_`` namespace — not just ``elicit_claude_`` — or it 400s
+    and the approval card is NEVER published.
+
+    Regression: the id regex was hard-coded to ``^elicit_claude_…$``, so every
+    kimi approval POST was rejected and no card surfaced in the web UI.
+    """
+    agent = await create_test_agent(client, "test-permission-kimi-id")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = "elicit_kimi_" + "0" * 32
+    payload = await _claude_permission_payload()
+    payload["_omnigent_elicitation_id"] = elicitation_id
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    # The published card uses the client-supplied id verbatim (not 400, not a
+    # server-minted replacement).
+    assert event["elicitation_id"] == elicitation_id
+    verdict = await _post_approval(client, session_id, elicitation_id, "accept")
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+
+
 async def test_cursor_permission_request_hook_allow_round_trip(
     client: httpx.AsyncClient,
 ) -> None:
@@ -247,6 +285,116 @@ async def test_cursor_permission_request_hook_allow_round_trip(
     resp = await hook_task
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"action": "accept"}
+
+
+async def test_qwen_permission_request_hook_allow_round_trip(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    qwen-native TUI ``can_use_tool`` → web ApprovalCard → accept → verdict.
+
+    The runner-side mirror (``omnigent.qwen_native_permissions``) reads a
+    ``can_use_tool`` control request off qwen's ``--json-file`` and POSTs it to
+    the generic ``/hooks/native-permission-request`` (shared with hermes-/goose-
+    native) with ``agent="qwen"`` + ``policy_name="qwen_native_permission"``; the
+    route publishes a ``response.elicitation_request`` (phase ``pre_tool_use``,
+    the qwen policy name, carrying the runner-minted elicitation id and the
+    rendered tool preview) and parks on the same harness-elicitation registry the
+    Claude/Cursor hooks use, then returns the MCP ``ElicitationResult`` once the
+    UI answers. The qwen-native analog of
+    ``test_cursor_permission_request_hook_allow_round_trip``.
+    """
+    agent = await create_test_agent(client, "test-qwen-permission-allow")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_qwen_{session_id}_r1"
+    payload = {
+        "elicitation_id": elicitation_id,
+        "agent": "qwen",
+        "policy_name": "qwen_native_permission",
+        "operation_type": "run_shell_command",
+        "message": "qwen wants to run run_shell_command",
+        "content_preview": "echo hi > out.txt",
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/native-permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    assert event["elicitation_id"] == elicitation_id
+    params = event["params"]
+    assert params["message"] == "qwen wants to run run_shell_command"
+    assert params["phase"] == "pre_tool_use"
+    assert params["policy_name"] == "qwen_native_permission"
+    assert params["content_preview"] == "echo hi > out.txt"
+
+    verdict = await _post_approval(client, session_id, elicitation_id, "accept")
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"action": "accept"}
+
+
+async def test_cursor_permission_request_hook_stamps_ask_user_question_extra(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    cursor ``AskQuestion`` → the structured ``ask_user_question`` extra is
+    published on the elicitation params (uncapped), so the web UI renders the
+    interactive form from it rather than parsing the ≤1024-char content_preview.
+
+    Catches: a multi-question payload silently dropped (web falls back to the
+    raw approve/reject card); the extra not surviving the params round-trip.
+    """
+    agent = await create_test_agent(client, "test-cursor-askquestion")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_cursor_{session_id}_q1"
+    ask_user_question = {
+        "questions": [
+            {
+                "id": "demo_topic",
+                "question": "What kind of example would you like to see?",
+                "options": [
+                    {"label": "A coding-related question"},
+                    {"label": "A workflow question"},
+                ],
+                "multiSelect": False,
+            }
+        ]
+    }
+    payload = {
+        "elicitation_id": elicitation_id,
+        "operation_type": "question",
+        "message": "AskQuestion Demo",
+        "content_preview": "AskUserQuestion({...})",
+        "ask_user_question": ask_user_question,
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/cursor-permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    params = event["params"]
+    assert params["policy_name"] == "cursor_native_permission"
+    # The structured payload rode through verbatim as the params extra.
+    assert params["ask_user_question"] == ask_user_question
+
+    verdict = await _post_approval(client, session_id, elicitation_id, "accept")
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
 
 
 async def test_top_level_elicitations_route_is_not_mounted(
