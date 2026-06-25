@@ -139,6 +139,12 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { SessionImage } from "@/components/SessionImage";
+import {
+  CodexGoalControl,
+  CodexGoalStatusPill,
+  useCodexGoalState,
+  type CodexGoal,
+} from "@/components/codex";
 
 const ATTACHED_RE = /\[Attached:[^\]]*\]\s*/g;
 
@@ -981,6 +987,7 @@ export function ChatPage() {
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
+      showCodexGoal={shouldShowCodexGoalControl(capabilitySource)}
       costRoutingVerdict={costRoutingVerdict}
       costRoutingEligible={costRoutingEligible}
       subAgentLabel={subAgentLabel}
@@ -1207,6 +1214,8 @@ interface MainAgentSurfaceProps {
   codexModelOptions: readonly CodexModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  /** Show the Codex Goal control. */
+  showCodexGoal?: boolean;
   /** Latest advisor verdict for the cost-routing pill; null when none. */
   costRoutingVerdict: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
@@ -1280,6 +1289,7 @@ function MainAgentSurface({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showCodexGoal = false,
   costRoutingVerdict,
   costRoutingEligible,
   subAgentLabel,
@@ -1635,6 +1645,7 @@ function MainAgentSurface({
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
         showCodexPlanMode={showCodexPlanMode}
+        showCodexGoal={showCodexGoal}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
         reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
@@ -2909,6 +2920,8 @@ interface ComposerProps {
   codexModelOptions: readonly CodexModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  /** Show the Codex Goal control. */
+  showCodexGoal?: boolean;
   /**
    * Terminal-first session (Chat/Terminal pill present). Presentation
    * only: tightens the composer's bottom padding to `pb-1.5` so it sits
@@ -3157,7 +3170,13 @@ export function composerHarnessLabel(
  * the session has nothing to report. Session cost lives in the header
  * agent-info popover (the "i" button), not here.
  */
-function ComposerStatusLine({ harnessLabel }: { harnessLabel: string | null }) {
+function ComposerStatusLine({
+  harnessLabel,
+  codexGoal,
+}: {
+  harnessLabel: string | null;
+  codexGoal: CodexGoal | null;
+}) {
   const conversationId = useChatStore((s) => s.conversationId);
   const contextWindow = useChatStore((s) => s.contextWindow);
   const tokensUsed = useChatStore((s) => s.tokensUsed);
@@ -3173,10 +3192,11 @@ function ComposerStatusLine({ harnessLabel }: { harnessLabel: string | null }) {
   // control that changes them.
   const showHarness = !!conversationId && harnessLabel !== null;
   const showPlanMode = !!conversationId && codexPlanMode;
+  const showGoal = !!conversationId && codexGoal != null;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showBranch && !showPlanMode && !showRing && !showHarness) return null;
+  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHarness) return null;
 
   return (
     <div
@@ -3218,6 +3238,7 @@ function ComposerStatusLine({ harnessLabel }: { harnessLabel: string | null }) {
             <span>Plan mode</span>
           </span>
         )}
+        {showGoal && codexGoal && <CodexGoalStatusPill goal={codexGoal} />}
         {showHarness && harnessLabel && (
           <span
             data-testid="composer-harness"
@@ -3330,6 +3351,7 @@ export function Composer({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showCodexGoal = false,
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
@@ -3397,6 +3419,10 @@ export function Composer({
   // module scope (not useRef) because Composer unmounts during the
   // loading gate between session switches.
   const conversationId = useChatStore((s) => s.conversationId);
+  const { goal: codexGoal, setGoal: setCodexGoal } = useCodexGoalState(
+    conversationId,
+    showCodexGoal,
+  );
   const valueRef = useRef(value);
   valueRef.current = value;
   const filesRef = useRef(files);
@@ -4195,6 +4221,14 @@ export function Composer({
                 </TooltipContent>
               </Tooltip>
             )}
+            {showCodexGoal && (
+              <CodexGoalControl
+                conversationId={conversationId}
+                readOnly={isReadOnly}
+                goal={codexGoal}
+                onGoalChange={setCodexGoal}
+              />
+            )}
             <AgentPicker
               agents={agents}
               isLoading={agentsLoading}
@@ -4238,7 +4272,7 @@ export function Composer({
           </div>
         </div>
       </div>
-      <ComposerStatusLine harnessLabel={harnessLabel} />
+      <ComposerStatusLine harnessLabel={harnessLabel} codexGoal={codexGoal} />
     </form>
   );
 }
@@ -4493,6 +4527,19 @@ export function shouldShowEffortPicker(
 }
 
 export function shouldShowCodexPlanModeControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isCodexNativeSession(conv);
+}
+
+/**
+ * True when the Codex Goal control should be visible.
+ *
+ * @param conv - Session or sidebar row carrying labels. ``null`` or missing
+ *   labels fail closed.
+ * @returns True only for Codex-native wrapper sessions.
+ */
+export function shouldShowCodexGoalControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
   return isCodexNativeSession(conv);
