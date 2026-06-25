@@ -841,7 +841,7 @@ function McpServerManagerDialog({
                 <XIcon className="size-3.5" />
                 Clear
               </Button>
-              <Button type="button" size="sm" onClick={handleSave} disabled={saving}>
+              <Button type="button" size="sm" onClick={handleSave} disabled={saving || validateMcpForm(form) !== null}>
                 <SaveIcon className="size-3.5" />
                 {saving ? "Saving..." : "Save"}
               </Button>
