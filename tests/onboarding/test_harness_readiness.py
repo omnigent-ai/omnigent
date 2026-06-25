@@ -145,6 +145,8 @@ def test_configured_harness_map_covers_all_spellings(
         "pi-native",
         "native-pi",
         "cursor",
+        # Cursor Cloud / Background Agents — shares the cursor API key.
+        "cursor-cloud",
         # Native Cursor (``omni cursor``) — gates on the cursor-agent CLI.
         "cursor-native",
         "native-cursor",
