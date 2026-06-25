@@ -1314,6 +1314,31 @@ describe("BlockStream — status events", () => {
     }
   });
 
+  it("output_item.done error event preserves persisted ids", () => {
+    const blocks = reduce([
+      {
+        type: "error",
+        source: "execution",
+        toolName: null,
+        error: {
+          code: "kiro_native_prompt_not_recorded",
+          message: "Kiro did not accept this web message.",
+        },
+        itemId: "err_kiro",
+        responseId: "resp_kiro_failed_input",
+      },
+    ]);
+
+    const err = blocks.find((b) => b.type === "error");
+    expect(err).toBeDefined();
+    if (err && err.type === "error") {
+      expect(err.ctx.itemId).toBe("err_kiro");
+      expect(err.ctx.responseId).toBe("resp_kiro_failed_input");
+      expect(err.message).toBe("Kiro did not accept this web message.");
+      expect(err.code).toBe("kiro_native_prompt_not_recorded");
+    }
+  });
+
   it("retry event → RetryBlock with attempt/max/delay fields", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse() },

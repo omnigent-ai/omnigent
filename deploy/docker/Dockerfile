@@ -18,7 +18,8 @@
 # and server-launched managed hosts. It bakes the full omnigent
 # install plus the tools a host needs at runtime — git (workspaces /
 # worktrees), tmux (terminal sessions spawned by native harnesses),
-# and the coding-harness CLIs (claude / codex / pi, via Node) — and
+# and the coding-harness CLIs (claude / codex / pi, via Node; kiro-cli via
+# Kiro's installer) — and
 # skips everything server-only: no SPA bundle, no psycopg, no
 # uvicorn entrypoint. Modal's `Image.from_registry` requirements shape
 # it: `python` + `pip` on $PATH, and CMD-only (an ENTRYPOINT that
@@ -168,9 +169,10 @@ FROM node:${NODE_VERSION}-slim AS node-runtime
 # port" and breaks web-turn injection), bubblewrap to OS-sandbox the
 # native harness terminals (mandatory and fail-loud on Linux), curl + CA
 # certificates for outbound HTTPS and in-sandbox downloads, plus the
-# coding-harness CLIs (claude / codex / pi) so claude-sdk, claude-native,
-# codex, and pi agents can run in managed sandboxes without an in-sandbox
-# install. No SPA, no psycopg, no server entrypoint.
+# coding-harness CLIs (claude / codex / pi / kiro-cli) so claude-sdk,
+# claude-native, codex, pi, and kiro-native agents can run in managed
+# sandboxes without an in-sandbox install. No SPA, no psycopg, no server
+# entrypoint.
 #
 # Also carries two additions required only by the NVIDIA OpenShell provider
 # (deploy/openshell/README.md) and inert for the root-based providers
@@ -199,7 +201,8 @@ ENV PYTHONUNBUFFERED=1 \
     IS_SANDBOX=1
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git tmux procps lsof bubblewrap curl ca-certificates \
+ && apt-get install -y --no-install-recommends \
+      git tmux procps lsof bubblewrap curl ca-certificates unzip \
       iproute2 nftables \
  && rm -rf /var/lib/apt/lists/*
 
@@ -243,6 +246,14 @@ RUN npm install -g --no-audit --no-fund \
       @earendil-works/pi-coding-agent \
  && npm cache clean --force
 
+# Kiro CLI is not published as an npm package; use its official installer and
+# copy the resulting root-local binaries onto the global PATH for all sandbox
+# users.
+RUN curl -fsSL https://cli.kiro.dev/install | bash \
+ && install -m 0755 /root/.local/bin/kiro-cli /usr/local/bin/kiro-cli \
+ && if [ -f /root/.local/bin/kiro-cli-chat ]; then \
+      install -m 0755 /root/.local/bin/kiro-cli-chat /usr/local/bin/kiro-cli-chat; \
+    fi
 # Antigravity CLI (`agy`) — the antigravity-native harness shells out to `agy`
 # on the host, launching it in a tmux pane (see omnigent/antigravity_native*.py),
 # so a managed host image must carry it. It is NOT an npm package

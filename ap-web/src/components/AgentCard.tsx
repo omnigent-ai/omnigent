@@ -33,6 +33,7 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   if (nativeAgent?.iconKind === "opencode") return OpenCodeIcon;
   if (nativeAgent?.iconKind === "pi") return PiIcon;
   if (nativeAgent?.iconKind === "cursor") return CursorIcon;
+  if (nativeAgent?.iconKind === "kiro") return CursorIcon;
   if (nativeAgent?.iconKind === "goose") return GooseIcon;
   if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
   // A null harness (spec couldn't load) flows through to the bot fallback.
@@ -40,6 +41,7 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   if (agent.harness?.includes("claude")) return ClaudeIcon;
   // Both the SDK "cursor" harness and "cursor-native" get the Cursor glyph.
   if (agent.harness?.includes("cursor")) return CursorIcon;
+  if (agent.harness?.includes("kiro")) return CursorIcon;
   if (agent.harness?.includes("goose")) return GooseIcon;
   // qwen falls back to generic BotIcon for now; see docs/QWEN_FOLLOWUPS.md
   // Exact match — a substring check would false-match e.g. "openapi".

@@ -452,6 +452,36 @@ describe("response.output_item.done (message)", () => {
   });
 });
 
+describe("response.output_item.done (error)", () => {
+  it("lifts persisted error items for live transcript rendering", () => {
+    const out = parse("response.output_item.done", {
+      type: "response.output_item.done",
+      item: {
+        id: "err_kiro",
+        type: "error",
+        status: "completed",
+        response_id: "resp_kiro_failed_input",
+        source: "execution",
+        code: "kiro_native_prompt_not_recorded",
+        message: "Kiro did not accept this web message.",
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    expect(out[0]).toEqual({
+      type: "error",
+      source: "execution",
+      toolName: null,
+      error: {
+        code: "kiro_native_prompt_not_recorded",
+        message: "Kiro did not accept this web message.",
+      },
+      itemId: "err_kiro",
+      responseId: "resp_kiro_failed_input",
+    });
+  });
+});
+
 describe("response.output_item.done (slash_command)", () => {
   // parseOutputItem returns null for unknown item.types; without
   // these cases the live UI silently drops every Skill invocation.

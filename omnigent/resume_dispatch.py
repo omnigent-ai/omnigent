@@ -252,6 +252,15 @@ def _dispatch_wrapper(
             cursor_args=(),
         )
         return True
+    if native_agent.key == "kiro":
+        from omnigent.kiro_native import run_kiro_native
+
+        run_kiro_native(
+            server=server,
+            session_id=session_id,
+            kiro_args=(),
+        )
+        return True
     if native_agent.key == "goose":
         from omnigent.goose_native import run_goose_native
 

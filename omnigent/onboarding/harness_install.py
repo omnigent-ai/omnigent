@@ -57,6 +57,10 @@ QWEN_KEY = "qwen"
 # installer rather than npm — so it carries an ``install_hint``, not a ``package``.
 CURSOR_KEY = "cursor"
 
+# Kiro authenticates against its own backend and ships as a standalone native
+# installer, not an npm package managed by ``omnigent setup``.
+KIRO_KEY = "kiro"
+
 # OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
 # installed via the ``opencode-ai`` npm package. No login/logout/status argv
 # is wired yet — readiness is binary-only until an auth check exists.
@@ -179,6 +183,12 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint="curl https://cursor.com/install -fsS | bash",
         login_status_key="isAuthenticated",
     ),
+    KIRO_KEY: HarnessInstallSpec(
+        "Kiro",
+        "kiro-cli",
+        package=None,
+        install_hint="curl -fsSL https://cli.kiro.dev/install | bash",
+    ),
     # The native Antigravity (agy) TUI bridge wraps the ``agy`` CLI. ``agy`` has
     # no ``login`` / ``logout`` subcommand — the user authenticates via browser
     # OAuth by launching ``agy`` with no arguments on first run — so login_args /
@@ -221,10 +231,11 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # here — the ones that cannot launch without a binary on ``PATH``:
 # ``claude-native`` wraps the ``claude`` CLI, ``codex-native`` the ``codex``
 # CLI, ``pi`` / ``pi-native`` the ``pi`` CLI, ``opencode-native`` the
-# ``opencode`` CLI, ``qwen`` / ``qwen-code`` the ``qwen`` CLI, and
-# ``cursor-native`` / ``native-cursor`` the ``cursor-agent`` CLI (the native
-# Cursor TUI, installed via Cursor's curl installer rather than npm — see its
-# ``install_hint``).
+# ``opencode`` CLI, ``qwen`` / ``qwen-code`` the ``qwen`` CLI,
+# ``cursor-native`` / ``native-cursor`` the ``cursor-agent`` CLI, and
+# ``kiro-native`` / ``native-kiro`` the ``kiro-cli`` CLI. Cursor and Kiro
+# install out-of-band rather than through npm — see their ``install_hint``
+# values.
 # SDK-based harnesses run in-process and are deliberately absent, so they
 # resolve to "no CLI required": ``claude-sdk``, ``codex``, ``openai-agents-sdk``,
 # the in-process ``antigravity`` Gemini SDK harness, and the SDK ``cursor``
@@ -237,6 +248,8 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "pi-native": PI_KEY,
     "cursor-native": CURSOR_KEY,
     "native-cursor": CURSOR_KEY,
+    "kiro-native": KIRO_KEY,
+    "native-kiro": KIRO_KEY,
     # The native agy TUI bridge wraps the ``agy`` CLI; both spellings map to
     # the Gemini family's install spec. (The in-process ``antigravity`` SDK
     # harness is deliberately absent — like the other SDK harnesses it needs no

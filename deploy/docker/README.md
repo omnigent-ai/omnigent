@@ -241,8 +241,8 @@ seconds instead of paying an in-sandbox dependency install. It bakes
 the full omnigent install (all three packages + deps, `python` and
 `pip` on PATH), `git` (workspaces / worktrees), `tmux` (terminal
 sessions spawned by native harnesses), and the coding-harness CLIs —
-`claude`, `codex`, and `pi`, with the Node runtime they need — so
-claude-sdk / claude-native / codex / pi agents run in sandboxes
+`claude`, `codex`, `pi`, and `kiro-cli`, with the runtime they need — so
+claude-sdk / claude-native / codex / pi / kiro-native agents run in sandboxes
 without an in-sandbox install. None of the server-only bits are
 included (no SPA bundle, no psycopg, no uvicorn entrypoint).
 

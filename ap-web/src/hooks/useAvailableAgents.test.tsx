@@ -108,6 +108,12 @@ describe("useAvailableAgents", () => {
             harness: "pi-native",
           },
           {
+            id: "ag_kiro_native",
+            name: "kiro-native-ui",
+            description: null,
+            harness: "kiro-native",
+          },
+          {
             id: "ag_agy_native",
             name: "antigravity-native-ui",
             description: null,
@@ -172,6 +178,14 @@ describe("useAvailableAgents", () => {
         display_name: "Pi",
         description: null,
         harness: "pi-native",
+        skills: [],
+      },
+      {
+        id: "ag_kiro_native",
+        name: "kiro-native-ui",
+        display_name: "Kiro",
+        description: null,
+        harness: "kiro-native",
         skills: [],
       },
       {
@@ -363,6 +377,53 @@ describe("useAvailableAgents", () => {
       .map((c) => c[0] as string)
       .filter((u) => u.endsWith("/agent"));
     expect(enrichCalls).toEqual(["/v1/sessions/conv_3/agent"]);
+  });
+
+  it("dedupes native built-ins and hides session-discovered native shadows", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          // Stale/non-canonical native row from older local state; it
+          // resolves by harness but must not compete with the seeded row.
+          { id: "ag_stale_kiro", name: "kiro-naitive", harness: "kiro-native" },
+          { id: "ag_kiro", name: "kiro-native-ui", harness: "kiro-native" },
+        ],
+        has_more: false,
+      }),
+      [SCAN_URL]: mockResponse({
+        object: "list",
+        data: [
+          // This distinct session-bound id used to enrich into a second
+          // Kiro row because it did not shadow the built-in by name/id.
+          { id: "conv_kiro", agent_id: "ag_session_kiro", agent_name: "kiro-naitive" },
+          // Legacy failed Kiro attempts used a plain "kiro" agent name and
+          // no harness; that row must not surface as a custom Kiro picker row.
+          { id: "conv_legacy", agent_id: "ag_legacy_kiro", agent_name: "kiro" },
+        ],
+        has_more: false,
+      }),
+      "/v1/sessions/conv_kiro/agent": mockResponse({
+        id: "ag_session_kiro",
+        object: "agent",
+        name: "kiro-naitive",
+        harness: "kiro-native",
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual([
+      {
+        id: "ag_kiro",
+        name: "kiro-native-ui",
+        display_name: "Kiro",
+        description: null,
+        harness: "kiro-native",
+        skills: [],
+      },
+    ]);
   });
 
   it("collapses same-named custom agents with distinct agent_ids to the newest session's row", async () => {

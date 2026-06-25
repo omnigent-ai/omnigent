@@ -183,6 +183,13 @@ describe("getConversationAgentType", () => {
     expect(getConversationAgentType(conv)).toBe("Pi");
   });
 
+  it("returns 'Kiro' for kiro-native-ui sessions", () => {
+    const conv = conversation("conv_kiro", null, new Date(2026, 4, 14, 9), {
+      labels: { "omnigent.wrapper": "kiro-native-ui" },
+    });
+    expect(getConversationAgentType(conv)).toBe("Kiro");
+  });
+
   it("returns 'Antigravity' for antigravity-native-ui sessions", () => {
     const conv = conversation("conv_agy", null, new Date(2026, 4, 14, 9), {
       labels: { "omnigent.wrapper": "antigravity-native-ui" },
@@ -276,6 +283,13 @@ describe("getConversationIconKind", () => {
         }),
       ),
     ).toBe("pi");
+    expect(
+      getConversationIconKind(
+        conversation("conv_kiro", null, new Date(2026, 4, 14, 9), {
+          labels: { "omnigent.wrapper": "kiro-native-ui" },
+        }),
+      ),
+    ).toBe("kiro");
     expect(
       getConversationIconKind(
         conversation("conv_agy", null, new Date(2026, 4, 14, 9), {

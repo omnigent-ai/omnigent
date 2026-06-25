@@ -35,6 +35,17 @@ describe("nativeCodingAgentForHarness", () => {
     expect(nativeCodingAgentForHarness("native-pi")).toBe(nativeCodingAgentForHarness("pi-native"));
   });
 
+  it("resolves Kiro and folds the reversed native-kiro alias", () => {
+    const kiro = nativeCodingAgentForHarness("kiro-native");
+    expect(kiro).toMatchObject({
+      key: "kiro",
+      displayName: "Kiro",
+      harness: "kiro-native",
+      wrapperLabel: "kiro-native-ui",
+    });
+    expect(nativeCodingAgentForHarness("native-kiro")).toBe(kiro);
+  });
+
   it("resolves the canonical antigravity-native harness", () => {
     expect(nativeCodingAgentForHarness("antigravity-native")?.key).toBe("antigravity");
   });

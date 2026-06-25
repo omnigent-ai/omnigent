@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
@@ -55,6 +55,17 @@ class _ConversationStore:
                 labels={
                     "omnigent.ui": "terminal",
                     "omnigent.wrapper": "claude-code-native-ui",
+                },
+            ),
+            "conv_kiro": Conversation(
+                id="conv_kiro",
+                created_at=1,
+                updated_at=1,
+                root_conversation_id="conv_kiro",
+                agent_id="ag_kiro",
+                labels={
+                    "omnigent.ui": "terminal",
+                    "omnigent.wrapper": "kiro-native-ui",
                 },
             ),
             # A spec-driven native sub-agent child (e.g. a nessie
@@ -2644,6 +2655,151 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
     assert len(errors) == 1
     assert errors[0].data.code == "native_terminal_start_failed"
     assert errors[0].data.message == "Native Claude requires the 'claude' CLI on PATH."
+
+
+@pytest.mark.asyncio
+async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
+    """Kiro web-chat input is mirrored by Kiro's session forwarder."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    conv = store.get_conversation("conv_kiro")
+    assert conv is not None
+    client = _FakeRunnerClient()
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+    )
+
+    try:
+        result = await _dispatch_session_event_to_runner(
+            "conv_kiro",
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            agent_name="kiro-native-ui",
+            file_store=None,
+            artifact_store=None,
+            created_by="alice@example.com",
+        )
+
+        assert result.item_id is None
+        assert result.pending_id is not None
+        assert result.pending_id.startswith("pending_")
+        assert [call[0] for call in client.post_json_calls] == [
+            "/v1/sessions/conv_kiro/resources/terminals",
+            "/v1/sessions/conv_kiro/events",
+        ]
+        pending = pending_inputs.snapshot_for("conv_kiro")
+        assert len(pending) == 1
+        assert pending[0]["content"] == [{"type": "input_text", "text": "hello"}]
+        assert store.appended_items == []
+        forwarded = client.post_json_calls[1][1]
+        assert forwarded["agent_id"] == "ag_kiro"
+        assert forwarded["model"] == "kiro-native-ui"
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_kiro_native_dispatch_clears_pending_when_injection_fails() -> None:
+    """A failed Kiro tmux injection must not leave a ghost pending input."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    conv = store.get_conversation("conv_kiro")
+    assert conv is not None
+    client = _FakeRunnerClient(
+        responses={"/v1/sessions/conv_kiro/events": (500, {"error": "tmux failed"})}
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+    )
+
+    try:
+        with pytest.raises(HTTPException):
+            await _dispatch_session_event_to_runner(
+                "conv_kiro",
+                conv,
+                body,
+                store,  # type: ignore[arg-type]
+                client,  # type: ignore[arg-type]
+                agent_name="kiro-native-ui",
+                file_store=None,
+                artifact_store=None,
+                created_by="alice@example.com",
+            )
+
+        assert [call[0] for call in client.post_json_calls] == [
+            "/v1/sessions/conv_kiro/resources/terminals",
+            "/v1/sessions/conv_kiro/events",
+        ]
+        assert store.appended_items == []
+        assert pending_inputs.snapshot_for("conv_kiro") == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() -> None:
+    """A failed Kiro prompt must not make the next prompt clear the wrong pending input."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    conv = store.get_conversation("conv_kiro")
+    assert conv is not None
+    first = pending_inputs.record(
+        "conv_kiro",
+        [{"type": "input_text", "text": "!!!! XOXOX !!!!"}],
+        created_by="alice@example.com",
+    )
+    second = pending_inputs.record(
+        "conv_kiro",
+        [{"type": "input_text", "text": "tell me a joke"}],
+        created_by="alice@example.com",
+    )
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "tell me a joke"}],
+            },
+            "response_id": "kiro:prompt-joke",
+        },
+    )
+
+    try:
+        item_id = await _persist_external_conversation_item(
+            "conv_kiro",
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert item_id == "item_2"
+        assert pending_inputs.snapshot_for("conv_kiro") == []
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        skipped_user, skipped_error, matched_user = store.appended_items
+        assert skipped_user.data.role == "user"
+        assert skipped_user.data.content == [{"type": "input_text", "text": "!!!! XOXOX !!!!"}]
+        assert skipped_user.created_by == "alice@example.com"
+        assert skipped_error.data.code == "kiro_native_prompt_not_recorded"
+        assert matched_user.data.role == "user"
+        assert matched_user.data.content == [{"type": "input_text", "text": "tell me a joke"}]
+        assert matched_user.created_by == "alice@example.com"
+        assert first != second
+    finally:
+        pending_inputs.reset_for_tests()
 
 
 @pytest.mark.asyncio
