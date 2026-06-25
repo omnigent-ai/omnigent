@@ -24,8 +24,37 @@ final class WebViewModel: ObservableObject {
 
   weak var webView: WKWebView?
 
+  /// How long, after a navigation begins, we wait for the web app to prove it's
+  /// alive by talking over the JS bridge. If the page never speaks within this
+  /// window — a blank render, crashed JS, or a hang that never reaches
+  /// `didFinish` — we surface the server switcher so the user is never stranded
+  /// on a broken page with no way back to server selection.
+  private static let bridgeLivenessTimeout: TimeInterval = 6
+
+  private var serverSwitcherWatchdog: Task<Void, Never>?
+
   func reload() {
     webView?.reload()
+  }
+
+  /// Arm (or re-arm) the liveness watchdog. Called whenever a navigation
+  /// begins. The switcher has just been hidden for the load; if the page never
+  /// claims it back over the bridge, the watchdog reveals it as an escape hatch.
+  func armServerSwitcherWatchdog() {
+    serverSwitcherWatchdog?.cancel()
+    serverSwitcherWatchdog = Task { @MainActor [weak self] in
+      try? await Task.sleep(nanoseconds: UInt64(Self.bridgeLivenessTimeout * 1_000_000_000))
+      guard !Task.isCancelled, let self else { return }
+      self.serverSwitcherHidden = false
+      self.serverSwitcherWatchdog = nil
+    }
+  }
+
+  /// Stand the watchdog down. Called the moment the page proves it's alive over
+  /// the bridge, and when a load fails (we route to server selection anyway).
+  func cancelServerSwitcherWatchdog() {
+    serverSwitcherWatchdog?.cancel()
+    serverSwitcherWatchdog = nil
   }
 
   func emitNotificationActivation(_ path: String) {
