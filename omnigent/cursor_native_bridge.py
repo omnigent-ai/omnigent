@@ -72,6 +72,18 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # first-run trust modal.
 _IDLE_MARKERS = ("Plan, search, build", "Add a follow-up")
 _TRUST_MARKER = "Trust this workspace"
+# Composer-clear (see _clear_composer): cursor-agent's input widget ignores the
+# readline Home/kill-line keys, so we delete with a Backspace flood instead.
+# Backspaces per round (one ``send-keys -N`` call) and a round cap; the loop
+# stops early once the pane stops changing (the draft is gone). The cap bounds a
+# pathological never-settles pane; ``_COMPOSER_CLEAR_CHUNK * _COMPOSER_CLEAR_MAX_ROUNDS``
+# deletions comfortably exceed any real draft.
+_COMPOSER_CLEAR_CHUNK = 200
+_COMPOSER_CLEAR_MAX_ROUNDS = 50
+# After a cancel, cursor-agent restores the interrupted prompt into the composer
+# slightly after the turn stops. Wait for the pane to stop changing (generation
+# ended and the draft settled) before clearing it, bounded by this timeout.
+_INTERRUPT_SETTLE_TIMEOUT_S = 2.0
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -438,6 +450,38 @@ def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> Non
         time.sleep(_POLL_INTERVAL_S)
 
 
+def _clear_composer(socket_path: str, tmux_target: str) -> None:
+    """Empty the cursor-agent composer of any leftover draft before a paste.
+
+    cursor-agent restores the interrupted prompt back into the composer when a
+    turn is cancelled (Stop button -> :func:`inject_interrupt`), and its input
+    widget ignores the readline ``C-a``/``C-k``/``C-u`` keys we'd otherwise use
+    to clear a line — only ``Backspace`` deletes. So jump to the end (``End``)
+    and flood ``Backspace`` in ``send-keys -N`` bursts until the pane stops
+    changing (the draft is gone) or a generous round cap is hit. A burst against
+    an already-empty composer is a harmless no-op (unlike ``C-c``, which would
+    arm cursor-agent's exit), so this is safe to run before every injection.
+    """
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "End")
+    previous = _capture_pane(socket_path, tmux_target)
+    for _ in range(_COMPOSER_CLEAR_MAX_ROUNDS):
+        _run_tmux(
+            socket_path,
+            "send-keys",
+            "-t",
+            tmux_target,
+            "-N",
+            str(_COMPOSER_CLEAR_CHUNK),
+            "BSpace",
+        )
+        current = _capture_pane(socket_path, tmux_target)
+        # Once a burst no longer changes the pane, the composer is empty —
+        # further Backspaces are no-ops, so stop.
+        if current == previous:
+            return
+        previous = current
+
+
 def inject_user_message(
     bridge_dir: Path,
     *,
@@ -469,9 +513,9 @@ def inject_user_message(
             "cursor terminal is no longer running (the TUI exited); restart the session"
         )
     _settle_pane(socket_path, tmux_target, timeout_s=timeout_s)
-    # Clear any leftover draft: Home (C-a) + kill-to-end (C-k).
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    # Clear any leftover draft (e.g. the prompt cursor-agent restores into the
+    # composer after a cancelled turn) so it can't prepend the new message.
+    _clear_composer(socket_path, tmux_target)
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
     ) as paste_file:
@@ -508,10 +552,30 @@ def inject_user_message(
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
 
 
-def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
-    """Cancel the in-flight Cursor turn by sending ``Escape`` to the pane.
+def _wait_for_pane_settle(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
+    """Best-effort wait until the pane stops changing across two captures.
 
-    cursor-agent stops a running turn on a single ``Escape`` (verified live).
+    Used after a cancel so the restored draft (and any final generation output)
+    has landed before we clear the composer. Falls through after *timeout_s*
+    rather than raising — the clear that follows is a no-op on an empty composer.
+    """
+    deadline = time.monotonic() + timeout_s
+    previous = _capture_pane(socket_path, tmux_target)
+    while time.monotonic() < deadline:
+        time.sleep(_POLL_INTERVAL_S)
+        current = _capture_pane(socket_path, tmux_target)
+        if current and current == previous:
+            return
+        previous = current
+
+
+def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
+    """Cancel the in-flight Cursor turn and clear the composer.
+
+    Sends ``Escape`` to stop the running turn, then clears the input box:
+    cursor-agent restores the interrupted prompt into the composer on cancel, so
+    without this the leftover prompt sits in the box and prepends the next
+    message (the web UI's Stop button would otherwise leave a half-sent draft).
     The harness ``run_turn`` returns right after the paste, so the runner's
     in-process cancel floor can't reach the turn — this is the analog of
     :func:`inject_user_message` for the web UI's Stop button.
@@ -519,8 +583,15 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
     # No ``-l``: tmux must interpret ``Escape`` as a key name.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+    # Let the cancel land and the restored draft settle, then clear it. The
+    # next injection also clears (defense in depth), but clearing here means the
+    # composer is empty the moment the user looks at the TUI after pressing Stop.
+    _wait_for_pane_settle(socket_path, tmux_target, timeout_s=_INTERRUPT_SETTLE_TIMEOUT_S)
+    _clear_composer(socket_path, tmux_target)
 
 
 def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
