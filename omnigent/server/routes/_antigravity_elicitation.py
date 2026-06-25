@@ -325,3 +325,92 @@ def _agy_permission_response(result: ElicitationResult) -> dict[str, Any]:
     :returns: ``{"permission": {"allow": <bool>}}``
     """
     return {"permission": {"allow": result.action == "accept"}}
+
+
+# agy's attended-TUI permission prompt is a numbered list: option 1 is the bare
+# "Yes" (approve once) and the LAST option is "No" (decline). The web card is a
+# binary Approve/Reject (the non-1:1 mapping with options 2/3 — the "always
+# allow" variants — is intentionally acceptable, #1200), so Approve drives the
+# always-safe "Yes" (1) and Reject drives "No" (4). These are the digits typed
+# into the pane, each followed by Enter to confirm the selection.
+_AGY_TUI_PERMISSION_APPROVE_OPTION = "1"
+_AGY_TUI_PERMISSION_REJECT_OPTION = "4"
+_AGY_TUI_CONFIRM_KEY = "Enter"
+
+
+def to_tui_selection_keys(
+    kind: str,
+    result: ElicitationResult,
+    spec: dict[str, Any],
+) -> list[str]:
+    """
+    Map an elicitation result to the tmux keys that answer agy's TUI prompt.
+
+    The attended agy TUI maintains its own permission / question prompt IN
+    PARALLEL with the RPC trajectory step (live-verified; see
+    ``docs/claude/antigravity-rpc-spike-notes.md``). Delivering the verdict over
+    ``HandleCascadeUserInteraction`` flips the backend step but can leave that TUI
+    prompt open, stranding the terminal (and folding the next typed turn into the
+    stale prompt's buffer — #1200). So the bridge ALSO types the selection into
+    the pane via
+    :func:`omnigent.antigravity_native_bridge.send_interaction_keys_via_tui`,
+    mirroring cursor-native. This is the pure shape-mapper for those keys.
+
+    * **permission** — Approve → option ``"1"`` ("Yes"), Reject → option ``"4"``
+      ("No"), each followed by ``Enter``. (The card is binary; the non-1:1 map
+      with the "always allow" variants 2/3 is intentionally acceptable, #1200.)
+    * **ask_question** — type the selected option id(s) ("1".."N") then ``Enter``;
+      agy's TUI numbers questions' options the same way its RPC ``selectedOptionIds``
+      do. A decline/cancel (or no usable selection) presses ``Escape`` to dismiss.
+
+    :param kind: Interaction kind — ``"ask_question"`` or ``"permission"``.
+    :param result: The web-submitted elicitation verdict.
+    :param spec: The original ``askQuestion`` / ``permission`` block (used to map
+        an ask_question answer's option labels back to ids).
+    :returns: Ordered tmux key arguments to send into the agy pane (possibly
+        empty when no keystroke is warranted, e.g. an unsupported kind).
+    :raises ValueError: When ``kind`` is not ``"ask_question"`` or ``"permission"``.
+    """
+    if kind == "permission":
+        option = (
+            _AGY_TUI_PERMISSION_APPROVE_OPTION
+            if result.action == "accept"
+            else _AGY_TUI_PERMISSION_REJECT_OPTION
+        )
+        return [option, _AGY_TUI_CONFIRM_KEY]
+    if kind == "ask_question":
+        return _agy_ask_question_tui_keys(result, spec)
+    raise ValueError(f"Unsupported agy interaction kind: {kind!r}")
+
+
+def _agy_ask_question_tui_keys(
+    result: ElicitationResult,
+    spec: dict[str, Any],
+) -> list[str]:
+    """
+    Map an ``ask_question`` result to the tmux keys answering agy's TUI prompt.
+
+    Reuses :func:`_agy_ask_question_response` to resolve the web answer back to
+    agy's option ids (``"1".."N"``), then types the FIRST question's selected
+    option id(s) followed by ``Enter``. agy's TUI shows one question's options as
+    a numbered list, so the option id is exactly the digit to press. A decline /
+    cancel — or any answer that resolves to no concrete option id — presses
+    ``Escape`` to dismiss the prompt (the RPC ``askQuestion`` skip already tells
+    the backend; the keystroke clears the TUI surface).
+
+    :param result: The web-submitted elicitation verdict.
+    :param spec: The ``askQuestion`` spec block (option id↔text map).
+    :returns: Ordered tmux key arguments (digits + ``Enter``, or ``["Escape"]``).
+    """
+    payload = _agy_ask_question_response(result, spec)
+    responses = payload.get("askQuestion", {}).get("responses", [])
+    selected: list[str] = []
+    if isinstance(responses, list) and responses:
+        first = responses[0]
+        if isinstance(first, dict):
+            ids = first.get("selectedOptionIds")
+            if isinstance(ids, list):
+                selected = [oid for oid in ids if isinstance(oid, str) and oid]
+    if not selected:
+        return ["Escape"]
+    return [*selected, _AGY_TUI_CONFIRM_KEY]

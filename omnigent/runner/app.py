@@ -60,6 +60,7 @@ from omnigent.runner.resource_registry import (
     CURSOR_NATIVE_TERMINAL_ROLE,
     GOOSE_NATIVE_TERMINAL_ROLE,
     HERMES_NATIVE_TERMINAL_ROLE,
+    KIMI_NATIVE_TERMINAL_ROLE,
     KIRO_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
     OPENCODE_NATIVE_TERMINAL_ROLE,
@@ -2275,6 +2276,160 @@ async def _auto_create_qwen_terminal(
         session_id,
         _forwarder_task.get_name(),
     )
+    return terminal_view
+
+
+async def _auto_create_kimi_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, Any]], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+) -> SessionResourceView:
+    """
+    Auto-create the Kimi TUI terminal for a kimi-native session.
+
+    Launches ``kimi`` (no args → interactive TUI) in a runner-owned tmux pane,
+    then advertises the pane's tmux socket+target so the kimi-native harness
+    executor can inject web-UI turns into the same pane (tmux paste).
+
+    The pane runs with a session-scoped ``KIMI_CODE_HOME`` (built by
+    :func:`omnigent.kimi_native_credentials.build_kimi_session_home`) that
+    mirrors the user's global ``kimi login`` (symlinked ``oauth`` / providers)
+    and adds the Omnigent tool-policy hooks — a ``PreToolUse`` deny-gate and a
+    ``PermissionRequest`` read-only surface dispatched to
+    :mod:`omnigent.kimi_native_hook`. The hook subprocess reads its routing
+    from ``hook_config.json`` in the bridge dir.
+
+    A background forwarder (:func:`omnigent.kimi_native_forwarder.
+    supervise_kimi_forwarder`) tails kimi's per-session ``wire.jsonl`` transcript
+    and mirrors each user prompt + assistant reply into the Omnigent chat, so the
+    response shows in the web UI — not only the embedded terminal. Tool calls and
+    reasoning are NOT mirrored (the embedded terminal renders those). NO MCP
+    plumbing (upstream kimi has no per-spawn MCP config).
+
+    :param session_id: Session/conversation identifier.
+    :param resource_registry: Session resource registry for launching the
+        terminal.
+    :param publish_event: Runner session event publisher.
+    :param server_client: Runner Omnigent server client (used only for the
+        workspace snapshot read).
+    :param ensure_comment_relay: Unused; kept for call-site parity with the
+        other native auto-create helpers.
+    :param agent_spec: Unused for now (model pinning via the kimi TUI is a
+        follow-up); kept for call-site parity.
+    :returns: Created terminal resource view.
+    """
+    del ensure_comment_relay, agent_spec
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.kimi_native import resolve_kimi_executable
+    from omnigent.kimi_native_bridge import (
+        bridge_dir_for_session_id,
+        write_hook_config,
+        write_tmux_target,
+    )
+    from omnigent.kimi_native_credentials import build_kimi_session_home
+    from omnigent.kimi_native_forwarder import clear_kimi_bridge_state, supervise_kimi_forwarder
+    from omnigent.runner._entry import _make_auth_token_factory
+
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    # Stamp launch time before the TUI starts so the forwarder only adopts a kimi
+    # session created for THIS launch. Tear down any prior forwarder + its line
+    # offset so a re-created terminal tails the fresh wire log (mirrors cursor).
+    launch_epoch_ms = int(time.time() * 1000)
+    await _cancel_auto_forwarder_task(session_id)
+    clear_kimi_bridge_state(bridge_dir)
+
+    # ``_pi_native_launch_config`` is a generic session-snapshot reader
+    # (workspace + terminal_launch_args); reused here, not Pi-specific.
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = os.path.realpath(str(launch_config.workspace))
+    kimi_command = resolve_kimi_executable()
+    # No subcommand: bare ``kimi`` launches the interactive TUI. Pass-through
+    # launch args (``omnigent kimi -- <args>``) are persisted on the session
+    # snapshot and threaded here.
+    kimi_args = list(launch_config.terminal_launch_args or [])
+
+    # Wire the Omnigent tool-policy hooks: kimi reads a single
+    # ``$KIMI_CODE_HOME/config.toml``, so point it at a session-scoped home that
+    # mirrors the user's global kimi config (symlinked auth) plus a PreToolUse
+    # deny-gate and a PermissionRequest read-only surface, both dispatched to
+    # ``omnigent.kimi_native_hook``. The hook subprocess reads the server URL +
+    # auth + session id from ``hook_config.json`` in the bridge dir, so persist
+    # those first. The hook gets a one-shot token snapshot (a quick
+    # request/reply, like claude-native's permission hook); ``None`` factory is
+    # a safe no-op for local unauthenticated runs.
+    server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/")
+    _auth_factory = _make_auth_token_factory()
+    _auth_token = _auth_factory() if _auth_factory is not None else None
+    _runner_headers = {"Authorization": f"Bearer {_auth_token}"} if _auth_token else {}
+    write_hook_config(
+        bridge_dir,
+        server_url=server_url,
+        headers=_runner_headers,
+        session_id=session_id,
+    )
+    kimi_env = build_kimi_session_home(
+        bridge_dir / "kimi-code-home",
+        bridge_dir=bridge_dir,
+    )
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="kimi",
+        session_key="main",
+        resource_role=KIMI_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            command=kimi_command,
+            args=kimi_args,
+            env=kimi_env,
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    # Advertise the tmux socket+target so the kimi-native harness executor can
+    # inject web-UI messages into this same pane (tmux paste), wiring the web
+    # chat box to the running TUI.
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "kimi", "main")
+        if instance is not None and instance.running:
+            write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+    # Mirror the kimi TUI transcript into the Omnigent chat: tail the per-session
+    # wire.jsonl and POST each user/assistant turn, so the reply renders in the
+    # web UI (not just the embedded pane). Reuses the shared auto-forwarder
+    # registry so terminal teardown / stop cancels it.
+    _forwarder_task = asyncio.create_task(
+        supervise_kimi_forwarder(
+            base_url=server_url,
+            headers=_runner_headers,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            kimi_home=bridge_dir / "kimi-code-home",
+            workspace=workspace,
+            launch_epoch_ms=launch_epoch_ms,
+        ),
+        name=f"kimi-forwarder-{session_id}",
+    )
+    _register_auto_forwarder_task(session_id, _forwarder_task)
+    _logger.info("Auto-created kimi terminal + forwarder for session %s", session_id)
     return terminal_view
 
 
@@ -6585,6 +6740,7 @@ def create_runner_app(
     _kiro_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _goose_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _qwen_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _kimi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _hermes_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     # Per-session lock guarding the claude-native terminal auto-create in
     # ``create_session``. Two ``POST /v1/sessions`` calls can land
@@ -7531,6 +7687,10 @@ def create_runner_app(
                 from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
 
                 spawn_env = build_qwen_native_spawn_env(session_id)
+            if harness_name == "kimi-native" and spawn_env is None:
+                from omnigent.kimi_native_bridge import build_kimi_native_spawn_env
+
+                spawn_env = build_kimi_native_spawn_env(session_id)
             _session_spec_cache[session_id] = spec_entry
         else:
             harness_name = "runner-test-default"
@@ -8125,6 +8285,42 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        if harness_name == "kimi-native":
+            _kimi_ensure_lock = _kimi_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with _kimi_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_kimi_terminal = (
+                    _tr is not None and _tr.get(session_id, "kimi", "main") is not None
+                )
+                if not _has_kimi_terminal:
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        try:
+                            _kimi_spec = await _resolve_session_agent_spec(session_id)
+                        except OmnigentError:
+                            _kimi_spec = None
+                        await _auto_create_kimi_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
+                            agent_spec=_kimi_spec,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create kimi terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "Kimi",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+
         # Auto-bootstrap the Omnigent REPL terminal for non-native
         # (SDK-harness) top-level sessions: host the framework's own TUI
         # (``omnigent attach``) in a tmux pane so the web UI can embed it
@@ -8397,6 +8593,7 @@ def create_runner_app(
         _antigravity_terminal_ensure_locks.pop(session_id, None)
         _goose_terminal_ensure_locks.pop(session_id, None)
         _qwen_terminal_ensure_locks.pop(session_id, None)
+        _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
@@ -9014,6 +9211,7 @@ def create_runner_app(
             "kiro-native",
             "goose-native",
             "qwen-native",
+            "kimi-native",
             "hermes-native",
         }:
             return
@@ -9754,6 +9952,33 @@ def create_runner_app(
         _wake_parent_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
+    async def _handle_kimi_native_interrupt(conv_id: str) -> Response:
+        """Cancel the in-flight kimi turn by sending ``Escape`` to its TUI pane.
+
+        kimi-native turns run inside the kimi TUI; the runner harness task
+        returns right after the tmux paste, so the in-process cancel floor has
+        nothing to cancel. ``Escape`` stops a running kimi turn.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 when Escape was sent; 503 if the tmux target is unavailable.
+        """
+        from omnigent.kimi_native_bridge import bridge_dir_for_session_id, inject_interrupt
+
+        try:
+            await asyncio.to_thread(
+                inject_interrupt, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "kimi_native_interrupt_failed",
+                    "detail": _client_safe_error_detail(exc, context="kimi-native interrupt"),
+                },
+            )
+        _wake_parent_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
     async def _handle_goose_native_stop(conv_id: str) -> Response:
         """Hard-stop a goose-native session by killing its tmux session.
 
@@ -9791,6 +10016,53 @@ def create_runner_app(
         ):
             _logger.warning(
                 "Goose-native stop succeeded but sub-agent delivery was "
+                "not confirmed; session=%s reason=%s",
+                conv_id,
+                delivery_ack.reason,
+            )
+        return Response(status_code=204)
+
+    async def _handle_kimi_native_stop(conv_id: str) -> Response:
+        """Hard-stop a kimi-native session by killing its tmux session.
+
+        Mirrors :func:`_handle_cursor_native_stop`: kill the pane (ends kimi),
+        cancel the transcript forwarder (the chat store is now frozen — nothing
+        left to mirror), tear the terminal resource down so the web UI stops
+        showing a live terminal, publish ``idle`` so the spinner clears, and
+        reclaim any sub-agent work entry.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 on success; 503 if the tmux target is unavailable.
+        """
+        from omnigent.kimi_native_bridge import bridge_dir_for_session_id, kill_session
+
+        try:
+            await asyncio.to_thread(
+                kill_session, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "kimi_native_stop_failed",
+                    "detail": _client_safe_error_detail(exc, context="kimi-native stop"),
+                },
+            )
+        await _teardown_session_terminals(conv_id)
+        # Stop mirroring: the wire log is now frozen, so cancel the forwarder so
+        # it isn't left polling a dead session.
+        await _cancel_auto_forwarder_task(conv_id)
+        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        delivery_ack = _mark_subagent_terminal_and_wake(
+            conv_id,
+            status="cancelled",
+            output="[System: sub-agent stopped]",
+        )
+        if not delivery_ack.delivered and (
+            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
+        ):
+            _logger.warning(
+                "Kimi-native stop succeeded but sub-agent delivery was "
                 "not confirmed; session=%s reason=%s",
                 conv_id,
                 delivery_ack.reason,
@@ -11939,6 +12211,10 @@ def create_runner_app(
             from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
 
             spawn_env = build_qwen_native_spawn_env(conv_id)
+        if harness_name == "kimi-native" and spawn_env is None:
+            from omnigent.kimi_native_bridge import build_kimi_native_spawn_env
+
+            spawn_env = build_kimi_native_spawn_env(conv_id)
 
         agent_version = dispatch.agent_version if dispatch else body.get("agent_version")
         if agent_version is not None and conv_id in _version_cache:
@@ -12855,6 +13131,9 @@ def create_runner_app(
             if _harness == "qwen-native":
                 # qwen turn lives in the qwen TUI; send Escape to stop it.
                 return await _handle_qwen_native_interrupt(conversation_id)
+            if _harness == "kimi-native":
+                # kimi turn lives in the kimi TUI; send Escape to stop it.
+                return await _handle_kimi_native_interrupt(conversation_id)
             # In-process harness: mark interrupted, forward an interrupt to the
             # harness, and force-cancel the runner turn task so the turn ends
             # promptly even if the harness can't honor the interrupt in time.
@@ -12935,6 +13214,9 @@ def create_runner_app(
             if _harness == "qwen-native":
                 # Hard-kill the qwen tmux pane (the TUI is the runtime).
                 return await _handle_qwen_native_stop(conversation_id)
+            if _harness == "kimi-native":
+                # Hard-kill the kimi tmux pane (the TUI is the runtime).
+                return await _handle_kimi_native_stop(conversation_id)
             await _cancel_inprocess_turn(conversation_id)
             return Response(status_code=204)
 
@@ -13805,6 +14087,49 @@ def create_runner_app(
                         session_id,
                     )
                     return _native_terminal_start_error_response(exc, "qwen")
+            return JSONResponse(
+                status_code=200,
+                content=session_resource_view_to_dict(terminal_view),
+            )
+
+        if (
+            body.get("ensure_native_terminal")
+            and terminal_name == "kimi"
+            and session_key == "main"
+        ):
+            kimi_terminal_id = terminal_resource_id("kimi", "main")
+            ensure_lock = _kimi_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with ensure_lock:
+                existing = await resource_registry.get_terminal_resource(
+                    session_id, kimi_terminal_id
+                )
+                if existing is not None:
+                    return JSONResponse(
+                        status_code=200,
+                        content=session_resource_view_to_dict(existing),
+                    )
+                try:
+                    # The spec only feeds optional model injection (a follow-up),
+                    # so a resolution failure must not block launching the
+                    # terminal — fall back to None like the cursor/Pi paths.
+                    try:
+                        kimi_agent_spec = await _resolve_session_agent_spec(session_id)
+                    except OmnigentError:
+                        kimi_agent_spec = None
+                    terminal_view = await _auto_create_kimi_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        server_client=server_client,
+                        ensure_comment_relay=_ensure_comment_relay_started,
+                        agent_spec=kimi_agent_spec,
+                    )
+                except Exception as exc:
+                    _logger.exception(
+                        "Kimi terminal ensure failed for session=%s",
+                        session_id,
+                    )
+                    return _native_terminal_start_error_response(exc, "Kimi")
             return JSONResponse(
                 status_code=200,
                 content=session_resource_view_to_dict(terminal_view),
@@ -15289,6 +15614,7 @@ def create_runner_app(
         _antigravity_terminal_ensure_locks.pop(session_id, None)
         _goose_terminal_ensure_locks.pop(session_id, None)
         _qwen_terminal_ensure_locks.pop(session_id, None)
+        _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
@@ -15347,6 +15673,7 @@ def create_runner_app(
         _antigravity_terminal_ensure_locks.pop(session_id, None)
         _goose_terminal_ensure_locks.pop(session_id, None)
         _qwen_terminal_ensure_locks.pop(session_id, None)
+        _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         # Close terminals with ``session.resource.deleted`` events BEFORE
@@ -16118,6 +16445,10 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     # (claude-native, codex-native) it honors the spec model via a launch
     # ``--model`` arg in _auto_create_cursor_terminal, not via an env var.
     "antigravity": "HARNESS_ANTIGRAVITY_MODEL",
+    # Kimi reads ``HARNESS_KIMI_MODEL`` in
+    # :mod:`omnigent.inner.kimi_executor`; without this mapping a per-session
+    # ``/model`` override would silently drop on the kimi harness path.
+    "kimi": "HARNESS_KIMI_MODEL",
     "qwen": "HARNESS_QWEN_MODEL",
     "goose": "HARNESS_GOOSE_MODEL",
     "copilot": "HARNESS_COPILOT_MODEL",
@@ -16156,6 +16487,7 @@ def _build_spawn_env_from_spec(
             _build_copilot_spawn_env,
             _build_cursor_spawn_env,
             _build_goose_spawn_env,
+            _build_kimi_spawn_env,
             _build_openai_agents_sdk_spawn_env,
             _build_pi_spawn_env,
             _build_qwen_spawn_env,
@@ -16173,6 +16505,8 @@ def _build_spawn_env_from_spec(
             env = _build_cursor_spawn_env(spec, workdir=workdir)
         elif harness == "antigravity":
             env = _build_antigravity_spawn_env(spec)
+        elif harness == "kimi":
+            env = _build_kimi_spawn_env(spec, cwd=cwd)
         elif harness == "qwen":
             env = _build_qwen_spawn_env(spec, workdir=workdir)
         elif harness == "goose":

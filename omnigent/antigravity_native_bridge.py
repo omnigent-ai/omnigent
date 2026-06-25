@@ -1080,3 +1080,53 @@ def inject_user_message_via_tui(
             time.sleep(_TMUX_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
     _submit_and_verify(socket_path, tmux_target)
+
+
+def send_interaction_keys_via_tui(
+    bridge_dir: Path,
+    *keys: str,
+) -> None:
+    """
+    Send raw key arguments to the agy TUI pane to answer its in-process prompt.
+
+    The companion to :func:`inject_user_message_via_tui` for the OTHER thing the
+    attended agy TUI maintains in parallel with the RPC step state: its
+    **in-process permission / question prompt**. When agy runs attended (the
+    web/mobile path types every turn into the TUI), an approval surfaces in the
+    Omnigent web UI AND as agy's own numbered TUI prompt ("Do you want to
+    proceed?", 1.Yes … 4.No). Delivering the verdict over
+    :func:`omnigent.antigravity_native_rpc.handle_user_interaction` flips the
+    backend trajectory step to DONE and the command runs, but the **TUI prompt
+    for that interaction can stay open** — and the next typed turn then lands in
+    that stale prompt's filter/amend buffer instead of starting a fresh turn
+    (live-verified; see ``docs/claude/antigravity-rpc-spike-notes.md`` §"attended
+    TUI"). So the bridge ALSO types the selection into the pane to dismiss the
+    prompt, mirroring cursor-native's
+    :func:`omnigent.cursor_native_bridge.send_cursor_pane_keys`.
+
+    Each argument is a tmux ``send-keys`` key argument — a bare ``"1"`` / ``"4"``
+    selects a numbered option, ``"Enter"`` confirms, ``"Escape"`` cancels — sent
+    in order as ONE ``send-keys`` invocation so the digit and its Enter cannot be
+    reordered or split across the pane's input handling. Keys are interpreted by
+    tmux (no ``-l``), so named keys like ``Enter`` / ``Escape`` work.
+
+    :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
+    :param keys: Ordered tmux key arguments, e.g. ``("1", "Enter")`` to approve.
+    :returns: None.
+    :raises RuntimeError: When the tmux target is not advertised, the agy TUI has
+        exited, or the ``send-keys`` invocation fails.
+    """
+    if not keys:
+        raise RuntimeError("antigravity-native TUI selection requires at least one key")
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        raise RuntimeError(
+            "antigravity-native tmux target not advertised (is the agy terminal running?)"
+        )
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "the agy terminal is no longer running (the TUI exited); restart the session"
+        )
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)

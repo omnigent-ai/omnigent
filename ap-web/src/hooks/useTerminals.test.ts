@@ -501,6 +501,12 @@ describe("inventoryTerminals", () => {
     session: "main",
     running: true,
   };
+  const kimiPane: TerminalInfo = {
+    id: "terminal_kimi_main",
+    name: "kimi",
+    session: "main",
+    running: true,
+  };
   const hermesPane: TerminalInfo = {
     id: "terminal_hermes_main",
     name: "hermes",
@@ -557,6 +563,14 @@ describe("inventoryTerminals", () => {
     // mode as the pi/cursor/goose panes above.
     expect(inventoryTerminals([qwenPane, bash], true)).toEqual([bash]);
     expect(isAgentTerminalKey("terminal:terminal_qwen_main")).toBe(true);
+  });
+
+  it("drops the kimi vendor pane for native Kimi sessions", () => {
+    // Regression: terminal_kimi_main was missing from AGENT_TERMINAL_IDS,
+    // same failure mode as the pi/cursor panes above — leaked into Shells
+    // and hid the Chat/Terminal pill in Terminal view.
+    expect(inventoryTerminals([kimiPane, bash], true)).toEqual([bash]);
+    expect(isAgentTerminalKey("terminal:terminal_kimi_main")).toBe(true);
   });
 
   it("drops the hermes vendor pane for native Hermes sessions", () => {

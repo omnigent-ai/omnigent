@@ -63,6 +63,7 @@ import { validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
 import {
   isIOSShell,
+  onNativeSidebarDrag,
   onNativeViewModeChanged,
   setNativeServerSwitcherHidden,
   setNativeViewMode,
@@ -1380,6 +1381,45 @@ function MainAgentSurface({
   // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
   // read and drive the scroll.
   const [scroller, setScroller] = useState<ConversationScroller | null>(null);
+  // While the iOS edge-swipe is driving the sidebar drawer, make the transcript
+  // ignore the finger so it doesn't scroll along with the drag. On iOS the page
+  // is viewport-locked, so the transcript scrolls as an inner overflow:auto
+  // element (`scroller.el`) that the native shell can't reach via
+  // webView.scrollView — it has to be frozen here in the DOM. The native drag
+  // stream marks when a drag is live; for its duration the scroller stops
+  // responding to touch (pointer-events:none), its overflow is locked, and its
+  // scroll offset is pinned so neither a finger-drag nor leftover momentum can
+  // move it. Everything is restored when the drag settles (open/close).
+  useEffect(() => {
+    const el = scroller?.el;
+    if (!el) return;
+    let frozenTop: number | null = null;
+    const pin = () => {
+      if (frozenTop != null) el.scrollTop = frozenTop;
+    };
+    const freeze = () => {
+      if (frozenTop != null) return;
+      frozenTop = el.scrollTop;
+      el.style.pointerEvents = "none";
+      el.style.overflowY = "hidden";
+      el.addEventListener("scroll", pin);
+    };
+    const thaw = () => {
+      if (frozenTop == null) return;
+      el.removeEventListener("scroll", pin);
+      el.style.pointerEvents = "";
+      el.style.overflowY = "auto";
+      frozenTop = null;
+    };
+    const unsubscribe = onNativeSidebarDrag((phase) => {
+      if (phase === "begin" || phase === "move") freeze();
+      else thaw();
+    });
+    return () => {
+      unsubscribe();
+      thaw();
+    };
+  }, [scroller]);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
   const handleSend = useCallback(
     (text: string, files?: File[]) => {
@@ -2023,10 +2063,14 @@ export function JumpToTopButton({
 
   return (
     <div
+      // top 50px centers the pill on the chat-scroll-fade border (the mask ramps
+      // 48px→80px), just below the h-14 ChatHeader. z-40 > header z-30. On the
+      // iOS shell the header and fade border shift down by the safe-area inset
+      // (see .chat-scroll-fade in index.css), so add --omnigent-inset-top here
+      // too to keep the pill centered on the border. The var is 0px off-shell.
+      style={{ top: "calc(50px + var(--omnigent-inset-top))" }}
       className={cn(
-        // top-[50px]: centers the pill on the chat-scroll-fade border (the mask
-        // ramps 48px→80px), just below the h-14 ChatHeader. z-40 > header z-30.
-        "pointer-events-none absolute inset-x-0 top-[50px] z-40 flex justify-center transition-opacity duration-150",
+        "pointer-events-none absolute inset-x-0 z-40 flex justify-center transition-opacity duration-150",
         visible ? "opacity-100" : "opacity-0",
       )}
     >

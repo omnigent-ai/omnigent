@@ -51,7 +51,8 @@ export const PANEL_NO_TERMINAL_KEY = "";
  * the embedded Omnigent REPL (``tui``/``main``) for SDK sessions,
  * and the vendor pane (``claude``/``main``, ``codex``/``main``,
  * ``pi``/``main``, ``cursor``/``main``, ``kiro``/``main``, ``goose``/``main``,
- * ``qwen``/``main``, or ``antigravity``/``main``) for native-wrapper sessions.
+ * ``qwen``/``main``, ``antigravity``/``main``, or ``kimi``/``main``) for
+ * native-wrapper sessions.
  * These are plumbing, not part of the session's shell inventory, and at most
  * one exists per session.
  *
@@ -71,6 +72,7 @@ export const AGENT_TERMINAL_IDS: ReadonlySet<string> = new Set([
   "terminal_goose_main",
   "terminal_qwen_main",
   "terminal_antigravity_main",
+  "terminal_kimi_main",
   "terminal_hermes_main",
 ]);
 
