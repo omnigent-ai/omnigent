@@ -62,6 +62,7 @@ describe("Composer status line (branch + context ring)", () => {
       gitBranch: null,
       llmModel: null,
       selectedModel: null,
+      sessionModelOverride: null,
       selectedEffort: null,
       codexModelOptions: [],
       codexPlanMode: false,
@@ -101,7 +102,9 @@ describe("Composer status line (branch + context ring)", () => {
 
   it("shows model and effort immediately left of the context ring", () => {
     useChatStore.setState({
-      selectedModel: "gpt-5.5",
+      // The label is driven by this session's applied override, not the
+      // global sticky pick — a codex session's override is `gpt-5.5`.
+      sessionModelOverride: "gpt-5.5",
       selectedEffort: "xhigh",
       contextWindow: 100_000,
       tokensUsed: 25_000,
@@ -142,6 +145,38 @@ describe("Composer status line (branch + context ring)", () => {
       "databricks-gpt-5-5 Medium",
     );
     expect(screen.queryByLabelText(/context used/)).toBeNull();
+  });
+
+  it("ignores a leaked global sticky model on a non-native session", () => {
+    // Repro of the Polly (claude-sdk) report: a `gpt-5.5` left in the global
+    // sticky `selectedModel` by a previous Codex session must NOT surface as
+    // a claude-sdk agent's model. The session truth (`sessionModelOverride`)
+    // is null and the agent has no bound model, so no model label renders.
+    useChatStore.setState({
+      selectedModel: "gpt-5.5", // leaked cross-session sticky
+      sessionModelOverride: null, // this session has no applied override
+      llmModel: null,
+      contextWindow: 100_000,
+      tokensUsed: 25_000, // ring keeps the tray visible
+    });
+    renderComposer();
+    expect(statusLine()).not.toBeNull();
+    expect(screen.queryByText(/gpt-5\.5/i)).toBeNull();
+    expect(screen.queryByTestId("composer-model-effort")).toBeNull();
+  });
+
+  it("shows the bound model, not a leaked sticky, on a non-native session", () => {
+    // Same leak, but the agent has a bound model — the label must show the
+    // real bound model and never the cross-session sticky.
+    useChatStore.setState({
+      selectedModel: "gpt-5.5", // leaked cross-session sticky
+      sessionModelOverride: null,
+      llmModel: "claude-opus-4-8",
+      selectedEffort: null,
+    });
+    renderComposer();
+    expect(screen.getByTestId("composer-model-effort")).toHaveTextContent("claude-opus-4-8");
+    expect(screen.queryByText(/gpt-5\.5/i)).toBeNull();
   });
 
   it("draws the ring arc as what's used, not what's left", () => {
@@ -220,7 +255,7 @@ describe("Composer status line (branch + context ring)", () => {
   it("places Plan mode to the left of model and effort", () => {
     useChatStore.setState({
       codexPlanMode: true,
-      selectedModel: "gpt-5.5",
+      sessionModelOverride: "gpt-5.5",
       selectedEffort: "xhigh",
     });
     renderComposer();

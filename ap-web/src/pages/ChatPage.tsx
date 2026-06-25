@@ -2919,7 +2919,15 @@ function ComposerStatusLine() {
   const contextWindow = useChatStore((s) => s.contextWindow);
   const tokensUsed = useChatStore((s) => s.tokensUsed);
   const selectedEffort = useChatStore((s) => s.selectedEffort);
-  const selectedModel = useChatStore((s) => s.selectedModel);
+  // The label reflects THIS session's applied model, not the global sticky
+  // pick (`selectedModel`). The sticky is a cross-session memory that is only
+  // auto-applied to native-wrapper sessions (claude-code / codex); for every
+  // other agent it can hold a model carried over from an unrelated session
+  // (e.g. a `gpt-5.5` left from a Codex session), which must never be shown
+  // as a Claude-SDK agent's model. `sessionModelOverride` is the server-truth
+  // override (or null → fall back to the bound `llmModel`), so the label is
+  // correct for any agent / harness / model without a per-model table.
+  const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
   const llmModel = useChatStore((s) => s.llmModel);
   const codexModelOptions = useChatStore((s) => s.codexModelOptions);
@@ -2930,7 +2938,7 @@ function ComposerStatusLine() {
 
   const showBranch = !!conversationId && !!gitBranch;
   const modelEffortLabel = conversationId
-    ? formatModelEffortStatusLabel(selectedModel ?? llmModel, selectedEffort, codexModelOptions)
+    ? formatModelEffortStatusLabel(sessionModelOverride ?? llmModel, selectedEffort, codexModelOptions)
     : null;
   const showPlanMode = !!conversationId && codexPlanMode;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
