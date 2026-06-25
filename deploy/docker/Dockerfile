@@ -145,6 +145,12 @@ RUN test -f ./omnigent/server/static/web-ui/index.html \
 # [databricks] extra in pyproject — so add it explicitly here.
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
 
+# The OpenShell overlay launcher is server-side: the server imports the
+# provider SDK when deploying managed OpenShell sandboxes. Keep it baked into
+# the published server image instead of requiring every image build to pass an
+# extra build arg.
+RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e ".[openshell]"
+
 # Optional managed-sandbox provider extras for the SERVER (the launcher imports
 # the provider SDK — e.g. the kubernetes client for `sandbox.provider:
 # kubernetes`). Off by default; the runner host image needs none of these. Build
