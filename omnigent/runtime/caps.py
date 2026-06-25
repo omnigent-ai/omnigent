@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from omnigent.server.smart_routing import RoutingClient
     from omnigent.spec.types import LLMConfig, PolicySpec
 
 
@@ -69,3 +70,8 @@ class RuntimeCaps:
     # propagate the caller's auth token instead of using static
     # server-level credentials.
     policy_llm_connection_factory: Callable[[], dict[str, str] | None] | None = None
+    # Pluggable model routing client.  The default LLMRoutingClient
+    # uses the server-level ``llm:`` config to call a lightweight judge.
+    # Managed deployments can supply a different implementation (e.g.
+    # a rules engine or remote service).  ``None`` disables routing.
+    routing_client: RoutingClient | None = None

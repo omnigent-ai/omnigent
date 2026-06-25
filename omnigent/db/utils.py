@@ -572,6 +572,7 @@ _ITEM_TYPE_PREFIX: dict[str, str] = {
     "resource_event": "rse_",
     "slash_command": "sc_",
     "terminal_command": "tc_",
+    "routing_decision": "rd_",
 }
 
 
@@ -770,7 +771,8 @@ def extract_search_text(item: NewConversationItem) -> str:
         ``type`` is one of ``"message"``, ``"function_call"``,
         ``"function_call_output"``, ``"reasoning"``,
         ``"compaction"``, ``"native_tool"``, ``"resource_event"``,
-        ``"slash_command"``, or ``"terminal_command"``.
+        ``"slash_command"``, ``"terminal_command"``, or
+        ``"routing_decision"``.
     :returns: A single plain-text string suitable for FTS indexing.
     :raises ValueError: If *item.type* is not a recognised type.
     """
@@ -824,6 +826,12 @@ def extract_search_text(item: NewConversationItem) -> str:
         # !cmd executions by what was typed or what was printed.
         return " ".join(
             part for part in (data.get("input") or "", data.get("stdout") or "") if part
+        )
+    if item.type == "routing_decision":
+        # Index model + tier + rationale so FTS can find a router
+        # verdict by the model it picked or its one-line explanation.
+        return " ".join(
+            part for part in (data.get("model"), data.get("tier"), data.get("rationale")) if part
         )
     raise ValueError(f"unknown item type: {item.type!r}")
 

@@ -11775,6 +11775,33 @@ def create_runner_app(
             cost_control_mode_override=cost_control_mode_override,
         )
 
+    def _emit_routing_decision(conv: str, result: AdvisorTurnResult | None) -> None:
+        """
+        Stream the router's verdict as a turn-start transcript chip.
+
+        Emitted on EVERY advised turn that produced a verdict — applied
+        (optimize) or shadow (advise / user pin won) alike — so the model
+        the router chose shows in the conversation flow the instant the
+        turn begins. Independent of the ``cost_control.plan`` label PATCH:
+        a 500 on that persist (telemetry) does NOT suppress this chip, and
+        independent of :func:`_apply_advisor_for_turn`'s sticky/apply logic
+        so a user-pin turn still surfaces the "would have picked" verdict.
+
+        The AP server's stream relay turns this into a durable, display-only
+        ``routing_decision`` item (in arrival order, before the assistant
+        output) and forwards it live. No-op when no verdict was produced
+        (advisor off, conversational turn, or judge/persist failure).
+
+        :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param result: The advisor turn result, or ``None`` (no verdict —
+            nothing to announce).
+        """
+        if result is None:
+            return
+        from omnigent.runner.cost_advisor import routing_decision_event
+
+        _publish_event(conv, routing_decision_event(result.verdict))
+
     def _apply_advisor_for_turn(
         body: dict[str, Any],
         conv: str,
@@ -12115,6 +12142,9 @@ def create_runner_app(
         # verdict model this turn and inject the one-line note. No-op
         # unless executor.config.cost_optimize is set.
         _advisor_result = await _run_turn_advisor(msg_body, conv, cached_spec)
+        # Announce the router's pick at turn start (display-only chip), before
+        # any harness output — independent of the apply/sticky logic below.
+        _emit_routing_decision(conv, _advisor_result)
         # harness_body is rebuilt without the inbound model_override, so the
         # user pin must be passed explicitly or the sticky stamp beats it.
         _apply_advisor_for_turn(
@@ -13327,6 +13357,9 @@ def create_runner_app(
                         conversation_id,
                         await _advisor_spec_for_session(conversation_id),
                     )
+                    # Announce the router's pick at turn start (display-only
+                    # chip), before any harness output — same as _run_turn_bg.
+                    _emit_routing_decision(conversation_id, _stream_advisor_result)
                     # Copy-on-write: the per-turn model override + note must
                     # not mutate the caller's body or the cached history.
                     message_body = dict(message_body)

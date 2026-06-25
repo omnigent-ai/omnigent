@@ -1233,6 +1233,106 @@ describe("buildBubbles — slash_command items", () => {
   });
 });
 
+describe("buildBubbles — routing_decision (intelligent model router) chip", () => {
+  it("routing_decision block becomes a standalone routing_decision bubble, not folded into an assistant bubble", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "routing_decision",
+        ctx: ctx({ itemId: "rd_1", responseId: "routing_1" }),
+        model: "databricks-claude-opus-4-8",
+        tier: "expensive",
+        applied: true,
+        rationale: "multi-file refactor needs deep reasoning",
+      },
+      // An assistant turn under a different responseId follows.
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "resp_1" }),
+        fullText: "Done.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    // The chip is its own top-level bubble BEFORE the assistant bubble —
+    // if it were folded into the assistant group, the kinds would be just
+    // ["assistant"] and the chip would render inside the answer.
+    expect(bubbles.map((b) => b.kind)).toEqual(["routing_decision", "assistant"]);
+    const chip = bubbles[0] as Extract<Bubble, { kind: "routing_decision" }>;
+    expect(chip.itemId).toBe("rd_1");
+    expect(chip.model).toBe("databricks-claude-opus-4-8");
+    expect(chip.tier).toBe("expensive");
+    expect(chip.applied).toBe(true);
+    expect(chip.rationale).toBe("multi-file refactor needs deep reasoning");
+  });
+
+  it("carries applied=false for a shadow verdict (would-have-picked)", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "routing_decision",
+        ctx: ctx({ itemId: "rd_shadow", responseId: "routing_2" }),
+        model: "databricks-claude-haiku-4-5",
+        tier: "cheap",
+        applied: false,
+        rationale: "trivial question",
+      },
+    ];
+    const chip = buildBubbles(blocks, null)[0] as Extract<Bubble, { kind: "routing_decision" }>;
+    // applied=false drives the "would have picked" copy — a flip to true
+    // would falsely claim the brain ran on the router's pick.
+    expect(chip.applied).toBe(false);
+    expect(chip.model).toBe("databricks-claude-haiku-4-5");
+  });
+
+  it("reload funnel: a routing_decision item maps through itemsToBlocks to the same bubble", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "rd_reload",
+        type: "routing_decision",
+        response_id: "routing_3",
+        status: "completed",
+        model: "databricks-claude-sonnet-4-6",
+        tier: "medium",
+        applied: true,
+        rationale: "moderate knowledge work",
+      } as unknown as ConversationItem,
+    ];
+    const blocks = itemsToBlocks(items);
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.length).toBe(1);
+    const chip = bubbles[0] as Extract<Bubble, { kind: "routing_decision" }>;
+    // Reload path produces the same chip the live path does — id carried
+    // from the persisted item so both funnels dedup by ctx.itemId.
+    expect(chip.kind).toBe("routing_decision");
+    expect(chip.itemId).toBe("rd_reload");
+    expect(chip.model).toBe("databricks-claude-sonnet-4-6");
+    expect(chip.tier).toBe("medium");
+  });
+
+  it("live funnel: a response.output_item.done routing_decision reduces to the same bubble", () => {
+    const events: StreamEvent[] = [
+      {
+        type: "routing_decision",
+        model: "databricks-claude-opus-4-8",
+        tier: "expensive",
+        applied: true,
+        rationale: "hard turn",
+        itemId: "rd_live",
+        responseId: "routing_live",
+      },
+    ];
+    const blocks = new BlockStream().reduceSync(events);
+    const bubbles = buildBubbles(blocks, null);
+    // The live reducer produces the same standalone chip the reload path
+    // does — a missing case here would silently drop the live chip.
+    expect(bubbles.length).toBe(1);
+    const chip = bubbles[0] as Extract<Bubble, { kind: "routing_decision" }>;
+    expect(chip.kind).toBe("routing_decision");
+    expect(chip.itemId).toBe("rd_live");
+    expect(chip.applied).toBe(true);
+    expect(chip.model).toBe("databricks-claude-opus-4-8");
+  });
+});
+
 describe("bubblesEqual — React.memo comparator", () => {
   const baseBlocks = (): AnyBlock[] => [
     {

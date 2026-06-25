@@ -7985,6 +7985,117 @@ async def _persist_session_event(
     return item_id
 
 
+def _extract_user_text_for_routing(body: SessionEventInput) -> str:
+    """Extract plain text from a user message event for the routing judge.
+
+    Concatenates all ``input_text`` blocks in ``body.data["content"]``,
+    returning the first 4 000 characters.  Returns ``""`` for non-message
+    events or events with no text content.
+    """
+    content = body.data.get("content")
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "input_text":
+            text = block.get("text", "")
+            if isinstance(text, str):
+                parts.append(text)
+    return " ".join(parts)[:4000]
+
+
+async def _emit_server_routing_decision(
+    session_id: str,
+    conversation_store: ConversationStore,
+    model: str,
+    verdict: dict[str, Any],
+) -> None:
+    """Persist and publish a ``routing_decision`` transcript chip.
+
+    Called by the server-side routing path before the turn is forwarded
+    to the runner.  The chip shows the judge's model pick at turn start
+    — the same UX the runner-side advisor produced, but driven entirely
+    by the server.
+    """
+    import uuid
+
+    from omnigent.runtime import session_stream
+
+    tier = verdict.get("tier", "medium")
+    rationale = verdict.get("rationale", "")
+    item_data = {
+        "model": model,
+        "tier": tier if tier in ("cheap", "medium", "expensive") else "medium",
+        "applied": True,
+        "rationale": rationale if isinstance(rationale, str) else "",
+    }
+    try:
+        parsed_data = parse_item_data("routing_decision", item_data)
+    except (ValueError, TypeError):
+        _logger.warning("Server routing: failed to parse routing_decision data")
+        return
+
+    routing_item = NewConversationItem(
+        type="routing_decision",
+        response_id=f"routing_{uuid.uuid4().hex}",
+        data=parsed_data,
+    )
+    try:
+        persisted = await asyncio.to_thread(conversation_store.append, session_id, [routing_item])
+        persisted_id: str | None = persisted[0].id if persisted else None
+    except Exception:
+        _logger.exception(
+            "Server routing: routing_decision persist failed for session=%s",
+            session_id,
+        )
+        persisted_id = None
+
+    # Persist the verdict as a session label so the AgentInfo popover's
+    # "Intelligent model router" section can read it (it uses
+    # parseCostRoutingVerdict which reads the cost_control.plan label).
+    try:
+        import datetime
+
+        from omnigent.cost_plan import COST_CONTROL_PLAN_LABEL
+
+        label_value = json.dumps(
+            {
+                "version": 3,
+                "tier": item_data["tier"],
+                "model": model,
+                "applied": True,
+                "rationale": item_data["rationale"],
+                "turn_anchor": datetime.datetime.now(tz=datetime.UTC).isoformat(),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            session_id,
+            {COST_CONTROL_PLAN_LABEL: label_value},
+        )
+    except (OSError, ValueError):
+        _logger.warning(
+            "Server routing: failed to persist verdict label for session=%s",
+            session_id,
+            exc_info=True,
+        )
+
+    # Publish live event so the web UI renders the chip immediately.
+    session_stream.publish(
+        session_id,
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "id": persisted_id,
+                "type": "routing_decision",
+                **item_data,
+            },
+        },
+    )
+
+
 async def _forward_event_to_runner(
     session_id: str,
     conv: Conversation,
@@ -8124,6 +8235,49 @@ async def _forward_event_to_runner(
     effective_runner_override = (
         body.model_override if body.model_override is not None else conv.model_override
     )
+    # ── Server-side intelligent routing ──────────────────────────────
+    # When the session toggle is ON and no model has been chosen yet,
+    # call the judge LLM on the FIRST message to pick the model for
+    # the entire session.  The verdict is persisted as model_override
+    # on the conversation so subsequent turns reuse it without another
+    # judge call.
+    if (
+        effective_runner_override is None
+        and conv.cost_control_mode_override == "on"
+        and body.type == "message"
+    ):
+        from omnigent.server.smart_routing import route_turn
+
+        _harness = _resolve_harness(conv)
+        _user_text = _extract_user_text_for_routing(body)
+        if _user_text:
+            _routed_model, _verdict = await route_turn(_harness, _user_text)
+            if _routed_model is not None:
+                effective_runner_override = _routed_model
+                # Persist as the session's model_override so all
+                # subsequent turns use this model automatically.
+                try:
+                    await asyncio.to_thread(
+                        conversation_store.update_conversation,
+                        session_id,
+                        model_override=_routed_model,
+                    )
+                except (OSError, ValueError):
+                    _logger.warning(
+                        "smart_routing: failed to persist model_override "
+                        "for session=%s; turn still uses routed model",
+                        session_id,
+                        exc_info=True,
+                    )
+                # Emit the routing_decision transcript chip so the UI
+                # shows which model was picked, before the turn output.
+                await _emit_server_routing_decision(
+                    session_id,
+                    conversation_store,
+                    _routed_model,
+                    _verdict or {},
+                )
+    # ────────────────────────────────────────────────────────────────
     if effective_runner_override is not None:
         runner_body["model_override"] = effective_runner_override
     # Per-session brain-harness override — create-time only, so no
@@ -8294,6 +8448,38 @@ async def _dispatch_session_event_to_runner(
             if isinstance(content, list) and content
             else None
         )
+        # ── Server-side routing for native terminal sessions ────────
+        # Same logic as the SDK path in _forward_event_to_runner: if
+        # the toggle is on and no model_override is set, call the
+        # judge and persist the chosen model on the conversation row.
+        # The native CLI reads model_override from the session.
+        if conv.model_override is None and conv.cost_control_mode_override == "on":
+            from omnigent.server.smart_routing import route_turn
+
+            _harness = _resolve_harness(conv)
+            _user_text = _extract_user_text_for_routing(body)
+            if _user_text:
+                _routed_model, _verdict = await route_turn(_harness, _user_text)
+                if _routed_model is not None:
+                    try:
+                        await asyncio.to_thread(
+                            conversation_store.update_conversation,
+                            session_id,
+                            model_override=_routed_model,
+                        )
+                    except (OSError, ValueError):
+                        _logger.warning(
+                            "smart_routing: persist failed for native session=%s",
+                            session_id,
+                            exc_info=True,
+                        )
+                    await _emit_server_routing_decision(
+                        session_id,
+                        conversation_store,
+                        _routed_model,
+                        _verdict or {},
+                    )
+        # ────────────────────────────────────────────────────────────
         forwarded = False
         try:
             await _forward_native_terminal_message(
@@ -8460,6 +8646,51 @@ def _resource_event_item_from_sse(
             resource_type=resource_type,
             resource=resource,
         ),
+    )
+
+
+def _routing_decision_item_from_sse(
+    event: dict[str, Any],
+) -> NewConversationItem | None:
+    """
+    Build a ``routing_decision`` conversation item from a runner SSE event.
+
+    The runner's cost advisor emits a ``response.output_item.done`` with a
+    ``routing_decision`` item at the START of an advised turn (the
+    intelligent model router's pick). This produces the durable,
+    display-only transcript item so the pick survives reload at the right
+    position (BEFORE the turn's assistant output); the relay also
+    re-publishes a live event carrying the persisted item id so the live
+    chip and a turn-start snapshot refetch dedup by the same id (no
+    double render).
+
+    Returns ``None`` for every other event, and for a malformed routing
+    item (empty model / unknown tier) so a bad frame can't poison the
+    relay.
+
+    :param event: Parsed SSE event dict from the runner stream.
+    :returns: A ``routing_decision`` :class:`NewConversationItem`, or
+        ``None``.
+    """
+    if event.get("type") != "response.output_item.done":
+        return None
+    item = event.get("item")
+    if not isinstance(item, dict) or item.get("type") != "routing_decision":
+        return None
+    try:
+        data = parse_item_data("routing_decision", item)
+    except (ValueError, TypeError):
+        _logger.warning("Failed to parse routing_decision item from SSE")
+        return None
+    # No turn response_id exists yet (emitted before response.in_progress),
+    # so stamp a fresh routing id — the chip renders as its own standalone
+    # line at turn start.
+    import uuid
+
+    return NewConversationItem(
+        type="routing_decision",
+        response_id=f"routing_{uuid.uuid4().hex}",
+        data=data,
     )
 
 
@@ -9021,6 +9252,43 @@ async def _relay_runner_stream(
                             and _session_terminal_pending_cache.get(session_id, False)
                         ):
                             _publish_terminal_pending(session_id, False)
+
+                    # Intelligent-model-router decision emitted by the runner's
+                    # cost advisor at turn start. Persist as a display-only
+                    # transcript item (arrival order = BEFORE the assistant
+                    # output), then re-publish the live event carrying the
+                    # store-assigned id so the live chip and a turn-start
+                    # snapshot refetch dedup by the same id. Handled
+                    # exclusively here (persist + publish + continue) so the
+                    # raw, id-less runner event is not also forwarded below.
+                    routing_item = _routing_decision_item_from_sse(event)
+                    if routing_item is not None:
+                        # Persist failure must NOT suppress the live chip
+                        # (the owner's hard requirement: the pick shows the
+                        # moment the turn starts). On a store error, log and
+                        # still publish the live event — id-less, so a later
+                        # snapshot can't dedup it, but a missing reload chip
+                        # beats no chip at all.
+                        try:
+                            persisted = await asyncio.to_thread(
+                                conversation_store.append, session_id, [routing_item]
+                            )
+                            _persisted_id: str | None = persisted[0].id if persisted else None
+                        except Exception:
+                            _logger.exception(
+                                "Relay: routing_decision persist failed for session=%s; "
+                                "publishing the live chip without a durable id",
+                                session_id,
+                            )
+                            _persisted_id = None
+                        session_stream.publish(
+                            session_id,
+                            {
+                                **event,
+                                "item": {**event["item"], "id": _persisted_id},
+                            },
+                        )
+                        continue
 
                     # Accumulate LLM token usage from the harness
                     # response so policy callables can read

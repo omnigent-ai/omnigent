@@ -136,6 +136,23 @@ export interface TerminalCommandItem extends BaseItem {
   stderr?: string;
 }
 
+/**
+ * An intelligent-model-router decision item. Display-only (server-side
+ * NON_CONTENT_ITEM_TYPES), so the model never sees it; the web UI renders
+ * it as a muted chip at its transcript position.
+ */
+export interface RoutingDecisionItem extends BaseItem {
+  type: "routing_decision";
+  /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */
+  model: string;
+  /** Difficulty tier the router assigned. */
+  tier: "cheap" | "medium" | "expensive";
+  /** `true` when the brain ran on `model`; `false` = "would have picked". */
+  applied: boolean;
+  /** The router's one-line rationale. */
+  rationale: string;
+}
+
 export type ConversationItem =
   | MessageItem
   | FunctionCallItem
@@ -144,6 +161,7 @@ export type ConversationItem =
   | NativeToolItem
   | CompactionItem
   | SlashCommandItem
+  | RoutingDecisionItem
   | TerminalCommandItem
   | (BaseItem & Record<string, unknown>);
 
@@ -173,6 +191,10 @@ export function isCompactionItem(item: ConversationItem): item is CompactionItem
 
 export function isSlashCommandItem(item: ConversationItem): item is SlashCommandItem {
   return item.type === "slash_command";
+}
+
+export function isRoutingDecisionItem(item: ConversationItem): item is RoutingDecisionItem {
+  return item.type === "routing_decision";
 }
 
 export function isTerminalCommandItem(item: ConversationItem): item is TerminalCommandItem {

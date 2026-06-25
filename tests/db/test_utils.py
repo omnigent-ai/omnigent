@@ -619,3 +619,23 @@ def test_strip_nul_bytes(value: str, expected: str) -> None:
     assert strip_nul_bytes(value) == expected
     # The result must never contain a raw NUL, regardless of input.
     assert "\x00" not in strip_nul_bytes(value)
+
+
+def test_extract_search_text_routing_decision() -> None:
+    """routing_decision items must index (model + tier + rationale) — an
+    unregistered type raises in the store's append path, which silently
+    dropped every verdict chip on persistence (the relay swallows it)."""
+    item = NewConversationItem.model_validate(
+        {
+            "type": "routing_decision",
+            "response_id": "resp_x",
+            "data": {
+                "model": "databricks-claude-opus-4-8",
+                "tier": "expensive",
+                "applied": True,
+                "rationale": "Deep design work.",
+                "turn_anchor": "2026-06-11T00:00:00+00:00",
+            },
+        }
+    )
+    assert extract_search_text(item) == "databricks-claude-opus-4-8 expensive Deep design work."

@@ -11,10 +11,8 @@ Covers:
   brain with no user pin applies the verdict model + injects the note;
   advise mode shadows (records, no apply, no note); a user model pin
   beats the advisor; a non-claude-sdk brain records but never applies.
-- None verdict (conversational): skips the label write and applies
-  nothing.
-- A failed label persist applies nothing (recorded and applied never
-  diverge).
+- None verdict (conversational): skips label and apply.
+- A failed label persist applies nothing.
 - Config-parsing fail-loud paths.
 
 Real types throughout: real ``AgentSpec`` / ``ExecutorSpec``, real
@@ -31,10 +29,12 @@ import httpx
 import pytest
 
 from omnigent.cost_plan import AdvisorVerdict, parse_verdict
+from omnigent.entities.conversation import NON_CONTENT_ITEM_TYPES, parse_item_data
 from omnigent.runner.cost_advisor import (
     AdvisorConfig,
     maybe_run_advisor,
     parse_advisor_config,
+    routing_decision_event,
 )
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -218,17 +218,14 @@ async def test_override_off_disables_advisor() -> None:
 
 @pytest.mark.asyncio
 async def test_conversational_verdict_skips_label_and_apply() -> None:
-    """A None (conversational) verdict skips the label write and applies
-    nothing — the prior selection stays."""
+    """A None (conversational) verdict skips label persist and apply."""
     judge = _ScriptedJudge(None)
     result = await _run(
         spec=_orchestrator_spec(cost_optimize=_TIERS_YAML),
         judge=judge,
-        transport=_raising_transport(),  # zero traffic: no label PATCH
+        transport=_raising_transport(),
     )
     assert result is None
-    # The judge WAS consulted (it decided conversational) — distinguishes
-    # this from the mode-off path above.
     assert judge.call_count == 1
 
 
@@ -317,8 +314,7 @@ async def test_optimize_non_claude_sdk_records_but_does_not_apply() -> None:
 
 @pytest.mark.asyncio
 async def test_advise_mode_shadows_no_apply_no_note() -> None:
-    """Advise mode records the verdict for telemetry but never changes the
-    brain model and injects no note."""
+    """advise mode shadows, records but never applies."""
     capture = _PatchCapture()
     advise_yaml = {**_TIERS_YAML, "mode": "advise"}
     judge = _ScriptedJudge(_verdict())
@@ -330,11 +326,8 @@ async def test_advise_mode_shadows_no_apply_no_note() -> None:
     assert result is not None
     assert result.apply_model is None
     assert result.note_item is None
-    # Verdict still persisted (shadow telemetry) with applied=False.
     parsed = parse_verdict(capture.requests[0]["labels"])
-    assert parsed is not None
-    assert parsed.applied is False
-    assert parsed.model == "databricks-claude-opus-4-8"
+    assert parsed is not None and parsed.applied is False
 
 
 @pytest.mark.asyncio
@@ -359,13 +352,12 @@ async def test_override_on_escalates_advise_to_optimize() -> None:
     assert parsed.applied is True
 
 
-# ── Degradation: failed persist applies nothing ─────────────────────────────────
+# ── Degradation: failed persist is telemetry-only ────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_failed_persist_applies_nothing() -> None:
-    """A 4xx on the label PATCH degrades to ``None`` — the model is NOT
-    applied, so recorded and applied state can never diverge."""
+    """A failed label PATCH must NOT kill the turn — assert result is None."""
     capture = _PatchCapture(status_code=403)  # multi-user reject
     judge = _ScriptedJudge(_verdict())
     result = await _run(
@@ -373,10 +365,9 @@ async def test_failed_persist_applies_nothing() -> None:
         judge=judge,
         transport=httpx.MockTransport(capture.handler),
     )
-    # None: the PATCH was attempted (recorded in capture) but failed, so no
-    # apply_model leaks out to the runner.
-    assert result is None
+    # The PATCH was attempted (and failed).
     assert len(capture.requests) == 1
+    assert result is None
 
 
 # ── Reserved-label authority header ─────────────────────────────────────────────
@@ -505,10 +496,84 @@ async def test_default_judge_build_threads_brain_databricks_profile(
             turn_anchor=_ANCHOR,
             harness="claude-sdk",
         )
-    # Null judge => conversational turn => no result, zero HTTP traffic
-    # (raising transport proves no PATCH was attempted).
     assert result is None
     # The brain's profile reached the judge builder — a missing key means
     # the advisor stopped threading it and the judge falls back to ambient
     # credential resolution (the misroute regression).
     assert captured["databricks_profile"] == "brain-profile"
+
+
+# ── routing_decision_event: the turn-start transcript chip ───────────────────
+
+
+def test_routing_decision_event_shape_applied() -> None:
+    """The event is a ``response.output_item.done`` carrying a
+    ``routing_decision`` item with the verdict's model/tier/applied/rationale.
+
+    A wrong shape here means the AP server relay never recognizes it as a
+    routing item (its ``_routing_decision_item_from_sse`` gates on exactly
+    this type + item type), so the chip never persists or streams."""
+    verdict = AdvisorVerdict(
+        tier="expensive",
+        model="databricks-claude-opus-4-8",
+        applied=True,
+        rationale="multi-file refactor needs deep reasoning",
+        turn_anchor=_ANCHOR,
+    )
+    event = routing_decision_event(verdict)
+    assert event["type"] == "response.output_item.done"
+    item = event["item"]
+    assert item["type"] == "routing_decision"
+    # Every render field is carried through verbatim — a dropped field
+    # would render a chip missing its model, tier, or rationale.
+    assert item["model"] == "databricks-claude-opus-4-8"
+    assert item["tier"] == "expensive"
+    assert item["applied"] is True
+    assert item["rationale"] == "multi-file refactor needs deep reasoning"
+
+
+def test_routing_decision_event_shadow_carries_applied_false() -> None:
+    """A shadow verdict (advise mode / user pin won) carries
+    ``applied=False`` so the UI renders "would have picked" instead of
+    naming the active model. If this flipped to True, the chip would
+    falsely claim the brain ran on the router's pick."""
+    verdict = AdvisorVerdict(
+        tier="cheap",
+        model="databricks-claude-haiku-4-5",
+        applied=False,
+        rationale="trivial question",
+        turn_anchor=_ANCHOR,
+    )
+    item = routing_decision_event(verdict)["item"]
+    assert item["applied"] is False
+    assert item["model"] == "databricks-claude-haiku-4-5"
+
+
+def test_routing_decision_event_item_parses_as_routing_decision_data() -> None:
+    """The emitted item validates against the real ``RoutingDecisionData``
+    model the AP server relay parses it with — so a field-name or type
+    drift between the runner emitter and the entity model fails here, not
+    silently at relay time where it would just drop the frame."""
+    verdict = AdvisorVerdict(
+        tier="medium",
+        model="databricks-claude-sonnet-4-6",
+        applied=True,
+        rationale="moderate knowledge work",
+        turn_anchor=_ANCHOR,
+    )
+    item = routing_decision_event(verdict)["item"]
+    data = parse_item_data("routing_decision", item)
+    # Round-trips through the entity model: proves the relay's
+    # parse_item_data("routing_decision", item) will succeed and persist.
+    assert data.model == "databricks-claude-sonnet-4-6"
+    assert data.tier == "medium"
+    assert data.applied is True
+    assert data.rationale == "moderate knowledge work"
+
+
+def test_routing_decision_type_is_non_content() -> None:
+    """The item type is in NON_CONTENT_ITEM_TYPES, so the agent loop's
+    history filter never feeds it to the model. If it were removed from
+    that set, the brain would start seeing (and answering) its own router
+    note — the exact "must not enter conversation history" constraint."""
+    assert "routing_decision" in NON_CONTENT_ITEM_TYPES

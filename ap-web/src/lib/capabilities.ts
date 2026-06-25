@@ -56,6 +56,11 @@ export interface ServerInfo {
    * ``managed_sandboxes_enabled`` is true.
    */
   sandbox_provider: string | null;
+  /**
+   * True when the server has a routing client configured
+   * (``OMNIGENT_SMART_ROUTING=1`` + ``llm:`` config). Hidden by default.
+   */
+  smart_routing_enabled: boolean;
 }
 
 /** Sentinel used when the probe fails — accounts is off, no login URL. */
@@ -66,6 +71,7 @@ const _OFF: ServerInfo = {
   databricks_features: false,
   managed_sandboxes_enabled: false,
   sandbox_provider: null,
+  smart_routing_enabled: false,
 };
 
 let _cached: ServerInfo | null = null;
@@ -98,6 +104,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           managed_sandboxes_enabled: data.managed_sandboxes_enabled === true,
           sandbox_provider:
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
+          smart_routing_enabled: data.smart_routing_enabled === true,
         };
         return _cached;
       }

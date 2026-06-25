@@ -5058,8 +5058,11 @@ class _FakeServerClient:
     exist. Tracks GET calls for assertion.
     """
 
-    def __init__(self, items: list[dict[str, Any]]) -> None:
+    def __init__(
+        self, items: list[dict[str, Any]], *, session_snapshot: dict[str, Any] | None = None
+    ) -> None:
         self._items = items
+        self._session_snapshot: dict[str, Any] = session_snapshot or {}
         self.get_calls: list[dict[str, str]] = []
 
     async def get(
@@ -5068,6 +5071,19 @@ class _FakeServerClient:
         del timeout
         params = params or {}
         self.get_calls.append(dict(params))
+
+        # Session snapshot GET (e.g. /v1/sessions/{id}, no /items suffix).
+        if "/items" not in url:
+            snapshot = dict(self._session_snapshot)
+
+            class _SnapshotResp:
+                status_code = 200
+
+                def json(self_inner) -> dict[str, Any]:
+                    return snapshot
+
+            return _SnapshotResp()
+
         after = params.get("after")
         limit = int(params.get("limit", "100"))
 
@@ -15216,8 +15232,13 @@ class _LabelPatchRecordingServerClient(_FakeServerClient):
     :param items: History items served by the inherited GET handler.
     """
 
-    def __init__(self, items: list[dict[str, Any]]) -> None:
-        super().__init__(items)
+    def __init__(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        session_snapshot: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(items, session_snapshot=session_snapshot)
         self.label_patches: list[dict[str, Any]] = []  # type: ignore[explicit-any]  # JSON bodies
 
     async def patch(
@@ -15383,11 +15404,8 @@ async def test_optimize_turn_applies_model_and_injects_note(
 async def test_advise_turn_records_but_does_not_apply(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An advise-mode turn shadows: the label persists (applied=False) but
-    the harness body carries NO model_override and NO note.
-
-    Mutation proof against the optimize test: same judge, same harness, only
-    the mode differs — yet nothing is applied, isolating "advise = shadow".
+    """An advise-mode turn shadows: the verdict is recorded (applied=False)
+    but the brain model is untouched and no note is injected.
 
     :param monkeypatch: Replaces the production judge with the stub.
     """
@@ -15432,18 +15450,18 @@ async def test_advise_turn_records_but_does_not_apply(
         assert resp2.status_code == 200
         assert "response.completed" in resp2.text
 
-    # Verdict recorded for telemetry, but applied=False (shadow).
+    # Advise mode: recorded but not applied.
     label_bodies = [body for body in server_client.label_patches if "labels" in body]
     assert len(label_bodies) == 1
     verdict = parse_verdict(label_bodies[0]["labels"])
     assert verdict is not None
+    assert verdict.model == "model-pricey"
     assert verdict.applied is False
 
-    # No application: the harness body has no model_override and no note —
-    # advise mode leaves the brain untouched.
+    # Shadow: no model_override, no note.
     assert len(hc.posted_bodies) == 1
     body = hc.posted_bodies[0]
-    assert body.get("model_override") is None, "advise mode must not switch the brain model"
+    assert body.get("model_override") is None
     assert _advisor_note_items(body.get("content") or []) == []
 
 

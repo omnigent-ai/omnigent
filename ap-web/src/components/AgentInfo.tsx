@@ -1,7 +1,8 @@
-// Agent info surface: the MCP-server and policy badges plus the
-// header info-icon popover that displays them.
+// Agent info surface: the MCP-server and policy badges, the
+// intelligent-routing readout, and the header info-icon popover that
+// displays them.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckIcon,
   CopyIcon,
@@ -21,6 +22,12 @@ import {
   type UpsertMcpServerInput,
 } from "@/hooks/useAgents";
 import type { Agent, McpServerSummary } from "@/hooks/useAgents";
+import { useSession } from "@/hooks/useSession";
+import {
+  isCostRoutingSession,
+  parseCostRoutingVerdict,
+  verdictRelativeTime,
+} from "@/components/CostRoutingControl";
 import type { ModelUsage } from "@/lib/types";
 import { showToast } from "@/components/ui/toast";
 import {
@@ -151,6 +158,73 @@ function formatSessionCostUsd(costUsd: number): string {
     return "<$0.01";
   }
   return `$${costUsd.toFixed(2)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Intelligent routing section
+// ---------------------------------------------------------------------------
+
+/**
+ * Read-only "Intelligent model router" section: the per-session routing
+ * state plus the judge's latest model decision. Mode mutation stays
+ * with the composer toggle — this surface only reports.
+ *
+ * Gated on routing capability (`isCostRoutingSession`, the predicate
+ * the composer's toggle uses) or a recorded decision — NOT on the
+ * toggle's visibility, so deployments that force routing on (toggle
+ * hidden) still surface the decisions here.
+ *
+ * @param sessionId Active session id, e.g. `"conv_abc123"` — keys the
+ *   shared snapshot cache the verdict is parsed from.
+ */
+function IntelligentRoutingSection({ sessionId }: { sessionId: string }) {
+  const mode = useChatStore((s) => s.costControlModeOverride);
+  // Shared ["session", id] cache — bindStream keeps it fresh; no new polling.
+  const { session } = useSession(sessionId);
+  const labels = session?.labels;
+  const verdict = useMemo(() => parseCostRoutingVerdict(labels), [labels]);
+
+  // Children never render — even a recorded verdict can't unhide them.
+  if (session?.parentSessionId) return null;
+  if (!isCostRoutingSession(session) && verdict === null) return null;
+  // Only an explicit "off" disables routing; unset defers to the spec (active).
+  const stateLabel = mode === "off" ? "Off" : "On";
+  const verdictTime = verdict === null ? null : verdictRelativeTime(verdict.turnAnchor);
+
+  return (
+    <div className="flex flex-col gap-1.5" data-testid="intelligent-routing-section">
+      <div className="flex items-baseline justify-between">
+        <SectionLabel>Intelligent model router</SectionLabel>
+        <span
+          className="text-[10px] font-medium text-muted-foreground"
+          data-testid="intelligent-routing-state"
+        >
+          {stateLabel}
+        </span>
+      </div>
+      {verdict !== null ? (
+        <div data-testid="intelligent-routing-verdict">
+          <div className="truncate text-xs">
+            <span className="font-mono" data-testid="intelligent-routing-model">
+              {verdict.model}
+            </span>
+            <span className="text-muted-foreground/70"> · {verdict.tier}</span>
+          </div>
+          <div className="mt-0.5 text-xs text-muted-foreground">
+            {verdict.applied ? "Applied" : "Would have picked"}
+            {verdictTime !== null && (
+              <span className="text-muted-foreground/70"> · {verdictTime}</span>
+            )}
+          </div>
+          {verdict.rationale !== null && verdict.rationale.length > 0 && (
+            <p className="mt-1 text-xs leading-snug text-muted-foreground">{verdict.rationale}</p>
+          )}
+        </div>
+      ) : (
+        <p className="text-xs text-muted-foreground">No decision yet this session.</p>
+      )}
+    </div>
+  );
 }
 
 /**
@@ -1032,6 +1106,8 @@ interface AgentInfoProps {
   agent: Agent | undefined;
   /** Session ID — needed to manage user policies. */
   sessionId?: string | null;
+  /** Dark until the routing-UI go-ahead (mirrors #3021's composer gates). */
+  showIntelligentRouting?: boolean;
 }
 
 /**
@@ -1048,7 +1124,11 @@ export function agentHasInfo(agent: Agent | undefined, sessionId?: string | null
  * Shared by the desktop header popover ({@link AgentInfoButton}) and the
  * mobile header menu's agent-info dialog.
  */
-export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
+export function AgentInfoContent({
+  agent,
+  sessionId,
+  showIntelligentRouting = false,
+}: AgentInfoProps) {
   const servers = agent?.mcp_servers ?? [];
   const mcpEditable = agent?.mcp_servers_editable === true;
   const displayName = agent ? agentDisplayLabel(agent.name) : null;
@@ -1155,6 +1235,7 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
       {sessionId && usageByModel != null && Object.keys(usageByModel).length > 0 && (
         <ModelUsageBreakdown usageByModel={usageByModel} />
       )}
+      {showIntelligentRouting && sessionId && <IntelligentRoutingSection sessionId={sessionId} />}
       <McpServersSection sessionId={sessionId} servers={servers} editable={mcpEditable} />
       {sessionId && <SessionPoliciesSection sessionId={sessionId} />}
     </div>
@@ -1168,7 +1249,11 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
  * header's three-dot menu, which opens {@link AgentInfoContent} in a
  * dialog. Self-hides when the agent has neither tools nor policies.
  */
-export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
+export function AgentInfoButton({
+  agent,
+  sessionId,
+  showIntelligentRouting = false,
+}: AgentInfoProps) {
   if (!agentHasInfo(agent, sessionId)) return null;
 
   return (
@@ -1191,7 +1276,11 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
         <TooltipContent>Agent tools &amp; policies</TooltipContent>
       </Tooltip>
       <PopoverContent align="end" className="w-80">
-        <AgentInfoContent agent={agent} sessionId={sessionId} />
+        <AgentInfoContent
+          agent={agent}
+          sessionId={sessionId}
+          showIntelligentRouting={showIntelligentRouting}
+        />
       </PopoverContent>
     </Popover>
   );

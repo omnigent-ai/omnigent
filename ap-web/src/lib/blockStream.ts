@@ -25,6 +25,7 @@ import {
   type ResponseEndBlock,
   type ResponseStartBlock,
   type RetryBlock,
+  type RoutingDecisionBlock,
   type SlashCommandBlock,
   type TerminalCommandBlock,
   type TextChunk,
@@ -646,6 +647,20 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         arguments: event.arguments,
         output: event.output,
       } satisfies SlashCommandBlock;
+      return;
+    }
+
+    // ── Intelligent model router decision ────────────
+    case "routing_decision": {
+      adoptResponseIdIfUnset(state, event.responseId);
+      yield {
+        type: "routing_decision",
+        ctx: ctx(state, event.itemId || null, event.responseId || null),
+        model: event.model,
+        tier: event.tier,
+        applied: event.applied,
+        rationale: event.rationale,
+      } satisfies RoutingDecisionBlock;
       return;
     }
 

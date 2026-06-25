@@ -260,7 +260,9 @@ export function ChatHeader({
             "Fork from here" action on assistant bubbles (ChatPage). */}
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
-        {conversationId && <AgentInfoButton agent={boundAgent} sessionId={conversationId} />}
+        {conversationId && (
+          <AgentInfoButton agent={boundAgent} sessionId={conversationId} showIntelligentRouting />
+        )}
         {/* Mobile-only three-dot menu folding the action buttons above
             (Share · Agent info) so the header stays
             uncluttered on a phone. The right-panel/rail control is

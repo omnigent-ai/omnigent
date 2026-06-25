@@ -3024,10 +3024,31 @@ def server(
 
     from omnigent.spec import parse_default_policies, parse_server_llm
 
+    server_llm = parse_server_llm(cfg.get("llm"))
+
+    # Build the default LLM-based routing client when BOTH the server
+    # has an ``llm:`` config AND the feature is explicitly enabled via
+    # OMNIGENT_SMART_ROUTING=1.  Hidden by default — managed deployments
+    # override RuntimeCaps.routing_client with their own implementation.
+    routing_client = None
+    if server_llm is not None and os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
+        from omnigent.runtime.policies.builder import (
+            _build_policy_llm_client,
+            _resolve_server_llm_connection,
+        )
+
+        _conn = _resolve_server_llm_connection(server_llm)
+        _policy_client = _build_policy_llm_client(server_llm, _conn)
+        if _policy_client is not None:
+            from omnigent.server.smart_routing import LLMRoutingClient
+
+            routing_client = LLMRoutingClient(_policy_client)
+
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
         default_policies=parse_default_policies(cfg.get("policies")),
-        llm=parse_server_llm(cfg.get("llm")),
+        llm=server_llm,
+        routing_client=routing_client,
     )
     init_runtime(
         conversation_store=conversation_store,

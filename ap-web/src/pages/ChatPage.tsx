@@ -53,7 +53,7 @@ import {
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
-import { CompactionMarker } from "@/components/blocks/StatusBlocks";
+import { CompactionMarker, RoutingDecisionChip } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
@@ -127,6 +127,7 @@ import {
   isCostRoutingSession,
   parseCostRoutingVerdict,
 } from "@/components/CostRoutingControl";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
@@ -732,7 +733,11 @@ export function ChatPage() {
   );
   // Orchestrator-only: polly's children inherit its agentName, so the gate
   // needs the session predicate (parent linkage), not a bare name check.
-  const costRoutingEligible = isCostRoutingSession(activeSession);
+  const serverInfo = useServerInfo();
+  const costRoutingEligible =
+    serverInfo !== "loading" &&
+    serverInfo.smart_routing_enabled &&
+    isCostRoutingSession(activeSession);
 
   // Non-null only when the active session is a sub-agent (child): the
   // composer then peeks a "Chatting with sub-agent …" tray and the
@@ -2189,6 +2194,7 @@ function bubbleKey(bubble: Bubble): string {
   if (bubble.kind === "user") return `user:${bubble.stableKey ?? bubble.itemId}`;
   if (bubble.kind === "compaction_loading") return `compaction_loading:${bubble.itemId}`;
   if (bubble.kind === "compaction") return `compaction:${bubble.itemId}`;
+  if (bubble.kind === "routing_decision") return `routing_decision:${bubble.itemId}`;
   return `assistant:${bubble.stableId}`;
 }
 
@@ -2630,6 +2636,16 @@ export const BubbleView = memo(
       );
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
+    if (bubble.kind === "routing_decision") {
+      return (
+        <RoutingDecisionChip
+          model={bubble.model}
+          tier={bubble.tier}
+          applied={bubble.applied}
+          rationale={bubble.rationale}
+        />
+      );
+    }
     return <AssistantBubble bubble={bubble} />;
   },
   (prev, next) => bubblesEqual(prev.bubble, next.bubble),
@@ -4135,8 +4151,7 @@ export function Composer({
           </div>
           {/* Cost toggle + agent picker + Send — right side */}
           <div className="flex min-w-0 items-center gap-0.5">
-            {/* Temporarily hidden (#3021): re-enable by removing the false gate. */}
-            {false && costRoutingEligible && (
+            {costRoutingEligible && (
               <IntelligentModelControl
                 value={costControlModeOverride}
                 onChange={(mode) =>

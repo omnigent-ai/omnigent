@@ -297,6 +297,42 @@ def _advisor_note_item(verdict: AdvisorVerdict) -> dict[str, Any]:  # type: igno
     }
 
 
+def routing_decision_event(verdict: AdvisorVerdict) -> dict[str, Any]:  # type: ignore[explicit-any]  # JSON-shaped SSE event
+    """
+    Build the turn-start SSE event carrying the router's verdict.
+
+    Shaped as a ``response.output_item.done`` carrying a
+    ``routing_decision`` item so it rides the existing stream-relay
+    pipeline end to end: the AP server's relay persists it as a durable,
+    display-only transcript item (in arrival order, BEFORE the turn's
+    assistant output) and forwards the same event live, and the web UI's
+    block stream renders it as a muted chip the moment the turn begins.
+    The item type is in :data:`~omnigent.entities.conversation.NON_CONTENT_ITEM_TYPES`
+    and is not in the runner's harness-input allowlist, so the brain
+    never sees it.
+
+    The runner emits this at turn start, before any ``response.in_progress``,
+    so the relay has no turn response_id yet — it stamps a fresh
+    ``routing_*`` id, and the item renders as its own standalone line.
+
+    :param verdict: The (already applied/shadowed) verdict for the turn.
+    :returns: An SSE event dict, e.g.
+        ``{"type": "response.output_item.done", "item": {"type":
+        "routing_decision", "model": "...", "tier": "expensive",
+        "applied": true, "rationale": "..."}}``.
+    """
+    return {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "routing_decision",
+            "model": verdict.model,
+            "tier": verdict.tier,
+            "applied": verdict.applied,
+            "rationale": verdict.rationale,
+        },
+    }
+
+
 async def maybe_run_advisor(
     *,
     spec: Any,  # type: ignore[explicit-any]  # structural spec stubs in tests
@@ -386,10 +422,6 @@ async def maybe_run_advisor(
         turn_anchor=turn_anchor,
     )
     if verdict is None:
-        _logger.info(
-            "cost_advisor: session %s conversational this turn; prior selection stays",
-            conversation_id,
-        )
         return None
     return await _finalize_advised_turn(
         verdict=verdict,
@@ -424,8 +456,8 @@ async def _finalize_advised_turn(
         ``None``.
     :param conversation_id: Session id, e.g. ``"conv_abc123"``.
     :param server_client: HTTP client for the label-persist PATCH.
-    :returns: The turn result, or ``None`` when the label persist failed
-        (nothing applied — recorded and applied state never diverge).
+    :returns: The turn result; the telemetry-label persist is best-effort
+        (the chip + application carry the verdict even if it fails).
     """
     apply_model = _model_to_apply(
         verdict=verdict,
@@ -441,7 +473,8 @@ async def _finalize_advised_turn(
         rationale=verdict.rationale,
         turn_anchor=verdict.turn_anchor,
     )
-    if not await _persist_verdict_label(applied_verdict, conversation_id, server_client):
+    persisted = await _persist_verdict_label(applied_verdict, conversation_id, server_client)
+    if not persisted:
         return None
     _logger.info(
         "cost_advisor: session %s verdict %s applied=%s",
@@ -550,10 +583,22 @@ async def _persist_verdict_label(
         )
         return False
     if resp.status_code >= 400:
+        # Log the response body too: the bare status code hid WHY a
+        # deployed multi-user server 500'd this persist (the chip no
+        # longer depends on it — it rides the routing_decision transcript
+        # item — but the telemetry label and its failure mode must stay
+        # diagnosable). Body is bounded so a large error page can't flood
+        # the log.
+        try:
+            _body = resp.text[:500]
+        except (UnicodeDecodeError, httpx.HTTPError):
+            _body = "<unreadable response body>"
         _logger.warning(
-            "cost_advisor: verdict label persist returned %d for %s; running turn unadvised",
+            "cost_advisor: verdict label persist returned %d for %s; "
+            "running turn unadvised. response body: %s",
             resp.status_code,
             conversation_id,
+            _body,
         )
         return False
     return True

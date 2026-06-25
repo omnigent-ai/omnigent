@@ -29,12 +29,6 @@ executor:
   context_window: 1000000
   config:
     harness: claude-sdk
-    # Cost advisor v3 (per-turn brain-model routing) is DISABLED for launch:
-    # the marker below is the feature's single kill switch — without it the
-    # advisor never runs (no judge calls, no labels, no transcript chips) and
-    # the per-session override is a logged no-op. To enable, restore the
-    # marker from git history (mode: advise = shadow telemetry only;
-    # mode: optimize = apply the verdict to polly's brain).
 
 prompt: |
   You are polly, a multi-agent CODING orchestrator. You are the tech lead, not
