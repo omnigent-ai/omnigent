@@ -1,6 +1,22 @@
 # Cursor-native TUI Mirror — Elicitation Plan
 
-**Status:** proposed
+> **⚠️ SUPERSEDED — historical.** The shipped implementation uses **transcript-based**
+> detection (tailing cursor's chat `store.db` for pending tool calls), not pane scraping. See
+> [`cursor-native-elicitation.md`](./cursor-native-elicitation.md) for the current design.
+>
+> This plan's core premise — *"the `store.db` contains only the user message while an approval
+> is pending (the decision lives in memory)"* (see "Why this approach") — turned out to be
+> **incorrect, and it was an investigation gap rather than a cursor-version difference.** The
+> pending tool call *is* persisted (carrying `providerOptions.cursor.pendingToolCallStartedAtMs`),
+> but inside cursor's **binary protobuf checkpoint frames**, which don't decode as a plain-JSON
+> `blobs` row — so an inspection that only reads clean-JSON blobs (as the forwarder does) sees
+> just the user message. Empirically, that marker is present in chat stores back to 2026.06.18
+> (this plan's `2026.06.19` era). The transcript channel is more reliable than pane-scraping
+> (no prompt-wording allowlist) and gives a stable `toolCallId`, which solves the dedup problem
+> this plan flagged as "the tricky part." Kept from this plan: native gate stays authoritative,
+> no bundle modification, tmux keystroke delivery, benign failure mode.
+
+**Status:** superseded (was: proposed)
 **Baseline:** `origin/main`
 **Tracking issue:** omnigent-ai/omnigent#1032 (cursor-native tool-call elicitations not surfaced in web UI)
 

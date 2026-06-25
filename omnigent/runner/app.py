@@ -1663,7 +1663,7 @@ async def _auto_create_cursor_terminal(
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
     from omnigent.cursor_native_forwarder import supervise_cursor_forwarder
-    from omnigent.cursor_native_permissions import supervise_cursor_approval_mirror
+    from omnigent.cursor_native_permissions import supervise_cursor_transcript_elicitations
 
     if server_client is not None and ensure_comment_relay is not None:
         await ensure_comment_relay(
@@ -1680,8 +1680,11 @@ async def _auto_create_cursor_terminal(
         them under one task keeps a single registration/cancellation handle
         (:func:`_register_auto_forwarder_task`) for session teardown. The
         forwarder mirrors cursor-agent's replies onto the conversation; the
-        approval mirror surfaces cursor's native tool-approval prompts as web
-        elicitations (see :mod:`omnigent.cursor_native_permissions`).
+        transcript elicitation detector surfaces cursor's native tool-approval
+        prompts as web elicitations by tailing the chat store for pending tool
+        calls (see :mod:`omnigent.cursor_native_permissions`) — more reliable
+        than scraping the rendered pane, which misses prompts whose wording
+        falls outside its regex.
         """
         await asyncio.gather(
             supervise_cursor_forwarder(
@@ -1694,11 +1697,13 @@ async def _auto_create_cursor_terminal(
                 launch_epoch_ms=launch_epoch_ms,
                 auth=_runner_auth,
             ),
-            supervise_cursor_approval_mirror(
+            supervise_cursor_transcript_elicitations(
                 base_url=server_url,
                 headers={},
                 session_id=session_id,
                 bridge_dir=bridge_dir,
+                workspace=workspace,
+                launch_epoch_ms=launch_epoch_ms,
                 auth=_runner_auth,
             ),
         )
