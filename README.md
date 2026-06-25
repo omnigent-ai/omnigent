@@ -41,9 +41,12 @@ Omnigent lets you:
   conversation to continue on their own.
 
 - **☁️ Run agents in cloud sandboxes.** No laptop required: run sessions in
-  disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io), or
-  [Islo](https://islo.dev) sandboxes, launched from the CLI or provisioned by
-  the server per session (*managed hosts*).
+  disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
+  [Islo](https://islo.dev), [E2B](https://e2b.dev),
+  [CoreWeave](https://docs.coreweave.com/products/sandboxes),
+  [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
+  or [Boxlite](https://github.com/boxlite-ai/boxlite) sandboxes, launched from the
+  CLI or provisioned by the server per session (*managed hosts*).
 
 - **🛡️ Govern your agents.** Create
   [policies](#6-govern-your-agents-with-policies) to pause for your approval
