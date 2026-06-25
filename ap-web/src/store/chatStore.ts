@@ -3379,8 +3379,9 @@ export function handleSessionEvent(event: StreamEvent): void {
       return;
     }
     case "session_model":
-      // A `/model` switch made inside the Claude Code terminal. Reflect
-      // it in the picker for the open session. The server already
+      // A `/model` switch made inside a native terminal (Claude Code,
+      // codex, or cursor-agent). Reflect it in the picker for the open
+      // session. The server already
       // persisted `model_override`, so a reload restores it; the
       // cross-session sticky pref is intentionally left untouched (a
       // terminal switch is a per-session choice, not a new default).

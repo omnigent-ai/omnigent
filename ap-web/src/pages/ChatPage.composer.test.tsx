@@ -488,6 +488,45 @@ describe("AgentPicker trigger label", () => {
     // Falls back to the bound agent's display label rather than rendering empty.
     expect(trigger).toHaveTextContent("Claude");
   });
+
+  it("surfaces a cursor-native session's model from the override, not the cross-session sticky", () => {
+    // cursor-native is a vendor-owns-model wrapper, so `nativeVendorOwnsModel`
+    // is true and the bound `llmModel` is a meaningless default. Its live model
+    // is mirrored into the session override (`sessionModelOverride`), NOT the
+    // cross-session sticky `selectedModel`. The trigger must read the real
+    // session model ("Composer 2.5"), not the stale sticky pick carried over
+    // from another session. Effort is NOT shown — cursor effort control is
+    // dropped for now (showEffort=false), so the pill is model-only.
+    useChatStore.setState({
+      nativeVendorOwnsModel: true,
+      selectedModel: "opus-4.5", // stale cross-session sticky — must be ignored
+      sessionModelOverride: "composer-2.5",
+      selectedEffort: "low",
+      llmModel: "fable", // meaningless vendor default — must not surface
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "cursor" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "cursor",
+          showModels: true,
+          showEffort: false, // cursor effort control is dropped for now
+          codexModelOptions: [
+            { id: "composer-2.5", displayName: "Composer 2.5" },
+            { id: "opus-4.5", displayName: "Opus 4.5" },
+          ],
+        })}
+      />,
+    );
+    const trigger = screen.getByTestId("agent-picker-trigger");
+    expect(trigger).toHaveTextContent("Composer 2.5");
+    // Neither the stale sticky, the meaningless vendor default, nor any effort leaks in.
+    expect(trigger).not.toHaveTextContent("Opus 4.5");
+    expect(trigger).not.toHaveTextContent("fable");
+    expect(trigger).not.toHaveTextContent("Low");
+    expect(within(trigger).getByText("Composer 2.5")).toHaveClass("text-foreground");
+  });
 });
 
 describe("Composer effort slash-command visibility", () => {

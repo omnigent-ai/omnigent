@@ -91,6 +91,7 @@ from omnigent.model_override import validate_model_override
 from omnigent.native_coding_agents import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
+    CURSOR_NATIVE_CODING_AGENT,
     NativeCodingAgent,
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -511,6 +512,7 @@ _CLAUDE_NATIVE_MODEL = CLAUDE_NATIVE_CODING_AGENT.agent_name
 _CODEX_NATIVE_WRAPPER_LABEL_VALUE = CODEX_NATIVE_CODING_AGENT.wrapper_label
 _CODEX_NATIVE_HARNESS = CODEX_NATIVE_CODING_AGENT.harness
 _CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
+_CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
 _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 _NATIVE_TERMINAL_ENSURE_FAILED_CODE = "native_terminal_ensure_failed"
@@ -19004,28 +19006,55 @@ def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
     return options
 
 
+# Native harnesses whose model picker is populated from a *live*, runner-owned
+# model-options endpoint, keyed by wrapper label -> the runner route segment.
+# Codex queries its live app-server ``model/list`` (account/session-scoped, so
+# it must come from the bound runner). Cursor is deliberately NOT here: its
+# catalog is a curated *static* base list served directly (see
+# ``_fetch_model_options``), which keeps it off the runner-backed cache that
+# ``refresh_state`` invalidates — otherwise an effort/model change would blank
+# the cursor picker mid-session.
+_MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
+    _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
+}
+
+
 async def _fetch_model_options(
     runner_client: httpx.AsyncClient | None,
     session_id: str,
     conv: Conversation,
 ) -> list[dict[str, Any]]:
     """
-    Fetch cached Codex model options for a codex-native session.
+    Resolve the Web UI model-picker options for a native session.
 
-    The bound runner owns this query because only it can reach the live
-    Codex app-server socket. Like skills, this stays off the snapshot hot
-    path: the first snapshot kicks a background fetch and returns ``[]``;
-    subsequent snapshots serve the cache.
+    Two shapes:
+
+    * **cursor-native** — a curated *static* base catalog
+      (:func:`omnigent.cursor_native.cursor_base_model_options`), returned
+      directly on every snapshot. It deliberately bypasses the runner-backed
+      cache below: the catalog never changes per session, and routing it
+      through that cache would let a ``refresh_state`` snapshot (which pops the
+      cache) blank the picker on an effort/model change.
+    * **codex-native** — a *live*, account-scoped catalog only the bound runner
+      can read (its app-server ``model/list``). Like skills, this stays off the
+      snapshot hot path: the first snapshot kicks a background fetch and returns
+      ``[]``; subsequent snapshots serve the cache.
 
     :param runner_client: HTTP client pointed at the bound runner, or
         ``None`` when no runner is bound.
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param conv: Conversation row whose labels identify the wrapper.
-    :returns: Cached Codex options, or ``[]`` when not codex-native or not
-        yet available.
+    :returns: Model options, or ``[]`` when the session has no model picker or
+        the (codex) options are not yet available.
     """
-    if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CODEX_NATIVE_WRAPPER_LABEL_VALUE:
+    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    if wrapper == _CURSOR_NATIVE_WRAPPER_LABEL_VALUE:
+        from omnigent.cursor_native import cursor_base_model_options
+
+        return cursor_base_model_options()
+    endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper or "")
+    if endpoint is None:
         return []
     if runner_client is None:
         return []
@@ -19033,7 +19062,8 @@ async def _fetch_model_options(
     if cached is not None:
         return cached
     if session_id not in _model_options_inflight:
-        task = asyncio.create_task(_load_model_options(runner_client, session_id))
+        path = f"/v1/sessions/{session_id}/{endpoint}"
+        task = asyncio.create_task(_load_model_options(runner_client, session_id, path))
         _model_options_inflight[session_id] = task
         task.add_done_callback(lambda _t, sid=session_id: _model_options_inflight.pop(sid, None))
     return []
@@ -19042,24 +19072,26 @@ async def _fetch_model_options(
 async def _load_model_options(
     runner_client: httpx.AsyncClient,
     session_id: str,
+    path: str,
 ) -> None:
     """
-    Background single-flight fetch of a session's Codex model catalog.
+    Background single-flight fetch of a session's native model catalog.
 
     :param runner_client: HTTP client pointed at the bound runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+    :param path: Runner route to query, e.g.
+        ``"/v1/sessions/conv_abc/cursor-model-options"``.
     """
-    path = f"/v1/sessions/{session_id}/codex-model-options"
     for attempt in range(len(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S) + 1):
         try:
             resp = await runner_client.get(path, timeout=5.0)
         except (httpx.HTTPError, ConnectionError):
-            _logger.debug("Runner Codex model-options query failed for %s", session_id)
+            _logger.debug("Runner model-options query failed for %s", session_id)
             return
         if resp.status_code != 200:
-            # 503 means Codex's app-server bridge is still booting. Keep the
-            # background single-flight alive so the web picker fills without a
-            # second manual refresh.
+            # 503 means the native backend (Codex app-server bridge / cursor
+            # login) is still booting. Keep the background single-flight alive
+            # so the web picker fills without a second manual refresh.
             if resp.status_code == 503 and attempt < len(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S):
                 await asyncio.sleep(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S[attempt])
                 continue
@@ -19067,7 +19099,7 @@ async def _load_model_options(
         try:
             options = _model_options_from_wire(resp.json().get("models", []))
         except (ValueError, KeyError, TypeError, ValidationError):
-            _logger.debug("Runner Codex model-options payload malformed for %s", session_id)
+            _logger.debug("Runner model-options payload malformed for %s", session_id)
             return
         if not options:
             # Older runners returned 200 + [] for the same not-ready window.

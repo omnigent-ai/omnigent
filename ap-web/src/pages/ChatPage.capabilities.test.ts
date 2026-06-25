@@ -48,10 +48,15 @@ describe("effortLevelsForConv", () => {
 });
 
 describe("shouldShowModelPicker", () => {
-  it("shows the picker only for claude-code-native-ui", () => {
-    // WHY: the model picker writes a mid-session override the runner injects;
-    // only claude-native honors it, so the gate is keyed on that exact label.
+  it("shows the picker for the native wrappers that honor a model override", () => {
+    // WHY: the model picker writes a model override the runner injects as
+    // --model at launch; claude, codex, and cursor native wrappers all honor
+    // it, so the gate is keyed on those exact labels.
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": NATIVE } })).toBe(true);
+    expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "codex-native-ui" } })).toBe(true);
+    expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "cursor-native-ui" } })).toBe(
+      true,
+    );
   });
 
   it("hides the picker for other wrappers and missing labels (fail closed)", () => {
@@ -76,6 +81,15 @@ describe("shouldShowEffortPicker", () => {
     expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "codex-native" } })).toBe(false);
     expect(shouldShowEffortPicker(null)).toBe(false);
     expect(shouldShowEffortPicker(undefined)).toBe(false);
+  });
+
+  it("hides effort controls for cursor-native (model switch only, for now)", () => {
+    // WHY: cursor effort lives on the /model picker's per-model "Tab to modify"
+    // axis and a model switch resets it to that model's default, so a Web UI
+    // dial would silently diverge from the TUI — dropped pending that fix.
+    expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "cursor-native-ui" } })).toBe(
+      false,
+    );
   });
 });
 

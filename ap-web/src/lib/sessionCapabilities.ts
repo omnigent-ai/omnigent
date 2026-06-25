@@ -9,6 +9,10 @@ const CODEX_NATIVE_WRAPPER = "codex-native-ui";
  * :param session: Session or sidebar row carrying labels. ``null`` or missing
  *     labels fail closed.
  * :returns: True only for native sessions with Web UI effort controls.
+ *     cursor-native is intentionally excluded: its effort lives on the /model
+ *     picker's per-model "Tab to modify" axis and a model switch resets it to
+ *     that model's default, so a Web UI effort dial would silently diverge from
+ *     the TUI. cursor-native supports model switching only for now.
  */
 export function supportsEffortControl(
   session: { labels?: Record<string, string | null> | null } | null | undefined,
