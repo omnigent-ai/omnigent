@@ -177,11 +177,11 @@ git clone https://github.com/omnigent-ai/omnigent
 cd omnigent
 uv sync --extra databricks
 
-# Edit deploy/databricks/databricks.yml and set:
-#   targets.prod.workspace.host = https://<your-workspace>.cloud.databricks.com
-
-databricks bundle deploy -t prod -p <your-profile>
-databricks bundle run omnigent_app -t prod -p <your-profile>
+# Set targets.prod.workspace.host in deploy/databricks/databricks.yml, then run
+# the deploy orchestrator — it builds the wheels and runs `databricks bundle
+# deploy` + `bundle run` for you:
+#   uv run python deploy/databricks/deploy.py --app-name omnigent --profile <profile> ...
+# See deploy/databricks/README.md for the full command and required flags.
 ```
 
 The full deploy walkthrough (one-time Lakebase bootstrap, UC volume
