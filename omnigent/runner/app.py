@@ -70,6 +70,7 @@ from omnigent.runner.resource_registry import (
     TerminalLifecycle,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.spec.omnigent import OMNIGENT_TOOL_LANGUAGE
 from omnigent.spec.parser import discover_host_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.ws_bridge import (
@@ -5243,6 +5244,15 @@ def _spec_with_workdir_paths(spec: Any, workdir: Path | None) -> Any:
     resolved_tools: list[LocalToolInfo] = []
     changed = False
     for info in local_tools:
+        # Omnigent dotted callables (``type: function`` tools) carry an
+        # importable module path (e.g. ``pkg.tools.retain``) in ``path``,
+        # not a file path. Workdir-joining one corrupts it into a bogus
+        # filesystem path, the import fails with ModuleNotFoundError, and
+        # the whole tool schema list is dropped. Pass them through as-is;
+        # only real file tools get resolved against the workdir.
+        if getattr(info, "language", None) == OMNIGENT_TOOL_LANGUAGE:
+            resolved_tools.append(info)
+            continue
         path = getattr(info, "path", None)
         # Only resolve genuine file paths onto the workdir. Callable-backed
         # tools store a dotted import path (``pkg.mod.func``) in the same
