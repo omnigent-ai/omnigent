@@ -1614,7 +1614,13 @@ async def _auto_create_pi_terminal(
             resolve_pi_native_provider,
         )
 
-        provider = resolve_pi_native_provider()
+        # Thread the agent spec's pinned model (``executor.model``) into the
+        # resolved provider so the generated ``models.json`` — and the
+        # appended ``--model`` arg (see ``pi_native_provider_launch``) — select
+        # it, reaching parity with claude-native / cursor-native. ``None``
+        # (no model declared) keeps the provider's default model.
+        spec_model = _pi_native_model_from_spec(agent_spec)
+        provider = resolve_pi_native_provider(model=spec_model)
         if provider is not None:
             cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
             pi_env.update(cred_env)
@@ -4194,6 +4200,32 @@ def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
         )
         return None
     return model
+
+
+def _pi_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
+    """
+    Read the Pi model id to launch the native TUI with, from a spec.
+
+    Reads the canonical ``spec.executor.model`` field (the same field the
+    in-process harnesses and cursor-native consume). Unlike cursor-native,
+    a gateway-routed id (``databricks-*``) IS usable here: the runner-owned
+    Pi process routes through the Databricks AI Gateway, whose ``models.json``
+    selects the model by its gateway id (see
+    :func:`omnigent.pi_native_credentials.resolve_pi_native_provider`). The
+    resolved model is threaded into ``resolve_pi_native_provider(model=...)``
+    so the generated ``models.json`` (and the appended ``--model``) selects
+    it.
+
+    :param agent_spec: Agent spec object, or a resolved wrapper carrying a
+        ``spec`` attribute. ``None`` means no spec was available.
+    :returns: A model id, e.g. ``"databricks-claude-opus-4-7"``, or ``None``
+        when the spec declares no model (Pi then uses the provider default).
+    """
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None:
+        return None
+    model = spec.executor.model
+    return model if isinstance(model, str) and model else None
 
 
 def _cursor_native_resume_args(chat_id: str | None, existing_args: list[str]) -> list[str]:
