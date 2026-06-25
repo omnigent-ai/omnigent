@@ -3006,8 +3006,18 @@ def _persist_native_cumulative_usage(
     current = dict(conv.session_usage) if conv and conv.session_usage else {}
     # Native usage is cumulative (SET semantics), so the per-turn delta
     # for the daily rollup is new_total - old_total. Capture the old
-    # cumulative cost before the fields below overwrite it.
+    # cumulative + enforcement costs before the fields below overwrite them.
+    # Both are clamped MONOTONIC below (a write may only raise them): the
+    # ``external_session_usage`` event is posted with the session owner's own
+    # bearer token (the forwarder uses no privileged identity), so a client
+    # could otherwise replay it with a falsified low cost to reset the gate's
+    # cost to ~0 (disabling the budget DENY/ASK) and drive the daily rollup
+    # delta negative (clawing back already-spent budget). Monotonicity makes a
+    # downward report a no-op, so the worst a forged post can do is leave the
+    # figure unchanged. (See also the runner-token guard on cost_control.*
+    # label writes in ``cost_advisor`` — usage was the missing half.)
     old_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
+    old_policy_cost = float(current.get("policy_cost_usd", 0.0) or 0.0)
     if cin is not None:
         # The reported input total is INCLUSIVE of cached tokens (codex's
         # ``inputTokens`` counts cache reads). Split the cached portion into
@@ -3056,7 +3066,8 @@ def _persist_native_cumulative_usage(
         else None
     )
     if cost is not None:
-        current["total_cost_usd"] = float(cost)
+        # Monotonic: a reported total below the persisted one is ignored.
+        current["total_cost_usd"] = max(old_cost, float(cost))
     elif has_tokens:
         if isinstance(model_name, str) and model_name:
             from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
@@ -3069,7 +3080,10 @@ def _persist_native_cumulative_usage(
                 # cache reads at their own rate; it falls back to the input
                 # rate for cache tokens when the catalog omits a cache price
                 # (e.g. ``databricks-*`` entries today).
-                current["total_cost_usd"] = compute_llm_cost(current, pricing)
+                # Monotonic, like the explicit-cost branch: token totals are
+                # also client-SET, so a lowered token report can't drop the
+                # priced cost below the persisted figure.
+                current["total_cost_usd"] = max(old_cost, compute_llm_cost(current, pricing))
 
     # Per-model attribution (SET). Native harnesses report cumulative SESSION
     # totals, not per-model splits, so attribute the running cumulative buckets
@@ -3092,9 +3106,13 @@ def _persist_native_cumulative_usage(
     # Enforcement value (claude-native display/policy split). Stored
     # separately from the displayed ``total_cost_usd`` so the gate can read
     # the real-time figure (incl. in-flight sub-agent spend) while the badge
-    # shows the frozen statusLine total. SET semantics, like the rest.
+    # shows the frozen statusLine total. Monotonic, like total_cost_usd: this
+    # is the value the cost-budget gate actually reads, so a forged low report
+    # must never lower it. When an in-flight estimate later resolves below a
+    # prior peak the clamp keeps the peak — conservative (the gate errs toward
+    # MORE enforcement, never less), which is the safe direction for a budget.
     if policy_cost is not None:
-        current["policy_cost_usd"] = float(policy_cost)
+        current["policy_cost_usd"] = max(old_policy_cost, float(policy_cost))
 
     conversation_store.set_session_usage(session_id, current)
     # Per-user daily rollup. Native reports cumulative totals, so the turn's
@@ -3102,7 +3120,9 @@ def _persist_native_cumulative_usage(
     # ``total_cost_usd`` (= statusLine S), NOT ``policy_cost_usd`` — the
     # daily report must reflect real spend, not the real-time gate estimate.
     new_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
-    _record_daily_cost(conv, new_cost - old_cost, conversation_store)
+    # Non-negative by the monotonic clamp above; ``max(0.0, ...)`` keeps the
+    # daily rollup from ever being clawed back even if that invariant changes.
+    _record_daily_cost(conv, max(0.0, new_cost - old_cost), conversation_store)
     return _priced_cost_for_display(current)
 
 

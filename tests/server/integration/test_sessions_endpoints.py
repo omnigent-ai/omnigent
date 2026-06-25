@@ -3849,6 +3849,48 @@ async def test_external_session_usage_cumulative_cost_is_set_not_added(
     assert usage.get("total_cost_usd") == 0.90
 
 
+async def test_external_session_usage_cost_is_monotonic(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A cumulative-usage post may only RAISE the persisted costs, never lower them.
+
+    The ``external_session_usage`` event carries the session owner's own bearer
+    token (the forwarder uses no privileged identity), so an owner could replay
+    it with a falsified low cost. Both the display cost (``total_cost_usd``) and
+    the enforcement cost (``policy_cost_usd``, which the cost-budget gate reads)
+    are clamped monotonic so such a post is a no-op — it can't reset the gate to
+    ~0 and re-enable spending past the budget. A regression (the low value
+    landing) would re-open the budget-bypass.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    high = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_usage",
+            "data": {"cumulative_cost_usd": 0.90, "policy_cost_usd": 0.95},
+        },
+    )
+    assert high.status_code == 202, high.text
+
+    # Falsified low report — must be ignored, not stored.
+    low = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_usage",
+            "data": {"cumulative_cost_usd": 0.0, "policy_cost_usd": 0.0},
+        },
+    )
+    assert low.status_code == 202, low.text
+
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage.get("total_cost_usd") == 0.90
+    assert usage.get("policy_cost_usd") == 0.95
+
+
 async def test_external_session_usage_codex_tokens_priced(
     client: httpx.AsyncClient,
     db_uri: str,
