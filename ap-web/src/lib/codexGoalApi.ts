@@ -85,7 +85,7 @@ export interface SetCodexGoalInput {
  */
 export type CodexGoalStatusUpdate = "active" | "paused";
 
-export async function __codexGoalApiErrorFromResponseForTest(res: Response): Promise<ApiError> {
+export async function codexGoalApiErrorFromResponse(res: Response): Promise<ApiError> {
   let message = `${res.status} ${res.statusText}`;
   let code: string | null = null;
   try {
@@ -107,7 +107,7 @@ export async function __codexGoalApiErrorFromResponseForTest(res: Response): Pro
 }
 
 async function readJsonOrThrow<T>(res: Response): Promise<T> {
-  if (!res.ok) throw await __codexGoalApiErrorFromResponseForTest(res);
+  if (!res.ok) throw await codexGoalApiErrorFromResponse(res);
   return (await res.json()) as T;
 }
 
