@@ -2651,9 +2651,7 @@ function CompactionLoadingIndicator() {
           <Shimmer as="span" duration={1.5}>
             Compacting conversation…
           </Shimmer>
-          {elapsed > 0 && (
-            <span className="text-muted-foreground">({elapsed}s)</span>
-          )}
+          {elapsed > 0 && <span className="text-muted-foreground">({elapsed}s)</span>}
         </div>
         <div className="mt-2 h-1 overflow-hidden rounded-full bg-muted">
           <div className="h-full w-1/3 animate-pulse rounded-full bg-muted-foreground/40" />
