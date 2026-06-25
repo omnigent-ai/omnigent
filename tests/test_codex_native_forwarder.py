@@ -667,3 +667,46 @@ async def test_elicitation_post_returns_none_when_budget_exhausted(
     # 1 = the deadline check stopped the loop before a second attempt
     # (backoff 1.0s > 0.5s budget); more means the budget is ignored.
     assert len(client.posts) == 1
+
+
+async def test_post_session_event_records_connectivity_failure_for_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex's exhausted-retry POST failure is recorded for the idle watchdog.
+
+    Writer half of issue #1119 for the codex forwarder: when every attempt to
+    POST a session event raises a connect error, ``_post_session_event`` must
+    record the failure in ``_native_forwarder_health`` (via
+    ``_log_post_transport_failure``) so the harness idle-turn watchdog can name
+    the connectivity cause instead of a generic "wedged LLM" reason.
+    """
+    from omnigent import _native_forwarder_health as health
+
+    class _AlwaysConnectError:
+        """Stub client whose every POST fails to connect."""
+
+        async def post(self, url: str, *, json: object) -> httpx.Response:
+            """Raise a connect error mimicking an unreachable server."""
+            del json
+            raise httpx.ConnectError("No route to host", request=httpx.Request("POST", url))
+
+    async def _no_sleep(_seconds: float) -> None:
+        """No-op sleep so the retry loop doesn't add real delay."""
+
+    monkeypatch.setattr(fwd, "_sleep", _no_sleep)
+
+    health.clear()
+    try:
+        result = await fwd._post_session_event(
+            _AlwaysConnectError(),  # type: ignore[arg-type]
+            "conv_x",
+            event_type="external_session_status",
+            data={},
+        )
+        assert result is None
+        detail = health.recent_post_failure(60.0)
+        assert detail is not None
+        assert "external_session_status" in detail
+        assert "No route to host" in detail
+    finally:
+        health.clear()

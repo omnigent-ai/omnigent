@@ -58,3 +58,48 @@ def test_post_may_have_been_delivered_classification(
         committed despite the error.
     """
     assert post_may_have_been_delivered(exc) is may_have_been_delivered
+
+
+async def test_retry_loop_records_exhausted_connectivity_failure_for_watchdog() -> None:
+    """An exhausted-retry connectivity failure is recorded for the idle watchdog.
+
+    Writer half of issue #1119: when every POST attempt raises a connection
+    error (e.g. ``No route to host``), the shared retry loop must record the
+    failure in ``_native_forwarder_health`` so the harness idle-turn watchdog
+    can name the real cause. Fails before the recording call was added (the
+    health slot stays empty); passes after.
+    """
+    from omnigent import _native_forwarder_health as health
+    from omnigent._native_post_delivery import post_session_event_with_retry
+
+    class _AlwaysConnectError:
+        """Stub client whose every POST fails to connect."""
+
+        async def post(self, url: str, *, json: object) -> httpx.Response:
+            """Raise a connect error mimicking an unreachable server."""
+            del json
+            raise httpx.ConnectError("No route to host", request=httpx.Request("POST", url))
+
+    async def _no_sleep(_: float) -> None:
+        """No-op sleep so retries don't add real delay."""
+
+    health.clear()
+    try:
+        result = await post_session_event_with_retry(
+            client=_AlwaysConnectError(),  # type: ignore[arg-type]
+            url="/v1/sessions/conv_x/events",
+            payload={"type": "external_session_status", "data": {}},
+            event_type="external_session_status",
+            max_attempts=2,
+            retry_status_codes=frozenset(),
+            sleep=_no_sleep,
+            retry_delay=lambda _attempt: 0.0,
+            logger_name="test.native_post_delivery",
+        )
+        assert result is None
+        detail = health.recent_post_failure(60.0)
+        assert detail is not None
+        assert "external_session_status" in detail
+        assert "No route to host" in detail
+    finally:
+        health.clear()

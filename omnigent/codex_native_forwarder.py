@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 
+from omnigent._native_forwarder_health import record_post_failure as record_native_post_failure
 from omnigent._native_post_delivery import post_may_have_been_delivered
 from omnigent.claude_native_bridge import url_component
 from omnigent.codex_native_app_server import (
@@ -4806,6 +4807,11 @@ def _log_post_transport_failure(event_type: str, exc: httpx.HTTPError) -> None:
         _POST_MAX_ATTEMPTS,
         exc,
     )
+    # Surface this connectivity failure to the harness idle-turn watchdog: if
+    # the turn stalls because events can't reach the server, the watchdog
+    # attaches this cause to the failure reason instead of a generic
+    # "wedged LLM" message (issue #1119).
+    record_native_post_failure(event_type, exc)
 
 
 def _log_failed_session_event_post(
