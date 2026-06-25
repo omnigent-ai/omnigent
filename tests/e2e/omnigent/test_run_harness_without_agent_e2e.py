@@ -155,6 +155,13 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     Gemini-native and its SDK launches a native binary needing a modern
     glibc.
 
+    ``copilot`` is excluded for the same reason as ``cursor`` / ``antigravity``:
+    the GitHub Copilot SDK authenticates with a GitHub token and talks only to
+    GitHub's Copilot backend (no Databricks gateway path), so ``_build_copilot_spawn_env``
+    emits none of the shared ``HARNESS_<H>_GATEWAY`` / profile probe vars this
+    matrix drives. Its live round-trip is covered by the gated
+    ``tests/e2e/test_polly_copilot_e2e.py`` and the ``copilot-sdk-e2e-dev`` skill.
+
     ``cursor-native`` is excluded for the union of both reasons above.
 
     ``qwen`` is excluded because it does not follow the shared
@@ -173,6 +180,46 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``goose-native`` is excluded for the same reason as ``claude-native`` /
     ``cursor-native``: it is a terminal-first TUI launched via ``omni goose``
     (tmux pane + bridge dir), not ``omnigent run --harness goose-native``.
+
+    ``antigravity-native`` is excluded for the union of both reasons above: it
+    is a terminal-first TUI launched via ``omnigent antigravity`` (runner-owned
+    agy tmux pane + bridge dir), not ``omnigent run --harness antigravity-native``,
+    AND it is Gemini-native (agy authenticates via Google OAuth, not the shared
+    Databricks gateway/profile probe wiring this matrix drives).
+
+    ``qwen-native`` is excluded for the same reason as ``goose-native`` /
+    ``cursor-native``: it is a terminal-first TUI launched via ``omni qwen``
+    (tmux pane + bridge dir, driving qwen's ``--input-file`` / ``--json-file``),
+    not ``omnigent run --harness qwen-native``. Its coverage is the dedicated
+    qwen-native bridge/executor/forwarder unit tests.
+
+    ``kiro-native`` is excluded for the same reason as ``goose-native`` /
+    ``qwen-native`` / ``cursor-native``: it is a terminal-first TUI launched via
+    ``omni kiro`` (tmux pane + bridge dir), not ``omnigent run --harness
+    kiro-native``. Its coverage is the dedicated kiro-native bridge/executor/
+    forwarder unit tests plus the ``test_native_kiro_render_parity`` e2e_ui suite.
+
+    ``kimi`` is excluded for the same reason as ``hermes``: it requires the
+    ``kimi`` CLI binary (installed via Moonshot's curl installer) and
+    authenticates through ``kimi login`` (OAuth or a Moonshot API key), not the
+    shared Databricks gateway/profile probe wiring this matrix drives.
+
+    ``kimi-native`` is excluded for the same reason as ``goose-native`` /
+    ``qwen-native`` / ``kiro-native``: it is a terminal-first TUI launched via
+    ``omni kimi`` (tmux pane + bridge dir), not ``omnigent run --harness
+    kimi-native``. Its coverage is the dedicated kimi-native bridge/executor/
+    forwarder/approval unit tests plus the Kimi picker e2e_ui suite.
+
+    ``hermes`` is excluded because it requires the ``hermes`` CLI binary
+    (installed separately via Nous Research's install script) and authenticates
+    through its own provider config, not the shared gateway/profile probe
+    wiring this matrix drives.
+
+    ``hermes-native`` is excluded for the union of both reasons: it is a
+    terminal-first TUI launched via ``omni hermes`` (tmux pane + bridge dir), not
+    ``omnigent run --harness hermes-native``, AND it wraps the ``hermes`` CLI
+    binary. Its coverage is the dedicated hermes-native bridge/executor/forwarder/
+    approval-mirror unit tests.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
@@ -182,8 +229,16 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "cursor",
         "cursor-native",
         "antigravity",
+        "antigravity-native",
+        "copilot",
         "qwen",
+        "qwen-native",
         "goose",
         "goose-native",
+        "kiro-native",
+        "kimi",
+        "kimi-native",
+        "hermes",
+        "hermes-native",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

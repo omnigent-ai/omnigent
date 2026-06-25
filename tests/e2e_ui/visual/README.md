@@ -48,10 +48,18 @@ which is generated and synced separately). Until it's added there it's an
 **advisory** red check — visible, but not enforced. Registering it as required is
 a one-line change to that synced config, outside this directory.
 
+It's **safe to register as required**: a PR that touches none of the render
+inputs skips the render via the `detect` job's `if` gate, and a job skipped by
+`if` reports **success** — so non-UI PRs satisfy the check instead of sitting
+"pending" (which is what an `on: paths:` filter would cause, blocking merges).
+
 ## How the gate behaves
 
-- On every PR, `ui-snapshot.yml` renders each page and compares it to its
-  committed baseline. Any pixel difference on any page fails the check.
+- On every PR that touches a render input (ap-web, the visual tests + fixtures,
+  or the pinned toolchain — see the `detect` job in `ui-snapshot.yml`),
+  `ui-snapshot.yml` renders each page and compares it to its committed baseline.
+  Any pixel difference on any page fails the check; PRs that touch none of those
+  skip the render (reported as a passing skip).
 - **Every run (pass or fail)** uploads one artifact and links it in the job
   summary, so the screenshots are always one click away:
   `ui-snapshot-<run_id>` carries this run's renders (`snapshots/`); on a mismatch
@@ -99,18 +107,19 @@ build.
 
 ### Fork PR without Docker — adopt the run's render
 
-The failing compare run already rendered your change in the pinned image, so pull
-that image into the baseline:
+The failing compare run already rendered your change in the pinned image, and
+because it runs under GitHub Actions the plugin rewrote each drifting baseline
+**in place** under `snapshots/`. Pull that tree in:
 
 ```bash
 tests/e2e_ui/visual/update_baseline_from_pr.sh <pr-number>
 ```
 
-It finds the PR's UI Snapshot run, downloads the artifact, and copies the
-runner-rendered `actual_` PNG over the committed baseline. **Review the image**,
-then commit and push. (Manual equivalent: download the `ui-snapshot-<run_id>`
-artifact, take `snapshot_failures/.../actual_*.png`, and commit it over the
-baseline path above.)
+It finds the PR's UI Snapshot run, downloads the artifact, and restores its
+runner-rendered `snapshots/` tree over the committed baselines — only the
+drifting ones differ. **Review the image(s)**, then commit and push. (Manual
+equivalent: download the `ui-snapshot-<run_id>` artifact and commit its
+`snapshots/` tree over `tests/e2e_ui/visual/snapshots/`.)
 
 ### Workflow dispatch (non-PR branches)
 

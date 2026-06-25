@@ -23,11 +23,55 @@ Tracks pending work and known limitations for the Qwen Code harness
   Verified end-to-end against an OpenAI-compatible endpoint. **Caveat:** this is
   authoritative only when qwen has no conflicting ambient `~/.qwen/settings.json`
   — see Pending work for the precedence limitation.
+- **Cost / token tracking.** Per-turn token usage is parsed from qwen's ACP
+  stream and emitted on `TurnComplete.usage` (and fed to the cost observer).
+  qwen rides usage out-of-band on an `agent_message_chunk` whose text is empty
+  and whose `_meta.usage` carries `{inputTokens, outputTokens, totalTokens,
+  thoughtTokens, cachedReadTokens}` (qwen-code `emitUsageMetadata`). The
+  executor sums these across a turn's internal model calls and splits
+  `cachedReadTokens` out of `input_tokens` (qwen's `inputTokens` is cache-
+  inclusive; cost wants the non-cached portion) — see `_accumulate_usage`.
+  Verified end-to-end against a live `qwen --acp` turn.
+- **Context status.** The UI context meter shows used/total for qwen. The
+  numerator (per-turn context consumed) comes from `_meta.usage.totalTokens`
+  via cost/token tracking above; the denominator (the model's context-window
+  *limit*) comes from a curated Qwen lookup in `get_model_context_window`
+  (`_QWEN_CONTEXT_WINDOWS`) — qwen models are absent from litellm and the MLflow
+  catalog, so without it they fell back to the wrong 128K default
+  (qwen3-coder-plus is 1M). A spec's `executor.context_window` still overrides;
+  unrecognized qwen models keep the 128K fallback.
+- **In-session model selection (`/model`).** Switching models mid-session
+  works. The model is fixed in the `qwen --acp` subprocess env
+  (`HARNESS_QWEN_MODEL`) at spawn, so on a `/model` change the runner's
+  `HarnessProcessManager` respawns the harness with the new value — a fresh
+  `QwenExecutor` then opens a new `session/new` carrying the new model. Context
+  survives the respawn because the first turn of the new session replays the
+  prior conversation (see History replay below).
+- **History replay on a fresh ACP session.** When the `qwen --acp` subprocess
+  is (re)spawned — first turn, a `/model` switch, or a `Session not found`
+  reset — qwen holds none of the earlier conversation (it lived in the dead
+  process). `run_turn` normally sends only the latest user turn, so the first
+  turn of any fresh session folds the prior transcript into the prompt as a
+  labeled `Conversation so far:` block (`_history_prefix`), mirroring
+  `ClaudeSDKExecutor._build_prompt`. Keeps a mid-conversation model switch from
+  dropping the thread. (Same fix applied to the goose ACP harness.)
 - **OS sandbox.** When the spec's `os_env.sandbox` is not `none`, the whole
   `qwen` process tree is wrapped in the platform sandbox (bwrap / seatbelt) at
   spawn (`_sandbox_launch_path`), confining qwen's own file/shell tools to the
   spec's read/write roots — an OS-level guarantee independent of the per-tool
   permission gate.
+- **File I/O delegation (`fs/*`).** When an `os_env` is configured, the executor
+  advertises `clientCapabilities.fs` in `initialize`, so qwen routes its file
+  reads/writes back to us as `fs/read_text_file` / `fs/write_text_file` requests
+  (qwen's `AcpFileSystemService` swaps in only when the capability is set). The
+  handlers execute the I/O through the Omnigent `OSEnvironment`, so the spec's
+  sandbox read/write roots are enforced at the Python layer — and the bytes flow
+  through Omnigent rather than qwen touching disk directly. Disabled (qwen uses
+  its own tools) when there's no `os_env` or it's a `fork` env (a forked tree's
+  path would diverge from the qwen subprocess cwd). Binary/non-UTF-8 reads are
+  refused; missing-file reads map to qwen's ENOENT code. (Same fix applied to
+  the goose ACP harness.) See the Pending item below for what's still out of
+  scope (event recording / TOOL_RESULT-phase content policy).
 
 ## Pending work
 
@@ -36,21 +80,139 @@ comments; this is the *what*, not the *how*.)
 
 ### High
 
-- [ ] **In-session model selection.** The model is fixed at `session/new` and
-  the session is reused across turns, so switching models mid-session (`/model`)
-  has no effect. Supporting it means re-creating the ACP session on a model
-  change (or passing a per-turn model if qwen accepts one).
-- [ ] **Cost / token tracking.** `TurnComplete.usage` is never populated for
-  qwen (the executor yields a turn with no token counts), so per-turn token and
-  cost reporting is blank. Parse usage from qwen's ACP stream (if it reports
-  token counts) and emit it on `TurnComplete`.
-- [ ] **Context status.** The executor surfaces no context-window usage and
-  overrides no `max_context_tokens`, so the UI's context meter stays empty.
-  Report the model's context limit and per-turn context consumed.
-- [ ] **Native TUI variant (`native-qwen`).** Attach to the live `qwen` terminal
-  (like `pi-native`) for a fully interactive experience instead of a piped turn.
+- [x] **Native TUI variant (`qwen-native` / `native-qwen`).** Implemented — the
+  live `qwen` TUI runs in a runner-owned tmux pane embedded in the web UI, driven
+  by `omnigent qwen`. Unlike the goose/cursor `tmux send-keys` native harnesses,
+  it uses qwen's built-in remote-control protocol: web-UI turns are appended to
+  qwen's `--input-file` (a `{"type":"submit"}` line, routed through the same
+  `submitQuery` path the keyboard uses, so it renders in the TUI), and the
+  transcript is mirrored back by tailing qwen's structured `--json-file` event
+  stream (Anthropic stream-json shape). Interrupt/stop still go through the pane
+  (`Escape` / kill) since the input-file watcher has no interrupt command. See
+  `docs/QWEN_NATIVE_DESIGN.md`. **Still a follow-up (PR2):** usage parsing from
+  the `result`/`assistant` events is not yet emitted on `TurnComplete.usage`
+  (see the status-line item below for the model/ring/cost consequences).
+
+- [x] **Tool-approval elicitation card (TUI → web).** Implemented — qwen's
+  in-terminal tool-approval prompt now also renders as an approval card in the
+  web chat, and answering either surface resolves the other. qwen emits a
+  structured `{"type":"control_request","request":{"subtype":"can_use_tool",
+  "tool_name","tool_use_id","input"},"request_id"}` on `--json-file` **and**
+  accepts a `{"type":"confirmation_response","request_id","allowed"}` on
+  `--input-file`, *coexisting* with its own TUI prompt (whichever answers first
+  wins; qwen's `dual-output.md` confirms `control_request` is emitted whenever a
+  tool needs approval — the earlier "default mode doesn't emit these" note was
+  wrong).
+  - **Mirror:** `omnigent/qwen_native_permissions.py` —
+    `supervise_qwen_approval_mirror` tails the *same* `--json-file` the
+    transcript forwarder reads (seeded at EOF so only new prompts park), POSTs
+    each `can_use_tool` to the server's `qwen-permission-request` hook, and on
+    the web verdict writes `confirmation_response` to the input file (no
+    keystrokes). It's the structured analog of cursor-native's pane-scraping
+    mirror. Wired alongside the forwarder under one supervised task in
+    `runner/app.py::_auto_create_qwen_terminal` (`_supervise_qwen_native_bridges`).
+  - **Server hook:** `POST /v1/sessions/{id}/hooks/qwen-permission-request`
+    (`qwen_permission_request_hook`, modeled on the cursor hook) publishes the
+    standard `response.elicitation_request` (`policy_name=qwen_native_permission`,
+    `phase=pre_tool_use`) and parks via `_publish_and_wait_for_harness_elicitation`.
+    This always surfaces a card whenever the TUI prompts — the explicit goal —
+    rather than routing through `/policies/evaluate` (which would auto-resolve
+    and skip the card when no TOOL_CALL policy matches qwen's tool names).
+  - **Loser release:** qwen emits a `control_response` for a `request_id`
+    whether the TUI or an external `confirmation_response` answered. The mirror
+    watches for it: if it lands while the web card is still parked (TUI answered
+    first), it POSTs `external_elicitation_resolved` to clear the card and skips
+    the stale `confirmation_response`; if the card answered first, the task is
+    already done and the `control_response` just cleans up. Still worth a live
+    E2E to confirm timing under a real `qwen --acp` turn.
+
+- [ ] **Composer status line: real model + context ring (Web UI).** For
+  native-qwen the composer's model/effort chip is currently **hidden** (web UI
+  flag `nativeVendorOwnsModel` in `chatStore.sessionBindingPatch` →
+  `ComposerStatusLine` in `ap-web/src/pages/ChatPage.tsx`). It was showing the
+  bound spec's *default* model (`claude-sonnet-4-6`) because the qwen-native-ui
+  spec sets no model and qwen picks its model inside the vendor TUI (OpenAI-compat
+  env / qwen's own `/model`), so Omnigent's `llmModel` was a misleading default.
+  Hiding it is the interim; the real fix is to **surface qwen's actual model**
+  (and effort/approval-mode if meaningful). The data is already on qwen's
+  `--json-file` stream — `assistant` message events carry `message.model` (e.g.
+  `openai/gpt-oss-120b:free`) and the `system/session_start` event carries model
+  metadata. The forwarder (`omnigent/qwen_native_forwarder.py`) could parse it
+  and report it onto the session so the chip reflects qwen's reality.
+  - **Context ring + cost tracking also missing**, same root cause: native-qwen
+    emits no token usage, so `tokensUsed` / `contextWindow` stay null (the ring
+    renders only when `contextWindow > 0 && tokensUsed != null`) and the session
+    cost stays $0 (cost is derived from per-turn usage × model price). The ACP
+    `qwen` harness already does this — see "Cost / token tracking" in *What works
+    today* (`_accumulate_usage`); native-qwen needs the equivalent off the
+    `--json-file` stream. Parse `result.usage` (`input_tokens` / `output_tokens`
+    / `cache_read_input_tokens` / `total_tokens`) in
+    `omnigent/qwen_native_forwarder.py`, split `cache_read_input_tokens` out of
+    `input_tokens` (qwen's `input_tokens` is cache-inclusive; cost wants the
+    non-cached portion), and report it onto the session so the cost observer +
+    context ring pick it up; the context-window *limit* comes from the curated
+    `_QWEN_CONTEXT_WINDOWS` lookup. One usage-parsing change feeds the model
+    chip, the ring, and cost together.
+
+- [x] **Restore qwen's TUI history on resume.** `omni qwen --resume <conv_id>`
+  used to relaunch a **blank** `qwen` TUI (only the web chat kept history, via the
+  forwarder). Fixed, using the **same `external_session_id` convention as
+  claude-/codex-/pi-native** (so it's consistent and fork-capable):
+  `_auto_create_qwen_terminal` persists the qwen session id on the Omnigent
+  session (`_persist_qwen_external_session_id` → `PATCH /v1/sessions/{id}`), reads
+  it back from the snapshot (`launch_config.external_session_id`) on the next
+  launch, and it's stamped as `omnigent.fork.source_external_session_id` for fork
+  history carry-over. qwen is cleaner than claude/codex here — it lets us *assign*
+  the id via `--session-id`, so we mint a deterministic one
+  (`qwen_session_id_for_conversation`, UUIDv5 of the `conv_id`) up front instead
+  of capturing a vendor-generated id, and a failed persist self-heals (the id is
+  recomputable). Launch is fresh `--session-id <id>` the first time, `--resume
+  <id>` once qwen has an on-disk recording — the recording check
+  (`qwen_session_recording_exists`, scoped to the launch workspace's qwen project
+  slug at `~/.qwen/projects/<slug>/chats/<id>.jsonl`) is the `--resume` guard,
+  since `--resume` on an id not recorded *under that cwd* shows qwen's blocking
+  "No saved session found" screen — qwen resolves `--resume` per-project, so the
+  check must be workspace-scoped, not a cross-project glob (also keeps
+  never-messaged / pre-convention sessions on the clean fresh path). **No forwarder change
+  needed:** verified that on `--resume` qwen restores history into the TUI from
+  its own checkpoint and emits *only new* events to `--json-file`, so the
+  transcript is never re-mirrored — qwen sidesteps the double-mirror problem that
+  forced goose-native to start fresh.
 
 ### Medium
+
+- [ ] **Compaction / context-compression mirroring (TUI → web).** qwen calls
+  compaction *compression*: it auto-compresses when the context fills and exposes
+  a `/compress` command, rendering an inline item in its TUI
+  (`{type:"compression", compression:{isPending, originalTokenCount,
+  newTokenCount, compressionStatus}}` and an internal `chat_compressed` event).
+  Native-qwen does **not** surface any of this in the web UI today — during a
+  compression the Chat tab just shows the turn stall, and afterward the mirrored
+  token counts don't reflect the shrink. Omnigent already has the web-facing
+  primitives — `response.compaction.in_progress` / `.completed` / `.failed`
+  (`omnigent/runtime/compaction.py`, `omnigent/server/schemas.py:3158+`,
+  rendered by `ap-web` as the "Compacting…" spinner / compaction divider) — so
+  this is a *forwarder* change, not new UI.
+  - **Verify the wire shape first (live E2E):** confirm whether qwen emits a
+    structured compression marker on the `--json-file` dual-output stream (a
+    `compression`/`chat_compressed`-shaped event) the way it emits
+    `control_request` for approvals, or whether compression is TUI-only and must
+    be inferred (e.g. from a token-count drop between consecutive `assistant`
+    `usage` events, or a `system`-style notice). The `control_request` →
+    elicitation work proved the stream carries non-transcript control events, so
+    a compression event is plausible but unconfirmed — `permission_suggestions`
+    was null, so don't assume field richness.
+  - **Mirror it:** in `omnigent/qwen_native_forwarder.py`, on a
+    compression-in-progress marker publish `response.compaction.in_progress`
+    (POST to the session) so the spinner shows, and on completion publish
+    `response.compaction.completed` with the post-compression `total_tokens`
+    (pairs with the usage/context-ring work in the "Composer status line" item —
+    one usage path feeds the ring, cost, and the compaction token count). If the
+    stream has no compression event, scope this to "best-effort: emit completed
+    with the new token count when usage drops" and `log()` the limitation.
+  - **Note on the ACP `qwen` harness:** the in-process executor compresses
+    internally over ACP and is opaque to us (same boundary as the LLM-phase
+    policy exclusion below), so this item is **native-qwen only**.
 
 - [ ] **Provider routing: settings.json precedence + token refresh.** The
   base injection now works (see What works today), but two gaps remain before
@@ -79,15 +241,14 @@ comments; this is the *what*, not the *how*.)
 - [ ] **Omnigent tools.** Qwen can only call its own built-in tools; tools
   defined by Omnigent aren't exposed to it (so they can't be invoked or
   recorded). Permission gating on qwen's *own* tool calls already works.
-- [ ] **File I/O execution / content recording.** Qwen performs file reads and
-  writes with its own tools (we don't advertise `clientCapabilities.fs`), so
-  Omnigent never executes the I/O and can't record the file content or run
-  TOOL_RESULT-phase content policy on it. Note the gaps that are *already*
-  closed: the TOOL_CALL request is gated (permission + policy) when qwen asks,
-  and the ops are confined when `os_env.sandbox` is set (see What works today).
-  What's missing is Omnigent-side execution/recording of the I/O itself —
-  advertise `clientCapabilities.fs` + re-add `fs/read_text_file` /
-  `fs/write_text_file` handlers to route it through Omnigent.
+- [ ] **File I/O recording / content policy.** Omnigent now *executes* delegated
+  file reads/writes through the `OSEnvironment` (see "File I/O delegation" in
+  What works today), so the bytes flow through Omnigent and the sandbox roots are
+  enforced. Still missing on top of that: (a) emitting the I/O into Omnigent's
+  event stream (ToolCall-style records) so it shows in history, and (b) running
+  TOOL_RESULT-phase content policy on the read/written content. Both build on the
+  `_handle_fs_read` / `_handle_fs_write` handlers — the byte-level hook now
+  exists; this is wiring the recording/policy layers onto it.
 
 > LLM-phase policy (`PHASE_LLM_REQUEST` / `PHASE_LLM_RESPONSE`) is intentionally
 > out of scope: qwen's model calls happen internally over ACP and are opaque to

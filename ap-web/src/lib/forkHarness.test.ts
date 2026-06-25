@@ -18,6 +18,9 @@ describe("harnessFamily", () => {
     ["openai-agents", "openai"],
     ["openai-agents-sdk", "openai"],
     ["agents_sdk", "openai"],
+    ["antigravity-native", "gemini"],
+    ["native-antigravity", "gemini"],
+    ["antigravity", "gemini"],
   ])("maps %s → %s", (harness, family) => {
     expect(harnessFamily(harness)).toBe(family);
   });
@@ -36,14 +39,22 @@ describe("isNativeHarness", () => {
     ["native-claude", true],
     ["codex-native", true],
     ["native-codex", true],
+    ["cursor-native", true],
+    ["native-cursor", true],
     ["pi-native", true],
     ["native-pi", true],
+    // Antigravity-native spellings are native too — aligned with Python
+    // NATIVE_HARNESSES (the in-process `antigravity` SDK harness is NOT).
+    ["antigravity-native", true],
+    ["native-antigravity", true],
     ["claude-sdk", false],
     ["claude_sdk", false],
     ["openai-agents", false],
     ["codex", false],
     // The SDK `pi` harness is in-process, not a native CLI wrapper.
     ["pi", false],
+    // The in-process Antigravity SDK harness is likewise not native.
+    ["antigravity", false],
     [null, false],
   ])("classifies %s as native=%s", (harness, expected) => {
     expect(isNativeHarness(harness as string | null)).toBe(expected);
@@ -54,12 +65,17 @@ describe("forkTargetCarriesHistory", () => {
   // SDK targets always carry history as context, regardless of source or
   // family — including native → SDK and cross-family. A false here would
   // wrongly hide a fully-supported switch from the picker.
-  it.each([["claude-sdk"], ["claude_sdk"], ["codex"], ["openai-agents"], ["agents_sdk"]])(
-    "SDK target %s carries history",
-    (target) => {
-      expect(forkTargetCarriesHistory(target)).toBe(true);
-    },
-  );
+  it.each([
+    ["claude-sdk"],
+    ["claude_sdk"],
+    ["codex"],
+    ["openai-agents"],
+    ["agents_sdk"],
+    // antigravity is the Gemini-family SDK target.
+    ["antigravity"],
+  ])("SDK target %s carries history", (target) => {
+    expect(forkTargetCarriesHistory(target)).toBe(true);
+  });
 
   // Native targets carry from ANY source: the runner clones the source's
   // native transcript when the source is same-family native, else rebuilds
@@ -73,10 +89,16 @@ describe("forkTargetCarriesHistory", () => {
     ["native-claude"],
     ["codex-native"],
     ["native-codex"],
+    // Cursor is native but server-backed: a fork carries history as a text
+    // preamble (text-prefix replay), so it must be offered in the picker too.
+    ["cursor-native"],
+    ["native-cursor"],
     // Pi is native but multi-family (no single harnessFamily) — it must
     // still be offered, or the fork/switch-agent pickers silently drop it.
     ["pi-native"],
     ["native-pi"],
+    ["antigravity-native"],
+    ["native-antigravity"],
   ])("native target %s carries history", (target) => {
     expect(forkTargetCarriesHistory(target)).toBe(true);
   });

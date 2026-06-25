@@ -54,6 +54,7 @@ from omnigent.onboarding.configure_models import (
 )
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
+    GEMINI_FAMILY,
     OPENAI_FAMILY,
     get_default_provider,
     load_config,
@@ -525,12 +526,13 @@ def test_add_menu_options_ordering() -> None:
     and Databricks sits just above the catch-all "Other". A regression to
     the old interleaved order (or Other above Databricks) fails here.
     """
-    # Full menu: keys, then subscriptions, then Gateway, OpenRouter,
-    # Databricks, Other.
+    # Full menu: first-party keys (OpenAI, Anthropic, Gemini), then
+    # subscriptions, then Gateway, OpenRouter, Databricks, Other.
     full = [o.label.split(None, 1)[1] for o in add_menu_options()]
     assert full == [
         "OpenAI — API key",
         "Anthropic — API key",
+        "Gemini — API key",
         "ChatGPT — subscription",
         "Claude — subscription (Pro/Max)",
         "Gateway — custom base URL + key (e.g. OpenRouter)",
@@ -564,6 +566,12 @@ def test_add_menu_options_ordering() -> None:
         "Databricks — workspace",
         "AWS Bedrock — API key",
     ]
+
+    # Gemini (antigravity) scoped: API key only — Gemini is key-only (no
+    # subscription/gateway/Databricks), and it must NOT appear in the
+    # openai-family "Other provider" catch-all (asserted via `codex` above).
+    gemini = [o.label.split(None, 1)[1] for o in add_menu_options_for_family(GEMINI_FAMILY)]
+    assert gemini == ["Gemini — API key"]
 
 
 def test_add_menu_databricks_option_gated_on_extra(monkeypatch) -> None:
@@ -1546,6 +1554,34 @@ def test_overview_marks_unconfigured_with_x_and_configured_without_checkmark(
     # Unconfigured Codex: red ✗ on the name + the "no credential yet" hint.
     assert "✗ Codex" in out
     assert "no credential yet" in out
+
+
+def test_overview_lists_kiro_native_row(isolated_config, monkeypatch) -> None:
+    """Level 1: Kiro appears as an installable native harness row.
+
+    Kiro (``kiro-native``) is a native CLI harness with its own auth
+    (``kiro-cli login``), so — like Goose/Hermes — it belongs in the setup
+    overview. Absent the CLI it renders a red ✗ plus its curl install hint;
+    installed, it renders ready with the sign-in reminder. A regression that
+    drops the Kiro row (the gap this PR closes) fails here.
+    """
+    # CLI absent → Kiro row + the curl install hint. (The red ✗ marker carries an
+    # ANSI reset between the glyph and the name, so assert on the stable text.)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda family: False,
+    )
+    out = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n").output
+    assert "Kiro" in out
+    assert "cli.kiro.dev/install" in out
+
+    # CLI present → ready row naming the sign-in step (no Omnigent credential).
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda family: True,
+    )
+    out = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n").output
+    assert "kiro-cli login" in out
 
 
 def test_drill_into_uninstalled_installs_then_proceeds(isolated_config, monkeypatch) -> None:

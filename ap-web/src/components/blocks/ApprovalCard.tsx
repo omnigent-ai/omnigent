@@ -49,6 +49,7 @@ import {
   parseAskUserQuestionPreview,
 } from "@/lib/askUserQuestion";
 import { formatPreview } from "@/lib/previewFormat";
+import type { RenderItem } from "@/lib/renderItems";
 import type { RememberScope } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
@@ -245,9 +246,13 @@ export function ApprovalCard({
   // paths are handled inline with approve/reject buttons.
   const isExternalUrl = typeof url === "string" && url.length > 0 && !url.startsWith("/approve/");
   const askUserQuestionTitle =
-    policyName.startsWith("codex_") || phase.startsWith("codex_")
-      ? "Codex needs input"
-      : "Claude has questions";
+    policyName.startsWith("agy_") || phase.startsWith("agy_")
+      ? "Antigravity needs your input"
+      : policyName.startsWith("codex_") || phase.startsWith("codex_")
+        ? "Codex needs input"
+        : policyName.startsWith("cursor_") || phase.startsWith("cursor_")
+          ? "Cursor has questions"
+          : "Claude has questions";
 
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-
@@ -546,5 +551,40 @@ export function ApprovalCard({
         )}
       </AlertDescription>
     </Alert>
+  );
+}
+
+/**
+ * Render an elicitation ``RenderItem`` as an ``ApprovalCard``. The prop
+ * mapping lives here, in one place, so the two callers stay in sync:
+ * ``BlockRenderer`` (inline in the message stream) and ``ChatPage``'s
+ * pinned tray (pending cards lifted above the composer). Pass ``onSubmit``
+ * to route the verdict somewhere other than the active chat store.
+ */
+export function ElicitationCard({
+  item,
+  onSubmit,
+}: {
+  item: Extract<RenderItem, { kind: "elicitation" }>;
+  onSubmit?: SubmitApprovalFn;
+}) {
+  return (
+    <ApprovalCard
+      elicitationId={item.elicitationId}
+      message={item.message}
+      phase={item.phase}
+      policyName={item.policyName}
+      contentPreview={item.contentPreview}
+      requestedSchema={item.requestedSchema}
+      url={item.url}
+      status={item.status}
+      response={item.response}
+      askUserQuestion={item.askUserQuestion}
+      exitPlanMode={item.exitPlanMode}
+      codexCommand={item.codexCommand}
+      allowAllEdits={item.allowAllEdits}
+      rememberScope={item.rememberScope}
+      onSubmit={onSubmit}
+    />
   );
 }

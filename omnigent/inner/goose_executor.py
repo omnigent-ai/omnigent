@@ -50,8 +50,47 @@ from omnigent.inner.executor import (
     TextChunk,
     TurnComplete,
 )
+from omnigent.inner.os_env import OSEnvironment, create_os_environment
 
 logger = logging.getLogger(__name__)
+
+# ACP error code Goose maps to a filesystem "not found" (ENOENT) when a
+# delegated ``fs/read_text_file`` fails — the shared ACP client lib special-
+# cases exactly this code to raise an ENOENT the model understands. Any other
+# code surfaces raw.
+_ACP_RESOURCE_NOT_FOUND_CODE = -32002
+
+
+class _AcpRequestError(Exception):
+    """A handler failure to return as a JSON-RPC error on a server request.
+
+    Carries the JSON-RPC ``code`` / ``message`` so the dispatch in
+    :meth:`GooseExecutor._respond_to_agent_request` can build the error reply
+    without each handler assembling the wire envelope itself.
+    """
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _looks_like_missing_file(message: str) -> bool:
+    """Heuristic: does an os_env error message indicate a missing path?
+
+    The os_env helper returns failures as ``{"error": "<str>"}`` rather than
+    typed exceptions, so the message text is the only signal that a read missed
+    because the file is absent (vs. a permission / decode failure). Used to map
+    onto the ENOENT code so the model sees "file not found".
+    """
+    lowered = message.lower()
+    return (
+        "no such file" in lowered
+        or "errno 2" in lowered
+        or "not found" in lowered
+        or "does not exist" in lowered
+    )
+
 
 # ACP protocol constants (JSON-RPC 2.0 method names).
 _AGENT_METHOD_INITIALIZE = "initialize"
@@ -161,6 +200,16 @@ class GooseExecutor(Executor):
         """
         self._cwd = cwd or os.getcwd()
         self._os_env = os_env
+        # Whether to advertise ``clientCapabilities.fs`` so Goose delegates file
+        # reads/writes back to us (executed through the Omnigent OSEnvironment,
+        # which enforces the spec's sandbox read/write roots) instead of using
+        # its own raw file tools. Enabled only when an os_env is configured and
+        # it isn't a ``fork`` env — a forked env operates on a *copied* tree
+        # whose path would diverge from the cwd the goose subprocess runs in.
+        self._fs_delegation: bool = os_env is not None and not bool(getattr(os_env, "fork", False))
+        # Live OSEnvironment backing fs delegation, created lazily on the first
+        # delegated op and torn down in :meth:`close`. ``None`` until then.
+        self._os_environment: OSEnvironment | None = None
         self._model = model
         self._provider = provider
         self._goose_path = goose_path or "goose"
@@ -396,10 +445,15 @@ class GooseExecutor(Executor):
             {
                 "protocolVersion": _PROTOCOL_VERSION,
                 "clientInfo": {"name": "omnigent", "version": "1.0"},
-                # We don't advertise fs/terminal capabilities, so Goose uses its
-                # own builtin tools (and any fs/* request hits method-not-found).
+                # Advertise fs delegation so Goose routes file reads/writes back
+                # to us (executed via the OSEnvironment) when an os_env is
+                # configured; both false (no os_env / fork env) leaves Goose on
+                # its own builtin tools. Terminal stays unadvertised.
                 "clientCapabilities": {
-                    "fs": {"readTextFile": False, "writeTextFile": False},
+                    "fs": {
+                        "readTextFile": self._fs_delegation,
+                        "writeTextFile": self._fs_delegation,
+                    },
                     "terminal": False,
                 },
             },
@@ -453,6 +507,10 @@ class GooseExecutor(Executor):
         - ``session/request_permission`` — decide via Omnigent's TOOL_CALL policy
           + human-consent elicitation (:meth:`_decide_permission`), then select
           the matching allow/reject option. NOT a blind approve.
+        - ``fs/read_text_file`` / ``fs/write_text_file`` — when fs delegation is
+          advertised (an os_env is configured; see :attr:`_fs_delegation`), Goose
+          routes its file I/O here, executed through the Omnigent OSEnvironment so
+          the spec's sandbox read/write roots are enforced. Off → never arrive.
         - anything else — reply with JSON-RPC ``method not found`` so goose fails
           loudly rather than acting on empty data.
         """
@@ -467,11 +525,17 @@ class GooseExecutor(Executor):
             if method == _AGENT_REQUEST_REQUEST_PERMISSION:
                 allow = await self._decide_permission(params)
                 result = {"outcome": self._permission_outcome(params, allow=allow)}
+            elif method == "fs/read_text_file" and self._fs_delegation:
+                result = await self._handle_fs_read(params)
+            elif method == "fs/write_text_file" and self._fs_delegation:
+                result = await self._handle_fs_write(params)
             else:
                 error = {
                     "code": -32601,
                     "message": f"omnigent: unsupported ACP request method {method!r}",
                 }
+        except _AcpRequestError as exc:
+            error = {"code": exc.code, "message": exc.message}
         except Exception as exc:  # noqa: BLE001
             logger.debug("goose agent request %s failed: %s", method, exc)
             error = {"code": -32603, "message": f"{method} failed: {exc}"}
@@ -482,6 +546,76 @@ class GooseExecutor(Executor):
         else:
             reply["result"] = result
         await self._send(reply)
+
+    # ------------------------------------------------------------------
+    # Filesystem delegation (goose → client, when fs capability advertised)
+    # ------------------------------------------------------------------
+
+    async def _ensure_os_environment(self) -> OSEnvironment:
+        """Lazily create the OSEnvironment backing fs delegation.
+
+        :returns: The live OSEnvironment for this executor's os_env spec.
+        :raises _AcpRequestError: When no usable os_env can be created.
+        """
+        if self._os_environment is None:
+            env = create_os_environment(self._os_env)
+            if env is None:
+                raise _AcpRequestError(-32603, "omnigent: no os_env for fs delegation")
+            self._os_environment = env
+        return self._os_environment
+
+    async def _handle_fs_read(self, params: dict[str, Any]) -> dict[str, Any]:  # type: ignore[explicit-any]
+        """Serve an ACP ``fs/read_text_file`` by reading through the OSEnvironment.
+
+        ACP params ``{path, line?, limit?}`` (1-based start line, max line count;
+        both optional → whole file) map onto :meth:`OSEnvironment.read`.
+
+        :param params: The request params.
+        :returns: ``{"content": <text>}`` per the ACP response shape.
+        :raises _AcpRequestError: On a missing path arg, a non-text/binary file,
+            or a read failure (mapped to ENOENT when it looks like a missing
+            file so goose raises the right error to the model).
+        """
+        path = params.get("path")
+        if not isinstance(path, str) or not path:
+            raise _AcpRequestError(-32602, "fs/read_text_file requires a string 'path'")
+        line = params.get("line")
+        limit = params.get("limit")
+        offset = line if isinstance(line, int) and line >= 1 else 1
+        read_limit = limit if isinstance(limit, int) and limit >= 1 else None
+
+        env = await self._ensure_os_environment()
+        result = await env.read(path, offset=offset, limit=read_limit)
+        if "error" in result:
+            message = str(result["error"])
+            code = _ACP_RESOURCE_NOT_FOUND_CODE if _looks_like_missing_file(message) else -32603
+            raise _AcpRequestError(code, message)
+        if result.get("encoding") != "utf-8":
+            raise _AcpRequestError(-32603, f"{path}: not a UTF-8 text file")
+        return {"content": result.get("content", "")}
+
+    async def _handle_fs_write(self, params: dict[str, Any]) -> dict[str, Any]:  # type: ignore[explicit-any]
+        """Serve an ACP ``fs/write_text_file`` by writing through the OSEnvironment.
+
+        ACP params ``{path, content}``; the write goes through the helper so the
+        spec's sandbox write roots are enforced at the Python layer.
+
+        :param params: The request params.
+        :returns: An empty result object (ACP expects no payload on success).
+        :raises _AcpRequestError: On missing/invalid args or a write failure.
+        """
+        path = params.get("path")
+        content = params.get("content")
+        if not isinstance(path, str) or not path:
+            raise _AcpRequestError(-32602, "fs/write_text_file requires a string 'path'")
+        if not isinstance(content, str):
+            raise _AcpRequestError(-32602, "fs/write_text_file requires string 'content'")
+
+        env = await self._ensure_os_environment()
+        result = await env.write(path, content)
+        if "error" in result:
+            raise _AcpRequestError(-32603, str(result["error"]))
+        return {}
 
     @staticmethod
     def _extract_tool_call(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:  # type: ignore[explicit-any]
@@ -654,6 +788,47 @@ class GooseExecutor(Executor):
                 parts.append(f"[attached image: {name}]" if name else "[attached image]")
         return "\n".join(parts)
 
+    @classmethod
+    def _history_prefix(cls, prior: list[Any]) -> str:  # type: ignore[explicit-any]
+        """Serialize prior conversation turns into a text prefix.
+
+        On a *fresh* ACP session (the first turn of a newly spawned/respawned
+        ``goose acp`` process, or after a session reset) Goose holds none of the
+        earlier conversation — its context lived in the dead subprocess. Since
+        :meth:`run_turn` normally sends only the latest user turn (relying on
+        the persistent session to retain history), we'd lose everything before
+        the switch. Replaying the transcript as a labeled ``role: content``
+        block restores that context, mirroring
+        ``ClaudeSDKExecutor._build_prompt``. A ``/model`` switch respawns the
+        subprocess (see HarnessProcessManager), so this is what keeps a
+        mid-conversation model change from dropping the thread.
+
+        :param prior: The conversation turns *before* the latest user message
+            (each an inner ``Message`` dict).
+        :returns: A ``"Conversation so far: …"`` text block, or ``""`` when
+            there is nothing to replay.
+        """
+        lines = ["Conversation so far:"]
+        for msg in prior:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "user")).replace("_", " ")
+            raw = msg.get("content")
+            if raw is None:
+                content = ""
+            elif isinstance(raw, str):
+                content = raw
+            elif isinstance(raw, list):
+                content = cls._text_from_blocks(raw, emit_image_marker=True)
+            else:
+                content = json.dumps(raw, ensure_ascii=True)
+            lines.append(f"{role}: {content}")
+        lines.append("")
+        lines.append(
+            "Respond to the latest user message, using the conversation above as context."
+        )
+        return "\n".join(lines)
+
     # ------------------------------------------------------------------
     # Executor interface
     # ------------------------------------------------------------------
@@ -709,12 +884,20 @@ class GooseExecutor(Executor):
             yield ExecutorError(message=str(exc), retryable=False)
             return
 
+        # A fresh ACP session (first turn of a new/respawned process, or after
+        # a reset) holds no prior context. Captured before we flip the latch
+        # below so we know whether to replay history into this turn.
+        fresh_session = not self._system_prompt_sent
+
         # Build the prompt payload from the most recent user message.
         user_text = ""
         image_blocks: list[dict[str, Any]] = []  # type: ignore[explicit-any]
-        for msg in reversed(messages):
+        latest_user_idx: int | None = None
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
             role = msg.get("role", "") if isinstance(msg, dict) else ""
             if role == "user":
+                latest_user_idx = idx
                 content = msg.get("content", "") if isinstance(msg, dict) else ""
                 if isinstance(content, str):
                     user_text = content
@@ -726,9 +909,21 @@ class GooseExecutor(Executor):
                     )
                 break
 
-        # ACP has no system-prompt field, so fold it into the first turn.
-        if not self._system_prompt_sent and system_prompt:
-            user_text = f"{system_prompt}\n\n{user_text}" if user_text else system_prompt
+        # On a fresh session, replay the prior conversation so a model switch
+        # (which respawns the subprocess) or a session reset doesn't drop the
+        # thread — Goose otherwise only ever sees this turn's latest message.
+        # Skipped when there's nothing before the latest user turn (the genuine
+        # first turn of a brand-new conversation). See :meth:`_history_prefix`.
+        if fresh_session and latest_user_idx is not None and latest_user_idx > 0:
+            history_prefix = self._history_prefix(messages[:latest_user_idx])
+            user_text = f"{history_prefix}\n\nuser: {user_text}" if user_text else history_prefix
+
+        # ACP has no system-prompt field, so fold it into the first turn. The
+        # latch flips on any fresh session — even with an empty system prompt —
+        # so a continuing session never re-replays history or re-folds.
+        if fresh_session:
+            if system_prompt:
+                user_text = f"{system_prompt}\n\n{user_text}" if user_text else system_prompt
             self._system_prompt_sent = True
 
         prompt_blocks: list[dict[str, Any]] = []  # type: ignore[explicit-any]
@@ -844,6 +1039,12 @@ class GooseExecutor(Executor):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._stderr_task
             self._stderr_task = None
+        # Release the fs-delegation OSEnvironment's helper subprocess, if one
+        # was spawned for a delegated file op this session.
+        if self._os_environment is not None:
+            with contextlib.suppress(Exception):
+                self._os_environment.close()
+            self._os_environment = None
         if self._proc:
             with contextlib.suppress(Exception):
                 self._proc.stdin.close()  # type: ignore[union-attr]

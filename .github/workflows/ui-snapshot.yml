@@ -22,7 +22,13 @@ name: UI Snapshot
 #   pull_request       compare the rendered pages against the committed
 #                      baselines; fail (with actual/expected/diff PNGs in the
 #                      artifact) on any mismatch. No secrets, so fork PRs run
-#                      fine.
+#                      fine. The render job is gated on the `detect` job (below):
+#                      a PR that touches none of the render inputs (ap-web, the
+#                      visual tests + fixtures, the pinned toolchain) SKIPS the
+#                      render. We gate at the job (not via `on: paths:`) on
+#                      purpose -- a job skipped by `if` reports SUCCESS, so this
+#                      stays safe to register as a required check, whereas a
+#                      path-filtered *workflow* would sit "pending" and block.
 #   workflow_dispatch  regenerate the baselines with --update-snapshots in the
 #                      same pinned image; the regenerated PNGs are in the
 #                      `ui-snapshot-<run_id>` artifact to download and commit.
@@ -45,6 +51,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read  # detect: list the PR's changed files
 
 concurrency:
   group: ui-snapshot-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.ref || github.ref }}
@@ -62,8 +69,48 @@ env:
   UV_PYTHON_PREFERENCE: only-system
 
 jobs:
+  # Cheap pre-flight (no container/build): does this PR touch anything that can
+  # change the render? The heavy job below is `if`-gated on it, so non-UI PRs
+  # skip the render (no wasted CI, no flaking against unrelated changes). The
+  # render is a pure function of the ap-web bundle + the visual tests + their
+  # shared fixtures + the pinned toolchain (npm pin, the image digest in THIS
+  # file, and the playwright/plugin versions in the lock), so watch exactly
+  # those. Fails open: if the file list can't be fetched, render rather than
+  # risk a false pass.
+  detect:
+    name: Detect render-affecting changes
+    runs-on: ubuntu-latest
+    outputs:
+      ui: ${{ steps.changes.outputs.ui }}
+    steps:
+      - id: changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "${PR:-}" ]; then
+            echo "ui=true" >> "$GITHUB_OUTPUT"; echo "no PR (dispatch) -> render"; exit 0
+          fi
+          if ! files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename'); then
+            echo "ui=true" >> "$GITHUB_OUTPUT"; echo "file list unavailable -> render"; exit 0
+          fi
+          pattern='^(ap-web/|tests/e2e_ui/visual/|tests/e2e_ui/conftest\.py|\.github/actions/setup-node/|\.github/workflows/ui-snapshot\.yml|pyproject\.toml|uv\.lock)'
+          if printf '%s\n' "$files" | grep -qE "$pattern"; then
+            echo "ui=true" >> "$GITHUB_OUTPUT"
+            echo "render-affecting files changed:"
+            printf '%s\n' "$files" | grep -E "$pattern" | sed 's/^/  /'
+          else
+            echo "ui=false" >> "$GITHUB_OUTPUT"
+            echo "no render-affecting files changed -> skip the render"
+          fi
+
   ui-snapshot:
-    name: UI Snapshot (visual baselines)
+    name: UI Snapshot (visual baselines) [non-blocking]
+    needs: detect
+    # Skipped (not failed) when no render input changed -> reports SUCCESS, so a
+    # non-UI PR neither runs the render nor blocks a required check.
+    if: ${{ needs.detect.outputs.ui == 'true' }}
     runs-on: ubuntu-24.04
     # Render in the digest-pinned Playwright image (browsers + fonts baked in),
     # so the committed baseline and the PR comparison are byte-identical and a

@@ -13,9 +13,15 @@
 // the last choice instead of the hardcoded default. A deep-link ?view= URL
 // param overrides the stored preference transiently without mutating it.
 
+import { type ChangedSort, isValidSort } from "@/lib/changedSort";
+
 export interface FilesPanelPreferences {
   /** true = changed-files-only flat list, false = full folder tree ("All"). */
   changedOnly: boolean;
+  /** Sort order for the changed-files flat list. */
+  sort: ChangedSort;
+  /** true = the panel header is collapsed (content hidden). */
+  collapsed: boolean;
 }
 
 const STORAGE_KEY = "omnigent:files-panel-preferences";
@@ -24,6 +30,8 @@ const STORAGE_KEY = "omnigent:files-panel-preferences";
 // the working folder, not just the changed subset.
 export const DEFAULT_FILES_PANEL_PREFERENCES: FilesPanelPreferences = {
   changedOnly: false,
+  sort: "recent",
+  collapsed: false,
 };
 
 /**
@@ -46,6 +54,12 @@ export function readFilesPanelPreferences(): FilesPanelPreferences {
         typeof p.changedOnly === "boolean"
           ? p.changedOnly
           : DEFAULT_FILES_PANEL_PREFERENCES.changedOnly,
+      sort:
+        typeof p.sort === "string" && isValidSort(p.sort)
+          ? p.sort
+          : DEFAULT_FILES_PANEL_PREFERENCES.sort,
+      collapsed:
+        typeof p.collapsed === "boolean" ? p.collapsed : DEFAULT_FILES_PANEL_PREFERENCES.collapsed,
     };
   } catch {
     return DEFAULT_FILES_PANEL_PREFERENCES;

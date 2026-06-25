@@ -42,6 +42,15 @@ struct OmnigentWebView: UIViewRepresentable {
     webView.scrollView.backgroundColor = .clear
     webView.scrollView.contentInsetAdjustmentBehavior = .never
 
+    // Allow Safari Web Inspector to attach to the web content. Since iOS 16.4 a
+    // WKWebView is inspectable only when this is opt-in. Debug-only so shipping
+    // builds aren't inspectable.
+    #if DEBUG
+      if #available(iOS 16.4, *) {
+        webView.isInspectable = true
+      }
+    #endif
+
     let edgePan = UIScreenEdgePanGestureRecognizer(
       target: context.coordinator,
       action: #selector(Coordinator.handleLeftEdgePan(_:))
@@ -135,6 +144,21 @@ struct OmnigentWebView: UIViewRepresentable {
           try { callback(mode); } catch {}
         }
       });
+      const insetCallbacks = new Set();
+      // Cache the last footprint so a subscriber that registers AFTER native
+      // first emitted (the React app mounts later than document-start) still
+      // gets the current value immediately on subscribe.
+      let lastInsets = null;
+      defineEmit("__omnigentNativeEmitInsets", (topBar, bottomBar) => {
+        const insets = {
+          topBar: typeof topBar === "number" && Number.isFinite(topBar) ? topBar : 0,
+          bottomBar: typeof bottomBar === "number" && Number.isFinite(bottomBar) ? bottomBar : 0,
+        };
+        lastInsets = insets;
+        for (const callback of insetCallbacks) {
+          try { callback(insets); } catch {}
+        }
+      });
       const sidebarDragCallbacks = new Set();
       Object.defineProperty(window, "__omnigentNativeEmitSidebarDrag", {
         configurable: false,
@@ -208,6 +232,12 @@ struct OmnigentWebView: UIViewRepresentable {
           viewModeCallbacks.add(callback);
           return () => viewModeCallbacks.delete(callback);
         },
+        onNativeInsets(callback) {
+          if (typeof callback !== "function") return () => {};
+          insetCallbacks.add(callback);
+          if (lastInsets) { try { callback(lastInsets); } catch {} }
+          return () => insetCallbacks.delete(callback);
+        },
       });
     })();
     """
@@ -230,6 +260,7 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func detach() {
+      parent.model.cancelServerSwitcherWatchdog()
       webView = nil
     }
 
@@ -284,6 +315,9 @@ struct OmnigentWebView: UIViewRepresentable {
       _ userContentController: WKUserContentController, didReceive message: WKScriptMessage
     ) {
       guard isTrustedBridgeMessage(message) else { return }
+      // Any trusted message proves the page is alive and driving the bridge, so
+      // stand down the liveness watchdog — the page owns the switcher from here.
+      parent.model.cancelServerSwitcherWatchdog()
       guard let body = message.body as? [String: Any],
         let method = body["method"] as? String
       else { return }
@@ -322,6 +356,7 @@ struct OmnigentWebView: UIViewRepresentable {
       parent.model.isLoading = true
       parent.model.currentURL = webView.url ?? parent.model.currentURL
       parent.model.serverSwitcherHidden = true
+      parent.model.armServerSwitcherWatchdog()
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
@@ -468,6 +503,7 @@ struct OmnigentWebView: UIViewRepresentable {
       let nsError = error as NSError
       guard nsError.code != NSURLErrorCancelled else { return }
       parent.model.isLoading = false
+      parent.model.cancelServerSwitcherWatchdog()
 
       let failedURL = failedURL(from: nsError) ?? webView.url ?? pinnedURL ?? parent.initialURL
       guard failedURL.omnigentOrigin == pinnedOrigin else { return }

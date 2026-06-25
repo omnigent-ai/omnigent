@@ -25,6 +25,7 @@ import {
   type ResponseEndBlock,
   type ResponseStartBlock,
   type RetryBlock,
+  type RoutingDecisionBlock,
   type SlashCommandBlock,
   type TerminalCommandBlock,
   type TextChunk,
@@ -649,6 +650,20 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       return;
     }
 
+    // ── Intelligent model router decision ────────────
+    case "routing_decision": {
+      adoptResponseIdIfUnset(state, event.responseId);
+      yield {
+        type: "routing_decision",
+        ctx: ctx(state, event.itemId || null, event.responseId || null),
+        model: event.model,
+        tier: event.tier,
+        applied: event.applied,
+        rationale: event.rationale,
+      } satisfies RoutingDecisionBlock;
+      return;
+    }
+
     // ── Terminal command (!cmd) ──────────────────────
     case "terminal_command": {
       adoptResponseIdIfUnset(state, event.responseId);
@@ -757,7 +772,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // shows just `[llm]` with no hint as to what went wrong).
       yield {
         type: "error",
-        ctx: ctx(state),
+        ctx: ctx(state, event.itemId ?? null, event.responseId ?? null),
         message: event.error.message,
         source: event.source,
         code: event.error.code,

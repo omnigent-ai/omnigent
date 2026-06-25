@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
@@ -172,6 +173,12 @@ class _SessionSnapshot(Protocol):
 # by iTerm2/Warp/tmux). Updating the hint without updating the
 # binding would desync the user's expectation from what actually
 # fires.
+# NOTE: keep this list short enough that the bottom toolbar
+# (``{model · state} … hints … state: sleeping``) fits the e2e PTY
+# width (120 cols). Adding an entry here can wrap the toolbar and
+# split the ``state: sleeping`` sync marker the e2e harness waits on
+# (tests/e2e/omnigent/_pexpect_harness.py). /quit discoverability is
+# served by the grouped ``/help`` output instead.
 WELCOME_HINTS = ["/help help", "Ctrl+O debug", "Ctrl+T show tools", "Esc cancel", "Ctrl+C exit"]
 
 # Per-request item count for ``client.sessions.list_items``
@@ -4395,11 +4402,36 @@ async def _cmd_help(
 ) -> None:
     from rich.text import Text
 
-    lines = []
-    for name, (desc, _) in COMMANDS.items():
-        if name in ("/?", "/exit"):
-            continue  # Skip aliases.
-        lines.append(f"  [{fmt.accent}]{name}[/{fmt.accent}]  [{fmt.muted}]{desc}[/{fmt.muted}]")
+    # Grouped, column-aligned command help instead of a flat alphabetical
+    # wall. Commands not listed in a group still render (under "Other"), so a
+    # newly registered command is never silently hidden from /help.
+    groups: list[tuple[str, list[str]]] = [
+        ("Chat", ["/new", "/clear", "/switch", "/fork", "/history", "/cancel"]),
+        ("Context", ["/compact", "/context", "/model", "/effort"]),
+        ("Display", ["/theme"]),
+        ("Diagnostics", ["/logs", "/report"]),
+        ("Help", ["/help", "/quit"]),
+    ]
+    visible = {n: d for n, (d, _) in COMMANDS.items() if n not in ("/?", "/exit")}
+    grouped = {name for _, names in groups for name in names}
+    leftover = [n for n in visible if n not in grouped]
+    if leftover:
+        groups.append(("Other", leftover))
+
+    name_width = max((len(n) for n in visible), default=0)
+    lines: list[str] = []
+    for title, names in groups:
+        rows = [(n, visible[n]) for n in names if n in visible]
+        if not rows:
+            continue
+        if lines:
+            lines.append("")  # blank line between sections
+        lines.append(f"  [{fmt.muted}]{title}[/{fmt.muted}]")
+        for name, desc in rows:
+            padded = name.ljust(name_width)
+            lines.append(
+                f"    [{fmt.accent}]{padded}[/{fmt.accent}]  [{fmt.muted}]{desc}[/{fmt.muted}]"
+            )
     host.output(Text.from_markup("\n".join(lines)))
 
 
@@ -5630,8 +5662,12 @@ def _render_context_tree(
         + _CONTEXT_COIN_BUF * buf_coins
     )
 
-    free_tokens = max(context_window - message_tokens, 0)
     buf_tokens = int(context_window * buf_frac)
+    # Free space excludes the compaction buffer so the three rows partition the
+    # window (Messages + Free + Buffer = window) and each row's token count
+    # agrees with its own percentage. (Previously free omitted the buffer, so it
+    # read e.g. "920,150 tokens (72%)" — a count that is 92% of the window.)
+    free_tokens = max(context_window - message_tokens - buf_tokens, 0)
     used_pct = used_frac * 100.0
 
     tree.add(
@@ -7941,6 +7977,13 @@ def _render_history_item(
 _SLASH_COMMAND_ALIASES: frozenset[str] = frozenset({"/?", "/exit"})
 
 
+# A skill name must read as a slash-command token: an alphanumeric start then
+# word chars, ``:`` (Claude ``plugin:skill``), or ``-`` (Cursor ``plugin--skill``).
+# Rejects whitespace, ``/``, and control characters. Mirrors the web composer's
+# SLASH_COMMAND_RE so the terminal and the menu agree on what is a command.
+_SKILL_COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9][\w:-]*$")
+
+
 def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     """
     Auto-register each discovered skill as a REPL slash command.
@@ -7950,6 +7993,12 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     global :data:`COMMANDS` registry. Collisions are skipped with a
     warning log so built-in commands always win.
 
+    Skills marked ``user-invocable: false`` are skipped — they are
+    internal orchestration skills, not user-typeable slash commands, so
+    they must not appear in the REPL's slash-command/autocomplete surface
+    (the same contract the web composer menu honors). The skill stays
+    loadable by the agent itself; only the user-facing command is hidden.
+
     :param skills: The agent's parsed skill list.
     :returns: List of registered command names (e.g. ``["/code-review"]``).
         Callers should pass this to :func:`unregister_skill_commands`
@@ -7957,6 +8006,17 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     """
     registered: list[str] = []
     for skill in skills:
+        if not skill.user_invocable:
+            continue
+        if not _SKILL_COMMAND_NAME_RE.match(skill.name):
+            # A name with whitespace, ``/``, or control chars yields an
+            # uninvocable or colliding command — skip + warn rather than
+            # register garbage. Mirrors the web composer's SLASH_COMMAND_RE.
+            _log.warning(
+                "Skill %r skipped: name is not a valid slash-command token",
+                skill.name,
+            )
+            continue
         cmd_name = f"/{skill.name}"
         if cmd_name in COMMANDS:
             _log.warning(
