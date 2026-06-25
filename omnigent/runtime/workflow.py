@@ -141,7 +141,7 @@ _logger = logging.getLogger(__name__)
 
 
 AgentHarnessType = Literal[
-    "claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "qwen", "goose"
+    "claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "kimi", "qwen", "goose"
 ]
 
 
@@ -433,6 +433,10 @@ _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     "openai-agents-sdk": "HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE",
     "qwen": "HARNESS_QWEN_DATABRICKS_PROFILE",
     # NB: no ``antigravity`` — it has no Databricks/gateway path (Gemini-native).
+    # NB: no ``kimi`` — upstream kimi has no per-spawn provider override flag,
+    # so Omnigent cannot thread a Databricks gateway through. Users configure
+    # providers via ``kimi provider add`` in ``~/.kimi/config.toml``
+    # (Omnigent-side provider injection is a deferred follow-up).
 }
 
 
@@ -1626,6 +1630,66 @@ def _build_cursor_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_CURSOR_OS_ENV"] = os_env_payload
+    return env
+
+
+def _build_kimi_spawn_env(
+    spec: AgentSpec,
+    *,
+    cwd: Path | None = None,
+) -> dict[str, str]:
+    """Build the env-var dict the kimi harness wrap reads.
+
+    Maps ``spec.executor`` fields → the ``HARNESS_KIMI_*`` env vars
+    defined in :mod:`omnigent.inner.kimi_harness`.
+
+    The upstream Kimi Code CLI has no per-spawn provider override flag
+    (no ``--config-file`` / ``--mcp-config-file``), so this builder
+    only threads the model, working directory, and ``os_env`` sandbox
+    spec. Provider routing for kimi lives in ``~/.kimi/config.toml``
+    and is managed out-of-band via ``kimi provider add``. Unlike the
+    sibling builders, ``_build_kimi_spawn_env`` never calls
+    :func:`configure_agent_harness_with_provider` (there is no env-var
+    surface to translate a provider into), so the rejection of declared
+    auth has to live here: a spec that declares an explicit
+    provider / Databricks / api_key auth raises directly so the user
+    understands why their auth didn't take effect rather than silently
+    routing through whatever default kimi already had.
+
+    :param spec: The agent spec.
+    :param cwd: Runtime working directory for the kimi subprocess — the
+        session workspace (the folder the user launched in), NOT the agent
+        bundle dir. Threaded as ``HARNESS_KIMI_CWD`` so kimi's tools operate on
+        the user's project rather than the /tmp bundle (upstream kimi has no
+        ``--work-dir`` flag, so the subprocess ``cwd=`` is the only lever).
+        When unset, the harness wrap falls back to ``OMNIGENT_RUNNER_WORKSPACE``.
+        Mirrors :func:`_build_pi_spawn_env`'s ``cwd`` handling.
+    :returns: A dict of env-var overrides.
+    :raises OmnigentError: If the spec declares ``executor.auth`` —
+        upstream kimi has no per-spawn provider override, so the
+        declared auth cannot be honored and we fail loud rather than
+        launch against an unrelated ambient provider.
+    """
+    if spec.executor.auth is not None:
+        raise OmnigentError(
+            "The 'kimi' harness does not support per-invocation provider / "
+            "auth injection: upstream kimi has no per-spawn config override "
+            "(no ``--config-file`` / ``--mcp-config-file``). Remove "
+            "``executor.auth`` from the spec and configure the provider once "
+            "via `kimi provider add` in ~/.kimi/config.toml, then pin the "
+            "resulting model id in the agent spec. Omnigent-side provider "
+            "injection is a deferred follow-up.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_KIMI_MODEL"] = model
+    if cwd is not None:
+        env["HARNESS_KIMI_CWD"] = str(cwd)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_KIMI_OS_ENV"] = os_env_payload
     return env
 
 

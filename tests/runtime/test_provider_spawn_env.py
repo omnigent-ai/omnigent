@@ -29,6 +29,7 @@ from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
     _build_codex_spawn_env,
     _build_goose_spawn_env,
+    _build_kimi_spawn_env,
     _build_openai_agents_sdk_spawn_env,
     _build_pi_spawn_env,
     _build_qwen_spawn_env,
@@ -93,6 +94,7 @@ def _make_spec(
     model: str | None = None,
     profile: str | None = None,
     auth: ApiKeyAuth | DatabricksAuth | ProviderAuth | None = None,
+    os_env: object | None = None,
 ) -> AgentSpec:
     """
     Build a minimal :class:`AgentSpec` for a given harness.
@@ -117,6 +119,7 @@ def _make_spec(
         instructions="You are a test agent.",
         executor=ExecutorSpec(type="omnigent", config=config, model=model, auth=auth),
         llm=LLMConfig(model=model) if model is not None else None,
+        os_env=os_env,  # type: ignore[arg-type]
     )
 
 
@@ -1005,3 +1008,124 @@ def test_codex_undismissed_config_provider_routes_via_detection(
     env = _build_codex_spawn_env(spec, workdir=None)
 
     assert env["HARNESS_CODEX_MODEL_PROVIDER"] == "Databricks"
+
+
+# ── Kimi Code CLI spawn-env ────────────────────────────────────────────────
+
+
+def test_kimi_spawn_env_threads_spec_model_only(config_home: Path) -> None:
+    """The kimi builder only emits ``HARNESS_KIMI_MODEL`` (when set) and
+    ``HARNESS_KIMI_CWD`` (when workdir given). Upstream kimi has no per-spawn
+    provider override, so no HARNESS_KIMI_GATEWAY_* / _DATABRICKS_PROFILE
+    env vars are emitted — provider routing lives in ``~/.kimi/config.toml``."""
+    _write_config(config_home, {"providers": {}})
+    spec = _make_spec(harness="kimi", model="kimi-k2-turbo")
+
+    env = _build_kimi_spawn_env(spec, cwd=None)
+
+    assert env == {"HARNESS_KIMI_MODEL": "kimi-k2-turbo"}
+
+
+def test_kimi_cwd_threads_through_as_subprocess_cwd(config_home: Path, tmp_path: Path) -> None:
+    """``cwd`` (the session workspace) lands in ``HARNESS_KIMI_CWD`` so kimi's
+    subprocess operates on the user's project — NOT the /tmp agent bundle dir.
+
+    Regression: the builder previously threaded the bundle ``workdir`` here, so
+    `omni --harness kimi` / web kimi sessions ran kimi out of the bundle dir and
+    it reported only ``kimi.yaml`` instead of the repo. Mirrors pi's cwd."""
+    _write_config(config_home, {"providers": {}})
+    spec = _make_spec(harness="kimi")
+
+    env = _build_kimi_spawn_env(spec, cwd=tmp_path)
+
+    assert env["HARNESS_KIMI_CWD"] == str(tmp_path)
+
+
+def test_kimi_no_provider_emits_no_gateway_vars(config_home: Path) -> None:
+    """With no provider configured and no spec auth, kimi uses its own
+    ``kimi login`` credentials — no HARNESS_KIMI_GATEWAY_* leaks in.
+
+    A regression here would either steal an ambient OPENAI_API_KEY (mis-billing)
+    or point at a stale URL the user never configured. Upstream kimi reads its
+    provider config from ``~/.kimi/config.toml``; Omnigent never injects."""
+    _write_config(config_home, {"providers": {}})
+    spec = _make_spec(harness="kimi")
+
+    env = _build_kimi_spawn_env(spec, cwd=None)
+
+    assert "HARNESS_KIMI_GATEWAY_BASE_URL" not in env
+    assert "HARNESS_KIMI_GATEWAY_API_KEY" not in env
+    assert "HARNESS_KIMI_GATEWAY_PROVIDER" not in env
+    assert "HARNESS_KIMI_DATABRICKS_PROFILE" not in env
+
+
+def test_kimi_ignores_global_default_provider(config_home: Path) -> None:
+    """An openai default provider does NOT inject creds into the kimi env.
+
+    Counterpart to the other harnesses: their spawn-env builders adopt the
+    global default. For kimi we DO NOT — upstream has no per-spawn provider
+    override flag, so silently injecting a key the executor can't pass to the
+    subprocess would be misleading (and would mis-bill the user against an
+    OpenAI key when their ``~/.kimi/config.toml`` actually points at
+    Moonshot). The builder emits no gateway vars regardless of what's
+    configured."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness="kimi")
+
+    env = _build_kimi_spawn_env(spec, cwd=None)
+
+    assert "HARNESS_KIMI_GATEWAY_BASE_URL" not in env
+    assert "HARNESS_KIMI_GATEWAY_API_KEY" not in env
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        ApiKeyAuth(api_key="sk-secret"),
+        DatabricksAuth(profile="my-profile"),
+        ProviderAuth(name="vendor-named"),
+    ],
+)
+def test_kimi_declared_auth_raises(
+    config_home: Path,
+    auth: ApiKeyAuth | DatabricksAuth | ProviderAuth,
+) -> None:
+    """A kimi spec that declares any ``executor.auth`` fails loud.
+
+    Upstream kimi has no per-spawn provider override (no ``--config-file`` /
+    ``--mcp-config-file``), so declared auth can't be threaded. Silently
+    launching against whatever ambient ``~/.kimi/config.toml`` resolves to
+    would be a confused-deputy / mis-attribution risk, so the builder raises
+    instead. Regression guard for the originally-dead ``OmnigentError``."""
+    from omnigent.errors import OmnigentError
+
+    _write_config(config_home, {"providers": {}})
+    spec = _make_spec(harness="kimi", auth=auth)
+
+    with pytest.raises(OmnigentError, match=r"kimi.*does not support"):
+        _build_kimi_spawn_env(spec, cwd=None)
+
+
+def test_kimi_os_env_serialized(config_home: Path) -> None:
+    """``spec.os_env`` is serialized into ``HARNESS_KIMI_OS_ENV`` so the wrap
+    can rebuild the sandbox spec and confine kimi's in-process Bash/edit/read
+    tools — parity with every sibling builder. Without this the executor's
+    sandbox launcher never engages and kimi runs unconfined."""
+    import json as _json
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    _write_config(config_home, {"providers": {}})
+    os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=None,
+        sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"),
+        fork=False,
+    )
+    spec = _make_spec(harness="kimi", os_env=os_env)
+
+    env = _build_kimi_spawn_env(spec, cwd=None)
+
+    assert "HARNESS_KIMI_OS_ENV" in env
+    decoded = _json.loads(env["HARNESS_KIMI_OS_ENV"])
+    assert decoded["sandbox"]["type"] == "darwin_seatbelt"

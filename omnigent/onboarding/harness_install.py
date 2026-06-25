@@ -57,6 +57,11 @@ QWEN_KEY = "qwen"
 # installer rather than npm — so it carries an ``install_hint``, not a ``package``.
 CURSOR_KEY = "cursor"
 
+# Kimi authenticates against Moonshot AI's backend (``kimi login`` OAuth or a
+# Moonshot API key), not via the ambient provider config; like Cursor it ships
+# via a curl installer rather than npm, so it carries an ``install_hint``.
+KIMI_KEY = "kimi"
+
 # Kiro authenticates against its own backend and ships as a standalone native
 # installer, not an npm package managed by ``omnigent setup``.
 KIRO_KEY = "kiro"
@@ -183,6 +188,21 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint="curl https://cursor.com/install -fsS | bash",
         login_status_key="isAuthenticated",
     ),
+    # Kimi Code CLI ships a single-binary ``kimi`` via a curl installer (no
+    # npm). ``kimi login`` is the interactive provider login (OAuth or a
+    # Moonshot API key). ``status_args`` is intentionally ``None``: kimi has
+    # no first-class "am I logged in?" exit-code probe — login state is
+    # only inspected interactively. With ``None`` the login path runs every
+    # time the operator asks for it (interactive, so they can cancel if
+    # already authenticated).
+    KIMI_KEY: HarnessInstallSpec(
+        "Kimi",
+        "kimi",
+        package=None,
+        login_args=("login",),
+        logout_args=("logout",),
+        install_hint="curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+    ),
     KIRO_KEY: HarnessInstallSpec(
         "Kiro",
         "kiro-cli",
@@ -246,6 +266,11 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "codex-native": OPENAI_FAMILY,
     PI_KEY: PI_KEY,
     "pi-native": PI_KEY,
+    # Kimi is multi-provider but binary-gated: cannot launch without the
+    # ``kimi`` CLI on PATH. Listed here so ``required_cli_for_harness``
+    # returns its install spec and ``missing_harness_cli`` fails loud
+    # before a subagent spawn.
+    KIMI_KEY: KIMI_KEY,
     "cursor-native": CURSOR_KEY,
     "native-cursor": CURSOR_KEY,
     "kiro-native": KIRO_KEY,
@@ -261,6 +286,9 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same
     # ``goose`` CLI as the native TUI, so it gates on the same binary.
     GOOSE_KEY: GOOSE_KEY,
+    # Native Kimi TUI harness — same binary gate as the bare ``kimi`` surface.
+    "kimi-native": KIMI_KEY,
+    "native-kimi": KIMI_KEY,
     QWEN_KEY: QWEN_KEY,
     "qwen-code": QWEN_KEY,
     # Native qwen TUI (``qwen-native``) wraps the same ``qwen`` CLI as the ACP
@@ -369,7 +397,7 @@ def harness_cli_installed(key: str) -> bool:
     ``claude-sdk`` harness can run without the ``claude`` CLI.
 
     :param key: A harness family (``"anthropic"`` / ``"openai"``) or
-        :data:`PI_KEY`.
+        :data:`PI_KEY` / :data:`KIMI_KEY`.
     :returns: ``True`` when the CLI is on ``PATH``; ``False`` when it isn't or
         the key has no associated CLI.
     """

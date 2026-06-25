@@ -33,6 +33,7 @@ _SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
         "openai-agents",
         "cursor",
         "antigravity",
+        "kimi",
         "qwen",
         "goose",
         "copilot",

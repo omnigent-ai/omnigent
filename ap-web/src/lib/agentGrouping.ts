@@ -21,6 +21,7 @@ export const BUILTIN_AGENTS = new Set([
   "antigravity-native-ui", // Antigravity
   "goose-native-ui", // Goose
   "qwen-native-ui", // Qwen Code
+  "kimi-native-ui", // Kimi
   "polly",
   "debby",
 ]);
@@ -38,6 +39,7 @@ export const AGENT_DISPLAY_ORDER = [
   "Kiro",
   "Antigravity",
   "Qwen Code",
+  "Kimi",
   "Polly",
   "Debby",
 ];

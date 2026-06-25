@@ -1065,6 +1065,14 @@ def _redirect_native_resume_if_needed(
             progress=progress,
         )
         return True
+    if native_agent.key == "kimi":
+        _run_kimi_native_resume_redirect(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            auto_open_conversation=auto_open_conversation,
+            progress=progress,
+        )
+        return True
     return False
 
 
@@ -1256,6 +1264,44 @@ def _run_cursor_native_resume_redirect(
         server=base_url,
         session_id=conversation_id,
         cursor_args=(),
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+def _run_kimi_native_resume_redirect(
+    *,
+    base_url: str,
+    conversation_id: str,
+    auto_open_conversation: bool,
+    progress: RunnerStartupProgress | None,
+) -> None:
+    """
+    Hand a kimi-native conversation back to ``omnigent kimi``.
+
+    The kimi-native session is driven by the ``kimi`` TUI in a runner-owned
+    tmux pane. Resuming through the Omnigent REPL would run an Omnigent turn
+    per message instead of attaching to the live TUI; redirecting to
+    ``omnigent kimi``'s direct tmux attach keeps the TUI the single source of
+    turns. Mirrors :func:`_run_cursor_native_resume_redirect`.
+
+    :param base_url: Omnigent server base URL.
+    :param conversation_id: Omnigent conversation id.
+    :param auto_open_conversation: Browser-open preference for the wrapper.
+    :param progress: Optional Omnigent startup spinner to finish before redirect.
+    :returns: None.
+    """
+    _finish_native_redirect_progress(
+        progress=progress,
+        conversation_id=conversation_id,
+        wrapper_name="kimi-native",
+        native_command="kimi",
+    )
+    from omnigent.kimi_native import run_kimi_native
+
+    run_kimi_native(
+        server=base_url,
+        session_id=conversation_id,
+        kimi_args=(),
         auto_open_conversation=auto_open_conversation,
     )
 
