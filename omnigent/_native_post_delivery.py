@@ -24,6 +24,13 @@ from collections.abc import Callable, Coroutine
 
 import httpx
 
+from omnigent._native_forwarder_health import (
+    note_post_success as note_native_post_success,
+)
+from omnigent._native_forwarder_health import (
+    record_post_failure as record_native_post_failure,
+)
+
 _logger = logging.getLogger(__name__)
 
 # Transport failures proving a POST never reached the server (no bytes
@@ -131,9 +138,19 @@ async def post_session_event_with_retry(
                     max_attempts,
                     exc,
                 )
+                # Surface this connectivity failure to the harness idle-turn
+                # watchdog so a stall caused by unreachable-server posts is
+                # reported with its real cause, not a generic "wedged LLM"
+                # reason (issue #1119).
+                record_native_post_failure(event_type, exc)
                 return None
             await sleep(retry_delay(attempt))
             continue
+        # Reaching here means the POST got an HTTP response (no transport
+        # error), proving the server is reachable — clear any stale
+        # connectivity-failure record so the watchdog can't later misattribute
+        # it to an unrelated stall (issue #1119).
+        note_native_post_success()
         if response.status_code < 400:
             return response
         if response.status_code not in retry_status_codes:

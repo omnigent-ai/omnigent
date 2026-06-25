@@ -1720,3 +1720,63 @@ async def test_on_shutdown_hook_called_during_lifespan_teardown(
         assert content == "shutdown_called"
     finally:
         await mgr.shutdown()
+
+
+# ── Idle-watchdog surfaces forwarder connectivity cause (issue #1119) ──
+#
+# The pure-module unit test for ``_native_forwarder_health`` (record / recency
+# / clear) lives in ``tests/test_native_forwarder_health.py``. This file keeps
+# only the watchdog-integration test, which needs the harness scaffold.
+
+
+async def test_idle_watchdog_attaches_recent_forwarder_post_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Idle-watchdog failure names a recent forwarder connectivity error.
+
+    Regression for issue #1119: when a native forwarder can't reach the server
+    its event POSTs starve the turn of progress, so the idle watchdog — not the
+    connectivity error — fails the turn. The watchdog must attach that recorded
+    POST failure to the reason instead of only the generic "wedged LLM" text.
+
+    Fails on the unfixed watchdog (reason omits the forwarder cause); passes
+    once the watchdog reads ``_native_forwarder_health``.
+    """
+    from omnigent import _native_forwarder_health as health
+    from omnigent.runtime.harnesses import _scaffold
+
+    class _WedgedApp(HarnessApp):
+        async def run_turn(self, request: Any, ctx: TurnContext) -> None:
+            """Never emit progress, so the idle watchdog must fire."""
+            del request, ctx
+            await asyncio.Event().wait()
+
+    # Short idle window so the watchdog trips quickly; absolute kept high so the
+    # idle ceiling (not the absolute one) is what fails the turn. The reader's
+    # recency window is 2x the idle timeout, comfortably covering the record
+    # made just before run_turn started plus scheduling overhead.
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 3600.0)
+
+    health.clear()
+    health.record_post_failure("external_session_status", httpx.ConnectError("No route to host"))
+
+    app = _WedgedApp()
+    ctx = TurnContext(
+        response_id="resp_watchdog_1119",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            await app._guarded_run_turn(None, ctx)  # type: ignore[arg-type]
+    finally:
+        health.clear()
+
+    message = str(excinfo.value)
+    # Names the idle ceiling (not the absolute one) so we know which watchdog
+    # fired, and carries the full recorded forwarder detail — both the event
+    # type and the connectivity error, not just a coincidental substring.
+    assert "idle watchdog" in message, message
+    assert "external_session_status" in message, message
+    assert "No route to host" in message, message

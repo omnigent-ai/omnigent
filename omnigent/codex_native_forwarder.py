@@ -13,6 +13,12 @@ from typing import Any
 
 import httpx
 
+from omnigent._native_forwarder_health import (
+    note_post_success as note_native_post_success,
+)
+from omnigent._native_forwarder_health import (
+    record_post_failure as record_native_post_failure,
+)
 from omnigent._native_post_delivery import post_may_have_been_delivered
 from omnigent.claude_native_bridge import url_component
 from omnigent.codex_native_app_server import (
@@ -4760,6 +4766,11 @@ async def _post_session_event(
                 return None
             await _sleep(_post_retry_delay(attempt))
             continue
+        # An HTTP response (no transport error) proves the server is reachable,
+        # so clear any stale connectivity-failure record — otherwise a recovered
+        # connection could have an old failure misattributed to a later,
+        # unrelated idle-watchdog stall (issue #1119).
+        note_native_post_success()
         if _post_response_is_final(response, attempt):
             return response
         await _sleep(_post_retry_delay(attempt))
@@ -4806,6 +4817,11 @@ def _log_post_transport_failure(event_type: str, exc: httpx.HTTPError) -> None:
         _POST_MAX_ATTEMPTS,
         exc,
     )
+    # Surface this connectivity failure to the harness idle-turn watchdog: if
+    # the turn stalls because events can't reach the server, the watchdog
+    # attaches this cause to the failure reason instead of a generic
+    # "wedged LLM" message (issue #1119).
+    record_native_post_failure(event_type, exc)
 
 
 def _log_failed_session_event_post(
