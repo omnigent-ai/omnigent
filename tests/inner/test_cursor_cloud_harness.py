@@ -1,19 +1,20 @@
 """Tests for the ``harness: cursor-cloud`` wrap shape.
 
 Verifies the module-registry entry, FastAPI routes, and env-var-driven lazy
-executor construction. The inner ``CursorCloudExecutor.__init__`` is mocked so
-the test runs without a live cloud client / ``cursor-sdk`` call.
+executor construction. ``CursorCloudExecutor.__init__`` is pure (no ``cursor-sdk``
+import — that is lazily imported inside ``run_turn``), so the env-var tests build
+the REAL executor and assert its private fields, rather than mocking the
+constructor (which would only prove the mock captured kwargs).
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any
-from unittest.mock import patch
 
 import pytest
 
 from omnigent.inner import cursor_cloud_harness
+from omnigent.inner.cursor_cloud_executor import CursorCloudExecutor
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 
 
@@ -36,29 +37,18 @@ def test_executor_factory_reads_env_vars(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("HARNESS_CURSOR_CLOUD_CWD", "/tmp/test-cwd")
     monkeypatch.setenv("HARNESS_CURSOR_CLOUD_AGENT_NAME", "demo")
 
-    captured: dict[str, Any] = {}
+    # The constructor is pure (cursor-sdk is imported lazily inside run_turn),
+    # so build the REAL executor and assert its resolved private fields.
+    executor = cursor_cloud_harness._build_cursor_cloud_executor()
+    assert isinstance(executor, CursorCloudExecutor)
 
-    def _fake_init(self: Any, **kwargs: Any) -> None:
-        captured.update(kwargs)
-
-    with patch(
-        "omnigent.inner.cursor_cloud_harness.CursorCloudExecutor.__init__",
-        _fake_init,
-    ):
-        cursor_cloud_harness._build_cursor_cloud_executor()
-
-    assert captured["model"] == "claude-4.6-sonnet-thinking"
-    assert captured["api_key"] == "crsr_secret"
-    assert captured["repo_url"] == "https://github.com/org/repo"
-    assert captured["ref"] == "main"
-    assert captured["cwd"] == "/tmp/test-cwd"
-    assert captured["agent_name"] == "demo"
-    # Default os_env when unset: caller_process + sandbox=none.
-    os_env_value = captured["os_env"]
-    assert os_env_value is not None
-    assert os_env_value.type == "caller_process"
-    assert os_env_value.sandbox is not None
-    assert os_env_value.sandbox.type == "none"
+    assert executor._model_override == "claude-4.6-sonnet-thinking"
+    assert executor._api_key == "crsr_secret"
+    assert executor._repo_url == "https://github.com/org/repo"
+    assert executor._ref == "main"
+    assert executor._agent_name == "demo"
+    # HARNESS_CURSOR_CLOUD_CWD takes precedence over the os_env cwd.
+    assert executor._cwd == "/tmp/test-cwd"
 
 
 def test_executor_factory_unset_optional_env_passes_none(
@@ -71,59 +61,43 @@ def test_executor_factory_unset_optional_env_passes_none(
         "HARNESS_CURSOR_CLOUD_REF",
         "HARNESS_CURSOR_CLOUD_CWD",
         "HARNESS_CURSOR_CLOUD_AGENT_NAME",
+        "HARNESS_CURSOR_CLOUD_OS_ENV",
     ):
         monkeypatch.delenv(var, raising=False)
 
-    captured: dict[str, Any] = {}
+    executor = cursor_cloud_harness._build_cursor_cloud_executor()
+    assert isinstance(executor, CursorCloudExecutor)
 
-    def _fake_init(self: Any, **kwargs: Any) -> None:
-        captured.update(kwargs)
-
-    with patch(
-        "omnigent.inner.cursor_cloud_harness.CursorCloudExecutor.__init__",
-        _fake_init,
-    ):
-        cursor_cloud_harness._build_cursor_cloud_executor()
-
-    assert captured["model"] is None
-    assert captured["api_key"] is None
-    assert captured["repo_url"] is None
-    assert captured["ref"] is None
-    assert captured["cwd"] is None
-    assert captured["agent_name"] is None
+    assert executor._model_override is None
+    # API key unset -> None (the spawn-env builder resolves the key before spawn;
+    # the wrap just reads the resolved value).
+    assert executor._api_key is None
+    assert executor._repo_url is None
+    assert executor._ref is None
+    assert executor._agent_name is None
+    # No cwd env and default os_env (cwd=None) -> None.
+    assert executor._cwd is None
 
 
 def test_executor_factory_decodes_os_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HARNESS_CURSOR_CLOUD_CWD", raising=False)
     monkeypatch.setenv(
         "HARNESS_CURSOR_CLOUD_OS_ENV",
         json.dumps({"type": "caller_process", "cwd": "/srv/app", "sandbox": {"type": "none"}}),
     )
-    captured: dict[str, Any] = {}
 
-    def _fake_init(self: Any, **kwargs: Any) -> None:
-        captured["os_env"] = kwargs["os_env"]
-
-    with patch(
-        "omnigent.inner.cursor_cloud_harness.CursorCloudExecutor.__init__",
-        _fake_init,
-    ):
-        cursor_cloud_harness._build_cursor_cloud_executor()
-
-    assert captured["os_env"].cwd == "/srv/app"
+    executor = cursor_cloud_harness._build_cursor_cloud_executor()
+    assert isinstance(executor, CursorCloudExecutor)
+    # With no HARNESS_CURSOR_CLOUD_CWD, the os_env cwd seeds the executor cwd.
+    assert executor._cwd == "/srv/app"
 
 
 def test_malformed_os_env_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HARNESS_CURSOR_CLOUD_CWD", raising=False)
     monkeypatch.setenv("HARNESS_CURSOR_CLOUD_OS_ENV", "{not-json")
-    captured: dict[str, Any] = {}
 
-    def _fake_init(self: Any, **kwargs: Any) -> None:
-        captured["os_env"] = kwargs["os_env"]
-
-    with patch(
-        "omnigent.inner.cursor_cloud_harness.CursorCloudExecutor.__init__",
-        _fake_init,
-    ):
-        cursor_cloud_harness._build_cursor_cloud_executor()
-
-    assert captured["os_env"].type == "caller_process"
-    assert captured["os_env"].sandbox.type == "none"
+    # A malformed os_env falls back to the default (cwd=None), so the executor's
+    # cwd is None rather than crashing the constructor.
+    executor = cursor_cloud_harness._build_cursor_cloud_executor()
+    assert isinstance(executor, CursorCloudExecutor)
+    assert executor._cwd is None

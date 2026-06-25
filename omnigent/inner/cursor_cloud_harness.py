@@ -16,8 +16,10 @@ Env vars read at startup:
   ``claude-4.6-sonnet-thinking``). ``None`` / a ``databricks-*`` id resolves to
   the cloud default.
 - ``HARNESS_CURSOR_CLOUD_API_KEY``: Cursor API key (the same ``crsr_`` key the
-  local ``cursor`` harness uses). ``None`` falls back to ambient
-  ``CURSOR_API_KEY``.
+  local ``cursor`` harness uses). The runner-side spawn-env builder
+  (``_build_cursor_cloud_spawn_env``) resolves the key (spec api-key > stored
+  cursor key > ambient ``CURSOR_API_KEY``) before spawn; this wrap simply reads
+  the already-resolved value, passing ``None`` when it is unset.
 - ``HARNESS_CURSOR_CLOUD_REPO`` / ``HARNESS_CURSOR_CLOUD_REF``: the GitHub repo
   URL + starting ref the cloud agent clones. Resolved by the spawn-env builder
   from the cwd ``origin`` remote (or an override).

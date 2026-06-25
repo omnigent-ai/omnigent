@@ -27,7 +27,9 @@ from omnigent.inner.cursor_cloud_executor import (
 from omnigent.inner.executor import (
     ExecutorError,
     Message,
+    ReasoningChunk,
     TextChunk,
+    ToolCallRequest,
     TurnCancelled,
     TurnComplete,
 )
@@ -41,6 +43,18 @@ def _assistant(text: str) -> SimpleNamespace:
     return SimpleNamespace(
         type="assistant",
         message=SimpleNamespace(content=[SimpleNamespace(type="text", text=text)]),
+    )
+
+
+def _thinking(text: str) -> SimpleNamespace:
+    return SimpleNamespace(type="thinking", text=text)
+
+
+def _tool(
+    name: str, call_id: str, status: str, args: Any = None, result: Any = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        type="tool_call", name=name, call_id=call_id, status=status, args=args, result=result
     )
 
 
@@ -201,6 +215,9 @@ async def test_run_turn_happy_path_appends_pr_url(monkeypatch: pytest.MonkeyPatc
     response = completes[0].response
     assert "Fixed the bug." in response
     assert "https://github.com/org/repo/pull/42" in response
+    # The prompt sent to agent.send is the first-turn prompt: the system prompt
+    # prepended to the user message (see _build_cursor_prompt).
+    assert state["sent"] == ["SYS\n\nfix it"]
     # Client constructed with the cloud base URL + auth token and torn down.
     assert state["base_urls"] == ["https://api.cursor.com"]
     assert state["auth_tokens"] == ["crsr_x"]
@@ -235,6 +252,68 @@ async def test_run_turn_branch_only_notes_no_pr(monkeypatch: pytest.MonkeyPatch)
     response = completes[0].response
     assert "cursor/wip" in response
     assert "no PR opened" in response
+
+
+async def test_run_turn_maps_thinking_and_tool_call_stream_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared SDK->ExecutorEvent mapping surfaces ``thinking`` as a
+    ReasoningChunk and a running ``tool_call`` as a ToolCallRequest (tools run in
+    the cloud VM, so they are informational, not bridged)."""
+    _install_fake_sdk(
+        monkeypatch,
+        messages=[
+            _thinking("planning the fix"),
+            _tool("Read", "t1", "running", args={"path": "f.py"}),
+            _assistant("done"),
+        ],
+        status="finished",
+        result_text="done",
+        git=SimpleNamespace(branches=[]),
+    )
+    executor = CursorCloudExecutor(repo_url="https://github.com/org/repo", api_key="crsr_x")
+    events = [e async for e in executor.run_turn([_user("fix it")], [], "SYS")]
+
+    reasoning = [e for e in events if isinstance(e, ReasoningChunk)]
+    assert len(reasoning) == 1 and reasoning[0].delta == "planning the fix"
+
+    reqs = [e for e in events if isinstance(e, ToolCallRequest)]
+    assert len(reqs) == 1
+    assert reqs[0].name == "Read"
+    assert reqs[0].args == {"path": "f.py"}
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+
+
+async def test_run_turn_turn_ended_update_carries_normalized_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream event whose ``interaction_update`` is a ``turn-ended`` with a usage
+    dict produces a TurnComplete carrying the normalized usage."""
+    turn_ended = SimpleNamespace(
+        type="turn-ended",
+        usage={"inputTokens": 1000, "outputTokens": 200, "totalTokens": 1200},
+    )
+    _install_fake_sdk(
+        monkeypatch,
+        messages=[_assistant("done")],
+        interaction_updates=[turn_ended],
+        status="finished",
+        result_text="done",
+        git=SimpleNamespace(branches=[]),
+    )
+    executor = CursorCloudExecutor(repo_url="https://github.com/org/repo", api_key="crsr_x")
+    events = [e async for e in executor.run_turn([_user("fix it")], [], "SYS")]
+
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completes) == 1
+    usage = completes[0].usage
+    assert usage is not None
+    assert usage["input_tokens"] == 1000
+    assert usage["output_tokens"] == 200
+    assert usage["total_tokens"] == 1200
+    # Resolved cloud default model is recorded on the usage dict.
+    assert usage["model"] == "composer-2.5"
 
 
 async def test_run_turn_auto_create_pr_threaded(monkeypatch: pytest.MonkeyPatch) -> None:

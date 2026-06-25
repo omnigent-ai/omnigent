@@ -14,6 +14,7 @@ Unit test — no subprocess spawn. The repo-resolution path is exercised via the
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,31 @@ def _make_spec(
 # ---------------------------------------------------------------------------
 # Repo / ref resolution
 # ---------------------------------------------------------------------------
+
+
+def _init_repo(path: Path, *, remote: str | None, branch: str = "feature/x") -> None:
+    """Initialize a git repo at *path* on *branch*, optionally with an origin remote."""
+    subprocess.run(["git", "init", "-q", "-b", branch, str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "t@t.t"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "t"], check=True)
+    if remote is not None:
+        subprocess.run(["git", "-C", str(path), "remote", "add", "origin", remote], check=True)
+    (path / "f.txt").write_text("x")
+    subprocess.run(["git", "-C", str(path), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", "init"], check=True)
+
+
+def test_cwd_origin_remote_resolves_repo_and_ref(tmp_path: Path) -> None:
+    """The default runtime path: no OMNIGENT_CURSOR_CLOUD_REPO/REF override, so the
+    repo + ref are derived from the cwd's ``origin`` remote and current branch.
+
+    (The autouse fixture already clears the override env vars.)
+    """
+    _init_repo(tmp_path, remote="git@github.com:org/repo.git", branch="feature/x")
+    env = _build_cursor_cloud_spawn_env(_make_spec(), cwd=tmp_path)
+    # Origin remote normalized to https form, current branch as the ref.
+    assert env["HARNESS_CURSOR_CLOUD_REPO"] == "https://github.com/org/repo"
+    assert env["HARNESS_CURSOR_CLOUD_REF"] == "feature/x"
 
 
 def test_repo_override_flows_through(monkeypatch: pytest.MonkeyPatch) -> None:
