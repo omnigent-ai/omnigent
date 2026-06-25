@@ -128,18 +128,22 @@ const MODEL_TOKEN_ROWS: ReadonlyArray<{ key: keyof ModelUsage; label: string }> 
  * @param usageByModel - Map of raw harness model id to its cumulative usage.
  */
 function ModelUsageBreakdown({ usageByModel }: { usageByModel: Record<string, ModelUsage> }) {
+  const [isOpen, setIsOpen] = useState(false);
   // Stable display order: most total tokens first, so the dominant model
   // leads. Falls back to 0 for models that haven't recorded a total yet.
   const models = Object.entries(usageByModel).sort(
     ([, a], [, b]) => (b.totalTokens ?? 0) - (a.totalTokens ?? 0),
   );
   return (
-    <details data-testid="agent-info-usage-by-model">
+    <details
+      data-testid="agent-info-usage-by-model"
+      onToggle={(e) => setIsOpen(e.currentTarget.open)}
+    >
       <summary className="cursor-pointer select-none list-none">
         <SectionLabel>
           <span className="inline-flex items-center gap-1">
             Token usage
-            <span className="text-[9px]">▶</span>
+            <span className="text-[9px]">{isOpen ? "▼" : "▶"}</span>
           </span>
         </SectionLabel>
       </summary>

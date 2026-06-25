@@ -706,6 +706,11 @@ _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S = 86400.0
 # so the long park never blocks the cursor pane.
 _CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
 
+# Same one-day park budget for the generic native-permission hook used by the
+# hermes- and goose-native approval mirrors (TUI prompt → web card). A
+# terminal-side answer ends the wait early via ``external_elicitation_resolved``.
+_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
+
 # ``external_elicitation_resolved`` can arrive just before the matching
 # Codex hook registers, and a web verdict can land between a severed
 # long-poll and its retry. Pinned, NOT the hook wait budget: Codex ids
@@ -722,8 +727,11 @@ _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES = 1024
 _HARNESS_ELICITATION_REPARK_GRACE_S = 10.0
 
 # Client-supplied re-attach ids, namespaced so they cannot collide
-# with Codex deterministic ids or server-minted ids.
-_CLAUDE_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_claude_[0-9a-f]{32}$")
+# with Codex deterministic ids or server-minted ids. The shared
+# PermissionRequest endpoint is used by every native-CLI wrapper that mints its
+# own id (claude-native ``elicit_claude_…``, kimi-native ``elicit_kimi_…``), so
+# the namespace is the harness token, not a fixed ``claude``.
+_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_[a-z]+_[0-9a-f]{32}$")
 # Stable re-attach id for ``POST /policies/evaluate`` retries. Allows the
 # server to re-park the existing ASK elicitation rather than minting a new
 # approval card when a transient 5xx or connect-drop triggered a retry.
@@ -1618,10 +1626,10 @@ def _client_supplied_hook_elicitation_id(
     raw = payload.get("_omnigent_elicitation_id")
     if raw is None:
         return None
-    if not isinstance(raw, str) or not _CLAUDE_HOOK_ELICITATION_ID_RE.fullmatch(raw):
+    if not isinstance(raw, str) or not _HOOK_ELICITATION_ID_RE.fullmatch(raw):
         raise OmnigentError(
             "PermissionRequest hook '_omnigent_elicitation_id' must match "
-            "'elicit_claude_' + 32 hex chars.",
+            "'elicit_<harness>_' + 32 hex chars.",
             code=ErrorCode.INVALID_INPUT,
         )
     owner = _harness_elicitation_owners.get(raw)
@@ -3001,8 +3009,18 @@ def _persist_native_cumulative_usage(
     current = dict(conv.session_usage) if conv and conv.session_usage else {}
     # Native usage is cumulative (SET semantics), so the per-turn delta
     # for the daily rollup is new_total - old_total. Capture the old
-    # cumulative cost before the fields below overwrite it.
+    # cumulative + enforcement costs before the fields below overwrite them.
+    # Both are clamped MONOTONIC below (a write may only raise them): the
+    # ``external_session_usage`` event is posted with the session owner's own
+    # bearer token (the forwarder uses no privileged identity), so a client
+    # could otherwise replay it with a falsified low cost to reset the gate's
+    # cost to ~0 (disabling the budget DENY/ASK) and drive the daily rollup
+    # delta negative (clawing back already-spent budget). Monotonicity makes a
+    # downward report a no-op, so the worst a forged post can do is leave the
+    # figure unchanged. (See also the runner-token guard on cost_control.*
+    # label writes in ``cost_advisor`` — usage was the missing half.)
     old_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
+    old_policy_cost = float(current.get("policy_cost_usd", 0.0) or 0.0)
     if cin is not None:
         # The reported input total is INCLUSIVE of cached tokens (codex's
         # ``inputTokens`` counts cache reads). Split the cached portion into
@@ -3051,7 +3069,8 @@ def _persist_native_cumulative_usage(
         else None
     )
     if cost is not None:
-        current["total_cost_usd"] = float(cost)
+        # Monotonic: a reported total below the persisted one is ignored.
+        current["total_cost_usd"] = max(old_cost, float(cost))
     elif has_tokens:
         if isinstance(model_name, str) and model_name:
             from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
@@ -3064,7 +3083,10 @@ def _persist_native_cumulative_usage(
                 # cache reads at their own rate; it falls back to the input
                 # rate for cache tokens when the catalog omits a cache price
                 # (e.g. ``databricks-*`` entries today).
-                current["total_cost_usd"] = compute_llm_cost(current, pricing)
+                # Monotonic, like the explicit-cost branch: token totals are
+                # also client-SET, so a lowered token report can't drop the
+                # priced cost below the persisted figure.
+                current["total_cost_usd"] = max(old_cost, compute_llm_cost(current, pricing))
 
     # Per-model attribution (SET). Native harnesses report cumulative SESSION
     # totals, not per-model splits, so attribute the running cumulative buckets
@@ -3087,9 +3109,13 @@ def _persist_native_cumulative_usage(
     # Enforcement value (claude-native display/policy split). Stored
     # separately from the displayed ``total_cost_usd`` so the gate can read
     # the real-time figure (incl. in-flight sub-agent spend) while the badge
-    # shows the frozen statusLine total. SET semantics, like the rest.
+    # shows the frozen statusLine total. Monotonic, like total_cost_usd: this
+    # is the value the cost-budget gate actually reads, so a forged low report
+    # must never lower it. When an in-flight estimate later resolves below a
+    # prior peak the clamp keeps the peak — conservative (the gate errs toward
+    # MORE enforcement, never less), which is the safe direction for a budget.
     if policy_cost is not None:
-        current["policy_cost_usd"] = float(policy_cost)
+        current["policy_cost_usd"] = max(old_policy_cost, float(policy_cost))
 
     conversation_store.set_session_usage(session_id, current)
     # Per-user daily rollup. Native reports cumulative totals, so the turn's
@@ -3097,7 +3123,9 @@ def _persist_native_cumulative_usage(
     # ``total_cost_usd`` (= statusLine S), NOT ``policy_cost_usd`` — the
     # daily report must reflect real spend, not the real-time gate estimate.
     new_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
-    _record_daily_cost(conv, new_cost - old_cost, conversation_store)
+    # Non-negative by the monotonic clamp above; ``max(0.0, ...)`` keeps the
+    # daily rollup from ever being clawed back even if that invariant changes.
+    _record_daily_cost(conv, max(0.0, new_cost - old_cost), conversation_store)
     return _priced_cost_for_display(current)
 
 
@@ -4620,13 +4648,20 @@ async def _persist_external_conversation_item(
     # The transcript is text-only, so without this the image is dropped
     # from durable history and disappears on every reload / navigation.
     cleared_pending_id: str | None = None
+    skipped_kiro_pending: list[pending_inputs.DrainedInput] = []
     if (
         item.type == "message"
         and isinstance(item.data, MessageData)
         and item.data.role == "user"
         and not item.data.is_meta
     ):
-        drained = pending_inputs.resolve_oldest(session_id)
+        if _is_kiro_native_session(conv):
+            text = _message_text(item.data.content) or ""
+            matched = pending_inputs.resolve_matching_text(session_id, text)
+            drained = matched.matched
+            skipped_kiro_pending = matched.skipped
+        else:
+            drained = pending_inputs.resolve_oldest(session_id)
         if drained is not None:
             cleared_pending_id = drained.pending_id
             item = _merge_pending_file_blocks(item, drained.content)
@@ -4642,6 +4677,12 @@ async def _persist_external_conversation_item(
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
+    for skipped in skipped_kiro_pending:
+        await _persist_skipped_kiro_pending_input(
+            session_id,
+            skipped,
+            conversation_store,
+        )
     persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     persisted = persisted_items[0]
@@ -4650,6 +4691,48 @@ async def _persist_external_conversation_item(
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
     return persisted.id
+
+
+def _is_kiro_native_session(conv: Conversation) -> bool:
+    """Return whether a conversation is backed by the native Kiro terminal."""
+    return conv.labels.get("omnigent.wrapper") == "kiro-native-ui"
+
+
+async def _persist_skipped_kiro_pending_input(
+    session_id: str,
+    skipped: pending_inputs.DrainedInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """Persist a Kiro web input that never appeared in Kiro's JSONL transcript."""
+    turn_id = generate_task_id()
+    user_item = NewConversationItem(
+        type="message",
+        response_id=turn_id,
+        data=MessageData(role="user", content=skipped.content),
+        created_by=skipped.created_by,
+    )
+    error = ErrorData(
+        source="execution",
+        code="kiro_native_prompt_not_recorded",
+        message=(
+            "Kiro did not accept this web message into its structured session transcript. "
+            "The native terminal may have shown the underlying error."
+        ),
+    )
+    persisted_items = await asyncio.to_thread(
+        conversation_store.append,
+        session_id,
+        [
+            user_item,
+            NewConversationItem(type="error", response_id=turn_id, data=error),
+        ],
+    )
+    _publish_input_consumed(
+        session_id,
+        persisted_items[0],
+        cleared_pending_id=skipped.pending_id,
+    )
+    _publish_external_conversation_item(session_id, persisted_items[1])
 
 
 def _merge_pending_file_blocks(
@@ -6513,8 +6596,7 @@ def _is_native_terminal_session(conv: Conversation) -> bool:
     Return whether a session is owned by a terminal-native wrapper.
 
     :param conv: Conversation row for the target session.
-    :returns: ``True`` for wrappers whose transcript forwarder is the
-        single writer for conversation history.
+    :returns: ``True`` for wrappers backed by a native terminal harness.
     """
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
     return native_coding_agent_for_wrapper_label(wrapper) is not None
@@ -8119,13 +8201,13 @@ async def _dispatch_session_event_to_runner(
     Callers stay harness-agnostic — the claude-native message bypass
     is encapsulated here. Two dispatch outcomes:
 
-    * **claude-native + ``type == "message"``**: web-chat user
+    * **transcript-forwarded native + ``type == "message"``**: web-chat user
       messages on these sessions must NOT be persisted by the AP
       server. The Omnigent would otherwise persist an AP-side copy AND
       let the transcript forwarder mirror the same message back
       (with its own store-assigned item id), so every web-typed
       prompt would land as two items in the chat panel. We forward
-      to the bound runner so the claude-native harness types the
+      to the bound runner so the native harness types the
       message into tmux; the transcript forwarder becomes the
       single writer for the conversation history. Returns a result
       with ``item_id=None`` (no AP-side persisted item) and a
@@ -15204,6 +15286,104 @@ def create_sessions_router(
             conversation_store=conversation_store,
             elicitation_id=elicitation_id,
             tool_name=f"Cursor({operation_type})",
+        )
+        if result is None:
+            return Response(status_code=status.HTTP_200_OK)
+        return Response(
+            content=json.dumps(result.model_dump(exclude_none=True)),
+            media_type="application/json",
+        )
+
+    # ── POST /sessions/{session_id}/hooks/native-permission-request ─
+
+    @router.post(
+        "/sessions/{session_id}/hooks/native-permission-request",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def native_permission_request_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Generic native-TUI tool-approval hook (TUI → web elicitation).
+
+        The vendor-agnostic counterpart of
+        :func:`cursor_permission_request_hook`, used by the hermes- and
+        goose-native approval mirrors. The runner-side mirror detects the
+        vendor's in-terminal approval prompt, POSTs it here, and the server
+        publishes ``response.elicitation_request`` and parks for the web verdict
+        — the same registry/publish/cleanup path as the cursor/codex/claude
+        hooks. An empty ``200`` (TUI answered, or timeout) leaves the vendor's
+        native prompt authoritative.
+
+        Unlike the cursor hook, the card label / policy name come from the
+        payload (``agent`` / ``policy_name``) so a Hermes or Goose approval is
+        labelled as such, not "Cursor".
+
+        :param request: FastAPI request carrying the detected prompt
+            (``elicitation_id``, ``message``, ``content_preview``,
+            ``operation_type``, optional ``agent`` / ``policy_name``).
+        :param session_id: Omnigent conversation id from the URL path.
+        :returns: An ``ElicitationResult`` (``{"action": …}``) on a web verdict,
+            or ``200`` with empty body on TUI-resolution / timeout / disconnect.
+        :raises OmnigentError: 404 if the session does not exist, 400 if the
+            body is malformed.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in native permission hook body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "Native permission hook body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        elicitation_id = payload.get("elicitation_id")
+        if not isinstance(elicitation_id, str) or not elicitation_id:
+            raise OmnigentError(
+                "Native permission hook body must include 'elicitation_id'.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        agent = payload.get("agent")
+        if not isinstance(agent, str) or not agent:
+            agent = "Agent"
+        message = payload.get("message")
+        if not isinstance(message, str) or not message:
+            message = f"{agent} wants approval to run a tool"
+        content_preview = payload.get("content_preview")
+        if not isinstance(content_preview, str):
+            content_preview = None
+        operation_type = payload.get("operation_type")
+        if not isinstance(operation_type, str) or not operation_type:
+            operation_type = "tool"
+        policy_name = payload.get("policy_name")
+        if not isinstance(policy_name, str) or not policy_name:
+            policy_name = "native_permission"
+        params = ElicitationRequestParams(
+            mode="form",
+            message=message,
+            requestedSchema=None,
+            url=None,
+            phase="pre_tool_use",
+            policy_name=policy_name,
+            content_preview=content_preview,
+        )
+        result = await _publish_and_wait_for_harness_elicitation(
+            request,
+            session_id=session_id,
+            params=params,
+            timeout_s=_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
+            conversation_store=conversation_store,
+            elicitation_id=elicitation_id,
+            tool_name=f"{agent}({operation_type})",
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)

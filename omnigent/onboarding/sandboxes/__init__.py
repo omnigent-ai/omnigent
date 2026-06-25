@@ -67,6 +67,9 @@ _LAUNCHERS: dict[str, str] = {
     # `omnigent[e2b]` extra), imported lazily like modal/daytona.
     "e2b": "omnigent.onboarding.sandboxes.e2b:E2BSandboxLauncher",
     "openshell": "omnigent.onboarding.sandboxes.openshell:OpenShellSandboxLauncher",
+    # On-demand Kubernetes runner Pod via the official kubernetes client (the
+    # `omnigent[kubernetes]` extra), imported lazily like modal/daytona.
+    "kubernetes": "omnigent.onboarding.sandboxes.kubernetes:KubernetesSandboxLauncher",
 }
 
 

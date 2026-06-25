@@ -122,37 +122,3 @@ jobs:
           num_shards: ${{ matrix.num_shards }}
           parallelism: ${{ github.event.inputs.parallelism || '2' }}
           nightly_full: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-
-  # Explicitly re-dispatch Merge Ready for same-repo PRs: the workflow_run hop
-  # is brittle and was dropped on #751/#792. Fork PRs are NOT re-dispatched here
-  # -- their pull_request GITHUB_TOKEN is read-only (actions:write is not
-  # granted), so `gh workflow run` would 403; they re-evaluate via
-  # merge-ready.yml's own workflow_run trigger instead. No checkout,
-  # actions:write only; GITHUB_TOKEN workflow_dispatch is exempt from recursion.
-  merge-ready-rerun:
-    name: Merge Ready rerun
-    needs: e2e
-    if: >-
-      always()
-      && needs.e2e.result != 'skipped'
-      && github.event_name == 'pull_request'
-      && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      actions: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      REPO: ${{ github.repository }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-    steps:
-      - name: Re-dispatch Merge Ready
-        run: |
-          set -euo pipefail
-          PR="$PR_NUMBER"
-          if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
-            echo "::notice::could not resolve PR number; nothing to do."
-            exit 0
-          fi
-          echo "Re-dispatching merge-ready.yml for PR #$PR after $GITHUB_WORKFLOW."
-          gh workflow run merge-ready.yml --repo "$REPO" -f pr="$PR"

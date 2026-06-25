@@ -127,6 +127,42 @@ def test_ask_on_os_tools_asks_for_pi_native_tools(
     assert expected_preview in result["reason"]
 
 
+# ── ask_on_os_tools: Goose native tools (developer__ namespace) ───────────────
+
+
+@pytest.mark.parametrize(
+    "tool,args,expected_preview",
+    [
+        ("developer__shell", {"command": "rm -rf /"}, "rm -rf /"),
+        ("developer__write", {"path": "/tmp/out.txt"}, "/tmp/out.txt"),
+        ("developer__edit", {"path": "main.py"}, "main.py"),
+        ("developer__text_editor", {"path": "main.py"}, "main.py"),
+    ],
+    ids=["shell", "write", "edit", "text_editor"],
+)
+def test_ask_on_os_tools_asks_for_goose_native_tools(
+    tool: str,
+    args: dict[str, str],
+    expected_preview: str,
+) -> None:
+    """Goose's ``developer__*`` tools trigger ASK via the ``PreToolUse`` hook.
+
+    Goose namespaces its built-in developer tools (``developer__shell`` etc.).
+    Without these names the standard ``ask_on_os_tools`` policy would silently
+    fail to gate a native goose session's shell/file tools — so a card would
+    never appear. ``developer__shell`` resolves the ``command`` preview branch;
+    the file tools use Goose's ``path`` arg, matching the default branch.
+
+    :param tool: Goose native tool name, e.g. ``"developer__shell"``.
+    :param args: Tool arguments dict.
+    :param expected_preview: Substring that must appear in the reason.
+    """
+    result = ask_on_os_tools(tc(tool, args))
+    assert result["result"] == "ASK"
+    assert tool in result["reason"]
+    assert expected_preview in result["reason"]
+
+
 def test_ask_on_os_tools_allows_non_os_tool() -> None:
     """A tool that is not a file/shell operation passes through.
 

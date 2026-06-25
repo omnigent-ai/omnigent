@@ -26,7 +26,12 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent import claude_native_bridge, codex_native_bridge, cursor_native_bridge
+from omnigent import (
+    claude_native_bridge,
+    codex_native_bridge,
+    cursor_native_bridge,
+    kiro_native_bridge,
+)
 from omnigent.antigravity_native_bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
 )
@@ -53,9 +58,11 @@ from omnigent.runner.app import (
     _auto_create_claude_terminal,
     _auto_create_codex_terminal,
     _auto_create_cursor_terminal,
+    _auto_create_kiro_terminal,
     _auto_create_pi_terminal,
     _auto_create_repl_terminal,
     _deliver_subagent_wake_post,
+    _KiroNativeLaunchConfig,
     _log_terminal_lookup_miss,
     _PiNativeLaunchConfig,
     _publish_native_terminal_start_error,
@@ -70,6 +77,7 @@ from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
+    KIRO_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
@@ -1161,6 +1169,51 @@ async def test_create_session_threads_cursor_bridge_dir_without_dead_guard_env(
         )
     }
     assert "HARNESS_CURSOR_NATIVE_REQUEST_SESSION_ID" not in env
+
+
+@pytest.mark.asyncio
+async def test_create_session_threads_kiro_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kiro-native session pre-spawn emits the Kiro bridge dir env."""
+    monkeypatch.setattr(kiro_native_bridge, "_BRIDGE_ROOT", tmp_path / "kiro-bridge")
+    spec = AgentSpec(
+        spec_version=1,
+        name="kiro-native-agent",
+        executor=ExecutorSpec(
+            config={"harness": "kiro-native", "model": "auto"},
+        ),
+    )
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=tmp_path)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_kiro", "agent_id": "ag_kiro"},
+        )
+
+    assert resp.status_code == 201
+    assert pm.get_client_calls
+    conversation_id, harness, env = pm.get_client_calls[-1]
+    assert conversation_id == "conv_kiro"
+    assert harness == "kiro-native"
+    assert env == {
+        kiro_native_bridge.KIRO_NATIVE_BRIDGE_DIR_ENV_VAR: str(
+            kiro_native_bridge.bridge_dir_for_session_id("conv_kiro")
+        )
+    }
 
 
 @pytest.mark.asyncio
@@ -2884,7 +2937,7 @@ async def test_auto_create_antigravity_cold_starts_real_conversation(
     # The same real id is PATCHed onto the session as external_session_id so a
     # later --resume continues agy's actual conversation (the read-path
     # replacement for the retired forwarder's _patch_external_session_id).
-    assert patch_calls == [(f"/v1/sessions/{session_id}", {"external_session_id": called_id})]
+    assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
     # The RPC reader spawns (it replaced the transcript forwarder).
     assert len(reader_calls) == 1
 
@@ -2947,7 +3000,7 @@ async def test_auto_create_antigravity_cold_start_scopes_to_pane_agy(
     assert not bridge_mod_is_placeholder(called_id)
     assert state is not None
     assert state.conversation_id == called_id
-    assert patch_calls == [(f"/v1/sessions/{session_id}", {"external_session_id": called_id})]
+    assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
 
 
 @pytest.mark.asyncio
@@ -2976,9 +3029,7 @@ async def test_auto_create_antigravity_cold_start_falls_back_when_no_pane(
     called_port, _called_id = start_cascade_calls[0]
     assert called_port == 52548  # the lowest candidate, NOT the (ignored) pane port
     assert state is not None
-    assert patch_calls == [
-        (f"/v1/sessions/{session_id}", {"external_session_id": state.conversation_id})
-    ]
+    assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
 
 
 @pytest.mark.asyncio
@@ -3040,9 +3091,7 @@ async def test_auto_create_antigravity_cold_start_falls_back_when_port_unattribu
     assert len(start_cascade_calls) == 1
     assert start_cascade_calls[0][0] == 52548  # safe candidate fallback
     assert state is not None
-    assert patch_calls == [
-        (f"/v1/sessions/{session_id}", {"external_session_id": state.conversation_id})
-    ]
+    assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
 
 
 @pytest.mark.asyncio
@@ -3170,67 +3219,6 @@ async def test_auto_create_antigravity_cold_start_port_timeout_keeps_placeholder
     assert patch_calls == []
     # The RPC reader still spawns regardless of the cold-start outcome.
     assert len(reader_calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_patch_agy_external_session_id_noop_without_client() -> None:
-    """A ``None`` server client makes the external_session_id PATCH a no-op.
-
-    The cold-start helper threads its (optional) runner server client through;
-    when absent there is nothing to PATCH against, so the call must simply return
-    without raising — the cascade id still lives in bridge state.
-    """
-    import omnigent.runner.app as runner_app_mod
-
-    # No client, no exception, no work — just returns.
-    await runner_app_mod._patch_agy_external_session_id(None, "conv_x", "cascade_x")
-
-
-@pytest.mark.asyncio
-async def test_patch_agy_external_session_id_swallows_transport_error(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A transport ``httpx.HTTPError`` is logged, never raised (best-effort).
-
-    The PATCH is the read-path resume-fidelity write; a transport failure must
-    not crash the cold-start (which would strand a terminal with no reader), so
-    it is caught and surfaced as a warning only.
-    """
-    import omnigent.runner.app as runner_app_mod
-
-    class _BoomClient:
-        async def patch(self, _url: str, **_kwargs: Any) -> httpx.Response:
-            raise httpx.ConnectError("boom")
-
-    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
-        await runner_app_mod._patch_agy_external_session_id(
-            cast(httpx.AsyncClient, _BoomClient()), "conv_x", "cascade_x"
-        )
-    assert "failed to PATCH external_session_id" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_patch_agy_external_session_id_logs_on_rejection(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A ``>= 400`` response is logged (not silently swallowed), never raised.
-
-    Mirrors the codex recorder PATCH: ``httpx`` does not raise on a 4xx/5xx
-    response unless asked, so the helper inspects ``status_code`` and warns when
-    the server rejects the write — otherwise the lost resume continuity would be
-    invisible.
-    """
-    import omnigent.runner.app as runner_app_mod
-
-    class _RejectClient:
-        async def patch(self, url: str, **_kwargs: Any) -> httpx.Response:
-            return httpx.Response(404, json={}, request=httpx.Request("PATCH", url))
-
-    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
-        await runner_app_mod._patch_agy_external_session_id(
-            cast(httpx.AsyncClient, _RejectClient()), "conv_x", "cascade_x"
-        )
-    assert "rejected external_session_id PATCH (404)" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -3412,6 +3400,132 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
         assert delivered[0]["payload"] == {"permission": {"allow": True}}
     finally:
         await runner_app_mod._cancel_auto_forwarder_task(session_id)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auto-create wires the Omnigent MCP relay so agy gets the sys_* tools (#1194).
+
+    Asserts the three wiring points end-to-end against fakes:
+
+    * the relay starter (``ensure_comment_relay``) is invoked for THIS session's
+      bridge dir before launch, so its ``tool_relay.json`` is on disk when agy
+      first scans the MCP server;
+    * the relay ``mcp_config.json`` is written into the per-session ISOLATED agy
+      HOME (``<bridge_dir>/agy-home/.gemini/config``), NOT the user's real
+      ``~/.gemini`` — the config-scoping footgun the design avoids;
+    * the launch env carries ``HOME`` = that isolated home, so agy actually loads
+      the bridge-scoped config (and never the user's interactive agy config).
+    """
+    import omnigent.antigravity_native_bridge as bridge_mod
+    import omnigent.antigravity_native_launch as launch_mod
+    import omnigent.antigravity_native_reader as reader_mod
+    import omnigent.antigravity_native_rpc as rpc_mod
+    import omnigent.runner.app as runner_app_mod
+
+    session_id = "conv_agy_mcp"
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
+    monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: (None, None))
+    monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", list)
+
+    # Capture the env build_agy_launch starts from so we can assert HOME is layered
+    # on top of it (the launch env is the captured spec's ``env`` below).
+    monkeypatch.setattr(
+        launch_mod, "build_agy_launch", lambda **_kwargs: (("agy",), {"AGY_ENV": "1"})
+    )
+
+    def _noop_reader(*_args: Any, **_kwargs: Any) -> Any:
+        async def _runner() -> None:
+            await asyncio.Event().wait()
+
+        return _runner()
+
+    monkeypatch.setattr(reader_mod, "supervise_reader", _noop_reader)
+
+    relay_calls: list[dict[str, Any]] = []
+
+    async def _recording_relay(session_id_arg: str, **kwargs: Any) -> None:
+        relay_calls.append({"session_id": session_id_arg, **kwargs})
+
+    captured_spec: dict[str, Any] = {}
+
+    snapshot = {"workspace": str(tmp_path / "workspace")}
+
+    class _SnapshotServerClient:
+        async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
+            assert url == f"/v1/sessions/{session_id}"
+            return httpx.Response(200, json=snapshot, request=httpx.Request("GET", url))
+
+        async def patch(self, url: str, *, json: dict[str, Any], **_kwargs: Any) -> httpx.Response:
+            del json
+            return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            **_kwargs: Any,
+        ) -> SessionResourceView:
+            captured_spec["env"] = dict(spec.env)
+            return SessionResourceView(
+                id="terminal_antigravity_main",
+                type="terminal",
+                session_id=session_id,
+                name="Antigravity",
+            )
+
+    try:
+        await _auto_create_antigravity_terminal(
+            session_id,
+            cast(SessionResourceRegistry, _FakeResourceRegistry()),
+            lambda _sid, _event: None,
+            server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
+            ensure_comment_relay=_recording_relay,
+        )
+        await asyncio.sleep(0)
+    finally:
+        await runner_app_mod._cancel_auto_forwarder_task(session_id)
+
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id(session_id)
+    iso_home = bridge_mod.agy_home_dir(bridge_dir)
+
+    # 1) The relay starter was invoked for this session's bridge dir.
+    assert len(relay_calls) == 1
+    assert relay_calls[0]["session_id"] == session_id
+    assert relay_calls[0]["explicit_bridge_dir"] == bridge_dir
+    assert relay_calls[0]["await_notify"] is False
+
+    # 2) The relay mcp_config.json landed in the ISOLATED agy HOME, not ~/.gemini.
+    mcp_config = iso_home / ".gemini" / "config" / "mcp_config.json"
+    assert mcp_config.is_file()
+    payload = json.loads(mcp_config.read_text(encoding="utf-8"))
+    server = payload["mcpServers"]["omnigent"]
+    assert server["args"][:4] == ["-I", "-m", "omnigent.claude_native_bridge", "serve-mcp"]
+    assert str(bridge_dir) in server["args"]
+    assert "sys_session_create" in server["enabledTools"]
+    # The bridge token the shared relay needs was written into the bridge dir.
+    assert (bridge_dir / "bridge.json").is_file()
+
+    # 3) The launch env carries HOME = the isolated home, layered over the
+    #    build_agy_launch base env.
+    assert captured_spec["env"]["HOME"] == str(iso_home)
+    assert captured_spec["env"]["AGY_ENV"] == "1"
 
 
 @pytest.mark.parametrize("parent_host_id", ["host_parent", None])
@@ -10019,6 +10133,177 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
     assert pm.released == [conv_id]
 
 
+@pytest.mark.parametrize("terminal_name", ["qwen", "antigravity"])
+@pytest.mark.asyncio
+async def test_required_terminal_clean_quit_publishes_idle_not_failed(
+    terminal_name: str,
+) -> None:
+    """A clean ``/quit`` of qwen/antigravity-native is not a crash.
+
+    Both harnesses leave the exit-classification memo stuck on ``running`` at
+    quit time — qwen's "powering down" redraw trips the PTY-activity watcher,
+    and antigravity-native is deliberately excluded from the PTY ``emit_status``
+    role set (the RPC reader owns working-status). So ``session_was_idle`` is
+    ``False`` even though the user quit normally. The runner must special-case
+    these terminals: publish a final ``idle`` (to clear the web "Working…"
+    spinner) and release the harness, but never render the spurious red
+    ``required_terminal_exited`` failure card.
+
+    :param terminal_name: The native terminal that the user quit cleanly.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import (
+        TerminalExitEvent,
+        TerminalLifecycle,
+    )
+
+    conv_id = f"conv_clean_quit_{terminal_name}_{uuid.uuid4().hex[:12]}"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resource_registry = app.state.session_resource_registry
+    # Grab the runner's terminal-exit publisher (the branch under test) and
+    # drive it directly, mimicking the registry firing on a clean quit.
+    publish_exit = resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        publish_exit(
+            TerminalExitEvent(
+                session_id=conv_id,
+                terminal_id=f"terminal_{terminal_name}_main",
+                terminal_name=terminal_name,
+                session_key="main",
+                lifecycle=TerminalLifecycle.REQUIRED,
+                # The memo never flipped to idle, so the generic guard would
+                # otherwise misclassify this normal quit as a crash.
+                session_was_idle=False,
+            )
+        )
+        queued_events: list[dict[str, Any]] = []
+        for _ in range(1000):
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            if pm.released:
+                break
+            await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        runner_app.unregister_child_session(conv_id)
+
+    # The terminal resource is removed and a final idle clears the spinner...
+    assert {
+        "type": "session.resource.deleted",
+        "resource_id": f"terminal_{terminal_name}_main",
+        "resource_type": "terminal",
+        "session_id": conv_id,
+    } in queued_events
+    assert {"type": "session.status", "status": "idle"} in queued_events
+    # ...but no spurious failure card renders — the user quit normally.
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] == []
+    # The harness subprocess is still released — the terminal is gone.
+    assert pm.released == [conv_id]
+
+
+@pytest.mark.asyncio
+async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path: Path) -> None:
+    """
+    A structured native ``idle`` status prevents a later pane close from failing.
+
+    Kiro completion is observed from its persisted JSONL session, not only from
+    PTY diff-idle. After a web turn marks the required terminal ``running``, the
+    forwarded ``external_session_status: idle`` must update the same exit memo
+    used by the required-terminal watcher; otherwise a normal user close after
+    Kiro answered is misclassified as ``required_terminal_exited``.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = f"conv_kiro_external_idle_exit_{uuid.uuid4().hex[:12]}"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("kiro", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("kiro", "main")] = instance
+    callbacks: dict[str, Any] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, idle_threshold_s, poll_interval_s, replace
+        callbacks["on_exit"] = on_exit
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    resource_registry = app.state.session_resource_registry
+
+    try:
+        await resource_registry.observe_required_terminal(
+            conv_id,
+            "kiro",
+            "main",
+            instance,
+            resource_role=KIRO_NATIVE_TERMINAL_ROLE,
+        )
+        resource_registry.note_session_turn_started(conv_id)
+        async with _runner_client(app) as client:
+            status_resp = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "external_session_status", "data": {"status": "idle"}},
+            )
+        assert status_resp.status_code == 204, status_resp.text
+
+        on_exit = callbacks.get("on_exit")
+        assert callable(on_exit)
+        on_exit()
+        deleted_event = {
+            "type": "session.resource.deleted",
+            "resource_id": "terminal_kiro_main",
+            "resource_type": "terminal",
+            "session_id": conv_id,
+        }
+        queued_events: list[dict[str, Any]] = []
+        for _ in range(1000):
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            if pm.released and deleted_event in queued_events:
+                break
+            await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+
+    assert terminal_registry.get(conv_id, "kiro", "main") is None
+    assert deleted_event in queued_events
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] == []
+    assert pm.released == [conv_id]
+
+
 @pytest.mark.asyncio
 async def test_events_effort_change_on_native_session_types_slash_command(
     monkeypatch: pytest.MonkeyPatch,
@@ -11448,6 +11733,113 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["spec"].command == "pi"
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolated_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kiro-native auto-create launches the TUI and session forwarder."""
+    import omnigent.kiro_native as kiro_native
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
+    monkeypatch.setattr(kiro_native_bridge, "_BRIDGE_ROOT", tmp_path / "kiro-bridge")
+    monkeypatch.setattr(
+        kiro_native,
+        "resolve_kiro_executable",
+        lambda **_kwargs: "/usr/bin/kiro-cli",
+    )
+    forwarder_calls: list[dict[str, Any]] = []
+
+    async def _fake_supervise_kiro_session_forwarder(**kwargs: Any) -> None:
+        forwarder_calls.append(kwargs)
+
+    monkeypatch.setattr(
+        "omnigent.kiro_native_session_forwarder.supervise_kiro_session_forwarder",
+        _fake_supervise_kiro_session_forwarder,
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _KiroNativeLaunchConfig:
+        return _KiroNativeLaunchConfig(
+            workspace=tmp_path,
+            terminal_launch_args=["--model", "auto", "--effort", "high", "hello"],
+            external_session_id="kiro-session-123",
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._kiro_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Records the launch; exposes ONLY the required-terminal launch API."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del parent_os_env
+            captured["terminal_name"] = terminal_name
+            captured["session_key"] = session_key
+            captured["resource_role"] = resource_role
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_kiro_main",
+                type="terminal",
+                session_id=session_id,
+                name="kiro:main",
+                metadata={"terminal_name": "kiro", "session_key": "main", "running": True},
+            )
+
+    published: list[dict[str, Any]] = []
+
+    await _auto_create_kiro_terminal(
+        "conv_kiro",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, evt: published.append(evt),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    await asyncio.sleep(0)
+
+    spec = captured["spec"]
+    assert captured["terminal_name"] == "kiro"
+    assert captured["session_key"] == "main"
+    assert captured["resource_role"] == KIRO_NATIVE_TERMINAL_ROLE
+    assert spec.command == "/usr/bin/kiro-cli"
+    assert spec.args == [
+        "chat",
+        "--tui",
+        "--resume-id",
+        "kiro-session-123",
+        "--model",
+        "auto",
+        "--effort",
+        "high",
+        "hello",
+    ]
+    assert spec.inherit_env is False
+    assert "OPENAI_API_KEY" not in spec.env
+    assert "OPENAI_API_KEY" in spec.env_unset
+    assert spec.env[kiro_native_bridge.KIRO_NATIVE_BRIDGE_DIR_ENV_VAR] == str(
+        kiro_native_bridge.bridge_dir_for_session_id("conv_kiro")
+    )
+    assert any(evt.get("type") == "session.resource.created" for evt in published)
+    assert forwarder_calls
+    assert forwarder_calls[0]["base_url"] == "http://127.0.0.1:6767"
+    assert forwarder_calls[0]["session_id"] == "conv_kiro"
+    assert forwarder_calls[0]["agent_name"] == "kiro-native-ui"
+    assert forwarder_calls[0]["workspace"] == str(tmp_path)
 
 
 @pytest.mark.asyncio
