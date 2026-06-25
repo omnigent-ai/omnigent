@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
@@ -421,6 +421,75 @@ describe("Composer slash-command submit routing", () => {
   });
 });
 
+describe("AgentPicker trigger label", () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      conversationId: "conv_test",
+      skills: [],
+      selectedModel: null,
+      selectedEffort: null,
+      llmModel: null,
+      codexModelOptions: [],
+      nativeVendorOwnsModel: false,
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("shows the model in the foreground and effort muted (model/effort swapped into the trigger)", () => {
+    useChatStore.setState({ selectedModel: "opus", selectedEffort: "high" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+        })}
+      />,
+    );
+    const trigger = screen.getByTestId("agent-picker-trigger");
+    expect(trigger).toHaveTextContent("Opus");
+    expect(trigger).toHaveTextContent("High");
+    // The harness identity ("Claude") is NOT in the trigger anymore — it
+    // moved to the status tray below.
+    expect(trigger).not.toHaveTextContent("Claude");
+    // Model black, effort grey.
+    expect(within(trigger).getByText("Opus")).toHaveClass("text-foreground");
+    expect(within(trigger).getByText("High")).toHaveClass("text-muted-foreground");
+  });
+
+  it("still renders an enabled trigger when the model/effort label is unresolved", () => {
+    // Regression guard: a claude-native session before the snapshot fills
+    // llmModel/selectedEffort has no model label, no effort label, and no
+    // agent switcher — but CLAUDE_NATIVE_MODELS still gives the dropdown
+    // model rows to switch (hasPickerActions). The trigger must NOT vanish
+    // (which would also take the model dropdown and the bare-`/model` path
+    // with it); it falls back to a stable identity label and stays enabled.
+    useChatStore.setState({ selectedModel: null, selectedEffort: null, llmModel: null });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          showEffort: false,
+        })}
+      />,
+    );
+    const trigger = screen.getByTestId("agent-picker-trigger");
+    expect(trigger).toBeVisible();
+    // Enabled because there are still model rows to switch — so the dropdown
+    // (and the bare-`/model` open path) stays reachable.
+    expect(trigger).toBeEnabled();
+    // Falls back to the bound agent's display label rather than rendering empty.
+    expect(trigger).toHaveTextContent("Claude");
+  });
+});
+
 describe("Composer effort slash-command visibility", () => {
   beforeEach(() => {
     useChatStore.setState({ conversationId: "conv_test", skills: [] });
@@ -437,10 +506,10 @@ describe("Composer effort slash-command visibility", () => {
     render(<Composer {...composerProps({ showEffort: false, isNativeWrapper: true })} />);
     fireEvent.change(textarea(), { target: { value: "/" } });
 
-    // Row testids — the active entry ("/compact") also renders in the
-    // detail card, so a text query would double-match.
+    // Row testids — /compact is hidden for non-native-wrapper sessions,
+    // so verify /context is present instead.
     expect(screen.queryByTestId("slash-menu-item-effort")).toBeNull();
-    expect(screen.getByTestId("slash-menu-item-compact")).toBeInTheDocument();
+    expect(screen.getByTestId("slash-menu-item-context")).toBeInTheDocument();
   });
 
   it("shows /model in suggestions for in-process and picker-backed native sessions", () => {

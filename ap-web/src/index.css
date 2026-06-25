@@ -99,6 +99,43 @@
  * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
  * describes the older cobalt direction). */
 :root {
+  /* ---- Inset system -------------------------------------------------------
+   * Single source of truth for how far content must stay clear of screen
+   * chrome. The SAME bundle runs in a browser, in Electron, and inside the
+   * iOS WKWebView shell, so these variables are defined universally and the
+   * runtime-specific inputs default to zero — `<PageScroll>` and the scoped
+   * rules below consume them without any `isIOSShell()` branching.
+   *
+   * Three inputs combine:
+   *   1. OS safe area  — `env(safe-area-inset-*)`, nonzero only on notched /
+   *      home-indicator devices (and only when `viewport-fit=cover`).
+   *   2. Native bar footprint — the pixel height of the iOS shell's floating
+   *      server switcher (top) and chat/terminal bar (bottom). The native
+   *      layer owns these dimensions and pushes them over the bridge (see
+   *      src/lib/nativeInsets.ts); they stay 0 off-shell.
+   *   3. Bar visibility — 0|1, owned by the web app (it is what tells the
+   *      shell to show/hide each bar). Folded in via a unitless multiply so a
+   *      hidden bar contributes nothing.
+   *
+   * The bottom chat/terminal bar overlays page content, so it feeds the
+   * content inset. The top server switcher floats within the web header band
+   * (ChatHeader, --omnigent-header-height) and is narrower than it, so content
+   * that already clears the header also clears the switcher — its size is
+   * tracked here for symmetry/introspection but is intentionally NOT added to
+   * the content top inset to avoid double-counting the header band. */
+  --omnigent-header-height: 3.5rem; /* web ChatHeader (h-14) */
+  --omnigent-safe-top: env(safe-area-inset-top, 0px);
+  --omnigent-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --omnigent-native-top-bar: 0px; /* set by native bridge (px) */
+  --omnigent-native-bottom-bar: 0px; /* set by native bridge (px) */
+  --omnigent-top-bar-visible: 0; /* web-owned 0|1 */
+  --omnigent-bottom-bar-visible: 0; /* web-owned 0|1 */
+  --omnigent-inset-top: var(--omnigent-safe-top);
+  --omnigent-inset-bottom: calc(
+    var(--omnigent-safe-bottom) + var(--omnigent-native-bottom-bar) *
+      var(--omnigent-bottom-bar-visible)
+  );
+
   /* Brand palette (light). Hex values are the brand spec, kept verbatim
      * for fidelity. --background is white: the lavender brand canvas is
      * expressed by the .app-shell gradient (see index.css .app-shell), so
@@ -408,12 +445,19 @@
  * bridge marker so normal iOS Safari keeps its existing browser-safe layout. */
 @media (width < 48rem) {
   [data-ios-native].app-shell {
-    height: 100vh;
+    /* Lock the shell to the live visual viewport so the soft keyboard can never
+       pan the whole document (which hides the header). --omnigent-viewport-
+       height is published by useIOSViewportLock from visualViewport.height; it
+       shrinks when the keyboard opens so inputs stay above it and only inner
+       panes scroll. Falls back to the large viewport before JS runs / on older
+       WebKit. The two-line pattern keeps the lvh fallback for browsers without
+       the var. */
     height: 100lvh;
-    min-height: 100vh;
+    height: var(--omnigent-viewport-height, 100lvh);
     min-height: 100lvh;
-    max-height: 100vh;
+    min-height: var(--omnigent-viewport-height, 100lvh);
     max-height: 100lvh;
+    max-height: var(--omnigent-viewport-height, 100lvh);
     overflow: hidden;
   }
 
@@ -457,28 +501,30 @@
   }
 
   [data-ios-native] .chat-conversation-content {
-    padding-top: calc(5rem + env(safe-area-inset-top, 0px));
+    /* header band + 1.5rem breathing room + OS safe area, sourced from the
+       shared inset vars (was a hardcoded 5rem). */
+    padding-top: calc(var(--omnigent-header-height) + 1.5rem + var(--omnigent-inset-top));
   }
 
   [data-ios-native] .main-terminal-view {
-    padding-top: calc(3.25rem + env(safe-area-inset-top, 0px));
+    padding-top: calc(3.25rem + var(--omnigent-inset-top));
   }
 
   [data-ios-native] .chat-scroll-fade {
     mask-image: linear-gradient(
       to bottom,
-      transparent calc(48px + env(safe-area-inset-top, 0px)),
-      black calc(80px + env(safe-area-inset-top, 0px))
+      transparent calc(48px + var(--omnigent-inset-top)),
+      black calc(80px + var(--omnigent-inset-top))
     );
     -webkit-mask-image: linear-gradient(
       to bottom,
-      transparent calc(48px + env(safe-area-inset-top, 0px)),
-      black calc(80px + env(safe-area-inset-top, 0px))
+      transparent calc(48px + var(--omnigent-inset-top)),
+      black calc(80px + var(--omnigent-inset-top))
     );
   }
 
   [data-ios-native] .chat-composer-form {
-    padding-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px));
+    padding-bottom: calc(0.75rem + var(--omnigent-safe-bottom));
   }
 
   [data-ios-native] .chat-composer-form.terminal-first-composer-form {
@@ -486,20 +532,22 @@
   }
 
   [data-ios-native] .terminal-first-switcher-container {
-    padding-bottom: calc(0.35rem + env(safe-area-inset-bottom, 0px));
+    padding-bottom: calc(0.35rem + var(--omnigent-safe-bottom));
   }
 
   /* Reserve room for the native Liquid Glass switcher that floats over the web
-     view (the in-page pill is suppressed in the iOS shell). Fixed height: the
-     bar's footprint above the home-indicator inset (env). Chat sits 1rem
-     tighter — its composer status line already cushions the gap to the bar. */
+     view (the in-page pill is suppressed in the iOS shell). Height is the
+     shared bottom inset — the native bar footprint (sourced from the shell, see
+     nativeInsets.ts) plus the home-indicator safe area — so it can never drift
+     from the bar's real size. Chat sits 1rem tighter: its composer status line
+     already cushions the gap to the bar. */
   [data-ios-native] .omnigent-native-bottom-spacer {
-    height: calc(3rem + env(safe-area-inset-bottom, 0px));
+    height: var(--omnigent-inset-bottom);
     flex: none;
   }
 
   [data-ios-native] .omnigent-native-bottom-spacer--chat {
-    height: calc(2rem + env(safe-area-inset-bottom, 0px));
+    height: calc(var(--omnigent-inset-bottom) - 1rem);
   }
 
   [data-ios-native] .terminal-first-switcher {
@@ -575,8 +623,8 @@
       [data-testid="subagents-panel-drawer"],
       [data-testid="todos-panel-drawer"]
     ) {
-    padding-top: env(safe-area-inset-top, 0px);
-    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-top: var(--omnigent-safe-top);
+    padding-bottom: var(--omnigent-safe-bottom);
   }
 }
 

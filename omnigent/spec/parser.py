@@ -698,6 +698,11 @@ def _parse_os_env(
         sandbox=sandbox,
         fork=fork,
         start_in_scratch=start_in_scratch,
+        # createos provider fields — keep in lockstep with loader._parse_os_env_spec
+        createos_base_url=str(raw["base_url"]) if raw.get("base_url") else None,
+        createos_api_key=str(raw["api_key"]) if raw.get("api_key") else None,
+        createos_shape=str(raw["shape"]) if raw.get("shape") else None,
+        createos_rootfs=str(raw["rootfs"]) if raw.get("rootfs") else None,
     )
 
 

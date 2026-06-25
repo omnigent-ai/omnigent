@@ -197,6 +197,39 @@ class TestPlannerResponseText:
         assert events[0].data["response_id"] == f"agy_{_CID}_2"
 
 
+class TestPlannerResponseError:
+    """An ERROR PLANNER_RESPONSE emits a visible error item (not a silent drop)."""
+
+    def test_error_planner_emits_one_error_message(self) -> None:
+        """A terminal-ERROR planner yields one assistant ``message`` error marker.
+
+        Regression for #6: previously an ERROR planner returned ``[]`` (the branch
+        committed only at DONE), so a model/turn error looked identical to a normal
+        empty reply. It must surface a visible item.
+        """
+        step = _load("planner_response_text")
+        step["status"] = "CORTEX_STEP_STATUS_ERROR"
+        step["plannerResponse"] = {}  # no text/error detail -> generic marker
+        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        assert len(events) == 1
+        ev = events[0]
+        assert ev.event_type == "external_conversation_item"
+        assert ev.data["item_type"] == "message"
+        item = ev.data["item_data"]
+        assert isinstance(item, dict)
+        assert item["role"] == "assistant"
+        text = item["content"][0]["text"]
+        assert "status ERROR" in text
+
+    def test_error_planner_includes_error_detail_when_present(self) -> None:
+        """Any ``plannerResponse.error`` text is folded into the marker."""
+        step = _load("planner_response_text")
+        step["status"] = "CORTEX_STEP_STATUS_ERROR"
+        step["plannerResponse"] = {"error": "model overloaded (503)"}
+        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        assert "model overloaded (503)" in events[0].data["item_data"]["content"][0]["text"]
+
+
 # ---------------------------------------------------------------------------
 # PLANNER_RESPONSE (tool_calls) → function_call events
 # ---------------------------------------------------------------------------

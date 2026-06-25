@@ -10,6 +10,7 @@ import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { resolveIdentity } from "./lib/identity";
+import { initNativeInsets } from "./lib/nativeInsets";
 import { initChatStore } from "./store/chatStore";
 import "./index.css";
 
@@ -34,6 +35,10 @@ initChatStore(queryClient);
 // all subsequent fetch calls include X-Forwarded-Email so session
 // routes know who's making the request.
 void resolveIdentity();
+
+// Mirror the iOS shell's native bar footprints into the inset CSS variables.
+// No-op off the iOS shell (the inset vars stay at their env()-only defaults).
+initNativeInsets();
 
 // Probe /v1/info BEFORE the first render so the route table knows
 // whether to mount accounts routes. The probe is unauthed and the
