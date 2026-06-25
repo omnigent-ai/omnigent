@@ -58,6 +58,10 @@ OPENCODE_NATIVE_WRAPPER_VALUE = "opencode-native-ui"
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 CURSOR_NATIVE_WRAPPER_VALUE = "cursor-native-ui"
 
+# Value the ``omnigent kiro`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+KIRO_NATIVE_WRAPPER_VALUE = "kiro-native-ui"
+
 # Value the ``omnigent goose`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 GOOSE_NATIVE_WRAPPER_VALUE = "goose-native-ui"
@@ -69,3 +73,10 @@ ANTIGRAVITY_NATIVE_WRAPPER_VALUE = "antigravity-native-ui"
 # Value the ``omnigent qwen`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 QWEN_NATIVE_WRAPPER_VALUE = "qwen-native-ui"
+
+# Value the ``omnigent kimi`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+KIMI_NATIVE_WRAPPER_VALUE = "kimi-native-ui"
+# Value the ``omnigent hermes`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+HERMES_NATIVE_WRAPPER_VALUE = "hermes-native-ui"

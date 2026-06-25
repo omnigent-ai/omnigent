@@ -10,9 +10,12 @@ export type NativeCodingAgentIconKind =
   | "opencode"
   | "pi"
   | "cursor"
+  | "kiro"
   | "goose"
+  | "qwen"
   | "antigravity"
-  | "qwen";
+  | "kimi"
+  | "hermes";
 export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
 
 export interface NativeCodingAgentSpec {
@@ -76,6 +79,15 @@ export const NATIVE_CODING_AGENTS = [
     sortRank: 40,
   },
   {
+    key: "kiro",
+    agentName: "kiro-native-ui",
+    harness: "kiro-native",
+    wrapperLabel: "kiro-native-ui",
+    displayName: "Kiro",
+    iconKind: "kiro",
+    sortRank: 50,
+  },
+  {
     // Antigravity's native CLI (Gemini-family). Mirrors the server's
     // canonical `antigravity-native` harness and the `antigravity-native-ui`
     // wrapper the runner keys off to boot the terminal. Added ALONGSIDE the
@@ -96,7 +108,7 @@ export const NATIVE_CODING_AGENTS = [
     wrapperLabel: "goose-native-ui",
     displayName: "Goose",
     iconKind: "goose",
-    sortRank: 50,
+    sortRank: 60,
   },
   {
     // qwen has no brand glyph yet, so it falls back to the generic bot icon
@@ -110,6 +122,28 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Qwen Code",
     iconKind: "qwen",
     sortRank: 60,
+  },
+  {
+    key: "kimi",
+    agentName: "kimi-native-ui",
+    harness: "kimi-native",
+    wrapperLabel: "kimi-native-ui",
+    displayName: "Kimi",
+    iconKind: "kimi",
+    sortRank: 70,
+  },
+  {
+    // hermes has no brand glyph yet, so it falls back to the generic bot icon
+    // (see AgentCard.iconForAgent / SubagentsPanel) — the `iconKind: "hermes"`
+    // intentionally matches no icon branch. Auth/approval surface in the
+    // embedded terminal, so no capability flags are declared here.
+    key: "hermes",
+    agentName: "hermes-native-ui",
+    harness: "hermes-native",
+    wrapperLabel: "hermes-native-ui",
+    displayName: "Hermes",
+    iconKind: "hermes",
+    sortRank: 80,
   },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
@@ -130,9 +164,12 @@ const BY_WRAPPER: Map<string, NativeCodingAgentSpec> = new Map(
 const HARNESS_ALIASES: Record<string, string> = {
   "native-pi": "pi-native",
   "native-cursor": "cursor-native",
+  "native-kiro": "kiro-native",
   "native-antigravity": "antigravity-native",
   "native-goose": "goose-native",
   "native-qwen": "qwen-native",
+  "native-kimi": "kimi-native",
+  "native-hermes": "hermes-native",
 };
 
 export function nativeCodingAgentForAgentName(

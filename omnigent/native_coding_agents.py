@@ -10,6 +10,9 @@ from omnigent._wrapper_labels import (
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
     GOOSE_NATIVE_WRAPPER_VALUE,
+    HERMES_NATIVE_WRAPPER_VALUE,
+    KIMI_NATIVE_WRAPPER_VALUE,
+    KIRO_NATIVE_WRAPPER_VALUE,
     OPENCODE_NATIVE_WRAPPER_VALUE,
     PI_NATIVE_WRAPPER_VALUE,
     QWEN_NATIVE_WRAPPER_VALUE,
@@ -89,6 +92,15 @@ CURSOR_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="cursor",
 )
 
+KIRO_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="kiro",
+    display_name="Kiro",
+    agent_name="kiro-native-ui",
+    harness="kiro-native",
+    wrapper_label=KIRO_NATIVE_WRAPPER_VALUE,
+    terminal_name="kiro",
+)
+
 GOOSE_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="goose",
     display_name="Goose",
@@ -115,15 +127,36 @@ QWEN_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="qwen",
 )
 
+KIMI_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="kimi",
+    display_name="Kimi",
+    agent_name="kimi-native-ui",
+    harness="kimi-native",
+    wrapper_label=KIMI_NATIVE_WRAPPER_VALUE,
+    terminal_name="kimi",
+)
+
+HERMES_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="hermes",
+    display_name="Hermes",
+    agent_name="hermes-native-ui",
+    harness="hermes-native",
+    wrapper_label=HERMES_NATIVE_WRAPPER_VALUE,
+    terminal_name="hermes",
+)
+
 NATIVE_CODING_AGENTS: tuple[NativeCodingAgent, ...] = (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
     OPENCODE_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    KIRO_NATIVE_CODING_AGENT,
     GOOSE_NATIVE_CODING_AGENT,
     ANTIGRAVITY_NATIVE_CODING_AGENT,
     QWEN_NATIVE_CODING_AGENT,
+    KIMI_NATIVE_CODING_AGENT,
+    HERMES_NATIVE_CODING_AGENT,
 )
 
 _BY_AGENT_NAME = {agent.agent_name: agent for agent in NATIVE_CODING_AGENTS}
