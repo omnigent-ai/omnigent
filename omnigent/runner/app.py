@@ -6362,6 +6362,7 @@ def create_runner_app(
     # sub-spec from the parent's spec tree.
     _session_sub_agent_names: dict[str, str] = {}
     _session_tool_schemas: dict[str, list[dict[str, Any]]] = {}  # session_id → cached tool schemas
+    _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
     # session_id → the brain model the cost advisor last APPLIED (optimize
     # mode). Carried forward on conversational turns so the brain doesn't
     # flap back to the spec/gateway default between advised turns; the
@@ -11383,35 +11384,39 @@ def create_runner_app(
                     )
             _session_tool_schemas[conv] = all_tools
 
-        # MCP schemas are resolved every turn (not cached) so that
-        # servers added/removed via the UI are picked up immediately
-        # without requiring a cache reset. The underlying MCP
-        # connections are pooled in RunnerMcpManager, so tools/list
-        # is fast after initial connect.
-        _session_mcp: Any = ProxyMcpManager(conv, server_client)
-        if cached_spec and cached_spec.mcp_servers and _session_mcp:
-            try:
-                mcp_result = await _session_mcp.schemas_for(
-                    cached_spec,
-                )
-                # Replace MCP tools in the cached list: keep builtin
-                # tools (no double-underscore separator) and append
-                # the fresh MCP schemas.
-                _builtin_tools = [
-                    t for t in _session_tool_schemas.get(conv, [])
-                    if not (isinstance(t, dict) and "__" in (t.get("name") or ""))
-                ]
-                _session_tool_schemas[conv] = _builtin_tools + list(mcp_result.schemas)
-            except (
-                httpx.HTTPError,
-                RuntimeError,
-                ValueError,
-            ):
-                _logger.warning(
-                    "MCP schema resolution failed for %s",
-                    conv,
-                    exc_info=True,
-                )
+        # MCP schemas are re-resolved only when the spec's MCP server
+        # list changes (tracked via a content hash). This avoids a
+        # tools/list round-trip on every turn while still picking up
+        # servers added/removed via the Agent Info UI immediately.
+        if cached_spec and cached_spec.mcp_servers:
+            from omnigent.runner.mcp_manager import compute_spec_hash
+
+            _mcp_hash = compute_spec_hash(list(cached_spec.mcp_servers))
+            if _mcp_hash != _session_mcp_spec_hash.get(conv):
+                _session_mcp_proxy: Any = ProxyMcpManager(conv, server_client)
+                try:
+                    mcp_result = await _session_mcp_proxy.schemas_for(
+                        cached_spec,
+                    )
+                    # Replace MCP tools in the cached list: keep builtin
+                    # tools (no double-underscore separator) and append
+                    # the fresh MCP schemas.
+                    _builtin_tools = [
+                        t for t in _session_tool_schemas.get(conv, [])
+                        if not (isinstance(t, dict) and "__" in (t.get("name") or ""))
+                    ]
+                    _session_tool_schemas[conv] = _builtin_tools + list(mcp_result.schemas)
+                    _session_mcp_spec_hash[conv] = _mcp_hash
+                except (
+                    httpx.HTTPError,
+                    RuntimeError,
+                    ValueError,
+                ):
+                    _logger.warning(
+                        "MCP schema resolution failed for %s",
+                        conv,
+                        exc_info=True,
+                    )
 
         # Spec builtin + MCP schemas are cached per conversation, but the
         # caller's client-side tools arrive per event on ``msg_body["tools"]``
@@ -14978,6 +14983,7 @@ def create_runner_app(
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
+        _session_mcp_spec_hash.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
         if agent_id:
             _spec_cache.pop(agent_id, None)
