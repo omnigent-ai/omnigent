@@ -265,6 +265,14 @@ def preseed_resume_state(
     Writing the known store path + current rowid here lets the forwarder skip
     discovery entirely and start tailing only messages posted after the resume.
 
+    External contract (verified empirically against the current cursor build):
+    ``cursor-agent --resume`` reuses the SAME chat store and *appends* new turns
+    at higher rowids — it does not re-write prior turns as new blobs. Seeding
+    ``last_rowid`` to the current max therefore mirrors only post-resume turns,
+    with no duplicate-history re-post. If a future cursor build re-appended the
+    prior conversation at rowids past the seed, those would be re-mirrored as
+    duplicates — the e2e gate (cursor-sdk-e2e-dev) is the guard for that drift.
+
     :param bridge_dir: Per-session bridge directory (``bridge_dir_for_session_id``).
     :param workspace: Realpath-normalised workspace (must match the cursor TUI cwd
         so the store hash aligns).

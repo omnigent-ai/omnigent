@@ -1546,12 +1546,26 @@ async def _auto_create_cursor_terminal(
     # chat store predates this launch and would fail _discover_store's floor check).
     # On a fresh start, clear any stale state from a prior terminal so the old
     # and new forwarders can't double-post the same chat.
-    if resume_chat_id and preseed_resume_state(
+    #
+    # Tie the ``--resume`` decision to preseed success: only resume when we
+    # actually pre-seeded the prior store. If preseed fails (the store dir is
+    # gone), injecting ``--resume`` anyway would reload that store in the TUI
+    # while the cleared forwarder falls back to discovery — whose recency floor
+    # excludes the pre-launch store — so the relaunched chat would go unmirrored.
+    # Dropping resume here starts a genuinely fresh chat that discovery can find.
+    preseeded = bool(resume_chat_id) and preseed_resume_state(
         bridge_dir, workspace, resume_chat_id, launch_epoch_ms
-    ):
-        pass  # forwarder will pick up the pre-seeded store path
-    else:
+    )
+    if not preseeded:
         clear_cursor_bridge_state(bridge_dir)
+        if resume_chat_id is not None:
+            _logger.warning(
+                "cursor-native: could not pre-seed prior chat store for %r; "
+                "starting a fresh chat (session=%s).",
+                resume_chat_id,
+                session_id,
+            )
+            resume_chat_id = None
     write_mcp_config(Path(workspace), bridge_dir)
     cursor_command = resolve_cursor_executable()
     cursor_args = list(launch_config.terminal_launch_args or [])

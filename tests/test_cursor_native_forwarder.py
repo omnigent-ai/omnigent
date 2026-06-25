@@ -22,6 +22,14 @@ import pytest
 
 from omnigent import cursor_native_forwarder as fwd
 
+# Real cursor chat ids are UUIDs. Use UUID-shaped ids in fixtures so the
+# persist side (forwarder) and the resume side (runner's strict
+# ``is_valid_cursor_chat_id`` guard) agree on the same id shape — exercising the
+# persist→resume path with values the resume side would actually accept.
+_CHAT_ID = "0ef42bbf-3b80-4bec-ac39-ca46531cbc47"
+_CHAT_ID_2 = "1a2b3c4d-5e6f-4a8b-9c0d-1e2f3a4b5c6d"
+_CHAT_ID_ABSENT = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+
 
 def _make_store(
     path: Path, rows: list[tuple[str, object]], *, wal: bool = False
@@ -583,11 +591,11 @@ class _PatchRecordingClient:
 async def test_patch_external_session_id_request_shape() -> None:
     """PATCH carries the correct URL and JSON body."""
     client = _PatchRecordingClient()
-    await fwd._patch_external_session_id(client, session_id="conv_abc", chat_id="chat-uuid-123")  # type: ignore[arg-type]
+    await fwd._patch_external_session_id(client, session_id="conv_abc", chat_id=_CHAT_ID)  # type: ignore[arg-type]
     assert len(client.patches) == 1
     url, body = client.patches[0]
     assert url == "/v1/sessions/conv_abc"
-    assert body == {"external_session_id": "chat-uuid-123"}
+    assert body == {"external_session_id": _CHAT_ID}
 
 
 @pytest.mark.asyncio
@@ -643,7 +651,7 @@ class TestPreseedResumeState:
         monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path / "chats")
         bridge_dir = tmp_path / "bridge"
         bridge_dir.mkdir()
-        result = fwd.preseed_resume_state(bridge_dir, "/ws", "no-such-chat", 1_000)
+        result = fwd.preseed_resume_state(bridge_dir, "/ws", _CHAT_ID_ABSENT, 1_000)
         assert result is False
         assert fwd._read_state(bridge_dir).store_path is None
 
@@ -651,11 +659,11 @@ class TestPreseedResumeState:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path / "chats")
-        store = self._seed_chat(tmp_path / "chats", "/ws", "chat-abc", rows=5)
+        store = self._seed_chat(tmp_path / "chats", "/ws", _CHAT_ID, rows=5)
         bridge_dir = tmp_path / "bridge"
         bridge_dir.mkdir()
 
-        result = fwd.preseed_resume_state(bridge_dir, "/ws", "chat-abc", launch_epoch_ms=99_000)
+        result = fwd.preseed_resume_state(bridge_dir, "/ws", _CHAT_ID, launch_epoch_ms=99_000)
 
         assert result is True
         state = fwd._read_state(bridge_dir)
@@ -667,11 +675,11 @@ class TestPreseedResumeState:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path / "chats")
-        self._seed_chat(tmp_path / "chats", "/ws", "chat-empty", rows=0)
+        self._seed_chat(tmp_path / "chats", "/ws", _CHAT_ID_2, rows=0)
         bridge_dir = tmp_path / "bridge"
         bridge_dir.mkdir()
 
-        fwd.preseed_resume_state(bridge_dir, "/ws", "chat-empty", launch_epoch_ms=1_000)
+        fwd.preseed_resume_state(bridge_dir, "/ws", _CHAT_ID_2, launch_epoch_ms=1_000)
 
         assert fwd._read_state(bridge_dir).last_rowid == 0
 
@@ -684,7 +692,7 @@ class TestForwardLoopPreseedResume:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """When bridge state is pre-seeded, forwarder skips _discover_store."""
-        chat_id = "preseeded-chat-uuid"
+        chat_id = _CHAT_ID
         store = tmp_path / chat_id / "store.db"
         store.parent.mkdir(parents=True)
         writer = _make_store(
@@ -764,7 +772,7 @@ class TestForwardLoopExternalSessionId:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The forwarder PATCHes external_session_id with the cursor chat_id."""
-        store = tmp_path / "chat-uuid-abc123" / "store.db"
+        store = tmp_path / _CHAT_ID / "store.db"
         store.parent.mkdir(parents=True)
         self._seed(store)
 
@@ -807,14 +815,14 @@ class TestForwardLoopExternalSessionId:
         assert len(patches) == 1
         session_id, chat_id = patches[0]
         assert session_id == "conv_1"
-        assert chat_id == "chat-uuid-abc123"
+        assert chat_id == _CHAT_ID
 
     @pytest.mark.asyncio
     async def test_patches_only_once_across_multiple_polls(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """external_session_id is patched exactly once, not on every poll tick."""
-        store = tmp_path / "chat-uuid-xyz" / "store.db"
+        store = tmp_path / _CHAT_ID_2 / "store.db"
         store.parent.mkdir(parents=True)
         self._seed(store)
 
