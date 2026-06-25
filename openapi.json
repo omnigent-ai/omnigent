@@ -283,6 +283,35 @@
         "title": "CompactionCompletedEvent",
         "type": "object"
       },
+      "CompactionData": {
+        "description": "Data payload for a compaction summary item.\n\nStored as a conversation item of ``type=\"compaction\"``.\nThe summary covers all items from the start of the\nconversation (or the previous compaction item) through\nthe item identified by ``last_item_id``.\n\n:param summary: The LLM-generated summary text covering\n    all conversation items up through ``last_item_id``,\n    e.g. ``\"User asked to analyze a dataset. Agent loaded\n    data.csv and computed statistics.\"``.\n:param last_item_id: The item ID (inclusive) of the last\n    conversation item covered by this summary, e.g.\n    ``\"msg_abc123\"``. Items at positions <= this item are\n    summarized and do not need to be loaded for prompt\n    construction.\n:param model: The model used to generate the summary,\n    e.g. ``\"openai/gpt-4o\"``.\n:param token_count: Approximate token count of the summary\n    text, for budget tracking, e.g. ``342``.",
+        "properties": {
+          "last_item_id": {
+            "title": "Last Item Id",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          },
+          "token_count": {
+            "title": "Token Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "summary",
+          "last_item_id",
+          "model",
+          "token_count"
+        ],
+        "title": "CompactionData",
+        "type": "object"
+      },
       "CompactionFailedEvent": {
         "description": "Conversation history compaction failed.\n\nEmitted by ``omnigent/server/routes/sessions.py`` when\n``compact_conversation_now()`` raises. Clients that rendered a\n\"Compacting\u2026\" spinner on :class:`CompactionInProgressEvent`\nshould dismiss it without leaving a permanent marker, since the\nconversation history was not modified.\n\n:param type: Always ``\"response.compaction.failed\"``.",
         "properties": {
@@ -366,6 +395,111 @@
           "response"
         ],
         "title": "CompletedEvent",
+        "type": "object"
+      },
+      "ConversationDeleted": {
+        "description": "Confirmation payload returned after deleting a conversation.\n\n:param id: ID of the deleted conversation,\n    e.g. ``\"conv_abc123\"``.\n:param object: Fixed resource type, always\n    ``\"conversation.deleted\"``.\n:param deleted: Always ``True``.",
+        "properties": {
+          "deleted": {
+            "default": true,
+            "title": "Deleted",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "object": {
+            "default": "conversation.deleted",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "ConversationDeleted",
+        "type": "object"
+      },
+      "ConversationItem": {
+        "description": "A persisted item with a store-assigned ID.\n\n:param id: Store-assigned item ID, e.g. ``\"msg_abc123\"``.\n:param type: Item type, e.g. ``\"message\"``,\n    ``\"function_call\"``.\n:param status: Item status, e.g. ``\"completed\"``.\n:param response_id: The task/response ID this item belongs to.\n:param created_at: Unix epoch timestamp of creation.\n:param data: The typed data payload (MessageData, etc.).\n:param created_by: Identity of the human actor who authored this\n    item, or ``None`` for agent/tool/system items and single-user\n    mode. Lets owner and collaborator messages be distinguished.",
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
+          "data": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MessageData"
+              },
+              {
+                "$ref": "#/components/schemas/FunctionCallData"
+              },
+              {
+                "$ref": "#/components/schemas/FunctionCallOutputData"
+              },
+              {
+                "$ref": "#/components/schemas/ErrorData"
+              },
+              {
+                "$ref": "#/components/schemas/ReasoningData"
+              },
+              {
+                "$ref": "#/components/schemas/CompactionData"
+              },
+              {
+                "$ref": "#/components/schemas/NativeToolData"
+              },
+              {
+                "$ref": "#/components/schemas/ResourceEventData"
+              },
+              {
+                "$ref": "#/components/schemas/SlashCommandData"
+              },
+              {
+                "$ref": "#/components/schemas/TerminalCommandData"
+              }
+            ],
+            "title": "Data"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "response_id": {
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "status",
+          "response_id",
+          "created_at",
+          "data"
+        ],
+        "title": "ConversationItem",
         "type": "object"
       },
       "ConversationRef": {
@@ -670,6 +804,35 @@
         "title": "ElicitationResolvedEvent",
         "type": "object"
       },
+      "ErrorData": {
+        "description": "Data for a persisted error banner item.\n\nThese items mirror ``response.error`` events so clients can render\nthe same error banner after reconnect / refresh. They are listed in\n:data:`NON_CONTENT_ITEM_TYPES` because they are operator-visible\ntranscript metadata, not content the next agent turn should receive.\n\n:param source: Error source, e.g. ``\"execution\"``.\n:param code: Stable error classifier, e.g.\n    ``\"native_terminal_start_failed\"``.\n:param message: Human-readable error message, e.g.\n    ``\"Native Codex requires the 'codex' CLI on PATH.\"``.",
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "llm",
+              "execution",
+              "tool"
+            ],
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "code",
+          "message"
+        ],
+        "title": "ErrorData",
+        "type": "object"
+      },
       "ErrorDetail": {
         "description": "Machine-readable error information attached to a failed response.\n\n:param code: Error code string, e.g. ``\"server_error\"``,\n    ``\"invalid_input\"``.\n:param message: Human-readable error description.",
         "properties": {
@@ -771,6 +934,54 @@
           "response"
         ],
         "title": "FailedEvent",
+        "type": "object"
+      },
+      "FunctionCallData": {
+        "description": "Data for a function_call item.\n\n:param agent: Agent name. Serialized as ``\"model\"`` in JSON.\n:param name: Tool function name, e.g. ``\"search.web\"``.\n:param arguments: JSON-encoded arguments string.\n:param call_id: Unique call identifier from the LLM,\n    e.g. ``\"call_abc123\"``.",
+        "properties": {
+          "arguments": {
+            "title": "Arguments",
+            "type": "string"
+          },
+          "call_id": {
+            "title": "Call Id",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model",
+          "name",
+          "arguments",
+          "call_id"
+        ],
+        "title": "FunctionCallData",
+        "type": "object"
+      },
+      "FunctionCallOutputData": {
+        "description": "Data for a function_call_output item.\n\n:param call_id: The call_id this output corresponds to,\n    e.g. ``\"call_abc123\"``.\n:param output: The tool's string result.",
+        "properties": {
+          "call_id": {
+            "title": "Call Id",
+            "type": "string"
+          },
+          "output": {
+            "title": "Output",
+            "type": "string"
+          }
+        },
+        "required": [
+          "call_id",
+          "output"
+        ],
+        "title": "FunctionCallOutputData",
         "type": "object"
       },
       "GrantPermissionRequest": {
@@ -1022,6 +1233,54 @@
         "title": "MCPServerSummary",
         "type": "object"
       },
+      "MessageData": {
+        "description": "Data for a message item (user or assistant).\n\n:param role: ``\"user\"`` or ``\"assistant\"``.\n:param content: Heterogeneous content blocks, e.g.\n    ``[{\"type\": \"input_text\", \"text\": \"Hello\"}]``.\n:param agent: Agent name (required for assistant messages,\n    absent for user). Serialized as ``\"model\"`` in JSON.\n:param is_meta: ``True`` for durable context that must be\n    replayed to agents but hidden from user-facing transcripts,\n    e.g. injected skill instructions. Defaults to ``False``\n    and is omitted from serialized payloads in that case.\n:param interrupted: ``True`` when an assistant message is a\n    durable partial response from an interrupted external-native\n    turn, e.g. Codex ``turn/completed`` with status\n    ``\"interrupted\"``. Defaults to ``False`` and is omitted from\n    serialized payloads in that case.",
+        "properties": {
+          "content": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Content",
+            "type": "array"
+          },
+          "interrupted": {
+            "default": false,
+            "title": "Interrupted",
+            "type": "boolean"
+          },
+          "is_meta": {
+            "default": false,
+            "title": "Is Meta",
+            "type": "boolean"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "role": {
+            "enum": [
+              "user",
+              "assistant"
+            ],
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ],
+        "title": "MessageData",
+        "type": "object"
+      },
       "ModelUsage": {
         "description": "Cumulative token/cost usage attributed to a single LLM model.\n\nOne value in the ``usage_by_model`` map on :class:`SessionResponse` /\n:class:`SessionUsageEvent`, keyed by the raw harness-reported model id\n(e.g. ``\"claude-sonnet-4-6\"``, ``\"databricks-gpt-5-5\"``). Counts are\nsummed over the session's subtree (itself + sub-agent descendants), so a\nparent folds in sub-agents that ran a different model. Token buckets\nmirror the flat per-session breakdown.\n\n:param input_tokens: Cumulative non-cached input (prompt) tokens for this\n    model over the subtree, e.g. ``12000``. ``None`` when not recorded.\n:param output_tokens: Cumulative output (completion) tokens, e.g.\n    ``3400``. ``None`` when not recorded.\n:param total_tokens: Cumulative total tokens (counts cache buckets too,\n    as the harness reports), e.g. ``15400``. ``None`` when not recorded.\n:param cache_read_input_tokens: Cumulative tokens read from the prompt\n    cache, e.g. ``8000``. ``None`` when not recorded.\n:param cache_creation_input_tokens: Cumulative tokens written to the\n    prompt cache, e.g. ``2000``. ``None`` when not recorded.\n:param total_cost_usd: Cumulative USD spend attributed to this model,\n    e.g. ``0.42``. Present **only when this model's turns were priced**\n    (same \"priced \u27fa key present\" contract as the session total); ``None``\n    when the model is unpriced, so the sum of priced per-model costs\n    equals the session ``total_cost_usd``.",
         "properties": {
@@ -1034,7 +1293,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Cache Creation Input Tokens"
           },
           "cache_read_input_tokens": {
@@ -1046,7 +1304,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Cache Read Input Tokens"
           },
           "input_tokens": {
@@ -1058,7 +1315,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Input Tokens"
           },
           "output_tokens": {
@@ -1070,7 +1326,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Output Tokens"
           },
           "total_cost_usd": {
@@ -1082,7 +1337,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Total Cost Usd"
           },
           "total_tokens": {
@@ -1094,11 +1348,25 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Total Tokens"
           }
         },
         "title": "ModelUsage",
+        "type": "object"
+      },
+      "NativeToolData": {
+        "description": "A provider-native tool output item (e.g. ``web_search_call``).\n\nThese are executed server-side by the LLM provider and returned\nas opaque dicts. Agent-plane persists and replays them so the\nLLM sees its own tool results on subsequent iterations.\n\n:param item: The raw dict from the Responses API output, e.g.\n    ``{\"type\": \"web_search_call\", \"id\": \"ws_abc\",\n    \"status\": \"completed\", \"action\": {...}}``.",
+        "properties": {
+          "item": {
+            "additionalProperties": true,
+            "title": "Item",
+            "type": "object"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "title": "NativeToolData",
         "type": "object"
       },
       "OutputFileDoneEvent": {
@@ -1302,6 +1570,30 @@
         "title": "PaginatedList",
         "type": "object"
       },
+      "PermissionObject": {
+        "description": "API representation of a session permission grant.\n\n:param user_id: The grantee, e.g. ``\"alice@example.com\"``.\n:param conversation_id: The session, e.g.\n    ``\"conv_abc123\"``.\n:param level: Numeric permission level (1=read, 2=edit,\n    3=manage).",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "level": {
+            "title": "Level",
+            "type": "integer"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "conversation_id",
+          "level"
+        ],
+        "title": "PermissionObject",
+        "type": "object"
+      },
       "PolicySummary": {
         "description": "Safe subset of a policy's spec for API exposure.\n\nExposes the policy name, type, and phases so the UI can\ndisplay which guardrails are active on an agent. The full\npolicy body (prompt text, callable path, label conditions)\nis intentionally excluded \u2014 this is a summary for display,\nnot a full spec.\n\n:param name: Policy name as declared in the agent spec,\n    e.g. ``\"block_long_sleep\"``.\n:param type: Policy type discriminator \u2014 ``\"function\"``\n    or ``\"prompt\"``.\n:param on: List of phase selectors the policy fires on,\n    e.g. ``[\"tool_call\"]`` or ``[\"request\", \"response\"]``.\n:param description: Short detail string about the policy\n    implementation. For function policies: the callable\n    dotted path. For prompt policies: the first line of\n    the prompt. ``None`` when not available.",
         "properties": {
@@ -1395,6 +1687,59 @@
         "title": "QueuedEvent",
         "type": "object"
       },
+      "ReasoningData": {
+        "description": "Data for a reasoning item.\n\n:param agent: Agent name. Serialized as ``\"model\"`` in JSON.\n:param summary: Summary text blocks,\n    e.g. ``[{\"type\": \"summary_text\", \"text\": \"...\"}]``.\n:param content: Raw reasoning content blocks, or ``None`` if\n    redacted.\n:param encrypted_content: Encrypted reasoning content, or\n    ``None``.",
+        "properties": {
+          "content": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content"
+          },
+          "encrypted_content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Encrypted Content"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "summary": {
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "title": "Summary",
+            "type": "array"
+          }
+        },
+        "required": [
+          "model",
+          "summary"
+        ],
+        "title": "ReasoningData",
+        "type": "object"
+      },
       "ReasoningStartedEvent": {
         "description": "Marker emitted once when a reasoning block begins.\n\nFired even when the reasoning content itself is encrypted /\nredacted (so no delta events follow), letting clients render\na \"thinking\u2026\" indicator regardless of provider verification\nstatus. Wire shape matches ``omnigent/runtime/workflow.py:1350``.\n\n:param type: Always ``\"response.reasoning.started\"``.",
         "properties": {
@@ -1484,6 +1829,42 @@
           "delta"
         ],
         "title": "ReasoningTextDeltaEvent",
+        "type": "object"
+      },
+      "ResourceEventData": {
+        "description": "Data payload for a persisted resource lifecycle event.\n\nThese items are written to the conversation store when a\nsession resource is created or deleted, so reconnecting\nclients can discover resource history without replaying the\nlive SSE stream.  The agent loop filters them out of the\nLLM's message context (they are metadata, not conversation\ncontent).\n\n:param event_type: The SSE event type literal, e.g.\n    ``\"session.resource.created\"`` or\n    ``\"session.resource.deleted\"``.\n:param resource_id: Opaque id of the affected resource,\n    e.g. ``\"terminal_bash_s1\"`` or ``\"file_abc123\"``.\n:param resource_type: Kind of resource, e.g.\n    ``\"terminal\"``, ``\"file\"``, ``\"environment\"``.\n:param resource: Full resource object dict for ``created``\n    events. ``None`` for ``deleted`` events.",
+        "properties": {
+          "event_type": {
+            "title": "Event Type",
+            "type": "string"
+          },
+          "resource": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resource"
+          },
+          "resource_id": {
+            "title": "Resource Id",
+            "type": "string"
+          },
+          "resource_type": {
+            "title": "Resource Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_type",
+          "resource_id",
+          "resource_type"
+        ],
+        "title": "ResourceEventData",
         "type": "object"
       },
       "ResponseObject": {
@@ -1730,6 +2111,39 @@
           "error"
         ],
         "title": "RetryEvent",
+        "type": "object"
+      },
+      "SandboxStatus": {
+        "description": "Managed-sandbox launch progress for a ``host_type=\"managed\"`` session.\n\nCarried on the session snapshot only while the session's\nbackground sandbox launch is in flight or has failed; ``None``\nfor sessions without a managed launch and once the launch\nsucceeds (the session then looks like any host-bound session).\n\n:param stage: Current launch stage, e.g. ``\"provisioning\"`` \u2014\n    one of :data:`SandboxLaunchStage`, in pipeline order:\n    ``provisioning`` (creating the sandbox) \u2192 ``cloning``\n    (cloning the repository workspace; skipped when the session\n    has none) \u2192 ``starting`` (starting the in-sandbox host) \u2192\n    ``connecting`` (launching the agent runner) \u2192 ``ready`` /\n    ``failed``.\n:param error: Failure detail when ``stage == \"failed\"``, e.g.\n    ``\"managed sandbox launch failed: spend limit reached\"``.\n    ``None`` otherwise.",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "stage": {
+            "enum": [
+              "provisioning",
+              "cloning",
+              "starting",
+              "connecting",
+              "ready",
+              "failed"
+            ],
+            "title": "Stage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stage"
+        ],
+        "title": "SandboxStatus",
         "type": "object"
       },
       "SendCommentsRequest": {
@@ -2772,6 +3186,391 @@
         "title": "SessionResourcePaginatedList",
         "type": "object"
       },
+      "SessionResponse": {
+        "description": "API representation of a session.\n\nReturned by ``POST /v1/sessions``, ``GET /v1/sessions/{id}``,\nand ``PATCH /v1/sessions/{id}``.\n\n:param id: Unique session identifier (also the underlying\n    conversation ID), e.g. ``\"conv_abc123\"``.\n:param agent_id: Durable identifier of the bound agent,\n    e.g. ``\"ag_abc123\"``. Stable across renames of the\n    agent.\n:param agent_name: Human-readable name of the bound agent,\n    e.g. ``\"research-agent\"``. Loaded from the agent row at\n    snapshot-build time. ``None`` when the agent row cannot\n    be found (deleted or orphaned session).\n:param status: Session lifecycle status. One of\n    ``\"idle\"`` (no loop running), ``\"running\"`` (loop\n    executing), or ``\"failed\"`` (terminal failure).\n:param created_at: Unix epoch seconds of creation.\n:param title: Optional human-readable title, e.g.\n    ``\"debugging auth flow\"``. ``None`` when unset.\n:param labels: Session-scoped guardrails labels. Empty dict\n    when no labels have been written.\n:param runner_id: Runner currently bound to this session, e.g.\n    ``\"runner_abc123\"``. ``None`` until a client binds one via\n    ``PATCH /v1/sessions/{id}``.\n:param host_id: Host that launched (or should launch) the\n    runner for this session, e.g. ``\"host_a1b2c3d4...\"``.\n    ``None`` for CLI-initiated sessions.\n:param runner_online: Strict runner liveness \u2014 ``True`` iff a\n    runner tunnel is currently registered for this session.\n    This is the sole reachability signal: ``True`` means the\n    client can chat normally. It does **not** fold in\n    host-relaunch optimism (a dead runner on a live host reads\n    ``False`` here, not ``True``) \u2014 the open-session view pairs\n    it with ``host_online`` to decide what to show. ``None``\n    when the server has no runner liveness lookup wired.\n:param host_online: Whether the session's host tunnel is live\n    (status online and fresh within the host liveness TTL).\n    ``None`` when the session has no ``host_id`` (CLI/local).\n    Used only to choose what the open view shows when\n    ``runner_online`` is ``False`` \u2014 host alive \u21d2 \"send a\n    message to wake the runner\"; host dead \u21d2 \"reconnect /\n    fork\". Never participates in the reachability decision.\n:param host_resumable: Whether this session is bound to a dormant\n    managed host the server can wake in place (its provider sets\n    :attr:`SandboxLauncher.can_resume`). The open view reads it only\n    when ``host_online`` is ``False``, to split a confirmed host-down\n    into a recoverable \"asleep\" state (send a message \u2014 the relaunch\n    path resumes the sandbox) versus the terminal ``host_offline``\n    dead-end (reconnect from your machine / fork). ``False`` for\n    non-managed or non-resumable hosts.\n:param reasoning_effort: Per-session reasoning-effort hint.\n    Accepted metadata values are ``\"none\"``, ``\"minimal\"``,\n    ``\"low\"``, ``\"medium\"``, ``\"high\"``, ``\"xhigh\"``, and\n    ``\"max\"``. Provider-specific support is validated when a\n    turn executes. ``None`` means use the agent default.\n:param items: Committed conversation items in chronological\n    order. Empty for a freshly created session.\n:param sub_agent_name: For sub-agent sessions, the sub-agent\n    type name within the parent's spec tree, e.g.\n    ``\"summarizer\"``. ``None`` for top-level sessions.\n:param parent_session_id: For sub-agent sessions, the parent\n    conversation's id, e.g. ``\"conv_parent987\"``. ``None`` for\n    top-level sessions. Lets clients identify a session as a\n    child and link back to its parent without an extra\n    round-trip \u2014 the same conversation row exposes this via\n    ``parent_conversation_id`` internally.\n:param root_conversation_id: The id of this session's spawn-tree\n    root, e.g. ``\"conv_root1\"``. Equals ``id`` for top-level\n    sessions; for sub-agents it points at the top-level ancestor.\n    Lets orchestration tools (e.g. ``sys_session_close``) confirm\n    a target shares the caller's spawn tree over the REST path.\n    ``None`` only when the underlying row predates the\n    ``root_conversation_id`` column (not expected post-migration).\n:param permission_level: The requesting user's numeric\n    permission level on this session: ``1`` = read, ``2`` =\n    edit, ``3`` = manage. ``None`` when permissions are\n    disabled (single-user mode without a permission store).\n:param llm_model: The LLM model identifier from the bound\n    agent's spec, e.g. ``\"anthropic/claude-sonnet-4-6\"``.\n    ``None`` when the agent has no explicit ``llm:`` block or\n    the agent cannot be looked up.\n:param harness: The bound agent's canonical harness, e.g.\n    ``\"claude-sdk\"`` or ``\"openai-agents\"``. Lets the client\n    render the active credential for the correct provider\n    family instead of inferring it from the model string (which\n    is wrong when the agent declares no model). ``None`` when\n    the agent cannot be looked up.\n:param model_override: Per-session LLM model override,\n    e.g. ``\"claude-opus-4-7\"``. ``None`` means no override is\n    active (the agent's ``llm_model`` applies). Set via\n    ``PATCH /v1/sessions/{id}`` or the REPL's ``/model``\n    command; both write the same column so the ap-web UI and\n    the TUI stay in sync.\n:param cost_control_mode_override: Per-session cost-control\n    switch: ``\"on\"`` activates the spec's configured cost-control\n    mode, ``\"off\"`` disables cost control for this session.\n    ``None`` means no override is active (the spec default\n    applies). Set at create time or via\n    ``PATCH /v1/sessions/{id}`` (the web \"Cost Optimized\"\n    toggle); read by the cost-control advisor pipeline.\n:param context_window: The model's context window size in tokens\n    as looked up server-side from litellm's registry (or from the\n    ``AP_CONTEXT_WINDOW_OVERRIDE`` env var), e.g. ``200_000``.\n    ``None`` when the model is not in litellm's registry and no\n    override is set.\n:param last_total_tokens: Total token count (input + output) from\n    the most recently completed task's ``usage``, e.g. ``45231``.\n    ``None`` when no task has completed yet. Lets clients seed\n    their context-ring on conversation resume without waiting for\n    the next ``response.completed`` SSE event.\n:param total_cost_usd: Cumulative LLM spend for this session in\n    USD, e.g. ``0.42``. ``None`` when the session is **unpriced**\n    \u2014 no turn has been priced yet (the model is absent from the\n    pricing catalog, or no usage has been recorded) \u2014 so clients\n    render \"\u2014\" rather than a misleading ``$0.00``. Server-computed\n    (cache-aware for relay/codex, exact billing for claude-native),\n    the same total the cost-budget policy gates on. Lets clients\n    seed their cost indicator on resume without waiting for the\n    next ``session.usage`` SSE event.\n:param usage_by_model: Per-model breakdown of the same subtree usage,\n    keyed by the raw harness model id, e.g.\n    ``{\"claude-sonnet-4-6\": ModelUsage(input_tokens=12000, ...)}``.\n    ``None`` when no per-model usage has been recorded (older sessions\n    recorded before this field existed, or before the first turn). Lets\n    the UI show which models a session spent its tokens / budget on.\n:param last_task_error: Error details from the most recently\n    failed task. Only present when ``status == \"failed\"`` and\n    the task stored an error. Lets clients display the failure\n    reason on historical load without relying on the transient\n    ``response.error`` SSE event (which may have been emitted\n    before the web client subscribed). Format mirrors the\n    ``RetryErrorDetail`` SSE shape:\n    ``{\"code\": \"executor_error\", \"message\": \"...\"}``.\n    ``None`` in all other cases.\n:param external_session_id: Runtime-native session id this\n    conversation wraps, e.g. a Claude Code session uuid for\n    ``omnigent claude`` sessions. ``None`` for regular\n    AP-only conversations. Populated by the wrapper bridge.\n:param terminal_launch_args: Pass-through CLI args the native\n    terminal wrapper (claude / codex) was launched with, e.g.\n    ``[\"--dangerously-skip-permissions\"]``. ``None`` for\n    non-native sessions or a native session launched with none.\n    Lets the launcher reproduce the command on resume.\n:param pending_elicitations: Outstanding approval prompts on\n    this session at the moment the snapshot was built \u2014 the\n    original ``response.elicitation_request`` event dicts.\n    Lets the UI render the ApprovalCard on cold load, since\n    the live SSE stream has no replay and a prompt emitted\n    before the user opened the chat would otherwise vanish.\n    Empty list when no prompts are outstanding. Sourced from\n    the Omnigent server's in-memory\n    :mod:`omnigent.runtime.pending_elicitations` index.\n:param pending_inputs: Un-consumed web-composer user messages on\n    native-terminal (claude-native / codex-native) sessions at\n    snapshot time, each ``{\"pending_id\", \"content\"}``. Native\n    sessions don't persist a web message at POST time (the\n    transcript forwarder is the single writer), so a client that\n    posted then navigated away / rebound would lose its optimistic\n    bubble; replaying these re-hydrates it. Empty list otherwise.\n    Sourced from the in-memory\n    :mod:`omnigent.runtime.pending_inputs` index.\n:param workspace: Absolute path on disk where the runner cd's,\n    e.g. ``\"/Users/corey/universe/src/foo\"``. Set when the\n    session was bound to a host workspace at create-time, or\n    when the CLI captured ``os.getcwd()`` at session-create.\n    Always ``None`` when not yet validated against a host. When a\n    git worktree was created for the session, this is the\n    worktree directory path.\n:param git_branch: Git branch checked out in the session's\n    worktree, e.g. ``\"feature/login\"``. Set only when the\n    session was created with a server-created git worktree;\n    ``None`` otherwise. The Web UI uses a non-``None`` value to\n    offer the \"delete local branch\" cleanup checkbox on session\n    delete. See designs/SESSION_GIT_WORKTREE.md.\n:param archived: Whether the session is archived. Archived\n    sessions are hidden from the default sidebar listing and\n    surface only behind the \"Show archived\" toggle. ``False``\n    for normal sessions. Toggled via ``PATCH /v1/sessions/{id}``.\n:param todos: Current Claude Code todo list items for\n    ``omnigent claude`` sessions, as raw dicts from Claude's\n    todo JSON file. Each dict has ``content``, ``status``,\n    and ``activeForm`` keys. Empty list for non-claude-native\n    sessions or when no todos have been reported yet. Sourced\n    from the Omnigent server's in-memory ``_session_todos_cache``.\n:param skills: Skills the bound agent has access to \u2014 the\n    merged result of the agent spec's bundled ``skills``\n    and the host-scope skills discovered along the agent\n    workdir / ``~/.claude/skills/`` (subject to the spec's\n    ``skills_filter``). Mirrors what the TUI passes to the\n    runner at startup. Empty list when the agent spec\n    cannot be loaded, or when bundled + host discovery\n    yields nothing.\n:param model_options: Codex app-server ``model/list`` options\n    for codex-native sessions, including each model's supported\n    reasoning efforts. Empty for non-codex-native sessions or while\n    the bound runner / Codex app-server cannot answer yet.\n:param terminal_pending: ``True`` while the runner is auto-creating\n    a terminal-first session's terminal (claude-native /\n    codex-native), so the Web UI shows a spinner on the Terminal\n    pill instead of a silent greyed-out button. Cleared to\n    ``False`` once the terminal lands or auto-create fails; from\n    then on the client relies purely on whether a terminal resource\n    exists. Sourced from the Omnigent server's in-memory\n    ``_session_terminal_pending_cache`` at snapshot build time, so a\n    client connecting mid-spin-up still sees the spinner.\n:param sandbox_status: Managed-sandbox launch progress while the\n    session's background sandbox launch is in flight or has\n    failed \u2014 see :class:`SandboxStatus`. ``None`` for sessions\n    without a managed launch and once the launch succeeds.\n    Sourced from the Omnigent server's in-memory\n    ``_session_sandbox_status_cache`` at snapshot build time, so\n    a client opening the session mid-launch sees the current\n    stage.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Name"
+          },
+          "archived": {
+            "default": false,
+            "title": "Archived",
+            "type": "boolean"
+          },
+          "context_window": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Window"
+          },
+          "cost_control_mode_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Control Mode Override"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "integer"
+          },
+          "external_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "External Session Id"
+          },
+          "git_branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Git Branch"
+          },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          },
+          "host_online": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Online"
+          },
+          "host_resumable": {
+            "default": false,
+            "title": "Host Resumable",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ConversationItem"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Labels",
+            "type": "object"
+          },
+          "last_task_error": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Task Error"
+          },
+          "last_total_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Total Tokens"
+          },
+          "llm_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Model"
+          },
+          "model_options": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Model Options",
+            "type": "array"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Override"
+          },
+          "parent_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Session Id"
+          },
+          "pending_elicitations": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Pending Elicitations",
+            "type": "array"
+          },
+          "pending_inputs": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Pending Inputs",
+            "type": "array"
+          },
+          "permission_level": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission Level"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Effort"
+          },
+          "root_conversation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Root Conversation Id"
+          },
+          "runner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runner Id"
+          },
+          "runner_online": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runner Online"
+          },
+          "sandbox_status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SandboxStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/SkillSummary"
+            },
+            "title": "Skills",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "idle",
+              "running",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "sub_agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sub Agent Name"
+          },
+          "terminal_launch_args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminal Launch Args"
+          },
+          "terminal_pending": {
+            "default": false,
+            "title": "Terminal Pending",
+            "type": "boolean"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "todos": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Todos",
+            "type": "array"
+          },
+          "total_cost_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Cost Usd"
+          },
+          "usage_by_model": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/ModelUsage"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usage By Model"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace"
+          }
+        },
+        "required": [
+          "id",
+          "agent_id",
+          "status",
+          "created_at"
+        ],
+        "title": "SessionResponse",
+        "type": "object"
+      },
       "SessionSandboxStatusEvent": {
         "description": "Managed-sandbox launch progress for a ``host_type=\"managed\"`` session.\n\nA managed create returns before its sandbox exists; the Omnigent\nserver emits this event as the background launch pipeline advances\nso the Web UI can show live provisioning progress on the session\npage instead of a silent dead chat: sandbox provision \u2192 repository\nclone \u2192 host startup \u2192 runner connect \u2192 ready, or a terminal\nfailure with the reason.\n\n:param type: Always ``\"session.sandbox_status\"``.\n:param conversation_id: Session identifier,\n    e.g. ``\"conv_abc123\"``.\n:param stage: The launch stage just entered, e.g.\n    ``\"provisioning\"`` \u2014 see :class:`SandboxStatus` for the full\n    pipeline order.\n:param error: Failure detail when ``stage == \"failed\"``, e.g.\n    ``\"managed sandbox launch failed: spend limit reached\"``.\n    ``None`` otherwise.\n\nCategory: **transient** (SSE-only). On reconnect, clients seed the\nprogress indicator from the session snapshot's ``sandbox_status``\nfield, which is populated by ``_session_sandbox_status_cache`` at\nsnapshot build time.",
         "properties": {
@@ -3158,6 +3957,101 @@
           "description"
         ],
         "title": "SkillSummary",
+        "type": "object"
+      },
+      "SlashCommandData": {
+        "description": "Data payload for a slash-command invocation observed in a\nharness transcript (today: Claude Code's embedded TUI).\n\nListed in :data:`NON_CONTENT_ITEM_TYPES` so the agent loop's\nhistory filter skips it \u2014 a downstream LLM never sees this as a\nphantom tool call. Field names mirror ``function_call`` so the\nweb renderer can reuse the tool-card layout.\n\n:param agent: Harness/agent name, e.g. ``\"claude-native-ui\"``.\n    Serialized as ``\"model\"`` for parity with other items.\n:param kind: ``\"skill\"`` for plugin/Skill invocations,\n    ``\"command\"`` for surfaced CLI built-ins (``/effort``,\n    ``/clear``, ``/compact``, ``/model``, ``/ultrareview``).\n    The web renderer uses this to pick the prefix label and\n    icon. Defaults to ``\"skill\"`` so persisted items predating\n    this field deserialize without backfill.\n:param name: Command name with leading ``/`` stripped, e.g.\n    ``\"dev-productivity:simplify\"``.\n:param arguments: Raw ``<command-args>`` text. Empty when none.\n:param output: ``<local-command-stdout>`` text when present,\n    else ``None`` (the common case \u2014 Skills act via the next\n    assistant turn, not stdout).",
+        "properties": {
+          "arguments": {
+            "title": "Arguments",
+            "type": "string"
+          },
+          "kind": {
+            "default": "skill",
+            "enum": [
+              "skill",
+              "command"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "output": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          }
+        },
+        "required": [
+          "model",
+          "name",
+          "arguments"
+        ],
+        "title": "SlashCommandData",
+        "type": "object"
+      },
+      "TerminalCommandData": {
+        "description": "Data payload for a runner-side terminal command (``!cmd``) observed\nin a harness transcript (today: Claude Code's embedded TUI).\n\nListed in :data:`NON_CONTENT_ITEM_TYPES` so the agent loop never\ninjects this as phantom content into the LLM's message history.\n\nClaude Code writes two sibling transcript records per ``!cmd``\ninvocation: one ``<bash-input>`` record and one combined\n``<bash-stdout>``/``<bash-stderr>`` record. Each maps to one\n``terminal_command`` item with ``kind=\"input\"`` or\n``kind=\"output\"`` respectively.\n\n:param kind: ``\"input\"`` for the command text, ``\"output\"`` for\n    the combined stdout/stderr result.\n:param input: The raw command string, e.g. ``\"pwd\"``. Present when\n    ``kind=\"input\"``, ``None`` otherwise.\n:param stdout: Captured stdout text. Present when ``kind=\"output\"``,\n    ``None`` otherwise.\n:param stderr: Captured stderr text. Present when ``kind=\"output\"``,\n    ``None`` otherwise.",
+        "properties": {
+          "input": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input"
+          },
+          "kind": {
+            "enum": [
+              "input",
+              "output"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "stderr": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stderr"
+          },
+          "stdout": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stdout"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "TerminalCommandData",
         "type": "object"
       },
       "TurnCancelledEvent": {
@@ -4806,7 +5700,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedList"
+                }
               }
             },
             "description": "Successful Response"
@@ -4875,7 +5771,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationDeleted"
+                }
               }
             },
             "description": "Successful Response"
@@ -4944,7 +5842,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -4993,7 +5893,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -5426,7 +6328,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedList"
+                }
               }
             },
             "description": "Successful Response"
@@ -5810,7 +6714,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedList"
+                }
               }
             },
             "description": "Successful Response"
@@ -5935,7 +6841,13 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PermissionObject"
+                  },
+                  "title": "Response 200 List Permissions V1 Sessions  Session Id  Permissions Get",
+                  "type": "array"
+                }
               }
             },
             "description": "Successful Response"
@@ -5984,7 +6896,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/PermissionObject"
+                }
               }
             },
             "description": "Successful Response"
@@ -7709,7 +8623,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -7760,7 +8676,9 @@
           "201": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
               }
             },
             "description": "Successful Response"
