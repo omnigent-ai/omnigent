@@ -177,12 +177,22 @@ def harness_is_configured(harness: str) -> bool:
     can't enumerate, so blocking them would risk false negatives that
     break working launches.
 
+    One family adds a credential axis on top of the binary: the antigravity
+    family (``antigravity-native`` / ``agy``) authenticates via a file-based
+    OAuth credential (it has no non-interactive ``login`` subcommand), so it
+    requires BOTH the binary on ``PATH`` AND a detected Gemini login (see
+    ``_FAMILY_CREDENTIAL_CHECK``). It therefore returns ``False`` when the
+    binary is missing *or* when it is present but unauthenticated.
+
     :param harness: A harness id, e.g. ``"claude-native"``, ``"codex"``,
         ``"openai-agents"``, ``"agents_sdk"``, ``"kiro-native"``, ``"pi"``,
-        ``"pi-native"``, ``"qwen"``, or ``"qwen-code"``.
-    :returns: ``True`` when launchable (CLI installed, or a harness the
-        daemon doesn't gate); ``False`` only when a CLI-wrapping
-        harness's binary is missing from ``PATH``.
+        ``"pi-native"``, ``"qwen"``, ``"qwen-code"``, or
+        ``"antigravity-native"``.
+    :returns: ``True`` when launchable (CLI installed — plus, for the
+        antigravity family, OAuth'd — or a harness the daemon doesn't
+        gate); ``False`` when a CLI-wrapping harness's binary is missing
+        from ``PATH``, or when the antigravity CLI is present but not yet
+        signed in.
     """
     canonical = _canonical_harness(harness)
     if canonical in _SDK_HARNESSES:
@@ -265,6 +275,44 @@ def harness_is_configured(harness: str) -> bool:
     if credential_check is not None:
         return credential_check()
     return True
+
+
+def harness_credential_satisfied(harness: str) -> bool:
+    """Return whether *harness*'s file-based credential is present.
+
+    The credential half of :func:`harness_is_configured`, **without** the
+    binary check. Only families in :data:`_FAMILY_CREDENTIAL_CHECK` — today
+    just the antigravity family (``agy``), which has no non-interactive login
+    and authenticates via a browser OAuth on first run — have a credential
+    axis; every other harness returns ``True`` (it has no separately-checkable
+    credential here, so this never blocks it).
+
+    Callers that already verify the binary separately (e.g. the sub-agent
+    dispatch gate, which probes ``missing_harness_cli`` first) use this to add
+    *only* the credential axis without re-gating on binary presence — so a
+    binary-less host (CI, or a host dispatching to a remote child) is not
+    falsely told claude/codex/pi are unconfigured.
+
+    :param harness: A harness id, e.g. ``"antigravity-native"``,
+        ``"claude-native"``, or ``"codex"``.
+    :returns: ``False`` only when *harness* belongs to a credential-gated
+        family AND that credential is absent; ``True`` otherwise (no credential
+        axis, or the credential is present).
+    """
+    canonical = _canonical_harness(harness)
+    if (
+        canonical not in _HARNESS_FAMILY
+        and canonical not in _PI_HARNESSES
+        and canonical not in _OPENCODE_HARNESSES
+        and canonical not in _QWEN_HARNESSES
+    ):
+        # Unknown / SDK harness — no install metadata, so no credential axis to
+        # assess here. Fail open, matching ``harness_is_configured``.
+        return True
+    credential_check = _FAMILY_CREDENTIAL_CHECK.get(_install_key(canonical))
+    if credential_check is None:
+        return True
+    return credential_check()
 
 
 def configured_harness_map() -> dict[str, bool]:

@@ -1185,7 +1185,11 @@ async def _execute_subagent_tool(
         # cause), and the orchestrator may re-dispatch into the same wall. The
         # which-probe here reads the same PATH the harness boot uses, so the
         # verdict can't disagree with the real launch.
-        from omnigent.onboarding.harness_install import missing_harness_cli
+        from omnigent.onboarding.harness_install import (
+            harness_setup_hint,
+            missing_harness_cli,
+        )
+        from omnigent.onboarding.harness_readiness import harness_credential_satisfied
 
         if child_harness is not None:
             missing_cli = missing_harness_cli(child_harness)
@@ -1203,6 +1207,29 @@ async def _execute_subagent_tool(
                     f"machine: harness {child_harness!r} needs the "
                     f"{missing_cli.binary!r} CLI on PATH, which was not found. "
                     f"Install it with: {install} "
+                    f"(or don't dispatch to {sub_agent_name!r} here)."
+                )
+            # The binary alone isn't always enough. The launch gate
+            # (``HostConnection._handle_launch_runner`` → ``harness_is_configured``)
+            # ALSO checks a file-based credential for families that have no
+            # non-interactive login — today only the ``agy`` (antigravity-native)
+            # CLI, which authenticates via a browser OAuth on first run. Add ONLY
+            # that credential axis here (``harness_credential_satisfied``), NOT
+            # the full ``harness_is_configured``: the latter re-checks binary
+            # presence, which would falsely reject claude/codex/pi on a
+            # binary-less host (CI, or a host dispatching to a remote child) even
+            # though the binary preflight above already covers the local case.
+            # ``harness_credential_satisfied`` returns True for every family
+            # without a credential axis, so claude/codex/pi are untouched; only
+            # an agy-installed-but-unauthed child is rejected — with the
+            # actionable "run agy once and complete the browser sign-in" hint,
+            # instead of stalling ~30-40s on agy's OAuth screen before dying with
+            # a confusing turn-delivery error.
+            if not harness_credential_satisfied(child_harness):
+                return (
+                    f"Error: sub-agent {sub_agent_name!r} can't start on this "
+                    f"machine: harness {child_harness!r} is installed but not "
+                    f"configured — {harness_setup_hint(child_harness)} "
                     f"(or don't dispatch to {sub_agent_name!r} here)."
                 )
         # Create child session on the server (no initial items —

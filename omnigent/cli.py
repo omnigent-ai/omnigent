@@ -10838,6 +10838,7 @@ def _run_configure_harnesses_interactive() -> None:
         cursor_api_key_configured,
         cursor_sdk_installed,
     )
+    from omnigent.onboarding.gemini_auth import gemini_login_detected
     from omnigent.onboarding.goose_auth import goose_config_summary
     from omnigent.onboarding.harness_install import (
         COPILOT_KEY,
@@ -10855,6 +10856,7 @@ def _run_configure_harnesses_interactive() -> None:
     from omnigent.onboarding.interactive import select
     from omnigent.onboarding.provider_config import (
         ANTHROPIC_FAMILY,
+        GEMINI_FAMILY,
         OPENAI_FAMILY,
         PI_SURFACE,
         surface_default_provider,
@@ -10990,33 +10992,62 @@ def _run_configure_harnesses_interactive() -> None:
             options.append(f"  {cursor_sub}")
             selectable.append(False)
             row_target.append(None)
-        # Antigravity (Gemini-native, no provider family): like Cursor, readiness
-        # is just whether a Gemini key is configured (``antigravity:`` block or
-        # ambient env); its drill-in manages that key. Vertex specs need no key,
-        # so a ✗ isn't a hard blocker for that path.
+        # Antigravity (Gemini, no provider family). Two surfaces share this row:
+        # the in-process ``antigravity`` SDK harness, configured by a Gemini API
+        # key (``antigravity:`` block or ambient env); and the native
+        # ``antigravity-native`` (``agy``) TUI, which the SDK key does NOT
+        # configure — the ``agy`` CLI ignores it and authenticates via a browser
+        # OAuth on first run. The row's green ✓ tracks the native path's real
+        # readiness (agy installed AND OAuth'd, via ``gemini_login_detected`` —
+        # the same file check the launch/dispatch gates use), so an SDK key alone
+        # no longer paints it green; the Gemini key state is still reported as a
+        # sub-line for the SDK path. Mirrors the qwen/opencode/goose rows, which
+        # surface install + auth state rather than a credential alone.
         ag_key_set = antigravity_api_key_configured(config) or any(
             os.environ.get(v) for v in ANTIGRAVITY_ENV_VARS
         )
-        options.append(f"{'  ' if ag_key_set else '[red]✗[/] '}Antigravity")
+        agy_installed = harness_cli_installed(GEMINI_FAMILY)
+        agy_logged_in = agy_installed and gemini_login_detected()
+        options.append(f"{'  ' if agy_logged_in else '[red]✗[/] '}Antigravity")
         selectable.append(True)
         row_target.append(_ANTIGRAVITY)
-        # The antigravity SDK ships in an OPTIONAL extra (unlike Cursor's baseline
-        # ``cursor-sdk``), so a user can have a key but no SDK. Lead with that gap when
-        # the extra is missing — naming the install command inline — then still report
-        # key status. ``[antigravity]`` is escaped since the sub-lines render as Rich
-        # markup (bare brackets parse as a tag).
+        # Sub-lines, in launch order: (1) native ``agy`` CLI install/OAuth state
+        # (the native TUI can't start without both); (2) the SDK-extra gap, when
+        # the optional ``antigravity`` package is missing; (3) the Gemini API key
+        # state used by the SDK path. ``[antigravity]`` and install hints are
+        # escaped since the sub-lines render as Rich markup (bare brackets parse
+        # as a tag).
         ag_sub_lines: list[str] = []
+        agy_spec = harness_install_spec(GEMINI_FAMILY)
+        if not agy_installed:
+            from rich.markup import escape as _rich_escape
+
+            agy_hint = _rich_escape(
+                agy_spec.install_hint
+                if agy_spec and agy_spec.install_hint
+                else "curl -fsSL https://antigravity.google/cli/install.sh | bash"
+            )
+            ag_sub_lines.append(f"[dim]agy CLI not installed — open to install ({agy_hint})[/]")
+        elif agy_logged_in:
+            ag_sub_lines.append("[green]✓[/] agy CLI signed in")
+        else:
+            agy_auth = (
+                agy_spec.auth_hint
+                if agy_spec and agy_spec.auth_hint
+                else "run `agy` once and complete the browser sign-in"
+            )
+            ag_sub_lines.append(f"[dim]agy CLI installed — {agy_auth}[/]")
         if not antigravity_sdk_installed():
             from rich.markup import escape as _rich_escape
 
             ag_sub_lines.append(
-                f"[dim]not installed — open to install "
+                f"[dim]SDK not installed — open to install "
                 f"({_rich_escape(ANTIGRAVITY_EXTRA_INSTALL_COMMAND)})[/]"
             )
         ag_sub_lines.append(
-            "[green]✓[/] Gemini API key configured"
+            "[green]✓[/] Gemini API key configured (SDK path)"
             if ag_key_set
-            else "[dim]no Gemini API key yet — open to add one[/]"
+            else "[dim]no Gemini API key yet — open to add one (SDK path)[/]"
         )
         for ag_sub in ag_sub_lines:
             options.append(f"  {ag_sub}")
