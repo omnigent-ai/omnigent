@@ -571,6 +571,42 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
     assert current_response_id == tool_call.response_id
 
 
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        "Prompt is too long",
+        "prompt is too long: 210000 tokens > 200000 maximum",
+        "Prompt is too long\n",
+    ],
+)
+def test_read_transcript_rewrites_prompt_too_long(tmp_path: Path, raw_text: str) -> None:
+    """
+    When Claude Code writes "Prompt is too long" to the transcript, the
+    bridge rewrites it to actionable guidance so the web UI shows
+    something useful instead of the raw API error.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "err-1",
+                "message": {"role": "assistant", "content": raw_text},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _, _, items = read_transcript_items_since(transcript_path, 0, agent_name="claude-native-ui")
+
+    assert len(items) == 1
+    text = items[0].data["content"][0]["text"]
+    assert "Context limit reached" in text
+    assert "/compact" in text
+    assert "/clear" in text
+
+
 def test_read_transcript_items_from_offset_skips_existing_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

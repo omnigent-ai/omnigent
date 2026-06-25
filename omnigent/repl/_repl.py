@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
@@ -7972,6 +7973,13 @@ def _render_history_item(
 _SLASH_COMMAND_ALIASES: frozenset[str] = frozenset({"/?", "/exit"})
 
 
+# A skill name must read as a slash-command token: an alphanumeric start then
+# word chars, ``:`` (Claude ``plugin:skill``), or ``-`` (Cursor ``plugin--skill``).
+# Rejects whitespace, ``/``, and control characters. Mirrors the web composer's
+# SLASH_COMMAND_RE so the terminal and the menu agree on what is a command.
+_SKILL_COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9][\w:-]*$")
+
+
 def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     """
     Auto-register each discovered skill as a REPL slash command.
@@ -7981,6 +7989,12 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     global :data:`COMMANDS` registry. Collisions are skipped with a
     warning log so built-in commands always win.
 
+    Skills marked ``user-invocable: false`` are skipped — they are
+    internal orchestration skills, not user-typeable slash commands, so
+    they must not appear in the REPL's slash-command/autocomplete surface
+    (the same contract the web composer menu honors). The skill stays
+    loadable by the agent itself; only the user-facing command is hidden.
+
     :param skills: The agent's parsed skill list.
     :returns: List of registered command names (e.g. ``["/code-review"]``).
         Callers should pass this to :func:`unregister_skill_commands`
@@ -7988,6 +8002,17 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     """
     registered: list[str] = []
     for skill in skills:
+        if not skill.user_invocable:
+            continue
+        if not _SKILL_COMMAND_NAME_RE.match(skill.name):
+            # A name with whitespace, ``/``, or control chars yields an
+            # uninvocable or colliding command — skip + warn rather than
+            # register garbage. Mirrors the web composer's SLASH_COMMAND_RE.
+            _log.warning(
+                "Skill %r skipped: name is not a valid slash-command token",
+                skill.name,
+            )
+            continue
         cmd_name = f"/{skill.name}"
         if cmd_name in COMMANDS:
             _log.warning(

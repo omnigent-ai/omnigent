@@ -33,6 +33,8 @@ interface SettingsNavItem {
   id: SettingsSectionId;
   label: string;
   icon: typeof PaletteIcon;
+  /** Hide this item on mobile (e.g. keyboard shortcuts on a touch device). */
+  hideOnMobile?: boolean;
 }
 
 interface SettingsNavGroup {
@@ -44,7 +46,7 @@ interface SettingsNavGroup {
 export function settingsNavGroups(accountsEnabled: boolean): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
-    { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon },
+    { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
   ];
   if (accountsEnabled) {
     // Account leads the group when present — it's the most-visited section
@@ -104,7 +106,13 @@ export function SettingsSidebarBody({
     <>
       <div className="flex items-center justify-between px-3 pt-3">
         <Button asChild variant="ghost" size="sm" className="gap-2 text-muted-foreground">
-          <Link to="/" onClick={onNavClick}>
+          {/* No onNavClick here: on mobile the sidebar is a full-screen
+          overlay. Navigating to "/" exits /settings, so the sidebar swaps
+          back to the conversation list — but we keep the overlay OPEN so
+          mobile lands on that list rather than closing onto the homepage
+          content behind it. On desktop onNavClick is a no-op (persistent
+          card), so dropping it changes nothing there. */}
+          <Link to="/">
             <ArrowLeftIcon className="size-4" />
             Back to Omnigent
           </Link>
@@ -142,6 +150,7 @@ export function SettingsSidebarBody({
                   className={cn(
                     "w-full justify-start gap-2 text-sm",
                     selected && "bg-muted font-semibold",
+                    item.hideOnMobile && "max-md:hidden",
                   )}
                 >
                   <Link

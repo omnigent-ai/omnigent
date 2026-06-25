@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib import error, request
 
+from omnigent._platform import stable_user_id
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 
 if TYPE_CHECKING:
@@ -73,8 +74,8 @@ BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
 # trusted parent (`/tmp`) is shared; everything under
 # `_BRIDGE_ROOT_PARENT` must be owned by the current uid and not be a
 # symlink — see :func:`_ensure_secure_dir`.
-_TRUSTED_PARENT = Path("/tmp")
-_BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{os.getuid()}"
+_TRUSTED_PARENT = Path(tempfile.gettempdir())
+_BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{stable_user_id()}"
 _BRIDGE_ROOT = _BRIDGE_ROOT_PARENT / "claude-native"
 _CONFIG_FILE = "bridge.json"
 _SERVER_FILE = "server.json"
@@ -243,10 +244,19 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
         # bridge-owned directories below it.
         return _absolute_syntactic_path(qwen_root.parent.parent)
 
+    from omnigent.hermes_native_bridge import bridge_root as hermes_bridge_root
+
+    hermes_root = _absolute_syntactic_path(hermes_bridge_root())
+    if target.is_relative_to(hermes_root):
+        # Same shape as cursor-native ($TMPDIR/omnigent-<uid>/hermes-native): trust
+        # the uid-scoped temp dir's parent and validate/chmod the two
+        # bridge-owned directories below it.
+        return _absolute_syntactic_path(hermes_root.parent.parent)
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, "
-        f"{antigravity_root!s}, {qwen_root!s})"
+        f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s})"
     )
 
 
@@ -638,7 +648,7 @@ def _ensure_secure_dir(target: Path) -> None:
     if cur != trusted_parent:
         raise RuntimeError(f"bridge dir {target!s} is not under trusted parent {trusted_parent!s}")
     ancestors.reverse()
-    my_uid = os.getuid()
+    my_uid = getattr(os, "getuid", lambda: -1)()
     for ancestor in ancestors:
         try:
             os.mkdir(ancestor, mode=0o700)
@@ -4554,6 +4564,18 @@ def _assistant_transcript_items_from_entry(
     return response_id if items else current_response_id, items
 
 
+_CONTEXT_OVERFLOW_RE = re.compile(
+    r"^prompt is too long",
+    re.IGNORECASE,
+)
+
+_CONTEXT_OVERFLOW_REPLACEMENT = (
+    "Context limit reached — the conversation has grown too long for "
+    "the model’s context window. Use /compact to summarize and free up "
+    "space, or /clear to start a new conversation."
+)
+
+
 def _assistant_message_item(
     *,
     source_key: str,
@@ -4572,13 +4594,16 @@ def _assistant_message_item(
     :param text: Assistant text block.
     :returns: Parsed transcript item.
     """
+    display_text = text
+    if _CONTEXT_OVERFLOW_RE.match(text.strip()):
+        display_text = _CONTEXT_OVERFLOW_REPLACEMENT
     return ClaudeTranscriptItem(
         source_id=_source_id(source_key, item_index, "message"),
         item_type="message",
         data={
             "role": "assistant",
             "agent": agent_name,
-            "content": [{"type": "output_text", "text": text}],
+            "content": [{"type": "output_text", "text": display_text}],
         },
         response_id=response_id,
     )

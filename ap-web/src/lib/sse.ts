@@ -54,6 +54,7 @@ import type {
   SessionTerminalPendingEvent,
   SessionUsageEvent,
   SlashCommand,
+  RoutingDecision,
   TerminalCommandEvent,
   StreamEvent,
   TextDelta,
@@ -957,6 +958,25 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       itemId,
       responseId,
     } satisfies SlashCommand;
+  }
+
+  if (itemType === "routing_decision") {
+    // Drop a malformed frame (empty model / unknown tier) rather than
+    // rendering a broken chip — the relay also persists nothing for it.
+    const model = typeof rec.model === "string" ? rec.model : "";
+    const tier = rec.tier;
+    if (!model || (tier !== "cheap" && tier !== "medium" && tier !== "expensive")) {
+      return null;
+    }
+    return {
+      type: "routing_decision",
+      model,
+      tier,
+      applied: rec.applied === true,
+      rationale: typeof rec.rationale === "string" ? rec.rationale : "",
+      itemId,
+      responseId,
+    } satisfies RoutingDecision;
   }
 
   if (itemType === "terminal_command") {

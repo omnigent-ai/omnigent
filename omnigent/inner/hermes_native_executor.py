@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from omnigent.hermes_native_bridge import BRIDGE_DIR_ENV_VAR, inject_user_message
+from omnigent.hermes_native_bridge import BRIDGE_DIR_ENV_VAR, inject_interrupt, inject_user_message
 from omnigent.inner.executor import (
     Executor,
     ExecutorConfig,
@@ -91,6 +91,19 @@ class HermesNativeExecutor(Executor):
             yield ExecutorError(message=str(exc))
             return
         yield TurnComplete(response=None)
+
+    async def interrupt_session(self, session_key: str) -> bool:
+        """Cancel the in-flight Hermes turn by sending Escape to the TUI pane.
+
+        :param session_key: Unused (single-session TUI).
+        :returns: ``True`` if the interrupt was sent, ``False`` on failure.
+        """
+        del session_key
+        try:
+            await asyncio.to_thread(inject_interrupt, self._bridge_dir)
+        except RuntimeError:
+            return False
+        return True
 
 
 def _bridge_dir_from_env() -> Path:
