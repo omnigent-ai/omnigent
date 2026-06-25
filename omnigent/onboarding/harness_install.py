@@ -288,6 +288,11 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "native-opencode": OPENCODE_KEY,
     # Hermes Agent (``harness: hermes``) wraps the ``hermes`` CLI.
     HERMES_KEY: HERMES_KEY,
+    # Native Hermes TUI (``hermes-native``, via ``omni hermes``) wraps the same
+    # ``hermes`` CLI as the headless harness; ``native-hermes`` reversed spelling
+    # gates on the same binary.
+    "hermes-native": HERMES_KEY,
+    "native-hermes": HERMES_KEY,
 }
 
 

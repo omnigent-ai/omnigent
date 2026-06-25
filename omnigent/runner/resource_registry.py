@@ -60,6 +60,7 @@ GOOSE_NATIVE_TERMINAL_ROLE = "goose-native"
 ANTIGRAVITY_NATIVE_TERMINAL_ROLE = "antigravity-native"
 QWEN_NATIVE_TERMINAL_ROLE = "qwen-native"
 KIMI_NATIVE_TERMINAL_ROLE = "kimi-native"
+HERMES_NATIVE_TERMINAL_ROLE = "hermes-native"
 # Role marker for the embedded Omnigent REPL terminal auto-created for
 # runner-hosted SDK sessions (``omnigent attach`` in a tmux pane — the
 # SDK mirror of the native terminals above). The attach WebSocket uses
@@ -981,6 +982,10 @@ class SessionResourceRegistry:
             # returns right after the tmux paste), so the PTY watcher is its
             # only running/idle status source — same as cursor/pi/claude.
             KIMI_NATIVE_TERMINAL_ROLE,
+            # hermes-native injects then returns (its forwarder only mirrors the
+            # SQLite transcript, not status), so the PTY watcher is its status
+            # source too.
+            HERMES_NATIVE_TERMINAL_ROLE,
         }
         if activity_publisher is None and not emit_status and exit_publisher is None:
             return

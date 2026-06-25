@@ -2884,7 +2884,7 @@ async def test_auto_create_antigravity_cold_starts_real_conversation(
     # The same real id is PATCHed onto the session as external_session_id so a
     # later --resume continues agy's actual conversation (the read-path
     # replacement for the retired forwarder's _patch_external_session_id).
-    assert patch_calls == [(f"/v1/sessions/{session_id}", {"external_session_id": called_id})]
+    assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
     # The RPC reader spawns (it replaced the transcript forwarder).
     assert len(reader_calls) == 1
 
@@ -2923,7 +2923,7 @@ async def test_auto_create_antigravity_cold_start_scopes_to_pane_agy(
     assert not bridge_mod_is_placeholder(called_id)
     assert state is not None
     assert state.conversation_id == called_id
-    assert patch_calls == [(f"/v1/sessions/{session_id}", {"external_session_id": called_id})]
+    assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
 
 
 @pytest.mark.asyncio
@@ -2952,9 +2952,7 @@ async def test_auto_create_antigravity_cold_start_falls_back_when_no_pane(
     called_port, _called_id = start_cascade_calls[0]
     assert called_port == 52548  # the lowest candidate, NOT the (ignored) pane port
     assert state is not None
-    assert patch_calls == [
-        (f"/v1/sessions/{session_id}", {"external_session_id": state.conversation_id})
-    ]
+    assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
 
 
 @pytest.mark.asyncio
@@ -3016,9 +3014,7 @@ async def test_auto_create_antigravity_cold_start_falls_back_when_port_unattribu
     assert len(start_cascade_calls) == 1
     assert start_cascade_calls[0][0] == 52548  # safe candidate fallback
     assert state is not None
-    assert patch_calls == [
-        (f"/v1/sessions/{session_id}", {"external_session_id": state.conversation_id})
-    ]
+    assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
 
 
 @pytest.mark.asyncio
@@ -3146,67 +3142,6 @@ async def test_auto_create_antigravity_cold_start_port_timeout_keeps_placeholder
     assert patch_calls == []
     # The RPC reader still spawns regardless of the cold-start outcome.
     assert len(reader_calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_patch_agy_external_session_id_noop_without_client() -> None:
-    """A ``None`` server client makes the external_session_id PATCH a no-op.
-
-    The cold-start helper threads its (optional) runner server client through;
-    when absent there is nothing to PATCH against, so the call must simply return
-    without raising — the cascade id still lives in bridge state.
-    """
-    import omnigent.runner.app as runner_app_mod
-
-    # No client, no exception, no work — just returns.
-    await runner_app_mod._patch_agy_external_session_id(None, "conv_x", "cascade_x")
-
-
-@pytest.mark.asyncio
-async def test_patch_agy_external_session_id_swallows_transport_error(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A transport ``httpx.HTTPError`` is logged, never raised (best-effort).
-
-    The PATCH is the read-path resume-fidelity write; a transport failure must
-    not crash the cold-start (which would strand a terminal with no reader), so
-    it is caught and surfaced as a warning only.
-    """
-    import omnigent.runner.app as runner_app_mod
-
-    class _BoomClient:
-        async def patch(self, _url: str, **_kwargs: Any) -> httpx.Response:
-            raise httpx.ConnectError("boom")
-
-    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
-        await runner_app_mod._patch_agy_external_session_id(
-            cast(httpx.AsyncClient, _BoomClient()), "conv_x", "cascade_x"
-        )
-    assert "failed to PATCH external_session_id" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_patch_agy_external_session_id_logs_on_rejection(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A ``>= 400`` response is logged (not silently swallowed), never raised.
-
-    Mirrors the codex recorder PATCH: ``httpx`` does not raise on a 4xx/5xx
-    response unless asked, so the helper inspects ``status_code`` and warns when
-    the server rejects the write — otherwise the lost resume continuity would be
-    invisible.
-    """
-    import omnigent.runner.app as runner_app_mod
-
-    class _RejectClient:
-        async def patch(self, url: str, **_kwargs: Any) -> httpx.Response:
-            return httpx.Response(404, json={}, request=httpx.Request("PATCH", url))
-
-    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
-        await runner_app_mod._patch_agy_external_session_id(
-            cast(httpx.AsyncClient, _RejectClient()), "conv_x", "cascade_x"
-        )
-    assert "rejected external_session_id PATCH (404)" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -9991,6 +9926,87 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
     ] == []
     assert parent_events == []
     assert parent_inbox.empty()
+    # The harness subprocess is still released — the terminal is gone.
+    assert pm.released == [conv_id]
+
+
+@pytest.mark.parametrize("terminal_name", ["qwen", "antigravity"])
+@pytest.mark.asyncio
+async def test_required_terminal_clean_quit_publishes_idle_not_failed(
+    terminal_name: str,
+) -> None:
+    """A clean ``/quit`` of qwen/antigravity-native is not a crash.
+
+    Both harnesses leave the exit-classification memo stuck on ``running`` at
+    quit time — qwen's "powering down" redraw trips the PTY-activity watcher,
+    and antigravity-native is deliberately excluded from the PTY ``emit_status``
+    role set (the RPC reader owns working-status). So ``session_was_idle`` is
+    ``False`` even though the user quit normally. The runner must special-case
+    these terminals: publish a final ``idle`` (to clear the web "Working…"
+    spinner) and release the harness, but never render the spurious red
+    ``required_terminal_exited`` failure card.
+
+    :param terminal_name: The native terminal that the user quit cleanly.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import (
+        TerminalExitEvent,
+        TerminalLifecycle,
+    )
+
+    conv_id = f"conv_clean_quit_{terminal_name}_{uuid.uuid4().hex[:12]}"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resource_registry = app.state.session_resource_registry
+    # Grab the runner's terminal-exit publisher (the branch under test) and
+    # drive it directly, mimicking the registry firing on a clean quit.
+    publish_exit = resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        publish_exit(
+            TerminalExitEvent(
+                session_id=conv_id,
+                terminal_id=f"terminal_{terminal_name}_main",
+                terminal_name=terminal_name,
+                session_key="main",
+                lifecycle=TerminalLifecycle.REQUIRED,
+                # The memo never flipped to idle, so the generic guard would
+                # otherwise misclassify this normal quit as a crash.
+                session_was_idle=False,
+            )
+        )
+        queued_events: list[dict[str, Any]] = []
+        for _ in range(1000):
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            if pm.released:
+                break
+            await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        runner_app.unregister_child_session(conv_id)
+
+    # The terminal resource is removed and a final idle clears the spinner...
+    assert {
+        "type": "session.resource.deleted",
+        "resource_id": f"terminal_{terminal_name}_main",
+        "resource_type": "terminal",
+        "session_id": conv_id,
+    } in queued_events
+    assert {"type": "session.status", "status": "idle"} in queued_events
+    # ...but no spurious failure card renders — the user quit normally.
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] == []
     # The harness subprocess is still released — the terminal is gone.
     assert pm.released == [conv_id]
 

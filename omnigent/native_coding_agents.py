@@ -10,6 +10,7 @@ from omnigent._wrapper_labels import (
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
     GOOSE_NATIVE_WRAPPER_VALUE,
+    HERMES_NATIVE_WRAPPER_VALUE,
     KIMI_NATIVE_WRAPPER_VALUE,
     OPENCODE_NATIVE_WRAPPER_VALUE,
     PI_NATIVE_WRAPPER_VALUE,
@@ -125,6 +126,15 @@ KIMI_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="kimi",
 )
 
+HERMES_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="hermes",
+    display_name="Hermes",
+    agent_name="hermes-native-ui",
+    harness="hermes-native",
+    wrapper_label=HERMES_NATIVE_WRAPPER_VALUE,
+    terminal_name="hermes",
+)
+
 NATIVE_CODING_AGENTS: tuple[NativeCodingAgent, ...] = (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
@@ -135,6 +145,7 @@ NATIVE_CODING_AGENTS: tuple[NativeCodingAgent, ...] = (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
     QWEN_NATIVE_CODING_AGENT,
     KIMI_NATIVE_CODING_AGENT,
+    HERMES_NATIVE_CODING_AGENT,
 )
 
 _BY_AGENT_NAME = {agent.agent_name: agent for agent in NATIVE_CODING_AGENTS}

@@ -363,6 +363,13 @@ overrides this auto-selection.
 | `oidc` | Standalone deploy with your own IdP: server handles the full login flow | Set `OMNIGENT_AUTH_ENABLED=1` and the `OMNIGENT_OIDC_*` env vars; the presence of `OMNIGENT_OIDC_ISSUER` selects OIDC (or pin `OMNIGENT_AUTH_PROVIDER=oidc`). Requires HTTPS (the session cookie uses the `__Host-` prefix). |
 | `header` | Behind an existing SSO proxy (oauth2-proxy, AWS ALB OIDC, Cloudflare Access, Tailscale Funnel, …) that injects an identity header | The default when `OMNIGENT_AUTH_ENABLED` is off; or pin `OMNIGENT_AUTH_PROVIDER=header`. Reads `X-Forwarded-Email` by default; set `OMNIGENT_AUTH_HEADER` for proxies that use another name (e.g. `Cf-Access-Authenticated-User-Email`), and `OMNIGENT_AUTH_HEADER_STRIP_PREFIX=accounts.google.com:` for Google IAP. Proxy MUST strip any inbound copy of the header from clients. Missing headers are always rejected. |
 
+> [!NOTE]
+> **Managed sandboxes need `header`/`oidc` or single-user auth.** Each session's
+> runner dials back with the *user's* identity, which the built-in `accounts` mode
+> (the deploy default above) can't supply over the runner WebSocket — it returns
+> `403` even though the host connects. Framework-level; applies to every sandbox
+> provider (Modal / Daytona / Islo / Kubernetes / …).
+
 ### Single sign-on (OIDC)
 
 The built-in `accounts` flow needs no setup beyond the deploy itself. To let

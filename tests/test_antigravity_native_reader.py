@@ -832,23 +832,23 @@ async def test_status_not_idle_while_tools_running(
 
 
 @pytest.mark.asyncio
-async def test_status_idle_on_error_planner_close(
+async def test_status_failed_on_error_planner_close(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     patched_discovery: None,
 ) -> None:
-    """A turn that ends in a terminal-ERROR planner still emits IDLE.
+    """A turn that ends in a terminal-ERROR planner closes as FAILED (not idle).
 
-    Regression for the stuck-spinner bug: previously IDLE fired only on a DONE
-    planner with closing text, so a turn ending in an ERROR planner left
-    ``turn_active`` True forever (spinner stuck; next turn could not re-open
-    RUNNING). The IDLE here comes from the ERROR-terminal rule, not the
-    text-close rule (the planner carries no closing text).
+    A model/turn ERROR must surface as a failed turn — not a clean idle that
+    looks identical to a normal empty reply (#6). The turn still closes (the
+    spinner clears; ``turn_active`` resets so the next turn can re-open RUNNING),
+    but on the ``failed`` status edge, and the mapper commits a visible error
+    message item.
     """
     user = _load("user_input")
     error_planner = _load("planner_response_text")
     error_planner["status"] = "CORTEX_STEP_STATUS_ERROR"
-    # No closing text — prove the IDLE is from the ERROR-terminal rule.
+    # No closing text — prove the close is from the ERROR-terminal rule.
     error_planner["plannerResponse"] = {}
     script = _StepScript([[user], [user, error_planner], [user, error_planner]])
     sink = _PostSink()
@@ -861,7 +861,10 @@ async def test_status_idle_on_error_planner_close(
         iterations=3,
     )
 
-    assert sink.statuses() == ["running", "idle"]
+    # Closes as FAILED, not idle.
+    assert sink.statuses() == ["running", "failed"]
+    # The user message + a visible error item are committed (no silent empty reply).
+    assert sink.message_roles() == ["user", "assistant"]
 
 
 # ---------------------------------------------------------------------------
@@ -2939,8 +2942,14 @@ async def test_run_reader_with_bridge_adopts_first_cascade_in_place(
         rotate_calls.append("forked")  # must NOT happen on adopt-in-place
         return "conv_should_not_be_used"
 
+    recorded_external: list[tuple[str, str]] = []
+
+    async def _fake_record_external(client: object, session_id: str, cascade_id: str) -> None:
+        recorded_external.append((session_id, cascade_id))
+
     monkeypatch.setattr(reader, "supervise_reader", _fake_supervise)
     monkeypatch.setattr(reader, "_rotate_session_for_cascade", _fake_rotate)
+    monkeypatch.setattr(reader, "_record_external_session_id", _fake_record_external)
     monkeypatch.setattr(
         "omnigent.antigravity_native_interactions.bridge_interaction",
         lambda *a, **k: None,
@@ -2965,6 +2974,10 @@ async def test_run_reader_with_bridge_adopts_first_cascade_in_place(
     assert state is not None
     assert state.session_id == _SESSION_ID
     assert state.conversation_id == new_cascade
+    # The adopted cascade is recorded as external_session_id so a later --resume /
+    # server restart loads THIS conversation, not the headless cold-start phantom
+    # (#2 data-loss). It is recorded against the SAME session.
+    assert recorded_external == [(_SESSION_ID, new_cascade)]
 
 
 @pytest.mark.asyncio

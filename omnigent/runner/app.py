@@ -59,6 +59,7 @@ from omnigent.runner.resource_registry import (
     CODEX_NATIVE_TERMINAL_ROLE,
     CURSOR_NATIVE_TERMINAL_ROLE,
     GOOSE_NATIVE_TERMINAL_ROLE,
+    HERMES_NATIVE_TERMINAL_ROLE,
     KIMI_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
     OPENCODE_NATIVE_TERMINAL_ROLE,
@@ -1619,6 +1620,15 @@ async def _auto_create_goose_terminal(
     )
     workspace = os.path.realpath(str(launch_config.workspace))
     goose_command = resolve_goose_executable()
+    # GOOSE_MODE=smart_approve so Goose prompts in its TUI before sensitive tools
+    # (its native approval, which shows in the terminal and the web's embedded
+    # terminal). Goose's default mode is Auto (no prompt), so we set this for the
+    # approval flow to appear at all. Provider/model come from `goose configure`.
+    goose_env: dict[str, str] = {
+        "GOOSE_CLI_THEME": "ansi",
+        "GOOSE_TELEMETRY_OFF": "1",
+        "GOOSE_MODE": "smart_approve",
+    }
     # Launch-unique Goose session name. `goose session --name X` (without
     # --resume) creates a NEW sessions row each launch (verified, Goose 1.38),
     # so a per-launch-unique name lets the forwarder bind to EXACTLY this
@@ -1644,9 +1654,10 @@ async def _auto_create_goose_terminal(
             args=goose_args,
             # ANSI theme keeps the pane cheap to scrape; GOOSE_TELEMETRY_OFF
             # suppresses Goose's first-run "share usage data?" prompt, which
-            # would otherwise block the headless pane on a fresh install. Goose's
+            # would otherwise block the headless pane on a fresh install;
+            # GOOSE_MODE=smart_approve turns on Goose's own in-TUI approval. Goose's
             # provider/model come from the user's own `goose configure` (KTD4).
-            env={"GOOSE_CLI_THEME": "ansi", "GOOSE_TELEMETRY_OFF": "1"},
+            env=goose_env,
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
@@ -1681,6 +1692,7 @@ async def _auto_create_goose_terminal(
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
     from omnigent.goose_native_forwarder import supervise_goose_forwarder
+    from omnigent.goose_native_permissions import supervise_goose_approval_mirror
 
     if server_client is not None and ensure_comment_relay is not None:
         await ensure_comment_relay(
@@ -1689,21 +1701,196 @@ async def _auto_create_goose_terminal(
             await_notify=False,
         )
 
+    async def _supervise_goose_native_bridges() -> None:
+        """Run the transcript forwarder and the approval mirror together.
+
+        Both are per-session, runner-owned, restart-on-failure; gathering them
+        under one task keeps a single registration/cancellation handle for
+        teardown. The forwarder mirrors Goose's transcript onto the conversation;
+        the approval mirror surfaces Goose's cliclack tool-confirmation prompt as
+        a web elicitation (see :mod:`omnigent.goose_native_permissions`).
+        """
+        await asyncio.gather(
+            supervise_goose_forwarder(
+                base_url=server_url,
+                headers={},
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                agent_name="goose-native-ui",
+                goose_session_name=goose_session_name,
+                auth=_runner_auth,
+            ),
+            supervise_goose_approval_mirror(
+                base_url=server_url,
+                headers={},
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                auth=_runner_auth,
+            ),
+        )
+
     _forwarder_task = asyncio.create_task(
-        supervise_goose_forwarder(
-            base_url=server_url,
-            headers={},
-            session_id=session_id,
-            bridge_dir=bridge_dir,
-            agent_name="goose-native-ui",
-            goose_session_name=goose_session_name,
-            auth=_runner_auth,
-        ),
-        name=f"goose-forwarder-{session_id}",
+        _supervise_goose_native_bridges(),
+        name=f"goose-bridges-{session_id}",
     )
     _register_auto_forwarder_task(session_id, _forwarder_task)
     _logger.info(
-        "Auto-created goose terminal + forwarder for session %s; forwarder_task=%s",
+        "Auto-created goose terminal + forwarder/approval-mirror for session %s; task=%s",
+        session_id,
+        _forwarder_task.get_name(),
+    )
+    return terminal_view
+
+
+async def _auto_create_hermes_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, Any]], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+) -> SessionResourceView:
+    """
+    Auto-create the Hermes TUI terminal for a hermes-native session.
+
+    Launches the bare ``hermes`` TUI in a runner-owned tmux pane. Auth is Hermes'
+    own configuration (``hermes setup`` / ``hermes model`` →
+    ``~/.hermes/config.yaml``), so HOME is inherited and Omnigent writes no vendor
+    config (Hermes owns its own tool surface / skills). Hermes can't be told its
+    session id in advance, so the forwarder discovers *this* launch's row by
+    ``cwd`` + ``started_at`` floor (see :mod:`omnigent.hermes_native_forwarder`).
+    Mirrors :func:`_auto_create_goose_terminal`.
+
+    :param session_id: Session/conversation identifier.
+    :param resource_registry: Session resource registry for launching the terminal.
+    :param publish_event: Runner session event publisher.
+    :param server_client: Runner Omnigent server client.
+    :returns: Created terminal resource view.
+    """
+    from omnigent.hermes_native import resolve_hermes_executable
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+
+    # Tear down any forwarder left from a prior terminal for this session before
+    # re-creating, so old and new tasks can't both mirror (double-posting), and
+    # drop the prior terminal's stale forward cursor.
+    await _cancel_auto_forwarder_task(session_id)
+    from omnigent.hermes_native_bridge import bridge_dir_for_session_id, write_tmux_target
+    from omnigent.hermes_native_forwarder import clear_hermes_bridge_state
+
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    clear_hermes_bridge_state(bridge_dir)
+
+    # ``_pi_native_launch_config`` is a generic session-snapshot reader
+    # (workspace + terminal_launch_args); reused here, not Pi-specific.
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = os.path.realpath(str(launch_config.workspace))
+    hermes_command = resolve_hermes_executable()
+    # Stamp the discovery floor BEFORE launch: the forwarder binds the newest
+    # ``sessions`` row whose ``cwd`` matches this workspace and whose
+    # ``started_at`` is at/after this instant (minus a small skew). A wiped bridge
+    # cursor (clear_hermes_bridge_state above) starts it at that row's first row.
+    launch_epoch_s = time.time()
+    hermes_args = [*(launch_config.terminal_launch_args or [])]
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="hermes",
+        session_key="main",
+        resource_role=HERMES_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            command=hermes_command,
+            args=hermes_args,
+            # No env overrides: Hermes uses the user's own ~/.hermes (model,
+            # provider, tools, and its native tool-approval prompt — which appears
+            # in the TUI and the web's embedded terminal). No NO_COLOR (an earlier
+            # NO_COLOR=1 rendered the gold TUI white); no HERMES_YOLO_MODE (that
+            # suppressed Hermes' own approval). The bridge captures the pane with
+            # ``tmux capture-pane -p`` (ANSI stripped), so colour never interferes.
+            env={},
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    # Advertise the tmux socket+target so the hermes-native harness executor can
+    # inject web-UI messages into this same pane (tmux paste).
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "hermes", "main")
+        if instance is not None and instance.running:
+            write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+
+    # Mirror the Hermes TUI's conversation back into the Omnigent session so the
+    # chat view tracks the embedded terminal. Host-spawned sessions have no CLI
+    # client to start this, so the runner owns it — reusing the runner's own
+    # server URL + refresh-capable auth.
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
+    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+
+    from omnigent.hermes_native_forwarder import supervise_hermes_forwarder
+    from omnigent.hermes_native_permissions import supervise_hermes_approval_mirror
+
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
+
+    async def _supervise_hermes_native_bridges() -> None:
+        """Run the transcript forwarder and the approval mirror together.
+
+        Both are per-session, runner-owned, restart-on-failure; gathering them
+        under one task keeps a single registration/cancellation handle for
+        teardown. The forwarder mirrors the TUI transcript onto the conversation;
+        the approval mirror surfaces Hermes' dangerous-command prompt as a web
+        elicitation (see :mod:`omnigent.hermes_native_permissions`).
+        """
+        await asyncio.gather(
+            supervise_hermes_forwarder(
+                base_url=server_url,
+                headers={},
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                agent_name="hermes-native-ui",
+                workspace=workspace,
+                launch_epoch_s=launch_epoch_s,
+                # The native TUI uses the user's ~/.hermes, so the forwarder tails
+                # the default store there (default_state_db()).
+                auth=_runner_auth,
+            ),
+            supervise_hermes_approval_mirror(
+                base_url=server_url,
+                headers={},
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                auth=_runner_auth,
+            ),
+        )
+
+    _forwarder_task = asyncio.create_task(
+        _supervise_hermes_native_bridges(),
+        name=f"hermes-bridges-{session_id}",
+    )
+    _register_auto_forwarder_task(session_id, _forwarder_task)
+    _logger.info(
+        "Auto-created hermes terminal + forwarder/approval-mirror for session %s; task=%s",
         session_id,
         _forwarder_task.get_name(),
     )
@@ -3272,10 +3459,16 @@ async def _cold_start_agy_conversation(
             cascade_id,
             session_id,
         )
-    # PATCH the real id onto the session so a later ``--resume`` continues this
-    # conversation (best-effort; mirrors codex/pi). A failure leaves the chat
-    # mirrored but loses agy's in-process resume continuity for this session.
-    await _patch_agy_external_session_id(server_client, session_id, cascade_id)
+    # Do NOT record this cold-start cascade as the session's external_session_id:
+    # it is the headless ``StartCascade`` bootstrap that the agy TUI never
+    # displays. The TUI mints its OWN cascade on the first typed turn, which the
+    # read driver ADOPTS in place and records as external_session_id (see
+    # ``antigravity_native_reader._record_external_session_id``). Recording the
+    # phantom here used to lose the whole conversation on resume: a later
+    # ``--resume`` launched ``--conversation <phantom>`` and loaded an EMPTY
+    # conversation. external_session_id is set-once, so it MUST be left unset here
+    # for the reader's adoption PATCH to set the real id.
+    del server_client  # retained for signature parity; no longer PATCHes here
     _logger.info(
         "Antigravity cold-start: created conversation %s on port %s for session %s",
         cascade_id,
@@ -3283,54 +3476,6 @@ async def _cold_start_agy_conversation(
         session_id,
     )
     return cascade_id
-
-
-async def _patch_agy_external_session_id(
-    server_client: httpx.AsyncClient | None,
-    session_id: str,
-    cascade_id: str,
-) -> None:
-    """
-    PATCH a cold-started agy cascade id onto the Omnigent session (best-effort).
-
-    Records ``external_session_id`` so a later ``omnigent antigravity --resume``
-    reads agy's real id back and passes ``--conversation <id>``. Read-path
-    replacement for the retired forwarder's ``_patch_external_session_id``;
-    mirrors the codex/pi recorder PATCH (best-effort — a transport
-    ``httpx.HTTPError`` or a ``>= 400`` rejection is logged, not raised, since the
-    chat mirror does not depend on it). A ``None`` client (no server client
-    available) is a no-op.
-
-    :param server_client: Runner Omnigent server client, or ``None`` to skip.
-    :param session_id: Omnigent conversation id to PATCH.
-    :param cascade_id: agy's real (cold-started) conversation id to record.
-    :returns: None.
-    """
-    if server_client is None:
-        return
-    try:
-        resp = await server_client.patch(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            json={"external_session_id": cascade_id},
-            timeout=10.0,
-        )
-    except httpx.HTTPError:
-        _logger.warning(
-            "Antigravity cold-start: failed to PATCH external_session_id=%s onto session %s; "
-            "the conversation is mirrored but `--resume` will cold-start fresh.",
-            cascade_id,
-            session_id,
-            exc_info=True,
-        )
-        return
-    if resp.status_code >= 400:
-        _logger.warning(
-            "Antigravity cold-start: AP rejected external_session_id PATCH (%s); session=%s "
-            "cascade=%s — the conversation is mirrored but `--resume` will cold-start fresh.",
-            resp.status_code,
-            session_id,
-            cascade_id,
-        )
 
 
 def _terminal_tmux_pane(
@@ -6389,6 +6534,7 @@ def create_runner_app(
     _goose_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _qwen_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _kimi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _hermes_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     # Per-session lock guarding the claude-native terminal auto-create in
     # ``create_session``. Two ``POST /v1/sessions`` calls can land
     # concurrently on a host-launched runner — ``_on_runner_connect``
@@ -6818,18 +6964,22 @@ def create_runner_app(
         if event.lifecycle != TerminalLifecycle.REQUIRED:
             return
 
-        # qwen-native: the user drives the qwen TUI directly, so quitting it
-        # (Ctrl+C / /quit) is a normal end-of-session, not a crash. The
-        # ``session_was_idle`` guard below is meant to catch a clean exit, but
-        # qwen's "powering down" redraw on quit trips the PTY-activity watcher
-        # and flips the status to ``running`` in the instant before the process
-        # exits — so the quit is misclassified as a crash and the scary
-        # ``required_terminal_exited`` card renders. Treat the qwen terminal's
-        # exit as a clean shutdown: genuine *boot* failures never reach here
-        # (they surface via ``_auto_create_qwen_terminal``'s error handler →
-        # ``_publish_native_terminal_start_error``), so a qwen required-terminal
-        # exit is always post-boot, i.e. user-initiated.
-        if event.terminal_name == "qwen" and event.session_key == "main":
+        # qwen-native / antigravity-native: the user drives the TUI directly, so
+        # quitting it (Ctrl+C / /quit) is a normal end-of-session, not a crash.
+        # The ``session_was_idle`` guard below is meant to catch a clean exit,
+        # but the exit-classification memo is never flipped to ``idle`` for these
+        # harnesses: qwen's "powering down" redraw on quit trips the PTY-activity
+        # watcher and flips the status to ``running`` in the instant before the
+        # process exits, and antigravity-native is deliberately excluded from the
+        # PTY ``emit_status`` role set (the RPC reader owns working-status, not
+        # PTY activity), so its memo stays ``running``. Either way the quit is
+        # misclassified as a crash and the scary ``required_terminal_exited`` card
+        # renders. Treat these terminals' exit as a clean shutdown: genuine *boot*
+        # failures never reach here (they surface via the respective
+        # ``_auto_create_*_terminal`` error handler →
+        # ``_publish_native_terminal_start_error``), so a qwen/antigravity
+        # required-terminal exit is always post-boot, i.e. user-initiated.
+        if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
             # Publish a final ``idle`` to clear the web "Working…" spinner: the
             # powering-down redraw may have left the PTY watcher's last edge on
             # ``running``, and the watcher is gone once the pane dies, so without
@@ -7318,6 +7468,10 @@ def create_runner_app(
                 from omnigent.goose_native_bridge import build_goose_native_spawn_env
 
                 spawn_env = build_goose_native_spawn_env(session_id)
+            if harness_name == "hermes-native" and spawn_env is None:
+                from omnigent.hermes_native_bridge import build_hermes_native_spawn_env
+
+                spawn_env = build_hermes_native_spawn_env(session_id)
             if harness_name == "qwen-native" and spawn_env is None:
                 from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
 
@@ -7825,6 +7979,39 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        if harness_name == "hermes-native":
+            _hermes_ensure_lock = _hermes_terminal_ensure_locks.setdefault(
+                session_id, asyncio.Lock()
+            )
+            async with _hermes_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_hermes_terminal = (
+                    _tr is not None and _tr.get(session_id, "hermes", "main") is not None
+                )
+                if not _has_hermes_terminal:
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        await _auto_create_hermes_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create hermes terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "Hermes",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+
         if harness_name == "qwen-native":
             _qwen_ensure_lock = _qwen_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
             async with _qwen_ensure_lock:
@@ -8166,6 +8353,7 @@ def create_runner_app(
         _goose_terminal_ensure_locks.pop(session_id, None)
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
+        _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         # Stop any TUI→web transcript forwarder (cursor-/goose-native) for this
@@ -8782,6 +8970,7 @@ def create_runner_app(
             "goose-native",
             "qwen-native",
             "kimi-native",
+            "hermes-native",
         }:
             return
         if status == "idle" and harness in {"codex-native", "antigravity-native"}:
@@ -9632,6 +9821,76 @@ def create_runner_app(
         ):
             _logger.warning(
                 "Kimi-native stop succeeded but sub-agent delivery was "
+                "not confirmed; session=%s reason=%s",
+                conv_id,
+                delivery_ack.reason,
+            )
+        return Response(status_code=204)
+
+    async def _handle_hermes_native_interrupt(conv_id: str) -> Response:
+        """Cancel the in-flight hermes turn by sending ``Escape`` to its TUI pane.
+
+        hermes-native turns run inside the ``hermes`` TUI; the runner harness task
+        returns right after the tmux paste, so the in-process cancel floor has
+        nothing to cancel. Mirrors the goose-native interrupt.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 when Escape was sent; 503 if the tmux target is unavailable.
+        """
+        from omnigent.hermes_native_bridge import bridge_dir_for_session_id, inject_interrupt
+
+        try:
+            await asyncio.to_thread(
+                inject_interrupt, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "hermes_native_interrupt_failed",
+                    "detail": _client_safe_error_detail(exc, context="hermes-native interrupt"),
+                },
+            )
+        _wake_parent_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _handle_hermes_native_stop(conv_id: str) -> Response:
+        """Hard-stop a hermes-native session by killing its tmux session.
+
+        Mirrors :func:`_handle_goose_native_stop`: kill the pane (ends
+        ``hermes``), tear the terminal resource down, cancel the forwarder,
+        publish ``idle``, and reclaim any sub-agent work entry.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 on success; 503 if the tmux target is unavailable.
+        """
+        from omnigent.hermes_native_bridge import bridge_dir_for_session_id, kill_session
+
+        try:
+            await asyncio.to_thread(
+                kill_session, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "hermes_native_stop_failed",
+                    "detail": _client_safe_error_detail(exc, context="hermes-native stop"),
+                },
+            )
+        await _teardown_session_terminals(conv_id)
+        await _cancel_auto_forwarder_task(conv_id)
+        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        delivery_ack = _mark_subagent_terminal_and_wake(
+            conv_id,
+            status="cancelled",
+            output="[System: sub-agent stopped]",
+        )
+        if not delivery_ack.delivered and (
+            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
+        ):
+            _logger.warning(
+                "Hermes-native stop succeeded but sub-agent delivery was "
                 "not confirmed; session=%s reason=%s",
                 conv_id,
                 delivery_ack.reason,
@@ -11675,6 +11934,10 @@ def create_runner_app(
             from omnigent.goose_native_bridge import build_goose_native_spawn_env
 
             spawn_env = build_goose_native_spawn_env(conv_id)
+        if harness_name == "hermes-native" and spawn_env is None:
+            from omnigent.hermes_native_bridge import build_hermes_native_spawn_env
+
+            spawn_env = build_hermes_native_spawn_env(conv_id)
         if harness_name == "qwen-native" and spawn_env is None:
             from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
 
@@ -12593,6 +12856,9 @@ def create_runner_app(
             if _harness == "goose-native":
                 # goose turn lives in the goose session TUI; send Escape to stop it.
                 return await _handle_goose_native_interrupt(conversation_id)
+            if _harness == "hermes-native":
+                # hermes turn lives in the hermes TUI; send Escape to stop it.
+                return await _handle_hermes_native_interrupt(conversation_id)
             if _harness == "qwen-native":
                 # qwen turn lives in the qwen TUI; send Escape to stop it.
                 return await _handle_qwen_native_interrupt(conversation_id)
@@ -12672,6 +12938,9 @@ def create_runner_app(
             if _harness == "goose-native":
                 # Hard-kill the goose session tmux pane (the TUI is the runtime).
                 return await _handle_goose_native_stop(conversation_id)
+            if _harness == "hermes-native":
+                # Hard-kill the hermes tmux pane (the TUI is the runtime).
+                return await _handle_hermes_native_stop(conversation_id)
             if _harness == "qwen-native":
                 # Hard-kill the qwen tmux pane (the TUI is the runtime).
                 return await _handle_qwen_native_stop(conversation_id)
@@ -13379,6 +13648,41 @@ def create_runner_app(
                         session_id,
                     )
                     return _native_terminal_start_error_response(exc, "Goose")
+            return JSONResponse(
+                status_code=200,
+                content=session_resource_view_to_dict(terminal_view),
+            )
+
+        if (
+            body.get("ensure_native_terminal")
+            and terminal_name == "hermes"
+            and session_key == "main"
+        ):
+            hermes_terminal_id = terminal_resource_id("hermes", "main")
+            ensure_lock = _hermes_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with ensure_lock:
+                existing = await resource_registry.get_terminal_resource(
+                    session_id, hermes_terminal_id
+                )
+                if existing is not None:
+                    return JSONResponse(
+                        status_code=200,
+                        content=session_resource_view_to_dict(existing),
+                    )
+                try:
+                    terminal_view = await _auto_create_hermes_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        server_client=server_client,
+                        ensure_comment_relay=_ensure_comment_relay_started,
+                    )
+                except Exception as exc:
+                    _logger.exception(
+                        "Hermes terminal ensure failed for session=%s",
+                        session_id,
+                    )
+                    return _native_terminal_start_error_response(exc, "Hermes")
             return JSONResponse(
                 status_code=200,
                 content=session_resource_view_to_dict(terminal_view),
@@ -15006,6 +15310,7 @@ def create_runner_app(
         _goose_terminal_ensure_locks.pop(session_id, None)
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
+        _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
         return JSONResponse(
@@ -15063,6 +15368,7 @@ def create_runner_app(
         _goose_terminal_ensure_locks.pop(session_id, None)
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
+        _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         # Close terminals with ``session.resource.deleted`` events BEFORE
         # cleanup_session — cleanup_conversation would silently pop them

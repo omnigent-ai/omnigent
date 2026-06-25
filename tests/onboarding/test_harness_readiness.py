@@ -176,8 +176,11 @@ def test_configured_harness_map_covers_all_spellings(
         # Copilot SDK harness + its user-facing alias.
         "copilot",
         "github-copilot",
-        # Hermes Agent harness — gates on the hermes CLI.
+        # Hermes — headless subprocess harness (``hermes``) + native TUI
+        # (``hermes-native`` / ``native-hermes``); all gate on the hermes CLI.
         "hermes",
+        "hermes-native",
+        "native-hermes",
     }
     assert set(result) == expected_keys
 

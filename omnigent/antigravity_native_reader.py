@@ -135,6 +135,11 @@ _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 # Session-status edge values (mirror the transcript forwarder's vocabulary).
 _STATUS_RUNNING = "running"
 _STATUS_IDLE = "idle"
+# Terminal-failure session status (a valid ``external_session_status``; see the
+# ``Literal["idle", "running", "failed"]`` schema). Emitted when an agy turn
+# closes on a model/turn ERROR so the web UI shows the turn FAILED instead of a
+# clean idle with a silent empty reply (#6).
+_STATUS_FAILED = "failed"
 
 # RPC step type/status constants needed for the status-transition heuristic. The
 # item-mapping constants live in the mapper; the driver only needs the few it
@@ -1632,9 +1637,27 @@ async def _emit_step(
 
     if _is_turn_close_step(step) and turn_active:
         turn_active = False
-        await _post_event(client, session_id, _status_event(_STATUS_IDLE))
+        # An ERROR planner closes the turn as FAILED, not a clean idle: a model /
+        # safety-policy / rate-limit / provider-overload error must surface as a
+        # failed turn (alongside the error item the mapper now emits), not a
+        # silent empty success that looks identical to a normal reply (#6).
+        close_status = _STATUS_FAILED if _step_is_error_planner(step) else _STATUS_IDLE
+        await _post_event(client, session_id, _status_event(close_status))
 
     return turn_active
+
+
+def _step_is_error_planner(step: dict[str, object]) -> bool:
+    """
+    Return whether a step is a PLANNER_RESPONSE that ended in ERROR.
+
+    Used to close the turn as ``failed`` (not ``idle``) so a model/turn error is
+    not mistaken for a clean empty reply.
+
+    :param step: One RPC step dict.
+    :returns: ``True`` for an ERROR-status planner step.
+    """
+    return step.get("type") == _TYPE_PLANNER_RESPONSE and step.get("status") == _STATUS_ERROR
 
 
 def _maybe_handle_interaction(
@@ -2119,6 +2142,51 @@ def _adopt_cascade_in_place(bridge_dir: Path, session_id: str, new_cascade_id: s
     )
 
 
+async def _record_external_session_id(
+    client: httpx.AsyncClient, session_id: str, cascade_id: str
+) -> None:
+    """
+    Best-effort record the agy cascade id as the session's ``external_session_id``.
+
+    So a later ``omnigent antigravity --resume`` / omnigent server restart
+    relaunches agy with ``--conversation <cascade_id>`` and continues THIS
+    conversation. Called on first-cascade adoption with the TUI-minted cascade.
+
+    The cold-start no longer records its headless ``StartCascade`` phantom (which
+    the agy TUI never displays) — that was the data-loss bug: a resume launched
+    ``--conversation <phantom>`` and loaded an EMPTY conversation, silently losing
+    the entire chat. ``external_session_id`` is set-once in the store; an overwrite
+    attempt (e.g. a second adoption) returns 400 and is logged, not raised — the
+    chat mirror does not depend on it.
+
+    :param client: The reader's Omnigent HTTP client.
+    :param session_id: Omnigent conversation id to record onto.
+    :param cascade_id: agy's adopted (TUI-minted) cascade/conversation id.
+    """
+    try:
+        resp = await client.patch(
+            f"/v1/sessions/{url_component(session_id)}",
+            json={"external_session_id": cascade_id},
+        )
+    except httpx.HTTPError:
+        _logger.warning(
+            "agy adopt: failed to record external_session_id=%s on session %s; "
+            "a later --resume will cold-start fresh.",
+            cascade_id,
+            session_id,
+            exc_info=True,
+        )
+        return
+    if resp.status_code >= 400:
+        _logger.info(
+            "agy adopt: external_session_id PATCH returned %s (likely already set); "
+            "session=%s cascade=%s",
+            resp.status_code,
+            session_id,
+            cascade_id,
+        )
+
+
 async def _rotate_session_for_cascade(
     *,
     client: httpx.AsyncClient,
@@ -2393,6 +2461,15 @@ async def run_reader_with_bridge(
                 # new one (the web/mobile UI watches the current session). The agy
                 # TUI and the web mirror then share ONE cascade (#1156/#1158).
                 _adopt_cascade_in_place(bridge_dir, current["session_id"], new_cascade_id)
+                # Record the adopted (TUI-minted) cascade as the session's
+                # external_session_id so a later --resume / omnigent server
+                # restart relaunches agy with --conversation <this cascade> and
+                # continues THIS conversation — NOT the headless cold-start
+                # StartCascade phantom the cold-start used to record, which a
+                # resume loaded as an EMPTY conversation (the whole chat silently
+                # vanished). external_session_id is set-once; the cold-start no
+                # longer records the phantom, so this first adoption sets it.
+                await _record_external_session_id(client, current["session_id"], new_cascade_id)
                 continue
             # GENUINE /clear (the bound cascade HAD turns): move Omnigent ownership
             # onto a fresh conversation bound to the new cascade, then rebind by
