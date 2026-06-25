@@ -24,10 +24,11 @@ from omnigent.cursor_native_bridge import (
     bridge_dir_for_session_id,
     build_cursor_native_spawn_env,
     build_mcp_config,
+    clear_fork_preamble,
     cursor_project_key,
     enable_mcp_for_workspace,
+    read_fork_preamble,
     read_tmux_info,
-    take_fork_preamble,
     wrap_fork_preamble,
     write_fork_preamble,
     write_mcp_bridge_config,
@@ -40,6 +41,7 @@ from omnigent.inner.cursor_native_executor import (
     _content_to_text,
     _latest_user_text,
 )
+from omnigent.inner.executor import ExecutorError
 
 
 class TestContentExtraction:
@@ -91,18 +93,22 @@ class TestExecutorCapabilities:
 class TestForkPreamble:
     """The fork preamble file + sentinel framing (text-prefix replay)."""
 
-    def test_write_take_round_trip_is_once_only(self, tmp_path: Path) -> None:
-        write_fork_preamble(tmp_path, "Conversation so far:\nuser: hi")
-        # First read returns it; the file is consumed so the second read is None.
-        assert take_fork_preamble(tmp_path) == "Conversation so far:\nuser: hi"
-        assert take_fork_preamble(tmp_path) is None
+    def test_read_does_not_consume_clear_does(self, tmp_path: Path) -> None:
+        write_fork_preamble(tmp_path, "You: hi")
+        # Read is idempotent (the file survives) so a failed/retried injection
+        # can re-read it; only clear consumes.
+        assert read_fork_preamble(tmp_path) == "You: hi"
+        assert read_fork_preamble(tmp_path) == "You: hi"
+        clear_fork_preamble(tmp_path)
+        assert read_fork_preamble(tmp_path) is None
 
     def test_empty_preamble_is_not_written(self, tmp_path: Path) -> None:
         write_fork_preamble(tmp_path, "")
-        assert take_fork_preamble(tmp_path) is None
+        assert read_fork_preamble(tmp_path) is None
 
-    def test_take_missing_is_none(self, tmp_path: Path) -> None:
-        assert take_fork_preamble(tmp_path) is None
+    def test_read_missing_is_none_and_clear_is_noop(self, tmp_path: Path) -> None:
+        assert read_fork_preamble(tmp_path) is None
+        clear_fork_preamble(tmp_path)  # no file -> no error
 
     def test_wrap_fences_preamble_before_user_text(self) -> None:
         wrapped = wrap_fork_preamble("Conversation so far:\nuser: hi", "do it")
@@ -140,6 +146,37 @@ class TestRunTurnPreambleInjection:
         async for _ in ex.run_turn([{"role": "user", "content": "second"}], [], ""):
             pass
         assert injected[1] == "second"
+
+    @pytest.mark.asyncio
+    async def test_failed_injection_preserves_preamble_for_retry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # If the FIRST injection fails (e.g. the TUI exited), the preamble must
+        # NOT be consumed — otherwise the forked history is lost permanently and
+        # a retried first turn launches with no prior context.
+        injected: list[str] = []
+        calls = {"n": 0}
+
+        def fake_inject(bridge_dir: Path, content: str) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("tmux target not advertised")
+            injected.append(content)
+
+        monkeypatch.setattr(cne, "inject_user_message", fake_inject)
+        write_fork_preamble(tmp_path, "You: earlier")
+        ex = CursorNativeExecutor(bridge_dir=tmp_path)
+
+        # First turn: injection fails -> ExecutorError, preamble still on disk.
+        events = [e async for e in ex.run_turn([{"role": "user", "content": "first"}], [], "")]
+        assert any(isinstance(e, ExecutorError) for e in events)
+        assert read_fork_preamble(tmp_path) == "You: earlier"
+
+        # Retry: injection succeeds, history rides along, THEN it's consumed.
+        async for _ in ex.run_turn([{"role": "user", "content": "first"}], [], ""):
+            pass
+        assert "You: earlier" in injected[0]
+        assert read_fork_preamble(tmp_path) is None
 
     @pytest.mark.asyncio
     async def test_no_preamble_injects_plain_text(

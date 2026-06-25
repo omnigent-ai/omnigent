@@ -144,23 +144,34 @@ def write_fork_preamble(bridge_dir: Path, preamble: str) -> None:
     (bridge_dir / _FORK_PREAMBLE_FILE).write_text(preamble, encoding="utf-8")
 
 
-def take_fork_preamble(bridge_dir: Path) -> str | None:
-    """Read and remove the fork preamble, returning it once (else ``None``).
+def read_fork_preamble(bridge_dir: Path) -> str | None:
+    """Read the fork preamble WITHOUT consuming it (else ``None``).
 
-    The file is deleted on read so the history rides only the FIRST injected
-    message; subsequent turns inject the plain user text.
+    Read and clear are deliberately split: the executor reads the preamble,
+    injects it, and only calls :func:`clear_fork_preamble` on a SUCCESSFUL
+    injection. Consuming on read would lose the forked history permanently if
+    the first injection fails (e.g. the TUI exited) and the turn is retried.
 
     :param bridge_dir: The session's cursor-native bridge dir.
     :returns: The preamble text, or ``None`` when absent/empty.
     """
-    path = bridge_dir / _FORK_PREAMBLE_FILE
     try:
-        text = path.read_text(encoding="utf-8")
+        text = (bridge_dir / _FORK_PREAMBLE_FILE).read_text(encoding="utf-8")
     except (OSError, ValueError):
         return None
-    with contextlib.suppress(OSError):
-        path.unlink()
     return text or None
+
+
+def clear_fork_preamble(bridge_dir: Path) -> None:
+    """Remove the fork preamble so it rides only the FIRST injected message.
+
+    Called by the executor only after a turn's injection succeeds; subsequent
+    turns then inject the plain user text. A no-op when the file is absent.
+
+    :param bridge_dir: The session's cursor-native bridge dir.
+    """
+    with contextlib.suppress(OSError):
+        (bridge_dir / _FORK_PREAMBLE_FILE).unlink()
 
 
 #: Human-readable lead-in / sign-off framing the replayed transcript inside the
