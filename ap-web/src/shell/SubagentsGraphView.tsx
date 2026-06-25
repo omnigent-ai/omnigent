@@ -24,7 +24,11 @@ const ACTIVITY_COLORS: Record<AgentActivity, { border: string; bg: string; dot: 
   working: { border: "border-brand-accent", bg: "bg-brand-accent/5", dot: "" },
   awaiting: { border: "border-warning", bg: "bg-warning/5", dot: "" },
   failed: { border: "border-destructive", bg: "bg-destructive/5", dot: "bg-destructive" },
-  launching: { border: "border-muted-foreground/40", bg: "bg-muted/30", dot: "bg-muted-foreground/70" },
+  launching: {
+    border: "border-muted-foreground/40",
+    bg: "bg-muted/30",
+    dot: "bg-muted-foreground/70",
+  },
   done: { border: "border-muted-foreground/30", bg: "bg-card", dot: "bg-muted-foreground/55" },
   idle: { border: "border-muted-foreground/30", bg: "bg-card", dot: "bg-muted-foreground/55" },
   other: { border: "border-muted-foreground/30", bg: "bg-card", dot: "bg-muted-foreground/55" },
@@ -33,7 +37,11 @@ const ACTIVITY_COLORS: Record<AgentActivity, { border: string; bg: string; dot: 
 function NodeStatusDot({ activity }: { activity: AgentActivity }) {
   if (activity === "working") return <RunningDot />;
   if (activity === "awaiting") {
-    return <Badge className="border-transparent bg-warning/15 text-warning text-[9px] px-1 py-0">!</Badge>;
+    return (
+      <Badge className="border-transparent bg-warning/15 text-warning text-[9px] px-1 py-0">
+        !
+      </Badge>
+    );
   }
   const colors = ACTIVITY_COLORS[activity];
   return <span className={cn("inline-block size-2 shrink-0 rounded-full", colors.dot)} />;
@@ -51,11 +59,12 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
   }, [location.search]);
 
   return (
-    <Link
-      to={{ pathname: `/c/${data.sessionId}`, search }}
-      className="block"
-    >
-      <Handle type="target" position={Position.Top} className="!bg-muted-foreground/40 !w-1.5 !h-1.5 !border-0" />
+    <Link to={{ pathname: `/c/${data.sessionId}`, search }} className="block">
+      <Handle
+        type="target"
+        position={Position.Top}
+        className="!bg-muted-foreground/40 !w-1.5 !h-1.5 !border-0"
+      />
       <div
         className={cn(
           "rounded-lg border px-3 py-2 shadow-sm transition-colors hover:shadow-md cursor-pointer",
@@ -77,7 +86,11 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
           <p className="mt-0.5 text-[10px] text-muted-foreground">{statusLabel}</p>
         )}
       </div>
-      <Handle type="source" position={Position.Bottom} className="!bg-muted-foreground/40 !w-1.5 !h-1.5 !border-0" />
+      <Handle
+        type="source"
+        position={Position.Bottom}
+        className="!bg-muted-foreground/40 !w-1.5 !h-1.5 !border-0"
+      />
     </Link>
   );
 }
@@ -135,17 +148,14 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
     }
   }
 
-  const handleCollected = useCallback(
-    (parentId: string, children: ChildSessionInfo[]) => {
-      setChildrenMap((prev) => {
-        if (prev.get(parentId) === children) return prev;
-        const next = new Map(prev);
-        next.set(parentId, children);
-        return next;
-      });
-    },
-    [],
-  );
+  const handleCollected = useCallback((parentId: string, children: ChildSessionInfo[]) => {
+    setChildrenMap((prev) => {
+      if (prev.get(parentId) === children) return prev;
+      const next = new Map(prev);
+      next.set(parentId, children);
+      return next;
+    });
+  }, []);
 
   const wrapper = session?.labels?.[WRAPPER_LABEL_KEY];
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
@@ -155,7 +165,15 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
 
   const tree = useMemo(
     () =>
-      buildTree(rootSessionId, rootLabel, rootActivity, rootActivity === "working" ? "Working" : "Idle", null, childrenMap, 0),
+      buildTree(
+        rootSessionId,
+        rootLabel,
+        rootActivity,
+        rootActivity === "working" ? "Working" : "Idle",
+        null,
+        childrenMap,
+        0,
+      ),
     [rootSessionId, rootLabel, rootActivity, childrenMap],
   );
 

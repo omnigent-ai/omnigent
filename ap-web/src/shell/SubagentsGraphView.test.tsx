@@ -21,7 +21,11 @@ import { SubagentsPanel } from "./SubagentsPanel";
 
 vi.mock("./SubagentsGraphView", () => ({
   SubagentsGraphView: (props: Record<string, unknown>) => (
-    <div data-testid="subagents-graph-view" data-conversation-id={props.conversationId} data-root-session-id={props.rootSessionId} />
+    <div
+      data-testid="subagents-graph-view"
+      data-conversation-id={props.conversationId}
+      data-root-session-id={props.rootSessionId}
+    />
   ),
 }));
 
@@ -220,10 +224,7 @@ describe("computeSubtreeWidths", () => {
   it("handles nested trees", () => {
     const root: TreeNode = {
       ...leaf("root"),
-      children: [
-        { ...leaf("a"), children: [leaf("a1"), leaf("a2")] },
-        leaf("b"),
-      ],
+      children: [{ ...leaf("a"), children: [leaf("a1"), leaf("a2")] }, leaf("b")],
     };
     const widths = computeSubtreeWidths(root);
     // a subtree: 2 * 180 + 40 = 400
@@ -385,7 +386,12 @@ describe("buildTree", () => {
     const map = new Map<string, ChildSessionInfo[]>();
     map.set("root", [
       childInfo({ id: "c1", session_name: "auth", tool: "researcher", busy: true }),
-      childInfo({ id: "c2", session_name: "docs", tool: "writer", current_task_status: "completed" }),
+      childInfo({
+        id: "c2",
+        session_name: "docs",
+        tool: "writer",
+        current_task_status: "completed",
+      }),
     ]);
     map.set("c1", [childInfo({ id: "c1a", session_name: "search", tool: "Explore" })]);
 
@@ -466,7 +472,12 @@ describe("SubagentsPanel view-mode toggle", () => {
     mockChildTree({
       conv_root: [
         childInfo({ id: "c1", tool: "researcher", session_name: "auth", busy: true }),
-        childInfo({ id: "c2", tool: "Explore", session_name: "files", current_task_status: "completed" }),
+        childInfo({
+          id: "c2",
+          tool: "Explore",
+          session_name: "files",
+          current_task_status: "completed",
+        }),
       ],
     });
 

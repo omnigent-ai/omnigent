@@ -1,7 +1,14 @@
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import { MAX_TREE_DEPTH } from "@/hooks/useChildSessions";
 
-export type AgentActivity = "launching" | "working" | "awaiting" | "done" | "failed" | "idle" | "other";
+export type AgentActivity =
+  | "launching"
+  | "working"
+  | "awaiting"
+  | "done"
+  | "failed"
+  | "idle"
+  | "other";
 
 export interface AgentNodeData {
   label: string;
@@ -44,8 +51,10 @@ export const HORIZONTAL_GAP = 40;
 export const VERTICAL_GAP = 30;
 
 export function childActivity(child: ChildSessionInfo): { activity: AgentActivity; label: string } {
-  if (child.pending_elicitations_count > 0) return { activity: "awaiting", label: "Needs response" };
-  if (child.current_task_status === "launching") return { activity: "launching", label: "Launching" };
+  if (child.pending_elicitations_count > 0)
+    return { activity: "awaiting", label: "Needs response" };
+  if (child.current_task_status === "launching")
+    return { activity: "launching", label: "Launching" };
   if (child.busy) return { activity: "working", label: "Working" };
   if (child.last_task_error) return { activity: "failed", label: "Failed" };
   if (child.current_task_status === "failed") return { activity: "failed", label: "Failed" };
@@ -67,7 +76,8 @@ export function computeSubtreeWidths(node: TreeNode): Map<string, number> {
       widths.set(n.id, NODE_WIDTH);
       return NODE_WIDTH;
     }
-    const total = n.children.reduce((sum, c) => sum + walk(c), 0) + (n.children.length - 1) * HORIZONTAL_GAP;
+    const total =
+      n.children.reduce((sum, c) => sum + walk(c), 0) + (n.children.length - 1) * HORIZONTAL_GAP;
     widths.set(n.id, Math.max(NODE_WIDTH, total));
     return Math.max(NODE_WIDTH, total);
   }
@@ -101,10 +111,9 @@ export function layoutTree(
     if (node.children.length === 0) return;
 
     const childY = y + NODE_HEIGHT + VERTICAL_GAP;
-    const totalChildrenWidth = node.children.reduce(
-      (sum, c) => sum + (subtreeWidths.get(c.id) ?? NODE_WIDTH),
-      0,
-    ) + (node.children.length - 1) * HORIZONTAL_GAP;
+    const totalChildrenWidth =
+      node.children.reduce((sum, c) => sum + (subtreeWidths.get(c.id) ?? NODE_WIDTH), 0) +
+      (node.children.length - 1) * HORIZONTAL_GAP;
 
     let childX = x - totalChildrenWidth / 2;
 
