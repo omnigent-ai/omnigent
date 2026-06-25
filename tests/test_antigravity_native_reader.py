@@ -773,6 +773,278 @@ async def test_reader_teardown_cancels_in_flight_interaction(
 
 
 # ---------------------------------------------------------------------------
+# #1200 direction 2: withdraw a surfaced elicitation resolved out-of-band
+# ---------------------------------------------------------------------------
+
+
+def _capturing_client() -> tuple[httpx.AsyncClient, list[dict[str, Any]]]:
+    """Build a real AsyncClient over a MockTransport that records every POST body.
+
+    ``_post_external_elicitation_resolved`` calls ``client.post`` directly (not
+    the post-retry sink), so a withdraw test needs a usable client. The transport
+    captures the JSON body of each POST and answers 200 so the reader proceeds.
+    """
+    captured: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.content:
+            captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    client = httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(_handler))
+    return client, captured
+
+
+def _permission_waiting() -> dict[str, Any]:
+    """A WAITING command-permission step (the #1200 fixture)."""
+    return _load("run_command_waiting")
+
+
+def _permission_done() -> dict[str, Any]:
+    """The same permission step advanced to DONE (answered/timed out → no WAITING).
+
+    Built from the WAITING fixture by flipping the status and dropping the
+    ``requestedInteraction`` block, so ``pending_interaction`` returns ``None`` —
+    exactly what the reader sees once the step leaves WAITING.
+    """
+    step = copy.deepcopy(_load("run_command_waiting"))
+    step["status"] = "CORTEX_STEP_STATUS_DONE"
+    step.pop("requestedInteraction", None)
+    return step
+
+
+@pytest.mark.asyncio
+async def test_step_leaving_waiting_withdraws_surfaced_elicitation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A surfaced WAITING step that later is NOT WAITING → withdraw the web card.
+
+    Models the terminal-answered / timed-out case: the reader surfaces the
+    permission elicitation, then on a later poll the step is DONE (no
+    ``requestedInteraction``). The reader must POST exactly one
+    ``external_elicitation_resolved`` for that step's deterministic elicitation id
+    so the lingering web card clears (#1200, direction 2).
+    """
+    from omnigent.antigravity_native_interactions import agy_elicitation_id
+
+    waiting = _permission_waiting()
+    done = _permission_done()
+    # WAITING twice (surface + dedup), then DONE (withdraw), then steady DONE.
+    script = _StepScript([[waiting], [waiting], [done], [done]])
+    sink = _PostSink()
+    client, captured = _capturing_client()
+
+    monkeypatch.setattr(
+        reader,
+        "stream_agent_state_updates",
+        _RaisingStream(httpx.ConnectError("stream disabled for poll test")),
+    )
+    monkeypatch.setattr(reader, "get_trajectory_steps", script)
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    async def _on_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        # Simulate a long-poll await that the terminal answer / timeout will
+        # short-circuit — it never returns a verdict here.
+        await asyncio.Event().wait()
+
+    async with client:
+        await asyncio.wait_for(
+            reader.supervise_reader(
+                _bridge_dir(tmp_path),
+                _SESSION_ID,
+                client=client,
+                on_pending_interaction=cast(Any, _on_pending),
+                poll_interval_s=0.0,
+                stop=_stop_after(4),
+            ),
+            timeout=5.0,
+        )
+
+    # Exactly one withdraw was posted, for THIS step's deterministic id.
+    expected_traj = waiting["metadata"]["sourceTrajectoryStepInfo"]["trajectoryId"]
+    expected_idx = waiting["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"]
+    expected_id = agy_elicitation_id(_CASCADE_ID, expected_traj, expected_idx)
+    withdraws = [body for body in captured if body.get("type") == "external_elicitation_resolved"]
+    assert len(withdraws) == 1
+    assert withdraws[0]["data"]["elicitation_id"] == expected_id
+
+
+@pytest.mark.asyncio
+async def test_still_waiting_does_not_withdraw(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A still-WAITING step is NOT withdrawn (the interaction is still live)."""
+    waiting = _permission_waiting()
+    script = _StepScript([[waiting], [waiting], [waiting]])
+    sink = _PostSink()
+    client, captured = _capturing_client()
+
+    monkeypatch.setattr(
+        reader,
+        "stream_agent_state_updates",
+        _RaisingStream(httpx.ConnectError("stream disabled for poll test")),
+    )
+    monkeypatch.setattr(reader, "get_trajectory_steps", script)
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    async def _on_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        await asyncio.Event().wait()
+
+    async with client:
+        await asyncio.wait_for(
+            reader.supervise_reader(
+                _bridge_dir(tmp_path),
+                _SESSION_ID,
+                client=client,
+                on_pending_interaction=cast(Any, _on_pending),
+                poll_interval_s=0.0,
+                stop=_stop_after(3),
+            ),
+            timeout=5.0,
+        )
+
+    withdraws = [body for body in captured if body.get("type") == "external_elicitation_resolved"]
+    assert withdraws == []
+
+
+@pytest.mark.asyncio
+async def test_withdraw_posts_at_most_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Even across many DONE re-reads, the withdraw is posted exactly once.
+
+    The dedup lives in ``surfaced_elicitations`` (popped on first withdraw), so a
+    steady-state poll that keeps returning the DONE step must not re-post.
+    """
+    waiting = _permission_waiting()
+    done = _permission_done()
+    script = _StepScript([[waiting], [done], [done], [done], [done]])
+    sink = _PostSink()
+    client, captured = _capturing_client()
+
+    monkeypatch.setattr(
+        reader,
+        "stream_agent_state_updates",
+        _RaisingStream(httpx.ConnectError("stream disabled for poll test")),
+    )
+    monkeypatch.setattr(reader, "get_trajectory_steps", script)
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    async def _on_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        await asyncio.Event().wait()
+
+    async with client:
+        await asyncio.wait_for(
+            reader.supervise_reader(
+                _bridge_dir(tmp_path),
+                _SESSION_ID,
+                client=client,
+                on_pending_interaction=cast(Any, _on_pending),
+                poll_interval_s=0.0,
+                stop=_stop_after(5),
+            ),
+            timeout=5.0,
+        )
+
+    withdraws = [body for body in captured if body.get("type") == "external_elicitation_resolved"]
+    assert len(withdraws) == 1
+
+
+@pytest.mark.asyncio
+async def test_withdraw_helper_pops_and_posts_once_directly() -> None:
+    """Unit-level: ``_maybe_withdraw_interaction`` posts once then no-ops.
+
+    Drives the helper directly with a surfaced id so the pop/no-double-post
+    contract is asserted without the full supervise loop.
+    """
+    from omnigent.antigravity_native_interactions import agy_elicitation_id
+
+    waiting = _permission_waiting()
+    done = _permission_done()
+    key = reader._step_key(waiting)
+    eid = agy_elicitation_id(
+        _CASCADE_ID,
+        waiting["metadata"]["sourceTrajectoryStepInfo"]["trajectoryId"],
+        waiting["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"],
+    )
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    state.surfaced_elicitations[key] = eid
+    client, captured = _capturing_client()
+
+    async with client:
+        # First call on a DONE step → posts the withdraw and pops the entry.
+        await reader._maybe_withdraw_interaction(
+            done, key=key, client=client, session_id=_SESSION_ID, state=state
+        )
+        # Second call → entry gone, no further post.
+        await reader._maybe_withdraw_interaction(
+            done, key=key, client=client, session_id=_SESSION_ID, state=state
+        )
+
+    assert key not in state.surfaced_elicitations
+    withdraws = [b for b in captured if b.get("type") == "external_elicitation_resolved"]
+    assert len(withdraws) == 1
+    assert withdraws[0]["data"]["elicitation_id"] == eid
+
+
+@pytest.mark.asyncio
+async def test_withdraw_helper_noop_while_still_waiting() -> None:
+    """``_maybe_withdraw_interaction`` does nothing while the step is still WAITING."""
+    from omnigent.antigravity_native_interactions import agy_elicitation_id
+
+    waiting = _permission_waiting()
+    key = reader._step_key(waiting)
+    eid = agy_elicitation_id(
+        _CASCADE_ID,
+        waiting["metadata"]["sourceTrajectoryStepInfo"]["trajectoryId"],
+        waiting["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"],
+    )
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    state.surfaced_elicitations[key] = eid
+    client, captured = _capturing_client()
+
+    async with client:
+        await reader._maybe_withdraw_interaction(
+            waiting, key=key, client=client, session_id=_SESSION_ID, state=state
+        )
+
+    # Still WAITING → entry retained, nothing posted.
+    assert state.surfaced_elicitations.get(key) == eid
+    assert captured == []
+
+
+# ---------------------------------------------------------------------------
 # Status edges: RUNNING on user turn, IDLE on assistant-text close
 # ---------------------------------------------------------------------------
 
@@ -832,23 +1104,23 @@ async def test_status_not_idle_while_tools_running(
 
 
 @pytest.mark.asyncio
-async def test_status_idle_on_error_planner_close(
+async def test_status_failed_on_error_planner_close(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     patched_discovery: None,
 ) -> None:
-    """A turn that ends in a terminal-ERROR planner still emits IDLE.
+    """A turn that ends in a terminal-ERROR planner closes as FAILED (not idle).
 
-    Regression for the stuck-spinner bug: previously IDLE fired only on a DONE
-    planner with closing text, so a turn ending in an ERROR planner left
-    ``turn_active`` True forever (spinner stuck; next turn could not re-open
-    RUNNING). The IDLE here comes from the ERROR-terminal rule, not the
-    text-close rule (the planner carries no closing text).
+    A model/turn ERROR must surface as a failed turn — not a clean idle that
+    looks identical to a normal empty reply (#6). The turn still closes (the
+    spinner clears; ``turn_active`` resets so the next turn can re-open RUNNING),
+    but on the ``failed`` status edge, and the mapper commits a visible error
+    message item.
     """
     user = _load("user_input")
     error_planner = _load("planner_response_text")
     error_planner["status"] = "CORTEX_STEP_STATUS_ERROR"
-    # No closing text — prove the IDLE is from the ERROR-terminal rule.
+    # No closing text — prove the close is from the ERROR-terminal rule.
     error_planner["plannerResponse"] = {}
     script = _StepScript([[user], [user, error_planner], [user, error_planner]])
     sink = _PostSink()
@@ -861,7 +1133,10 @@ async def test_status_idle_on_error_planner_close(
         iterations=3,
     )
 
-    assert sink.statuses() == ["running", "idle"]
+    # Closes as FAILED, not idle.
+    assert sink.statuses() == ["running", "failed"]
+    # The user message + a visible error item are committed (no silent empty reply).
+    assert sink.message_roles() == ["user", "assistant"]
 
 
 # ---------------------------------------------------------------------------
@@ -1431,6 +1706,61 @@ async def test_stream_waiting_frame_invokes_callback_once(
     assert port == _PORT
     assert pending["kind"] == "ask_question"
     assert pending["trajectory_id"] == _CASCADE_ID
+
+
+@pytest.mark.asyncio
+async def test_stream_waiting_then_non_waiting_withdraws_elicitation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Over the STREAM path too, a WAITING step that goes DONE withdraws the card.
+
+    Confirms #1200 direction 2 is covered on the stream-primary path, not just the
+    poll fallback (a permission answered in the TUI / timed out surfaces as a
+    DONE frame after the WAITING frame).
+    """
+    from omnigent.antigravity_native_interactions import agy_elicitation_id
+
+    waiting = _permission_waiting()
+    done = _permission_done()
+    frames = [_frame([waiting]), _frame([done]), _frame([done])]
+    sink = _PostSink()
+    client, captured = _capturing_client()
+
+    monkeypatch.setattr(reader, "stream_agent_state_updates", _FrameScript(frames))
+    monkeypatch.setattr(reader, "get_trajectory_steps", _StepScript([[]]))
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    async def _on_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        await asyncio.Event().wait()
+
+    async with client:
+        await asyncio.wait_for(
+            reader.supervise_reader(
+                _bridge_dir(tmp_path),
+                _SESSION_ID,
+                client=client,
+                on_pending_interaction=cast(Any, _on_pending),
+                poll_interval_s=0.0,
+                stop=_stop_after(1),
+            ),
+            timeout=5.0,
+        )
+
+    expected_id = agy_elicitation_id(
+        _CASCADE_ID,
+        waiting["metadata"]["sourceTrajectoryStepInfo"]["trajectoryId"],
+        waiting["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"],
+    )
+    withdraws = [b for b in captured if b.get("type") == "external_elicitation_resolved"]
+    assert len(withdraws) == 1
+    assert withdraws[0]["data"]["elicitation_id"] == expected_id
 
 
 # ---------------------------------------------------------------------------
@@ -2939,8 +3269,14 @@ async def test_run_reader_with_bridge_adopts_first_cascade_in_place(
         rotate_calls.append("forked")  # must NOT happen on adopt-in-place
         return "conv_should_not_be_used"
 
+    recorded_external: list[tuple[str, str]] = []
+
+    async def _fake_record_external(client: object, session_id: str, cascade_id: str) -> None:
+        recorded_external.append((session_id, cascade_id))
+
     monkeypatch.setattr(reader, "supervise_reader", _fake_supervise)
     monkeypatch.setattr(reader, "_rotate_session_for_cascade", _fake_rotate)
+    monkeypatch.setattr(reader, "_record_external_session_id", _fake_record_external)
     monkeypatch.setattr(
         "omnigent.antigravity_native_interactions.bridge_interaction",
         lambda *a, **k: None,
@@ -2965,6 +3301,10 @@ async def test_run_reader_with_bridge_adopts_first_cascade_in_place(
     assert state is not None
     assert state.session_id == _SESSION_ID
     assert state.conversation_id == new_cascade
+    # The adopted cascade is recorded as external_session_id so a later --resume /
+    # server restart loads THIS conversation, not the headless cold-start phantom
+    # (#2 data-loss). It is recorded against the SAME session.
+    assert recorded_external == [(_SESSION_ID, new_cascade)]
 
 
 @pytest.mark.asyncio

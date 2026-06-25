@@ -70,9 +70,10 @@ import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 
-// Hidden on the new-session picker only (superseded by polly; older
-// deployments still carry a seeded nessie row this filter keeps out).
-const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie"]);
+// Hidden from the new-session picker only. `nessie` is superseded by polly.
+// `kimi` / `kimi-code` are the headless SDK harness (kept for sub-agent / `run
+// --harness kimi` use) — the picker offers only the native TUI (`kimi-native-ui`).
+const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie", "kimi", "kimi-code"]);
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.

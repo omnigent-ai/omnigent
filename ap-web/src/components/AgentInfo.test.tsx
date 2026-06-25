@@ -246,6 +246,42 @@ describe("AgentInfoButton per-model usage breakdown", () => {
     expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
     expect(screen.queryByTestId("agent-info-usage-by-model")).toBeNull();
   });
+
+  it("toggles the arrow indicator when expanding/collapsing the details", () => {
+    useChatStore.setState({
+      sessionUsageByModel: {
+        "claude-sonnet-4-6": {
+          inputTokens: 1000,
+          outputTokens: 500,
+          totalTokens: 1500,
+          cacheReadInputTokens: null,
+          cacheCreationInputTokens: null,
+          totalCostUsd: 0.1,
+        },
+      },
+    });
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_arrow");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    const details = screen.getByTestId("agent-info-usage-by-model") as HTMLDetailsElement;
+    const summary = details.querySelector("summary")!;
+
+    // Initially collapsed — arrow points right.
+    expect(summary).toHaveTextContent("▶");
+    expect(summary).not.toHaveTextContent("▼");
+
+    // Expand the details by setting the open attribute and firing toggle.
+    details.open = true;
+    fireEvent(details, new Event("toggle"));
+    expect(summary).toHaveTextContent("▼");
+    expect(summary).not.toHaveTextContent("▶");
+
+    // Collapse again.
+    details.open = false;
+    fireEvent(details, new Event("toggle"));
+    expect(summary).toHaveTextContent("▶");
+    expect(summary).not.toHaveTextContent("▼");
+  });
 });
 
 // ---------------------------------------------------------------------------

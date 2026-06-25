@@ -27,9 +27,12 @@ export type ConversationIconKind =
   | "opencode"
   | "pi"
   | "cursor"
+  | "kiro"
   | "goose"
   | "antigravity"
   | "qwen"
+  | "kimi"
+  | "hermes"
   | "nessie"
   | null;
 

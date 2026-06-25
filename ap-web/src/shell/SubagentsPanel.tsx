@@ -35,6 +35,7 @@ import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
 import { GooseIcon } from "@/components/icons/GooseIcon";
+import { KimiIcon } from "@/components/icons/KimiIcon";
 import { NessieIcon } from "@/components/icons/NessieIcon";
 import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
 import { OttoIcon } from "@/components/icons/OttoIcon";
@@ -311,8 +312,10 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
   if (nativeAgent?.iconKind === "opencode") return OpenCodeIcon;
   if (nativeAgent?.iconKind === "pi") return PiIcon;
   if (nativeAgent?.iconKind === "cursor") return CursorIcon;
+  if (nativeAgent?.iconKind === "kiro") return CursorIcon;
   if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
   if (nativeAgent?.iconKind === "goose") return GooseIcon;
+  if (nativeAgent?.iconKind === "kimi") return KimiIcon;
   // Exact match — substring checks would false-match names like "pipeline".
   if (child.tool === PI_AGENT_NAME) return PiIcon;
   return null;
@@ -459,6 +462,32 @@ function mainMessagePreview(items: SessionItem[] | undefined): string | null {
   return null;
 }
 
+/**
+ * Resolve a session's brand icon from its native-wrapper ``iconKind``
+ * (authoritative for native-terminal sessions) with a harness-substring
+ * fallback for plain SDK sessions that carry no wrapper label — e.g.
+ * ``omni --harness kimi``, whose ``harness: "kimi"`` would otherwise fall
+ * through to the generic bot. Mirrors ``iconForAgent`` in ``AgentCard.tsx``.
+ */
+function iconForWrapperOrHarness(
+  iconKind: string | undefined,
+  harness: string | null | undefined,
+  isNessie: boolean,
+): AgentRowIcon {
+  if (iconKind === "claude" || harness?.includes("claude")) return ClaudeIcon;
+  if (iconKind === "codex" || harness?.includes("codex")) return CodexIcon;
+  if (iconKind === "opencode" || harness?.includes("opencode")) return OpenCodeIcon;
+  if (iconKind === "cursor" || iconKind === "kiro" || harness?.includes("cursor"))
+    return CursorIcon;
+  if (iconKind === "goose" || harness?.includes("goose")) return GooseIcon;
+  if (iconKind === "kimi" || harness?.includes("kimi")) return KimiIcon;
+  if (iconKind === "antigravity" || harness?.includes("antigravity")) return AntigravityIcon;
+  // Exact match — a substring check would false-match e.g. "openapi".
+  if (iconKind === "pi" || harness === "pi") return PiIcon;
+  if (isNessie) return NessieIcon;
+  return BotIcon;
+}
+
 function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive: boolean }) {
   const { session } = useSession(rootSessionId);
   const search = railLinkSearch(useLocation().search);
@@ -467,24 +496,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
   const wrapper = session?.labels?.[WRAPPER_LABEL_KEY];
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
   const isNessie = session?.agentName === "nessie";
-  const Icon =
-    nativeAgent?.iconKind === "claude"
-      ? ClaudeIcon
-      : nativeAgent?.iconKind === "codex"
-        ? CodexIcon
-        : nativeAgent?.iconKind === "opencode"
-          ? OpenCodeIcon
-          : nativeAgent?.iconKind === "pi"
-            ? PiIcon
-            : nativeAgent?.iconKind === "cursor"
-              ? CursorIcon
-              : nativeAgent?.iconKind === "antigravity"
-                ? AntigravityIcon
-                : nativeAgent?.iconKind === "goose"
-                  ? GooseIcon
-                  : isNessie
-                    ? NessieIcon
-                    : BotIcon;
+  const Icon = iconForWrapperOrHarness(nativeAgent?.iconKind, session?.harness, isNessie);
   // Native wrappers show the product name (mirroring the sidebar) instead
   // of the spec's YAML name (e.g. "claude-native-ui"); other agents show
   // their agent name, with "main" only while the session loads or when it
