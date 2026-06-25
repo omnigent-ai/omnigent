@@ -595,6 +595,21 @@ async def test_pids_holding_socket_returns_empty_for_missing(
     assert pids == []
 
 
+async def test_pids_holding_socket_returns_empty_when_lsof_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    short_tmp_parent: Path,
+) -> None:
+    """Missing ``lsof`` is best-effort cleanup noise, not a boot failure."""
+
+    async def missing_lsof(*_args: object, **_kwargs: object) -> object:
+        raise FileNotFoundError(2, "No such file or directory", "lsof")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", missing_lsof)
+
+    pids = await _pids_holding_socket(short_tmp_parent / "conv-stale.sock")
+    assert pids == []
+
+
 # ── Per-spawn env override ─────────────────────────────────────
 
 
