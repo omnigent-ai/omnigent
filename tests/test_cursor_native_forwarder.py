@@ -756,9 +756,7 @@ class TestForwardLoopExternalSessionId:
 
     @staticmethod
     def _seed(store: Path, text: str = "hello") -> None:
-        writer = _make_store(
-            store, [("u", _user(f"<user_query>\n{text}\n</user_query>"))]
-        )
+        writer = _make_store(store, [("u", _user(f"<user_query>\n{text}\n</user_query>"))])
         writer.close()
 
     @pytest.mark.asyncio
