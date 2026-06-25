@@ -53,7 +53,7 @@ import {
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
-import { CompactionMarker } from "@/components/blocks/StatusBlocks";
+import { CompactionMarker, RoutingDecisionChip } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
@@ -127,6 +127,7 @@ import {
   isCostRoutingSession,
   parseCostRoutingVerdict,
 } from "@/components/CostRoutingControl";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
@@ -738,7 +739,11 @@ export function ChatPage() {
   );
   // Orchestrator-only: polly's children inherit its agentName, so the gate
   // needs the session predicate (parent linkage), not a bare name check.
-  const costRoutingEligible = isCostRoutingSession(activeSession);
+  const serverInfo = useServerInfo();
+  const costRoutingEligible =
+    serverInfo !== "loading" &&
+    serverInfo.smart_routing_enabled &&
+    isCostRoutingSession(activeSession);
 
   // Non-null only when the active session is a sub-agent (child): the
   // composer then peeks a "Chatting with sub-agent …" tray and the
@@ -2200,6 +2205,7 @@ function bubbleKey(bubble: Bubble): string {
   if (bubble.kind === "user") return `user:${bubble.stableKey ?? bubble.itemId}`;
   if (bubble.kind === "compaction_loading") return `compaction_loading:${bubble.itemId}`;
   if (bubble.kind === "compaction") return `compaction:${bubble.itemId}`;
+  if (bubble.kind === "routing_decision") return `routing_decision:${bubble.itemId}`;
   return `assistant:${bubble.stableId}`;
 }
 
@@ -2641,6 +2647,16 @@ export const BubbleView = memo(
       );
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
+    if (bubble.kind === "routing_decision") {
+      return (
+        <RoutingDecisionChip
+          model={bubble.model}
+          tier={bubble.tier}
+          applied={bubble.applied}
+          rationale={bubble.rationale}
+        />
+      );
+    }
     return <AssistantBubble bubble={bubble} />;
   },
   (prev, next) => bubblesEqual(prev.bubble, next.bubble),
@@ -3123,7 +3139,7 @@ export function formatModelEffortStatusLabel(
  * shelf below.
  *
  * @param modelPickerKind - Native picker family, when the session is a
- *   claude-/codex-native wrapper.
+ *   claude-/codex-/cursor-native wrapper.
  * @param agentName - Bound agent name (lowercase slug), if any.
  * @param sessionHarness - Effective brain harness id (override-aware).
  * @returns Display label, or ``null`` when nothing is known.
@@ -3135,6 +3151,7 @@ export function composerHarnessLabel(
 ): string | null {
   if (modelPickerKind === "claude") return "Claude";
   if (modelPickerKind === "codex") return "Codex";
+  if (modelPickerKind === "cursor") return "Cursor";
   const display = agentName ? agentDisplayLabel(agentName) : null;
   const harness = sessionHarness ? (BRAIN_HARNESS_LABELS[sessionHarness] ?? null) : null;
   if (display && harness) return `${display} (${harness})`;
@@ -4160,8 +4177,7 @@ export function Composer({
           </div>
           {/* Cost toggle + agent picker + Send — right side */}
           <div className="flex min-w-0 items-center gap-0.5">
-            {/* Temporarily hidden (#3021): re-enable by removing the false gate. */}
-            {false && costRoutingEligible && (
+            {costRoutingEligible && (
               <IntelligentModelControl
                 value={costControlModeOverride}
                 onChange={(mode) =>
@@ -4422,7 +4438,7 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
-type NativeModelPickerKind = "claude" | "codex";
+type NativeModelPickerKind = "claude" | "codex" | "cursor";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4484,6 +4500,8 @@ export function modelPickerKindForConv(
       return "claude";
     case "codex-native-ui":
       return "codex";
+    case "cursor-native-ui":
+      return "cursor";
     default:
       return null;
   }
@@ -4593,12 +4611,17 @@ function AgentPicker({
   const hasAgents = !!agents && agents.length > 0;
   const selectedEffort = useChatStore((s) => s.selectedEffort);
   const selectedModel = useChatStore((s) => s.selectedModel);
+  const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const llmModel = useChatStore((s) => s.llmModel);
 
+  // Codex and cursor both populate the picker from the server-provided
+  // ``codexModelOptions`` channel (the snapshot's ``model_options`` field);
+  // claude uses the static local catalog.
+  const usesServerModelOptions = modelPickerKind === "codex" || modelPickerKind === "cursor";
   const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
     modelPickerKind === "claude"
       ? CLAUDE_NATIVE_MODELS
-      : modelPickerKind === "codex"
+      : usesServerModelOptions
         ? codexModelOptions
         : [];
   const isNativeModelPicker = modelPickerKind !== null;
@@ -4618,7 +4641,20 @@ function AgentPicker({
   // surface it as if it were live; claude-/codex-native and SDK agents
   // resolve to a real model.
   const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
-  const effectiveModel = nativeVendorOwnsModel ? null : (selectedModel ?? llmModel);
+  // cursor-native is a vendor-owns-model wrapper, but unlike qwen/goose/pi/
+  // opencode it mirrors its live TUI model into the session override
+  // (`sessionModelOverride` / `model_override`), kept current both by the
+  // forwarder's terminal→web mirror and by web-side picks. Surface *that* as
+  // the live model — never the cross-session sticky `selectedModel` (a pick
+  // carried over from some other session) nor the meaningless `llmModel`
+  // default. The other vendor-owns wrappers have no Omnigent-visible model and
+  // stay null.
+  const pickerSelectedModel = modelPickerKind === "cursor" ? sessionModelOverride : selectedModel;
+  const effectiveModel = nativeVendorOwnsModel
+    ? modelPickerKind === "cursor"
+      ? sessionModelOverride
+      : null
+    : (selectedModel ?? llmModel);
   const modelLabel = formatStatusModelLabel(effectiveModel, codexModelOptions);
   const effortTriggerLabel =
     showEffort && selectedEffort
@@ -4708,10 +4744,10 @@ function AgentPicker({
             {!isNativeModelPicker && <DropdownMenuSeparator className="my-1" />}
             <PickerSectionHeader>Models</PickerSectionHeader>
             {modelOptions.map((m) => {
-              const isExplicit = selectedModel === m.id;
+              const isExplicit = pickerSelectedModel === m.id;
               const isImplicit =
-                selectedModel === null &&
-                (modelPickerKind === "codex"
+                pickerSelectedModel === null &&
+                (usesServerModelOptions
                   ? findCodexModelOption(codexModelOptions, llmModel)?.id === m.id
                   : isModelImplicitlySelected(m.id, llmModel));
               const isActive = isExplicit || isImplicit;
@@ -4733,7 +4769,7 @@ function AgentPicker({
                   )}
                 >
                   <span className="flex-1 truncate">
-                    {modelPickerKind === "codex" ? (m.displayName ?? m.id) : m.label}
+                    {usesServerModelOptions ? (m.displayName ?? m.id) : m.label}
                   </span>
                 </DropdownMenuItem>
               );

@@ -29,6 +29,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from omnigent._platform import IS_WINDOWS, resolve_repo_symlink
 from omnigent._startup_profile import StartupProfiler
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
@@ -43,7 +44,7 @@ from omnigent.host.local_server import (
     stop_local_omnigent_server,
     stop_untracked_local_server,
 )
-from omnigent.inner import ui
+from omnigent.inner import _proc, ui
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
 from omnigent.onboarding.ucode_setup import (
     build_ucode_configure_command,
@@ -454,7 +455,10 @@ def _bundled_example_path(name: str) -> str:
     """
     import importlib.resources
 
-    return str(importlib.resources.files("omnigent.resources.examples").joinpath(name))
+    resource = importlib.resources.files("omnigent.resources.examples").joinpath(name)
+    # On a no-symlink Windows checkout the packaged symlink is a stub text file;
+    # dereference it to the real examples/<name> directory.
+    return str(resolve_repo_symlink(Path(str(resource))))
 
 
 def _pick_first_run_harness() -> _FirstRunPlan | None:
@@ -2062,7 +2066,7 @@ def _spawn_host_daemon_process(
             env=env,
             stdout=log_fh,
             stderr=log_fh,
-            start_new_session=True,
+            **_proc.spawn_kwargs(),
         )
     except OSError:
         return None
@@ -2657,7 +2661,7 @@ def _start_cli_runner_process(
             env=env,
             stdout=log_fh,
             stderr=log_fh,
-            start_new_session=True,
+            **_proc.spawn_kwargs(),
         )
     finally:
         if log_fh is not None:
@@ -3020,10 +3024,31 @@ def server(
 
     from omnigent.spec import parse_default_policies, parse_server_llm
 
+    server_llm = parse_server_llm(cfg.get("llm"))
+
+    # Build the default LLM-based routing client when BOTH the server
+    # has an ``llm:`` config AND the feature is explicitly enabled via
+    # OMNIGENT_SMART_ROUTING=1.  Hidden by default — managed deployments
+    # override RuntimeCaps.routing_client with their own implementation.
+    routing_client = None
+    if server_llm is not None and os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
+        from omnigent.runtime.policies.builder import (
+            _build_policy_llm_client,
+            _resolve_server_llm_connection,
+        )
+
+        _conn = _resolve_server_llm_connection(server_llm)
+        _policy_client = _build_policy_llm_client(server_llm, _conn)
+        if _policy_client is not None:
+            from omnigent.server.smart_routing import LLMRoutingClient
+
+            routing_client = LLMRoutingClient(_policy_client)
+
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
         default_policies=parse_default_policies(cfg.get("policies")),
-        llm=parse_server_llm(cfg.get("llm")),
+        llm=server_llm,
+        routing_client=routing_client,
     )
     init_runtime(
         conversation_store=conversation_store,
@@ -4043,6 +4068,24 @@ def _expand_builtin_env_vars(  # type: ignore[explicit-any]  # entries are parse
 _RESUME_PICKER_SENTINEL = "__resume_picker__"
 
 
+def _reject_native_on_windows(harness: str) -> None:
+    """Fail a native (tmux/PTY) harness command with an actionable message.
+
+    The ``omnigent claude`` / ``codex`` / ``cursor`` native wrappers drive a
+    private tmux server and PTY, which don't exist on Windows. Point users at
+    the SDK harnesses / web UI instead of letting them hit a tmux crash.
+
+    :param harness: The native command name, e.g. ``"claude"``.
+    :raises click.ClickException: Always, when running on Windows.
+    """
+    if IS_WINDOWS:
+        raise click.ClickException(
+            f"`omnigent {harness}` (native tmux/PTY terminal) is not supported on "
+            "Windows. Use an SDK-based harness via `omnigent run <agent.yaml>` "
+            "or the web UI."
+        )
+
+
 @cli.command(
     context_settings={
         "ignore_unknown_options": True,
@@ -4151,6 +4194,7 @@ def claude(
       omnigent claude --resume                  # interactive picker
       omnigent claude --server https://<app>.databricksapps.com
     """
+    _reject_native_on_windows("claude")
     startup_profiler = StartupProfiler.from_env(
         name="omnigent claude",
         env_var=_CLAUDE_STARTUP_PROFILE_ENV_VAR,
@@ -4277,6 +4321,7 @@ def codex(
       omnigent codex --resume                  # interactive picker
       omnigent codex --server https://<app>.databricksapps.com
     """
+    _reject_native_on_windows("codex")
     choice = _split_resume_value(resume)
     if session_id is not None and (choice.picker or choice.conversation_id is not None):
         raise click.UsageError(
@@ -4661,24 +4706,34 @@ def _ensure_bundled_agent_brain_credential(name: str) -> None:
         "``ask``: Q&A style for explanations and questions (read-only)."
     ),
 )
+@click.option(
+    "--model",
+    default=None,
+    help="Cursor model to use for the native TUI (e.g. gpt-5.2, claude-4.6-sonnet-medium).",
+)
 @click.argument("cursor_args", nargs=-1, type=click.UNPROCESSED)
 def cursor(
     server: str | None,
     resume: str | None,
     session_id: str | None,
     mode: str | None,
+    model: str | None,
     cursor_args: tuple[str, ...],
 ) -> None:
+    # Param docs live in comments — Click uses the docstring for --help.
+    # :param model: Cursor model id passed to cursor-agent as ``--model``.
     """Launch the Cursor TUI in an Omnigent terminal.
 
     \b
     Examples:
       omnigent cursor
+      omnigent cursor --model gpt-5.2
       omnigent cursor --resume conv_abc123
       omnigent cursor --resume                 # interactive picker
       omnigent cursor --mode plan              # start in plan (read-only) mode
       omnigent cursor --mode ask               # start in ask (Q&A) mode
     """
+    _reject_native_on_windows("cursor")
     choice = _split_resume_value(resume)
     if session_id is not None and (choice.picker or choice.conversation_id is not None):
         raise click.UsageError(
@@ -4691,6 +4746,10 @@ def cursor(
     cfg = _load_effective_config()
     if server is None:
         server = cfg.get("server")
+    # Deliberately no ``cfg.get("model")`` fallback (unlike ``codex``): the
+    # global config model is a Claude/Codex catalog id, not a cursor-agent
+    # model id, and pinning it would break the cursor TUI launch. Cursor's
+    # model is explicit-only here; persistent selection rides the web /model.
     auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
 
     server = _ensure_backend(server)
@@ -4703,6 +4762,7 @@ def cursor(
         session_id=resolved_session_id,
         resume_picker=choice.picker,
         cursor_args=cursor_args,
+        model=model,
         auto_open_conversation=auto_open_conversation,
         mode=mode,
     )
@@ -7509,7 +7569,7 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
         time.sleep(0.1)
     if force:
         with contextlib.suppress(ProcessLookupError):
-            os.kill(record.pid, signal.SIGKILL)
+            os.kill(record.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             if not _pid_alive(record.pid):
