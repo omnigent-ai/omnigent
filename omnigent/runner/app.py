@@ -509,6 +509,10 @@ class _PiNativeLaunchConfig:
     :param model_override: Persisted per-session ``/model`` override, e.g.
         ``"claude-4.6-sonnet-medium"``; ``None`` when unset. Consumed by the
         cursor-native launch (``--model``), ignored by pi-native.
+    :param fork_carry_history: ``True`` when the session is a fork bound to a
+        carry-history native target (``omnigent.fork.carry_history``). Consumed
+        by the cursor-native launch to replay prior turns as a text preamble on
+        the first message; ignored by pi-native.
     """
 
     workspace: Path
@@ -516,6 +520,7 @@ class _PiNativeLaunchConfig:
     terminal_launch_args: list[str] | None
     external_session_id: str | None
     model_override: str | None = None
+    fork_carry_history: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -713,12 +718,19 @@ async def _pi_native_launch_config(
             raise RuntimeError(
                 f"Invalid model_override for session {session_id!r}: {exc}"
             ) from exc
+    from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
+
+    labels = snapshot.get("labels")
+    fork_carry_history = (
+        isinstance(labels, dict) and labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
+    )
     return _PiNativeLaunchConfig(
         workspace=_pi_session_workspace(session_workspace),
         server_url=os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
         terminal_launch_args=terminal_launch_args,
         external_session_id=external_session_id,
         model_override=model_override,
+        fork_carry_history=fork_carry_history,
     )
 
 
@@ -1535,6 +1547,7 @@ async def _auto_create_cursor_terminal(
     from omnigent.cursor_native_bridge import (
         approve_mcp_server_for_workspace,
         bridge_dir_for_session_id,
+        write_fork_preamble,
         write_hooks_config,
         write_mcp_config,
     )
@@ -1596,6 +1609,26 @@ async def _auto_create_cursor_terminal(
                 session_id,
             )
             resume_chat_id = None
+    # A fork bound to cursor carries history as a text preamble: cursor's
+    # conversation is server-backed, so there's no local store to seed for
+    # ``--resume`` (a fresh fork has no prior chat anyway → ``not preseeded``).
+    # Render the copied Omnigent items once and stash them; the executor prepends
+    # them to the fork's first injected message. Best-effort — a failure just
+    # starts the cursor turn without the prior context.
+    if launch_config.fork_carry_history and not preseeded and server_client is not None:
+        try:
+            from omnigent.claude_native import _fetch_all_session_items_for_claude_resume
+
+            fork_items = await _fetch_all_session_items_for_claude_resume(
+                server_client, session_id
+            )
+            write_fork_preamble(bridge_dir, _cursor_fork_history_preamble(fork_items))
+        except Exception:  # noqa: BLE001 — context carry-over is best-effort
+            _logger.warning(
+                "cursor-native: could not build fork history preamble (session=%s).",
+                session_id,
+                exc_info=True,
+            )
     write_mcp_config(Path(workspace), bridge_dir)
     # Register the cursor ``stop`` hook that captures per-turn token usage into
     # the bridge dir for the usage forwarder below (see cursor_native_usage).
@@ -4016,6 +4049,66 @@ def _cursor_native_resume_args(chat_id: str | None, existing_args: list[str]) ->
     if any(arg == "--resume" or arg.startswith("--resume=") for arg in existing_args):
         return []
     return ["--resume", chat_id]
+
+
+def _cursor_message_item_text(content: Any) -> str:
+    """Join the text of a session message item's content blocks.
+
+    :param content: A message item's ``content`` — a plain string or a list of
+        ``{"type": "input_text"|"output_text"|"text", "text": ...}`` blocks.
+    :returns: The concatenated block text (stripped), or ``""``.
+    """
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") in ("input_text", "output_text", "text"):
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "".join(parts).strip()
+
+
+#: Transcript role labels for the fork preamble. cursor's TUI can't reconstruct
+#: native user/assistant bubbles (its conversation is server-backed), so the
+#: replayed history reads as close to that as a single text block allows:
+#: capitalized speaker labels, blank-line-separated turns.
+_CURSOR_FORK_ROLE_LABELS = {"user": "You", "assistant": "Assistant"}
+
+
+def _cursor_fork_history_preamble(items: list[dict[str, Any]]) -> str:
+    """Render copied fork items as a readable conversation transcript.
+
+    cursor's conversation is server-backed, so a fork can't seed a local store
+    for ``--resume`` to load; instead the prior turns are replayed as a text
+    prefix on the fork's first message (text-prefix replay). Only user/assistant
+    message text is replayed — cursor's TUI has no surface to import tool-call
+    history or reconstruct native bubbles, so this formats the turns as a clean
+    speaker-labelled transcript (the closest single-block analog), mirroring the
+    antigravity executor's documented text-prefix fallback. The human framing +
+    strip sentinel are added by
+    :func:`omnigent.cursor_native_bridge.wrap_fork_preamble`.
+
+    :param items: Committed Omnigent items (``GET /v1/sessions/{id}/items``),
+        chronological.
+    :returns: A blank-line-separated transcript like ``"You: …\\n\\nAssistant:
+        …"``, or ``""`` when no replayable user/assistant text exists.
+    """
+    turns: list[str] = []
+    for item in items:
+        if item.get("type") != "message":
+            continue
+        role = item.get("role")
+        if role not in _CURSOR_FORK_ROLE_LABELS:
+            continue
+        text = _cursor_message_item_text(item.get("content"))
+        if text:
+            turns.append(f"{_CURSOR_FORK_ROLE_LABELS[role]}: {text}")
+    return "\n\n".join(turns)
 
 
 def _agent_os_env_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> Any | None:
