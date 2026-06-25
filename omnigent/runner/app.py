@@ -11381,24 +11381,37 @@ def create_runner_app(
                         conv,
                         exc_info=True,
                     )
-            _session_mcp: Any = ProxyMcpManager(conv, server_client)
-            if cached_spec and cached_spec.mcp_servers and _session_mcp:
-                try:
-                    mcp_result = await _session_mcp.schemas_for(
-                        cached_spec,
-                    )
-                    all_tools.extend(mcp_result.schemas)
-                except (
-                    httpx.HTTPError,
-                    RuntimeError,
-                    ValueError,
-                ):
-                    _logger.warning(
-                        "MCP schema resolution failed for %s",
-                        conv,
-                        exc_info=True,
-                    )
             _session_tool_schemas[conv] = all_tools
+
+        # MCP schemas are resolved every turn (not cached) so that
+        # servers added/removed via the UI are picked up immediately
+        # without requiring a cache reset. The underlying MCP
+        # connections are pooled in RunnerMcpManager, so tools/list
+        # is fast after initial connect.
+        _session_mcp: Any = ProxyMcpManager(conv, server_client)
+        if cached_spec and cached_spec.mcp_servers and _session_mcp:
+            try:
+                mcp_result = await _session_mcp.schemas_for(
+                    cached_spec,
+                )
+                # Replace MCP tools in the cached list: keep builtin
+                # tools (no double-underscore separator) and append
+                # the fresh MCP schemas.
+                _builtin_tools = [
+                    t for t in _session_tool_schemas.get(conv, [])
+                    if not (isinstance(t, dict) and "__" in (t.get("name") or ""))
+                ]
+                _session_tool_schemas[conv] = _builtin_tools + list(mcp_result.schemas)
+            except (
+                httpx.HTTPError,
+                RuntimeError,
+                ValueError,
+            ):
+                _logger.warning(
+                    "MCP schema resolution failed for %s",
+                    conv,
+                    exc_info=True,
+                )
 
         # Spec builtin + MCP schemas are cached per conversation, but the
         # caller's client-side tools arrive per event on ``msg_body["tools"]``
