@@ -48,33 +48,36 @@ class CursorCloudRepo:
     ref: str | None
 
 
-# ``git@host:org/repo(.git)`` — the scp-like SSH remote form.
-_SSH_REMOTE_RE = re.compile(r"^(?:ssh://)?git@(?P<host>[^:/]+)[:/](?P<path>.+?)(?:\.git)?/?$")
-# ``scheme://[user@]host/org/repo(.git)`` — the HTTP(S) / git protocol form.
-_URL_REMOTE_RE = re.compile(
-    r"^(?P<scheme>https?|git)://(?:[^@/]+@)?(?P<host>[^/]+)/(?P<path>.+?)(?:\.git)?/?$"
+# scp-like SSH remote ``git@host:org/repo(.git)`` — the colon separates host
+# and path (no port is possible in this form).
+_SCP_REMOTE_RE = re.compile(r"^git@(?P<host>[^:/]+):(?P<path>.+?)(?:\.git)?/?$")
+# URI-form remote ``(ssh|https|git)://[user@]host[:port]/org/repo(.git)`` — an
+# optional ``:port`` after the host is stripped (e.g. ``ssh://git@github.com:22/...``).
+_URI_REMOTE_RE = re.compile(
+    r"^(?:ssh|https?|git)://(?:[^@/]+@)?(?P<host>[^:/]+)(?::\d+)?/(?P<path>.+?)(?:\.git)?/?$"
 )
 
 
 def normalize_remote_url(raw: str) -> str:
     """Normalize a git remote URL to the ``https://<host>/<path>`` form.
 
-    Accepts SSH (``git@github.com:org/repo.git``), HTTPS
+    Accepts scp-like SSH (``git@github.com:org/repo.git``), URI-form SSH
+    (``ssh://git@github.com[:port]/org/repo.git``), HTTPS
     (``https://github.com/org/repo.git``), and ``git://`` remotes; strips any
-    ``.git`` suffix, embedded credentials, and trailing slash. A string that
-    matches no known remote shape is returned stripped but otherwise unchanged
-    (the Cursor API rejects a malformed URL more clearly than we can here).
+    ``.git`` suffix, embedded credentials, ``:port``, and trailing slash. A
+    string that matches no known remote shape is returned stripped but otherwise
+    unchanged (the Cursor API rejects a malformed URL more clearly than we can).
 
     :param raw: The remote URL as reported by ``git remote get-url``.
     :returns: The normalized ``https://<host>/<org>/<repo>`` URL.
     """
     candidate = raw.strip()
-    ssh = _SSH_REMOTE_RE.match(candidate)
-    if ssh:
-        return f"https://{ssh.group('host')}/{ssh.group('path')}"
-    url = _URL_REMOTE_RE.match(candidate)
-    if url:
-        return f"https://{url.group('host')}/{url.group('path')}"
+    scp = _SCP_REMOTE_RE.match(candidate)
+    if scp:
+        return f"https://{scp.group('host')}/{scp.group('path')}"
+    uri = _URI_REMOTE_RE.match(candidate)
+    if uri:
+        return f"https://{uri.group('host')}/{uri.group('path')}"
     return candidate
 
 
@@ -108,10 +111,16 @@ def resolve_cursor_cloud_repo(
 ) -> CursorCloudRepo:
     """Resolve the cloud-agent repo URL + starting ref.
 
-    Override precedence: an explicit ``repo_override`` / ``ref_override`` wins
-    over the cwd-derived value, field by field. With no repo override, the
-    ``origin`` remote of *cwd* supplies the URL and the current branch supplies
-    the ref (unless ``ref_override`` is given).
+    Resolution paths:
+
+    - **Repo override given:** use it. The ref is ``ref_override`` if given,
+        else ``None`` (the target repo's default branch). The cwd branch is
+        deliberately NOT carried over — it belongs to a possibly-different repo
+        and may not exist on the override target, so defaulting is the safe
+        choice.
+    - **No repo override:** the ``origin`` remote of *cwd* supplies the URL, and
+        the ref is ``ref_override`` if given, else the cwd's current branch
+        (the exact commit SHA on a detached HEAD).
 
     :param cwd: Session working directory to read git config from. ``None``
         means "no cwd available" — only an explicit ``repo_override`` can
@@ -149,8 +158,9 @@ def resolve_cursor_cloud_repo(
         ref: str | None = ref_override.strip()
     else:
         ref = _git(cwd_path, "rev-parse", "--abbrev-ref", "HEAD")
-        # A detached HEAD reports "HEAD" — not a usable ref to clone; let the
-        # cloud default to the repo's default branch instead.
+        # A detached HEAD reports "HEAD", which is not a clonable ref — fall
+        # back to the exact commit SHA so a CI / checked-out-SHA workflow runs
+        # the cloud agent on that commit rather than the repo's default branch.
         if ref == "HEAD":
-            ref = None
+            ref = _git(cwd_path, "rev-parse", "HEAD")
     return CursorCloudRepo(url=url, ref=ref)

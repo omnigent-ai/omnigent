@@ -33,6 +33,9 @@ from omnigent.cursor_cloud_repo import (
         ("git@github.com:org/repo", "https://github.com/org/repo"),
         # ssh:// prefixed form.
         ("ssh://git@github.com/org/repo.git", "https://github.com/org/repo"),
+        # ssh:// with an explicit port — the port is stripped, not folded into path.
+        ("ssh://git@github.com:22/org/repo.git", "https://github.com/org/repo"),
+        ("ssh://git@ssh.github.com:443/org/repo", "https://ssh.github.com/org/repo"),
         # HTTPS form with .git suffix.
         ("https://github.com/org/repo.git", "https://github.com/org/repo"),
         ("https://github.com/org/repo", "https://github.com/org/repo"),
@@ -114,7 +117,7 @@ def test_ref_override_beats_cwd_branch(tmp_path: Path) -> None:
     assert resolved.ref == "release-1.0"
 
 
-def test_detached_head_yields_none_ref(tmp_path: Path) -> None:
+def test_detached_head_yields_commit_sha(tmp_path: Path) -> None:
     _init_repo(tmp_path, remote="git@github.com:org/repo.git", branch="main")
     # Detach HEAD at the current commit so `rev-parse --abbrev-ref HEAD` -> "HEAD".
     sha = subprocess.run(
@@ -126,7 +129,8 @@ def test_detached_head_yields_none_ref(tmp_path: Path) -> None:
     subprocess.run(["git", "-C", str(tmp_path), "checkout", "-q", sha], check=True)
     resolved = resolve_cursor_cloud_repo(tmp_path)
     assert resolved.url == "https://github.com/org/repo"
-    assert resolved.ref is None  # detached "HEAD" is not a usable ref
+    # Detached "HEAD" is not a clonable ref; fall back to the exact commit SHA.
+    assert resolved.ref == sha
 
 
 # ---------------------------------------------------------------------------
