@@ -8862,21 +8862,26 @@ def create_runner_app(
             elif item_type == "error":
                 # #1108: error items used to be silently dropped here, so a
                 # turn that actually failed replayed as if it had never erred
-                # ("silent success"). Surface each error item as a visible
-                # message block so the failure reason survives history reload
-                # and the next turn sees it rather than a clean slate.
+                # ("silent success"). Preserve the error as a typed ``error``
+                # item — the same shape ``ErrorData.to_api_dict`` produces
+                # (source/code/message) — rather than a synthetic user
+                # message. This keeps the failure visible AND attributed as
+                # an error (not as user input), and round-trips the stable
+                # ``code`` for downstream classification. Like other non-
+                # message items (function_call, etc.), the harness input
+                # translator skips it for LLM context, but it survives the
+                # conversion instead of being dropped on the floor.
                 message = item.get("message")
                 code = item.get("code")
-                text = message if isinstance(message, str) and message else "unknown error"
-                if isinstance(code, str) and code:
-                    text = f"[Error: {code}] {text}"
-                else:
-                    text = f"[Error] {text}"
+                source = item.get("source")
                 result.append(
                     {
-                        "type": "message",
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": text}],
+                        "type": "error",
+                        "source": source if isinstance(source, str) and source else "execution",
+                        "code": code if isinstance(code, str) and code else "error",
+                        "message": (
+                            message if isinstance(message, str) and message else "unknown error"
+                        ),
                     }
                 )
         if _skipped_types:

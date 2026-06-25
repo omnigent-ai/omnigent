@@ -125,6 +125,14 @@ _CODEX_ERROR_ITEM_TYPE = "error"
 # error as authentication-related, so the surface can include a re-auth hint.
 # Kept deliberately broad: Codex auth failures surface in several phrasings
 # (expired ChatGPT login, 401/403 from the responses API, "run codex login").
+# The broad ``login`` / ``sign in`` tokens are retained intentionally rather
+# than gated on co-occurring auth context: ``"run codex login"`` is the
+# canonical Codex re-auth error and ``login`` is its only signal, so requiring
+# extra context would weaken detection of the exact failure this hint exists
+# for. Because Phase 1 is surface-only, a false positive merely appends a
+# re-auth hint to an already-failed turn (cheap), whereas a false negative
+# leaves the user unaware they must re-authenticate (costly) — the asymmetry
+# favors recall over precision here.
 _CODEX_AUTH_ERROR_FRAGMENTS = (
     "401",
     "403",
