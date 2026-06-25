@@ -306,6 +306,15 @@ def _dispatch_wrapper(
             hermes_args=(),
         )
         return True
+    if native_agent.key == "cline":
+        from omnigent.cline_native import run_cline_native
+
+        run_cline_native(
+            server=server,
+            session_id=session_id,
+            cline_args=(),
+        )
+        return True
     return False
 
 

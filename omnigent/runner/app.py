@@ -56,6 +56,7 @@ from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
+    CLINE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     CURSOR_NATIVE_TERMINAL_ROLE,
     GOOSE_NATIVE_TERMINAL_ROLE,
@@ -2453,6 +2454,100 @@ async def _auto_create_kimi_terminal(
     )
     _register_auto_forwarder_task(session_id, _forwarder_task)
     _logger.info("Auto-created kimi terminal + forwarder for session %s", session_id)
+    return terminal_view
+
+
+async def _auto_create_cline_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, Any]], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+) -> SessionResourceView:
+    """
+    Auto-create the Cline TUI terminal for a cline-native session.
+
+    Launches ``cline -i`` (the standalone Cline CLI's interactive TUI) in a
+    runner-owned tmux pane, then advertises the pane's tmux socket+target so the
+    cline-native harness executor can inject web-UI turns into the same pane
+    (tmux paste). Auth is the ambient ``cline auth`` (``$HOME/.cline``), so HOME
+    is inherited and Omnigent writes no vendor config — Cline owns its own tool
+    surface and its plan/act approval prompts run in-terminal. Mirrors
+    :func:`_auto_create_cursor_terminal`, minus the MCP machinery and the
+    transcript forwarder (the embedded terminal renders Cline's output live).
+
+    :param session_id: Session/conversation identifier.
+    :param resource_registry: Session resource registry for launching the
+        terminal.
+    :param publish_event: Runner session event publisher.
+    :param server_client: Runner Omnigent server client (used only for the
+        workspace snapshot read).
+    :param ensure_comment_relay: Unused; kept for call-site parity with the other
+        native auto-create helpers.
+    :param agent_spec: Unused for now (model pinning via the cline TUI is a
+        follow-up); kept for call-site parity.
+    :returns: Created terminal resource view.
+    """
+    del ensure_comment_relay, agent_spec
+    from omnigent.cline_native import resolve_cline_executable
+    from omnigent.cline_native_bridge import bridge_dir_for_session_id, write_tmux_target
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    # No forwarder for cline-native, but a prior terminal for this session may
+    # still own one from another native harness on a /clear rotation — cancel it
+    # so nothing keeps mirroring against the re-created pane (mirrors cursor).
+    await _cancel_auto_forwarder_task(session_id)
+
+    # ``_pi_native_launch_config`` is a generic session-snapshot reader
+    # (workspace + terminal_launch_args); reused here, not Pi-specific.
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = os.path.realpath(str(launch_config.workspace))
+    cline_command = resolve_cline_executable()
+    # ``-i`` opens the interactive TUI; pass-through launch args
+    # (``omnigent cline -- <args>``) are persisted on the session snapshot and
+    # threaded here after it.
+    cline_args = ["-i", *(launch_config.terminal_launch_args or [])]
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="cline",
+        session_key="main",
+        resource_role=CLINE_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            command=cline_command,
+            args=cline_args,
+            env={},
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    # Advertise the tmux socket+target so the cline-native harness executor can
+    # inject web-UI messages into this same pane (tmux paste), wiring the web
+    # chat box to the running TUI.
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "cline", "main")
+        if instance is not None and instance.running:
+            write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+    _logger.info("Auto-created cline terminal for session %s", session_id)
     return terminal_view
 
 
@@ -6765,6 +6860,7 @@ def create_runner_app(
     _qwen_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _kimi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _hermes_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _cline_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     # Per-session lock guarding the claude-native terminal auto-create in
     # ``create_session``. Two ``POST /v1/sessions`` calls can land
     # concurrently on a host-launched runner — ``_on_runner_connect``
@@ -7714,6 +7810,10 @@ def create_runner_app(
                 from omnigent.kimi_native_bridge import build_kimi_native_spawn_env
 
                 spawn_env = build_kimi_native_spawn_env(session_id)
+            if harness_name == "cline-native" and spawn_env is None:
+                from omnigent.cline_native_bridge import build_cline_native_spawn_env
+
+                spawn_env = build_cline_native_spawn_env(session_id)
             _session_spec_cache[session_id] = spec_entry
         else:
             harness_name = "runner-test-default"
@@ -8344,6 +8444,44 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        if harness_name == "cline-native":
+            _cline_ensure_lock = _cline_terminal_ensure_locks.setdefault(
+                session_id, asyncio.Lock()
+            )
+            async with _cline_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_cline_terminal = (
+                    _tr is not None and _tr.get(session_id, "cline", "main") is not None
+                )
+                if not _has_cline_terminal:
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        try:
+                            _cline_spec = await _resolve_session_agent_spec(session_id)
+                        except OmnigentError:
+                            _cline_spec = None
+                        await _auto_create_cline_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
+                            agent_spec=_cline_spec,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create cline terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "Cline",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+
         # Auto-bootstrap the Omnigent REPL terminal for non-native
         # (SDK-harness) top-level sessions: host the framework's own TUI
         # (``omnigent attach``) in a tmux pane so the web UI can embed it
@@ -8618,6 +8756,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _cline_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         # Stop any TUI→web transcript forwarder (cursor-/goose-native) for this
@@ -9236,6 +9375,7 @@ def create_runner_app(
             "qwen-native",
             "kimi-native",
             "hermes-native",
+            "cline-native",
         }:
             return
         if status == "idle" and harness in {"codex-native", "antigravity-native"}:
@@ -15639,6 +15779,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _cline_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
         return JSONResponse(
@@ -15698,6 +15839,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _cline_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         # Close terminals with ``session.resource.deleted`` events BEFORE
         # cleanup_session — cleanup_conversation would silently pop them

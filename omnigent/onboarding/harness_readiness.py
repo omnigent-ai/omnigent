@@ -30,6 +30,7 @@ from collections.abc import Callable
 import omnigent.onboarding.gemini_auth as _gemini_auth
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
 from omnigent.onboarding.harness_install import (
+    CLINE_KEY,
     COPILOT_KEY,
     CURSOR_KEY,
     GOOSE_KEY,
@@ -118,6 +119,12 @@ _KIMI_NATIVE_HARNESSES: frozenset[str] = frozenset({"kimi-native", "native-kimi"
 # native CLI harnesses. Hermes owns its own auth (``hermes setup`` /
 # ``hermes model``); the headless ``hermes`` harness gates on the same binary.
 _HERMES_NATIVE_HARNESSES: frozenset[str] = frozenset({"hermes-native", "native-hermes"})
+
+# Native Cline harnesses. Boot the ``cline -i`` TUI (``omni cline``) and can't
+# launch without the ``cline`` binary on ``PATH`` — gate on it, like the other
+# native CLI harnesses. Cline owns its own auth (``cline auth`` → ``$HOME/.cline``),
+# so there is no SDK variant or Omnigent key to gate on.
+_CLINE_NATIVE_HARNESSES: frozenset[str] = frozenset({"cline-native", "native-cline"})
 
 # CLI-wrapping qwen harnesses. ``qwen`` / ``qwen-code`` (the ACP harness) and
 # ``qwen-native`` / ``native-qwen`` (the native TUI via ``omni qwen``) all resolve
@@ -209,6 +216,12 @@ def harness_is_configured(harness: str) -> bool:
         # Research). Auth/provider config surfaces at run time via Hermes' own
         # ``hermes model`` flow; gate only on binary presence.
         return harness_cli_installed(HERMES_KEY)
+    if canonical in _CLINE_NATIVE_HARNESSES:
+        # Native Cline (``omni cline``) wraps the ``cline`` CLI — gate on that
+        # binary, like the other native harnesses. Login state (``cline auth``,
+        # stored under ``$HOME/.cline``) surfaces at run time; the daemon gates
+        # only on binary presence.
+        return harness_cli_installed(CLINE_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -290,6 +303,7 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_GOOSE_NATIVE_HARNESSES)
     spellings.update(_KIMI_NATIVE_HARNESSES)
     spellings.update(_HERMES_NATIVE_HARNESSES)
+    spellings.update(_CLINE_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(KIMI_SURFACE)
