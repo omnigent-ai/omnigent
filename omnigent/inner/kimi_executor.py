@@ -47,8 +47,8 @@ Env-var contract (read once at construction by
 Per-invocation provider routing (``--config-file`` / ``--mcp-config-file``
 / gateway env vars) is **not** wired: upstream kimi has no per-spawn
 config override. Provider configuration lives in ``~/.kimi/config.toml``
-and is managed out-of-band via ``kimi provider add``. See
-``docs/KIMI_FOLLOWUPS.md`` for the deferred provider-injection follow-up.
+and is managed out-of-band via ``kimi provider add`` (Omnigent-side
+provider injection is a deferred follow-up).
 """
 
 from __future__ import annotations
@@ -131,8 +131,7 @@ def _latest_user_text(messages: list[Message]) -> str:
     Kimi receives the conversation history via ``--session <id>``, not
     via stdin, so we only need the most recent user turn to drive
     ``-p <text>``. Image / file / audio content blocks are dropped with
-    a single warning per turn (multimodal input is deferred — see
-    ``docs/KIMI_FOLLOWUPS.md``).
+    a single warning per turn (multimodal input is a deferred follow-up).
     """
     dropped_blocks = 0
     for message in reversed(messages):
@@ -154,8 +153,7 @@ def _latest_user_text(messages: list[Message]) -> str:
             if dropped_blocks:
                 _logger.warning(
                     "kimi harness: dropped %d non-text content block(s) on the "
-                    "latest user message (multimodal input not yet wired — see "
-                    "docs/KIMI_FOLLOWUPS.md)",
+                    "latest user message (multimodal input not yet wired)",
                     dropped_blocks,
                 )
             return "".join(text_parts)
@@ -214,7 +212,7 @@ class KimiExecutor(Executor):
         self._session_id: str | None = None
         # Tracks whether we've already warned this session about tools
         # being declared without a provider-injection bridge (one warning
-        # per session — see docs/KIMI_FOLLOWUPS.md item 1).
+        # per session; the tool-injection bridge is a deferred follow-up).
         self._warned_tools_without_bridge = False
         # Active subprocess handle, captured so interrupt can target it.
         self._active_process: asyncio.subprocess.Process | None = None
@@ -416,8 +414,7 @@ class KimiExecutor(Executor):
                 "kimi executor received %d declared tool(s) but Omnigent has no "
                 "tool-injection bridge for the upstream kimi binary yet (no "
                 "per-spawn --mcp-config-file). The tools will not be exposed to "
-                "kimi for this session. See docs/KIMI_FOLLOWUPS.md for the MCP "
-                "follow-up.",
+                "kimi for this session (MCP tool-injection is a deferred follow-up).",
                 len(tools),
             )
             self._warned_tools_without_bridge = True
@@ -581,8 +578,8 @@ class KimiExecutor(Executor):
     ) -> bool:
         """Not supported under the per-turn subprocess model.
 
-        The ``kimi acp`` long-lived path would unlock this — see
-        ``docs/KIMI_FOLLOWUPS.md``.
+        The ``kimi acp`` long-lived path would unlock this (a deferred
+        follow-up).
         """
         return False
 

@@ -2223,6 +2223,22 @@ def test_materialize_harness_launcher_file_writes_omnigent_yaml() -> None:
     assert "profile" not in raw["executor"], raw["executor"]
 
 
+def test_materialize_harness_launcher_file_kimi_gets_os_env() -> None:
+    """``run --harness kimi`` bakes a caller-process ``os_env`` so the SDK kimi
+    operates in the user's current directory, matching claude-sdk.
+
+    Regression: kimi was missing from ``_OS_ENV_HARNESSES``, so its launcher
+    spec had no ``os_env`` block and the headless harness ran detached from the
+    cwd (the user saw it operate out of the /tmp spec dir, not their folder)."""
+    for alias in ("kimi", "kimi-code"):
+        generated = _materialize_harness_launcher_file(
+            harness=alias, model=None, system_prompt=None
+        )
+        raw = yaml.safe_load(generated.read_text())
+        assert raw["executor"]["harness"] == "kimi"
+        assert raw["os_env"] == {"type": "caller_process", "sandbox": {"type": "none"}}
+
+
 def test_run_without_agent_drops_into_configure_when_unconfigured(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

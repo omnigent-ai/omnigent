@@ -57,23 +57,39 @@ def render_kimi_hooks_toml(*, bridge_dir: Path, python_executable: str | None = 
     :returns: TOML text starting with a leading newline, safe to append.
     """
     python = python_executable or sys.executable
-    base = f"{shlex.quote(python)} -m omnigent.kimi_native_hook"
+    # ``-I`` (isolated mode) is REQUIRED, not cosmetic: kimi runs the hook with
+    # ``cwd`` set to the session workspace, and ``python -m`` puts cwd on
+    # ``sys.path[0]``. A workspace that contains its own ``omnigent/`` directory
+    # (another checkout, a vendored copy) would otherwise shadow the installed
+    # package and the hook dies on ``ImportError`` before it can POST — so the
+    # approval card never publishes. ``-I`` drops cwd + PYTHONPATH + user-site
+    # from the path, importing only the interpreter's own omnigent. Mirrors
+    # claude-native's ``python -I -m omnigent.claude_native_hook``.
+    base = f"{shlex.quote(python)} -I -m omnigent.kimi_native_hook"
     bridge = shlex.quote(str(bridge_dir))
     pre = f"{base} evaluate-policy --bridge-dir {bridge}"
     perm = f"{base} permission-request --bridge-dir {bridge}"
     # No ``matcher`` → matches every tool. Commands are TOML basic strings;
     # shlex.quote yields single-quoted POSIX tokens, which contain no double
     # quotes or backslashes, so they embed in a "..." TOML string verbatim.
+    #
+    # ``timeout`` is required: kimi's DEFAULT_HOOK_TIMEOUT_SECONDS is 30s, which
+    # would kill the permission hook while it long-polls the web verdict (so the
+    # injected Approve/Deny keystroke never lands) and could sever a slow policy
+    # evaluate. Pin both to kimi's 600s ceiling — the longest the human may take
+    # to answer the card — after which kimi's own TUI prompt stands.
     return (
         "\n"
         "# --- Omnigent native hooks (auto-generated; do not edit) ---\n"
         "[[hooks]]\n"
         'event = "PreToolUse"\n'
         f'command = "{pre}"\n'
+        "timeout = 600\n"
         "\n"
         "[[hooks]]\n"
         'event = "PermissionRequest"\n'
         f'command = "{perm}"\n'
+        "timeout = 600\n"
     )
 
 

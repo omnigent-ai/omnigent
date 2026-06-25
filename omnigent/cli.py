@@ -5226,7 +5226,9 @@ _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnige
 # operations route through the Omnigent dispatch path (runner
 # visibility, timeouts, error recovery) instead of the harness's
 # internal built-in tools.
-_OS_ENV_HARNESSES: frozenset[str] = frozenset({"claude-sdk", "codex", "pi", "qwen", "goose"})
+_OS_ENV_HARNESSES: frozenset[str] = frozenset(
+    {"claude-sdk", "codex", "pi", "qwen", "goose", "kimi"}
+)
 
 
 def _validate_harness(harness: str) -> None:
@@ -9733,8 +9735,8 @@ def _print_kimi_auth_help() -> None:
     provider, and ``kimi provider add`` to register any other provider (an
     OpenAI-compatible endpoint, a Databricks gateway, …) in
     ``~/.kimi/config.toml``. Omnigent has no per-spawn provider override for
-    upstream kimi, so all of this lives in the kimi CLI's own config — see
-    ``docs/KIMI_FOLLOWUPS.md`` for the deferred Omnigent-side injection work.
+    upstream kimi, so all of this lives in the kimi CLI's own config —
+    Omnigent-side injection remains a deferred follow-up.
     """
     from omnigent.onboarding.interactive import console
 

@@ -1021,19 +1021,24 @@ def test_kimi_spawn_env_threads_spec_model_only(config_home: Path) -> None:
     _write_config(config_home, {"providers": {}})
     spec = _make_spec(harness="kimi", model="kimi-k2-turbo")
 
-    env = _build_kimi_spawn_env(spec, workdir=None)
+    env = _build_kimi_spawn_env(spec, cwd=None)
 
     assert env == {"HARNESS_KIMI_MODEL": "kimi-k2-turbo"}
 
 
-def test_kimi_workdir_threads_through_as_cwd(config_home: Path, tmp_path: Path) -> None:
-    """``workdir`` lands in ``HARNESS_KIMI_CWD`` so kimi's subprocess runs in
-    the bundle dir (upstream kimi has no ``--work-dir`` flag, so the executor
-    threads this as ``cwd=`` on the subprocess)."""
+def test_kimi_cwd_threads_through_as_subprocess_cwd(
+    config_home: Path, tmp_path: Path
+) -> None:
+    """``cwd`` (the session workspace) lands in ``HARNESS_KIMI_CWD`` so kimi's
+    subprocess operates on the user's project — NOT the /tmp agent bundle dir.
+
+    Regression: the builder previously threaded the bundle ``workdir`` here, so
+    `omni --harness kimi` / web kimi sessions ran kimi out of the bundle dir and
+    it reported only ``kimi.yaml`` instead of the repo. Mirrors pi's cwd."""
     _write_config(config_home, {"providers": {}})
     spec = _make_spec(harness="kimi")
 
-    env = _build_kimi_spawn_env(spec, workdir=tmp_path)
+    env = _build_kimi_spawn_env(spec, cwd=tmp_path)
 
     assert env["HARNESS_KIMI_CWD"] == str(tmp_path)
 
@@ -1048,7 +1053,7 @@ def test_kimi_no_provider_emits_no_gateway_vars(config_home: Path) -> None:
     _write_config(config_home, {"providers": {}})
     spec = _make_spec(harness="kimi")
 
-    env = _build_kimi_spawn_env(spec, workdir=None)
+    env = _build_kimi_spawn_env(spec, cwd=None)
 
     assert "HARNESS_KIMI_GATEWAY_BASE_URL" not in env
     assert "HARNESS_KIMI_GATEWAY_API_KEY" not in env
@@ -1069,7 +1074,7 @@ def test_kimi_ignores_global_default_provider(config_home: Path) -> None:
     _write_config(config_home, _openai_default_config())
     spec = _make_spec(harness="kimi")
 
-    env = _build_kimi_spawn_env(spec, workdir=None)
+    env = _build_kimi_spawn_env(spec, cwd=None)
 
     assert "HARNESS_KIMI_GATEWAY_BASE_URL" not in env
     assert "HARNESS_KIMI_GATEWAY_API_KEY" not in env
@@ -1100,7 +1105,7 @@ def test_kimi_declared_auth_raises(
     spec = _make_spec(harness="kimi", auth=auth)
 
     with pytest.raises(OmnigentError, match=r"kimi.*does not support"):
-        _build_kimi_spawn_env(spec, workdir=None)
+        _build_kimi_spawn_env(spec, cwd=None)
 
 
 def test_kimi_os_env_serialized(config_home: Path) -> None:
@@ -1121,7 +1126,7 @@ def test_kimi_os_env_serialized(config_home: Path) -> None:
     )
     spec = _make_spec(harness="kimi", os_env=os_env)
 
-    env = _build_kimi_spawn_env(spec, workdir=None)
+    env = _build_kimi_spawn_env(spec, cwd=None)
 
     assert "HARNESS_KIMI_OS_ENV" in env
     decoded = _json.loads(env["HARNESS_KIMI_OS_ENV"])

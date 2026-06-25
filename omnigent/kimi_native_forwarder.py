@@ -41,7 +41,7 @@ import httpx
 _logger = logging.getLogger(__name__)
 
 #: Poll cadence for new wire-log lines (matches cursor_native_forwarder).
-_POLL_INTERVAL_S = 0.7
+_POLL_INTERVAL_S = 0.25
 #: Persisted forwarder state (discovered wire path + high-water line count).
 _STATE_FILE = "kimi_forwarder.json"
 #: Clock-skew tolerance when matching a session created at/after launch.

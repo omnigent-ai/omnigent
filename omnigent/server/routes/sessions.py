@@ -722,8 +722,11 @@ _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES = 1024
 _HARNESS_ELICITATION_REPARK_GRACE_S = 10.0
 
 # Client-supplied re-attach ids, namespaced so they cannot collide
-# with Codex deterministic ids or server-minted ids.
-_CLAUDE_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_claude_[0-9a-f]{32}$")
+# with Codex deterministic ids or server-minted ids. The shared
+# PermissionRequest endpoint is used by every native-CLI wrapper that mints its
+# own id (claude-native ``elicit_claude_…``, kimi-native ``elicit_kimi_…``), so
+# the namespace is the harness token, not a fixed ``claude``.
+_HOOK_ELICITATION_ID_RE = re.compile(r"^elicit_[a-z]+_[0-9a-f]{32}$")
 # Stable re-attach id for ``POST /policies/evaluate`` retries. Allows the
 # server to re-park the existing ASK elicitation rather than minting a new
 # approval card when a transient 5xx or connect-drop triggered a retry.
@@ -1618,10 +1621,10 @@ def _client_supplied_hook_elicitation_id(
     raw = payload.get("_omnigent_elicitation_id")
     if raw is None:
         return None
-    if not isinstance(raw, str) or not _CLAUDE_HOOK_ELICITATION_ID_RE.fullmatch(raw):
+    if not isinstance(raw, str) or not _HOOK_ELICITATION_ID_RE.fullmatch(raw):
         raise OmnigentError(
             "PermissionRequest hook '_omnigent_elicitation_id' must match "
-            "'elicit_claude_' + 32 hex chars.",
+            "'elicit_<harness>_' + 32 hex chars.",
             code=ErrorCode.INVALID_INPUT,
         )
     owner = _harness_elicitation_owners.get(raw)

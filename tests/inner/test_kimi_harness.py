@@ -103,6 +103,9 @@ def test_executor_factory_defaults_when_env_unset(monkeypatch: pytest.MonkeyPatc
         "HARNESS_KIMI_PLAN",
         "HARNESS_KIMI_CONTINUE_LAST",
         "HARNESS_KIMI_SKILLS_DIRS",
+        # Cleared too: cwd now falls back to it, so a dev with it exported
+        # mustn't flip this default-path assertion.
+        "OMNIGENT_RUNNER_WORKSPACE",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -123,6 +126,38 @@ def test_executor_factory_defaults_when_env_unset(monkeypatch: pytest.MonkeyPatc
     assert captured["model"] is None
     assert captured["cwd"] is None
     assert captured["skills_dirs"] == []
+
+
+def test_executor_factory_falls_back_to_runner_workspace_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no HARNESS_KIMI_CWD, kimi runs in OMNIGENT_RUNNER_WORKSPACE — the
+    session workspace the user launched in — not the runner's /tmp cwd.
+
+    Regression: kimi lacked the workspace fallback the other SDK harnesses have,
+    so `omni --harness kimi` launched in the repo but kimi's tools reported the
+    /tmp launcher dir. An explicit HARNESS_KIMI_CWD still wins over the fallback.
+    """
+    monkeypatch.delenv("HARNESS_KIMI_CWD", raising=False)
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "/home/me/project")
+
+    captured: dict[str, Any] = {}
+    with patch(
+        "omnigent.inner.kimi_harness.KimiExecutor.__init__",
+        lambda self, **kwargs: captured.update(kwargs),
+    ):
+        kimi_harness._build_kimi_executor()
+    assert captured["cwd"] == "/home/me/project"
+
+    # An explicit HARNESS_KIMI_CWD overrides the workspace fallback.
+    monkeypatch.setenv("HARNESS_KIMI_CWD", "/tmp/explicit")
+    captured.clear()
+    with patch(
+        "omnigent.inner.kimi_harness.KimiExecutor.__init__",
+        lambda self, **kwargs: captured.update(kwargs),
+    ):
+        kimi_harness._build_kimi_executor()
+    assert captured["cwd"] == "/tmp/explicit"
 
 
 def test_malformed_os_env_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) -> None:

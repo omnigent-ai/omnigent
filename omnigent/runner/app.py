@@ -1952,9 +1952,8 @@ async def _auto_create_kimi_terminal(
     supervise_kimi_forwarder`) tails kimi's per-session ``wire.jsonl`` transcript
     and mirrors each user prompt + assistant reply into the Omnigent chat, so the
     response shows in the web UI — not only the embedded terminal. Tool calls and
-    reasoning are NOT mirrored (the embedded terminal renders those); see
-    docs/KIMI_FOLLOWUPS.md. NO MCP plumbing (upstream kimi has no per-spawn MCP
-    config).
+    reasoning are NOT mirrored (the embedded terminal renders those). NO MCP
+    plumbing (upstream kimi has no per-spawn MCP config).
 
     :param session_id: Session/conversation identifier.
     :param resource_registry: Session resource registry for launching the
@@ -15895,7 +15894,7 @@ def _build_spawn_env_from_spec(
         elif harness == "antigravity":
             env = _build_antigravity_spawn_env(spec)
         elif harness == "kimi":
-            env = _build_kimi_spawn_env(spec, workdir=workdir)
+            env = _build_kimi_spawn_env(spec, cwd=cwd)
         elif harness == "qwen":
             env = _build_qwen_spawn_env(spec, workdir=workdir)
         elif harness == "goose":

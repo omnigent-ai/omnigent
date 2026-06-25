@@ -173,6 +173,43 @@ class TestApprovalKeystroke:
         assert sent == []
 
 
+class TestSettlePaneReadiness:
+    """``_settle_pane`` must recognize the real kimi TUI chrome so it returns on
+    the first capture — a wrong marker silently burns the full readiness timeout
+    on every web→TUI injection (the original web→TUI latency bug)."""
+
+    def test_marker_matches_live_kimi_footer(self) -> None:
+        # Footer chrome captured verbatim from a live K2.7 session.
+        footer = (
+            " K2.7 Code thinking  ~/omnigent  pr521-kimi-native [+61 -8]"
+            '   ask Kimi to schedule tasks, e.g. "remind me at 5pm"\n'
+            "   context: 6.5% (17.0k/262.1k)"
+        )
+        assert any(m in footer for m in kimi_native_bridge._INPUT_READY_MARKERS)
+        # The cursor-native strings carried over unverified never appeared.
+        assert "Plan, search, build" not in footer
+        assert "Add a follow-up" not in footer
+
+    def test_settle_returns_on_first_capture_when_ready(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captures = {"n": 0}
+
+        def _capture(_s: str, _t: str) -> str:
+            captures["n"] += 1
+            return "context: 6.5% (17.0k/262.1k)"
+
+        monkeypatch.setattr(kimi_native_bridge, "_capture_pane", _capture)
+        # If the marker fails to match, this would loop until the deadline; a
+        # tiny timeout keeps the test fast either way, but it must return after
+        # exactly one capture with no sleep.
+        slept: list[float] = []
+        monkeypatch.setattr(kimi_native_bridge.time, "sleep", lambda s: slept.append(s))
+        kimi_native_bridge._settle_pane("/s", "main", timeout_s=30.0)
+        assert captures["n"] == 1
+        assert slept == []
+
+
 class TestRegistration:
     def test_harness_is_registered(self) -> None:
         from omnigent.runtime.harnesses import _HARNESS_MODULES

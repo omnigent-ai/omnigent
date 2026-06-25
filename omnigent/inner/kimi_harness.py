@@ -32,9 +32,8 @@ Env vars read at startup (full contract in
 
 Provider routing for kimi happens via ``kimi provider add`` / its
 ``~/.kimi/config.toml`` (out-of-band from Omnigent) — upstream kimi
-has no per-spawn ``--config-file`` or env-var provider override. See
-``docs/KIMI_FOLLOWUPS.md`` for the deferred Omnigent-side provider
-injection work.
+has no per-spawn ``--config-file`` or env-var provider override.
+Omnigent-side provider injection remains a deferred follow-up.
 """
 
 from __future__ import annotations
@@ -116,7 +115,12 @@ def _build_kimi_executor() -> Executor:
     defer their SDK / binary lookup.
     """
     return KimiExecutor(
-        cwd=os.environ.get(_ENV_CWD) or None,
+        # Run kimi in the session workspace: an explicit HARNESS_KIMI_CWD wins,
+        # else the runner's OMNIGENT_RUNNER_WORKSPACE (the cwd the user launched
+        # in), else the process cwd. Without the workspace fallback kimi ran out
+        # of the runner's cwd (a /tmp launcher dir), so its tools reported the
+        # wrong directory. Mirrors goose / pi / qwen / hermes harness cwd resolution.
+        cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None,
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL) or None,
         binary_path=os.environ.get(_ENV_BIN) or None,

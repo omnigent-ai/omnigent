@@ -435,8 +435,8 @@ _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     # NB: no ``antigravity`` — it has no Databricks/gateway path (Gemini-native).
     # NB: no ``kimi`` — upstream kimi has no per-spawn provider override flag,
     # so Omnigent cannot thread a Databricks gateway through. Users configure
-    # providers via ``kimi provider add`` in ``~/.kimi/config.toml`` (see
-    # docs/KIMI_FOLLOWUPS.md for the deferred provider-injection follow-up).
+    # providers via ``kimi provider add`` in ``~/.kimi/config.toml``
+    # (Omnigent-side provider injection is a deferred follow-up).
 }
 
 
@@ -1636,7 +1636,7 @@ def _build_cursor_spawn_env(
 def _build_kimi_spawn_env(
     spec: AgentSpec,
     *,
-    workdir: Path | None = None,
+    cwd: Path | None = None,
 ) -> dict[str, str]:
     """Build the env-var dict the kimi harness wrap reads.
 
@@ -1657,9 +1657,13 @@ def _build_kimi_spawn_env(
     routing through whatever default kimi already had.
 
     :param spec: The agent spec.
-    :param workdir: The bundle's on-disk path. Threaded as
-        ``HARNESS_KIMI_CWD`` so the kimi subprocess runs with its cwd
-        pointed at the bundle (upstream has no ``--work-dir`` flag).
+    :param cwd: Runtime working directory for the kimi subprocess — the
+        session workspace (the folder the user launched in), NOT the agent
+        bundle dir. Threaded as ``HARNESS_KIMI_CWD`` so kimi's tools operate on
+        the user's project rather than the /tmp bundle (upstream kimi has no
+        ``--work-dir`` flag, so the subprocess ``cwd=`` is the only lever).
+        When unset, the harness wrap falls back to ``OMNIGENT_RUNNER_WORKSPACE``.
+        Mirrors :func:`_build_pi_spawn_env`'s ``cwd`` handling.
     :returns: A dict of env-var overrides.
     :raises OmnigentError: If the spec declares ``executor.auth`` —
         upstream kimi has no per-spawn provider override, so the
@@ -1673,16 +1677,16 @@ def _build_kimi_spawn_env(
             "(no ``--config-file`` / ``--mcp-config-file``). Remove "
             "``executor.auth`` from the spec and configure the provider once "
             "via `kimi provider add` in ~/.kimi/config.toml, then pin the "
-            "resulting model id in the agent spec. See docs/KIMI_FOLLOWUPS.md "
-            "for the deferred Omnigent-side provider injection work.",
+            "resulting model id in the agent spec. Omnigent-side provider "
+            "injection is a deferred follow-up.",
             code=ErrorCode.INVALID_INPUT,
         )
     env: dict[str, str] = {}
     model = _resolve_spec_model(spec)
     if model is not None:
         env["HARNESS_KIMI_MODEL"] = model
-    if workdir is not None:
-        env["HARNESS_KIMI_CWD"] = str(workdir)
+    if cwd is not None:
+        env["HARNESS_KIMI_CWD"] = str(cwd)
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_KIMI_OS_ENV"] = os_env_payload

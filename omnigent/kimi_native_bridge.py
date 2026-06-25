@@ -33,22 +33,24 @@ _TMUX_FILE = "tmux.json"
 # PermissionRequest read-only surface).
 _HOOK_CONFIG_FILE = "hook_config.json"
 _TMUX_READY_TIMEOUT_S = 30.0
-_TMUX_SEND_TIMEOUT_S = 10.0
-_POLL_INTERVAL_S = 0.2
-_PASTE_SETTLE_S = 0.3
+_TMUX_SEND_TIMEOUT_S = 5.0
+_POLL_INTERVAL_S = 0.15
+_PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 _PASTE_BUFFER = "omnigent-kimi-paste"
 # How long to wait for the pasted text to become visible in the pane before
 # sending Enter — submitting before the TUI commits the paste folds the Enter
 # into the paste as a newline and the message sits unsent.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
-# kimi TUI readiness markers. TODO(kimi-native): these strings are carried
-# over from cursor-native and are NOT yet verified against a live kimi TUI.
-# They only gate the pre-paste settle wait in ``_settle_pane`` (idle prompt
-# vs. first-run trust modal); a wrong marker is non-fatal — the settle simply
-# falls through on ``_PASTE_COMMIT_TIMEOUT_S`` and the paste still lands. Pin
-# the real kimi placeholder / trust-prompt strings once verified on a real
-# session, and drop ``_TRUST_MARKER`` if kimi has no first-run trust modal.
-_IDLE_MARKERS = ("Plan, search, build", "Add a follow-up")
+# kimi TUI readiness markers — substrings that appear once the TUI has mounted
+# its input box, gating the pre-paste wait in ``_settle_pane``. The footer
+# context-window indicator (``context: 6.5% (17.0k/262.1k)``) is verified
+# present in EVERY mounted state of a live K2.7 session — idle, thinking, and
+# while an approval menu is up — so the gate returns on the first capture
+# instead of blocking the full readiness timeout before each paste. (The old
+# ``"Plan, search, build"`` / ``"Add a follow-up"`` strings were carried over
+# from cursor-native unverified and never matched, so every injection ate the
+# whole 30s timeout — the web→TUI latency the markers were meant to avoid.)
+_INPUT_READY_MARKERS = ("context:",)
 _TRUST_MARKER = "Trust this workspace"
 
 
@@ -274,15 +276,15 @@ def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> Non
     """Best-effort wait until the Kimi input box is ready to receive a paste.
 
     Accepts the first-run "Trust this workspace" modal (sends ``a`` at most once)
-    so the input box can mount, then waits for an idle/running input marker. Falls
-    through after the timeout (mid-turn steering has no idle placeholder) rather
-    than raising.
+    so the input box can mount, then returns as soon as the TUI chrome is present
+    (see :data:`_INPUT_READY_MARKERS`). Falls through after the timeout (e.g. a
+    boot that never renders) rather than raising — the paste still lands.
     """
     deadline = time.monotonic() + timeout_s
     trust_accepted = False
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
-        if any(marker in pane for marker in _IDLE_MARKERS):
+        if any(marker in pane for marker in _INPUT_READY_MARKERS):
             return
         # One-shot, only when no input marker is up (so a later transcript that
         # merely echoes the phrase can't spray repeated keystrokes into the TUI).
