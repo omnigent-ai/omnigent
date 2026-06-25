@@ -720,16 +720,82 @@ def test_bundled_agent_no_credential_does_not_write_config(
 ) -> None:
     """No available credential → no config write; the launch still dispatches (#334).
 
-    When nothing serves the brain's family, the shorthand must not fabricate
-    a default (the harness raises its own launch error downstream). The
-    config is left untouched and ``run`` is still forwarded so that error
-    surfaces in the normal launch path rather than as a silent no-op.
+    When nothing serves any of the bundle's head families, the shorthand must
+    not fabricate a default (the harness raises its own launch error
+    downstream). The config is left untouched and ``run`` is still forwarded so
+    that error surfaces in the normal launch path rather than as a silent no-op.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
-    # An OpenAI-only credential — the claude-sdk brain needs anthropic.
-    config_path = _write_isolated_provider_config(
+    # No providers configured at all — nothing to adopt for any head family.
+    config_path = _write_isolated_provider_config(tmp_path, {})
+    before = config_path.read_text()
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, ["polly"])
+
+    assert result.exit_code == 0, result.output
+    assert config_path.read_text() == before  # no default fabricated
+    dispatch.assert_called_once()
+
+
+def test_bundled_agent_adopts_credential_for_every_head_family(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A multi-head bundle adopts a default for EVERY head's family (#334).
+
+    Debby's brain is claude-sdk (``anthropic``) and its GPT head is codex
+    (``openai``). A single Databricks workspace serves both families but is not
+    marked ``default``. Launching debby must adopt it as the default for BOTH
+    families — previously only the brain's family was covered, leaving the GPT
+    head credential-less (the Databricks-only "Invalid API key" report).
+    """
+    from omnigent.onboarding.provider_config import default_provider_for_harness
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    _write_isolated_provider_config(
+        tmp_path,
+        {"databricks": {"kind": "databricks", "profile": "gtm-ai-agent"}},
+    )
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, ["debby"])
+
+    assert result.exit_code == 0, result.output
+    # The Databricks workspace is the default for both families the bundle
+    # uses — verified through the real resolver, not the raw YAML shape.
+    saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    brain = default_provider_for_harness(saved, "claude-sdk")
+    gpt = default_provider_for_harness(saved, "codex")
+    assert brain is not None and brain.name == "databricks"
+    assert gpt is not None and gpt.name == "databricks"
+    assert "saving it as the default" in result.output
+    dispatch.assert_called_once()
+
+
+def test_bundled_agent_adopts_subagent_family_without_fabricating_brain(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Adoption is per-family: a GPT-only credential never fabricates the brain (#334).
+
+    With only an ``openai`` credential, debby's GPT head (codex → ``openai``)
+    must adopt it, while the brain (claude-sdk → ``anthropic``) is left with no
+    default since nothing serves ``anthropic`` — adoption never crosses
+    families.
+    """
+    from omnigent.onboarding.provider_config import default_provider_for_harness
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    _write_isolated_provider_config(
         tmp_path,
         {
             "openai_key": {
@@ -741,14 +807,16 @@ def test_bundled_agent_no_credential_does_not_write_config(
             }
         },
     )
-    before = config_path.read_text()
     dispatch = Mock()
     monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
 
-    result = CliRunner().invoke(cli, ["polly"])
+    result = CliRunner().invoke(cli, ["debby"])
 
     assert result.exit_code == 0, result.output
-    assert config_path.read_text() == before  # no default fabricated
+    saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    gpt = default_provider_for_harness(saved, "codex")
+    assert gpt is not None and gpt.name == "openai_key"  # GPT head adopted it
+    assert default_provider_for_harness(saved, "claude-sdk") is None  # brain not fabricated
     dispatch.assert_called_once()
 
 
