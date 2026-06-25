@@ -60,6 +60,7 @@ GOOSE_NATIVE_TERMINAL_ROLE = "goose-native"
 # runner-owned agy TUI apart from an arbitrary terminal before reusing it.
 ANTIGRAVITY_NATIVE_TERMINAL_ROLE = "antigravity-native"
 QWEN_NATIVE_TERMINAL_ROLE = "qwen-native"
+KIMI_NATIVE_TERMINAL_ROLE = "kimi-native"
 HERMES_NATIVE_TERMINAL_ROLE = "hermes-native"
 # Role marker for the embedded Omnigent REPL terminal auto-created for
 # runner-hosted SDK sessions (``omnigent attach`` in a tmux pane — the
@@ -996,6 +997,10 @@ class SessionResourceRegistry:
             # JSON event transcript, not status), so the PTY watcher is its
             # status source too.
             QWEN_NATIVE_TERMINAL_ROLE,
+            # kimi-native also has no forwarder/hook (the injection run_turn
+            # returns right after the tmux paste), so the PTY watcher is its
+            # only running/idle status source — same as cursor/pi/claude.
+            KIMI_NATIVE_TERMINAL_ROLE,
             # hermes-native injects then returns (its forwarder only mirrors the
             # SQLite transcript, not status), so the PTY watcher is its status
             # source too.

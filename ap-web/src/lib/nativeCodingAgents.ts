@@ -12,8 +12,9 @@ export type NativeCodingAgentIconKind =
   | "cursor"
   | "kiro"
   | "goose"
-  | "antigravity"
   | "qwen"
+  | "antigravity"
+  | "kimi"
   | "hermes";
 export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
 
@@ -123,6 +124,15 @@ export const NATIVE_CODING_AGENTS = [
     sortRank: 60,
   },
   {
+    key: "kimi",
+    agentName: "kimi-native-ui",
+    harness: "kimi-native",
+    wrapperLabel: "kimi-native-ui",
+    displayName: "Kimi",
+    iconKind: "kimi",
+    sortRank: 70,
+  },
+  {
     // hermes has no brand glyph yet, so it falls back to the generic bot icon
     // (see AgentCard.iconForAgent / SubagentsPanel) — the `iconKind: "hermes"`
     // intentionally matches no icon branch. Auth/approval surface in the
@@ -133,7 +143,7 @@ export const NATIVE_CODING_AGENTS = [
     wrapperLabel: "hermes-native-ui",
     displayName: "Hermes",
     iconKind: "hermes",
-    sortRank: 70,
+    sortRank: 80,
   },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
@@ -158,6 +168,7 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-antigravity": "antigravity-native",
   "native-goose": "goose-native",
   "native-qwen": "qwen-native",
+  "native-kimi": "kimi-native",
   "native-hermes": "hermes-native",
 };
 

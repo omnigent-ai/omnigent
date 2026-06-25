@@ -1070,6 +1070,26 @@ def test_translate_event_mcp_tool_call_request_emits_observed_with_bare_name() -
     )
 
 
+def test_tool_call_complete_suppressed_for_dispatched_executor() -> None:
+    """A normal internally-handling executor's ``ToolCallComplete`` is
+    suppressed mid-turn (its tools round-trip through dispatch_tool, which
+    emits the output) — the existing dedup contract."""
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    adapter._executor = _StubExecutor()  # type: ignore[assignment]
+    ctx = _RecordingTurnContext()
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    adapter._translate_event(
+        ToolCallComplete(name="", status=ToolCallStatus.SUCCESS, result="out", metadata={}),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    assert ctx.emitted == []
+
+
 def test_translate_event_mcp_request_queues_tool_use_id_for_dispatch() -> None:
     """
     A ``ToolCallRequest`` with an MCP-prefixed name pushes the
