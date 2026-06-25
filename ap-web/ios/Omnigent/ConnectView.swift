@@ -55,25 +55,26 @@ struct ConnectView: View {
             }
             .submitLabel(.go)
             .onSubmit(connect)
+            .disabled(isConnecting)
         }
 
         Button(action: connect) {
           if isConnecting {
-            ProgressView()
-              .tint(primaryForeground)
+            HStack(spacing: 8) {
+              ProgressView()
+                .tint(primaryForeground)
+              Text("Connecting…")
+            }
           } else {
             Text("Connect")
           }
         }
-        .buttonStyle(.plain)
-        .font(.system(size: 14, weight: .medium))
-        .frame(maxWidth: .infinity)
-        .frame(height: 38)
-        .background(primary)
-        .foregroundStyle(primaryForeground)
-        .clipShape(RoundedRectangle(cornerRadius: DesignTokens.radius))
+        .buttonStyle(PrimaryButtonStyle(background: primary, foreground: primaryForeground))
         .padding(.top, 16)
         .disabled(isConnecting)
+        // Fires the moment connect() flips isConnecting, so the tap is
+        // acknowledged by touch even before the spinner appears.
+        .sensoryFeedback(.impact(weight: .light), trigger: isConnecting)
 
         Text(message ?? "")
           .font(.system(size: 13))
@@ -110,6 +111,7 @@ struct ConnectView: View {
             }
           }
           .padding(.top, 12)
+          .disabled(isConnecting)
         }
       }
       .frame(maxWidth: 384)
@@ -149,6 +151,28 @@ struct ConnectView: View {
         }
       }
     }
+  }
+}
+
+// Primary (filled) button appearance plus an instant touch-down response.
+// `.buttonStyle(.plain)` gave no press feedback, so the tap felt dead until
+// the spinner swapped in; the opacity/scale here acknowledges the press the
+// moment the finger lands.
+private struct PrimaryButtonStyle: ButtonStyle {
+  let background: Color
+  let foreground: Color
+
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .font(.system(size: 14, weight: .medium))
+      .frame(maxWidth: .infinity)
+      .frame(height: 38)
+      .background(background)
+      .foregroundStyle(foreground)
+      .clipShape(RoundedRectangle(cornerRadius: DesignTokens.radius))
+      .opacity(configuration.isPressed ? 0.85 : 1)
+      .scaleEffect(configuration.isPressed ? 0.98 : 1)
+      .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
   }
 }
 
