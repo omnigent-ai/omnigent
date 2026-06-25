@@ -495,6 +495,12 @@ describe("inventoryTerminals", () => {
     session: "main",
     running: true,
   };
+  const hermesPane: TerminalInfo = {
+    id: "terminal_hermes_main",
+    name: "hermes",
+    session: "main",
+    running: true,
+  };
   const antigravityPane: TerminalInfo = {
     id: "terminal_antigravity_main",
     name: "antigravity",
@@ -538,6 +544,15 @@ describe("inventoryTerminals", () => {
     // mode as the pi/cursor/goose panes above.
     expect(inventoryTerminals([qwenPane, bash], true)).toEqual([bash]);
     expect(isAgentTerminalKey("terminal:terminal_qwen_main")).toBe(true);
+  });
+
+  it("drops the hermes vendor pane for native Hermes sessions", () => {
+    // Regression: terminal_hermes_main was missing from AGENT_TERMINAL_IDS, so
+    // the hermes TUI pane leaked into the Shells inventory and (via isShellView)
+    // opened as a plain shell while hiding the Chat/Terminal pill — same failure
+    // mode as the pi/cursor/goose/qwen panes above.
+    expect(inventoryTerminals([hermesPane, bash], true)).toEqual([bash]);
+    expect(isAgentTerminalKey("terminal:terminal_hermes_main")).toBe(true);
   });
 
   it("drops the antigravity vendor pane for native Antigravity sessions", () => {

@@ -121,6 +121,13 @@ _HARNESS_MODULES: dict[str, str] = {
     # omnigent/inner/hermes_executor.py. The ``hermes`` binary must be
     # on PATH (or set by HARNESS_HERMES_PATH).
     "hermes": "omnigent.inner.hermes_harness",
+    # hermes-native harness wrap. Drives the resident ``hermes`` TUI by
+    # injecting each web-UI turn into its tmux pane and mirroring the transcript
+    # back from Hermes' SQLite ``state.db`` session store — a native-CLI harness
+    # like goose-native, so it IS in ``NATIVE_HARNESSES``. The bare ``hermes``
+    # name stays the headless subprocess harness. See
+    # omnigent/inner/hermes_native_harness.py.
+    "hermes-native": "omnigent.inner.hermes_native_harness",
 }
 
 __all__ = ["_HARNESS_MODULES"]

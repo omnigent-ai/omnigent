@@ -706,6 +706,11 @@ _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S = 86400.0
 # so the long park never blocks the cursor pane.
 _CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
 
+# Same one-day park budget for the generic native-permission hook used by the
+# hermes- and goose-native approval mirrors (TUI prompt → web card). A
+# terminal-side answer ends the wait early via ``external_elicitation_resolved``.
+_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
+
 # ``external_elicitation_resolved`` can arrive just before the matching
 # Codex hook registers, and a web verdict can land between a severed
 # long-poll and its retry. Pinned, NOT the hook wait budget: Codex ids
@@ -15192,6 +15197,104 @@ def create_sessions_router(
             conversation_store=conversation_store,
             elicitation_id=elicitation_id,
             tool_name=f"Cursor({operation_type})",
+        )
+        if result is None:
+            return Response(status_code=status.HTTP_200_OK)
+        return Response(
+            content=json.dumps(result.model_dump(exclude_none=True)),
+            media_type="application/json",
+        )
+
+    # ── POST /sessions/{session_id}/hooks/native-permission-request ─
+
+    @router.post(
+        "/sessions/{session_id}/hooks/native-permission-request",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def native_permission_request_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Generic native-TUI tool-approval hook (TUI → web elicitation).
+
+        The vendor-agnostic counterpart of
+        :func:`cursor_permission_request_hook`, used by the hermes- and
+        goose-native approval mirrors. The runner-side mirror detects the
+        vendor's in-terminal approval prompt, POSTs it here, and the server
+        publishes ``response.elicitation_request`` and parks for the web verdict
+        — the same registry/publish/cleanup path as the cursor/codex/claude
+        hooks. An empty ``200`` (TUI answered, or timeout) leaves the vendor's
+        native prompt authoritative.
+
+        Unlike the cursor hook, the card label / policy name come from the
+        payload (``agent`` / ``policy_name``) so a Hermes or Goose approval is
+        labelled as such, not "Cursor".
+
+        :param request: FastAPI request carrying the detected prompt
+            (``elicitation_id``, ``message``, ``content_preview``,
+            ``operation_type``, optional ``agent`` / ``policy_name``).
+        :param session_id: Omnigent conversation id from the URL path.
+        :returns: An ``ElicitationResult`` (``{"action": …}``) on a web verdict,
+            or ``200`` with empty body on TUI-resolution / timeout / disconnect.
+        :raises OmnigentError: 404 if the session does not exist, 400 if the
+            body is malformed.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in native permission hook body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "Native permission hook body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        elicitation_id = payload.get("elicitation_id")
+        if not isinstance(elicitation_id, str) or not elicitation_id:
+            raise OmnigentError(
+                "Native permission hook body must include 'elicitation_id'.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        agent = payload.get("agent")
+        if not isinstance(agent, str) or not agent:
+            agent = "Agent"
+        message = payload.get("message")
+        if not isinstance(message, str) or not message:
+            message = f"{agent} wants approval to run a tool"
+        content_preview = payload.get("content_preview")
+        if not isinstance(content_preview, str):
+            content_preview = None
+        operation_type = payload.get("operation_type")
+        if not isinstance(operation_type, str) or not operation_type:
+            operation_type = "tool"
+        policy_name = payload.get("policy_name")
+        if not isinstance(policy_name, str) or not policy_name:
+            policy_name = "native_permission"
+        params = ElicitationRequestParams(
+            mode="form",
+            message=message,
+            requestedSchema=None,
+            url=None,
+            phase="pre_tool_use",
+            policy_name=policy_name,
+            content_preview=content_preview,
+        )
+        result = await _publish_and_wait_for_harness_elicitation(
+            request,
+            session_id=session_id,
+            params=params,
+            timeout_s=_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
+            conversation_store=conversation_store,
+            elicitation_id=elicitation_id,
+            tool_name=f"{agent}({operation_type})",
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)

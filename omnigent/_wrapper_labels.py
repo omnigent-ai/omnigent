@@ -69,3 +69,7 @@ ANTIGRAVITY_NATIVE_WRAPPER_VALUE = "antigravity-native-ui"
 # Value the ``omnigent qwen`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 QWEN_NATIVE_WRAPPER_VALUE = "qwen-native-ui"
+
+# Value the ``omnigent hermes`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+HERMES_NATIVE_WRAPPER_VALUE = "hermes-native-ui"

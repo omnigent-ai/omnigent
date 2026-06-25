@@ -12,7 +12,8 @@ export type NativeCodingAgentIconKind =
   | "cursor"
   | "goose"
   | "antigravity"
-  | "qwen";
+  | "qwen"
+  | "hermes";
 export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
 
 export interface NativeCodingAgentSpec {
@@ -111,6 +112,19 @@ export const NATIVE_CODING_AGENTS = [
     iconKind: "qwen",
     sortRank: 60,
   },
+  {
+    // hermes has no brand glyph yet, so it falls back to the generic bot icon
+    // (see AgentCard.iconForAgent / SubagentsPanel) — the `iconKind: "hermes"`
+    // intentionally matches no icon branch. Auth/approval surface in the
+    // embedded terminal, so no capability flags are declared here.
+    key: "hermes",
+    agentName: "hermes-native-ui",
+    harness: "hermes-native",
+    wrapperLabel: "hermes-native-ui",
+    displayName: "Hermes",
+    iconKind: "hermes",
+    sortRank: 70,
+  },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
 const BY_AGENT_NAME: Map<string, NativeCodingAgentSpec> = new Map(
@@ -133,6 +147,7 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-antigravity": "antigravity-native",
   "native-goose": "goose-native",
   "native-qwen": "qwen-native",
+  "native-hermes": "hermes-native",
 };
 
 export function nativeCodingAgentForAgentName(
