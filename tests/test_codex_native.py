@@ -8958,3 +8958,68 @@ def test_command_execution_leaves_normal_output_untouched() -> None:
     assert tool_call.output == "/repo\n"
     assert "Full access" not in tool_call.output
     assert "danger-full-access" not in tool_call.output
+
+
+def test_forwarder_mirrors_codex_context_compaction(tmp_path: Path) -> None:
+    """
+    Codex context-compaction surfaces as external_compaction_status (#1255).
+
+    A ``contextCompaction`` item/started shows the spinner (in_progress) and
+    the ``thread/compacted`` notification clears it (completed). Both signals
+    were previously dropped, so the web UI never indicated Codex compacted —
+    increasingly relevant with GPT-5.1-Codex-Max auto-compaction.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    forwarder_state = codex_native_forwarder._CodexForwarderState()
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record /events bodies; 202 for events, 200 otherwise."""
+        if request.url.path.endswith("/events"):
+            posted.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": False})
+        return httpx.Response(200, json={})
+
+    async def run() -> None:
+        """Drive a compaction start item then the completion notification."""
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            for event in [
+                {
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": {"type": "contextCompaction", "id": "item_c"},
+                    },
+                },
+                {"method": "thread/compacted", "params": {"threadId": "thread_123"}},
+            ]:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    forwarder_state=forwarder_state,
+                )
+
+    asyncio.run(run())
+
+    compaction = [p for p in posted if p.get("type") == "external_compaction_status"]
+    assert compaction == [
+        {"type": "external_compaction_status", "data": {"status": "in_progress"}},
+        {"type": "external_compaction_status", "data": {"status": "completed"}},
+    ]

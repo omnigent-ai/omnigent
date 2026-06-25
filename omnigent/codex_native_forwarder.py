@@ -61,6 +61,17 @@ _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _DELTA_FLUSH_INTERVAL_SECONDS = 0.05
 _DELTA_FLUSH_CHAR_THRESHOLD = 64
 _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE = "external_reasoning_effort_change"
+# Context-compaction progress edge. Publishes the same
+# ``response.compaction.in_progress`` / ``response.compaction.completed`` SSE
+# the AP-side compaction path emits, so the web UI shows its "Compacting
+# conversation…" spinner while Codex compacts. Payload: ``{"status": ...}``.
+_EXTERNAL_COMPACTION_STATUS_TYPE = "external_compaction_status"
+# Codex ThreadItem type for a context compaction, and the thread-level
+# notification Codex emits when compaction finishes. (Codex 5.1-Codex-Max+
+# auto-compacts mid-turn.) Sourced from the Codex app-server protocol enums;
+# handlers are harmless no-ops if a build spells these differently.
+_CODEX_COMPACTION_ITEM_TYPE = "contextCompaction"
+_CODEX_THREAD_COMPACTED_METHOD = "thread/compacted"
 # Transient reasoning (chain-of-thought) delta — the reasoning analogue of
 # ``external_output_text_delta``. Nothing is persisted; it publishes
 # ``response.reasoning_text.delta`` (preceded by ``response.reasoning.started``
@@ -281,6 +292,11 @@ class _CodexForwarderState:
     completed_plan_text_by_turn: dict[str, str] = field(default_factory=dict)
     plan_thread_by_turn: dict[str, str] = field(default_factory=dict)
     prompted_plan_turns: set[str] = field(default_factory=set)
+    # Last context-compaction status mirrored to Omnigent
+    # (``"in_progress"`` / ``"completed"``), used to dedupe consecutive
+    # identical posts when Codex signals completion via both a
+    # ``contextCompaction`` item and a ``thread/compacted`` notification.
+    compaction_status_posted: str | None = None
     # Codex reasoning item id whose live deltas are currently being mirrored.
     # When a delta arrives for a different item, it opens a new reasoning
     # block (``started=True`` → ``response.reasoning.started``). Reset at each
@@ -2008,6 +2024,11 @@ async def _handle_event(
         item = params.get("item")
         if isinstance(item, dict) and item.get("type") == _CODEX_COLLAB_AGENT_ITEM_TYPE:
             await _handle_collab_item(client, params, item, forwarder_state)
+        elif isinstance(item, dict) and item.get("type") == _CODEX_COMPACTION_ITEM_TYPE:
+            # Compaction started mid-turn — show the spinner.
+            await _post_compaction_status(
+                client, route_session_id, "in_progress", forwarder_state=forwarder_state
+            )
         elif isinstance(item, dict) and item.get("type") == "agentMessage":
             # Post the turn's user message NOW — before the assistant's text
             # deltas start streaming. The live ``userMessage`` event can be
@@ -2452,6 +2473,12 @@ async def _maybe_handle_turn_event(
             await delta_coalescer.flush()
         await _handle_turn_plan_updated(client, session_id, params)
         return True
+    if method == _CODEX_THREAD_COMPACTED_METHOD:
+        # Codex finished compacting the thread's context window.
+        await _post_compaction_status(
+            client, session_id, "completed", forwarder_state=forwarder_state
+        )
+        return True
     return False
 
 
@@ -2575,6 +2602,13 @@ async def _handle_terminal_turn_boundary(
     """
     if delta_coalescer is not None:
         await delta_coalescer.flush()
+    # Safety net: if a compaction was reported in progress but Codex never
+    # emitted a completion signal we recognize (e.g. a protocol-spelling
+    # drift), force the spinner closed at the turn boundary so it can't hang.
+    if forwarder_state is not None and forwarder_state.compaction_status_posted == "in_progress":
+        await _post_compaction_status(
+            client, session_id, "completed", forwarder_state=forwarder_state
+        )
     await _maybe_persist_interrupted_partial_text(
         client,
         session_id=session_id,
@@ -3343,6 +3377,14 @@ async def _handle_completed_item(
     if item_type == _CODEX_COLLAB_AGENT_ITEM_TYPE:
         if forwarder_state is not None:
             await _handle_collab_item(client, params, item, forwarder_state)
+        return
+    # A context-compaction item is a status edge, not transcript history:
+    # clear the compaction spinner. Handled before the dedup gate (it never
+    # appends an item).
+    if item_type == _CODEX_COMPACTION_ITEM_TYPE:
+        await _post_compaction_status(
+            client, session_id, "completed", forwarder_state=forwarder_state
+        )
         return
     if not _claim_completed_item(params, item, forwarder_state):
         return
@@ -4646,6 +4688,42 @@ async def _post_output_text_delta(
         data=data,
     )
     _log_failed_session_event_post("external_output_text_delta", response)
+
+
+async def _post_compaction_status(
+    client: httpx.AsyncClient,
+    session_id: str,
+    status: str,
+    *,
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """
+    Mirror a Codex context-compaction edge to Omnigent (#1255).
+
+    Publishes ``external_compaction_status`` so the web UI shows its
+    "Compacting conversation…" spinner while Codex compacts and clears it
+    when done — matching how claude-native brackets compaction. Consecutive
+    identical statuses are deduped because Codex may signal completion via
+    both a ``contextCompaction`` item and a ``thread/compacted``
+    notification.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param status: ``"in_progress"`` or ``"completed"``.
+    :param forwarder_state: Optional state carrying the dedupe baseline.
+    :returns: None.
+    """
+    if forwarder_state is not None and forwarder_state.compaction_status_posted == status:
+        return
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_COMPACTION_STATUS_TYPE,
+        data={"status": status},
+    )
+    _log_failed_session_event_post(_EXTERNAL_COMPACTION_STATUS_TYPE, response)
+    if forwarder_state is not None and response is not None and response.status_code < 400:
+        forwarder_state.compaction_status_posted = status
 
 
 async def _handle_reasoning_delta(
