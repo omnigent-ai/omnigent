@@ -1507,6 +1507,7 @@ async def _auto_create_cursor_terminal(
     # and drop the prior terminal's stale forward cursor so the new forwarder
     # can't resume the wrong chat / a stale rowid (mirrors codex's clear_bridge_state).
     await _cancel_auto_forwarder_task(session_id)
+    from omnigent.cursor_native import is_valid_cursor_chat_id
     from omnigent.cursor_native_bridge import (
         approve_mcp_server_for_workspace,
         bridge_dir_for_session_id,
@@ -1526,12 +1527,25 @@ async def _auto_create_cursor_terminal(
     # cursor TUI's cwd and the forwarder hash the SAME path — cursor keys its
     # chat store dir on ``md5(cwd)``, and a mismatch would hide the store.
     workspace = os.path.realpath(str(launch_config.workspace))
+    # Validate the persisted chat id ONCE, up front. It feeds two untrusted
+    # sinks below — the cursor store path in preseed_resume_state (filesystem)
+    # and the ``--resume`` argv in _cursor_native_resume_args — so a malformed
+    # value must reach neither (defense-in-depth). cursor mints UUID chat ids;
+    # anything else is dropped here and the session starts fresh.
+    resume_chat_id = launch_config.external_session_id
+    if resume_chat_id and not is_valid_cursor_chat_id(resume_chat_id):
+        _logger.warning(
+            "cursor-native: persisted chat id %r is not a well-formed cursor "
+            "chat id; ignoring it for resume (session=%s).",
+            resume_chat_id,
+            session_id,
+        )
+        resume_chat_id = None
     # On cold resume, pre-seed the bridge state with the known store path and
     # current rowid so the forwarder skips launch-recency discovery (the existing
     # chat store predates this launch and would fail _discover_store's floor check).
     # On a fresh start, clear any stale state from a prior terminal so the old
     # and new forwarders can't double-post the same chat.
-    resume_chat_id = launch_config.external_session_id
     if resume_chat_id and preseed_resume_state(
         bridge_dir, workspace, resume_chat_id, launch_epoch_ms
     ):
@@ -1544,10 +1558,9 @@ async def _auto_create_cursor_terminal(
     if "--approve-mcps" not in cursor_args:
         cursor_args.append("--approve-mcps")
     # On cold resume, pass ``--resume <chatId>`` to cursor-agent so the TUI
-    # reloads the prior conversation. ``external_session_id`` is set by the
-    # forwarder the first time it discovers the cursor chat store; absent on a
+    # reloads the prior conversation. The id was validated above; ``None`` on a
     # brand-new session, so no ``--resume`` is injected and cursor starts fresh.
-    cursor_args.extend(_cursor_native_resume_args(launch_config.external_session_id, cursor_args))
+    cursor_args.extend(_cursor_native_resume_args(resume_chat_id, cursor_args))
     # Honor the spec's pinned model (``--model`` flag / config.yaml ``model:``)
     # by launching cursor-agent with ``--model <model>``. An explicit model in
     # the passthrough launch args (``omnigent cursor -- --model X`` or the joined
@@ -3890,14 +3903,6 @@ def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
     return model
 
 
-#: cursor chat ids are UUIDs (hex + dashes). Validate the persisted
-#: ``external_session_id`` against this shape before feeding it back to
-#: ``cursor-agent --resume`` / storing it durably — defense-in-depth mirroring
-#: codex's ``_CODEX_THREAD_ID_RE`` guard, so a malformed discovery result can
-#: never reach the argv or pin the session to a junk id.
-_CURSOR_CHAT_ID_RE = re.compile(r"^[0-9a-fA-F-]+$")
-
-
 def _cursor_native_resume_args(chat_id: str | None, existing_args: list[str]) -> list[str]:
     """Return ``["--resume", chat_id]`` for a cursor-native cold resume, or ``[]``.
 
@@ -3907,6 +3912,9 @@ def _cursor_native_resume_args(chat_id: str | None, existing_args: list[str]) ->
     cursor-agent reuses the same chat id/store across ``--resume`` (verified
     empirically), so the persisted id stays valid for the life of the session.
 
+    Re-validates the chat id (callers should already have, but this stays
+    self-defensive so a malformed id can never reach the argv directly).
+
     :param chat_id: The cursor chat id stored as ``external_session_id``, or
         ``None`` for a brand-new session where the forwarder hasn't run yet.
     :param existing_args: Already-built cursor-agent args; ``--resume`` is
@@ -3914,14 +3922,9 @@ def _cursor_native_resume_args(chat_id: str | None, existing_args: list[str]) ->
         ``--resume=X`` form) via passthrough launch args.
     :returns: ``["--resume", chat_id]`` or ``[]``.
     """
-    if not chat_id:
-        return []
-    if not _CURSOR_CHAT_ID_RE.fullmatch(chat_id):
-        _logger.warning(
-            "cursor-native: persisted chat id %r is not a well-formed cursor "
-            "chat id; not injecting --resume.",
-            chat_id,
-        )
+    from omnigent.cursor_native import is_valid_cursor_chat_id
+
+    if not is_valid_cursor_chat_id(chat_id):
         return []
     if any(arg == "--resume" or arg.startswith("--resume=") for arg in existing_args):
         return []

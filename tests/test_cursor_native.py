@@ -137,3 +137,35 @@ async def _async_noop(*_: object, **__: object) -> None:
 
 async def _launch_runner(*_: object, **__: object) -> str:
     return "runner_1"
+
+
+class TestIsValidCursorChatId:
+    """``is_valid_cursor_chat_id`` gates the persisted external_session_id."""
+
+    @pytest.mark.parametrize(
+        "chat_id",
+        [
+            "0ef42bbf-3b80-4bec-ac39-ca46531cbc47",
+            "00000000-0000-0000-0000-000000000000",
+            "0EF42BBF-3B80-4BEC-AC39-CA46531CBC47",  # uppercase hex
+        ],
+    )
+    def test_accepts_well_formed_uuids(self, chat_id: str) -> None:
+        assert cursor_native.is_valid_cursor_chat_id(chat_id) is True
+
+    @pytest.mark.parametrize(
+        "chat_id",
+        [
+            None,
+            "",
+            "deadbeef",  # hex but not UUID-shaped
+            "chat-uuid-abc123",  # non-hex letters
+            "----",
+            "../../etc/passwd",  # path traversal shape
+            "0ef42bbf;reboot",  # shell metachar
+            "0ef42bbf-3b80-4bec-ac39-ca46531cbc47x",  # trailing junk
+            "0ef42bbf-3b80-4bec-ac39-ca46531cbc4",  # one short in last group
+        ],
+    )
+    def test_rejects_malformed_or_empty(self, chat_id: str | None) -> None:
+        assert cursor_native.is_valid_cursor_chat_id(chat_id) is False

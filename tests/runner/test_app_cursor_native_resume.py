@@ -10,8 +10,6 @@ id (not a UUID-shaped hex+dash string) is rejected defensively.
 
 from __future__ import annotations
 
-import logging
-
 import pytest
 
 from omnigent.runner.app import _cursor_native_resume_args
@@ -59,15 +57,33 @@ def test_cursor_native_resume_args(
     "bad_id",
     [
         "chat-uuid-abc123",  # contains non-hex letters
+        "deadbeef",  # hex but not UUID-shaped
+        "----",  # dashes only
+        "0",  # single digit
         "../../etc/passwd",  # path traversal shape
         "id with spaces",
         "$(rm -rf /)",
         "0ef42bbf;reboot",
+        "0ef42bbf-3b80-4bec-ac39-ca46531cbc47x",  # trailing junk
     ],
-    ids=["non-hex", "traversal", "spaces", "shell", "semicolon"],
+    ids=[
+        "non-hex",
+        "short-hex",
+        "dashes-only",
+        "single-digit",
+        "traversal",
+        "spaces",
+        "shell",
+        "semicolon",
+        "trailing-junk",
+    ],
 )
-def test_malformed_chat_id_is_rejected(bad_id: str, caplog: pytest.LogCaptureFixture) -> None:
-    """A chat id that isn't UUID-shaped is never injected, and is logged."""
-    with caplog.at_level(logging.WARNING):
-        assert _cursor_native_resume_args(bad_id, []) == []
-    assert any(bad_id in rec.getMessage() for rec in caplog.records)
+def test_malformed_chat_id_is_rejected(bad_id: str) -> None:
+    """A chat id that isn't UUID-shaped is never injected as a --resume arg.
+
+    The strict UUID guard (shared with the runner / CLI via
+    ``is_valid_cursor_chat_id``) keeps a malformed id out of the argv. The
+    runner logs the rejection at its single validation site; this function
+    just returns no args.
+    """
+    assert _cursor_native_resume_args(bad_id, []) == []
