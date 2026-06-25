@@ -849,12 +849,21 @@ async def _run_tunnel_from_env() -> None:
 
     :returns: None.
     """
-    from omnigent.runner.identity import get_stable_runner_id
+    from omnigent.runner.identity import RUNNER_AUTH_TOKEN_ENV_VAR, get_stable_runner_id
     from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel
 
     server_url = _server_url_from_env()
     auth_token_factory = _make_auth_token_factory()
     auth_token = auth_token_factory() if auth_token_factory is not None else None
+    # Managed-sandbox runners have no logged-in user credential of their own
+    # (the OIDC token factory above finds nothing in the sandbox). The server
+    # mints a short-lived owner JWT at launch and the host seeds it here;
+    # prefer it so the tunnel handshake carries an owner identity the server
+    # can resolve when accounts/OIDC auth is enabled. Unset → unchanged
+    # (single-user / no-auth, or the binding-token-only legacy path).
+    managed_auth_token = os.environ.get(RUNNER_AUTH_TOKEN_ENV_VAR)
+    if managed_auth_token and managed_auth_token.strip():
+        auth_token = managed_auth_token.strip()
     binding_token = _runner_tunnel_binding_token_from_env()
     parent_pid = _runner_parent_pid_from_env()
     runner_id = get_stable_runner_id()

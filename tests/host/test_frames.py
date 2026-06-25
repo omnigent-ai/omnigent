@@ -85,6 +85,33 @@ def test_launch_runner_frame_round_trip() -> None:
     assert decoded.request_id == "req_001"
     assert decoded.binding_token == "secret_token_xyz"
     assert decoded.workspace == "/Users/corey/projects/frontend"
+    # No auth_token supplied → decodes to None (single-user / no-auth).
+    assert decoded.auth_token is None
+
+
+def test_launch_runner_frame_round_trips_auth_token() -> None:
+    """
+    The owner-bearer ``auth_token`` (server-minted for managed runners
+    when accounts auth is on) survives encode → decode, and a frame from
+    an older server that omits it decodes to ``None`` (back-compat).
+    """
+    original = HostLaunchRunnerFrame(
+        request_id="req_002",
+        binding_token="tok",
+        workspace="/ws",
+        harness="claude-sdk",
+        auth_token="jwt.header.payload.sig",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert decoded.auth_token == "jwt.header.payload.sig"
+
+    # An older server doesn't send the key at all — must not raise.
+    legacy = json.loads(encode_host_frame(original))
+    del legacy["auth_token"]
+    decoded_legacy = decode_host_frame(json.dumps(legacy))
+    assert isinstance(decoded_legacy, HostLaunchRunnerFrame)
+    assert decoded_legacy.auth_token is None
 
 
 def test_launch_runner_result_frame_success_round_trip() -> None:

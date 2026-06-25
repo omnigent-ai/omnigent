@@ -5617,6 +5617,8 @@ async def _launch_runner_on_host(
     conversation_store: ConversationStore,
     host_registry: HostRegistry,
     host_conn: HostConnection,
+    *,
+    auth_provider: AuthProvider | None = None,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -5634,6 +5636,12 @@ async def _launch_runner_on_host(
     :param conversation_store: Store for updating ``runner_id``.
     :param host_registry: In-memory ``HostRegistry``.
     :param host_conn: The live ``HostConnection`` for the host.
+    :param auth_provider: Active auth provider, used to mint a
+        short-lived owner JWT for the runner's tunnel handshake when
+        accounts/OIDC auth is enabled (a managed sandbox runner has no
+        user credential of its own). ``None`` (single-user / no-auth)
+        skips minting — the runner authenticates with its binding token
+        alone.
     :returns: The :class:`_HostLaunchAttempt` — the new runner id plus any
         structured refusal from the host.
     """
@@ -5642,6 +5650,16 @@ async def _launch_runner_on_host(
 
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
+
+    # When auth is enabled, the sandbox runner can't authenticate its tunnel
+    # on its own — mint a short-lived owner JWT scoped to the host's owner
+    # (the session creator). ``None`` when auth is disabled or the provider
+    # can't mint (header/proxy mode); the runner then uses binding-token auth.
+    runner_auth_token = (
+        auth_provider.mint_runner_bearer(host_conn.owner)
+        if auth_provider is not None and host_conn.owner is not None
+        else None
+    )
 
     await asyncio.to_thread(
         conversation_store.replace_runner_id,
@@ -5676,6 +5694,7 @@ async def _launch_runner_on_host(
             # same configuration check it does at create-time launch. None
             # (agent not resolvable) skips the host-side check — fail open.
             harness=_resolve_harness(conv),
+            auth_token=runner_auth_token,
         )
     )
     try:
@@ -5748,6 +5767,7 @@ async def _run_managed_launch(
     host_store: HostStore,
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
+    auth_provider: AuthProvider | None = None,
     relaunch_host: Host | None = None,
 ) -> None:
     """
@@ -5818,6 +5838,7 @@ async def _run_managed_launch(
         host_store=host_store,
         host_registry=host_registry,
         tunnel_registry=tunnel_registry,
+        auth_provider=auth_provider,
     )
 
 
@@ -5915,6 +5936,7 @@ async def _bind_and_launch_managed_runner(
     host_store: HostStore,
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
+    auth_provider: AuthProvider | None = None,
 ) -> None:
     """
     Bind a provisioned managed host to its session and launch a runner.
@@ -5977,6 +5999,7 @@ async def _bind_and_launch_managed_runner(
                 conversation_store,
                 host_registry,
                 host_conn,
+                auth_provider=auth_provider,
             )
             if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
                 # The sandbox image should bake in the harness, but if the
@@ -6193,6 +6216,7 @@ def _kick_managed_relaunch(
             host_store=host_store,
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
+            auth_provider=getattr(app_state, "auth_provider", None),
             relaunch_host=host,
         )
     )
@@ -6248,6 +6272,7 @@ def _kick_managed_wake(
             host_store=host_store,
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
+            auth_provider=getattr(app_state, "auth_provider", None),
         )
     )
     _managed_launch_tasks.add(wake_task)
@@ -6264,6 +6289,7 @@ async def _run_managed_wake(
     host_store: HostStore,
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
+    auth_provider: AuthProvider | None = None,
 ) -> None:
     """
     Wake a dormant resumable managed host in the background, settling the
@@ -6328,6 +6354,7 @@ async def _run_managed_wake(
                 conversation_store,
                 host_registry,
                 host_conn,
+                auth_provider=auth_provider,
             )
             if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
                 reason = launch_attempt.error or "harness not configured on the sandbox host"
@@ -13218,6 +13245,7 @@ def create_sessions_router(
                     host_store=host_store_for_managed,
                     host_registry=getattr(request.app.state, "host_registry", None),
                     tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                    auth_provider=auth_provider,
                 )
             )
             _managed_launch_tasks.add(launch_task)
@@ -18109,6 +18137,7 @@ def create_sessions_router(
                         conversation_store,
                         _host_reg,
                         _host_conn,
+                        auth_provider=auth_provider,
                     )
                     if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
                         # The host refused: the agent's harness isn't
