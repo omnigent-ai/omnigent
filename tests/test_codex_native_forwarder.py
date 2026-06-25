@@ -667,3 +667,91 @@ async def test_elicitation_post_returns_none_when_budget_exhausted(
     # 1 = the deadline check stopped the loop before a second attempt
     # (backoff 1.0s > 0.5s budget); more means the budget is ignored.
     assert len(client.posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_reasoning_delta_opens_block_then_continues() -> None:
+    """
+    Codex reasoning deltas mirror as external_output_reasoning_delta (#1254).
+
+    The first delta of a reasoning item opens the block (``started=True``
+    → ``response.reasoning.started``); subsequent deltas for the same item
+    continue it (``started=False``). Reasoning was previously dropped — only
+    the effort *level* synced, never the thinking text.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await fwd._handle_reasoning_delta(
+        client,
+        "conv_x",
+        {"turnId": "turn_1", "itemId": "item_r", "delta": "Let me "},
+        state,
+    )
+    await fwd._handle_reasoning_delta(
+        client,
+        "conv_x",
+        {"turnId": "turn_1", "itemId": "item_r", "delta": "think."},
+        state,
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_output_reasoning_delta",
+                "data": {"delta": "Let me ", "started": True},
+            },
+        ),
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_output_reasoning_delta",
+                "data": {"delta": "think.", "started": False},
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_delta_new_item_reopens_block() -> None:
+    """
+    A reasoning delta for a new item id opens a fresh block.
+
+    Multi-step turns (reason → tool → reason) emit a second reasoning item;
+    its first delta must re-open the block so the web UI starts a new
+    "thinking" section rather than appending to the prior one.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await fwd._handle_reasoning_delta(
+        client, "conv_x", {"itemId": "item_a", "delta": "first"}, state
+    )
+    await fwd._handle_reasoning_delta(
+        client, "conv_x", {"itemId": "item_b", "delta": "second"}, state
+    )
+
+    started_flags = [post[1]["data"]["started"] for post in client.posts]
+    assert started_flags == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_delta_skips_empty_non_opening_delta() -> None:
+    """
+    An empty delta that does not open a block is dropped (no noise post).
+
+    The block-opening delta is always posted (even empty, to emit
+    ``response.reasoning.started``); a later empty continuation carries
+    nothing to render and must not POST.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    # Opening delta (empty) still posts to open the block.
+    await fwd._handle_reasoning_delta(client, "conv_x", {"itemId": "item_r", "delta": ""}, state)
+    # Empty continuation for the same item is dropped.
+    await fwd._handle_reasoning_delta(client, "conv_x", {"itemId": "item_r", "delta": ""}, state)
+
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["data"] == {"delta": "", "started": True}
