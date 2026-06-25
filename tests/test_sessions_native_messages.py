@@ -82,6 +82,49 @@ def test_kiro_native_session_uses_kiro_harness_for_web_messages() -> None:
     }
 
 
+def test_antigravity_native_session_uses_antigravity_harness_for_web_messages() -> None:
+    """
+    Antigravity-native sessions use the native bypass and dispatch web
+    messages into the ``antigravity-native`` harness, mirroring the
+    codex/claude native-terminal wrappers. Without this the web UI would
+    persist the message itself instead of forwarding it to the agy terminal,
+    and the runner would never see the turn.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    conv = _conversation_with_wrapper("antigravity-native-ui")
+
+    assert sessions_routes._is_native_terminal_session(conv) is True
+    assert sessions_routes._build_native_terminal_message_event(conv, _message_event()) == {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "hello"}],
+        "model": "antigravity-native-ui",
+        "harness": "antigravity-native",
+        "agent_id": "ag_native_test",
+    }
+
+
+def test_antigravity_native_runtime_maps_wrapper_to_agy_terminal() -> None:
+    """
+    The wrapper label resolves to the agy display name, model, harness, and
+    the ``antigravity`` runner terminal resource name. The ensure-readiness
+    probe (``_ensure_native_terminal_ready``) routes off exactly these two
+    helpers, so a missing antigravity branch would 400 the first web message.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    conv = _conversation_with_wrapper("antigravity-native-ui")
+
+    display_name, model, harness = sessions_routes._native_terminal_runtime(conv)
+    assert (display_name, model, harness) == (
+        "Antigravity",
+        "antigravity-native-ui",
+        "antigravity-native",
+    )
+    assert sessions_routes._native_terminal_name_for_harness(harness) == "antigravity"
+
+
 def test_transcript_forwarded_native_sessions_use_native_bypass() -> None:
     """Transcript-forwarded native sessions skip AP-side message persistence."""
     from omnigent.server.routes import sessions as sessions_routes

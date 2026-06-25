@@ -91,7 +91,15 @@ _CODEX_FAMILY_HARNESSES: frozenset[str] = frozenset({"codex", "codex-native", "n
 # dispatch gate instead of leaking a ``HARNESS_ANTIGRAVITY_MODEL`` the SDK can
 # never route.
 _ANTIGRAVITY_FAMILY_HARNESSES: frozenset[str] = frozenset(
-    {"antigravity", "agy", "google-antigravity"}
+    {
+        "antigravity",
+        "agy",
+        "google-antigravity",
+        # The native agy TUI bridge is equally Gemini-native (it drives the
+        # same Gemini-backed ``agy`` runtime), so it shares the reject-list.
+        "antigravity-native",
+        "native-antigravity",
+    }
 )
 # A ``databricks-`` gateway prefix marks an id bound to the Databricks gateway,
 # which antigravity never reaches — a definitive mismatch on its own.

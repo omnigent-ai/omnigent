@@ -52,6 +52,11 @@ NATIVE_HARNESSES: frozenset[str] = frozenset(
         "native-cursor",
         "kiro-native",
         "native-kiro",
+        # Native Antigravity (agy) TUI bridge used by ``omnigent antigravity``;
+        # the in-process SDK counterpart is the canonical ``antigravity``
+        # harness (see HARNESS_ALIASES / runtime/harnesses/__init__.py).
+        "antigravity-native",
+        "native-antigravity",
         "goose-native",
         "native-goose",
         "qwen-native",

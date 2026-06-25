@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from omnigent._wrapper_labels import (
+    ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
@@ -107,6 +108,14 @@ GOOSE_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="goose",
 )
 
+ANTIGRAVITY_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="antigravity",
+    display_name="Antigravity",
+    agent_name="antigravity-native-ui",
+    harness="antigravity-native",
+    wrapper_label=ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
+    terminal_name="antigravity",
+)
 QWEN_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="qwen",
     display_name="Qwen Code",
@@ -124,6 +133,7 @@ NATIVE_CODING_AGENTS: tuple[NativeCodingAgent, ...] = (
     CURSOR_NATIVE_CODING_AGENT,
     KIRO_NATIVE_CODING_AGENT,
     GOOSE_NATIVE_CODING_AGENT,
+    ANTIGRAVITY_NATIVE_CODING_AGENT,
     QWEN_NATIVE_CODING_AGENT,
 )
 

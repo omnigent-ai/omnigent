@@ -190,6 +190,16 @@ describe("getConversationAgentType", () => {
     expect(getConversationAgentType(conv)).toBe("Kiro");
   });
 
+  it("returns 'Antigravity' for antigravity-native-ui sessions", () => {
+    const conv = conversation("conv_agy", null, new Date(2026, 4, 14, 9), {
+      labels: { "omnigent.wrapper": "antigravity-native-ui" },
+    });
+    // antigravity-native-ui is the wrapper label assigned to sessions started
+    // via `omnigent antigravity` or the web-UI Antigravity picker. It gets its
+    // own filter bucket and friendly sidebar name.
+    expect(getConversationAgentType(conv)).toBe("Antigravity");
+  });
+
   it("returns agent_name for YAML-based sessions", () => {
     const conv: Conversation = {
       ...conversation("conv_yaml", "My session", new Date(2026, 4, 14, 9)),
@@ -280,6 +290,13 @@ describe("getConversationIconKind", () => {
         }),
       ),
     ).toBe("kiro");
+    expect(
+      getConversationIconKind(
+        conversation("conv_agy", null, new Date(2026, 4, 14, 9), {
+          labels: { "omnigent.wrapper": "antigravity-native-ui" },
+        }),
+      ),
+    ).toBe("antigravity");
     expect(
       getConversationIconKind({
         ...conversation("conv_nessie", null, new Date(2026, 4, 14, 9)),

@@ -76,8 +76,8 @@ describe("Composer slash-command menu", () => {
   });
 
   it("highlights the first match as soon as the menu opens", () => {
-    // isNativeWrapper so "/compact" is offered (#1139 hides it for non-native);
-    // it is the first built-in, which is what this menu-UX test pins.
+    // /compact is native-wrapper-only (#1139); render a native session so it
+    // appears as the first built-in and is the default highlight.
     render(<Composer {...composerProps({ isNativeWrapper: true })} />);
     fireEvent.change(textarea(), { target: { value: "/" } });
     // Built-ins are inserted first, so "/compact" tops the list and is the
@@ -150,7 +150,8 @@ describe("Composer slash-command menu", () => {
   });
 
   it("ArrowDown moves the highlight to the next match", () => {
-    // isNativeWrapper so "/compact" is offered (#1139 hides it for non-native).
+    // /compact is native-wrapper-only (#1139); render a native session so the
+    // first built-in is "/compact" and ArrowDown advances to "/context".
     render(<Composer {...composerProps({ isNativeWrapper: true })} />);
     const ta = textarea();
     fireEvent.change(ta, { target: { value: "/" } });
@@ -431,8 +432,8 @@ describe("Composer effort slash-command visibility", () => {
   });
 
   it("omits /effort from suggestions when effort controls are hidden", () => {
-    // isNativeWrapper so "/compact" is offered (#1139 hides it for non-native);
-    // the assertion below uses it as the surviving built-in control.
+    // /compact is native-wrapper-only (#1139); render a native session so it
+    // stays present as the control row used to anchor this assertion.
     render(<Composer {...composerProps({ showEffort: false, isNativeWrapper: true })} />);
     fireEvent.change(textarea(), { target: { value: "/" } });
 

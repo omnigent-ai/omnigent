@@ -135,6 +135,21 @@ struct OmnigentWebView: UIViewRepresentable {
           try { callback(mode); } catch {}
         }
       });
+      const insetCallbacks = new Set();
+      // Cache the last footprint so a subscriber that registers AFTER native
+      // first emitted (the React app mounts later than document-start) still
+      // gets the current value immediately on subscribe.
+      let lastInsets = null;
+      defineEmit("__omnigentNativeEmitInsets", (topBar, bottomBar) => {
+        const insets = {
+          topBar: typeof topBar === "number" && Number.isFinite(topBar) ? topBar : 0,
+          bottomBar: typeof bottomBar === "number" && Number.isFinite(bottomBar) ? bottomBar : 0,
+        };
+        lastInsets = insets;
+        for (const callback of insetCallbacks) {
+          try { callback(insets); } catch {}
+        }
+      });
       const sidebarDragCallbacks = new Set();
       Object.defineProperty(window, "__omnigentNativeEmitSidebarDrag", {
         configurable: false,
@@ -207,6 +222,12 @@ struct OmnigentWebView: UIViewRepresentable {
           if (typeof callback !== "function") return () => {};
           viewModeCallbacks.add(callback);
           return () => viewModeCallbacks.delete(callback);
+        },
+        onNativeInsets(callback) {
+          if (typeof callback !== "function") return () => {};
+          insetCallbacks.add(callback);
+          if (lastInsets) { try { callback(lastInsets); } catch {} }
+          return () => insetCallbacks.delete(callback);
         },
       });
     })();

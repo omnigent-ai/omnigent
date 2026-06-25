@@ -114,6 +114,12 @@ describe("useAvailableAgents", () => {
             harness: "kiro-native",
           },
           {
+            id: "ag_agy_native",
+            name: "antigravity-native-ui",
+            description: null,
+            harness: "antigravity-native",
+          },
+          {
             id: "ag_opencode_native",
             name: "opencode-native-ui",
             description: null,
@@ -180,6 +186,14 @@ describe("useAvailableAgents", () => {
         display_name: "Kiro",
         description: null,
         harness: "kiro-native",
+        skills: [],
+      },
+      {
+        id: "ag_agy_native",
+        name: "antigravity-native-ui",
+        display_name: "Antigravity",
+        description: null,
+        harness: "antigravity-native",
         skills: [],
       },
       {

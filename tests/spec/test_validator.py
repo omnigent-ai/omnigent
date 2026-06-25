@@ -392,6 +392,26 @@ def test_omnigent_executor_accepts_valid_harness() -> None:
     assert result.valid, f"Expected valid spec, got errors: {result.errors}"
 
 
+def test_omnigent_executor_accepts_antigravity_native_harness() -> None:
+    """
+    ``omnigent`` executor with ``config.harness == "antigravity-native"``
+    validates cleanly.
+
+    Failure here means the antigravity-native harness is missing from
+    ``OMNIGENT_HARNESSES``, which would cause every spec that targets it
+    to be rejected at load time with an "unknown harness" validation error.
+    """
+    spec = _minimal_spec(
+        llm=LLMConfig(model="databricks-claude-sonnet-4-6"),
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "antigravity-native"},
+        ),
+    )
+    result = validate(spec)
+    assert result.valid, f"Expected valid spec, got errors: {result.errors}"
+
+
 def test_omnigent_executor_rejects_missing_harness() -> None:
     """
     ``omnigent`` executor without ``config.harness`` is rejected.
