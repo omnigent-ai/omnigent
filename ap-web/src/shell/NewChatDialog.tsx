@@ -70,9 +70,10 @@ import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 
-// Hidden on the new-session picker only (superseded by polly; older
-// deployments still carry a seeded nessie row this filter keeps out).
-const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie"]);
+// Hidden from the new-session picker only. `nessie` is superseded by polly.
+// `kimi` / `kimi-code` are the headless SDK harness (kept for sub-agent / `run
+// --harness kimi` use) — the picker offers only the native TUI (`kimi-native-ui`).
+const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie", "kimi", "kimi-code"]);
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
@@ -1302,8 +1303,10 @@ export function NewChatLandingScreen() {
       data-testid="new-chat-landing"
     >
       {/* Padding lives inside the 840px cap, so the composer renders at
-          840 − 80 = 760px max. */}
-      <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-10 pt-8 pb-16">
+          840 − 80 = 760px max on desktop. px-4 on phones (16px gutters)
+          keeps the composer from feeling cramped against the viewport
+          edges; widens to the full px-10 at the md breakpoint and up. */}
+      <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:px-10">
         <div className="flex flex-col items-center gap-3.5 sm:flex-row">
           <OttoEyes className="h-18 w-auto shrink-0" />
           <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground sm:text-left">

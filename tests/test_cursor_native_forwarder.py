@@ -10,6 +10,7 @@ tmux + cursor-agent path is exercised by the e2e gate, not here.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -100,6 +101,18 @@ class TestBlobToItem:
             "content": [{"type": "input_text", "text": "hi"}],
         }
         assert item.response_id == "cursor:bid"
+
+    def test_response_id_capped_at_column_width(self) -> None:
+        # cursor's blob id is a 64-char content hash, so an un-capped
+        # ``cursor:<blob_id>`` (71 chars) overflows the VARCHAR(64) column and
+        # 500s the mirror POST. The response_id must stay within the column.
+        blob_id = "b" * 64
+        item = fwd._blob_to_item(
+            5, blob_id, self._blob(_user("<user_query>\nhi\n</user_query>")), "cursor-native-ui"
+        )
+        assert item is not None
+        assert len(item.response_id) <= fwd._RESPONSE_ID_MAX_LEN
+        assert item.response_id == f"cursor:{blob_id}"[: fwd._RESPONSE_ID_MAX_LEN]
 
     def test_assistant_text_becomes_output_text_item(self) -> None:
         item = fwd._blob_to_item(
@@ -345,3 +358,204 @@ async def test_post_conversation_item_shape() -> None:
         "item_data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
         "response_id": "cursor:bid",
     }
+
+
+def _http_status_error(status: int) -> httpx.HTTPStatusError:
+    """An ``HTTPStatusError`` carrying *status*, as ``raise_for_status`` would raise."""
+    req = httpx.Request("POST", "http://test/v1/sessions/conv_1/events")
+    return httpx.HTTPStatusError(
+        f"HTTP {status}", request=req, response=httpx.Response(status, request=req)
+    )
+
+
+class _FakePoster:
+    """Async ``_post_conversation_item`` stub for driving the poll loop.
+
+    ``fail(item)`` returns an exception to raise for that item (simulating a
+    rejected or failed POST) or ``None`` to accept it. Every attempt lands in
+    ``calls``; accepted items also land in ``delivered``.
+    """
+
+    def __init__(self, fail) -> None:
+        self.calls: list[fwd._MirrorItem] = []
+        self.delivered: list[fwd._MirrorItem] = []
+        self._fail = fail
+
+    async def __call__(self, client: object, *, session_id: str, item: fwd._MirrorItem) -> None:
+        self.calls.append(item)
+        exc = self._fail(item)
+        if exc is not None:
+            raise exc
+        self.delivered.append(item)
+
+
+async def _drive_forwarder(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    store: Path,
+    poster: _FakePoster,
+    *,
+    until,
+    max_ticks: int = 2000,
+) -> Path:
+    """Run the real poll loop against *store* + *poster* until *until* holds.
+
+    Stubs discovery/claim so the loop binds *store* at once and routes every
+    POST through *poster*, then polls ``until(bridge_dir)`` (which inspects the
+    persisted cursor and/or *poster*) and cancels the loop. Raises if the
+    condition is never reached within *max_ticks* — i.e. the loop wedged.
+    """
+    bridge_dir = tmp_path / "cursor-native" / "sess"
+    bridge_dir.mkdir(parents=True)
+    monkeypatch.setattr(fwd, "_discover_store", lambda workspace, launch_ms: store)
+    monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
+    monkeypatch.setattr(fwd, "_post_conversation_item", poster)
+    task = asyncio.create_task(
+        fwd.forward_cursor_store_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv_1",
+            bridge_dir=bridge_dir,
+            agent_name="cursor-native-ui",
+            workspace="/ws",
+            launch_epoch_ms=1_000,
+            poll_interval_s=0.001,
+        )
+    )
+    try:
+        for _ in range(max_ticks):
+            if until(bridge_dir):
+                break
+            await asyncio.sleep(0.001)
+        else:
+            raise AssertionError("forwarder never reached the expected state (wedged?)")
+    finally:
+        task.cancel()
+        # Drain the cancelled task (return_exceptions swallows its CancelledError).
+        await asyncio.gather(task, return_exceptions=True)
+    return bridge_dir
+
+
+class TestForwardLoopPostFailures:
+    """Drive the real poll loop to pin its POST-failure handling.
+
+    The unit tests above cover the pure transforms; these exercise
+    ``forward_cursor_store_to_session`` end to end against a fake poster, so the
+    bounded-retry-then-skip guard — and the original truncation wedge it hardens
+    against — are verified at the loop level, not just per item.
+    """
+
+    @staticmethod
+    def _seed(store: Path, blobs: list[tuple[str, str]]) -> None:
+        # Each (blob_id, prompt) becomes a user blob; rowids are 1, 2, … in order.
+        writer = _make_store(
+            store,
+            [(bid, _user(f"<user_query>\n{text}\n</user_query>")) for bid, text in blobs],
+        )
+        writer.close()
+
+    @pytest.mark.asyncio
+    async def test_long_blob_id_is_mirrored_not_wedged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Incident repro: cursor's blob id is a 64-char content hash, so the
+        # pre-fix ``cursor:<id>`` was 71 chars and overflowed the VARCHAR(64)
+        # column — every mirror POST 500'd and the loop wedged on message #1. A
+        # poster mimicking that column limit must now ACCEPT the capped id.
+        store = tmp_path / "store.db"
+        self._seed(store, [("a" * 64, "hello")])
+
+        def fail(item: fwd._MirrorItem):
+            if len(item.response_id) > fwd._RESPONSE_ID_MAX_LEN:
+                return _http_status_error(500)
+            return None
+
+        poster = _FakePoster(fail)
+        bridge = await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            poster,
+            until=lambda b: fwd._read_state(b).last_rowid >= 1,
+        )
+        assert [it.rowid for it in poster.delivered] == [1]
+        assert all(len(it.response_id) <= fwd._RESPONSE_ID_MAX_LEN for it in poster.delivered)
+        assert fwd._read_state(bridge).last_rowid == 1
+
+    @pytest.mark.asyncio
+    async def test_rejected_item_is_skipped_after_bounded_retries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A persistently rejected item (rowid 2) must be retried only a BOUNDED
+        # number of times and then skipped, so the messages after it still
+        # mirror — no infinite re-post flood, no permanent wedge.
+        store = tmp_path / "store.db"
+        self._seed(store, [("b1", "one"), ("b2", "two"), ("b3", "three")])
+
+        def fail(item: fwd._MirrorItem):
+            return _http_status_error(500) if item.rowid == 2 else None
+
+        poster = _FakePoster(fail)
+        bridge = await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            poster,
+            until=lambda b: fwd._read_state(b).last_rowid >= 3,
+        )
+        assert sum(it.rowid == 2 for it in poster.calls) == fwd._MAX_ITEM_POST_ATTEMPTS
+        assert [it.rowid for it in poster.delivered] == [1, 3]
+        assert fwd._read_state(bridge).last_rowid == 3
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_failure_is_skipped_without_retry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A ReadTimeout means the request was sent but the response was lost:
+        # the server may have committed the item, and external items aren't
+        # deduped, so a retry could duplicate the bubble. The loop must skip the
+        # item after a SINGLE attempt — not the bounded-retry burst.
+        store = tmp_path / "store.db"
+        self._seed(store, [("b1", "one"), ("b2", "two")])
+        req = httpx.Request("POST", "http://test")
+
+        def fail(item: fwd._MirrorItem):
+            return httpx.ReadTimeout("response lost", request=req) if item.rowid == 1 else None
+
+        poster = _FakePoster(fail)
+        bridge = await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            poster,
+            until=lambda b: fwd._read_state(b).last_rowid >= 2,
+        )
+        assert sum(it.rowid == 1 for it in poster.calls) == 1
+        assert [it.rowid for it in poster.delivered] == [2]
+        assert fwd._read_state(bridge).last_rowid == 2
+
+    @pytest.mark.asyncio
+    async def test_connection_failure_retries_indefinitely(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A ConnectError means the server was unreachable — no bytes delivered,
+        # not the item's fault. The loop must retry it indefinitely (NOT count it
+        # toward the skip bound) so a server outage never drops a message.
+        store = tmp_path / "store.db"
+        self._seed(store, [("b1", "one")])
+        req = httpx.Request("POST", "http://test")
+
+        def fail(item: fwd._MirrorItem):
+            return httpx.ConnectError("connection refused", request=req)
+
+        poster = _FakePoster(fail)
+        bridge = await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            poster,
+            until=lambda b: len(poster.calls) >= fwd._MAX_ITEM_POST_ATTEMPTS + 3,
+        )
+        # Retried well past the skip bound, yet never advanced — not quarantined.
+        assert fwd._read_state(bridge).last_rowid == 0
+        assert not poster.delivered

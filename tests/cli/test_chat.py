@@ -73,6 +73,35 @@ def test_is_url_absolute() -> None:
     assert _is_url("/home/user/my-agent") is False
 
 
+def test_redirect_native_resume_routes_kiro_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A kiro-native wrapper session redirects to ``run_kiro_native``."""
+    monkeypatch.setattr(
+        chat_module,
+        "_wrapper_label_for_conversation",
+        lambda *, base_url, conversation_id: "kiro-native-ui",
+    )
+    captured: dict[str, object] = {}
+
+    def _capture(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.kiro_native.run_kiro_native", _capture)
+
+    redirected = chat_module._redirect_native_resume_if_needed(
+        base_url="https://example.com",
+        conversation_id="conv_kiro",
+        auto_open_conversation=True,
+    )
+
+    assert redirected is True
+    assert captured == {
+        "server": "https://example.com",
+        "session_id": "conv_kiro",
+        "kiro_args": (),
+        "auto_open_conversation": True,
+    }
+
+
 # ── _extract_agent_name ──────────────────────────────
 
 
@@ -1941,7 +1970,6 @@ def test_materialize_directory_bundle_with_override_keeps_nested_harness_unpinne
                 "claude_code": "claude-native",
                 "codex": "codex-native",
                 "pi": "pi",
-                "opencode": "opencode-native",
             },
         ),
         ("debby", {"claude": "claude-sdk", "gpt": "codex", "opencode": "opencode-native"}),

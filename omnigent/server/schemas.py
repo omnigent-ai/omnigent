@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from typing import Annotated, Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from omnigent.entities import ConversationItem
 
@@ -80,6 +80,59 @@ class MCPServerSummary(BaseModel):
     url: str | None = None
     command: str | None = None
     args: list[str] = Field(default_factory=list)
+
+
+_MCP_SERVER_NAME_RE = r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}$"
+
+
+class UpsertMCPServerRequest(BaseModel):
+    """
+    Request body for creating or updating a session agent MCP server.
+
+    Secret-bearing fields (``headers`` and ``env``) are intentionally
+    not accepted by the UI route. Existing secrets are preserved when a
+    server is edited without changing transport.
+    """
+
+    name: str = Field(min_length=1, max_length=128, pattern=_MCP_SERVER_NAME_RE)
+    transport: Literal["http", "stdio"]
+    description: str | None = Field(default=None, max_length=512)
+    url: str | None = None
+    command: str | None = None
+    args: list[str] = Field(default_factory=list, max_length=64)
+
+    @field_validator("name")
+    @classmethod
+    def _reject_dot_names(cls, value: str) -> str:
+        """Reject names that would make unsafe or confusing YAML filenames."""
+        if value in {".", ".."}:
+            raise ValueError("name cannot be '.' or '..'")
+        return value
+
+    @field_validator("args")
+    @classmethod
+    def _string_args_only(cls, value: list[str]) -> list[str]:
+        """Keep args as a small list of strings."""
+        return [str(item) for item in value]
+
+    @model_validator(mode="after")
+    def _validate_transport_fields(self) -> UpsertMCPServerRequest:
+        """Enforce the same transport shape as the agent spec parser."""
+        if self.transport == "http":
+            if not self.url:
+                raise ValueError("url is required when transport is 'http'")
+            if not (self.url.startswith("http://") or self.url.startswith("https://")):
+                raise ValueError("url must start with http:// or https://")
+            if self.command:
+                raise ValueError("command is not allowed when transport is 'http'")
+            if self.args:
+                raise ValueError("args are not allowed when transport is 'http'")
+        if self.transport == "stdio":
+            if not self.command:
+                raise ValueError("command is required when transport is 'stdio'")
+            if self.url:
+                raise ValueError("url is not allowed when transport is 'stdio'")
+        return self
 
 
 class SkillSummary(BaseModel):
@@ -158,6 +211,9 @@ class AgentObject(BaseModel):
         (secret fields omitted). Empty list when the spec
         declares no MCP servers or when the bundle cannot be
         loaded.
+    :param mcp_servers_editable: Whether the MCP list can be edited
+        through the session UI. Built-in template agents are read-only;
+        session-scoped uploaded agents are editable.
     :param policies: Guardrails policies declared on the agent.
         Each entry summarises the policy name, type, and
         phases. Empty list when the spec declares no policies
@@ -189,6 +245,7 @@ class AgentObject(BaseModel):
     updated_at: int | None = None
     harness: str | None = None
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
+    mcp_servers_editable: bool = False
     policies: list[PolicySummary] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
     terminals: list[str] = Field(default_factory=list)

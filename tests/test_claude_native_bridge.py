@@ -336,6 +336,59 @@ def test_prepare_bridge_dir_refuses_symlinked_ancestor(
     assert not (attacker_dir / "bridge.json").exists()
 
 
+def test_trusted_parent_accepts_qwen_native_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The relay's bridge-root allowlist accepts qwen-native bridge dirs.
+
+    The comment relay (``start_tool_relay`` → ``_ensure_secure_dir`` →
+    ``_trusted_parent_for_bridge_dir``) writes its JSON file under the
+    harness's bridge dir, validating it lives below a known bridge root.
+    qwen-native reuses this relay but keeps files under its own root
+    (``$TMPDIR/omnigent-<uid>/qwen-native``); if that root is missing from the
+    allowlist, every qwen-native session raises ``not under an allowed bridge
+    root`` and the relay never starts (observed in a live runner log). This
+    pins the qwen-native branch so the regression can't return.
+    """
+    from omnigent import qwen_native_bridge
+
+    # Distinct claude root so the qwen target can't match the claude branch
+    # first (the autouse fixture points the claude root at ``tmp_path``).
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    # qwen root mirrors production shape: <uid-scoped temp>/qwen-native.
+    qwen_root = tmp_path / "omnigent-test" / "qwen-native"
+    monkeypatch.setattr(qwen_native_bridge, "_BRIDGE_ROOT", qwen_root)
+
+    target = claude_native_bridge._absolute_syntactic_path(qwen_root / "abc123")
+    trusted = claude_native_bridge._trusted_parent_for_bridge_dir(target)
+
+    # Same anchor as cursor-native: the uid-scoped temp dir's parent.
+    assert trusted == claude_native_bridge._absolute_syntactic_path(qwen_root.parent.parent)
+
+
+def test_trusted_parent_rejects_path_outside_all_roots_and_names_qwen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A path under no known root is refused, and the error names the qwen root."""
+    from omnigent import qwen_native_bridge
+
+    # Distinct claude root so ``outside`` below isn't swept under it (the autouse
+    # fixture points the claude root at ``tmp_path``).
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    qwen_root = tmp_path / "omnigent-test" / "qwen-native"
+    monkeypatch.setattr(qwen_native_bridge, "_BRIDGE_ROOT", qwen_root)
+
+    outside = claude_native_bridge._absolute_syntactic_path(tmp_path / "somewhere-else" / "x")
+    with pytest.raises(RuntimeError, match="not under an allowed bridge root") as exc:
+        claude_native_bridge._trusted_parent_for_bridge_dir(outside)
+    assert "qwen-native" in str(exc.value)
+
+
 def test_record_hook_event_updates_transcript_state(tmp_path: Path) -> None:
     """
     Hook records expose Claude's JSONL transcript path to the executor.
@@ -3470,6 +3523,69 @@ async def test_start_tool_relay_accepts_codex_native_bridge_root(
         )
         relay_info = json.loads(relay_file.read_text(encoding="utf-8"))
         assert relay_info["tools"][0]["name"] == "list_comments"
+    finally:
+        if relay is not None:
+            relay.close()
+
+
+@pytest.mark.asyncio
+async def test_start_tool_relay_accepts_antigravity_native_bridge_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Relay startup accepts Antigravity-native's persistent bridge root (#1194).
+
+    Antigravity-native reuses the Claude MCP relay but stores bridge files in
+    ``~/.omnigent/antigravity-native`` (the same ``$HOME/.omnigent/<harness>``
+    shape codex uses). A regression in :func:`_trusted_parent_for_bridge_dir`
+    would reject the bridge dir, the relay would fail to write
+    ``tool_relay.json``, and the wrapped agy would get no ``sys_*`` tools.
+
+    :param tmp_path: Pytest temp directory used as an isolated user
+        state parent.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent import antigravity_native_bridge
+
+    antigravity_root = tmp_path / ".omnigent" / "antigravity-native"
+    monkeypatch.setattr("omnigent.antigravity_native_bridge._BRIDGE_ROOT", antigravity_root)
+    bridge_dir = antigravity_native_bridge.prepare_bridge_dir("conv_agy")
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+
+    async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """
+        Return an empty result for the unused relay tool callback.
+
+        :param name: Tool name, e.g. ``"sys_session_list"``.
+        :param arguments: Tool arguments.
+        :returns: Empty tool result.
+        """
+        del name, arguments
+        return {}
+
+    relay = None
+    try:
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[
+                {
+                    "name": "sys_session_create",
+                    "description": "Spawn an Omnigent sub-agent session.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_executor=_executor,
+            loop=asyncio.get_running_loop(),
+        )
+
+        assert relay_file.exists(), (
+            "Antigravity-native relay did not write tool_relay.json under the "
+            "persistent bridge root"
+        )
+        relay_info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert relay_info["tools"][0]["name"] == "sys_session_create"
     finally:
         if relay is not None:
             relay.close()

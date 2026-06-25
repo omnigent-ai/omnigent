@@ -13,13 +13,40 @@ const { addMutate, deleteMutate, copyTextMock } = vi.hoisted(() => ({
   deleteMutate: vi.fn(),
   copyTextMock: vi.fn(() => Promise.resolve()),
 }));
+const { createMcpMutate, updateMcpMutate, deleteMcpMutate } = vi.hoisted(() => ({
+  createMcpMutate: vi.fn((_payload, options?: { onSuccess?: () => void }) =>
+    options?.onSuccess?.(),
+  ),
+  updateMcpMutate: vi.fn((_payload, options?: { onSuccess?: () => void }) =>
+    options?.onSuccess?.(),
+  ),
+  deleteMcpMutate: vi.fn(),
+}));
 const policiesData = { current: [] as unknown[] };
 const registryData = { current: [] as unknown[] };
+// Session owner + viewer identity, controllable per test. Dereferenced lazily
+// inside the mock hooks (same pattern as policiesData) so the closures are safe
+// despite vi.mock hoisting. Default null → no owner row, keeping the pre-existing
+// cost/id/usage tests untouched.
+const ownerData = { current: null as string | null | undefined };
+const viewerData = { current: null as string | null };
 vi.mock("@/hooks/usePolicies", () => ({
   usePolicies: () => ({ data: policiesData.current }),
   usePolicyRegistry: () => ({ data: registryData.current }),
   useAddPolicy: () => ({ mutate: addMutate, isPending: false, isError: false, error: null }),
   useDeletePolicy: () => ({ mutate: deleteMutate }),
+}));
+vi.mock("@/hooks/useAgents", () => ({
+  useCreateMcpServer: () => ({ mutate: createMcpMutate, isPending: false, error: null }),
+  useUpdateMcpServer: () => ({ mutate: updateMcpMutate, isPending: false, error: null }),
+  useDeleteMcpServer: () => ({ mutate: deleteMcpMutate, isPending: false, error: null }),
+}));
+vi.mock("@/hooks/usePermissions", () => ({
+  useSessionOwner: () => ({ data: ownerData.current }),
+}));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/identity")>()),
+  getCurrentUserId: () => viewerData.current,
 }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 
@@ -28,6 +55,11 @@ import { AgentInfoButton, AgentInfoContent, agentDisplayLabel } from "./AgentInf
 afterEach(() => {
   cleanup();
   copyTextMock.mockClear();
+  createMcpMutate.mockClear();
+  updateMcpMutate.mockClear();
+  deleteMcpMutate.mockClear();
+  ownerData.current = null;
+  viewerData.current = null;
 });
 
 function renderButton(agent: Agent | undefined) {
@@ -61,6 +93,7 @@ const AGENT_WITH_BOTH: Agent = {
   id: "agent_1",
   name: "databricks_coding_agent",
   description: "Codes against Databricks.",
+  mcp_servers_editable: true,
   mcp_servers: [
     { name: "slack", transport: "http", description: "Slack MCP", url: "https://example/slack" },
     { name: "jira", transport: "stdio", command: "jira-mcp" },
@@ -173,6 +206,54 @@ describe("AgentInfoButton session id row", () => {
   });
 });
 
+describe("AgentInfoButton session owner row", () => {
+  // The owner row lets a viewer see whose session a shared chat is. It reads
+  // the owner via useSessionOwner (mocked) and the viewer via getCurrentUserId
+  // (mocked); both reset to null in afterEach.
+
+  it("shows the session owner in the popover when one is known", () => {
+    ownerData.current = "alice@example.com";
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
+    // Closed popover: the owner row is not mounted yet.
+    expect(screen.queryByTestId("agent-info-session-owner")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    expect(screen.getByTestId("agent-info-session-owner")).toHaveTextContent("alice@example.com");
+  });
+
+  it("appends (you) when the viewer owns the session", () => {
+    ownerData.current = "alice@example.com";
+    viewerData.current = "alice@example.com";
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    const row = screen.getByTestId("agent-info-session-owner");
+    expect(row).toHaveTextContent("alice@example.com");
+    expect(row).toHaveTextContent("(you)");
+  });
+
+  it("omits (you) when someone else owns the session", () => {
+    ownerData.current = "alice@example.com";
+    viewerData.current = "bob@example.com";
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    const row = screen.getByTestId("agent-info-session-owner");
+    expect(row).toHaveTextContent("alice@example.com");
+    expect(row).not.toHaveTextContent("(you)");
+  });
+
+  it("omits the owner row when no owner is known (permissions off / loading)", () => {
+    // owner null → no row at all, rather than an empty placeholder. The rest of
+    // the popover still renders (agent name proves it opened).
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-info-session-owner")).toBeNull();
+  });
+});
+
 describe("AgentInfoButton per-model usage breakdown", () => {
   // The breakdown reads `sessionUsageByModel` from the store; reset between
   // cases so they stay independent.
@@ -245,6 +326,42 @@ describe("AgentInfoButton per-model usage breakdown", () => {
     // The popover still opens (agent name proves it), but no breakdown.
     expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
     expect(screen.queryByTestId("agent-info-usage-by-model")).toBeNull();
+  });
+
+  it("toggles the arrow indicator when expanding/collapsing the details", () => {
+    useChatStore.setState({
+      sessionUsageByModel: {
+        "claude-sonnet-4-6": {
+          inputTokens: 1000,
+          outputTokens: 500,
+          totalTokens: 1500,
+          cacheReadInputTokens: null,
+          cacheCreationInputTokens: null,
+          totalCostUsd: 0.1,
+        },
+      },
+    });
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_arrow");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    const details = screen.getByTestId("agent-info-usage-by-model") as HTMLDetailsElement;
+    const summary = details.querySelector("summary")!;
+
+    // Initially collapsed — arrow points right.
+    expect(summary).toHaveTextContent("▶");
+    expect(summary).not.toHaveTextContent("▼");
+
+    // Expand the details by setting the open attribute and firing toggle.
+    details.open = true;
+    fireEvent(details, new Event("toggle"));
+    expect(summary).toHaveTextContent("▼");
+    expect(summary).not.toHaveTextContent("▶");
+
+    // Collapse again.
+    details.open = false;
+    fireEvent(details, new Event("toggle"));
+    expect(summary).toHaveTextContent("▶");
+    expect(summary).not.toHaveTextContent("▼");
   });
 });
 
@@ -376,11 +493,86 @@ describe("SessionPoliciesSection", () => {
   });
 });
 
+describe("McpServersSection", () => {
+  beforeEach(() => {
+    createMcpMutate.mockClear();
+    updateMcpMutate.mockClear();
+    deleteMcpMutate.mockClear();
+  });
+
+  it("creates an HTTP MCP server from the manager dialog", () => {
+    renderContent("conv_mcp");
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("Name"), { target: { value: "github" } });
+    fireEvent.change(within(dialog).getByLabelText("URL"), {
+      target: { value: "https://example.com/sse" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Save/ }));
+
+    expect(createMcpMutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "github",
+        transport: "http",
+        url: "https://example.com/sse",
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("updates an existing stdio MCP server", () => {
+    renderContent("conv_mcp");
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Edit jira" }));
+    fireEvent.change(within(dialog).getByLabelText("Command"), {
+      target: { value: "jira-mcp-new" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Save/ }));
+
+    expect(updateMcpMutate).toHaveBeenCalledWith(
+      {
+        serverName: "jira",
+        payload: expect.objectContaining({
+          name: "jira",
+          transport: "stdio",
+          command: "jira-mcp-new",
+        }),
+      },
+      expect.anything(),
+    );
+  });
+
+  it("deletes an MCP server from the manager dialog", () => {
+    renderContent("conv_mcp");
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete slack" }));
+
+    expect(deleteMcpMutate).toHaveBeenCalledWith("slack", expect.anything());
+  });
+
+  it("deletes an MCP server from the inline pill popover", () => {
+    renderContent("conv_mcp");
+
+    // Click the pill to open its popover
+    fireEvent.click(screen.getByRole("button", { name: "slack" }));
+    // Click "Remove" in the popover
+    fireEvent.click(screen.getByRole("button", { name: /Remove/ }));
+
+    expect(deleteMcpMutate).toHaveBeenCalledWith("slack", expect.anything());
+  });
+});
+
 describe("agentDisplayLabel", () => {
   it("maps native wrapper slugs to their display name", () => {
     expect(agentDisplayLabel("pi-native-ui")).toBe("Pi");
     expect(agentDisplayLabel("claude-native-ui")).toBe("Claude");
     expect(agentDisplayLabel("codex-native-ui")).toBe("Codex");
+    expect(agentDisplayLabel("antigravity-native-ui")).toBe("Antigravity");
   });
 
   it("strips the fork/switch clone suffix before resolving the native label", () => {
