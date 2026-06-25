@@ -205,14 +205,16 @@ comments; this is the *what*, not the *how*.)
 - [ ] **Omnigent tools.** Qwen can only call its own built-in tools; tools
   defined by Omnigent aren't exposed to it (so they can't be invoked or
   recorded). Permission gating on qwen's *own* tool calls already works.
-- [ ] **File I/O recording / content policy.** Omnigent now *executes* delegated
+- [x] **File I/O recording / content policy.** Omnigent *executes* delegated
   file reads/writes through the `OSEnvironment` (see "File I/O delegation" in
   What works today), so the bytes flow through Omnigent and the sandbox roots are
-  enforced. Still missing on top of that: (a) emitting the I/O into Omnigent's
-  event stream (ToolCall-style records) so it shows in history, and (b) running
-  TOOL_RESULT-phase content policy on the read/written content. Both build on the
-  `_handle_fs_read` / `_handle_fs_write` handlers — the byte-level hook now
-  exists; this is wiring the recording/policy layers onto it.
+  enforced. On top of that the `_handle_fs_read` / `_handle_fs_write` handlers now
+  (a) emit ToolCall-style records onto the turn stream so the I/O shows in
+  history, and (b) run `PHASE_TOOL_RESULT` content policy on the read/written
+  bytes — an explicit deny refuses the op (a write is gated before it happens),
+  failing open otherwise. Result-phase policy here gates on content only: the
+  harness round-trip doesn't carry `request_data`, so the fs tool's identity
+  isn't surfaced to result-phase policy.
 
 > LLM-phase policy (`PHASE_LLM_REQUEST` / `PHASE_LLM_RESPONSE`) is intentionally
 > out of scope: qwen's model calls happen internally over ACP and are opaque to
