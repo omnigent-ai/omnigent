@@ -588,9 +588,10 @@ def _databrickscfg_profiles_for_host(host: str) -> list[str]:
 def _get_openai_client(profile: str | None = None) -> OpenAI:
     """Lazily import and construct the OpenAI client.
 
-    Supports two configuration modes (in priority order):
+    Supports three configuration modes (in priority order):
       1. Direct OpenAI-compatible: OPENAI_BASE_URL + OPENAI_API_KEY
-      2. Databricks config file: ~/.databrickscfg
+      2. Direct OpenAI default endpoint: OPENAI_API_KEY
+      3. Databricks config file: ~/.databrickscfg
     """
     try:
         from openai import OpenAI
@@ -609,6 +610,15 @@ def _get_openai_client(profile: str | None = None) -> OpenAI:
             # See _OPENAI_KEY_PLACEHOLDER docstring in open_responses_sdk.
             api_key=os.environ.get("OPENAI_API_KEY", _OPENAI_KEY_PLACEHOLDER),
         )
+
+    # Plain OpenAI key against the default api.openai.com endpoint. Use it
+    # directly rather than falling through to Databricks auth, which would
+    # otherwise raise a misleading "install databricks-sdk" error for a user
+    # who only configured OPENAI_API_KEY. Mirrors the sibling builder in
+    # open_responses_sdk._get_openai_client.
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        return OpenAI(api_key=api_key)
 
     from .open_responses_sdk import _OPENAI_KEY_PLACEHOLDER as _placeholder
 
