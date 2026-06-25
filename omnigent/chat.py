@@ -14,7 +14,6 @@ import logging
 import os
 import secrets
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -56,6 +55,7 @@ from omnigent._wrapper_labels import (
 from omnigent.conversation_browser import open_conversation_link_if_enabled
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
 from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.spec import load as load_spec
@@ -3563,7 +3563,7 @@ def _start_local_server(
             env=child_env,
             stdout=log_fh,
             stderr=log_fh,
-            start_new_session=True,
+            **_proc.spawn_kwargs(),
         )
     finally:
         log_fh.close()
@@ -3685,14 +3685,11 @@ def _stop_server(proc: subprocess.Popen[bytes]) -> None:
     :param proc: The server subprocess.
     """
     if proc.poll() is None:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            proc.wait(timeout=5)
+        _proc.terminate_tree(proc, grace=5)
+        if proc.poll() is None:
+            _proc.kill_tree(proc)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
 
 
 def _stop_local_server(server: LocalServer) -> None:

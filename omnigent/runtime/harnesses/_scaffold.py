@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import logging
 import os
 import time
@@ -46,7 +47,7 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, FastAPI, Request, Response, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, OmnigentError
@@ -876,6 +877,39 @@ class HarnessApp:
         app.include_router(self._build_v1_router(), prefix="/v1")
         return app
 
+    def _check_auth(self, request: Request) -> Response | None:
+        """
+        Authenticate a ``/v1`` request with the per-spawn bearer token (S1).
+
+        The harness control channel is a uid-isolated Unix socket on POSIX but a
+        loopback-TCP listener on Windows, where any local process can connect.
+        The ``/v1`` event endpoint starts turns, runs tools, and satisfies
+        approval / policy verdicts, so it must not be reachable by an
+        unauthenticated peer that merely learns the (non-secret)
+        ``conversation_id``. The runner stashes the expected token on
+        ``app.state.harness_auth_token``; the parent (process_manager) presents
+        it as ``Authorization: Bearer <token>``. Comparison is constant-time.
+
+        Checked in the event handler rather than via middleware so the SSE
+        ``StreamingResponse`` and lifespan teardown are untouched
+        (``BaseHTTPMiddleware`` interferes with both). ``/health`` is never
+        gated. When no token is configured — the app was built outside the
+        runner, e.g. a unit test calling ``create_app()`` directly — the gate is
+        inert, preserving those callers' direct access.
+
+        :param request: The inbound request, for ``Authorization`` + app.state.
+        :returns: A 401 :class:`Response` to short-circuit on failure, or
+            ``None`` to proceed.
+        """
+        expected = getattr(request.app.state, "harness_auth_token", None)
+        if not expected:
+            return None
+        header = request.headers.get("Authorization", "")
+        scheme, _, token = header.partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(token, expected):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        return None
+
     @contextlib.asynccontextmanager
     async def _lifespan(self, _app: FastAPI) -> AsyncIterator[None]:
         """
@@ -1061,6 +1095,9 @@ class HarnessApp:
             unknown elicitation_id, or interrupt with no
             in-flight turn; 503 on shutdown for fresh turns.
         """
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
         self._check_conversation_id(request, conversation_id)
         if isinstance(body, MessageEvent):
             return await self._start_or_inject_turn(body.to_create_request())

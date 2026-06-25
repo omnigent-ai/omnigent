@@ -67,6 +67,9 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     marker; each rerun resolves to a different model via
     :mod:`tests._model_pools` rotation.
     """
+    is_windows = os.name == "nt"
+    skip_posix = pytest.mark.skip(reason="POSIX-only test; skipped on Windows")
+    skip_windows = pytest.mark.skip(reason="Windows-only test; skipped on POSIX")
     for item in items:
         llm_flaky = item.get_closest_marker("llm_flaky")
         if llm_flaky is not None:
@@ -76,6 +79,12 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             reruns = int(llm_flaky.kwargs.get("reruns", 2))
             delay = int(llm_flaky.kwargs.get("reruns_delay", 1))
             item.add_marker(pytest.mark.flaky(reruns=reruns, reruns_delay=delay))
+        # Auto-skip platform-pinned tests on the wrong OS so the Linux suite
+        # is unchanged and a Windows run doesn't choke on POSIX-only tests.
+        if item.get_closest_marker("posix_only") is not None and is_windows:
+            item.add_marker(skip_posix)
+        if item.get_closest_marker("windows_only") is not None and not is_windows:
+            item.add_marker(skip_windows)
 
 
 # Tmpdir owned by *this* process (master or single worker) for the
