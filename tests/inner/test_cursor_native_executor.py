@@ -118,6 +118,16 @@ class TestForkPreamble:
         assert wrapped.endswith("do it")
         assert wrapped.index(FORK_HISTORY_CLOSE_TAG) < wrapped.index("do it")
 
+    def test_wrap_defangs_sentinels_inside_preamble(self) -> None:
+        # A literal close tag in the replayed transcript must not produce a second
+        # real close tag inside the block (which would let the forwarder's strip
+        # stop early and leak history). The framed block holds exactly one pair.
+        wrapped = wrap_fork_preamble(f"You: see {FORK_HISTORY_CLOSE_TAG} here", "go")
+        assert wrapped.count(FORK_HISTORY_CLOSE_TAG) == 1
+        assert wrapped.count(FORK_HISTORY_OPEN_TAG) == 1
+        # The defanged form stays readable.
+        assert "[/omnigent_fork_history]" in wrapped
+
 
 class TestRunTurnPreambleInjection:
     """run_turn prepends the fork preamble to the FIRST injected message only."""

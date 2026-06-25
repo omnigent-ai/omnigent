@@ -108,8 +108,17 @@ _ATTACHMENT_MARKER_RE = re.compile(r"\[Attached:[^\]]*\]")
 # user_query; strip the whole block so the mirrored bubble shows only the user's
 # real text — the copied history already lives in the Omnigent timeline, so
 # echoing it here would duplicate it.
+#
+# The match is non-greedy so it stops at the FIRST close tag: that is always the
+# real one, because wrap_fork_preamble defangs any literal sentinels inside the
+# replayed transcript (so the block holds exactly one real open/close pair), and
+# stopping at the first close preserves a tag in the user's own message that
+# sits after it. The trailing alternative strips an UNTERMINATED open block (a
+# truncated paste with no close tag) to end-of-text, so it degrades gracefully
+# instead of mirroring the whole raw block.
 _FORK_HISTORY_RE = re.compile(
-    rf"{re.escape(FORK_HISTORY_OPEN_TAG)}.*?{re.escape(FORK_HISTORY_CLOSE_TAG)}",
+    rf"{re.escape(FORK_HISTORY_OPEN_TAG)}.*?{re.escape(FORK_HISTORY_CLOSE_TAG)}"
+    rf"|{re.escape(FORK_HISTORY_OPEN_TAG)}.*",
     re.DOTALL,
 )
 

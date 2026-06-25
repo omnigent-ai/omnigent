@@ -182,6 +182,26 @@ _FORK_HISTORY_HEADER = "This session was forked. Here is the conversation so far
 _FORK_HISTORY_FOOTER = "(End of prior conversation. Please continue from here.)"
 
 
+def _neutralize_fork_sentinels(text: str) -> str:
+    """Defang any literal fork sentinel tags inside replayed transcript text.
+
+    The preamble is rendered from prior user/assistant turns verbatim, so a turn
+    could literally contain ``<omnigent_fork_history>`` /
+    ``</omnigent_fork_history>`` (a user typed it, pasted logs, etc.). If left
+    intact, an embedded close tag would let the forwarder's strip stop early and
+    leak the rest of the transcript into the mirrored web bubble. Replacing the
+    angle brackets guarantees the framed block contains exactly ONE real
+    open/close pair, so the (non-greedy) strip is unambiguous. The bracketed form
+    stays readable for the cursor agent.
+
+    :param text: Rendered transcript text.
+    :returns: The text with any literal sentinel tags defanged.
+    """
+    return text.replace(FORK_HISTORY_OPEN_TAG, "[omnigent_fork_history]").replace(
+        FORK_HISTORY_CLOSE_TAG, "[/omnigent_fork_history]"
+    )
+
+
 def wrap_fork_preamble(preamble: str, user_text: str) -> str:
     """Combine a fork preamble with the latest user text for one injection.
 
@@ -193,6 +213,13 @@ def wrap_fork_preamble(preamble: str, user_text: str) -> str:
     sentinel block from the mirrored user turn so the copied history isn't
     duplicated in the Omnigent timeline.
 
+    Any literal sentinel tags inside *preamble* are defanged
+    (:func:`_neutralize_fork_sentinels`) so the framed block holds exactly one
+    real open/close pair — this keeps the forwarder's non-greedy strip
+    unambiguous and prevents embedded tags from leaking history. *user_text* is
+    left untouched (it sits after the close tag; the non-greedy strip stops at
+    the real close, so a tag in the user's own message is preserved).
+
     :param preamble: Rendered prior-conversation transcript.
     :param user_text: The user's first message in the fork.
     :returns: The framed, fenced transcript followed by the user text.
@@ -200,7 +227,7 @@ def wrap_fork_preamble(preamble: str, user_text: str) -> str:
     return (
         f"{FORK_HISTORY_OPEN_TAG}\n"
         f"{_FORK_HISTORY_HEADER}\n\n"
-        f"{preamble}\n\n"
+        f"{_neutralize_fork_sentinels(preamble)}\n\n"
         f"{_FORK_HISTORY_FOOTER}\n"
         f"{FORK_HISTORY_CLOSE_TAG}\n\n"
         f"{user_text}"

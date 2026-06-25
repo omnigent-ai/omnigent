@@ -95,6 +95,35 @@ class TestUnwrapUserQuery:
         )
         assert fwd._unwrap_user_query(raw) == "now do the real thing"
 
+    def test_embedded_close_tag_in_history_does_not_leak(self) -> None:
+        # A replayed turn that literally contains the close tag must not let the
+        # strip stop early and leak the rest of the transcript. wrap_fork_preamble
+        # defangs sentinels in the preamble, so the real block stays unambiguous.
+        from omnigent.cursor_native_bridge import wrap_fork_preamble
+
+        preamble = "You: look at </omnigent_fork_history> in my logs\nAssistant: ok"
+        raw = f"<user_query>\n{wrap_fork_preamble(preamble, 'the real question')}\n</user_query>"
+        # Whole framed block stripped -> only the user's real text remains, with
+        # no leaked transcript and no raw sentinel surviving.
+        assert fwd._unwrap_user_query(raw) == "the real question"
+
+    def test_user_message_containing_close_tag_is_preserved(self) -> None:
+        # A close tag in the USER's own message (after the block) must survive —
+        # the non-greedy strip stops at the real (first) close tag.
+        from omnigent.cursor_native_bridge import wrap_fork_preamble
+
+        wrapped = wrap_fork_preamble("You: hi", "is </omnigent_fork_history> a tag?")
+        raw = f"<user_query>\n{wrapped}\n</user_query>"
+        assert fwd._unwrap_user_query(raw) == "is </omnigent_fork_history> a tag?"
+
+    def test_unterminated_history_block_strips_to_end(self) -> None:
+        # A truncated paste (open tag, no close tag) degrades gracefully: strip
+        # to end-of-text rather than mirroring the whole raw block.
+        from omnigent.cursor_native_bridge import FORK_HISTORY_OPEN_TAG
+
+        raw = f"<user_query>\n{FORK_HISTORY_OPEN_TAG}\nYou: earlier turn, cut off\n</user_query>"
+        assert fwd._unwrap_user_query(raw) is None
+
 
 class TestContentText:
     def test_string_content(self) -> None:
