@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -28,6 +29,7 @@ from omnigent.claude_native_bridge import (
     write_active_session_id,
 )
 from omnigent.claude_native_forwarder import (
+    _persist_native_compaction_item,
     forward_claude_transcript_to_session,
 )
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
@@ -5923,3 +5925,207 @@ async def test_forward_session_cost_tags_display_advance_with_model(
         estimate_box["value"] = 0.90
         await run()
         assert posted[-1] == {"policy_cost_usd": pytest.approx(0.90)}
+
+
+# ---------------------------------------------------------------------------
+# _persist_native_compaction_item tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_persist_native_compaction_item_posts_compaction_event() -> None:
+    """
+    ``_persist_native_compaction_item`` queries the latest item and posts a compaction event.
+
+    The function GETs ``/v1/sessions/{id}/items?limit=1&order=desc`` to
+    find the most recent persisted item, then POSTs a ``compaction``
+    event using that item's id as ``last_item_id``.
+    """
+    get_response = MagicMock()
+    get_response.raise_for_status = MagicMock()
+    get_response.json.return_value = {"data": [{"id": "item_123"}]}
+
+    post_response = MagicMock()
+    post_response.raise_for_status = MagicMock()
+
+    client = AsyncMock()
+    client.get.return_value = get_response
+    client.post.return_value = post_response
+
+    await _persist_native_compaction_item(client, session_id="conv_test")
+
+    client.get.assert_called_once_with(
+        "/v1/sessions/conv_test/items",
+        params={"limit": 1, "order": "desc"},
+    )
+    client.post.assert_called_once()
+    post_call = client.post.call_args
+    assert post_call[0][0] == "/v1/sessions/conv_test/events"
+    body = post_call[1]["json"] if "json" in post_call[1] else post_call[0][1]
+    assert body["type"] == "compaction"
+    assert body["data"]["last_item_id"] == "item_123"
+    assert body["data"]["summary"] is not None
+    assert body["data"]["model"] == "unknown"
+    assert body["data"]["token_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_persist_native_compaction_item_empty_items_uses_fallback() -> None:
+    """
+    When no items exist, ``last_item_id`` falls back to a generated boundary id.
+
+    If the session has no persisted items yet (e.g. the very first turn
+    was compacted before anything was stored), the function generates
+    ``compact_boundary_{session_id}`` as the boundary marker instead of
+    crashing on an empty list.
+    """
+    get_response = MagicMock()
+    get_response.raise_for_status = MagicMock()
+    get_response.json.return_value = {"data": []}
+
+    post_response = MagicMock()
+    post_response.raise_for_status = MagicMock()
+
+    client = AsyncMock()
+    client.get.return_value = get_response
+    client.post.return_value = post_response
+
+    await _persist_native_compaction_item(client, session_id="conv_empty")
+
+    post_call = client.post.call_args
+    body = post_call[1]["json"] if "json" in post_call[1] else post_call[0][1]
+    assert body["data"]["last_item_id"].startswith("compact_boundary_")
+
+
+@pytest.mark.asyncio
+async def test_compaction_completed_triggers_persist(tmp_path: Path) -> None:
+    """
+    ``SessionStart source=compact`` triggers both status POST and item persistence.
+
+    When the forwarder processes a ``SessionStart source=compact`` record
+    (compaction completed), it must call ``_post_external_compaction_status``
+    to surface the status AND ``_persist_native_compaction_item`` to write
+    the compaction boundary item.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    # Initial SessionStart populates transcript_path.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    # Post-compaction SessionStart — the completion signal.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "source": "compact",
+            "session_id": "claude-session",
+        },
+    )
+    server, thread, base_url = _start_recording_server()
+    persist_called = asyncio.Event()
+
+    async def _persist_side_effect(*args: Any, **kwargs: Any) -> None:
+        persist_called.set()
+
+    persist_mock = AsyncMock(side_effect=_persist_side_effect)
+    with patch(
+        "omnigent.claude_native_forwarder._persist_native_compaction_item",
+        persist_mock,
+    ):
+        task = asyncio.create_task(
+            forward_claude_transcript_to_session(
+                base_url=base_url,
+                headers={},
+                session_id="conv_persist",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                start_at_end=False,
+                poll_interval_s=0.01,
+            )
+        )
+        try:
+            # Wait for the compaction status POST to arrive.
+            request = await _get_recorded_request(server)
+            # Wait for _persist_native_compaction_item to be called
+            # (it runs right after the POST in the same await chain).
+            await asyncio.wait_for(persist_called.wait(), timeout=5.0)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5.0)
+
+    # The recording server captured the compaction status POST.
+    assert request["body"]["type"] == "external_compaction_status"
+    assert request["body"]["data"]["status"] == "completed"
+    # _persist_native_compaction_item was called with the right session id.
+    persist_mock.assert_called_once()
+    call_kwargs = persist_mock.call_args
+    assert call_kwargs[1]["session_id"] == "conv_persist"
+
+
+@pytest.mark.asyncio
+async def test_compaction_in_progress_does_not_persist(tmp_path: Path) -> None:
+    """
+    ``PreCompact`` (in_progress) does NOT call ``_persist_native_compaction_item``.
+
+    Only compaction *completion* (``SessionStart source=compact``) writes
+    the boundary item. ``PreCompact`` merely forwards the ``in_progress``
+    status so the UI shows a spinner — there is no boundary to persist yet.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "PreCompact", "session_id": "claude-session"},
+    )
+    server, thread, base_url = _start_recording_server()
+    persist_mock = AsyncMock()
+    with patch(
+        "omnigent.claude_native_forwarder._persist_native_compaction_item",
+        persist_mock,
+    ):
+        task = asyncio.create_task(
+            forward_claude_transcript_to_session(
+                base_url=base_url,
+                headers={},
+                session_id="conv_no_persist",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                start_at_end=False,
+                poll_interval_s=0.01,
+            )
+        )
+        try:
+            # Wait for the in_progress status POST to arrive.
+            request = await _get_recorded_request(server)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5.0)
+
+    assert request["body"]["type"] == "external_compaction_status"
+    assert request["body"]["data"]["status"] == "in_progress"
+    # _persist_native_compaction_item must NOT be called for in_progress.
+    persist_mock.assert_not_called()
