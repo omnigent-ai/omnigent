@@ -11164,12 +11164,17 @@ async def test_events_compact_on_cursor_native_pastes_summarize_and_raises_spinn
     # A regression re-adding ``completed`` here would flash the permanent
     # "Conversation compacted" marker while the TUI is still summarizing.
     compaction_types = [
-        e.get("type") for e in queued_events if str(e.get("type", "")).startswith("response.compaction")
+        e.get("type")
+        for e in queued_events
+        if str(e.get("type", "")).startswith("response.compaction")
     ]
     assert compaction_types == ["response.compaction.in_progress"], (
-        f"Handler must publish only in_progress (forwarder completes it); got {compaction_types!r}."
+        f"Handler must publish only in_progress (forwarder completes it); "
+        f"got {compaction_types!r}."
     )
-    in_progress = next(e for e in queued_events if e.get("type") == "response.compaction.in_progress")
+    in_progress = next(
+        e for e in queued_events if e.get("type") == "response.compaction.in_progress"
+    )
     assert in_progress.get("task_id") == conv_id, (
         f"in_progress must carry the session id as task_id; got {in_progress!r}."
     )
@@ -11246,7 +11251,9 @@ async def test_events_compact_on_cursor_native_503_dismisses_spinner_when_bridge
     )
 
     compaction_types = [
-        e.get("type") for e in queued_events if str(e.get("type", "")).startswith("response.compaction")
+        e.get("type")
+        for e in queued_events
+        if str(e.get("type", "")).startswith("response.compaction")
     ]
     # in_progress raised the spinner; failed must dismiss it. completed must
     # never fire — the history was not compacted.
