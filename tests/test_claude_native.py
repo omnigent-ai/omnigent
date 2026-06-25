@@ -411,8 +411,9 @@ def test_ucode_config_for_profile_defaults_model_when_ucode_omits_it(
     config = claude_native._ucode_config_for_profile("test-profile")
 
     assert config is not None
-    # The verified routable gateway endpoint name, not the CLI's own default.
-    assert config.model == "databricks-claude-opus-4-8"
+    # The verified routable gateway endpoint name (with the [1m] suffix, since
+    # opus-4-8 is a known 1M model), not the CLI's own Anthropic-direct default.
+    assert config.model == "databricks-claude-opus-4-8[1m]"
 
 
 def test_ucode_config_for_profile_fails_loud_on_malformed_claude_state(
@@ -436,6 +437,105 @@ def test_ucode_config_for_profile_fails_loud_on_malformed_claude_state(
 
     with pytest.raises(click.ClickException, match="missing Claude base URL"):
         claude_native._ucode_config_for_profile("test-profile")
+
+
+@pytest.mark.parametrize(
+    "ident",
+    [
+        "claude-opus-4-8",
+        "databricks-claude-opus-4-8",
+        "anthropic/claude-opus-4-8",
+        "databricks/databricks-claude-opus-4-8",
+        "claude-opus-4-8[1m]",
+        "Databricks-Claude-Opus-4-8",
+        "claude-opus-4-8:beta",
+        "databricks-claude-opus-4-6",
+        "databricks-claude-sonnet-4-6",
+    ],
+)
+def test_model_supports_1m_window_true_for_known_1m_models(ident: str) -> None:
+    """Every naming a 1M Claude id reaches us in is recognized as 1M-capable.
+
+    Covers the gateway ``databricks-`` prefix, provider prefix, an existing
+    ``[1m]`` alias, a ``:tag`` suffix, and mixed case.
+    """
+    assert claude_native._model_supports_1m_window(ident) is True
+
+
+@pytest.mark.parametrize(
+    "ident",
+    [
+        "databricks-claude-sonnet-4-5",  # real Claude model, but 200K base
+        "databricks-claude-haiku-4-5",  # not a 1M model
+        "databricks-gpt-5-5",  # not Claude
+        "claude-3-opus-20240229",  # older Claude, 200K
+    ],
+)
+def test_model_supports_1m_window_false_for_non_1m_models(ident: str) -> None:
+    """Non-1M / non-Claude models are not flagged (no [1m] gets appended)."""
+    assert claude_native._model_supports_1m_window(ident) is False
+
+
+def test_maybe_enable_1m_window_appends_for_known_1m_model() -> None:
+    """A known 1M Claude model gets the [1m] suffix so Claude Code uses 1M."""
+    assert (
+        claude_native._maybe_enable_1m_window("databricks-claude-opus-4-8")
+        == "databricks-claude-opus-4-8[1m]"
+    )
+
+
+def test_maybe_enable_1m_window_bare_for_non_1m_model() -> None:
+    """A non-1M model is returned unchanged (no spurious 1M claim)."""
+    # haiku is not a 1M model — appending [1m] would mis-size its window.
+    assert (
+        claude_native._maybe_enable_1m_window("databricks-claude-haiku-4-5")
+        == "databricks-claude-haiku-4-5"
+    )
+
+
+def test_maybe_enable_1m_window_idempotent_when_already_1m() -> None:
+    """A model already carrying [1m] is returned unchanged (no double suffix)."""
+    assert (
+        claude_native._maybe_enable_1m_window("databricks-claude-opus-4-8[1m]")
+        == "databricks-claude-opus-4-8[1m]"
+    )
+
+
+def test_ucode_config_for_profile_appends_1m_for_opus_4_8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    End to end: a 1M Claude model resolves to a [1m] launch model.
+
+    Proves the resolved ``--model`` Claude Code is launched with carries the
+    1M alias for opus-4-8, which is what makes Claude Code's own context meter
+    and compaction use the real 1M window instead of the 200K base.
+    """
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    workspace_state = UcodeWorkspaceState(
+        workspace_url="https://example.databricks.com",
+        agents={
+            "claude": UcodeAgentState(
+                model="databricks-claude-opus-4-8",
+                base_url="https://example.databricks.com/ai-gateway/anthropic",
+                auth_command="printf token",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
+        lambda profile: "https://example.databricks.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda workspace_url: workspace_state,
+    )
+
+    config = claude_native._ucode_config_for_profile("test-profile")
+
+    assert config is not None
+    assert config.model == "databricks-claude-opus-4-8[1m]"
 
 
 def test_attach_url_encodes_path_components() -> None:

@@ -149,6 +149,24 @@ _UCODE_CLAUDE_TIER_TO_ENV: dict[str, str] = {
     "haiku": _ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV,
 }
 _DEFAULT_UCODE_AUTH_REFRESH_INTERVAL_MS = 900_000
+
+# Claude Code's "[1m]" model-id suffix opts a model into Anthropic's 1M-token
+# context window: Claude Code strips the suffix from the wire model id and
+# sends the "context-1m" beta header. The Databricks AI gateway serves these
+# models at 1M unconditionally (verified in #1299: a 375K-token
+# databricks-claude-opus-4-8 request is accepted with AND without the beta).
+# Without "[1m]", Claude Code reports the model's 200K Anthropic base as its
+# window and so its own context meter / proactive compaction run ~5x too
+# early; appending "[1m]" makes Claude Code use the real 1M window.
+_CLAUDE_1M_MODEL_SUFFIX = "[1m]"
+# Bare (normalized) Claude model ids that serve a 1M context window. Mirrors
+# the 1M Claude set in omnigent.llms.context_window (#1299/#1300, which fixes
+# the same under-reporting for the in-process / claude-sdk path); keep the two
+# in sync until they are consolidated behind one shared helper.
+_CLAUDE_1M_MODELS: frozenset[str] = frozenset(
+    {"claude-opus-4-8", "claude-opus-4-6", "claude-sonnet-4-6"}
+)
+
 _SESSION_LABELS = {
     "omnigent.ui": "terminal",
     _WRAPPER_LABEL_KEY: _WRAPPER_LABEL_VALUE,
@@ -1378,6 +1396,46 @@ def _strip_resume_from_claude_args(args: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _model_supports_1m_window(model: str) -> bool:
+    """
+    Return whether a model id denotes a Claude model that serves 1M context.
+
+    Normalizes the id the way model strings reach us — a provider prefix
+    (``anthropic/claude-opus-4-8``), the gateway ``databricks-`` prefix
+    (``databricks-claude-opus-4-8``), an OpenRouter-style ``:tag`` suffix, and
+    an existing ``[1m]`` bracket alias — down to the bare base id before
+    matching :data:`_CLAUDE_1M_MODELS`.
+
+    :param model: The model identifier (any namespacing), e.g.
+        ``"databricks-claude-opus-4-8"``.
+    :returns: ``True`` if the model is a known 1M-context Claude model.
+    """
+    bare = model.rsplit("/", 1)[-1].split(":", 1)[0].split("[", 1)[0].strip().lower()
+    if bare.startswith("databricks-"):
+        bare = bare[len("databricks-") :]
+    return bare in _CLAUDE_1M_MODELS
+
+
+def _maybe_enable_1m_window(model: str) -> str:
+    """
+    Append the ``[1m]`` window suffix for a known 1M-context Claude model.
+
+    Native Claude through a Databricks gateway otherwise reports the model's
+    200K Anthropic base as its window — the gateway serves 1M regardless (see
+    #1299) — so Claude Code's own context meter and proactive compaction run
+    ~5x too early. Appending ``[1m]`` makes Claude Code use the real 1M
+    window. Idempotent; only known 1M Claude models are upgraded.
+
+    :param model: Gateway model id, e.g. ``"databricks-claude-opus-4-8"``.
+    :returns: ``model`` with ``[1m]`` appended when it is a known 1M Claude
+        model and not already suffixed, otherwise ``model`` unchanged.
+    """
+    if _CLAUDE_1M_MODEL_SUFFIX in model or not _model_supports_1m_window(model):
+        return model
+    _logger.info("native-claude: requesting 1M context window for model %r", model)
+    return f"{model}{_CLAUDE_1M_MODEL_SUFFIX}"
+
+
 def _ucode_config_for_profile(profile: str | None) -> ClaudeNativeUcodeConfig | None:
     """
     Resolve native Claude Code launch config from ucode state.
@@ -1450,10 +1508,15 @@ def _ucode_config_for_profile(profile: str | None) -> ClaudeNativeUcodeConfig | 
             env[env_var] = model_id
     # When ucode caches no model, default it so Claude Code doesn't fall back
     # to its host-config model (an Anthropic-direct id the gateway rejects).
+    model = agent_state.model or DATABRICKS_CLAUDE_DEFAULT_MODEL
+    # Opt the active model into the 1M context window when it is a known
+    # 1M-context Claude model, so Claude Code's own context meter and
+    # compaction use the real window instead of the 200K Anthropic base.
+    model = _maybe_enable_1m_window(model)
     return ClaudeNativeUcodeConfig(
         env=env,
         api_key_helper=agent_state.auth_command,
-        model=agent_state.model or DATABRICKS_CLAUDE_DEFAULT_MODEL,
+        model=model,
     )
 
 
