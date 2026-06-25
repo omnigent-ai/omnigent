@@ -52,6 +52,22 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 
+// The version footer reads the server version (capabilities probe) and the
+// per-session host version (health poll). Mock both hooks so the footer
+// renders deterministically without those providers; `versionEnv` lets each
+// case dial the values. Defaults (server null / host undefined) keep the
+// footer hidden, so the unrelated cases above are unaffected.
+const versionEnv = vi.hoisted(() => ({
+  serverVersion: null as string | null,
+  hostVersion: undefined as string | null | undefined,
+}));
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({ server_version: versionEnv.serverVersion }),
+}));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionHostVersion: () => versionEnv.hostVersion,
+}));
+
 import { AgentInfoButton, AgentInfoContent, agentDisplayLabel } from "./AgentInfo";
 
 afterEach(() => {
@@ -205,6 +221,49 @@ describe("AgentInfoButton session cost row", () => {
     // The rest of the popover still renders (agent name proves it opened).
     expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
     expect(screen.queryByTestId("agent-info-session-cost")).toBeNull();
+  });
+});
+
+describe("AgentInfoButton version footer", () => {
+  // The footer reads the server + bound-host versions via the mocked hooks
+  // above; reset between cases so a leaked value can't mask a regression.
+  beforeEach(() => {
+    versionEnv.serverVersion = null;
+    versionEnv.hostVersion = undefined;
+  });
+
+  it("joins server and host versions in the popover footer", () => {
+    versionEnv.serverVersion = "0.3.0.dev0";
+    versionEnv.hostVersion = "0.1.0";
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_ver");
+    // Closed popover: the footer is not mounted yet.
+    expect(screen.queryByTestId("agent-info-versions")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    expect(screen.getByTestId("agent-info-versions")).toHaveTextContent(
+      "server 0.3.0.dev0 · host 0.1.0",
+    );
+  });
+
+  it("shows only the server version when the host version is unknown", () => {
+    // No host binding (or host on another replica) → host omitted, not "—".
+    versionEnv.serverVersion = "0.3.0.dev0";
+    versionEnv.hostVersion = undefined;
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_ver");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    const footer = screen.getByTestId("agent-info-versions");
+    expect(footer).toHaveTextContent("server 0.3.0.dev0");
+    expect(footer).not.toHaveTextContent("host");
+  });
+
+  it("hides the footer when neither version is known", () => {
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_ver");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+    // Popover still opens (agent name proves it) — just no version footer.
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-info-versions")).toBeNull();
   });
 });
 

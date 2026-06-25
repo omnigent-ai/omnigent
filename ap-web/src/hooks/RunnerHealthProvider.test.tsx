@@ -22,6 +22,7 @@ import {
   RunnerHealthProvider,
   useRunnerHealthRegistration,
   useSessionHostOnline,
+  useSessionHostVersion,
   useSessionRunnerOnline,
 } from "./RunnerHealthProvider";
 
@@ -29,8 +30,12 @@ const useConvMock = vi.mocked(useConversations);
 const useRunnerHealthMock = vi.mocked(useRunnerHealth);
 const useSessionMock = vi.mocked(useSession);
 
-function liveness(runner_online: boolean, host_online: boolean | null = null): SessionLiveness {
-  return { runner_online, host_online };
+function liveness(
+  runner_online: boolean,
+  host_online: boolean | null = null,
+  host_version: string | null = null,
+): SessionLiveness {
+  return { runner_online, host_online, host_version };
 }
 
 function OnlineProbe({ sessionId }: { sessionId: string | undefined }) {
@@ -41,6 +46,11 @@ function OnlineProbe({ sessionId }: { sessionId: string | undefined }) {
 function HostProbe({ sessionId }: { sessionId: string | undefined }) {
   const host = useSessionHostOnline(sessionId);
   return <span data-testid="host-probe">{String(host)}</span>;
+}
+
+function HostVersionProbe({ sessionId }: { sessionId: string | undefined }) {
+  const version = useSessionHostVersion(sessionId);
+  return <span data-testid="host-version-probe">{String(version)}</span>;
 }
 
 // Reads the shared runner map back via a no-op registration (empty array
@@ -170,6 +180,21 @@ describe("useSessionHostOnline (host tunnel, tri-state)", () => {
     );
     renderInProvider(<HostProbe sessionId="conv_child" />, ["/c/conv_child"]);
     expect(screen.getByTestId("host-probe").textContent).toBe("true");
+  });
+
+  it("surfaces the host version from the fallback poll for the open session", () => {
+    // The info-popover footer reads the bound host's version; it rides the
+    // same /health poll as host_online (poll-only — not the sidebar stream).
+    useSessionMock.mockReturnValue({
+      session: { id: "conv_child" },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+    useRunnerHealthMock.mockReturnValue(
+      new Map<string, SessionLiveness>([["conv_child", liveness(false, true, "0.1.0")]]),
+    );
+    renderInProvider(<HostVersionProbe sessionId="conv_child" />, ["/c/conv_child"]);
+    expect(screen.getByTestId("host-version-probe").textContent).toBe("0.1.0");
   });
 });
 

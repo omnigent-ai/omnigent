@@ -1882,10 +1882,18 @@ class SessionLiveness:
         Used only to choose what the open view shows when
         ``runner_online`` is ``False``; never participates in the
         reachability decision.
+    :param host_version: Version string from the bound host's
+        ``host.hello`` frame, e.g. ``"0.1.0"`` — surfaced in the
+        session info popover. ``None`` when the session has no host
+        binding, the host is offline, or its version isn't resolvable
+        on this replica (the version lives in the in-memory host
+        registry, not the hosts table, so a host connected to another
+        replica reads ``None`` here).
     """
 
     runner_online: bool
     host_online: bool | None
+    host_version: str | None = None
 
 
 def _build_session_list_item(
