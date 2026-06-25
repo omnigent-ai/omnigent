@@ -5662,8 +5662,12 @@ def _render_context_tree(
         + _CONTEXT_COIN_BUF * buf_coins
     )
 
-    free_tokens = max(context_window - message_tokens, 0)
     buf_tokens = int(context_window * buf_frac)
+    # Free space excludes the compaction buffer so the three rows partition the
+    # window (Messages + Free + Buffer = window) and each row's token count
+    # agrees with its own percentage. (Previously free omitted the buffer, so it
+    # read e.g. "920,150 tokens (72%)" — a count that is 92% of the window.)
+    free_tokens = max(context_window - message_tokens - buf_tokens, 0)
     used_pct = used_frac * 100.0
 
     tree.add(

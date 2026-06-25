@@ -2535,9 +2535,24 @@ class ClaudeSDKExecutor(Executor):
                     for m in _msgs
                     if isinstance(m.message, dict)
                 ]
+                if not _compacted:
+                    logger.warning(
+                        "Claude post-compaction read returned no messages "
+                        "(session=%s); resume will fall back to the synthetic "
+                        "summary instead of the harness's real compacted state.",
+                        claude_session_id,
+                    )
             except Exception:  # noqa: BLE001
-                logger.debug(
-                    "Failed to read Claude session messages for compaction persist",
+                # WARNING, not DEBUG: a swallowed read here silently degrades
+                # EVERY later resume of this conversation. The runner persists a
+                # compaction item with no ``compacted_messages``, so resume
+                # replays the lossy synthetic-summary pair instead of the
+                # harness's real post-compaction context. Surface it.
+                logger.warning(
+                    "Failed to read Claude post-compaction session messages "
+                    "(session=%s); resume fidelity for this conversation will "
+                    "degrade to the synthetic summary.",
+                    claude_session_id,
                     exc_info=True,
                 )
             yield CompactionComplete(

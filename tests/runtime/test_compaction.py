@@ -19,6 +19,7 @@ from omnigent.llms.types import MessageOutput, OutputText, Response
 from omnigent.runtime.compaction import (
     _BINARY_CONTENT_CLEARED,
     _TOOL_RESULT_CLEARED,
+    _is_summary_auth_error,
     _pair_aware_drop_count,
     _truncate_oldest,
     compact,
@@ -1506,3 +1507,32 @@ async def test_default_window_compacts_same_fill(monkeypatch: pytest.MonkeyPatch
         llm_client=_ReturnsTextClient("Summary of earlier context."),
     )
     assert result.summary_metadata is not None
+
+
+# ---------------------------------------------------------------------------
+# Layer-2 auth-failure detection (issue #1121: don't bury a 401)
+# ---------------------------------------------------------------------------
+
+
+def test_is_summary_auth_error_distinguishes_401_403() -> None:
+    """401/403 (by status code or message) are auth errors; others are not."""
+
+    class _Resp:
+        def __init__(self, code: int) -> None:
+            self.status_code = code
+
+    class _HTTPStatusError(Exception):
+        def __init__(self, code: int) -> None:
+            super().__init__(f"status {code}")
+            self.response = _Resp(code)
+
+    # By response.status_code (as httpx.HTTPStatusError carries it).
+    assert _is_summary_auth_error(_HTTPStatusError(401)) is True
+    assert _is_summary_auth_error(_HTTPStatusError(403)) is True
+    assert _is_summary_auth_error(_HTTPStatusError(500)) is False
+    # By message text (when no structured response is attached).
+    assert _is_summary_auth_error(Exception("Client error '401 Unauthorized'")) is True
+    assert _is_summary_auth_error(Exception("Forbidden")) is True
+    # Non-auth failures fall through to the generic warning path.
+    assert _is_summary_auth_error(Exception("connection reset by peer")) is False
+    assert _is_summary_auth_error(TimeoutError("read timed out")) is False
