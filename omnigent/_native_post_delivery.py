@@ -29,6 +29,8 @@ from pathlib import Path
 
 import httpx
 
+from omnigent._native_forwarder_health import record_post_failure as record_native_post_failure
+
 _logger = logging.getLogger(__name__)
 
 # Dead-letter sink for permanently-undeliverable forward payloads (#1120).
@@ -221,6 +223,11 @@ async def post_session_event_with_retry(
                     max_attempts,
                     exc,
                 )
+                # Surface this connectivity failure to the harness idle-turn
+                # watchdog so a stall caused by unreachable-server posts is
+                # reported with its real cause, not a generic "wedged LLM"
+                # reason (issue #1119).
+                record_native_post_failure(event_type, exc)
                 return None
             await sleep(retry_delay(attempt))
             continue
