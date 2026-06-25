@@ -1494,6 +1494,7 @@ function MainAgentSurface({
           >
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
+            <PreserveScrollDistanceOnResize />
             <ConversationScrollRefBridge onScroller={setScroller} />
             <HistoryAutoLoader
               hasMoreHistory={hasMoreHistory}
@@ -1777,6 +1778,76 @@ function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
     scrollToBottom("instant");
     requestAnimationFrame(() => scrollToBottom("instant"));
   }, [nonce, scrollToBottom]);
+
+  return null;
+}
+
+/**
+ * Preserves the transcript's distance-from-bottom whenever its scroll container
+ * resizes on the iOS shell — so the content you're looking at stays put while
+ * the soft keyboard opens/closes (and while the composer grows on focus).
+ *
+ * Two things resize the container, and neither is handled by `use-stick-to-
+ * bottom` (which only re-anchors on *content* resize): the keyboard, via
+ * `useIOSViewportLock` shrinking the app-shell; and the composer growing taller
+ * when focused (its send row / status line), which steals flex height from the
+ * transcript a couple of lines at a time — *without* firing a visualViewport
+ * resize. Watching only visualViewport missed the composer growth, which is why
+ * the transcript crept up ~2 lines on focus.
+ *
+ * So we watch the scroll container itself with a `ResizeObserver` and, on any
+ * size change, hold the scroll position relative to the bottom constant:
+ * `scrollTop = scrollHeight - clientHeight - distance`. `distance` is tracked
+ * from genuine user scrolls only — scrolls that coincide with a dimension change
+ * (the resize's own clamp, or our restore) are ignored so they can't corrupt it.
+ * At the bottom (distance 0) you stay at the bottom; scrolled up reading
+ * history, you keep seeing the same messages. New messages still go through the
+ * library (content resize doesn't change the container's box). Stateless across
+ * any number of keyboard cycles.
+ */
+function PreserveScrollDistanceOnResize() {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef?: React.RefObject<HTMLElement>;
+  };
+  const scrollRef = ctx.scrollRef;
+
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    const el = scrollRef?.current;
+    if (!el) return;
+
+    const measure = () => el.scrollHeight - el.clientHeight - el.scrollTop;
+    let distance = Math.max(0, measure());
+    let prevSH = el.scrollHeight;
+    let prevCH = el.clientHeight;
+
+    const onScroll = () => {
+      const sh = el.scrollHeight;
+      const ch = el.clientHeight;
+      // A scroll that lands on the same frame as a size change is resize-induced
+      // (the browser's clamp, or our own restore below) — not the user. Skip it
+      // so it can't overwrite the distance we're trying to preserve.
+      if (sh !== prevSH || ch !== prevCH) {
+        prevSH = sh;
+        prevCH = ch;
+        return;
+      }
+      distance = Math.max(0, measure());
+    };
+
+    const observer = new ResizeObserver(() => {
+      el.scrollTop = el.scrollHeight - el.clientHeight - distance;
+      prevSH = el.scrollHeight;
+      prevCH = el.clientHeight;
+    });
+
+    el.addEventListener("scroll", onScroll, { passive: true });
+    observer.observe(el);
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      observer.disconnect();
+    };
+  }, [scrollRef]);
 
   return null;
 }

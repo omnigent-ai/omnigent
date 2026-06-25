@@ -42,6 +42,15 @@ struct OmnigentWebView: UIViewRepresentable {
     webView.scrollView.backgroundColor = .clear
     webView.scrollView.contentInsetAdjustmentBehavior = .never
 
+    // Allow Safari Web Inspector to attach to the web content. Since iOS 16.4 a
+    // WKWebView is inspectable only when this is opt-in. Debug-only so shipping
+    // builds aren't inspectable.
+    #if DEBUG
+      if #available(iOS 16.4, *) {
+        webView.isInspectable = true
+      }
+    #endif
+
     let edgePan = UIScreenEdgePanGestureRecognizer(
       target: context.coordinator,
       action: #selector(Coordinator.handleLeftEdgePan(_:))
