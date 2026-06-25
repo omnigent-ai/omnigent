@@ -16858,6 +16858,7 @@ def create_sessions_router(
         # rows/blobs already created so a partial copy never persists.
         mapping: dict[str, str] = {}
         created: list[str] = []
+        copied: list[StoredFile] = []
         try:
             for stored, content in sources:
                 new = file_store.create(
@@ -16869,21 +16870,29 @@ def create_sessions_router(
                 created.append(new.id)
                 artifact_store.put(new.id, content)
                 mapping[stored.id] = new.id
-                resource = _stored_file_to_resource(session_id, new)
-                _publish_and_persist_resource_event(
-                    session_id,
-                    "session.resource.created",
-                    resource_id=new.id,
-                    resource_type="file",
-                    conversation_store=conversation_store,
-                    resource=resource,
-                )
+                copied.append(new)
         except Exception:
             for new_id in created:
                 with contextlib.suppress(Exception):
                     file_store.delete(new_id, session_id=session_id)
                     artifact_store.delete(new_id)
             raise
+
+        # Resource events fire only after every write lands. Publishing them
+        # inside the copy loop would emit (and persist as transcript items)
+        # ``session.resource.created`` for early files, then a later write
+        # failure would roll back the file rows/blobs without compensating
+        # those events — clients would see phantom files that no longer
+        # exist. Keep the create + event all-or-nothing together.
+        for new in copied:
+            _publish_and_persist_resource_event(
+                session_id,
+                "session.resource.created",
+                resource_id=new.id,
+                resource_type="file",
+                conversation_store=conversation_store,
+                resource=_stored_file_to_resource(session_id, new),
+            )
 
         return CopyFilesResponse(
             session_id=session_id,

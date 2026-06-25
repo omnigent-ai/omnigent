@@ -840,6 +840,31 @@ def _subagent_file_ids_from_args(args: dict[str, Any]) -> list[str]:
     return list(raw_ids)
 
 
+async def _teardown_failed_child(
+    server_client: httpx.AsyncClient,
+    child_session_id: str,
+    *,
+    created_child: bool,
+) -> None:
+    """Undo a failed named-send spawn so it leaves no phantom behind.
+
+    Unregisters the runner-local child/work mappings and, when this send
+    just created the server child session, deletes it. Deleting the child
+    also reclaims any files copied into it before the failure — leaving an
+    empty child behind would poison a retry with the same ``(agent, title)``
+    (the next send would attach to the phantom instead of spawning clean)
+    and orphan the copied file rows. Used on both the copy/content failure
+    and the message-post failure paths so they tear down identically.
+    """
+    from omnigent.runner import app as _runner_app
+
+    _runner_app.unregister_child_session(child_session_id)
+    _runner_app.unregister_subagent_work(child_session_id)
+    if created_child:
+        with contextlib.suppress(httpx.HTTPError):
+            await server_client.delete(f"/v1/sessions/{child_session_id}", timeout=30.0)
+
+
 async def _build_subagent_message_content(
     message: str,
     file_ids: list[str],
@@ -1448,15 +1473,7 @@ async def _execute_subagent_tool(
         server_client=server_client,
     )
     if content_error is not None:
-        _runner_app.unregister_child_session(child_session_id)
-        _runner_app.unregister_subagent_work(child_session_id)
-        # If we just created the server child session, tear it down too:
-        # session.created was already published, and leaving an empty child
-        # behind would poison a retry with the same (agent, title) — the
-        # next send would attach to the phantom instead of spawning clean.
-        if created_child:
-            with contextlib.suppress(httpx.HTTPError):
-                await server_client.delete(f"/v1/sessions/{child_session_id}", timeout=30.0)
+        await _teardown_failed_child(server_client, child_session_id, created_child=created_child)
         return content_error
 
     # Send the user message as a separate event so the server's
@@ -1480,12 +1497,10 @@ async def _execute_subagent_tool(
             timeout=_ASK_GATE_DELIVERY_TIMEOUT,
         )
     except httpx.HTTPError as exc:
-        _runner_app.unregister_child_session(child_session_id)
-        _runner_app.unregister_subagent_work(child_session_id)
+        await _teardown_failed_child(server_client, child_session_id, created_child=created_child)
         return f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
     if msg_resp.status_code >= 400:
-        _runner_app.unregister_child_session(child_session_id)
-        _runner_app.unregister_subagent_work(child_session_id)
+        await _teardown_failed_child(server_client, child_session_id, created_child=created_child)
         return (
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
         )

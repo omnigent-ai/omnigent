@@ -234,6 +234,7 @@ def _spawn_server_handler(
     copy_status: int = 200,
     copy_error: dict[str, Any] | None = None,
     deletes: list[str] | None = None,
+    events_status: int = 202,
 ):
     """
     Build a mock Omnigent-server handler for a fresh named spawn.
@@ -279,6 +280,8 @@ def _spawn_server_handler(
             return httpx.Response(200, json=meta)
         if request.method == "POST" and path == f"/v1/sessions/{_CHILD_ID}/events":
             events.append(json.loads(request.content))
+            if events_status >= 400:
+                return httpx.Response(events_status, json={"error": {"message": "boom"}})
             return httpx.Response(202, json={"queued": True})
         if request.method == "DELETE" and path == f"/v1/sessions/{_CHILD_ID}":
             if deletes is not None:
@@ -493,3 +496,40 @@ async def test_send_with_bad_file_id_surfaces_copy_error_and_posts_nothing(
     # The freshly-created server child is torn down so it can't poison a
     # retry with the same (agent, title) as a phantom existing child.
     assert deletes == [_CHILD_ID], "failed spawn must delete the empty child session"
+
+
+@pytest.mark.asyncio
+async def test_send_message_failure_after_copy_tears_down_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A copy that succeeds but a child events POST that then fails must
+    tear down the freshly-created child — the copy already wrote
+    child-scoped file rows, so leaving the child behind would orphan
+    those rows and poison a same-(agent, title) retry with a phantom.
+    """
+    events: list[dict[str, Any]] = []
+    copies: list[dict[str, Any]] = []
+    deletes: list[str] = []
+    handler = _spawn_server_handler(
+        events=events,
+        copies=copies,
+        mapping={"file_parent": "file_child"},
+        file_meta={"file_child": _file_resource("file_child", "notes.txt")},
+        deletes=deletes,
+        events_status=500,
+    )
+
+    output = await _run_spawn(
+        monkeypatch,
+        args_payload={"input": "use this", "file_ids": ["file_parent"]},
+        handler=handler,
+    )
+
+    assert output.startswith("Error: failed to send message to child:"), output
+    assert "500" in output
+    # Copy happened and the event was attempted, but the failure must
+    # delete the child (which reclaims the copied file rows with it).
+    assert len(copies) == 1
+    assert len(events) == 1
+    assert deletes == [_CHILD_ID], "send failure after copy must delete the child"

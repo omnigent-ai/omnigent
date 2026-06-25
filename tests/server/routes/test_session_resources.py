@@ -1821,6 +1821,50 @@ async def test_copy_files_missing_source_file_is_all_or_nothing(
 
 
 @pytest.mark.asyncio
+async def test_copy_files_midbatch_write_failure_persists_no_resource_events(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+    file_conv_store: _ConversationStore,
+) -> None:
+    """A write that fails mid-batch leaves no rows AND no resource events.
+
+    Resource events fire only after every write lands, so a second-file
+    failure rolls back the first file's row/blob and never persists a
+    ``session.resource.created`` for it — clients must not see a phantom
+    file that was rolled back.
+    """
+    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aa")
+    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bb")
+    file_conv_store.appended_items.clear()
+    before = file_store.list(session_id="conv_c").data
+
+    real_put = artifact_store.put
+    calls = {"n": 0}
+
+    def _put_then_fail(key: str, data: bytes) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("blob backend down")
+        real_put(key, data)
+
+    artifact_store.put = _put_then_fail  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="blob backend down"):
+        await file_client.post(
+            "/v1/sessions/conv_c/resources/files:copy",
+            json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+        )
+
+    # First file's row + blob rolled back: destination unchanged.
+    after = file_store.list(session_id="conv_c").data
+    assert len(after) == len(before)
+    # No phantom resource event persisted for the rolled-back first file.
+    events = [i for i in file_conv_store.appended_items if i.type == "resource_event"]
+    assert events == [], f"rolled-back copy must persist no resource events, got {events}"
+
+
+@pytest.mark.asyncio
 async def test_copy_files_self_source_is_rejected(
     file_client: httpx.AsyncClient,
     file_store: Any,
