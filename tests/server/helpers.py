@@ -622,6 +622,7 @@ def build_agent_bundle(
     skills: list[dict[str, str]] | None = None,
     guardrails: dict[str, Any] | None = None,
     terminals: dict[str, Any] | None = None,
+    include_llm: bool = True,
 ) -> bytes:
     """
     Build a minimal valid agent bundle (tar.gz) for testing.
@@ -655,6 +656,8 @@ def build_agent_bundle(
     :param terminals: Optional ``terminals:`` block written verbatim
         into the spec, e.g. ``{"shell": {"command": "bash"}}``.
         ``None`` omits it (the agent has no terminal access).
+    :param include_llm: Whether to include the default ``llm:`` block.
+        Set ``False`` for model-less harness tests.
     :returns: A gzipped tar archive containing the generated
         ``config.yaml`` plus optional sub-agent and skill files.
     """
@@ -662,15 +665,16 @@ def build_agent_bundle(
     config: dict[str, Any] = {
         "spec_version": 1,
         "name": name,
+    }
+    if include_llm:
         # LLM config is required for the real workflow to execute.
         # The model value must match the agent name used by tests.
-        "llm": {
+        config["llm"] = {
             "model": name,
             # api_key is required by spec validation; the workflow
             # uses the mock LLM client so it's never actually sent.
             "connection": {"api_key": "test-key"},
-        },
-    }
+        }
     if description is not None:
         config["description"] = description
     if guardrails is not None:
@@ -753,6 +757,7 @@ async def create_test_agent(
     skills: list[dict[str, str]] | None = None,
     user: str | None = None,
     guardrails: dict[str, Any] | None = None,
+    include_llm: bool = True,
 ) -> dict[str, Any]:
     """
     Create an agent via multipart session create and return the agent JSON.
@@ -778,6 +783,8 @@ async def create_test_agent(
     :param guardrails: Optional ``guardrails:`` block for the agent
         spec (e.g. a ``cost_budget`` policy). Passed verbatim to
         :func:`build_agent_bundle`. ``None`` omits guardrails.
+    :param include_llm: Whether to include the default ``llm:`` block.
+        Set ``False`` for model-less harness tests.
     :returns: Parsed agent response body from the session agent
         endpoint, with an extra ``_session_id`` key for the owning
         session.
@@ -789,6 +796,7 @@ async def create_test_agent(
         executor=executor,
         skills=skills,
         guardrails=guardrails,
+        include_llm=include_llm,
     )
     metadata: dict[str, Any] = {}
     headers: dict[str, str] = {}
