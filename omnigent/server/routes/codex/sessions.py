@@ -54,7 +54,7 @@ def _codex_goal_error(status_code: int, *, detail: str) -> JSONResponse:
     """Build a public Codex goal route error response."""
     return JSONResponse(
         status_code=status_code,
-        content={"error": _CODEX_NATIVE_GOAL_ERROR, "detail": detail},
+        content={"error": {"code": _CODEX_NATIVE_GOAL_ERROR, "message": detail}},
     )
 
 

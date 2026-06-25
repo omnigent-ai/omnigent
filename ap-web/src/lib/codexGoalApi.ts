@@ -85,13 +85,21 @@ export interface SetCodexGoalInput {
  */
 export type CodexGoalStatusUpdate = "active" | "paused";
 
-async function apiErrorFromResponse(res: Response): Promise<ApiError> {
+export async function __codexGoalApiErrorFromResponseForTest(res: Response): Promise<ApiError> {
   let message = `${res.status} ${res.statusText}`;
   let code: string | null = null;
   try {
-    const body = (await res.json()) as { error?: { code?: string; message?: string } };
-    if (body.error?.message) message = body.error.message;
-    if (body.error?.code) code = body.error.code;
+    const body = (await res.json()) as {
+      detail?: string;
+      error?: string | { code?: string; message?: string };
+    };
+    if (typeof body.error === "string") {
+      code = body.error;
+      if (typeof body.detail === "string") message = body.detail;
+    } else {
+      if (body.error?.message) message = body.error.message;
+      if (body.error?.code) code = body.error.code;
+    }
   } catch {
     // Non-JSON / empty body - keep the status-line fallback.
   }
@@ -99,7 +107,7 @@ async function apiErrorFromResponse(res: Response): Promise<ApiError> {
 }
 
 async function readJsonOrThrow<T>(res: Response): Promise<T> {
-  if (!res.ok) throw await apiErrorFromResponse(res);
+  if (!res.ok) throw await __codexGoalApiErrorFromResponseForTest(res);
   return (await res.json()) as T;
 }
 

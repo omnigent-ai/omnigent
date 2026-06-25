@@ -275,11 +275,11 @@ function codexGoalError(prefix: string, err: unknown): string {
  * @returns Positive integer budget, or ``null`` when the field is blank.
  * @throws Error when the value is not a positive whole number.
  */
-function parseCodexGoalBudget(value: string): number | null {
+export function __parseCodexGoalBudgetForTest(value: string): number | null {
   const trimmedBudget = value.trim();
   if (!trimmedBudget) return null;
   const parsed = Number(trimmedBudget);
-  if (!Number.isInteger(parsed) || parsed <= 0) {
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
     throw new Error("Token budget must be a positive whole number.");
   }
   return parsed;
@@ -451,7 +451,7 @@ function useCodexGoalDialogState({
     }
     let parsedBudget: number | null;
     try {
-      parsedBudget = parseCodexGoalBudget(tokenBudget);
+      parsedBudget = __parseCodexGoalBudgetForTest(tokenBudget);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       return;

@@ -317,7 +317,8 @@ async def test_omnigent_codex_goal_put_without_live_runner_returns_503() -> None
         )
 
     assert response.status_code == 503
-    assert response.json()["error"] == "codex_native_goal_failed"
+    assert response.json()["error"]["code"] == "codex_native_goal_failed"
+    assert "no live Codex runner" in response.json()["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -368,7 +369,8 @@ async def test_omnigent_codex_goal_api_maps_malformed_runner_body_to_502() -> No
         )
 
     assert response.status_code == 502
-    assert response.json()["error"] == "codex_native_goal_failed"
+    assert response.json()["error"]["code"] == "codex_native_goal_failed"
+    assert "malformed response" in response.json()["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -389,7 +391,8 @@ async def test_omnigent_codex_goal_api_maps_partial_goal_to_502() -> None:
         response = await client.get("/v1/sessions/conv_codex/codex_goal")
 
     assert response.status_code == 502
-    assert response.json()["error"] == "codex_native_goal_failed"
+    assert response.json()["error"]["code"] == "codex_native_goal_failed"
+    assert "malformed response" in response.json()["error"]["message"]
 
 
 @pytest.mark.asyncio
