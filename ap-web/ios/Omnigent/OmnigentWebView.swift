@@ -260,6 +260,7 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func detach() {
+      parent.model.cancelServerSwitcherWatchdog()
       webView = nil
     }
 
@@ -314,6 +315,9 @@ struct OmnigentWebView: UIViewRepresentable {
       _ userContentController: WKUserContentController, didReceive message: WKScriptMessage
     ) {
       guard isTrustedBridgeMessage(message) else { return }
+      // Any trusted message proves the page is alive and driving the bridge, so
+      // stand down the liveness watchdog — the page owns the switcher from here.
+      parent.model.cancelServerSwitcherWatchdog()
       guard let body = message.body as? [String: Any],
         let method = body["method"] as? String
       else { return }
@@ -352,6 +356,7 @@ struct OmnigentWebView: UIViewRepresentable {
       parent.model.isLoading = true
       parent.model.currentURL = webView.url ?? parent.model.currentURL
       parent.model.serverSwitcherHidden = true
+      parent.model.armServerSwitcherWatchdog()
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
@@ -498,6 +503,7 @@ struct OmnigentWebView: UIViewRepresentable {
       let nsError = error as NSError
       guard nsError.code != NSURLErrorCancelled else { return }
       parent.model.isLoading = false
+      parent.model.cancelServerSwitcherWatchdog()
 
       let failedURL = failedURL(from: nsError) ?? webView.url ?? pinnedURL ?? parent.initialURL
       guard failedURL.omnigentOrigin == pinnedOrigin else { return }
