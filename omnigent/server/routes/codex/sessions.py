@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, Response
 from starlette.datastructures import State
 
 from omnigent.entities import Conversation
@@ -16,6 +17,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
+from omnigent.native_coding_agents import CODEX_NATIVE_CODING_AGENT
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
@@ -45,12 +47,38 @@ from omnigent.stores.permission_store import PermissionStore
 _logger = logging.getLogger(__name__)
 
 
+_CODEX_NATIVE_GOAL_ERROR = "codex_native_goal_failed"
+
+
+def _codex_goal_error(status_code: int, *, detail: str) -> JSONResponse:
+    """Build a public Codex goal route error response."""
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": _CODEX_NATIVE_GOAL_ERROR, "detail": detail},
+    )
+
+
+def _runner_error_payload(body: str) -> dict[str, Any] | None:
+    """Return a structured runner ``{error, detail}`` body if present."""
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    detail = payload.get("detail")
+    if isinstance(error, str) and isinstance(detail, str):
+        return {"error": error, "detail": detail}
+    return None
+
+
 def _require_codex_goal_runner_payload(
     session_id: str,
     *,
     action: str,
     runner_result: _RunnerForwardResult | None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """
     Return the JSON payload from a required Codex goal runner forward.
 
@@ -64,34 +92,44 @@ def _require_codex_goal_runner_payload(
     :param action: Human-readable goal operation, e.g. ``"read"``.
     :param runner_result: HTTP result returned by the runner, or ``None``
         when no runner could be reached.
-    :returns: Parsed runner JSON payload, e.g. ``{"goal": None}``.
-    :raises OmnigentError: If no runner was reachable, the runner rejected the
-        operation, or the runner returned a malformed payload.
+    :returns: Parsed runner JSON payload, e.g. ``{"goal": None}``, or a
+        prebuilt error response for transport/upstream failures.
     """
     if runner_result is None:
-        raise OmnigentError(
-            f"Could not {action} Codex goal: no live Codex runner is available "
-            f"for session {session_id!r}. Reconnect the session and try again.",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
+        return _codex_goal_error(
+            503,
+            detail=(
+                f"Could not {action} Codex goal: no live Codex runner is available "
+                f"for session {session_id!r}. Reconnect the session and try again."
+            ),
         )
     if not 200 <= runner_result.status_code < 300:
-        raise OmnigentError(
-            f"Could not {action} Codex goal: runner returned status "
-            f"{runner_result.status_code} for session {session_id!r}. "
-            f"Reconnect the session and try again.",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
+        structured_error = _runner_error_payload(runner_result.body)
+        if structured_error is not None:
+            return JSONResponse(
+                status_code=runner_result.status_code,
+                content=structured_error,
+            )
+        return _codex_goal_error(
+            502,
+            detail=(
+                f"Could not {action} Codex goal: runner returned malformed "
+                f"error response with status {runner_result.status_code} "
+                f"for session {session_id!r}."
+            ),
         )
     try:
         payload = json.loads(runner_result.body)
     except json.JSONDecodeError as exc:
-        raise OmnigentError(
-            f"Could not {action} Codex goal: runner returned a malformed response.",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        ) from exc
+        del exc
+        return _codex_goal_error(
+            502,
+            detail=f"Could not {action} Codex goal: runner returned a malformed response.",
+        )
     if not isinstance(payload, dict):
-        raise OmnigentError(
-            f"Could not {action} Codex goal: runner returned a malformed response.",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
+        return _codex_goal_error(
+            502,
+            detail=f"Could not {action} Codex goal: runner returned a malformed response.",
         )
     return payload
 
@@ -374,6 +412,8 @@ async def _forward_codex_goal_event(
     )
     if runner_result is not None:
         return runner_result
+    if event.get("type") == "goal_get":
+        return None
     runner_client = await _launch_runner_for_codex_goal(
         session_id=session_id,
         conv=conv,
@@ -409,7 +449,10 @@ async def _require_codex_native_goal_session(
             "Session not found",
             code=ErrorCode.NOT_FOUND,
         )
-    if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != "codex-native-ui":
+    if (
+        conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+        != CODEX_NATIVE_CODING_AGENT.wrapper_label
+    ):
         raise OmnigentError(
             "codex_goal is only supported for codex-native sessions",
             code=ErrorCode.INVALID_INPUT,
@@ -435,7 +478,7 @@ def register_codex_session_routes(
     async def get_codex_goal(
         request: Request,
         session_id: str,
-    ) -> CodexGoalResponse:
+    ) -> CodexGoalResponse | Response:
         """
         Read the current Codex app-server goal for a Codex-native session.
 
@@ -456,28 +499,34 @@ def register_codex_session_routes(
             conversation_store,
         )
         conv = await _require_codex_native_goal_session(session_id, conversation_store)
+        runner_result = await _forward_codex_goal_event(
+            session_id=session_id,
+            conv=conv,
+            event={"type": "goal_get"},
+            request=request,
+            user_id=user_id,
+            runner_router=runner_router,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+            runner_exit_reports=runner_exit_reports,
+        )
+        if runner_result is None:
+            return CodexGoalResponse(goal=None)
         runner_payload = _require_codex_goal_runner_payload(
             session_id,
             action="read",
-            runner_result=await _forward_codex_goal_event(
-                session_id=session_id,
-                conv=conv,
-                event={"type": "goal_get"},
-                request=request,
-                user_id=user_id,
-                runner_router=runner_router,
-                conversation_store=conversation_store,
-                permission_store=permission_store,
-                runner_exit_reports=runner_exit_reports,
-            ),
+            runner_result=runner_result,
         )
+        if isinstance(runner_payload, JSONResponse):
+            return runner_payload
         try:
             return CodexGoalResponse.model_validate(runner_payload)
         except ValueError as exc:
-            raise OmnigentError(
-                "Could not read Codex goal: runner returned a malformed response.",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
-            ) from exc
+            del exc
+            return _codex_goal_error(
+                502,
+                detail="Could not read Codex goal: runner returned a malformed response.",
+            )
 
     @router.put(
         "/sessions/{session_id}/codex_goal",
@@ -487,7 +536,7 @@ def register_codex_session_routes(
         request: Request,
         session_id: str,
         body: SetCodexGoalRequest,
-    ) -> CodexGoalResponse:
+    ) -> CodexGoalResponse | Response:
         """
         Set or replace the current Codex app-server goal.
 
@@ -539,13 +588,16 @@ def register_codex_session_routes(
                 runner_exit_reports=runner_exit_reports,
             ),
         )
+        if isinstance(runner_payload, JSONResponse):
+            return runner_payload
         try:
             return CodexGoalResponse.model_validate(runner_payload)
         except ValueError as exc:
-            raise OmnigentError(
-                "Could not set Codex goal: runner returned a malformed response.",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
-            ) from exc
+            del exc
+            return _codex_goal_error(
+                502,
+                detail="Could not set Codex goal: runner returned a malformed response.",
+            )
 
     @router.patch(
         "/sessions/{session_id}/codex_goal/status",
@@ -555,7 +607,7 @@ def register_codex_session_routes(
         request: Request,
         session_id: str,
         body: UpdateCodexGoalStatusRequest,
-    ) -> CodexGoalResponse:
+    ) -> CodexGoalResponse | Response:
         """
         Pause or resume the current Codex app-server goal.
 
@@ -597,13 +649,16 @@ def register_codex_session_routes(
                 runner_exit_reports=runner_exit_reports,
             ),
         )
+        if isinstance(runner_payload, JSONResponse):
+            return runner_payload
         try:
             return CodexGoalResponse.model_validate(runner_payload)
         except ValueError as exc:
-            raise OmnigentError(
-                "Could not update Codex goal status: runner returned a malformed response.",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
-            ) from exc
+            del exc
+            return _codex_goal_error(
+                502,
+                detail="Could not update Codex goal status: runner returned a malformed response.",
+            )
 
     @router.delete(
         "/sessions/{session_id}/codex_goal",
@@ -612,7 +667,7 @@ def register_codex_session_routes(
     async def clear_codex_goal(
         request: Request,
         session_id: str,
-    ) -> ClearCodexGoalResponse:
+    ) -> ClearCodexGoalResponse | Response:
         """
         Clear the current Codex app-server goal.
 
@@ -647,10 +702,13 @@ def register_codex_session_routes(
                 runner_exit_reports=runner_exit_reports,
             ),
         )
+        if isinstance(runner_payload, JSONResponse):
+            return runner_payload
         try:
             return ClearCodexGoalResponse.model_validate(runner_payload)
         except ValueError as exc:
-            raise OmnigentError(
-                "Could not clear Codex goal: runner returned a malformed response.",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
-            ) from exc
+            del exc
+            return _codex_goal_error(
+                502,
+                detail="Could not clear Codex goal: runner returned a malformed response.",
+            )

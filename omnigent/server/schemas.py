@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from typing import Annotated, Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
 
 from omnigent.entities import ConversationItem
 
@@ -1814,9 +1814,9 @@ class CodexGoalObject(BaseModel):
     thread_id: str
     objective: str
     status: str
-    token_budget: int | None = None
-    tokens_used: int
-    time_used_seconds: int
+    token_budget: Annotated[int, Strict(), Field(gt=0)] | None = None
+    tokens_used: Annotated[int, Strict(), Field(ge=0)]
+    time_used_seconds: Annotated[int, Strict(), Field(ge=0)]
     created_at: int | None = None
     updated_at: int | None = None
 
@@ -1849,7 +1849,7 @@ class SetCodexGoalRequest(BaseModel):
     """
 
     objective: str = Field(min_length=1, max_length=4000)
-    token_budget: int | None = Field(default=None, gt=0)
+    token_budget: Annotated[int, Strict(), Field(gt=0)] | None = None
     status: Literal["active", "paused"] | None = None
 
     model_config = ConfigDict(extra="forbid")

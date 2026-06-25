@@ -15,6 +15,8 @@ from typing import Any, Protocol
 
 from fastapi.responses import JSONResponse, Response
 
+from omnigent.native_coding_agents import CODEX_NATIVE_CODING_AGENT
+
 
 class BridgeStateForSession(Protocol):
     """Callable that resolves a live Codex app-server bridge state."""
@@ -57,15 +59,43 @@ class CodexGoalRunner:
         API uses snake_case, so normalize the goal at the runner boundary
         before returning it through ``/events``.
         """
+        def required_str(name: str) -> str:
+            value = goal.get(name)
+            if not isinstance(value, str):
+                raise ValueError(f"malformed upstream goal: missing string {name!r}")
+            return value
+
+        def required_non_negative_int(name: str) -> int:
+            value = goal.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"malformed upstream goal: missing non-negative integer {name!r}")
+            return value
+
+        def optional_int(name: str) -> int | None:
+            value = goal.get(name)
+            if value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"malformed upstream goal: invalid integer {name!r}")
+            return value
+
+        token_budget = goal.get("tokenBudget")
+        if token_budget is not None and (
+            isinstance(token_budget, bool)
+            or not isinstance(token_budget, int)
+            or token_budget <= 0
+        ):
+            raise ValueError("malformed upstream goal: invalid integer 'tokenBudget'")
+
         return {
-            "thread_id": goal["threadId"],
-            "objective": goal["objective"],
-            "status": goal["status"],
-            "token_budget": goal.get("tokenBudget"),
-            "tokens_used": goal["tokensUsed"],
-            "time_used_seconds": goal["timeUsedSeconds"],
-            "created_at": goal.get("createdAt"),
-            "updated_at": goal.get("updatedAt"),
+            "thread_id": required_str("threadId"),
+            "objective": required_str("objective"),
+            "status": required_str("status"),
+            "token_budget": token_budget,
+            "tokens_used": required_non_negative_int("tokensUsed"),
+            "time_used_seconds": required_non_negative_int("timeUsedSeconds"),
+            "created_at": optional_int("createdAt"),
+            "updated_at": optional_int("updatedAt"),
         }
 
     @staticmethod
@@ -80,7 +110,7 @@ class CodexGoalRunner:
     def _bridge_error(action: str) -> JSONResponse:
         """Build the standard no-bridge response for Codex goal operations."""
         return JSONResponse(
-            status_code=503,
+            status_code=502,
             content={
                 "error": "codex_native_goal_failed",
                 "detail": (f"Codex-native goal {action} requires a loaded Codex bridge."),
@@ -122,6 +152,8 @@ class CodexGoalRunner:
                 await codex_client.request(method, {"threadId": state.thread_id, **params}),
                 action=action,
             )
+        except ValueError as exc:
+            return self._malformed_response(action, str(exc))
         except Exception as exc:  # noqa: BLE001 - surface app-server goal failures to AP.
             self._logger.warning(
                 "Codex-native %s failed for session=%s",
@@ -156,7 +188,11 @@ class CodexGoalRunner:
         goal = result.get("goal")
         if goal is not None and not isinstance(goal, dict):
             return self._malformed_response("read", "invalid goal object")
-        return JSONResponse({"goal": None if goal is None else self._goal_to_api(goal)})
+        try:
+            api_goal = None if goal is None else self._goal_to_api(goal)
+        except ValueError as exc:
+            return self._malformed_response("read", str(exc))
+        return JSONResponse({"goal": api_goal})
 
     async def set(
         self,
@@ -186,7 +222,11 @@ class CodexGoalRunner:
         goal = result.get("goal")
         if not isinstance(goal, dict):
             return self._malformed_response("set", "invalid goal object")
-        return JSONResponse({"goal": self._goal_to_api(goal)})
+        try:
+            api_goal = self._goal_to_api(goal)
+        except ValueError as exc:
+            return self._malformed_response("set", str(exc))
+        return JSONResponse({"goal": api_goal})
 
     async def update_status(self, conv_id: str, *, status: str) -> Response:
         """
@@ -210,7 +250,11 @@ class CodexGoalRunner:
                 "update status",
                 "invalid goal object",
             )
-        return JSONResponse({"goal": self._goal_to_api(goal)})
+        try:
+            api_goal = self._goal_to_api(goal)
+        except ValueError as exc:
+            return self._malformed_response("update status", str(exc))
+        return JSONResponse({"goal": api_goal})
 
     async def clear(self, conv_id: str) -> Response:
         """Clear the current Codex app-server goal for a loaded thread."""
@@ -239,7 +283,7 @@ class CodexGoalRunner:
         if body_type not in {"goal_get", "goal_set", "goal_status", "goal_clear"}:
             return None
 
-        if session_harness_name(conv_id) != "codex-native":
+        if session_harness_name(conv_id) != CODEX_NATIVE_CODING_AGENT.harness:
             return JSONResponse(
                 status_code=400,
                 content={
@@ -264,6 +308,14 @@ class CodexGoalRunner:
                     content={
                         "error": "invalid_input",
                         "detail": "Body 'objective' must be a non-empty string",
+                    },
+                )
+            if len(objective) > 4000:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_input",
+                        "detail": "Body 'objective' must be at most 4000 characters",
                     },
                 )
             token_budget_provided = isinstance(body, dict) and "token_budget" in body

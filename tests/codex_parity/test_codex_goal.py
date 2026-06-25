@@ -52,6 +52,17 @@ class _CodexGoalConversationStore:
                     "omnigent.ui": "terminal",
                     "omnigent.wrapper": "codex-native-ui",
                 },
+            ),
+            "conv_codex_no_runner": Conversation(
+                id="conv_codex_no_runner",
+                created_at=1,
+                updated_at=1,
+                root_conversation_id="conv_codex_no_runner",
+                agent_id="ag_codex",
+                labels={
+                    "omnigent.ui": "terminal",
+                    "omnigent.wrapper": "codex-native-ui",
+                },
             )
         }
 
@@ -66,8 +77,16 @@ class _CodexGoalAgentStore:
 
 
 class _CodexGoalRunnerClient:
-    def __init__(self, *, response_status: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        response_status: str | None = None,
+        response_body: dict[str, Any] | str | None = None,
+        status_code: int = 200,
+    ) -> None:
         self.response_status = response_status
+        self.response_body = response_body
+        self.status_code = status_code
         self.post_json_calls: list[tuple[str, Any]] = []
 
     async def post(
@@ -79,6 +98,18 @@ class _CodexGoalRunnerClient:
     ) -> httpx.Response:
         del timeout
         self.post_json_calls.append((url, json))
+        if isinstance(self.response_body, str):
+            return httpx.Response(
+                status_code=self.status_code,
+                text=self.response_body,
+                request=httpx.Request("POST", url),
+            )
+        if self.response_body is not None:
+            return httpx.Response(
+                status_code=self.status_code,
+                json=self.response_body,
+                request=httpx.Request("POST", url),
+            )
         requested_status = json.get("status") if isinstance(json, dict) else None
         status = self.response_status or (
             requested_status if isinstance(requested_status, str) else "active"
@@ -106,15 +137,16 @@ class _CodexGoalRoutedRunner:
 
 
 class _CodexGoalRunnerRouter:
-    def __init__(self, client: _CodexGoalRunnerClient) -> None:
+    def __init__(self, client: _CodexGoalRunnerClient | None) -> None:
         self.client = client
 
     def client_for_session_resources(self, session_id: str) -> _CodexGoalRoutedRunner:
-        assert session_id == "conv_codex"
+        if self.client is None or session_id == "conv_codex_no_runner":
+            raise LookupError(session_id)
         return _CodexGoalRoutedRunner(self.client)
 
 
-def _codex_goal_api_app(runner_client: _CodexGoalRunnerClient) -> FastAPI:
+def _codex_goal_api_app(runner_client: _CodexGoalRunnerClient | None) -> FastAPI:
     app = FastAPI()
 
     @app.exception_handler(OmnigentError)
@@ -259,6 +291,105 @@ async def test_omnigent_codex_goal_set_api_forwards_mode_configuration() -> None
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_omnigent_codex_goal_get_without_live_runner_returns_empty_read_only() -> None:
+    app = _codex_goal_api_app(None)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/sessions/conv_codex_no_runner/codex_goal")
+
+    assert response.status_code == 200
+    assert response.json() == {"goal": None}
+
+
+@pytest.mark.asyncio
+async def test_omnigent_codex_goal_put_without_live_runner_returns_503() -> None:
+    app = _codex_goal_api_app(None)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.put(
+            "/v1/sessions/conv_codex_no_runner/codex_goal",
+            json={"objective": "Finish parity"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "codex_native_goal_failed"
+
+
+@pytest.mark.asyncio
+async def test_omnigent_codex_goal_set_api_rejects_boolean_token_budget() -> None:
+    runner_client = _CodexGoalRunnerClient()
+    app = _codex_goal_api_app(runner_client)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.put(
+            "/v1/sessions/conv_codex/codex_goal",
+            json={"objective": "Finish parity", "token_budget": True},
+        )
+
+    assert response.status_code == 422
+    assert runner_client.post_json_calls == []
+
+
+@pytest.mark.asyncio
+async def test_omnigent_codex_goal_api_preserves_runner_4xx_error_payload() -> None:
+    runner_client = _CodexGoalRunnerClient(
+        status_code=400,
+        response_body={"error": "invalid_input", "detail": "harness mismatch"},
+    )
+    app = _codex_goal_api_app(runner_client)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.put(
+            "/v1/sessions/conv_codex/codex_goal",
+            json={"objective": "Finish parity"},
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid_input", "detail": "harness mismatch"}
+
+
+@pytest.mark.asyncio
+async def test_omnigent_codex_goal_api_maps_malformed_runner_body_to_502() -> None:
+    runner_client = _CodexGoalRunnerClient(response_body="not-json")
+    app = _codex_goal_api_app(runner_client)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.put(
+            "/v1/sessions/conv_codex/codex_goal",
+            json={"objective": "Finish parity"},
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"] == "codex_native_goal_failed"
+
+
+@pytest.mark.asyncio
+async def test_omnigent_codex_goal_api_maps_partial_goal_to_502() -> None:
+    runner_client = _CodexGoalRunnerClient(
+        response_body={
+            "goal": {
+                "thread_id": "thread_goal_test",
+                "objective": "Finish parity",
+                "status": "active",
+            }
+        }
+    )
+    app = _codex_goal_api_app(runner_client)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/sessions/conv_codex/codex_goal")
+
+    assert response.status_code == 502
+    assert response.json()["error"] == "codex_native_goal_failed"
 
 
 @pytest.mark.asyncio

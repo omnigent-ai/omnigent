@@ -285,12 +285,14 @@
             "type": "string"
           },
           "time_used_seconds": {
+            "minimum": 0.0,
             "title": "Time Used Seconds",
             "type": "integer"
           },
           "token_budget": {
             "anyOf": [
               {
+                "exclusiveMinimum": 0.0,
                 "type": "integer"
               },
               {
@@ -300,6 +302,7 @@
             "title": "Token Budget"
           },
           "tokens_used": {
+            "minimum": 0.0,
             "title": "Tokens Used",
             "type": "integer"
           },
