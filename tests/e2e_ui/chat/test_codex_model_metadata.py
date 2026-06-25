@@ -108,14 +108,14 @@ def test_codex_native_picker_uses_raw_model_metadata(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    expect(page.get_by_test_id("composer-model-effort")).to_contain_text(
-        "Codex Pretty 5.5 xhigh",
-        timeout=15_000,
-    )
-
+    # The model/effort label now lives in the picker trigger (it's the
+    # control that changes them); the harness identity moved to the tray.
     trigger = page.get_by_test_id("agent-picker-trigger")
+    expect(trigger).to_contain_text("Codex Pretty 5.5 xhigh", timeout=15_000)
+
+    expect(page.get_by_test_id("composer-harness")).to_contain_text("Codex")
+
     expect(trigger).to_be_visible()
-    expect(trigger).to_contain_text("Codex")
     trigger.click()
 
     model_row = page.locator('[data-testid="model-picker-item"][data-model-id="gpt-5.5"]')

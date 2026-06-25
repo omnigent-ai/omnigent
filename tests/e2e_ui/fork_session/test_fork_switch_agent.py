@@ -260,10 +260,13 @@ def test_fork_into_pi_labels_model_picker_pi(
         f"expected the fork to bind the target's verbatim name, got {bound_name!r}"
     )
 
-    # The model-picker pill shows the friendly "Pi" — the raw wrapper slug
-    # ("native-ui") must be gone. Pre-fix this read "Pi-native-ui".
-    trigger = page.get_by_test_id("agent-picker-trigger")
-    expect(trigger).to_be_visible(timeout=30_000)
-    expect(trigger).to_contain_text("Pi")
-    expect(trigger).not_to_contain_text("native-ui")
-    expect(trigger).not_to_contain_text("fork")
+    # The harness identity in the status tray shows the friendly "Pi" — the
+    # raw wrapper slug ("native-ui") must be gone. Pre-fix this read
+    # "Pi-native-ui". The identity moved out of the picker trigger into the
+    # status tray; a Pi-native session exposes no web-UI model/effort switch,
+    # so the trigger renders nothing and the tray carries the identity.
+    harness = page.get_by_test_id("composer-harness")
+    expect(harness).to_be_visible(timeout=30_000)
+    expect(harness).to_contain_text("Pi")
+    expect(harness).not_to_contain_text("native-ui")
+    expect(harness).not_to_contain_text("fork")
