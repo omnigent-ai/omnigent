@@ -19,6 +19,7 @@ from omnigent.antigravity_native_bridge import (
     build_mcp_config,
     clear_bridge_state,
     ensure_agy_onboarding_complete,
+    inject_slash_command,
     inject_user_message_via_tui,
     prepare_bridge_dir,
     read_bridge_state,
@@ -1011,6 +1012,136 @@ def test_inject_user_message_via_tui_rejects_empty_content(tmp_path: Path) -> No
     """Empty content is a programming error, not something to type into the TUI."""
     with pytest.raises(RuntimeError, match="non-empty content"):
         inject_user_message_via_tui(tmp_path / "bridge", content="")
+
+
+# ---------------------------------------------------------------------------
+# Live-control slash commands (inject_slash_command)
+# ---------------------------------------------------------------------------
+
+
+def test_inject_slash_command_clears_draft_sends_literal_then_enter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Slash commands flow via C-a + C-k (clear) + literal send + Enter.
+
+    The clear kills any draft the user is mid-typing — otherwise the literal
+    send concatenates and Enter submits ``<draft>/model ...`` as a turn. ``-l``
+    is required so tmux sends ``/`` and spaces literally; the trailing Enter
+    submits.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+
+    captured: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Record one tmux invocation; return rc=0."""
+        del kwargs
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_slash_command(bridge_dir, command="/model gemini-2.5-pro")
+
+    # Four tmux calls in order: C-a, C-k (clear), literal send, Enter.
+    assert len(captured) == 4, (
+        f"Expected 4 tmux send-keys calls (C-a + C-k + literal + Enter), got {captured}"
+    )
+    clear_home, clear_kill, literal, submit = captured
+    assert clear_home == ["tmux", "-S", "/tmp/ex/tmux.sock", "send-keys", "-t", "main", "C-a"]
+    assert clear_kill == ["tmux", "-S", "/tmp/ex/tmux.sock", "send-keys", "-t", "main", "C-k"]
+    assert literal == [
+        "tmux",
+        "-S",
+        "/tmp/ex/tmux.sock",
+        "send-keys",
+        "-l",
+        "-t",
+        "main",
+        "/model gemini-2.5-pro",
+    ]
+    assert submit == ["tmux", "-S", "/tmp/ex/tmux.sock", "send-keys", "-t", "main", "Enter"]
+
+
+def test_inject_slash_command_auto_confirm_sends_extra_enter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``auto_confirm=True`` sends a second Enter to accept a TUI confirm dialog.
+
+    ``/model`` can pop a confirmation prompt the chat UI can't render; the extra
+    Enter accepts its default. When no dialog appears the keystroke is a no-op.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+
+    enters = {"n": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Count Enter sends; return rc=0."""
+        del kwargs
+        if cmd[-1] == "Enter":
+            enters["n"] += 1
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_slash_command(bridge_dir, command="/model gemini-2.5-pro", auto_confirm=True)
+
+    assert enters["n"] == 2, "auto_confirm must send the submit Enter plus a confirm Enter"
+
+
+@pytest.mark.parametrize(
+    "bad_command",
+    [
+        "",
+        "model gemini-2.5-pro",  # missing leading slash
+        "/model x\nrm -rf /",  # multi-line
+    ],
+)
+def test_inject_slash_command_rejects_invalid_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_command: str,
+) -> None:
+    """
+    Malformed slash commands raise ValueError before touching tmux.
+
+    No leading ``/`` would type as plain text; a stray newline would chain a
+    second command. Validation must fire before the tmux call so the route
+    returns 4xx instead of silently appearing to succeed.
+    """
+    bridge_dir = tmp_path / "bridge"
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Fail the test if tmux is invoked for an invalid command."""
+        del cmd, kwargs
+        raise AssertionError("subprocess.run must not be called for invalid commands")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(ValueError):
+        inject_slash_command(bridge_dir, command=bad_command)
+
+
+def test_inject_slash_command_raises_when_tmux_target_never_advertised(
+    tmp_path: Path,
+) -> None:
+    """
+    Missing tmux.json surfaces RuntimeError, mirroring inject_user_message_via_tui.
+
+    The runner route catches and returns 503, so the Omnigent server's PATCH
+    still succeeds (model persisted) and the next spawn picks it up via
+    ``--model``.
+    """
+    with pytest.raises(RuntimeError, match="tmux target was not advertised"):
+        inject_slash_command(
+            tmp_path / "bridge",
+            command="/model gemini-2.5-pro",
+            timeout_s=0.0,
+        )
 
 
 # ---------------------------------------------------------------------------
