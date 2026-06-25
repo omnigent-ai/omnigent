@@ -204,6 +204,33 @@ async def test_compact_runs_omnigent_compaction_when_runner_noops(
     )
 
 
+async def test_compact_model_less_sdk_harness_returns_clear_unavailable_message(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A model-less SDK-style harness should not expose the raw server-side
+    compaction model requirement.
+    """
+    agent = await create_test_agent(
+        client,
+        name="model-less-sdk",
+        executor={"type": "agents_sdk"},
+        include_llm=False,
+    )
+    sid = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "compact", "data": {}},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "/compact is unavailable" in resp.text
+    assert "agents_sdk" in resp.text
+    assert "llm.model" in resp.text
+    assert "executor.model" in resp.text
+
+
 async def test_compact_errors_when_runner_injection_fails(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
