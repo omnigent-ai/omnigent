@@ -492,19 +492,28 @@ class _CodexNativeLaunchConfig:
 @dataclasses.dataclass(frozen=True)
 class _PiNativeLaunchConfig:
     """
-    Persisted launch config needed for runner-owned Pi terminal setup.
+    Persisted launch config read from a session snapshot for native terminals.
 
-    :param workspace: Workspace cwd for the Pi TUI.
-    :param server_url: Omnigent server URL for the Pi extension.
-    :param terminal_launch_args: User pass-through Pi CLI args.
-    :param external_session_id: Existing Pi session id, when captured by
+    A generic session-snapshot reader shared by the pi-native and
+    cursor-native launch paths (workspace + terminal_launch_args +
+    model_override). Each path consumes the subset it needs: pi-native
+    ignores ``model_override``; cursor-native applies it as ``--model``.
+
+    :param workspace: Workspace cwd for the native TUI.
+    :param server_url: Omnigent server URL for the extension/forwarder.
+    :param terminal_launch_args: User pass-through native CLI args.
+    :param external_session_id: Existing external session id, when captured by
         the extension.
+    :param model_override: Persisted per-session ``/model`` override, e.g.
+        ``"claude-4.6-sonnet-medium"``; ``None`` when unset. Consumed by the
+        cursor-native launch (``--model``), ignored by pi-native.
     """
 
     workspace: Path
     server_url: str
     terminal_launch_args: list[str] | None
     external_session_id: str | None
+    model_override: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -644,7 +653,9 @@ async def _pi_native_launch_config(
     server_client: httpx.AsyncClient | None,
 ) -> _PiNativeLaunchConfig:
     """
-    Fetch and validate persisted Pi launch config for a session.
+    Fetch and validate a session's persisted native-terminal launch config.
+
+    Shared by the pi-native and cursor-native launch paths.
 
     :param session_id: Session/conversation id.
     :param server_client: Runner Omnigent server client.
@@ -690,11 +701,22 @@ async def _pi_native_launch_config(
         not isinstance(session_workspace, str) or not session_workspace
     ):
         raise RuntimeError(f"Invalid workspace for Pi session {session_id!r}.")
+    model_override = snapshot.get("model_override")
+    if model_override is not None:
+        if not isinstance(model_override, str) or not model_override:
+            raise RuntimeError(f"Invalid model_override for session {session_id!r}.")
+        try:
+            model_override = validate_model_override(model_override)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid model_override for session {session_id!r}: {exc}"
+            ) from exc
     return _PiNativeLaunchConfig(
         workspace=_pi_session_workspace(session_workspace),
         server_url=os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
         terminal_launch_args=terminal_launch_args,
         external_session_id=external_session_id,
+        model_override=model_override,
     )
 
 
@@ -1517,8 +1539,8 @@ async def _auto_create_cursor_terminal(
 
     bridge_dir = bridge_dir_for_session_id(session_id)
 
-    # ``_pi_native_launch_config`` is a generic session-snapshot reader
-    # (workspace + terminal_launch_args); reused here, not Pi-specific.
+    # Shared native-terminal snapshot reader (workspace + terminal_launch_args
+    # + model_override), also used by the pi-native launch.
     launch_config = await _pi_native_launch_config(
         session_id=session_id,
         server_client=server_client,
@@ -1575,15 +1597,17 @@ async def _auto_create_cursor_terminal(
     # reloads the prior conversation. The id was validated above; ``None`` on a
     # brand-new session, so no ``--resume`` is injected and cursor starts fresh.
     cursor_args.extend(_cursor_native_resume_args(resume_chat_id, cursor_args))
-    # Honor the spec's pinned model (``--model`` flag / config.yaml ``model:``)
-    # by launching cursor-agent with ``--model <model>``. An explicit model in
-    # the passthrough launch args (``omnigent cursor -- --model X`` or the joined
-    # ``--model=X`` form) wins, so only inject when the user did not already pin
-    # one — otherwise cursor-agent would see two ``--model`` values.
+    # Launch cursor-agent with ``--model <model>``. Precedence mirrors the
+    # codex-native path above: the persisted ``/model`` override
+    # (``model_override``) wins, falling back to the spec's pinned model
+    # (``--model`` flag / config.yaml ``model:``). An explicit model in the
+    # passthrough launch args (``omnigent cursor -- --model X`` or the joined
+    # ``--model=X`` form) wins over both, so only inject when the user did not
+    # already pin one — otherwise cursor-agent would see two ``--model`` values.
     if not any(arg in ("--model", "-m") or arg.startswith("--model=") for arg in cursor_args):
-        spec_model = _cursor_native_model_from_spec(agent_spec)
-        if spec_model is not None:
-            cursor_args.extend(["--model", spec_model])
+        model = launch_config.model_override or _cursor_native_model_from_spec(agent_spec)
+        if model is not None:
+            cursor_args.extend(["--model", model])
     terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
         terminal_name="cursor",
@@ -10449,6 +10473,58 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _handle_cursor_native_model_change(
+        conv_id: str,
+        model: str | None,
+    ) -> Response:
+        """
+        Switch a running cursor-native session's model via its TUI picker.
+
+        cursor-agent's ``--model`` flag is baked in at spawn (see
+        ``_auto_create_cursor_terminal``), so a live web-UI / REPL ``/model``
+        switch can't be applied by re-reading the persisted ``model_override``
+        — ``inject_model_command`` types ``/model <id>`` into the tmux pane and
+        selects the filtered match. Mirrors ``_handle_claude_native_model_change``.
+
+        Skipped silently when *model* is ``None`` or blank — cursor-agent has no
+        slash form for "use the spawn default", so a clear only takes effect on
+        the next spawn.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param model: New persisted cursor-agent model id, e.g. ``"gpt-5.2"``;
+            ``None`` when the user cleared the override.
+        :returns: 204 on success or skip; 503 if the tmux pane isn't advertised
+            yet (best-effort — the persisted value applies on the next spawn).
+        """
+        from omnigent.cursor_native_bridge import (
+            bridge_dir_for_session_id,
+            inject_model_command,
+        )
+
+        if model is None or not model.strip():
+            # Persistence already happened on the Omnigent server; the
+            # next spawn picks up the new value via ``--model``.
+            return Response(status_code=204)
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            # Short timeout: a missing tmux.json means the pane isn't attached;
+            # the persisted model still applies on the next spawn.
+            await asyncio.to_thread(
+                inject_model_command,
+                bridge_dir,
+                model=model.strip(),
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "cursor_native_model_failed",
+                    "detail": _client_safe_error_detail(exc, context="cursor-native model change"),
+                },
+            )
+        return Response(status_code=204)
+
     async def _handle_claude_native_compact(conv_id: str) -> Response:
         """
         Type ``/compact`` into Claude's tmux pane.
@@ -13338,9 +13414,13 @@ def create_runner_app(
             # so harnesses that can't re-read it from store at turn
             # boundaries can propagate it live. Claude-native injects a
             # slash command into its terminal; codex-native queues a
-            # Codex app-server next-turn settings update. Other harnesses
-            # pick up the persisted value on the next turn and need no
-            # runtime side effect, so they 204 here.
+            # Codex app-server next-turn settings update. cursor-native is
+            # intentionally absent: its effort lives on the /model picker's
+            # per-model "Tab to modify" axis, and switching the model resets it
+            # to that model's default — so a web effort would silently diverge
+            # from the TUI. cursor-native supports model switching only; effort
+            # control is dropped pending a model-switch-resets-effort fix. Other
+            # harnesses pick up the persisted value on the next turn and 204 here.
             harness = _session_harness_name(conversation_id)
             if harness in ("claude-native", "codex-native"):
                 effort = body.get("effort") if isinstance(body, dict) else None
@@ -13366,12 +13446,13 @@ def create_runner_app(
         if body_type == "model_change":
             # Omnigent server forwards the persisted model_override here so
             # harnesses that can't re-read it from store at turn
-            # boundaries can propagate it live. Claude-native types
-            # ``/model`` into its tmux pane; codex-native queues a
-            # Codex app-server next-turn settings update. Other harnesses
-            # pick up the persisted value on the next turn and 204 here.
+            # boundaries can propagate it live. Claude-native and
+            # cursor-native type ``/model`` into their tmux pane;
+            # codex-native queues a Codex app-server next-turn settings
+            # update. Other harnesses pick up the persisted value on the
+            # next turn and 204 here.
             harness = _session_harness_name(conversation_id)
-            if harness in ("claude-native", "codex-native"):
+            if harness in ("claude-native", "codex-native", "cursor-native"):
                 model = body.get("model") if isinstance(body, dict) else None
                 if model is not None and not isinstance(model, str):
                     return JSONResponse(
@@ -13387,6 +13468,11 @@ def create_runner_app(
                     return await _handle_codex_native_settings_update(
                         conversation_id,
                         {"model": model.strip()},
+                    )
+                if harness == "cursor-native":
+                    return await _handle_cursor_native_model_change(
+                        conversation_id,
+                        model,
                     )
                 return await _handle_claude_native_model_change(
                     conversation_id,
@@ -15436,6 +15522,12 @@ def create_runner_app(
                 },
             )
 
+    # Note: cursor-native has no model-options route. Its catalog is a curated
+    # *static* base list served directly by the AP server (see
+    # ``_fetch_model_options`` in omnigent/server/routes/sessions.py), so it
+    # needs no runner round-trip and stays immune to the runner-backed cache
+    # invalidation that would otherwise blank the picker on an effort change.
+
     @app.post("/v1/sessions/{session_id}/skills/resolve")
     async def resolve_session_skill(session_id: str, request: Request) -> JSONResponse:
         """
@@ -16596,8 +16688,10 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "cursor": "HARNESS_CURSOR_MODEL",
     # cursor-native is intentionally omitted here (and from
     # model_override._SDK_MODEL_OVERRIDE_HARNESSES): like the other native CLIs
-    # (claude-native, codex-native) it honors the spec model via a launch
-    # ``--model`` arg in _auto_create_cursor_terminal, not via an env var.
+    # (claude-native, codex-native) it receives the model as a ``--model`` argv
+    # at terminal launch (see ``_auto_create_cursor_terminal``), not via a
+    # spawn-env var. ``harness_supports_model_override`` already returns True for
+    # it because it is a native harness.
     "antigravity": "HARNESS_ANTIGRAVITY_MODEL",
     # Kimi reads ``HARNESS_KIMI_MODEL`` in
     # :mod:`omnigent.inner.kimi_executor`; without this mapping a per-session

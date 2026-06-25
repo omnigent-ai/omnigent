@@ -68,6 +68,10 @@ _PASTE_BUFFER = "omnigent-cursor-paste"
 # sending Enter — submitting before the TUI commits the paste folds the Enter
 # into the paste as a newline and the message sits unsent.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
+# Pause between the ``/model`` filter landing and Enter. cursor-agent's
+# composer debounces input (~1.5s); an Enter fired too soon selects a stale
+# picker highlight. See the cursor-native e2e_ui TUI-driving notes.
+_MODEL_PICKER_SETTLE_S = 1.5
 # cursor-agent TUI markers (Phase 0): idle input placeholder / running footer /
 # first-run trust modal.
 _IDLE_MARKERS = ("Plan, search, build", "Add a follow-up")
@@ -549,6 +553,59 @@ def inject_user_message(
                 break
             time.sleep(_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+
+
+def inject_model_command(
+    bridge_dir: Path,
+    *,
+    model: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> None:
+    """Switch the live Cursor model by driving the TUI ``/model`` picker.
+
+    cursor-agent's ``--model`` flag is baked in at spawn, so a web-UI / REPL
+    model switch on a *running* pane can't be applied by re-reading the
+    persisted ``model_override`` — it has to be typed into the TUI. Typing
+    ``/model <id>`` opens cursor-agent's model picker filtered to *model* and
+    Enter selects the (now top) match; verified live that an exact model id
+    selects exactly that model (e.g. ``gpt-5.2`` → "GPT-5.2 Medium"). This is
+    the cursor analog of claude-native's ``inject_slash_command('/model …')``.
+
+    :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
+    :param model: cursor-agent model id, e.g. ``"gpt-5.2"`` (the same ids
+        ``cursor-agent --list-models`` reports).
+    :param timeout_s: Per-readiness-gate timeout.
+    :raises RuntimeError: If the tmux target is never advertised, the TUI has
+        exited, or a tmux command fails.
+    """
+    model = model.strip()
+    if not model:
+        raise RuntimeError("cursor-native model switch requires a non-empty model id")
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "cursor terminal is no longer running (the TUI exited); restart the session"
+        )
+    _settle_pane(socket_path, tmux_target, timeout_s=timeout_s)
+    # Clear any leftover draft so the slash command isn't appended to it:
+    # Home (C-a) + kill-to-end (C-k).
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    # ``-l`` sends the command as literal characters so ``/`` opens the slash
+    # menu and the id filters the picker rather than being parsed as key names.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "-l", f"/model {model}")
+    # Wait until the picker has filtered to the id before Enter: the composer
+    # debounces input, so an Enter in the same tick as the last char selects a
+    # stale/empty highlight (same race ``inject_user_message`` guards against).
+    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if model in _capture_pane(socket_path, tmux_target):
+            break
+        time.sleep(_POLL_INTERVAL_S)
+    time.sleep(_MODEL_PICKER_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
 
 

@@ -349,6 +349,157 @@ class _RecordingClient:
         return httpx.Response(200, request=httpx.Request("POST", url))
 
 
+def _write_meta_model(con: sqlite3.Connection, model: str | None, *, key: str = "0") -> None:
+    """Add cursor's ``meta`` table to *con* and store a hex-encoded model blob.
+
+    Mirrors cursor's on-disk layout: ``meta(key TEXT, value TEXT)`` where value
+    is hex-encoded JSON. When *model* is ``None`` the JSON omits ``lastUsedModel``.
+    """
+    con.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+    payload: dict = {"mode": "default"}
+    if model is not None:
+        payload["lastUsedModel"] = model
+    hexed = json.dumps(payload).encode("utf-8").hex()
+    con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (key, hexed))
+    con.commit()
+
+
+class TestLastUsedModelFromMetaValue:
+    def test_decodes_hex_json(self) -> None:
+        hexed = json.dumps({"lastUsedModel": "gpt-5.2"}).encode().hex()
+        assert fwd._last_used_model_from_meta_value(hexed) == "gpt-5.2"
+
+    def test_strips_whitespace(self) -> None:
+        hexed = json.dumps({"lastUsedModel": "  composer-2.5  "}).encode().hex()
+        assert fwd._last_used_model_from_meta_value(hexed) == "composer-2.5"
+
+    def test_missing_field_is_none(self) -> None:
+        hexed = json.dumps({"mode": "default"}).encode().hex()
+        assert fwd._last_used_model_from_meta_value(hexed) is None
+
+    def test_empty_model_is_none(self) -> None:
+        hexed = json.dumps({"lastUsedModel": "   "}).encode().hex()
+        assert fwd._last_used_model_from_meta_value(hexed) is None
+
+    def test_non_hex_text_is_none(self) -> None:
+        assert fwd._last_used_model_from_meta_value("not-hex-zzz") is None
+
+    def test_bytes_value_is_decoded(self) -> None:
+        raw = json.dumps({"lastUsedModel": "auto"}).encode()
+        assert fwd._last_used_model_from_meta_value(raw) == "auto"
+
+
+class TestReadLastUsedModel:
+    def test_reads_model_from_live_wal_store(self, tmp_path: Path) -> None:
+        store = tmp_path / "store.db"
+        writer = _make_store(store, [("u", _user("<user_query>hi</user_query>"))], wal=True)
+        try:
+            _write_meta_model(writer, "claude-opus-4-7")
+            assert fwd._read_last_used_model(store) == "claude-opus-4-7"
+        finally:
+            writer.close()
+
+    def test_no_meta_table_is_none(self, tmp_path: Path) -> None:
+        store = tmp_path / "store.db"
+        writer = _make_store(store, [("u", _user("<user_query>hi</user_query>"))])
+        try:
+            assert fwd._read_last_used_model(store) is None
+        finally:
+            writer.close()
+
+
+class TestPostModelChangeIfNew:
+    @pytest.mark.asyncio
+    async def test_first_observation_is_posted(self) -> None:
+        # Unlike claude-native, cursor posts the FIRST observed model so an
+        # un-pinned session shows the real cursor model instead of omnigent's
+        # default ("fable") in the Web UI pill.
+        client = _RecordingClient()
+        state = fwd._ModelMirrorState()
+        await fwd._post_model_change_if_new(
+            client,  # type: ignore[arg-type]
+            session_id="conv_1",
+            state=state,
+            model="claude-sonnet-4-5",
+        )
+        url, body = client.posts[0]
+        assert url == "/v1/sessions/conv_1/events"
+        assert body == {"type": "external_model_change", "data": {"model": "claude-sonnet-4-5"}}
+        assert state.posted == "claude-sonnet-4-5"
+
+    @pytest.mark.asyncio
+    async def test_switch_after_seed_posts_external_model_change(self) -> None:
+        client = _RecordingClient()
+        state = fwd._ModelMirrorState(observed="composer-2.5", posted="composer-2.5")
+        await fwd._post_model_change_if_new(
+            client,  # type: ignore[arg-type]
+            session_id="conv_1",
+            state=state,
+            model="gpt-5.2",
+        )
+        url, body = client.posts[0]
+        assert url == "/v1/sessions/conv_1/events"
+        assert body == {"type": "external_model_change", "data": {"model": "gpt-5.2"}}
+        assert state.posted == "gpt-5.2"
+
+    @pytest.mark.asyncio
+    async def test_unchanged_model_does_not_repost(self) -> None:
+        client = _RecordingClient()
+        state = fwd._ModelMirrorState(observed="gpt-5.2", posted="gpt-5.2")
+        await fwd._post_model_change_if_new(
+            client,  # type: ignore[arg-type]
+            session_id="conv_1",
+            state=state,
+            model="gpt-5.2",
+        )
+        assert client.posts == []
+
+    @pytest.mark.asyncio
+    async def test_none_observation_does_not_clear_or_post(self) -> None:
+        client = _RecordingClient()
+        state = fwd._ModelMirrorState(observed="gpt-5.2", posted="gpt-5.2")
+        await fwd._post_model_change_if_new(
+            client,  # type: ignore[arg-type]
+            session_id="conv_1",
+            state=state,
+            model=None,
+        )
+        assert client.posts == []
+        assert state.observed == "gpt-5.2"
+
+    @pytest.mark.asyncio
+    async def test_failed_post_retries_next_poll(self) -> None:
+        class _FailingThenOkClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def post(self, url: str, *, json: dict) -> httpx.Response:
+                self.calls += 1
+                if self.calls == 1:
+                    raise httpx.ConnectError("boom")
+                return httpx.Response(200, request=httpx.Request("POST", url))
+
+        client = _FailingThenOkClient()
+        state = fwd._ModelMirrorState(observed="composer-2.5", posted="composer-2.5")
+        # First poll: switch observed, POST fails → posted stays behind observed.
+        await fwd._post_model_change_if_new(
+            client,  # type: ignore[arg-type]
+            session_id="conv_1",
+            state=state,
+            model="gpt-5.2",
+        )
+        assert state.posted == "composer-2.5" and state.observed == "gpt-5.2"
+        # Next poll retries (model=None means "no fresh read") and succeeds.
+        await fwd._post_model_change_if_new(
+            client,  # type: ignore[arg-type]
+            session_id="conv_1",
+            state=state,
+            model=None,
+        )
+        assert state.posted == "gpt-5.2"
+        assert client.calls == 2
+
+
 @pytest.mark.asyncio
 async def test_post_conversation_item_shape() -> None:
     client = _RecordingClient()

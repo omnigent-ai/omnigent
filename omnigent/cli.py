@@ -4661,19 +4661,28 @@ def _ensure_bundled_agent_brain_credential(name: str) -> None:
         "``ask``: Q&A style for explanations and questions (read-only)."
     ),
 )
+@click.option(
+    "--model",
+    default=None,
+    help="Cursor model to use for the native TUI (e.g. gpt-5.2, claude-4.6-sonnet-medium).",
+)
 @click.argument("cursor_args", nargs=-1, type=click.UNPROCESSED)
 def cursor(
     server: str | None,
     resume: str | None,
     session_id: str | None,
     mode: str | None,
+    model: str | None,
     cursor_args: tuple[str, ...],
 ) -> None:
+    # Param docs live in comments — Click uses the docstring for --help.
+    # :param model: Cursor model id passed to cursor-agent as ``--model``.
     """Launch the Cursor TUI in an Omnigent terminal.
 
     \b
     Examples:
       omnigent cursor
+      omnigent cursor --model gpt-5.2
       omnigent cursor --resume conv_abc123
       omnigent cursor --resume                 # interactive picker
       omnigent cursor --mode plan              # start in plan (read-only) mode
@@ -4691,6 +4700,10 @@ def cursor(
     cfg = _load_effective_config()
     if server is None:
         server = cfg.get("server")
+    # Deliberately no ``cfg.get("model")`` fallback (unlike ``codex``): the
+    # global config model is a Claude/Codex catalog id, not a cursor-agent
+    # model id, and pinning it would break the cursor TUI launch. Cursor's
+    # model is explicit-only here; persistent selection rides the web /model.
     auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
 
     server = _ensure_backend(server)
@@ -4703,6 +4716,7 @@ def cursor(
         session_id=resolved_session_id,
         resume_picker=choice.picker,
         cursor_args=cursor_args,
+        model=model,
         auto_open_conversation=auto_open_conversation,
         mode=mode,
     )
