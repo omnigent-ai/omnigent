@@ -136,6 +136,11 @@ _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 # Session-status edge values (mirror the transcript forwarder's vocabulary).
 _STATUS_RUNNING = "running"
 _STATUS_IDLE = "idle"
+# Terminal-failure session status (a valid ``external_session_status``; see the
+# ``Literal["idle", "running", "failed"]`` schema). Emitted when an agy turn
+# closes on a model/turn ERROR so the web UI shows the turn FAILED instead of a
+# clean idle with a silent empty reply (#6).
+_STATUS_FAILED = "failed"
 
 # RPC step type/status constants needed for the status-transition heuristic. The
 # item-mapping constants live in the mapper; the driver only needs the few it
@@ -183,6 +188,19 @@ _StepKey = tuple[str | None, int | None, str | None]
 # Telemetry event types (design §10.3 + §10.4).
 _EXTERNAL_SESSION_USAGE = "external_session_usage"
 _EXTERNAL_MODEL_CHANGE = "external_model_change"
+
+# Event that WITHDRAWS a surfaced elicitation whose WAITING step left WAITING
+# out-of-band (answered directly in the agy TUI, or agy timed out / auto-resolved
+# it). Posting it sets the server's parked-future ``resolved_elsewhere`` flag,
+# which (a) returns ``None`` from any in-flight ``request_elicitation`` long-poll
+# — so ``bridge_interaction`` does NOT then deliver a stale verdict — and (b)
+# clears the web approval card so the chat stops showing "Respond to the pending
+# request above to continue." Mirrors cursor-native's
+# ``_post_external_elicitation_resolved`` (#1200, direction 2). The reader's own
+# web→TUI delivery, by contrast, does NOT post this: the WAITING step there leaves
+# WAITING because the bridge ALREADY resolved the card (the human's verdict), so
+# the reader must not double-resolve it — see :func:`_maybe_withdraw_interaction`.
+_EXTERNAL_ELICITATION_RESOLVED = "external_elicitation_resolved"
 
 # Async callback handed each distinct WAITING interaction. It receives the SAME
 # ``cascade_id`` + connect-RPC ``port`` the reader discovered and is using, so the
@@ -1088,6 +1106,12 @@ class _ReaderState:
         a day); at most one runs at a time because the in-flight bridge owns agy's
         WAITING-timeout retries (a second would double-fire). Cancelled on reader
         teardown.
+    :param surfaced_elicitations: ``_StepKey`` → the deterministic elicitation id
+        published for that WAITING step. Populated when an interaction is handed to
+        the bridge; consumed by :func:`_maybe_withdraw_interaction` when the step
+        is later seen NO LONGER WAITING (answered in the agy TUI, or agy timed
+        out) to WITHDRAW the still-parked web card (#1200, direction 2). An entry
+        is removed once withdrawn so the withdraw posts at most once.
     """
 
     allocator: _ToolCallIdAllocator
@@ -1104,6 +1128,7 @@ class _ReaderState:
     cumulative_cache_read_input_tokens: int = 0
     last_input_tokens: int = 0
     interaction_task: asyncio.Task[None] | None = None
+    surfaced_elicitations: dict[_StepKey, str] = field(default_factory=dict)
 
 
 async def _poll_loop(
@@ -1347,6 +1372,19 @@ async def _process_committed_step(
         cascade_id=cascade_id,
         state=state,
         on_pending_interaction=on_pending_interaction,
+    )
+    # Inverse of the above (#1200, direction 2): if a step we previously surfaced
+    # is now NO LONGER WAITING (answered in the agy TUI, or agy timed out), withdraw
+    # the parked web card so it does not linger. Runs unconditionally — including
+    # for an already-``seen`` step — because a WAITING step is not ``seen`` until it
+    # settles, so its terminal transition arrives as a fresh (not-yet-seen) step
+    # here; the dedup lives in ``surfaced_elicitations`` (popped on first withdraw).
+    await _maybe_withdraw_interaction(
+        step,
+        key=key,
+        client=client,
+        session_id=session_id,
+        state=state,
     )
 
 
@@ -1640,9 +1678,27 @@ async def _emit_step(
 
     if _is_turn_close_step(step) and turn_active:
         turn_active = False
-        await _post_event(client, session_id, _status_event(_STATUS_IDLE))
+        # An ERROR planner closes the turn as FAILED, not a clean idle: a model /
+        # safety-policy / rate-limit / provider-overload error must surface as a
+        # failed turn (alongside the error item the mapper now emits), not a
+        # silent empty success that looks identical to a normal reply (#6).
+        close_status = _STATUS_FAILED if _step_is_error_planner(step) else _STATUS_IDLE
+        await _post_event(client, session_id, _status_event(close_status))
 
     return turn_active
+
+
+def _step_is_error_planner(step: dict[str, object]) -> bool:
+    """
+    Return whether a step is a PLANNER_RESPONSE that ended in ERROR.
+
+    Used to close the turn as ``failed`` (not ``idle``) so a model/turn error is
+    not mistaken for a clean empty reply.
+
+    :param step: One RPC step dict.
+    :returns: ``True`` for an ERROR-status planner step.
+    """
+    return step.get("type") == _TYPE_PLANNER_RESPONSE and step.get("status") == _STATUS_ERROR
 
 
 def _maybe_handle_interaction(
@@ -1697,6 +1753,17 @@ def _maybe_handle_interaction(
         # WAITING-timeout retries, so don't double-fire on the retry step.
         return
     state.interacted.add(key)
+    # Record the deterministic elicitation id this WAITING step surfaces, so that
+    # if the step later leaves WAITING out-of-band (answered in the agy TUI, or
+    # agy timed it out) :func:`_maybe_withdraw_interaction` can WITHDRAW the parked
+    # web card (#1200, direction 2). ``agy_elicitation_id`` is lazily imported —
+    # like ``bridge_interaction`` — so the reader stays importable from the
+    # lightweight CLI process without eagerly pulling the server-route stack.
+    from omnigent.antigravity_native_interactions import agy_elicitation_id
+
+    state.surfaced_elicitations[key] = agy_elicitation_id(
+        cascade_id, pending["trajectory_id"], pending["step_index"]
+    )
 
     async def _run_bridge() -> None:
         await on_pending_interaction(cascade_id, state.port, pending)
@@ -1716,6 +1783,114 @@ def _maybe_handle_interaction(
     task = asyncio.create_task(_run_bridge(), name="antigravity-interaction-bridge")
     state.interaction_task = task
     task.add_done_callback(_clear_slot)
+
+
+async def _maybe_withdraw_interaction(
+    step: dict[str, object],
+    *,
+    key: _StepKey,
+    client: httpx.AsyncClient,
+    session_id: str,
+    state: _ReaderState,
+) -> None:
+    """
+    Withdraw a surfaced elicitation whose WAITING step left WAITING (#1200, dir 2).
+
+    The inverse of :func:`_maybe_handle_interaction`. The reader publishes an
+    elicitation when it first sees a WAITING permission/ask_question step; but a
+    step can stop being WAITING without the WEB card being answered — the user
+    types the answer directly in the agy TUI pane, or agy times out / auto-resolves
+    the interaction. Without this, the parked web card LINGERS forever, showing
+    "Respond to the pending request above to continue" while the agent has already
+    moved on.
+
+    So: when a step the reader previously surfaced is, on a later poll/frame, NO
+    LONGER WAITING, POST ``external_elicitation_resolved`` for its elicitation id.
+    Server-side this sets the parked future's ``resolved_elsewhere`` flag, which
+    (a) clears the web card, and (b) makes any in-flight ``request_elicitation``
+    long-poll return ``None`` — so a racing :func:`bridge_interaction` does NOT
+    then deliver a stale verdict (the await short-circuits cleanly). Mirrors
+    cursor-native's ``_post_external_elicitation_resolved``.
+
+    Idempotency / no double-resolve: the entry is popped from
+    ``surfaced_elicitations`` so the withdraw posts AT MOST ONCE per step. This is
+    safe even when the step left WAITING because the WEB verdict resolved it (the
+    bridge delivered): the server already consumed that parked future, so the
+    withdraw finds none and merely tombstones the id (harmless) — it can never
+    re-deliver, because the bridge's ``request_elicitation`` already returned the
+    real verdict and the elicitation id is unique per ``step_index``.
+
+    :param step: One RPC step dict (any status).
+    :param key: The step's identity key (already computed by the caller).
+    :param client: HTTP client for the Omnigent event POST.
+    :param session_id: Omnigent conversation id whose card to withdraw.
+    :param state: Per-run reader state — ``surfaced_elicitations`` is read/mutated.
+    :returns: None.
+    """
+    elicitation_id = state.surfaced_elicitations.get(key)
+    if elicitation_id is None:
+        return
+    # Still WAITING → the interaction is live; nothing to withdraw yet.
+    if pending_interaction(step) is not None:
+        return
+    # Left WAITING out-of-band (or the web verdict already advanced it): withdraw
+    # the card exactly once.
+    state.surfaced_elicitations.pop(key, None)
+    await _post_external_elicitation_resolved(client, session_id, elicitation_id)
+
+
+async def _post_external_elicitation_resolved(
+    client: httpx.AsyncClient,
+    session_id: str,
+    elicitation_id: str,
+) -> None:
+    """
+    Tell the server a surfaced agy elicitation was resolved/withdrawn out-of-band.
+
+    POSTs ``external_elicitation_resolved`` so the parked web card clears and any
+    in-flight ``request_elicitation`` long-poll returns ``None``. Best-effort: a
+    transport error or a non-2xx is logged, never raised — a failed withdraw must
+    not crash the reader loop (the next signal, or agy's own timeout, recovers).
+    Mirrors cursor-native's ``_post_external_elicitation_resolved``.
+
+    :param client: HTTP client for Omnigent event posts (the reader's client).
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param elicitation_id: The deterministic agy elicitation id to withdraw.
+    :returns: None.
+    """
+    try:
+        response = await client.post(
+            f"/v1/sessions/{url_component(session_id)}/events",
+            json={
+                "type": _EXTERNAL_ELICITATION_RESOLVED,
+                "data": {"elicitation_id": elicitation_id},
+            },
+        )
+    except httpx.HTTPError:
+        _logger.warning(
+            "agy external_elicitation_resolved POST failed; the web card may linger "
+            "until agy's own timeout: session=%s elicitation_id=%s",
+            session_id,
+            elicitation_id,
+            exc_info=True,
+        )
+        return
+    if response.status_code >= 400:
+        _logger.warning(
+            "agy external_elicitation_resolved rejected: session=%s elicitation_id=%s "
+            "status=%s body=%s",
+            session_id,
+            elicitation_id,
+            response.status_code,
+            response.text[:512],
+        )
+        return
+    _logger.info(
+        "agy withdrew a surfaced elicitation resolved out-of-band (TUI answer / "
+        "timeout): session=%s elicitation_id=%s",
+        session_id,
+        elicitation_id,
+    )
 
 
 async def _maybe_emit_session_usage(
@@ -2157,6 +2332,51 @@ def _adopt_cascade_in_place(bridge_dir: Path, session_id: str, new_cascade_id: s
     )
 
 
+async def _record_external_session_id(
+    client: httpx.AsyncClient, session_id: str, cascade_id: str
+) -> None:
+    """
+    Best-effort record the agy cascade id as the session's ``external_session_id``.
+
+    So a later ``omnigent antigravity --resume`` / omnigent server restart
+    relaunches agy with ``--conversation <cascade_id>`` and continues THIS
+    conversation. Called on first-cascade adoption with the TUI-minted cascade.
+
+    The cold-start no longer records its headless ``StartCascade`` phantom (which
+    the agy TUI never displays) — that was the data-loss bug: a resume launched
+    ``--conversation <phantom>`` and loaded an EMPTY conversation, silently losing
+    the entire chat. ``external_session_id`` is set-once in the store; an overwrite
+    attempt (e.g. a second adoption) returns 400 and is logged, not raised — the
+    chat mirror does not depend on it.
+
+    :param client: The reader's Omnigent HTTP client.
+    :param session_id: Omnigent conversation id to record onto.
+    :param cascade_id: agy's adopted (TUI-minted) cascade/conversation id.
+    """
+    try:
+        resp = await client.patch(
+            f"/v1/sessions/{url_component(session_id)}",
+            json={"external_session_id": cascade_id},
+        )
+    except httpx.HTTPError:
+        _logger.warning(
+            "agy adopt: failed to record external_session_id=%s on session %s; "
+            "a later --resume will cold-start fresh.",
+            cascade_id,
+            session_id,
+            exc_info=True,
+        )
+        return
+    if resp.status_code >= 400:
+        _logger.info(
+            "agy adopt: external_session_id PATCH returned %s (likely already set); "
+            "session=%s cascade=%s",
+            resp.status_code,
+            session_id,
+            cascade_id,
+        )
+
+
 async def _rotate_session_for_cascade(
     *,
     client: httpx.AsyncClient,
@@ -2431,6 +2651,15 @@ async def run_reader_with_bridge(
                 # new one (the web/mobile UI watches the current session). The agy
                 # TUI and the web mirror then share ONE cascade (#1156/#1158).
                 _adopt_cascade_in_place(bridge_dir, current["session_id"], new_cascade_id)
+                # Record the adopted (TUI-minted) cascade as the session's
+                # external_session_id so a later --resume / omnigent server
+                # restart relaunches agy with --conversation <this cascade> and
+                # continues THIS conversation — NOT the headless cold-start
+                # StartCascade phantom the cold-start used to record, which a
+                # resume loaded as an EMPTY conversation (the whole chat silently
+                # vanished). external_session_id is set-once; the cold-start no
+                # longer records the phantom, so this first adoption sets it.
+                await _record_external_session_id(client, current["session_id"], new_cascade_id)
                 continue
             # GENUINE /clear (the bound cascade HAD turns): move Omnigent ownership
             # onto a fresh conversation bound to the new cascade, then rebind by

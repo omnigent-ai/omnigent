@@ -198,6 +198,32 @@ def test_dispatch_by_runtime_codex_native_local_routes_to_wrapper(
     assert captured["codex_args"] == ()
 
 
+def test_dispatch_by_runtime_kiro_native_remote_routes_to_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote kiro-native conv routes to ``run_kiro_native``."""
+    monkeypatch.setattr(
+        resume_dispatch,
+        "_read_wrapper_label_remote",
+        lambda *, server, conv_id: "kiro-native-ui",
+    )
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.kiro_native.run_kiro_native", _capture)
+
+    resume_dispatch._dispatch_by_runtime(
+        target="conv_kiro",
+        server="https://example.com/",
+    )
+
+    assert captured["session_id"] == "conv_kiro"
+    assert captured["server"] == "https://example.com"
+    assert captured["kiro_args"] == ()
+
+
 def test_dispatch_by_runtime_antigravity_native_remote_routes_to_wrapper(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
