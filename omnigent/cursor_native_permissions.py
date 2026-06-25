@@ -357,13 +357,23 @@ def _iter_embedded_json_objects(raw: bytes) -> list[dict]:
     objects: list[dict] = []
     i, n = 0, len(text)
     while i < n:
+        # Only attempt at a plausible object opener: ``{`` then (whitespace) ``"``.
+        # Every message/part object we care about is keyed (``{"type"``, ``{"role"``,
+        # ``{"args":{"…``), so this skips the stray ``{`` bytes that pepper the
+        # surrounding binary protobuf — cheaply and without false starts.
         if text[i] != "{":
+            i += 1
+            continue
+        k = i + 1
+        while k < n and text[k] in " \t\r\n":
+            k += 1
+        if k >= n or text[k] != '"':
             i += 1
             continue
         depth = 0
         in_str = False
         esc = False
-        matched = False
+        parsed_ok = False
         j = i
         while j < n:
             ch = text[j]
@@ -387,12 +397,14 @@ def _iter_embedded_json_objects(raw: bytes) -> list[dict]:
                         obj = None
                     if isinstance(obj, dict):
                         objects.append(obj)
-                    matched = True
+                        parsed_ok = True
                     break
             j += 1
-        # Advance past a matched object; otherwise step one char past this brace
-        # so binary noise containing a stray "{" can't abort the whole scan.
-        i = (j + 1) if matched else (i + 1)
+        # Jump past the object ONLY when it parsed; a balanced-but-invalid span
+        # (a stray opener whose braces happened to balance around real JSON) must
+        # advance by one so the genuine object nested inside still gets scanned —
+        # otherwise a large binary checkpoint frame can swallow a real tool-call.
+        i = (j + 1) if parsed_ok else (i + 1)
     return objects
 
 

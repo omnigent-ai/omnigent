@@ -225,6 +225,29 @@ def _tool_result_obj(tool_call_id: str) -> dict:
     }
 
 
+def test_iter_embedded_json_recovers_from_enclosing_garbage() -> None:
+    """A stray opener whose braces balance AROUND the real object must not hide it.
+
+    Large cursor checkpoint frames contain binary that can form a ``{ … }`` span
+    enclosing a real message object while itself being invalid JSON. The scanner
+    must keep going (advance by one) and still extract the inner object — not
+    jump past the whole failed span (which dropped genuinely-pending tool calls,
+    e.g. MCP, in big frames).
+    """
+    inner = _json.dumps(_pending_tool_call_obj("call_mcp\nfc", "omnigent-list_comments", {"x": 1}))
+    # Leading "{"k": … <inner> … bad}" balances at the trailing brace but fails
+    # to parse; the genuine object is nested inside it.
+    raw = b'{"k": ' + inner.encode("utf-8") + b" trailing-bad}"
+    objs = cnp._iter_embedded_json_objects(raw)
+    names = [
+        p.get("toolName")
+        for o in objs
+        for p in (o.get("content") or [])
+        if isinstance(p, dict) and p.get("type") == "tool-call"
+    ]
+    assert "omnigent-list_comments" in names
+
+
 def test_read_pending_detects_framed_gated_tool_call(tmp_path: Path) -> None:
     """A pending tool-call embedded in a binary frame is detected with its args.
 
