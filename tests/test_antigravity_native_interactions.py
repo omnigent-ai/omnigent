@@ -202,6 +202,31 @@ class _DeliverRecorder:
                 raise err
 
 
+class _InjectTuiRecorder:
+    """
+    Records every ``inject_tui`` call's key sequence (and optionally raises).
+
+    Stands in for :func:`_inject_via_tui` so a test can assert the EXACT tmux key
+    sequence the bridge types into the agy TUI pane after a successful RPC
+    delivery (#1200), without a live pane. Mirrors :class:`_DeliverRecorder`.
+    """
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        """
+        :param error: When not ``None``, raised on every call so a test can drive
+            the best-effort "TUI dismissal failed but the verdict still landed"
+            branch.
+        """
+        self.calls: list[list[str]] = []
+        self._error = error
+
+    async def __call__(self, keys: list[str]) -> None:
+        """Record one TUI key sequence, raising the scripted error if set."""
+        self.calls.append(list(keys))
+        if self._error is not None:
+            raise self._error
+
+
 def _steps_returner(*frames: list[dict[str, Any]]) -> Any:
     """
     Build a ``get_steps`` fake that returns successive snapshots per call.
@@ -259,6 +284,7 @@ async def test_happy_path_delivers_selected_option_to_fresh_step() -> None:
         ElicitationResult(action="accept", content={"0": "Second"})
     )
     deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
 
     await bridge_interaction(
         _CASCADE,
@@ -267,6 +293,7 @@ async def test_happy_path_delivers_selected_option_to_fresh_step() -> None:
         get_steps=_steps_returner([waiting]),
         request_elicitation=request,
         deliver=deliver,
+        inject_tui=inject_tui,
     )
 
     assert len(deliver.calls) == 1
@@ -279,6 +306,8 @@ async def test_happy_path_delivers_selected_option_to_fresh_step() -> None:
     # The elicitation was published under the deterministic id for these ids.
     assert len(elicit_calls) == 1
     assert elicit_calls[0][0] == agy_elicitation_id(_CASCADE, _TRAJ, 3)
+    # The TUI prompt was dismissed by typing the selected option id + Enter.
+    assert inject_tui.calls == [["2", "Enter"]]
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +400,7 @@ async def test_permission_accept_delivers_allow_true() -> None:
     waiting = _permission_step(step_index=2)
     request, _ = _elicitation_returner(ElicitationResult(action="accept", content=None))
     deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
 
     await bridge_interaction(
         _CASCADE,
@@ -379,11 +409,94 @@ async def test_permission_accept_delivers_allow_true() -> None:
         get_steps=_steps_returner([waiting]),
         request_elicitation=request,
         deliver=deliver,
+        inject_tui=inject_tui,
     )
 
     assert len(deliver.calls) == 1
     assert deliver.calls[0]["payload"] == {"permission": {"allow": True}}
     assert deliver.calls[0]["step_index"] == 2
+    # #1200: Approve drives agy's TUI prompt to option 1 ("Yes") + Enter, so the
+    # attended terminal advances (the RPC alone leaves the TUI prompt open).
+    assert inject_tui.calls == [["1", "Enter"]]
+
+
+@pytest.mark.asyncio
+async def test_permission_reject_delivers_allow_false_and_types_no() -> None:
+    """Permission rejected → deliver ``allow: False`` AND type option 4 ("No")."""
+    pending = _pending_permission(step_index=2)
+    waiting = _permission_step(step_index=2)
+    request, _ = _elicitation_returner(ElicitationResult(action="decline", content=None))
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([waiting]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    assert deliver.calls[0]["payload"] == {"permission": {"allow": False}}
+    # #1200: Reject drives agy's TUI prompt to option 4 ("No") + Enter.
+    assert inject_tui.calls == [["4", "Enter"]]
+
+
+@pytest.mark.asyncio
+async def test_tui_dismissal_failure_does_not_undo_delivered_verdict() -> None:
+    """A TUI send-keys failure is best-effort: the RPC verdict still stands.
+
+    The backend step is already answered by the time the keystroke is typed, so a
+    flaky/exited pane must NOT raise out of ``bridge_interaction`` (which would
+    look like the verdict failed). The delivery is recorded; the TUI error is
+    swallowed (logged).
+    """
+    pending = _pending_permission(step_index=2)
+    waiting = _permission_step(step_index=2)
+    request, _ = _elicitation_returner(ElicitationResult(action="accept", content=None))
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder(error=RuntimeError("the agy terminal exited"))
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([waiting]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    # The RPC verdict was delivered exactly once and the bridge returned cleanly
+    # despite the TUI keystroke raising.
+    assert len(deliver.calls) == 1
+    assert deliver.calls[0]["payload"] == {"permission": {"allow": True}}
+    assert inject_tui.calls == [["1", "Enter"]]
+
+
+@pytest.mark.asyncio
+async def test_no_tui_keystroke_when_nothing_delivered() -> None:
+    """When the elicitation returns None (timeout/cancel), no TUI key is typed."""
+    pending = _pending_permission(step_index=2)
+    waiting = _permission_step(step_index=2)
+    request, _ = _elicitation_returner(None)
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([waiting]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    assert deliver.calls == []
+    assert inject_tui.calls == []
 
 
 # ---------------------------------------------------------------------------

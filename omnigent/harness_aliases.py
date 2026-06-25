@@ -8,6 +8,7 @@ from __future__ import annotations
 
 HARNESS_ALIASES: dict[str, str] = {
     "claude": "claude-sdk",
+    "native-kiro": "kiro-native",
     "native-pi": "pi-native",
     # The SDK package / runtime dispatch spelling; specs use "openai-agents".
     "openai-agents-sdk": "openai-agents",
@@ -15,9 +16,15 @@ HARNESS_ALIASES: dict[str, str] = {
     # canonical id is "antigravity" (matches the registry / workflow type).
     "agy": "antigravity",
     "google-antigravity": "antigravity",
+    # User-facing spelling for Moonshot AI's Kimi Code CLI; the canonical id
+    # is "kimi" (matches the binary and the registry / workflow type).
+    "kimi-code": "kimi",
     # User-facing reversed spelling for the Goose native-CLI harness; canonical
     # id is "goose-native".
     "native-goose": "goose-native",
+    # Reversed spelling for the native Kimi Code TUI harness; canonical id is
+    # "kimi-native" (the SDK/headless harness keeps the bare "kimi" id).
+    "native-kimi": "kimi-native",
     # Qwen Code harness alias.
     "qwen-code": "qwen",
     # User-facing reversed spelling for the qwen native-CLI harness; canonical
@@ -28,6 +35,10 @@ HARNESS_ALIASES: dict[str, str] = {
     # (there is no separate SDK ``opencode`` harness, so the bare name is free).
     "opencode": "opencode-native",
     "native-opencode": "opencode-native",
+    # User-facing reversed spelling for the Hermes native-CLI (TUI) harness;
+    # canonical id is "hermes-native" (the headless subprocess harness keeps the
+    # bare "hermes" name, like goose vs goose-native).
+    "native-hermes": "hermes-native",
     # User-facing spelling for the GitHub Copilot SDK harness; the canonical id
     # is "copilot" (matches the registry / workflow type).
     "github-copilot": "copilot",
@@ -49,6 +60,8 @@ NATIVE_HARNESSES: frozenset[str] = frozenset(
         "native-pi",
         "cursor-native",
         "native-cursor",
+        "kiro-native",
+        "native-kiro",
         # Native Antigravity (agy) TUI bridge used by ``omnigent antigravity``;
         # the in-process SDK counterpart is the canonical ``antigravity``
         # harness (see HARNESS_ALIASES / runtime/harnesses/__init__.py).
@@ -60,6 +73,13 @@ NATIVE_HARNESSES: frozenset[str] = frozenset(
         "native-qwen",
         "opencode-native",
         "native-opencode",
+        "kimi-native",
+        "native-kimi",
+        # Native Hermes (TUI) bridge used by ``omnigent hermes``; the headless
+        # subprocess counterpart is the canonical ``hermes`` harness (see
+        # HARNESS_ALIASES / runtime/harnesses/__init__.py).
+        "hermes-native",
+        "native-hermes",
     }
 )
 

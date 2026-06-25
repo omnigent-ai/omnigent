@@ -33,6 +33,7 @@ _SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
         "openai-agents",
         "cursor",
         "antigravity",
+        "kimi",
         "qwen",
         "goose",
         "copilot",
@@ -230,7 +231,7 @@ def harness_supports_model_override(harness: str | None) -> bool:
     """
     Return whether *harness* has per-session model-override plumbing.
 
-    Native CLIs (claude-native / codex-native) receive the override as
+    Native CLIs receive the override as
     ``--model`` at terminal launch; the SDK harnesses receive it via
     ``HARNESS_<H>_MODEL`` in the spawn env. Anything else (e.g.
     unknown harnesses) silently ignores the

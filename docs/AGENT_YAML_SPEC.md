@@ -49,7 +49,7 @@ resolved from the YAML file's directory.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, pi, antigravity, qwen, copilot, hermes, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
@@ -65,6 +65,11 @@ gateway / `auth.type: databricks` does not apply. Authenticate it with
 `CURSOR_API_KEY` (or a prior `cursor-agent login`), optionally pinned via
 `auth: {type: api_key, api_key: ${CURSOR_API_KEY}}`, and choose a Cursor model
 id (e.g. `auto`, `gpt-5`) rather than a `databricks-*` id.
+
+The `kiro-native` harness is the native Kiro CLI terminal path used by
+`omnigent kiro`. It requires `kiro-cli` on `PATH` and Kiro's own login/auth; it
+does not use Databricks, OpenAI, or Anthropic provider credentials. Plain
+`harness: kiro` is not a generic Omnigent harness id.
 
 ### Antigravity (Gemini)
 
@@ -113,6 +118,27 @@ To route through OpenRouter / a gateway, declare a key/gateway provider in
 `~/.omnigent/config.yaml` and reference it (`auth: {type: provider, name: …}`),
 or set `auth.base_url` to the OpenAI-compatible endpoint alongside the key.
 For Databricks, use `auth: {type: databricks, profile: …}`.
+
+### Kimi Code
+
+`harness: kimi` runs the agent through Moonshot AI's
+[Kimi Code CLI](https://github.com/MoonshotAI/Kimi-Code) headlessly via
+`kimi --print --output-format stream-json` per turn. Install the binary
+with `curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash`
+and authenticate once with `kimi login` (OAuth or a Moonshot API key).
+
+```yaml
+executor:
+  harness: kimi               # alias: kimi-code
+  model: kimi-k2-turbo
+```
+
+By default Kimi authenticates against Moonshot AI's backend — Omnigent
+declares no `executor.auth` block. To route through a gateway, either set
+`HARNESS_KIMI_GATEWAY_BASE_URL` + `HARNESS_KIMI_GATEWAY_API_KEY` in the
+shell, declare a key/gateway provider in `~/.omnigent/config.yaml`, or use
+`executor.auth: {type: databricks, profile: …}` and let Omnigent resolve
+the workspace.
 
 CLI flags such as `--harness` and `--model` can override or supply missing
 executor values for a run. Databricks credentials come from the spec's

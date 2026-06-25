@@ -83,7 +83,7 @@ ENV PYTHONUNBUFFERED=1 \
 USER 0
 
 # curl-minimal and ca-certificates are preinstalled in UBI9.
-RUN dnf install -y --nodocs git tmux \
+RUN dnf install -y --nodocs git tmux unzip \
  && dnf clean all
 
 RUN git config --system credential.helper \
@@ -100,6 +100,14 @@ RUN npm install -g --no-audit --no-fund \
       @openai/codex \
       @earendil-works/pi-coding-agent \
  && npm cache clean --force
+
+# Kiro CLI is not published as an npm package; use its official installer and
+# copy the resulting root-local binaries onto the global PATH.
+RUN curl -fsSL https://cli.kiro.dev/install | bash \
+ && install -m 0755 /root/.local/bin/kiro-cli /usr/local/bin/kiro-cli \
+ && if [ -f /root/.local/bin/kiro-cli-chat ]; then \
+      install -m 0755 /root/.local/bin/kiro-cli-chat /usr/local/bin/kiro-cli-chat; \
+    fi
 
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /build /build
