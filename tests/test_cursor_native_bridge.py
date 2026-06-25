@@ -167,3 +167,78 @@ def test_inject_user_message_clears_before_pasting(
     assert not any("C-a" in cmd or "C-k" in cmd for cmd in captured)
     # Submit still happens last.
     assert any("send-keys" in cmd and "Enter" in cmd for cmd in captured)
+
+
+# Idle marker so _settle_pane returns and _clear_composer settles at once.
+_IDLE = "Add a follow-up"
+
+
+def _prepare_bridge(tmp_path: Path) -> Path:
+    """Write a tmux target so ``_wait_for_tmux_info`` resolves in-process."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path(_SOCK), tmux_target=_TARGET)
+    return bridge_dir
+
+
+class TestInjectModelGate:
+    """``inject_model_command`` must gate Enter on the picker's filter result.
+
+    Regression for the reviewer-flagged bug: the readiness check used
+    ``model in pane``, which is satisfied instantly by the echoed
+    ``/model <id>`` composer text and never confirms a match landed — so an
+    unavailable id would press Enter against "No matches" and mis-select.
+    """
+
+    def test_presses_enter_when_picker_matches(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A landed filter ("Models matching") commits the selection with Enter."""
+        bridge_dir = _prepare_bridge(tmp_path)
+        captured = _install_fake_tmux(
+            monkeypatch, pane_captures=[f'{_IDLE}\nModels matching "gpt-5.2"\n →  GPT-5.2   High']
+        )
+        monkeypatch.setattr(cursor_native_bridge.time, "sleep", lambda *_a, **_k: None)
+
+        cursor_native_bridge.inject_model_command(bridge_dir, model="gpt-5.2")
+
+        tails = _send_keys_calls(captured)
+        assert ["-t", _TARGET, "-l", "/model gpt-5.2"] in tails  # the filter command
+        assert ["-t", _TARGET, "Enter"] in tails  # selection committed
+        assert ["-t", _TARGET, "Escape"] not in tails  # no dismiss on a real match
+
+    def test_raises_without_enter_on_no_match(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ "No matches" fails loudly, dismisses the picker, and never presses Enter."""
+        bridge_dir = _prepare_bridge(tmp_path)
+        captured = _install_fake_tmux(
+            monkeypatch, pane_captures=[f"{_IDLE}\n → /model bogus-model\n    No matches"]
+        )
+        monkeypatch.setattr(cursor_native_bridge.time, "sleep", lambda *_a, **_k: None)
+
+        with pytest.raises(RuntimeError, match="not available"):
+            cursor_native_bridge.inject_model_command(bridge_dir, model="bogus-model")
+
+        tails = _send_keys_calls(captured)
+        assert ["-t", _TARGET, "Enter"] not in tails  # wrong/no selection never committed
+        assert ["-t", _TARGET, "Escape"] in tails  # picker dismissed
+
+    def test_echoed_command_alone_does_not_satisfy_the_gate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The id in the echoed composer line (no header) is still treated as no-match.
+
+        The pane contains the typed ``/model gpt-5.2`` — a naive ``model in
+        pane`` check would pass — but with a "No matches" result and no "Models
+        matching" header the gate must refuse to press Enter.
+        """
+        bridge_dir = _prepare_bridge(tmp_path)
+        captured = _install_fake_tmux(
+            monkeypatch, pane_captures=[f"{_IDLE}\n → /model gpt-5.2\n    No matches"]
+        )
+        monkeypatch.setattr(cursor_native_bridge.time, "sleep", lambda *_a, **_k: None)
+
+        with pytest.raises(RuntimeError, match="not available"):
+            cursor_native_bridge.inject_model_command(bridge_dir, model="gpt-5.2")
+
+        assert ["-t", _TARGET, "Enter"] not in _send_keys_calls(captured)
