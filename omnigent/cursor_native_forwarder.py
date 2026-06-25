@@ -754,7 +754,14 @@ async def forward_cursor_store_to_session(
                                 # only leaves the spinner lingering; unlike a
                                 # chat item it carries no content to lose, so we
                                 # never retry-wedge the mirror on it. Advance the
-                                # cursor either way.
+                                # cursor either way. NOTE: this also swallows
+                                # connection-level errors (a server blip at
+                                # exactly the rollup blob loses the completion
+                                # for good, since the cursor persists past it) —
+                                # strictly less resilient than the chat path,
+                                # which retries connection loss forever. Matches
+                                # the claude forwarder's best-effort posture and
+                                # never desyncs the mirror, so it is acceptable.
                                 try:
                                     await _post_external_compaction_status(
                                         client, session_id=session_id, status="completed"

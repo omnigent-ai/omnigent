@@ -11181,19 +11181,34 @@ async def test_events_compact_on_cursor_native_pastes_summarize_and_raises_spinn
 
 
 @pytest.mark.asyncio
-async def test_events_compact_on_cursor_native_503_dismisses_spinner_when_bridge_not_ready(
+@pytest.mark.parametrize(
+    ("inject_exc", "label"),
+    [
+        # Pane not attached: _wait_for_tmux_info / _run_tmux raise RuntimeError.
+        (RuntimeError("tmux target is not advertised"), "runtime"),
+        # Filesystem fault writing the paste tempfile into bridge_dir (disk
+        # full, perms, dir removed). cursor's inject_user_message has this
+        # surface; the claude-native analog does not. A narrow
+        # ``except (RuntimeError, ValueError)`` would let this escape AFTER
+        # in_progress fired, stranding the spinner with no failed edge.
+        (OSError("No space left on device"), "oserror"),
+    ],
+)
+async def test_events_compact_on_cursor_native_503_dismisses_spinner_on_inject_failure(
+    inject_exc: Exception,
+    label: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    Bridge-not-ready RuntimeError surfaces as 503 and dismisses the spinner.
+    An injection failure surfaces as 503 AND dismisses the spinner.
 
-    When the cursor TUI pane isn't attached there is no live cursor to
-    compact, so the handler returns 503 with ``cursor_native_compact_failed``.
-    Crucially it must also publish ``response.compaction.failed`` so the web
-    UI dismisses the "Compacting…" spinner the ``in_progress`` event raised —
-    otherwise the spinner is stranded forever — and must NOT publish
-    ``completed`` (the history was never compacted, so no permanent marker).
+    The handler publishes ``response.compaction.in_progress`` before injecting,
+    so every failure path must publish ``response.compaction.failed`` to
+    dismiss the "Compacting…" spinner — otherwise it is stranded forever — and
+    must NOT publish ``completed`` (the history was never compacted). Covers
+    both the tmux ``RuntimeError`` and the tempfile ``OSError`` surfaces; the
+    latter is unique to cursor's bracketed-paste path.
     """
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
@@ -11201,9 +11216,9 @@ async def test_events_compact_on_cursor_native_503_dismisses_spinner_when_bridge
     monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
 
     def _fake_inject(bridge_dir: Any, *, content: str, timeout_s: float) -> None:
-        """Simulate the bridge-not-ready path (pane not attached)."""
+        """Simulate an injection failure (tmux down, or tempfile write fault)."""
         del bridge_dir, content, timeout_s
-        raise RuntimeError("tmux target is not advertised")
+        raise inject_exc
 
     monkeypatch.setattr(cursor_native_bridge, "inject_user_message", _fake_inject)
 
@@ -11218,7 +11233,7 @@ async def test_events_compact_on_cursor_native_503_dismisses_spinner_when_bridge
         del agent_id, session_id
         return cursor_native_spec
 
-    conv_id = "conv_cursor_compact_fail"
+    conv_id = f"conv_cursor_compact_fail_{label}"
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]

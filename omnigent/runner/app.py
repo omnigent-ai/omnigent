@@ -10603,10 +10603,16 @@ def create_runner_app(
                 content="/summarize",
                 timeout_s=1.0,
             )
-        except (RuntimeError, ValueError) as exc:
+        except (RuntimeError, ValueError, OSError) as exc:
             # Dismiss the spinner the in_progress event raised — the history
             # was not compacted, so no permanent marker should be left, and no
             # summary blob will arrive for the forwarder to complete it.
+            #
+            # OSError is in scope (unlike the claude-native analog): cursor's
+            # ``inject_user_message`` writes the paste payload to a tempfile in
+            # ``bridge_dir`` first, so a filesystem fault (disk full, perms, dir
+            # gone) raises OSError. Without it here that escapes after in_progress
+            # already fired, stranding the spinner with no failed/completed edge.
             _publish_event(conv_id, {"type": "response.compaction.failed", "task_id": conv_id})
             return JSONResponse(
                 status_code=503,
