@@ -74,7 +74,7 @@ from omnigent.runner.resource_registry import (
     TerminalLifecycle,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.spec.parser import discover_host_skills
+from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -7023,6 +7023,14 @@ def get_session_agent_id(session_id: str) -> str | None:
     return _session_agent_ids_ref.get(session_id)
 
 
+# How long a session's discovered skills stay cached before the runner
+# re-walks the filesystem. Short enough that a skill or plugin installed
+# mid-session surfaces in the composer menu without a session restart, long
+# enough to collapse the bursty menu-open + per-invocation resolve calls onto
+# a single walk. Module-level so it can be tuned/patched in one place.
+_SESSION_SKILLS_CACHE_TTL_SECONDS = 60.0
+
+
 def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
@@ -7131,10 +7139,12 @@ def create_runner_app(
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
-    # session_id → merged (bundled + host) skills, discovered against
-    # this runner's filesystem. Skills are runner-owned: the walk runs
-    # once per session lifetime and is dropped in ``delete_session``.
-    _session_skills_cache: dict[str, list[SkillSpec]] = {}
+    # session_id → (monotonic expiry, merged bundled + host skills),
+    # discovered against this runner's filesystem. Skills are runner-owned:
+    # the walk reruns at most once per ``_SESSION_SKILLS_CACHE_TTL_SECONDS``
+    # (so a mid-session skill/plugin install surfaces) and the entry is
+    # dropped in ``delete_session``.
+    _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_agent_ids = _session_agent_ids_ref  # shared with module-level get_session_agent_id
     # Sub-agent name per session. Set from POST /v1/sessions body
@@ -15897,8 +15907,11 @@ def create_runner_app(
         contributes nothing). Falls back to the runner's global workspace,
         then the process cwd, when no workspace is known. Deduplicated by
         name with bundled winning, then earlier roots winning. Cached per
-        session so the filesystem walk runs once per session lifetime
-        (dropped in ``delete_session``).
+        session with a short TTL (``_SESSION_SKILLS_CACHE_TTL_SECONDS``) so the
+        walk reruns at most once per window — fresh enough to surface a
+        skill/plugin installed mid-session, while still collapsing the bursty
+        menu-open + per-invocation resolve calls (dropped in
+        ``delete_session``).
 
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -15910,7 +15923,11 @@ def create_runner_app(
         """
         cached = _session_skills_cache.get(session_id)
         if cached is not None:
-            return cached
+            expires_at, cached_skills = cached
+            if time.monotonic() < expires_at:
+                return cached_skills
+            # TTL elapsed — fall through to re-walk so a skill or plugin
+            # installed mid-session surfaces without a session restart.
         entry = await _resolve_session_spec_entry(session_id)
         spec = _unwrap_resolved_spec(entry) if entry is not None else None
         if spec is None:
@@ -15939,18 +15956,44 @@ def create_runner_app(
             roots.append(Path.cwd())
 
         def _discover() -> list[SkillSpec]:
-            """Merge bundled + host skills (every root) off the event loop."""
-            merged: list[SkillSpec] = list(spec.skills)
-            seen = {s.name for s in merged}
-            for root in roots:
-                for hs in discover_host_skills(root, spec.skills_filter):
-                    if hs.name not in seen:
-                        seen.add(hs.name)
-                        merged.append(hs)
+            """Merge bundled skills with the harness's extra skills off the loop."""
+            # Drop user-invocable:false skills from the bundle too, so the
+            # composer menu never lists a non-invocable skill regardless of
+            # source (harness skills are already filtered in resolve_harness_skills).
+            merged: list[SkillSpec] = [s for s in spec.skills if s.user_invocable]
+            # Seed the dedup set from EVERY bundled name — including the
+            # non-invocable ones dropped above — so marking a bundled skill
+            # non-invocable can't un-shadow a same-named host/harness skill
+            # the author never meant to surface.
+            seen = {s.name for s in spec.skills}
+            # Also dedup by on-disk skill dir: a harness provider (e.g. codex)
+            # may rediscover a bundle skill under a *different* name than its
+            # frontmatter ``name`` (it keys by directory), which would otherwise
+            # double-list the same skill. Same dir == same skill, drop it.
+            seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
+            ctx = SkillSourceContext(
+                roots=tuple(roots),
+                home=Path.home(),
+                skills_filter=spec.skills_filter,
+                bundle_dir=_resolved_spec_workdir(entry),
+            )
+            harness = canonicalize_harness(spec.executor.harness_kind)
+            for hs in resolve_harness_skills(ctx, harness):
+                if hs.name in seen:
+                    continue
+                if hs.skill_dir is not None and hs.skill_dir.resolve() in seen_dirs:
+                    continue
+                seen.add(hs.name)
+                if hs.skill_dir is not None:
+                    seen_dirs.add(hs.skill_dir.resolve())
+                merged.append(hs)
             return merged
 
         skills = await asyncio.to_thread(_discover)
-        _session_skills_cache[session_id] = skills
+        _session_skills_cache[session_id] = (
+            time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,
+            skills,
+        )
         return skills
 
     @app.get("/v1/sessions/{session_id}/skills")
