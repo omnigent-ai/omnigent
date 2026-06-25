@@ -10895,12 +10895,6 @@ def _run_configure_harnesses_interactive() -> None:
     # is outside the anthropic/openai machinery), so it dispatches to its own
     # credential manager rather than ``_manage_harness_providers``.
     _ANTIGRAVITY = "\x00antigravity"
-    # Sentinel marking the Cursor Cloud row — Cursor Cloud / Background Agents
-    # run in Cursor's cloud against a GitHub repo via the same ``cursor-sdk`` and
-    # the same ``CURSOR_API_KEY`` as the SDK Cursor harness, so it dispatches to
-    # the shared Cursor key flow (``_manage_cursor_harness``) rather than a
-    # separate credential of its own.
-    _CURSOR_CLOUD = "\x00cursor-cloud"
     # Sentinel marking the Qwen Code row — like Antigravity/Cursor it is not a
     # provider family (its v1 auth is the CLI's own env vars / ``/auth`` flow,
     # not an Omnigent credential), so it dispatches to its own drill-in.
@@ -11001,22 +10995,10 @@ def _run_configure_harnesses_interactive() -> None:
             options.append(f"  {cursor_sub}")
             selectable.append(False)
             row_target.append(None)
-        # Cursor Cloud / Background Agents: runs in Cursor's cloud against a
-        # GitHub repo (opens a PR) via the same ``cursor-sdk`` and the same
-        # ``CURSOR_API_KEY`` as the SDK Cursor harness — no separate secret. So
-        # readiness mirrors Cursor's (the shared key), and its row dispatches to
-        # the same key flow.
-        options.append(f"{'  ' if cursor_key_set else '[red]✗[/] '}Cursor Cloud")
-        selectable.append(True)
-        row_target.append(_CURSOR_CLOUD)
-        cursor_cloud_sub = (
-            "[green]✓[/] shares the Cursor API key"
-            if cursor_key_set
-            else "[dim]shares the Cursor API key — open to add one[/]"
-        )
-        options.append(f"  {cursor_cloud_sub}")
-        selectable.append(False)
-        row_target.append(None)
+        # NB: the ``cursor-cloud`` harness (Cursor Cloud / Background Agents)
+        # shares this same ``CURSOR_API_KEY`` and has no separate credential, so
+        # it intentionally has no row of its own here — configuring Cursor above
+        # configures it too. It remains selectable via ``--harness cursor-cloud``.
         # Antigravity (Gemini-native, no provider family): like Cursor, readiness
         # is just whether a Gemini key is configured (``antigravity:`` block or
         # ambient env); its drill-in manages that key. Vertex specs need no key,
@@ -11241,9 +11223,6 @@ def _run_configure_harnesses_interactive() -> None:
             return
         target = row_target[idx]
         if target == CURSOR_KEY:
-            _manage_cursor_harness()
-        elif target == _CURSOR_CLOUD:
-            # Cursor Cloud shares the Cursor API key — route to the same flow.
             _manage_cursor_harness()
         elif target == COPILOT_KEY:
             _manage_copilot_harness()
