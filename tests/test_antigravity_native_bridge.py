@@ -21,6 +21,7 @@ from omnigent.antigravity_native_bridge import (
     prepare_bridge_dir,
     read_bridge_state,
     read_tmux_info,
+    send_interaction_keys_via_tui,
     update_conversation_id,
     write_bridge_state,
     write_tmux_target,
@@ -1005,3 +1006,86 @@ def test_inject_user_message_via_tui_rejects_empty_content(tmp_path: Path) -> No
     """Empty content is a programming error, not something to type into the TUI."""
     with pytest.raises(RuntimeError, match="non-empty content"):
         inject_user_message_via_tui(tmp_path / "bridge", content="")
+
+
+# ---------------------------------------------------------------------------
+# Interaction-prompt TUI delivery (send_interaction_keys_via_tui) — #1200
+# ---------------------------------------------------------------------------
+
+
+def test_send_interaction_keys_via_tui_sends_one_send_keys_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The verdict keys go out as ONE ``send-keys`` so digit + Enter stay together."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    captured: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    send_interaction_keys_via_tui(bridge_dir, "1", "Enter")
+
+    assert captured == [
+        ["tmux", "-S", "/tmp/ex/tmux.sock", "send-keys", "-t", "main", "1", "Enter"]
+    ]
+
+
+def test_send_interaction_keys_via_tui_reject_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reject verdict's ``4`` + Enter sequence is forwarded verbatim."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    captured: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    send_interaction_keys_via_tui(bridge_dir, "4", "Enter")
+
+    assert captured == [
+        ["tmux", "-S", "/tmp/ex/tmux.sock", "send-keys", "-t", "main", "4", "Enter"]
+    ]
+
+
+def test_send_interaction_keys_via_tui_raises_without_target(tmp_path: Path) -> None:
+    """No advertised tmux target → a clear RuntimeError (no silent drop)."""
+    with pytest.raises(RuntimeError, match="tmux target not advertised"):
+        send_interaction_keys_via_tui(tmp_path / "bridge", "1", "Enter")
+
+
+def test_send_interaction_keys_via_tui_raises_when_pane_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exited agy pane → RuntimeError so the bridge logs the best-effort miss."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        # has-session reports the pane is gone (non-zero exit).
+        return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="no longer running"):
+        send_interaction_keys_via_tui(bridge_dir, "1", "Enter")
+
+
+def test_send_interaction_keys_via_tui_rejects_empty_keys(tmp_path: Path) -> None:
+    """No keys is a programming error, not an empty send-keys call."""
+    with pytest.raises(RuntimeError, match="at least one key"):
+        send_interaction_keys_via_tui(tmp_path / "bridge")

@@ -188,6 +188,19 @@ _StepKey = tuple[str | None, int | None, str | None]
 _EXTERNAL_SESSION_USAGE = "external_session_usage"
 _EXTERNAL_MODEL_CHANGE = "external_model_change"
 
+# Event that WITHDRAWS a surfaced elicitation whose WAITING step left WAITING
+# out-of-band (answered directly in the agy TUI, or agy timed out / auto-resolved
+# it). Posting it sets the server's parked-future ``resolved_elsewhere`` flag,
+# which (a) returns ``None`` from any in-flight ``request_elicitation`` long-poll
+# — so ``bridge_interaction`` does NOT then deliver a stale verdict — and (b)
+# clears the web approval card so the chat stops showing "Respond to the pending
+# request above to continue." Mirrors cursor-native's
+# ``_post_external_elicitation_resolved`` (#1200, direction 2). The reader's own
+# web→TUI delivery, by contrast, does NOT post this: the WAITING step there leaves
+# WAITING because the bridge ALREADY resolved the card (the human's verdict), so
+# the reader must not double-resolve it — see :func:`_maybe_withdraw_interaction`.
+_EXTERNAL_ELICITATION_RESOLVED = "external_elicitation_resolved"
+
 # Async callback handed each distinct WAITING interaction. It receives the SAME
 # ``cascade_id`` + connect-RPC ``port`` the reader discovered and is using, so the
 # Task 8 interaction bridge it drives targets agy's live conversation WITHOUT
@@ -1086,6 +1099,12 @@ class _ReaderState:
         a day); at most one runs at a time because the in-flight bridge owns agy's
         WAITING-timeout retries (a second would double-fire). Cancelled on reader
         teardown.
+    :param surfaced_elicitations: ``_StepKey`` → the deterministic elicitation id
+        published for that WAITING step. Populated when an interaction is handed to
+        the bridge; consumed by :func:`_maybe_withdraw_interaction` when the step
+        is later seen NO LONGER WAITING (answered in the agy TUI, or agy timed
+        out) to WITHDRAW the still-parked web card (#1200, direction 2). An entry
+        is removed once withdrawn so the withdraw posts at most once.
     """
 
     allocator: _ToolCallIdAllocator
@@ -1101,6 +1120,7 @@ class _ReaderState:
     cumulative_output_tokens: int = 0
     cumulative_cache_read_input_tokens: int = 0
     interaction_task: asyncio.Task[None] | None = None
+    surfaced_elicitations: dict[_StepKey, str] = field(default_factory=dict)
 
 
 async def _poll_loop(
@@ -1344,6 +1364,19 @@ async def _process_committed_step(
         cascade_id=cascade_id,
         state=state,
         on_pending_interaction=on_pending_interaction,
+    )
+    # Inverse of the above (#1200, direction 2): if a step we previously surfaced
+    # is now NO LONGER WAITING (answered in the agy TUI, or agy timed out), withdraw
+    # the parked web card so it does not linger. Runs unconditionally — including
+    # for an already-``seen`` step — because a WAITING step is not ``seen`` until it
+    # settles, so its terminal transition arrives as a fresh (not-yet-seen) step
+    # here; the dedup lives in ``surfaced_elicitations`` (popped on first withdraw).
+    await _maybe_withdraw_interaction(
+        step,
+        key=key,
+        client=client,
+        session_id=session_id,
+        state=state,
     )
 
 
@@ -1712,6 +1745,17 @@ def _maybe_handle_interaction(
         # WAITING-timeout retries, so don't double-fire on the retry step.
         return
     state.interacted.add(key)
+    # Record the deterministic elicitation id this WAITING step surfaces, so that
+    # if the step later leaves WAITING out-of-band (answered in the agy TUI, or
+    # agy timed it out) :func:`_maybe_withdraw_interaction` can WITHDRAW the parked
+    # web card (#1200, direction 2). ``agy_elicitation_id`` is lazily imported —
+    # like ``bridge_interaction`` — so the reader stays importable from the
+    # lightweight CLI process without eagerly pulling the server-route stack.
+    from omnigent.antigravity_native_interactions import agy_elicitation_id
+
+    state.surfaced_elicitations[key] = agy_elicitation_id(
+        cascade_id, pending["trajectory_id"], pending["step_index"]
+    )
 
     async def _run_bridge() -> None:
         await on_pending_interaction(cascade_id, state.port, pending)
@@ -1731,6 +1775,114 @@ def _maybe_handle_interaction(
     task = asyncio.create_task(_run_bridge(), name="antigravity-interaction-bridge")
     state.interaction_task = task
     task.add_done_callback(_clear_slot)
+
+
+async def _maybe_withdraw_interaction(
+    step: dict[str, object],
+    *,
+    key: _StepKey,
+    client: httpx.AsyncClient,
+    session_id: str,
+    state: _ReaderState,
+) -> None:
+    """
+    Withdraw a surfaced elicitation whose WAITING step left WAITING (#1200, dir 2).
+
+    The inverse of :func:`_maybe_handle_interaction`. The reader publishes an
+    elicitation when it first sees a WAITING permission/ask_question step; but a
+    step can stop being WAITING without the WEB card being answered — the user
+    types the answer directly in the agy TUI pane, or agy times out / auto-resolves
+    the interaction. Without this, the parked web card LINGERS forever, showing
+    "Respond to the pending request above to continue" while the agent has already
+    moved on.
+
+    So: when a step the reader previously surfaced is, on a later poll/frame, NO
+    LONGER WAITING, POST ``external_elicitation_resolved`` for its elicitation id.
+    Server-side this sets the parked future's ``resolved_elsewhere`` flag, which
+    (a) clears the web card, and (b) makes any in-flight ``request_elicitation``
+    long-poll return ``None`` — so a racing :func:`bridge_interaction` does NOT
+    then deliver a stale verdict (the await short-circuits cleanly). Mirrors
+    cursor-native's ``_post_external_elicitation_resolved``.
+
+    Idempotency / no double-resolve: the entry is popped from
+    ``surfaced_elicitations`` so the withdraw posts AT MOST ONCE per step. This is
+    safe even when the step left WAITING because the WEB verdict resolved it (the
+    bridge delivered): the server already consumed that parked future, so the
+    withdraw finds none and merely tombstones the id (harmless) — it can never
+    re-deliver, because the bridge's ``request_elicitation`` already returned the
+    real verdict and the elicitation id is unique per ``step_index``.
+
+    :param step: One RPC step dict (any status).
+    :param key: The step's identity key (already computed by the caller).
+    :param client: HTTP client for the Omnigent event POST.
+    :param session_id: Omnigent conversation id whose card to withdraw.
+    :param state: Per-run reader state — ``surfaced_elicitations`` is read/mutated.
+    :returns: None.
+    """
+    elicitation_id = state.surfaced_elicitations.get(key)
+    if elicitation_id is None:
+        return
+    # Still WAITING → the interaction is live; nothing to withdraw yet.
+    if pending_interaction(step) is not None:
+        return
+    # Left WAITING out-of-band (or the web verdict already advanced it): withdraw
+    # the card exactly once.
+    state.surfaced_elicitations.pop(key, None)
+    await _post_external_elicitation_resolved(client, session_id, elicitation_id)
+
+
+async def _post_external_elicitation_resolved(
+    client: httpx.AsyncClient,
+    session_id: str,
+    elicitation_id: str,
+) -> None:
+    """
+    Tell the server a surfaced agy elicitation was resolved/withdrawn out-of-band.
+
+    POSTs ``external_elicitation_resolved`` so the parked web card clears and any
+    in-flight ``request_elicitation`` long-poll returns ``None``. Best-effort: a
+    transport error or a non-2xx is logged, never raised — a failed withdraw must
+    not crash the reader loop (the next signal, or agy's own timeout, recovers).
+    Mirrors cursor-native's ``_post_external_elicitation_resolved``.
+
+    :param client: HTTP client for Omnigent event posts (the reader's client).
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param elicitation_id: The deterministic agy elicitation id to withdraw.
+    :returns: None.
+    """
+    try:
+        response = await client.post(
+            f"/v1/sessions/{url_component(session_id)}/events",
+            json={
+                "type": _EXTERNAL_ELICITATION_RESOLVED,
+                "data": {"elicitation_id": elicitation_id},
+            },
+        )
+    except httpx.HTTPError:
+        _logger.warning(
+            "agy external_elicitation_resolved POST failed; the web card may linger "
+            "until agy's own timeout: session=%s elicitation_id=%s",
+            session_id,
+            elicitation_id,
+            exc_info=True,
+        )
+        return
+    if response.status_code >= 400:
+        _logger.warning(
+            "agy external_elicitation_resolved rejected: session=%s elicitation_id=%s "
+            "status=%s body=%s",
+            session_id,
+            elicitation_id,
+            response.status_code,
+            response.text[:512],
+        )
+        return
+    _logger.info(
+        "agy withdrew a surfaced elicitation resolved out-of-band (TUI answer / "
+        "timeout): session=%s elicitation_id=%s",
+        session_id,
+        elicitation_id,
+    )
 
 
 async def _maybe_emit_session_usage(
