@@ -231,6 +231,72 @@ def _chat_claimed_by_other(bridge_dir: Path, store_path: Path, my_launch_ms: int
     return False
 
 
+def _get_current_rowid(store_path: Path) -> int:
+    """Return the highest rowid currently in *store_path*, or 0 on any error."""
+    sql = "SELECT MAX(rowid) FROM blobs"
+    for uri, kw in ((f"file:{store_path}?mode=ro", {"uri": True}), (str(store_path), {})):
+        try:
+            con = sqlite3.connect(uri, timeout=5.0, **kw)
+        except sqlite3.Error:
+            continue
+        try:
+            row = con.execute(sql).fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        except sqlite3.Error:
+            continue
+        finally:
+            con.close()
+    return 0
+
+
+def preseed_resume_state(
+    bridge_dir: Path,
+    workspace: str,
+    chat_id: str,
+    launch_epoch_ms: int,
+) -> bool:
+    """Pre-seed the bridge state for a cold resume of a cursor-native session.
+
+    On cold resume ``cursor-agent --resume <chatId>`` loads an existing chat
+    store whose ``meta.json`` creation timestamp predates this launch.
+    ``_discover_store``'s recency filter would therefore miss it, leaving the
+    forwarder stuck in an empty-discovery loop and new messages unmirrored.
+
+    Writing the known store path + current rowid here lets the forwarder skip
+    discovery entirely and start tailing only messages posted after the resume.
+
+    External contract (verified empirically against the current cursor build):
+    ``cursor-agent --resume`` reuses the SAME chat store and *appends* new turns
+    at higher rowids — it does not re-write prior turns as new blobs. Seeding
+    ``last_rowid`` to the current max therefore mirrors only post-resume turns,
+    with no duplicate-history re-post. If a future cursor build re-appended the
+    prior conversation at rowids past the seed, those would be re-mirrored as
+    duplicates — the e2e gate (cursor-sdk-e2e-dev) is the guard for that drift.
+
+    :param bridge_dir: Per-session bridge directory (``bridge_dir_for_session_id``).
+    :param workspace: Realpath-normalised workspace (must match the cursor TUI cwd
+        so the store hash aligns).
+    :param chat_id: The cursor chat id (``external_session_id``).
+    :param launch_epoch_ms: Wall-clock ms of this terminal launch (used for the
+        claim-ownership heartbeat).
+    :returns: ``True`` when the store was found and state was written; ``False``
+        when the store doesn't exist yet (unlikely on resume, but safe to handle).
+    """
+    store_path = _cursor_chats_root() / _workspace_hash(workspace) / chat_id / "store.db"
+    if not store_path.exists():
+        return False
+    last_rowid = _get_current_rowid(store_path)
+    _write_state(
+        bridge_dir,
+        _ForwardState(
+            store_path=str(store_path),
+            last_rowid=last_rowid,
+            launch_epoch_ms=launch_epoch_ms,
+        ),
+    )
+    return True
+
+
 def _cursor_chats_root() -> Path:
     """Return ``~/.cursor/chats`` for the process's HOME (shared with the TUI)."""
     return Path.home() / ".cursor" / "chats"
@@ -452,6 +518,33 @@ def _blob_to_item(rowid: int, blob_id: str, data: object, agent_name: str) -> _M
     return None  # system or other scaffolding
 
 
+async def _patch_external_session_id(
+    client: httpx.AsyncClient, *, session_id: str, chat_id: str
+) -> None:
+    """PATCH the Omnigent session with the cursor chat id for cold-resume.
+
+    Best-effort: logs on failure but does not raise so the forwarder loop
+    continues mirroring even if the PATCH can't be delivered.
+    """
+    try:
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"external_session_id": chat_id},
+        )
+        if resp.status_code >= 400:
+            _logger.warning(
+                "AP rejected external_session_id PATCH (%s); session=%s chat_id=%s",
+                resp.status_code,
+                session_id,
+                chat_id,
+            )
+    except httpx.HTTPError:
+        _logger.warning(
+            "Transient error PATCHing external_session_id; session=%s — will not retry",
+            session_id,
+        )
+
+
 async def _post_conversation_item(
     client: httpx.AsyncClient, *, session_id: str, item: _MirrorItem
 ) -> None:
@@ -519,6 +612,9 @@ async def forward_cursor_store_to_session(
     # has seen. Reset whenever the cursor advances past an item.
     failed_rowid = 0
     failed_attempts = 0
+    # Track whether the cursor chat id has been persisted as external_session_id
+    # so the cold-resume path can pass ``--resume <chatId>`` to cursor-agent.
+    chat_id_patched = False
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
@@ -526,24 +622,60 @@ async def forward_cursor_store_to_session(
         while True:
             try:
                 if store_path is None or not store_path.exists():
-                    resolved = await asyncio.to_thread(_discover_store, workspace, launch_epoch_ms)
-                    if resolved is not None and not await asyncio.to_thread(
-                        _chat_claimed_by_other, bridge_dir, resolved, launch_epoch_ms
-                    ):
-                        store_path = resolved
-                        if persisted.store_path == str(resolved):
-                            last_rowid = persisted.last_rowid
-                        else:
-                            last_rowid = 0
+                    # On cold resume the runner pre-seeds the bridge state with
+                    # the known store path (see ``preseed_resume_state``), so we
+                    # use it directly rather than running ``_discover_store`` whose
+                    # launch-recency filter would miss a store created before this
+                    # launch. For a normal fresh start the persisted path is absent
+                    # (bridge state was cleared) and we fall through to discovery.
+                    if persisted.store_path and Path(persisted.store_path).exists():
+                        store_path = Path(persisted.store_path)
+                        last_rowid = persisted.last_rowid
                         _write_state(
                             bridge_dir,
                             _ForwardState(
-                                store_path=str(resolved),
+                                store_path=str(store_path),
                                 last_rowid=last_rowid,
                                 launch_epoch_ms=launch_epoch_ms,
                             ),
                         )
                         persisted = _ForwardState()  # consumed
+                        if not chat_id_patched:
+                            chat_id_val = store_path.parent.name
+                            await _patch_external_session_id(
+                                client, session_id=session_id, chat_id=chat_id_val
+                            )
+                            chat_id_patched = True
+                    else:
+                        resolved = await asyncio.to_thread(
+                            _discover_store, workspace, launch_epoch_ms
+                        )
+                        if resolved is not None and not await asyncio.to_thread(
+                            _chat_claimed_by_other, bridge_dir, resolved, launch_epoch_ms
+                        ):
+                            store_path = resolved
+                            if persisted.store_path == str(resolved):
+                                last_rowid = persisted.last_rowid
+                            else:
+                                last_rowid = 0
+                            _write_state(
+                                bridge_dir,
+                                _ForwardState(
+                                    store_path=str(resolved),
+                                    last_rowid=last_rowid,
+                                    launch_epoch_ms=launch_epoch_ms,
+                                ),
+                            )
+                            persisted = _ForwardState()  # consumed
+                            # Persist the cursor chat id as external_session_id so
+                            # a later cold resume can pass ``--resume <chatId>``
+                            # to the cursor-agent TUI.
+                            if not chat_id_patched:
+                                chat_id_val = store_path.parent.name
+                                await _patch_external_session_id(
+                                    client, session_id=session_id, chat_id=chat_id_val
+                                )
+                                chat_id_patched = True
                 if store_path is not None and store_path.exists():
                     # cursor keeps ONE chat per working dir, so two cursor-native
                     # sessions launched in the same cwd discover the same store.

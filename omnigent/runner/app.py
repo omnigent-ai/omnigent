@@ -15,6 +15,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import sys
 import tempfile
 import time
@@ -1506,15 +1507,15 @@ async def _auto_create_cursor_terminal(
     # and drop the prior terminal's stale forward cursor so the new forwarder
     # can't resume the wrong chat / a stale rowid (mirrors codex's clear_bridge_state).
     await _cancel_auto_forwarder_task(session_id)
+    from omnigent.cursor_native import is_valid_cursor_chat_id
     from omnigent.cursor_native_bridge import (
         approve_mcp_server_for_workspace,
         bridge_dir_for_session_id,
         write_mcp_config,
     )
-    from omnigent.cursor_native_forwarder import clear_cursor_bridge_state
+    from omnigent.cursor_native_forwarder import clear_cursor_bridge_state, preseed_resume_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
-    clear_cursor_bridge_state(bridge_dir)
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args); reused here, not Pi-specific.
@@ -1526,11 +1527,54 @@ async def _auto_create_cursor_terminal(
     # cursor TUI's cwd and the forwarder hash the SAME path — cursor keys its
     # chat store dir on ``md5(cwd)``, and a mismatch would hide the store.
     workspace = os.path.realpath(str(launch_config.workspace))
+    # Validate the persisted chat id ONCE, up front. It feeds two untrusted
+    # sinks below — the cursor store path in preseed_resume_state (filesystem)
+    # and the ``--resume`` argv in _cursor_native_resume_args — so a malformed
+    # value must reach neither (defense-in-depth). cursor mints UUID chat ids;
+    # anything else is dropped here and the session starts fresh.
+    resume_chat_id = launch_config.external_session_id
+    if resume_chat_id and not is_valid_cursor_chat_id(resume_chat_id):
+        _logger.warning(
+            "cursor-native: persisted chat id %r is not a well-formed cursor "
+            "chat id; ignoring it for resume (session=%s).",
+            resume_chat_id,
+            session_id,
+        )
+        resume_chat_id = None
+    # On cold resume, pre-seed the bridge state with the known store path and
+    # current rowid so the forwarder skips launch-recency discovery (the existing
+    # chat store predates this launch and would fail _discover_store's floor check).
+    # On a fresh start, clear any stale state from a prior terminal so the old
+    # and new forwarders can't double-post the same chat.
+    #
+    # Tie the ``--resume`` decision to preseed success: only resume when we
+    # actually pre-seeded the prior store. If preseed fails (the store dir is
+    # gone), injecting ``--resume`` anyway would reload that store in the TUI
+    # while the cleared forwarder falls back to discovery — whose recency floor
+    # excludes the pre-launch store — so the relaunched chat would go unmirrored.
+    # Dropping resume here starts a genuinely fresh chat that discovery can find.
+    preseeded = bool(resume_chat_id) and preseed_resume_state(
+        bridge_dir, workspace, resume_chat_id, launch_epoch_ms
+    )
+    if not preseeded:
+        clear_cursor_bridge_state(bridge_dir)
+        if resume_chat_id is not None:
+            _logger.warning(
+                "cursor-native: could not pre-seed prior chat store for %r; "
+                "starting a fresh chat (session=%s).",
+                resume_chat_id,
+                session_id,
+            )
+            resume_chat_id = None
     write_mcp_config(Path(workspace), bridge_dir)
     cursor_command = resolve_cursor_executable()
     cursor_args = list(launch_config.terminal_launch_args or [])
     if "--approve-mcps" not in cursor_args:
         cursor_args.append("--approve-mcps")
+    # On cold resume, pass ``--resume <chatId>`` to cursor-agent so the TUI
+    # reloads the prior conversation. The id was validated above; ``None`` on a
+    # brand-new session, so no ``--resume`` is injected and cursor starts fresh.
+    cursor_args.extend(_cursor_native_resume_args(resume_chat_id, cursor_args))
     # Honor the spec's pinned model (``--model`` flag / config.yaml ``model:``)
     # by launching cursor-agent with ``--model <model>``. An explicit model in
     # the passthrough launch args (``omnigent cursor -- --model X`` or the joined
@@ -3896,6 +3940,34 @@ def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
     return model
 
 
+def _cursor_native_resume_args(chat_id: str | None, existing_args: list[str]) -> list[str]:
+    """Return ``["--resume", chat_id]`` for a cursor-native cold resume, or ``[]``.
+
+    The forwarder persists the cursor chat id as ``external_session_id`` after
+    it first discovers the chat store. On a cold resume (terminal has exited)
+    this id is injected here so cursor-agent reloads the prior conversation.
+    cursor-agent reuses the same chat id/store across ``--resume`` (verified
+    empirically), so the persisted id stays valid for the life of the session.
+
+    Re-validates the chat id (callers should already have, but this stays
+    self-defensive so a malformed id can never reach the argv directly).
+
+    :param chat_id: The cursor chat id stored as ``external_session_id``, or
+        ``None`` for a brand-new session where the forwarder hasn't run yet.
+    :param existing_args: Already-built cursor-agent args; ``--resume`` is
+        skipped when the user already passed one (``--resume X`` or the joined
+        ``--resume=X`` form) via passthrough launch args.
+    :returns: ``["--resume", chat_id]`` or ``[]``.
+    """
+    from omnigent.cursor_native import is_valid_cursor_chat_id
+
+    if not is_valid_cursor_chat_id(chat_id):
+        return []
+    if any(arg == "--resume" or arg.startswith("--resume=") for arg in existing_args):
+        return []
+    return ["--resume", chat_id]
+
+
 def _agent_os_env_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> Any | None:
     """
     Read the agent's ``os_env`` from a resolved agent spec.
@@ -5669,8 +5741,6 @@ def _is_context_overflow_error(event: dict[str, Any]) -> tuple[int, int] | None:
     msg = str(error.get("message", "")).lower()
     if not any(pat in msg for pat in _CONTEXT_OVERFLOW_PATTERNS):
         return None
-    import re
-
     actual_gt_max = re.search(r"(\d{4,})\D*>\D*(\d{4,})", msg)
     if actual_gt_max is not None:
         return int(actual_gt_max.group(2)), int(actual_gt_max.group(1))

@@ -4,8 +4,9 @@ Covers the pure pieces a live cursor-agent isn't needed for: reading the
 content-addressed SQLite chat store (including the live-WAL layout that the
 ``immutable=1`` open mode silently missed), unwrapping cursor's
 ``<user_query>`` framing, building conversation items, rowid-based dedup,
-store discovery by ``md5(cwd)`` + launch recency, and the POST shapes. The live
-tmux + cursor-agent path is exercised by the e2e gate, not here.
+store discovery by ``md5(cwd)`` + launch recency, the POST shapes, and the
+``external_session_id`` patch that enables cold resume. The live tmux +
+cursor-agent path is exercised by the e2e gate, not here.
 """
 
 from __future__ import annotations
@@ -20,6 +21,14 @@ import httpx
 import pytest
 
 from omnigent import cursor_native_forwarder as fwd
+
+# Real cursor chat ids are UUIDs. Use UUID-shaped ids in fixtures so the
+# persist side (forwarder) and the resume side (runner's strict
+# ``is_valid_cursor_chat_id`` guard) agree on the same id shape — exercising the
+# persist→resume path with values the resume side would actually accept.
+_CHAT_ID = "0ef42bbf-3b80-4bec-ac39-ca46531cbc47"
+_CHAT_ID_2 = "1a2b3c4d-5e6f-4a8b-9c0d-1e2f3a4b5c6d"
+_CHAT_ID_ABSENT = "ffffffff-ffff-4fff-8fff-ffffffffffff"
 
 
 def _make_store(
@@ -559,3 +568,301 @@ class TestForwardLoopPostFailures:
         # Retried well past the skip bound, yet never advanced — not quarantined.
         assert fwd._read_state(bridge).last_rowid == 0
         assert not poster.delivered
+
+
+# ---------------------------------------------------------------------------
+# external_session_id patching (cold-resume support)
+# ---------------------------------------------------------------------------
+
+
+class _PatchRecordingClient:
+    """Async stub that records PATCH calls and allows injecting a failure response."""
+
+    def __init__(self, status: int = 200) -> None:
+        self.patches: list[tuple[str, dict]] = []
+        self._status = status
+
+    async def patch(self, url: str, *, json: dict) -> httpx.Response:
+        self.patches.append((url, json))
+        return httpx.Response(self._status, request=httpx.Request("PATCH", url))
+
+
+@pytest.mark.asyncio
+async def test_patch_external_session_id_request_shape() -> None:
+    """PATCH carries the correct URL and JSON body."""
+    client = _PatchRecordingClient()
+    await fwd._patch_external_session_id(client, session_id="conv_abc", chat_id=_CHAT_ID)  # type: ignore[arg-type]
+    assert len(client.patches) == 1
+    url, body = client.patches[0]
+    assert url == "/v1/sessions/conv_abc"
+    assert body == {"external_session_id": _CHAT_ID}
+
+
+@pytest.mark.asyncio
+async def test_patch_external_session_id_4xx_logs_but_does_not_raise(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 4xx rejection from the server is logged but must not propagate."""
+    client = _PatchRecordingClient(status=400)
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        await fwd._patch_external_session_id(client, session_id="conv_x", chat_id="cid")  # type: ignore[arg-type]
+    assert any("400" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_patch_external_session_id_http_error_logs_but_does_not_raise(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A transport error is logged and swallowed so the forwarder loop continues."""
+
+    class _ErrorClient:
+        async def patch(self, url: str, *, json: dict) -> httpx.Response:
+            raise httpx.ConnectError("refused", request=httpx.Request("PATCH", url))
+
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        await fwd._patch_external_session_id(_ErrorClient(), session_id="conv_x", chat_id="cid")  # type: ignore[arg-type]
+    assert caplog.records
+
+
+class TestPreseedResumeState:
+    """``preseed_resume_state`` pre-seeds bridge state for cold resume."""
+
+    def _seed_chat(self, chats_root: Path, workspace: str, chat_id: str, rows: int = 3) -> Path:
+        import hashlib
+
+        ws_hash = hashlib.md5(workspace.encode()).hexdigest()
+        chat_dir = chats_root / ws_hash / chat_id
+        chat_dir.mkdir(parents=True)
+        store = chat_dir / "store.db"
+        writer = _make_store(
+            store,
+            [(f"b{i}", _user(f"<user_query>\nmsg{i}\n</user_query>")) for i in range(rows)],
+        )
+        writer.close()
+        return store
+
+    def test_returns_false_when_store_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path / "chats")
+        bridge_dir = tmp_path / "bridge"
+        bridge_dir.mkdir()
+        result = fwd.preseed_resume_state(bridge_dir, "/ws", _CHAT_ID_ABSENT, 1_000)
+        assert result is False
+        assert fwd._read_state(bridge_dir).store_path is None
+
+    def test_writes_store_path_and_current_rowid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path / "chats")
+        store = self._seed_chat(tmp_path / "chats", "/ws", _CHAT_ID, rows=5)
+        bridge_dir = tmp_path / "bridge"
+        bridge_dir.mkdir()
+
+        result = fwd.preseed_resume_state(bridge_dir, "/ws", _CHAT_ID, launch_epoch_ms=99_000)
+
+        assert result is True
+        state = fwd._read_state(bridge_dir)
+        assert state.store_path == str(store)
+        assert state.last_rowid == 5  # all 5 rows already in store
+        assert state.launch_epoch_ms == 99_000
+
+    def test_empty_store_seeds_rowid_zero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path / "chats")
+        self._seed_chat(tmp_path / "chats", "/ws", _CHAT_ID_2, rows=0)
+        bridge_dir = tmp_path / "bridge"
+        bridge_dir.mkdir()
+
+        fwd.preseed_resume_state(bridge_dir, "/ws", _CHAT_ID_2, launch_epoch_ms=1_000)
+
+        assert fwd._read_state(bridge_dir).last_rowid == 0
+
+
+class TestForwardLoopPreseedResume:
+    """Forwarder uses pre-seeded bridge state on cold resume, skipping discovery."""
+
+    @pytest.mark.asyncio
+    async def test_uses_preseed_store_without_discover(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When bridge state is pre-seeded, forwarder skips _discover_store."""
+        chat_id = _CHAT_ID
+        store = tmp_path / chat_id / "store.db"
+        store.parent.mkdir(parents=True)
+        writer = _make_store(
+            store,
+            [
+                ("old", _user("<user_query>\nold message\n</user_query>")),  # rowid 1 (pre-resume)
+                ("new", _user("<user_query>\nnew message\n</user_query>")),  # rowid 2 (new)
+            ],
+        )
+        writer.close()
+
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        bridge_dir.mkdir(parents=True)
+        # Pre-seed: rowid 1 already mirrored (old history), start from there.
+        fwd._write_state(
+            bridge_dir,
+            fwd._ForwardState(store_path=str(store), last_rowid=1, launch_epoch_ms=999_000),
+        )
+
+        discover_calls: list = []
+
+        def _no_discover(workspace: str, launch_ms: int) -> None:
+            discover_calls.append((workspace, launch_ms))
+            return  # should never be reached
+
+        monkeypatch.setattr(fwd, "_discover_store", _no_discover)
+        monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
+
+        delivered: list[fwd._MirrorItem] = []
+
+        async def _collect(client: object, *, session_id: str, item: fwd._MirrorItem) -> None:
+            delivered.append(item)
+
+        monkeypatch.setattr(fwd, "_post_conversation_item", _collect)
+        monkeypatch.setattr(fwd, "_patch_external_session_id", lambda *a, **k: None)
+
+        task = asyncio.create_task(
+            fwd.forward_cursor_store_to_session(
+                base_url="http://test",
+                headers={},
+                session_id="conv_1",
+                bridge_dir=bridge_dir,
+                agent_name="cursor-native-ui",
+                workspace="/ws",
+                launch_epoch_ms=1_000_000,  # far future — discovery would find nothing
+                poll_interval_s=0.001,
+            )
+        )
+        try:
+            for _ in range(2000):
+                if delivered:
+                    break
+                await asyncio.sleep(0.001)
+            else:
+                raise AssertionError("forwarder never mirrored the new message")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        # Only the NEW message (rowid 2) was mirrored; old history was skipped.
+        assert len(delivered) == 1
+        assert delivered[0].item_data["content"][0]["text"] == "new message"
+        # _discover_store was never called (pre-seed took the fast path).
+        assert not discover_calls
+
+
+class TestForwardLoopExternalSessionId:
+    """The poll loop patches external_session_id once when the store is found."""
+
+    @staticmethod
+    def _seed(store: Path, text: str = "hello") -> None:
+        writer = _make_store(store, [("u", _user(f"<user_query>\n{text}\n</user_query>"))])
+        writer.close()
+
+    @pytest.mark.asyncio
+    async def test_patches_chat_id_on_first_store_discovery(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The forwarder PATCHes external_session_id with the cursor chat_id."""
+        store = tmp_path / _CHAT_ID / "store.db"
+        store.parent.mkdir(parents=True)
+        self._seed(store)
+
+        patches: list[tuple[str, dict]] = []
+
+        async def _fake_patch(client: object, *, session_id: str, chat_id: str) -> None:
+            patches.append((session_id, chat_id))
+
+        monkeypatch.setattr(fwd, "_patch_external_session_id", _fake_patch)
+        monkeypatch.setattr(fwd, "_post_conversation_item", _FakePoster(lambda _: None))
+
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        bridge_dir.mkdir(parents=True)
+        monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: store)
+        monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
+
+        task = asyncio.create_task(
+            fwd.forward_cursor_store_to_session(
+                base_url="http://test",
+                headers={},
+                session_id="conv_1",
+                bridge_dir=bridge_dir,
+                agent_name="cursor-native-ui",
+                workspace="/ws",
+                launch_epoch_ms=1_000,
+                poll_interval_s=0.001,
+            )
+        )
+        try:
+            for _ in range(2000):
+                if patches:
+                    break
+                await asyncio.sleep(0.001)
+            else:
+                raise AssertionError("external_session_id patch was never called")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert len(patches) == 1
+        session_id, chat_id = patches[0]
+        assert session_id == "conv_1"
+        assert chat_id == _CHAT_ID
+
+    @pytest.mark.asyncio
+    async def test_patches_only_once_across_multiple_polls(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """external_session_id is patched exactly once, not on every poll tick."""
+        store = tmp_path / _CHAT_ID_2 / "store.db"
+        store.parent.mkdir(parents=True)
+        self._seed(store)
+
+        patch_count = 0
+
+        async def _count_patches(client: object, *, session_id: str, chat_id: str) -> None:
+            nonlocal patch_count
+            patch_count += 1
+
+        monkeypatch.setattr(fwd, "_patch_external_session_id", _count_patches)
+        monkeypatch.setattr(fwd, "_post_conversation_item", _FakePoster(lambda _: None))
+
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        bridge_dir.mkdir(parents=True)
+        monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: store)
+        monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
+
+        task = asyncio.create_task(
+            fwd.forward_cursor_store_to_session(
+                base_url="http://test",
+                headers={},
+                session_id="conv_2",
+                bridge_dir=bridge_dir,
+                agent_name="cursor-native-ui",
+                workspace="/ws",
+                launch_epoch_ms=1_000,
+                poll_interval_s=0.001,
+            )
+        )
+        try:
+            # Let the loop run for several ticks after the patch fires.
+            for _ in range(2000):
+                if patch_count >= 1:
+                    break
+                await asyncio.sleep(0.001)
+            # Extra ticks to confirm it doesn't re-patch.
+            for _ in range(50):
+                await asyncio.sleep(0.001)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert patch_count == 1
