@@ -1531,6 +1531,13 @@ async def _auto_create_cursor_terminal(
     cursor_args = list(launch_config.terminal_launch_args or [])
     if "--approve-mcps" not in cursor_args:
         cursor_args.append("--approve-mcps")
+    # On cold resume, pass ``--resume <chatId>`` to cursor-agent so the TUI
+    # reloads the prior conversation. ``external_session_id`` is set by the
+    # forwarder the first time it discovers the cursor chat store; absent on a
+    # brand-new session, so no ``--resume`` is injected and cursor starts fresh.
+    cursor_args.extend(
+        _cursor_native_resume_args(launch_config.external_session_id, cursor_args)
+    )
     # Honor the spec's pinned model (``--model`` flag / config.yaml ``model:``)
     # by launching cursor-agent with ``--model <model>``. An explicit model in
     # the passthrough launch args (``omnigent cursor -- --model X`` or the joined
@@ -3871,6 +3878,24 @@ def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
         )
         return None
     return model
+
+
+def _cursor_native_resume_args(chat_id: str | None, existing_args: list[str]) -> list[str]:
+    """Return ``["--resume", chat_id]`` for a cursor-native cold resume, or ``[]``.
+
+    The forwarder persists the cursor chat id as ``external_session_id`` after
+    it first discovers the chat store. On a cold resume (terminal has exited)
+    this id is injected here so cursor-agent reloads the prior conversation.
+
+    :param chat_id: The cursor chat id stored as ``external_session_id``, or
+        ``None`` for a brand-new session where the forwarder hasn't run yet.
+    :param existing_args: Already-built cursor-agent args; ``--resume`` is
+        skipped when the user already passed one via passthrough launch args.
+    :returns: ``["--resume", chat_id]`` or ``[]``.
+    """
+    if chat_id and "--resume" not in existing_args:
+        return ["--resume", chat_id]
+    return []
 
 
 def _agent_os_env_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> Any | None:

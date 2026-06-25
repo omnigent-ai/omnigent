@@ -363,13 +363,16 @@ async def _prepare_cursor_terminal_via_daemon(
                     tmux_target=existing_terminal.tmux_target,
                     reattached=True,
                 )
-            # Session exists but its terminal has exited. Cursor records no
-            # resumable chat id, so the launch below starts a fresh TUI with
-            # no prior turns. Flag it so the caller can say so honestly.
-            # Mutually exclusive with the reattach path above: we leave
-            # reattached at False here (unlike claude_native, which treats
-            # cold_resumed/reattached as independent). Safe because cursor
-            # never uses reattached for teardown ownership.
+            # Session exists but its terminal has exited. The forwarder
+            # persists the cursor chat id as external_session_id, so the
+            # runner's _auto_create_cursor_terminal will pass
+            # ``--resume <chatId>`` to cursor-agent and the TUI reloads
+            # the prior conversation. Flag cold_resumed so the caller can
+            # show an honest hint. Mutually exclusive with the reattach
+            # path above: we leave reattached at False here (unlike
+            # claude_native, which treats cold_resumed/reattached as
+            # independent). Safe because cursor never uses reattached for
+            # teardown ownership.
             cold_resumed = True
             if persist_args:
                 _update_startup_progress(startup_progress, "Updating Cursor session...")

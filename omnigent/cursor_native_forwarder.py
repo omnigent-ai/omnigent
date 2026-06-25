@@ -452,6 +452,33 @@ def _blob_to_item(rowid: int, blob_id: str, data: object, agent_name: str) -> _M
     return None  # system or other scaffolding
 
 
+async def _patch_external_session_id(
+    client: httpx.AsyncClient, *, session_id: str, chat_id: str
+) -> None:
+    """PATCH the Omnigent session with the cursor chat id for cold-resume.
+
+    Best-effort: logs on failure but does not raise so the forwarder loop
+    continues mirroring even if the PATCH can't be delivered.
+    """
+    try:
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"external_session_id": chat_id},
+        )
+        if resp.status_code >= 400:
+            _logger.warning(
+                "AP rejected external_session_id PATCH (%s); session=%s chat_id=%s",
+                resp.status_code,
+                session_id,
+                chat_id,
+            )
+    except httpx.HTTPError:
+        _logger.warning(
+            "Transient error PATCHing external_session_id; session=%s — will not retry",
+            session_id,
+        )
+
+
 async def _post_conversation_item(
     client: httpx.AsyncClient, *, session_id: str, item: _MirrorItem
 ) -> None:
@@ -519,6 +546,9 @@ async def forward_cursor_store_to_session(
     # has seen. Reset whenever the cursor advances past an item.
     failed_rowid = 0
     failed_attempts = 0
+    # Track whether the cursor chat id has been persisted as external_session_id
+    # so the cold-resume path can pass ``--resume <chatId>`` to cursor-agent.
+    chat_id_patched = False
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
@@ -544,6 +574,16 @@ async def forward_cursor_store_to_session(
                             ),
                         )
                         persisted = _ForwardState()  # consumed
+                        # Persist the cursor chat id as external_session_id so a
+                        # later cold resume can pass ``--resume <chatId>`` to the
+                        # cursor-agent TUI. The chat_id is the UUID directory that
+                        # contains ``store.db`` (i.e. store_path.parent.name).
+                        if not chat_id_patched:
+                            chat_id = store_path.parent.name
+                            await _patch_external_session_id(
+                                client, session_id=session_id, chat_id=chat_id
+                            )
+                            chat_id_patched = True
                 if store_path is not None and store_path.exists():
                     # cursor keeps ONE chat per working dir, so two cursor-native
                     # sessions launched in the same cwd discover the same store.

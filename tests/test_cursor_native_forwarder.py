@@ -4,8 +4,9 @@ Covers the pure pieces a live cursor-agent isn't needed for: reading the
 content-addressed SQLite chat store (including the live-WAL layout that the
 ``immutable=1`` open mode silently missed), unwrapping cursor's
 ``<user_query>`` framing, building conversation items, rowid-based dedup,
-store discovery by ``md5(cwd)`` + launch recency, and the POST shapes. The live
-tmux + cursor-agent path is exercised by the e2e gate, not here.
+store discovery by ``md5(cwd)`` + launch recency, the POST shapes, and the
+``external_session_id`` patch that enables cold resume. The live tmux +
+cursor-agent path is exercised by the e2e gate, not here.
 """
 
 from __future__ import annotations
@@ -559,3 +560,172 @@ class TestForwardLoopPostFailures:
         # Retried well past the skip bound, yet never advanced — not quarantined.
         assert fwd._read_state(bridge).last_rowid == 0
         assert not poster.delivered
+
+
+# ---------------------------------------------------------------------------
+# external_session_id patching (cold-resume support)
+# ---------------------------------------------------------------------------
+
+
+class _PatchRecordingClient:
+    """Async stub that records PATCH calls and allows injecting a failure response."""
+
+    def __init__(self, status: int = 200) -> None:
+        self.patches: list[tuple[str, dict]] = []
+        self._status = status
+
+    async def patch(self, url: str, *, json: dict) -> httpx.Response:
+        self.patches.append((url, json))
+        return httpx.Response(self._status, request=httpx.Request("PATCH", url))
+
+
+@pytest.mark.asyncio
+async def test_patch_external_session_id_request_shape() -> None:
+    """PATCH carries the correct URL and JSON body."""
+    client = _PatchRecordingClient()
+    await fwd._patch_external_session_id(client, session_id="conv_abc", chat_id="chat-uuid-123")  # type: ignore[arg-type]
+    assert len(client.patches) == 1
+    url, body = client.patches[0]
+    assert url == "/v1/sessions/conv_abc"
+    assert body == {"external_session_id": "chat-uuid-123"}
+
+
+@pytest.mark.asyncio
+async def test_patch_external_session_id_4xx_logs_but_does_not_raise(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 4xx rejection from the server is logged but must not propagate."""
+    client = _PatchRecordingClient(status=400)
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        await fwd._patch_external_session_id(client, session_id="conv_x", chat_id="cid")  # type: ignore[arg-type]
+    assert any("400" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_patch_external_session_id_http_error_logs_but_does_not_raise(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A transport error is logged and swallowed so the forwarder loop continues."""
+
+    class _ErrorClient:
+        async def patch(self, url: str, *, json: dict) -> httpx.Response:
+            raise httpx.ConnectError("refused", request=httpx.Request("PATCH", url))
+
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        await fwd._patch_external_session_id(_ErrorClient(), session_id="conv_x", chat_id="cid")  # type: ignore[arg-type]
+    assert caplog.records
+
+
+class TestForwardLoopExternalSessionId:
+    """The poll loop patches external_session_id once when the store is found."""
+
+    @staticmethod
+    def _seed(store: Path, text: str = "hello") -> None:
+        writer = _make_store(
+            store, [("u", _user(f"<user_query>\n{text}\n</user_query>"))]
+        )
+        writer.close()
+
+    @pytest.mark.asyncio
+    async def test_patches_chat_id_on_first_store_discovery(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The forwarder PATCHes external_session_id with the cursor chat_id."""
+        store = tmp_path / "chat-uuid-abc123" / "store.db"
+        store.parent.mkdir(parents=True)
+        self._seed(store)
+
+        patches: list[tuple[str, dict]] = []
+
+        async def _fake_patch(client: object, *, session_id: str, chat_id: str) -> None:
+            patches.append((session_id, chat_id))
+
+        monkeypatch.setattr(fwd, "_patch_external_session_id", _fake_patch)
+        monkeypatch.setattr(fwd, "_post_conversation_item", _FakePoster(lambda _: None))
+
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        bridge_dir.mkdir(parents=True)
+        monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: store)
+        monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
+
+        task = asyncio.create_task(
+            fwd.forward_cursor_store_to_session(
+                base_url="http://test",
+                headers={},
+                session_id="conv_1",
+                bridge_dir=bridge_dir,
+                agent_name="cursor-native-ui",
+                workspace="/ws",
+                launch_epoch_ms=1_000,
+                poll_interval_s=0.001,
+            )
+        )
+        try:
+            for _ in range(2000):
+                if patches:
+                    break
+                await asyncio.sleep(0.001)
+            else:
+                raise AssertionError("external_session_id patch was never called")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert len(patches) == 1
+        session_id, chat_id = patches[0]
+        assert session_id == "conv_1"
+        assert chat_id == "chat-uuid-abc123"
+
+    @pytest.mark.asyncio
+    async def test_patches_only_once_across_multiple_polls(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """external_session_id is patched exactly once, not on every poll tick."""
+        store = tmp_path / "chat-uuid-xyz" / "store.db"
+        store.parent.mkdir(parents=True)
+        self._seed(store)
+
+        patch_count = 0
+
+        async def _count_patches(client: object, *, session_id: str, chat_id: str) -> None:
+            nonlocal patch_count
+            patch_count += 1
+
+        monkeypatch.setattr(fwd, "_patch_external_session_id", _count_patches)
+        monkeypatch.setattr(fwd, "_post_conversation_item", _FakePoster(lambda _: None))
+
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        bridge_dir.mkdir(parents=True)
+        monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: store)
+        monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
+
+        task = asyncio.create_task(
+            fwd.forward_cursor_store_to_session(
+                base_url="http://test",
+                headers={},
+                session_id="conv_2",
+                bridge_dir=bridge_dir,
+                agent_name="cursor-native-ui",
+                workspace="/ws",
+                launch_epoch_ms=1_000,
+                poll_interval_s=0.001,
+            )
+        )
+        try:
+            # Let the loop run for several ticks after the patch fires.
+            for _ in range(2000):
+                if patch_count >= 1:
+                    break
+                await asyncio.sleep(0.001)
+            # Extra ticks to confirm it doesn't re-patch.
+            for _ in range(50):
+                await asyncio.sleep(0.001)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert patch_count == 1
