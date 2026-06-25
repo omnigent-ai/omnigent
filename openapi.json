@@ -964,9 +964,10 @@
         "type": "object"
       },
       "CopyFilesRequest": {
-        "description": "Request to copy files from a lineage ancestor into a session.\n\nThe destination session is the path parameter; ``source_session_id``\nmust be the destination itself or one of its ``parent_conversation_id``\nancestors (spawn lineage). The copy creates new child-scoped rows \u2014\nit does not grant cross-session read access.\n\n:param source_session_id: Session that owns the source files, e.g.\n    ``\"conv_parent\"``. Must be in the destination's lineage.\n:param file_ids: Ids of the source-owned files to copy, e.g.\n    ``[\"file_abc123\"]``.",
+        "description": "Request to copy files from a lineage ancestor into a session.\n\nThe destination session is the path parameter; `source_session_id`\nmust be the destination itself or one of its `parent_conversation_id`\nancestors (spawn lineage). The copy creates new child-scoped rows \u2014\nit does not grant cross-session read access.",
         "properties": {
           "file_ids": {
+            "description": "Ids of the source-owned files to copy, e.g. `[\"file_abc123\"]`.",
             "items": {
               "type": "string"
             },
@@ -974,6 +975,7 @@
             "type": "array"
           },
           "source_session_id": {
+            "description": "Session that owns the source files, e.g. `\"conv_parent\"`. Must be in the destination's lineage.",
             "title": "Source Session Id",
             "type": "string"
           }
@@ -9792,10 +9794,11 @@
     },
     "/v1/sessions/{session_id}/resources/files:copy": {
       "post": {
-        "description": "Copy lineage-owned files into this (destination) session.\n\nAuthorizes by spawn lineage: ``body.source_session_id`` must be\nthe destination itself or one of its ``parent_conversation_id``\nancestors. Each source file is read and re-stored as a new\nchild-scoped row owned by ``session_id`` \u2014 this preserves the\nsession-scoping invariant (the child reads its OWN copy; no\ncross-session read grant is created). Validation is all-or-\nnothing: an unauthorized source or a missing file copies nothing.\n\n:param request: The incoming FastAPI request (for auth).\n:param session_id: Destination (child) session/conversation id.\n:param body: Source session id plus the file ids to copy.\n:returns: A ``session.files.copied`` object carrying the\n    ``{source_file_id: new_file_id}`` mapping.",
+        "description": "Copy lineage-owned files into this (destination) session.\n\nAuthorizes by spawn lineage: `body.source_session_id` must be\nthe destination itself or one of its `parent_conversation_id`\nancestors. Each source file is read and re-stored as a new\nchild-scoped row owned by `session_id` \u2014 this preserves the\nsession-scoping invariant (the child reads its OWN copy; no\ncross-session read grant is created). Validation is all-or-\nnothing: an unauthorized source or a missing file copies nothing.\n\n**Parameters**\n\n- `body` \u2014 Source session id plus the file ids to copy.\n\n**Returns:** A `session.files.copied` object carrying the `{source_file_id: new_file_id}` mapping.",
         "operationId": "copy_session_files_v1_sessions__session_id__resources_files_copy_post",
         "parameters": [
           {
+            "description": "Destination (child) session/conversation id.",
             "in": "path",
             "name": "session_id",
             "required": true,
@@ -9837,7 +9840,7 @@
         },
         "summary": "Copy Session Files",
         "tags": [
-          "sessions"
+          "session_resources"
         ]
       }
     },
