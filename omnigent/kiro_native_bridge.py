@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import Any
 
 KIRO_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_KIRO_NATIVE_BRIDGE_DIR"
+KIRO_ACP_RECORD_PATH_ENV_VAR = "KIRO_ACP_RECORD_PATH"
 
 _BRIDGE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{os.getuid()}" / "kiro-native"
 _TMUX_FILE = "tmux.json"
 _FORWARDER_READY_FILE = "kiro_session_forwarder_ready.json"
+_ACP_RECORD_FILE = "kiro_acp_record.jsonl"
 _TMUX_READY_TIMEOUT_S = 30.0
 _TMUX_SEND_TIMEOUT_S = 10.0
 _POLL_INTERVAL_S = 0.2
@@ -24,12 +26,20 @@ _TYPE_SETTLE_S = 0.3
 _TYPE_COMMIT_TIMEOUT_S = 5.0
 _SUBMIT_VERIFY_TIMEOUT_S = 5.0
 _SUBMIT_RETRY_INTERVAL_S = 0.5
+_PERMISSION_KEY_INTERVAL_S = 0.3
+_PERMISSION_ENTER_SETTLE_S = 0.5
 _KIRO_SEPARATOR = "────"
 _KIRO_INPUT_READY_MARKERS = (
     "ask a question or describe a task",
     "Type to steer",
 )
 _PASTE_BUFFER = "omnigent-kiro-paste"
+_KIRO_PERMISSION_MARKERS = (
+    "requires approval",
+    "Yes, single permission",
+    "Trust, always allow in this session",
+    "No (Tab to edit)",
+)
 
 # Ambient provider/cloud/CI credentials that must not be inherited by Kiro.
 KIRO_NATIVE_ENV_UNSET = [
@@ -82,6 +92,11 @@ def prepare_bridge_dir(session_id: str) -> Path:
     return bridge_dir
 
 
+def acp_record_path(bridge_dir: Path) -> Path:
+    """Return the per-session Kiro TUI ACP recorder file path."""
+    return bridge_dir / _ACP_RECORD_FILE
+
+
 def build_kiro_native_spawn_env(session_id: str) -> dict[str, str]:
     """Build the ``HARNESS_KIRO_NATIVE_*`` env for the harness executor."""
     bridge_dir = prepare_bridge_dir(session_id)
@@ -96,7 +111,9 @@ def build_kiro_native_terminal_env(
     """Build the allowlisted child environment for ``kiro-cli``."""
     env = os.environ if source_env is None else source_env
     child = {key: env[key] for key in _CHILD_ENV_ALLOWLIST if env.get(key)}
-    child[KIRO_NATIVE_BRIDGE_DIR_ENV_VAR] = str(prepare_bridge_dir(session_id))
+    bridge_dir = prepare_bridge_dir(session_id)
+    child[KIRO_NATIVE_BRIDGE_DIR_ENV_VAR] = str(bridge_dir)
+    child[KIRO_ACP_RECORD_PATH_ENV_VAR] = str(acp_record_path(bridge_dir))
     return child
 
 
@@ -305,6 +322,79 @@ def _kiro_input_ready(pane: str) -> bool:
     return any(marker in region for marker in _KIRO_INPUT_READY_MARKERS)
 
 
+def _kiro_permission_prompt_active(pane: str) -> bool:
+    """Return whether Kiro's visible approval prompt is active."""
+    return all(marker in pane for marker in _KIRO_PERMISSION_MARKERS)
+
+
+def _kiro_permission_focus_on_one_time_allow(pane: str) -> bool:
+    """Return whether Kiro's approval picker is focused on one-time allow."""
+    return any(line.strip().startswith("❯ Yes, single permission") for line in pane.splitlines())
+
+
+def _kiro_permission_focus_on_reject(pane: str) -> bool:
+    """Return whether Kiro's approval picker is focused on one-time reject."""
+    return any(line.strip().startswith("❯ No (Tab to edit)") for line in pane.splitlines())
+
+
+def _kiro_active_permission_tool_line(pane: str) -> str:
+    """Return the tool line associated with the active approval panel."""
+    lines = pane.splitlines()
+    approval_index = -1
+    for index, line in enumerate(lines):
+        if "requires approval" in line:
+            approval_index = index
+    if approval_index < 0:
+        return ""
+    for line in reversed(lines[:approval_index]):
+        stripped = line.strip()
+        if not stripped or _KIRO_SEPARATOR in stripped:
+            continue
+        return stripped.lstrip("↓●○✓✗ ").strip()
+    return ""
+
+
+def _kiro_permission_prompt_matches_title(pane: str, expected_title: str | None) -> bool:
+    """Return whether the visible prompt appears to match the parsed request title."""
+    if not expected_title:
+        return True
+    title = expected_title.strip()
+    if not title:
+        return True
+    tool_line = _kiro_active_permission_tool_line(pane)
+    if not tool_line:
+        return False
+    if title == tool_line:
+        return True
+    if title.startswith("Running:"):
+        command = title.removeprefix("Running:").strip()
+        return bool(command and (tool_line == command or tool_line.endswith(f" {command}")))
+    return title in tool_line
+
+
+def _wait_for_kiro_permission_prompt(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    expected_title: str | None,
+    timeout_s: float,
+) -> None:
+    """Wait until Kiro has rendered an approval prompt before typing a verdict."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        if (
+            _kiro_permission_prompt_active(pane)
+            and _kiro_permission_focus_on_one_time_allow(pane)
+            and _kiro_permission_prompt_matches_title(pane, expected_title)
+        ):
+            return
+        time.sleep(_POLL_INTERVAL_S)
+    raise RuntimeError(
+        "kiro-native permission prompt was not safely focused before verdict delivery"
+    )
+
+
 def _wait_for_kiro_input_ready(
     socket_path: str,
     tmux_target: str,
@@ -455,3 +545,43 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+
+
+def send_kiro_permission_verdict(
+    bridge_dir: Path,
+    *,
+    action: str,
+    expected_title: str | None = None,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> None:
+    """Deliver a one-time Kiro permission verdict to the active TUI prompt."""
+    if action not in {"accept", "decline", "cancel"}:
+        raise RuntimeError(f"unsupported Kiro permission action: {action!r}")
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "kiro terminal is no longer running (the TUI exited); restart the session"
+        )
+    _wait_for_kiro_permission_prompt(
+        socket_path, tmux_target, expected_title=expected_title, timeout_s=timeout_s
+    )
+    if action == "accept":
+        time.sleep(_PERMISSION_ENTER_SETTLE_S)
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        time.sleep(_PERMISSION_KEY_INTERVAL_S)
+        return
+    for key in ("Down", "Down"):
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
+        time.sleep(_PERMISSION_KEY_INTERVAL_S)
+    pane = _capture_pane(socket_path, tmux_target)
+    if not (
+        _kiro_permission_prompt_active(pane)
+        and _kiro_permission_focus_on_reject(pane)
+        and _kiro_permission_prompt_matches_title(pane, expected_title)
+    ):
+        raise RuntimeError("kiro-native reject option was not safely focused before delivery")
+    time.sleep(_PERMISSION_ENTER_SETTLE_S)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    time.sleep(_PERMISSION_KEY_INTERVAL_S)
