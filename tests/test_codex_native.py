@@ -28,6 +28,116 @@ from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.spec import load
 
 
+def _write_codex_auth(path: Path, payload: object) -> None:
+    """Write a test Codex auth.json payload."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _point_codex_auth_check_at(
+    monkeypatch: pytest.MonkeyPatch, auth_path: Path, *, binary_present: bool
+) -> None:
+    """Redirect Codex availability checks away from the real machine state."""
+    monkeypatch.setattr(
+        codex_native,
+        "_resolve_codex_auth_source",
+        lambda: codex_native._CodexAuthSource(auth_path=auth_path),
+    )
+    monkeypatch.setattr(
+        codex_native.shutil,
+        "which",
+        lambda name: f"/tmp/{name}" if binary_present else None,
+    )
+
+
+def test_codex_auth_unavailable_reason_binary_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Missing codex binary reports binary-missing before reading auth.json."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=False)
+
+    assert codex_native._codex_auth_unavailable_reason() == "binary-missing"
+
+
+def test_codex_auth_unavailable_reason_absent_auth_json_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Installed codex without auth.json reports needs-auth."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_chatgpt_tokens_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A real ChatGPT/OAuth auth.json (tokens block) is available.
+
+    Mirrors the openai/codex ``AuthDotJson`` shape: ``auth_mode=chatgpt`` with a
+    ``tokens`` object. There is no top-level expiry field — access-token expiry
+    lives in the JWT and is refreshed via ``refresh_token`` — so presence of the
+    tokens is what marks the credential configured.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    _write_codex_auth(
+        auth_path,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": "header.payload.sig",
+                "access_token": "header.payload.sig",
+                "refresh_token": "opaque-refresh",
+                "account_id": "org_test",
+            },
+            "last_refresh": "2026-06-25T15:04:05Z",
+        },
+    )
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_api_key_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A real API-key auth.json (``auth_mode=api``) is available."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    _write_codex_auth(auth_path, {"auth_mode": "api", "OPENAI_API_KEY": "sk-test"})
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_no_credential_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A parseable auth.json with no credential field reports needs-auth.
+
+    e.g. a stub that records ``auth_mode`` but carries neither an
+    ``OPENAI_API_KEY`` nor a ``tokens`` block — there is nothing to authenticate
+    with, so the picker should warn rather than show Codex as ready.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    _write_codex_auth(auth_path, {"auth_mode": "chatgpt"})
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_malformed_auth_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Installed codex with malformed auth.json reports needs-auth."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.write_text("{not json", encoding="utf-8")
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
 class _FakeTerminalClient:
     """
     Minimal async client for terminal-launch helper tests.

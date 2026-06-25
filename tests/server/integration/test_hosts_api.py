@@ -56,7 +56,7 @@ def _websocket_scope(path: str) -> dict[str, object]:
 
 def _make_hello(
     name: str = "test-laptop",
-    configured_harnesses: dict[str, bool] | None = None,
+    configured_harnesses: dict[str, bool | str] | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -105,7 +105,7 @@ async def _connect_host(
     registry: HostRegistry,
     host_id: str = _HOST_ID,
     name: str = "test-laptop",
-    configured_harnesses: dict[str, bool] | None = None,
+    configured_harnesses: dict[str, bool | str] | None = None,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -259,7 +259,7 @@ async def test_hosts_api_surfaces_configured_harnesses(
     _comm = await _connect_host(
         app,
         registry,
-        configured_harnesses={"claude-sdk": True, "codex": False},
+        configured_harnesses={"claude-sdk": True, "codex": "needs-auth"},
     )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -271,10 +271,10 @@ async def test_hosts_api_surfaces_configured_harnesses(
     # picker warning; a lossy encode/persist would drop it.
     assert listing.json()["hosts"][0]["configured_harnesses"] == {
         "claude-sdk": True,
-        "codex": False,
+        "codex": "needs-auth",
     }
     assert single.status_code == 200
-    assert single.json()["configured_harnesses"] == {"claude-sdk": True, "codex": False}
+    assert single.json()["configured_harnesses"] == {"claude-sdk": True, "codex": "needs-auth"}
 
 
 async def test_hosts_api_configured_harnesses_null_for_older_host(
