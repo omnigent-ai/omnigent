@@ -28,6 +28,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -126,17 +127,27 @@ def _load_user_hermes_config() -> dict:
         return {}
 
 
+_MCP_BRIDGE_CONFIG_FILE = "bridge.json"
+
+
 def write_policy_hook_config(
     bridge_dir: Path,
     server_url: str,
     session_id: str,
 ) -> Path:
-    """Write per-session ``HERMES_HOME`` with the Omnigent policy hook.
+    """Write per-session ``HERMES_HOME`` with Omnigent policy hook and MCP server.
 
-    Creates a ``config.yaml`` registering the ``pre_tool_call`` shell hook, a
-    wrapper script exporting ``_OMNIGENT_SERVER_URL`` and
-    ``_OMNIGENT_SESSION_ID``, and copies the user's auth/env files so the TUI
-    can still authenticate with its inference provider. Mirrors
+    Creates a ``config.yaml`` registering:
+
+    1. A ``pre_tool_call`` shell hook that evaluates tool calls against the
+       Omnigent policy engine (same hook the headless ``hermes`` harness uses).
+    2. An ``mcp_servers.omnigent`` entry that launches the Omnigent MCP stdio
+       server (``serve-mcp``), exposing Omnigent builtin tools
+       (``sys_session_*``, ``sys_agent_*``, ``load_skill``, ``web_fetch``, etc.)
+       to the Hermes model.
+
+    Also copies the user's auth/env files so the TUI can still authenticate
+    with its inference provider. Mirrors
     :func:`omnigent.inner.hermes_executor._populate_hermes_home`.
 
     :param bridge_dir: Per-session bridge dir (parent of the HERMES_HOME).
@@ -161,6 +172,9 @@ def write_policy_hook_config(
     )
     wrapper.chmod(0o755)
 
+    # Write bridge.json with an auth token for serve-mcp (idempotent).
+    _write_mcp_bridge_config(bridge_dir)
+
     # Merge user config so model/provider/auth settings carry over.
     user_cfg = _load_user_hermes_config()
     config: dict = {**user_cfg}
@@ -174,6 +188,20 @@ def write_policy_hook_config(
                 "timeout": 86400,
             },
         ],
+    }
+
+    # Register the Omnigent MCP stdio server so Hermes can call
+    # Omnigent builtin tools (sys_session_*, sys_agent_*, load_skill, etc.).
+    config["mcp_servers"] = {
+        **config.get("mcp_servers", {}),
+        "omnigent": {
+            "command": sys.executable,
+            "args": [
+                "-m", "omnigent.claude_native_bridge",
+                "serve-mcp",
+                "--bridge-dir", str(bridge_dir),
+            ],
+        },
     }
 
     config_path = hermes_home / "config.yaml"
@@ -199,6 +227,29 @@ def write_policy_hook_config(
     allowlist_path.write_text(json.dumps(allowlist_data, indent=2) + "\n")
 
     return hermes_home
+
+
+def _write_mcp_bridge_config(bridge_dir: Path) -> None:
+    """Write ``bridge.json`` with an auth token for ``serve-mcp``.
+
+    Idempotent: skips if a config already exists (avoids overwriting a token
+    that the relay HTTP server was started with). Mirrors
+    :func:`omnigent.codex_native_bridge.write_mcp_bridge_config`.
+    """
+    config_path = bridge_dir / _MCP_BRIDGE_CONFIG_FILE
+    if config_path.exists():
+        return
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    payload = {"token": secrets.token_urlsafe(32)}
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_MCP_BRIDGE_CONFIG_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_name, config_path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
 
 
 def inject_compress_command(bridge_dir: Path, *, timeout_s: float = 5.0) -> None:

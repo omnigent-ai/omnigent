@@ -210,6 +210,18 @@ def test_write_policy_hook_config_creates_expected_files(tmp_path) -> None:
     assert allowlist["approvals"][0]["event"] == "pre_tool_call"
     assert allowlist["approvals"][0]["command"] == str(wrapper)
 
+    # MCP server registered.
+    mcp = config["mcp_servers"]["omnigent"]
+    assert mcp["command"] == sys.executable
+    assert "serve-mcp" in mcp["args"]
+    assert "--bridge-dir" in mcp["args"]
+    assert str(bridge_dir) in mcp["args"]
+
+    # bridge.json written with auth token.
+    bridge_config = json.loads((bridge_dir / "bridge.json").read_text())
+    assert isinstance(bridge_config["token"], str)
+    assert len(bridge_config["token"]) > 0
+
 
 def test_write_policy_hook_config_copies_user_files(tmp_path, monkeypatch) -> None:
     bridge_dir = tmp_path / "bridge"
