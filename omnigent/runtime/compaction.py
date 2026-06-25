@@ -486,6 +486,29 @@ def compaction_to_history_items(
     assert isinstance(compaction_item.data, CompactionData)
     data = compaction_item.data
 
+    # Prefer compacted_messages when available — they carry the
+    # full compacted state (e.g. OpenAI's opaque compaction tokens
+    # or Claude's post-compaction transcript) that the harness can
+    # replay directly. Fall back to the synthetic summary pair for
+    # older compaction items that don't have compacted messages.
+    if data.compacted_messages:
+        items: list[ConversationItem] = []
+        for i, msg in enumerate(data.compacted_messages):
+            items.append(
+                ConversationItem(
+                    id=f"{compaction_item.id}_compacted_{i}",
+                    type=msg.get("type", "message"),
+                    status="completed",
+                    response_id=compaction_item.response_id,
+                    created_at=compaction_item.created_at,
+                    data=MessageData(
+                        role=msg.get("role", "user"),
+                        content=msg.get("content", []),
+                    ),
+                )
+            )
+        return items
+
     synthetic_user_content = (
         "[This is an automatically generated summary of the prior conversation "
         "context. The original messages are available but not included in this "
