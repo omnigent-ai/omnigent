@@ -29,6 +29,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, ViewportSize, expect
 
+from tests.e2e_ui.conftest import send_and_await_assistant_reply
+
 # iPhone-12-class portrait viewport — comfortably below the Tailwind
 # ``md`` breakpoint (768px) so every ``md:`` rule resolves to its
 # mobile branch.
@@ -250,18 +252,11 @@ def test_mobile_files_drawer_opens_seeded_file(
     expect(file_viewer.get_by_text(_SEEDED_FILE_CONTENT).first).to_be_visible(timeout=20_000)
 
 
-# Root cause of the historical flake: the composer becomes interactive as
-# soon as ``bindStream``'s history snapshot resolves, which can land BEFORE
-# the live event pump has connected — ``bindStream`` starts the pump
-# fire-and-forget (``void startStreamPump(...)``) and the session stream is
-# live-tail with no replay buffer (see ``ap-web/src/store/chatStore.ts``).
-# A reply that streams in that window reaches no subscriber, so the bubble
-# never renders live even though the server persisted the turn (its runner
-# relay subscribes before dispatch). The instant mock LLM makes losing this
-# race likely. We recover by reloading once on a miss — ``bindStream``
-# re-hydrates the persisted reply from the snapshot — so the test no longer
-# depends on winning the subscription race. The ``flaky`` marker stays as a
-# backstop for any residual harness scheduling stall.
+# ``send_and_await_assistant_reply`` absorbs the client-side
+# stream-subscription race that historically flaked this turn (the composer
+# is interactive before the live event pump connects, and the session stream
+# has no replay buffer — see the helper's docstring). The ``flaky`` marker
+# stays as a backstop for any residual harness scheduling stall.
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_mobile_chat_send_and_response(
     page: Page,
@@ -276,23 +271,5 @@ def test_mobile_chat_send_and_response(
     page.set_viewport_size(_MOBILE_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
 
-    composer = page.get_by_placeholder("Ask the agent anything…")
-    expect(composer).to_be_visible()
-    composer.fill("Say 'pong' in one word.")
-    page.get_by_role("button", name="Send", exact=True).click()
-
-    assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
-    try:
-        # 30s comfortably covers a turn whose events the live pump received;
-        # a miss (pump connected after the reply streamed) never resolves, so
-        # this is the signal to re-hydrate rather than keep waiting.
-        expect(assistant).to_be_visible(timeout=30_000)
-    except AssertionError:
-        # Live stream was missed — reload to pull the persisted reply from
-        # the snapshot. Reloading mid-turn is also safe: the fresh bind
-        # connects the pump before forwarding and catches an in-flight turn.
-        page.reload()
-        assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
-
-    expect(assistant).to_be_visible(timeout=60_000)
+    assistant = send_and_await_assistant_reply(page, "Say 'pong' in one word.")
     expect(assistant).to_have_text(re.compile(r"\S"), timeout=60_000)
