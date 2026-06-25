@@ -3408,9 +3408,13 @@ export function Composer({
   // Harness/agent identity shown in the status tray below the card. The
   // picker trigger owns model/effort now, so the identity moves here.
   const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const subAgentName = useChatStore((s) => s.subAgentName);
   const harnessLabel = composerHarnessLabel(
     modelPickerKind,
-    agents?.find((a) => a.id === selectedAgentId)?.name ?? agents?.[0]?.name ?? null,
+    // For a sub-agent (head) session, identify the head family being viewed
+    // (e.g. the GPT head → "Gpt") rather than the bundle orchestrator
+    // ("Debby") — the bundle is already named in the breadcrumb / Agents rail.
+    subAgentName ?? agents?.find((a) => a.id === selectedAgentId)?.name ?? agents?.[0]?.name ?? null,
     sessionHarness,
   );
 
