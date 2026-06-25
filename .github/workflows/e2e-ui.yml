@@ -193,7 +193,7 @@ jobs:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/.codex-cli" && cd "${GITHUB_WORKSPACE}/.codex-cli"
-          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.128.0-alpha.1
+          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
           echo "${GITHUB_WORKSPACE}/.codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Run UI e2e tests
