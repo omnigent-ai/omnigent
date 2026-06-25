@@ -14019,6 +14019,19 @@ def create_sessions_router(
             with contextlib.suppress(RuntimeError):
                 await websocket.close()
 
+    # ── Codex-native goal controls ───────────────────────────────
+
+    from omnigent.server.routes.codex.sessions import register_codex_session_routes
+
+    register_codex_session_routes(
+        router,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
+        runner_exit_reports=runner_exit_reports,
+    )
+
     # ── PATCH /sessions/{session_id} ────────────────────────────
 
     @router.patch(

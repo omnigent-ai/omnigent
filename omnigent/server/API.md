@@ -836,6 +836,11 @@ runner, waits for registration, then PATCHes the session to the new
 runner id. The write replaces any previous value in
 `conversations.runner_id`; no history table is maintained.
 
+### Codex-specific APIs
+
+Codex-native session routes, including the Codex Goal subresource, are
+documented in [codex-API.md](codex-API.md).
+
 ### Post Event
 
 ```
