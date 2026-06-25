@@ -2621,6 +2621,48 @@ async def test_post_external_session_status_publishes_session_status(
     assert "response_id" not in published[0][1]
 
 
+async def test_post_external_session_status_failed_surfaces_output_and_reauth(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``failed`` edge with ``output`` surfaces a typed error on the stream (#1108).
+
+    A native forwarder (e.g. codex-native on an expired login) posts the
+    terminal failure reason as ``data.output`` and flags ``reauth_required``.
+    The handler must surface it as the ``session.status`` edge's ``error`` so a
+    *top-level* session sees the reason — not only the sub-agent parent path.
+    ``reauth_required`` selects the ``codex_reauth_required`` code.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "failed",
+                "output": "401 Unauthorized\n\nRun `codex login` and retry.",
+                "reauth_required": True,
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    assert published[0][1]["status"] == "failed"
+    error = published[0][1]["error"]
+    assert error is not None
+    assert error["code"] == "codex_reauth_required"
+    assert "401 Unauthorized" in error["message"]
+
+
 async def test_post_external_session_status_carries_response_id(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

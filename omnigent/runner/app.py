@@ -9075,7 +9075,12 @@ def create_runner_app(
         _skipped_types: list[str] = []
         for item in remaining:
             item_type = item.get("type")
-            if item_type not in ("message", "function_call", "function_call_output"):
+            if item_type not in (
+                "message",
+                "function_call",
+                "function_call_output",
+                "error",
+            ):
                 _skipped_types.append(str(item_type))
             if item_type == "message":
                 result.append(
@@ -9100,6 +9105,25 @@ def create_runner_app(
                         "type": "function_call_output",
                         "call_id": item.get("call_id"),
                         "output": item.get("output"),
+                    }
+                )
+            elif item_type == "error":
+                # Error items were silently dropped here, so a failed turn
+                # replayed as if it had never erred. Preserve it as a typed
+                # error item (the source/code/message shape
+                # ``ErrorData.to_api_dict`` produces) so the failure survives
+                # reload and stays attributed as an error, not user input.
+                message = item.get("message")
+                code = item.get("code")
+                source = item.get("source")
+                result.append(
+                    {
+                        "type": "error",
+                        "source": source if isinstance(source, str) and source else "execution",
+                        "code": code if isinstance(code, str) and code else "error",
+                        "message": (
+                            message if isinstance(message, str) and message else "unknown error"
+                        ),
                     }
                 )
         if _skipped_types:
