@@ -2974,6 +2974,7 @@ async def _auto_create_antigravity_terminal(
     publish_event: Callable[[str, dict[str, object]], None],
     *,
     server_client: httpx.AsyncClient | None = None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the native Antigravity (agy) terminal for a session.
@@ -3023,6 +3024,11 @@ async def _auto_create_antigravity_terminal(
     :param server_client: Runner's Omnigent server HTTP client. Used to read
         the persisted workspace, launch args, and the discovered agy
         conversation id (``external_session_id``) for resume.
+    :param ensure_comment_relay: The runner's relay starter
+        (``_ensure_comment_relay_started``). When provided, the Omnigent MCP
+        relay is started against this session's bridge dir before launch so the
+        wrapped agy sees the ``sys_*`` tools (#1194). ``None`` skips relay wiring
+        (the ``_run_turn_bg`` first-turn fallback re-ensures it).
     :returns: The created terminal resource view.
     :raises RuntimeError: If the session snapshot or required runner env is
         unavailable.
@@ -3033,7 +3039,9 @@ async def _auto_create_antigravity_terminal(
         clear_bridge_state,
         ensure_agy_onboarding_complete,
         prepare_bridge_dir,
+        seed_isolated_agy_home,
         write_bridge_state,
+        write_mcp_config,
         write_tmux_target,
     )
     from omnigent.antigravity_native_launch import build_agy_launch
@@ -3118,6 +3126,36 @@ async def _auto_create_antigravity_terminal(
         headless=False,
         extra_args=terminal_launch_args,
     )
+
+    # Wire the Omnigent MCP relay so the wrapped agy gets the sys_* tools
+    # (spawn sub-agent sessions, drive Omnigent terminals, list agents/models,
+    # sys_os_*) — the only native harness that otherwise lacks them (#1194).
+    # agy has no --mcp-config flag and ignores ANTIGRAVITY_* env knobs; it loads
+    # MCP servers ONLY from the HOME-global ~/.gemini/config/mcp_config.json. To
+    # avoid clobbering the user's interactive agy config (and the concurrency
+    # footgun of a single shared file), launch agy under a per-session ISOLATED
+    # HOME seeded with a copy of the user's OAuth token + onboarding state and a
+    # bridge-scoped mcp_config.json. The relay subprocess is the same shared
+    # ``serve-mcp`` claude/codex/cursor use. Offloaded to a thread (file I/O) and
+    # done BEFORE the terminal launch so agy sees the config on its first MCP scan.
+    await asyncio.to_thread(write_mcp_config, bridge_dir)
+    env_overrides = {
+        **env_overrides,
+        **await asyncio.to_thread(seed_isolated_agy_home, bridge_dir),
+    }
+    # Start the shared comment/sys_* relay against THIS session's bridge dir before
+    # launch so its tool_relay.json is on disk when agy first scans the MCP server.
+    # ``await_notify=False``: agy starts its MCP client lazily, so awaiting the
+    # tools/list_changed notification would stall the launch (mirrors codex). The
+    # _run_turn_bg first-turn fallback re-ensures this for any session whose
+    # terminal was launched outside this path.
+    if ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            bridge_id=bridge_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
 
     _logger.info(
         "Antigravity terminal auto-create starting: session=%s workspace=%s resume=%s "
@@ -7919,6 +7957,7 @@ def create_runner_app(
                             resource_registry,
                             _publish_event,
                             server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
                         )
                     except Exception as exc:
                         _logger.exception(
@@ -11670,6 +11709,29 @@ def create_runner_app(
             # _ensure_comment_relay_started docstring).
             await _ensure_comment_relay_started(
                 conv, explicit_bridge_dir=codex_bdir, await_notify=False
+            )
+        elif harness_name == "antigravity-native":
+            from omnigent.antigravity_native_bridge import (
+                ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+                write_mcp_bridge_config,
+            )
+            from omnigent.antigravity_native_bridge import (
+                bridge_dir_for_bridge_id as antigravity_bridge_dir_for_id,
+            )
+
+            antigravity_labels = await _session_labels_for_runner_spawn(
+                server_client=server_client,
+                session_id=conv,
+            )
+            antigravity_bid = antigravity_labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
+            antigravity_bdir = antigravity_bridge_dir_for_id(antigravity_bid or conv)
+            write_mcp_bridge_config(antigravity_bdir)
+            # Fallback for sessions not started via _auto_create_antigravity_terminal
+            # (which already started the relay + wrote agy's isolated-HOME mcp_config).
+            # await_notify=False: agy starts its MCP client lazily, so awaiting would
+            # stall the turn (see the _ensure_comment_relay_started docstring).
+            await _ensure_comment_relay_started(
+                conv, explicit_bridge_dir=antigravity_bdir, await_notify=False
             )
 
         try:
