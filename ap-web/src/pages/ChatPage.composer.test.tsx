@@ -80,10 +80,9 @@ describe("Composer slash-command menu", () => {
     // appears as the first built-in and is the default highlight.
     render(<Composer {...composerProps({ isNativeWrapper: true })} />);
     fireEvent.change(textarea(), { target: { value: "/" } });
-    // Built-ins are inserted first, so "/context" tops the list and is the
+    // Built-ins are inserted first, so "/compact" tops the list and is the
     // default highlight — the crux of the fix (was -1 / nothing selected).
-    // (/compact is hidden for non-native-wrapper sessions.)
-    expect(activeRow()?.textContent).toContain("/context");
+    expect(activeRow()?.textContent).toContain("/compact");
   });
 
   it("Tab completes the highlighted skill into the textarea", () => {
@@ -156,11 +155,11 @@ describe("Composer slash-command menu", () => {
     render(<Composer {...composerProps({ isNativeWrapper: true })} />);
     const ta = textarea();
     fireEvent.change(ta, { target: { value: "/" } });
-    expect(activeRow()?.textContent).toContain("/context");
+    expect(activeRow()?.textContent).toContain("/compact");
 
     fireEvent.keyDown(ta, { key: "ArrowDown" });
-    // Second built-in entry (/compact is hidden for non-native-wrapper sessions).
-    expect(activeRow()?.textContent).toContain("/effort");
+    // Second built-in entry.
+    expect(activeRow()?.textContent).toContain("/context");
   });
 });
 
