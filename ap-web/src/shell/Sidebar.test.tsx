@@ -137,6 +137,41 @@ describe("Sidebar session list", () => {
     );
   });
 
+  it("renders the footer Settings as an icon-only floating control on mobile", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const settings = screen.getByTestId("settings-button");
+    // Accessible name survives even though the label is visually dropped on
+    // mobile (the icon stands alone there).
+    expect(settings).toHaveAttribute("aria-label", "Settings");
+    // Mobile: compact square icon button, out of flow at the bottom-left.
+    expect(settings.className).toContain("max-md:size-9");
+    // The text label is desktop-only.
+    const label = within(settings).getByText("Settings");
+    expect(label.className).toContain("max-md:hidden");
+  });
+
+  it("does NOT close the sidebar when the footer Settings is tapped", () => {
+    // No onNavClick on the footer Settings link: on mobile the overlay stays
+    // open and swaps to the settings section list rather than collapsing onto
+    // the default section's content.
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    const onClose = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Sidebar open onClose={onClose} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByTestId("settings-button"));
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it("keeps archived sessions out of the sidebar list (they live on the Settings page)", () => {
     mockConversations([
       conv("conv_active", "Claude Code"),
