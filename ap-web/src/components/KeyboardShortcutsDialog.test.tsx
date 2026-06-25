@@ -30,11 +30,12 @@ describe("KeyboardShortcutsDialog", () => {
     toggleViaHotkey();
 
     expect(screen.getByText("Keyboard shortcuts")).toBeTruthy();
-    // General / In chats / Navigation / Slash commands — one representative each.
+    // General / In chats / Navigation / View / Slash commands — one each.
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
     expect(screen.getByText("Previous session")).toBeTruthy();
+    expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
     expect(screen.getByText("Navigate suggestions")).toBeTruthy();
   });
 
