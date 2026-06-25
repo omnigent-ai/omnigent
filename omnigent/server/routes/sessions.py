@@ -5369,10 +5369,10 @@ async def _get_runner_client(
             return routed.client
         except (LookupError, httpx.HTTPError, OmnigentError):
             _logger.debug(
-                "No runner bound via router for session=%s; "
-                "falling back to in-process runner client",
+                "No runner bound for session=%s",
                 session_id,
             )
+            return None
     return cast("httpx.AsyncClient | None", get_runner_client())
 
 
@@ -12091,6 +12091,11 @@ async def _handle_mcp_tools_list(
     """
     runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
+        # Fall back to the in-process runner client (local single-user mode).
+        from omnigent.runtime import get_runner_client
+
+        runner_client = cast("httpx.AsyncClient | None", get_runner_client())
+    if runner_client is None:
         return _mcp_error_response(rpc_id, -32000, f"No runner bound for session {session_id!r}")
     _logger.debug("MCP tools/list: delegating to runner execute for session=%r", session_id)
     try:
@@ -12403,6 +12408,10 @@ async def _handle_mcp_tools_call(
     # and env). We call its /mcp/execute endpoint through the same WS
     # tunnel the runner already opened to the Omnigent server at startup.
     runner_client = await _get_runner_client(session_id, runner_router)
+    if runner_client is None:
+        from omnigent.runtime import get_runner_client
+
+        runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:
         return _mcp_error_response(rpc_id, -32000, f"No runner bound for session {session_id!r}")
     try:
