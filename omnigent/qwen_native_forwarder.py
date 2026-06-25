@@ -20,9 +20,11 @@ Event shapes consumed (others are ignored defensively):
 - ``{"type":"assistant","message":{"role":"assistant","content":[{"type":"text"|
   "thinking"|"tool_use",...}]}}`` — only ``text`` blocks are mirrored.
 - ``{"type":"control_request","request":{"subtype":"can_use_tool",...},
-  "request_id":...}`` — recognized and logged; Omnigent-side policy gating
-  (answer via ``confirmation_response``) is the documented follow-up. With the
-  default in-terminal approval mode qwen does not emit these.
+  "request_id":...}`` and the matching ``control_response`` — the permission
+  control plane. NOT handled here: the tool-approval mirror
+  (:mod:`omnigent.qwen_native_permissions`) tails the same stream and surfaces
+  these as web elicitation cards. This forwarder ignores them (they carry no
+  transcript prose to mirror).
 
 Status (``running``/``idle``) is intentionally NOT posted here: the runner's
 PTY-activity watcher owns those edges for qwen-native (see
@@ -157,15 +159,9 @@ def _event_to_item(event: dict[str, object], agent_name: str) -> _MirrorItem | N
     """Convert one qwen stream-json event to a mirror item, or ``None`` to skip it."""
     etype = event.get("type")
     if etype not in ("user", "assistant"):
-        if etype == "control_request":
-            request = event.get("request")
-            subtype = request.get("subtype") if isinstance(request, dict) else None
-            if subtype == "can_use_tool":
-                # Recognized but not yet gated through Omnigent's policy engine —
-                # qwen's in-terminal approval is the gate for now. Wiring
-                # confirmation_response back through TOOL_CALL policy is the
-                # documented follow-up (see module docstring / design doc).
-                _logger.debug("qwen forwarder saw can_use_tool control_request (in-terminal gate)")
+        # control_request / control_response (the permission control plane) carry
+        # no transcript prose; the tool-approval mirror
+        # (omnigent.qwen_native_permissions) owns them off the same stream.
         return None
     uuid = event.get("uuid")
     if not isinstance(uuid, str) or not uuid:

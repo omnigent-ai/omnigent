@@ -93,35 +93,38 @@ comments; this is the *what*, not the *how*.)
   the `result`/`assistant` events is not yet emitted on `TurnComplete.usage`
   (see the status-line item below for the model/ring/cost consequences).
 
-- [ ] **Tool-approval elicitation card (TUI → web).** Today a tool call gates
-  only via qwen's **own in-terminal prompt** ("Apply this change? 1. Yes …") —
-  no approval card renders in the web chat, so a user on the Chat tab sees the
-  turn just hang. **Verified feasible** against a live session (and qwen
-  v0.18.1-preview.1): qwen emits a structured
-  `{"type":"control_request","request":{"subtype":"can_use_tool","tool_name",
-  "tool_use_id","input"},"request_id"}` on `--json-file` **and** accepts a
-  `{"type":"confirmation_response","request_id","allowed"}` on `--input-file`,
-  *coexisting* with its own TUI prompt (whichever answers first wins). The
-  forwarder currently just logs the `can_use_tool` (PR2 stub in
-  `qwen_native_forwarder.py`), so the request goes unanswered from the web side.
-  - **Template to copy:** cursor-native's approval mirror —
-    `omnigent/cursor_native_permissions.py` + `supervise_cursor_approval_mirror`
-    (wired in `runner/app.py::_auto_create_cursor_terminal`). qwen is *cleaner*:
-    read the structured `can_use_tool` from the event stream (no pane scraping)
-    and write `confirmation_response` to the input file (no keystrokes).
-  - **Reuse, don't add an endpoint:** POST the tool call to the existing
-    `/v1/sessions/{id}/policies/evaluate` (`_evaluate_tool_call_policy` in
-    `runner/app.py`) — it runs TOOL_CALL policy *and*, on ASK, parks a human
-    approval card (`response.elicitation_request`) and blocks for the verdict.
-    Map the verdict → `confirmation_response`. This delivers both the card and
-    the deferred policy gating in one shot.
-  - **Tricky edge (needs live E2E):** the user can answer in the **terminal**
-    *or* the **card**. The loser must be released — if qwen proceeds first
-    (a `tool_result` / next assistant event for that `tool_use_id` appears),
-    cancel the park via `external_elicitation_resolved` and skip the stale
-    `confirmation_response`; if the card answers first, write the response and
-    let the TUI prompt clear. Run the mirror as a supervised task alongside the
-    transcript forwarder in `_auto_create_qwen_terminal`.
+- [x] **Tool-approval elicitation card (TUI → web).** Implemented — qwen's
+  in-terminal tool-approval prompt now also renders as an approval card in the
+  web chat, and answering either surface resolves the other. qwen emits a
+  structured `{"type":"control_request","request":{"subtype":"can_use_tool",
+  "tool_name","tool_use_id","input"},"request_id"}` on `--json-file` **and**
+  accepts a `{"type":"confirmation_response","request_id","allowed"}` on
+  `--input-file`, *coexisting* with its own TUI prompt (whichever answers first
+  wins; qwen's `dual-output.md` confirms `control_request` is emitted whenever a
+  tool needs approval — the earlier "default mode doesn't emit these" note was
+  wrong).
+  - **Mirror:** `omnigent/qwen_native_permissions.py` —
+    `supervise_qwen_approval_mirror` tails the *same* `--json-file` the
+    transcript forwarder reads (seeded at EOF so only new prompts park), POSTs
+    each `can_use_tool` to the server's `qwen-permission-request` hook, and on
+    the web verdict writes `confirmation_response` to the input file (no
+    keystrokes). It's the structured analog of cursor-native's pane-scraping
+    mirror. Wired alongside the forwarder under one supervised task in
+    `runner/app.py::_auto_create_qwen_terminal` (`_supervise_qwen_native_bridges`).
+  - **Server hook:** `POST /v1/sessions/{id}/hooks/qwen-permission-request`
+    (`qwen_permission_request_hook`, modeled on the cursor hook) publishes the
+    standard `response.elicitation_request` (`policy_name=qwen_native_permission`,
+    `phase=pre_tool_use`) and parks via `_publish_and_wait_for_harness_elicitation`.
+    This always surfaces a card whenever the TUI prompts — the explicit goal —
+    rather than routing through `/policies/evaluate` (which would auto-resolve
+    and skip the card when no TOOL_CALL policy matches qwen's tool names).
+  - **Loser release:** qwen emits a `control_response` for a `request_id`
+    whether the TUI or an external `confirmation_response` answered. The mirror
+    watches for it: if it lands while the web card is still parked (TUI answered
+    first), it POSTs `external_elicitation_resolved` to clear the card and skips
+    the stale `confirmation_response`; if the card answered first, the task is
+    already done and the `control_response` just cleans up. Still worth a live
+    E2E to confirm timing under a real `qwen --acp` turn.
 
 - [ ] **Composer status line: real model + context ring (Web UI).** For
   native-qwen the composer's model/effort chip is currently **hidden** (web UI
@@ -177,6 +180,39 @@ comments; this is the *what*, not the *how*.)
   forced goose-native to start fresh.
 
 ### Medium
+
+- [ ] **Compaction / context-compression mirroring (TUI → web).** qwen calls
+  compaction *compression*: it auto-compresses when the context fills and exposes
+  a `/compress` command, rendering an inline item in its TUI
+  (`{type:"compression", compression:{isPending, originalTokenCount,
+  newTokenCount, compressionStatus}}` and an internal `chat_compressed` event).
+  Native-qwen does **not** surface any of this in the web UI today — during a
+  compression the Chat tab just shows the turn stall, and afterward the mirrored
+  token counts don't reflect the shrink. Omnigent already has the web-facing
+  primitives — `response.compaction.in_progress` / `.completed` / `.failed`
+  (`omnigent/runtime/compaction.py`, `omnigent/server/schemas.py:3158+`,
+  rendered by `ap-web` as the "Compacting…" spinner / compaction divider) — so
+  this is a *forwarder* change, not new UI.
+  - **Verify the wire shape first (live E2E):** confirm whether qwen emits a
+    structured compression marker on the `--json-file` dual-output stream (a
+    `compression`/`chat_compressed`-shaped event) the way it emits
+    `control_request` for approvals, or whether compression is TUI-only and must
+    be inferred (e.g. from a token-count drop between consecutive `assistant`
+    `usage` events, or a `system`-style notice). The `control_request` →
+    elicitation work proved the stream carries non-transcript control events, so
+    a compression event is plausible but unconfirmed — `permission_suggestions`
+    was null, so don't assume field richness.
+  - **Mirror it:** in `omnigent/qwen_native_forwarder.py`, on a
+    compression-in-progress marker publish `response.compaction.in_progress`
+    (POST to the session) so the spinner shows, and on completion publish
+    `response.compaction.completed` with the post-compression `total_tokens`
+    (pairs with the usage/context-ring work in the "Composer status line" item —
+    one usage path feeds the ring, cost, and the compaction token count). If the
+    stream has no compression event, scope this to "best-effort: emit completed
+    with the new token count when usage drops" and `log()` the limitation.
+  - **Note on the ACP `qwen` harness:** the in-process executor compresses
+    internally over ACP and is opaque to us (same boundary as the LLM-phase
+    policy exclusion below), so this item is **native-qwen only**.
 
 - [ ] **Provider routing: settings.json precedence + token refresh.** The
   base injection now works (see What works today), but two gaps remain before

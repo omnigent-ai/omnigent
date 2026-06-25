@@ -336,6 +336,59 @@ def test_prepare_bridge_dir_refuses_symlinked_ancestor(
     assert not (attacker_dir / "bridge.json").exists()
 
 
+def test_trusted_parent_accepts_qwen_native_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The relay's bridge-root allowlist accepts qwen-native bridge dirs.
+
+    The comment relay (``start_tool_relay`` → ``_ensure_secure_dir`` →
+    ``_trusted_parent_for_bridge_dir``) writes its JSON file under the
+    harness's bridge dir, validating it lives below a known bridge root.
+    qwen-native reuses this relay but keeps files under its own root
+    (``$TMPDIR/omnigent-<uid>/qwen-native``); if that root is missing from the
+    allowlist, every qwen-native session raises ``not under an allowed bridge
+    root`` and the relay never starts (observed in a live runner log). This
+    pins the qwen-native branch so the regression can't return.
+    """
+    from omnigent import qwen_native_bridge
+
+    # Distinct claude root so the qwen target can't match the claude branch
+    # first (the autouse fixture points the claude root at ``tmp_path``).
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    # qwen root mirrors production shape: <uid-scoped temp>/qwen-native.
+    qwen_root = tmp_path / "omnigent-test" / "qwen-native"
+    monkeypatch.setattr(qwen_native_bridge, "_BRIDGE_ROOT", qwen_root)
+
+    target = claude_native_bridge._absolute_syntactic_path(qwen_root / "abc123")
+    trusted = claude_native_bridge._trusted_parent_for_bridge_dir(target)
+
+    # Same anchor as cursor-native: the uid-scoped temp dir's parent.
+    assert trusted == claude_native_bridge._absolute_syntactic_path(qwen_root.parent.parent)
+
+
+def test_trusted_parent_rejects_path_outside_all_roots_and_names_qwen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A path under no known root is refused, and the error names the qwen root."""
+    from omnigent import qwen_native_bridge
+
+    # Distinct claude root so ``outside`` below isn't swept under it (the autouse
+    # fixture points the claude root at ``tmp_path``).
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    qwen_root = tmp_path / "omnigent-test" / "qwen-native"
+    monkeypatch.setattr(qwen_native_bridge, "_BRIDGE_ROOT", qwen_root)
+
+    outside = claude_native_bridge._absolute_syntactic_path(tmp_path / "somewhere-else" / "x")
+    with pytest.raises(RuntimeError, match="not under an allowed bridge root") as exc:
+        claude_native_bridge._trusted_parent_for_bridge_dir(outside)
+    assert "qwen-native" in str(exc.value)
+
+
 def test_record_hook_event_updates_transcript_state(tmp_path: Path) -> None:
     """
     Hook records expose Claude's JSONL transcript path to the executor.

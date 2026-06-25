@@ -185,8 +185,8 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     Return the trusted parent for an allowed bridge directory.
 
     Claude-native files live below the uid-scoped temp bridge root.
-    Codex- and Cursor-native reuse the relay/MCP implementation but keep bridge
-    files below their own bridge roots. All roots use the same
+    Codex-, Cursor-, and Qwen-native reuse the relay/MCP implementation but keep
+    bridge files below their own bridge roots. All roots use the same
     owner-only ancestor validation; only the trusted anchor differs.
 
     :param target: Normalized bridge directory path being created or validated,
@@ -234,9 +234,19 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
             trusted_parent = antigravity_root.parent.parent
         return _absolute_syntactic_path(trusted_parent)
 
+    from omnigent.qwen_native_bridge import bridge_root as qwen_bridge_root
+
+    qwen_root = _absolute_syntactic_path(qwen_bridge_root())
+    if target.is_relative_to(qwen_root):
+        # Same shape as cursor-native ($TMPDIR/omnigent-<uid>/qwen-native): trust
+        # the uid-scoped temp dir's parent and validate/chmod the two
+        # bridge-owned directories below it.
+        return _absolute_syntactic_path(qwen_root.parent.parent)
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
-        f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, {antigravity_root!s})"
+        f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, "
+        f"{antigravity_root!s}, {qwen_root!s})"
     )
 
 
