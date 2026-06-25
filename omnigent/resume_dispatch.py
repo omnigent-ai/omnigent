@@ -252,6 +252,15 @@ def _dispatch_wrapper(
             cursor_args=(),
         )
         return True
+    if native_agent.key == "kiro":
+        from omnigent.kiro_native import run_kiro_native
+
+        run_kiro_native(
+            server=server,
+            session_id=session_id,
+            kiro_args=(),
+        )
+        return True
     if native_agent.key == "goose":
         from omnigent.goose_native import run_goose_native
 
@@ -261,6 +270,15 @@ def _dispatch_wrapper(
             goose_args=(),
         )
         return True
+    if native_agent.key == "antigravity":
+        from omnigent.antigravity_native import run_antigravity_native
+
+        run_antigravity_native(
+            server=server,
+            session_id=session_id,
+            antigravity_args=(),
+        )
+        return True
     if native_agent.key == "qwen":
         from omnigent.qwen_native import run_qwen_native
 
@@ -268,6 +286,24 @@ def _dispatch_wrapper(
             server=server,
             session_id=session_id,
             qwen_args=(),
+        )
+        return True
+    if native_agent.key == "kimi":
+        from omnigent.kimi_native import run_kimi_native
+
+        run_kimi_native(
+            server=server,
+            session_id=session_id,
+            kimi_args=(),
+        )
+        return True
+    if native_agent.key == "hermes":
+        from omnigent.hermes_native import run_hermes_native
+
+        run_hermes_native(
+            server=server,
+            session_id=session_id,
+            hermes_args=(),
         )
         return True
     return False

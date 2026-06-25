@@ -92,6 +92,8 @@ def test_validate_model_override_rejects_unsafe_values(value: str) -> None:
         "openai-agents",
         "cursor",
         "antigravity",
+        "kiro-native",
+        "native-kiro",
     ],
 )
 def test_harness_supports_model_override_for_plumbed_harnesses(harness: str) -> None:
@@ -160,6 +162,8 @@ class TestModelFamilyMismatch:
             ("agy", "gemini-3.5-flash"),
             ("google-antigravity", "gemini-2.5-flash"),
             ("antigravity", "gemini-2.5-pro"),
+            ("kiro-native", "claude-sonnet-4.5"),
+            ("native-kiro", "gpt-5.4-mini"),
         ],
     )
     def test_compatible_pairs_pass(self, harness: str, model: str) -> None:

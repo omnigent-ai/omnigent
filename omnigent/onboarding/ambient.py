@@ -34,7 +34,7 @@ from typing import Literal
 
 import tomllib
 
-from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
+from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.onboarding.providers import PROVIDER_ENV_VARS
 
 DetectedKind = Literal["key", "subscription", "local", "cli-config"]
@@ -73,12 +73,14 @@ _OLLAMA_PROBE_TIMEOUT = 0.25
 # ``family=None`` — their key is detected but no harness surface is
 # implied. Anthropic serves the ``anthropic`` surface; OpenAI and
 # OpenAI-compatible gateways (OpenRouter) serve the ``openai`` surface;
-# Gemini has no omnigent harness family yet, so ``None``.
+# Gemini serves the ``gemini`` surface (the antigravity-sdk harness drives
+# the Gemini SDK directly with a GEMINI_API_KEY), so a detected
+# GEMINI_API_KEY is adopted as a ``gemini``-family ``key`` provider.
 _ENV_KEY_FAMILY: dict[str, str | None] = {
     "anthropic": ANTHROPIC_FAMILY,
     "openai": OPENAI_FAMILY,
     "openrouter": OPENAI_FAMILY,
-    "gemini": None,
+    "gemini": GEMINI_FAMILY,
 }
 
 
@@ -93,9 +95,8 @@ class DetectedProvider:
         in the environment), ``"subscription"`` (a logged-in CLI), or
         ``"local"`` (a self-hosted endpoint).
     :param family: The model family this credential serves
-        (``"anthropic"`` / ``"openai"``), or ``None`` when the credential
-        is detected but maps to no omnigent harness surface (e.g. a
-        Gemini key).
+        (``"anthropic"`` / ``"openai"`` / ``"gemini"``), or ``None`` when the
+        credential is detected but maps to no omnigent harness surface.
     :param source: A human-readable descriptor of where the credential
         comes from, e.g. ``"$ANTHROPIC_API_KEY"``, ``"claude CLI login"``,
         or ``"http://localhost:11434"``.

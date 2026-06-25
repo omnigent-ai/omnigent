@@ -18,7 +18,7 @@ struct ChatTerminalBar: View {
       segment(.chat, title: "Chat", systemImage: "message")
       segment(.terminal, title: "Terminal", systemImage: "terminal")
     }
-    .padding(4)
+    .padding(InsetMetrics.barCapsulePadding)
     .modifier(GlassCapsule(colorScheme: colorScheme))
     .animation(.easeInOut(duration: 0.18), value: mode)
     .accessibilityElement(children: .contain)
@@ -50,7 +50,7 @@ struct ChatTerminalBar: View {
           ? DesignTokens.foreground(colorScheme) : DesignTokens.mutedForeground(colorScheme)
       )
       .padding(.horizontal, 14)
-      .frame(height: 34)
+      .frame(height: InsetMetrics.barSegmentHeight)
       .background {
         if isSelected {
           Capsule(style: .continuous)

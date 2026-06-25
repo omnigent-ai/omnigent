@@ -24,14 +24,54 @@ final class WebViewModel: ObservableObject {
 
   weak var webView: WKWebView?
 
+  /// How long, after a navigation begins, we wait for the web app to prove it's
+  /// alive by talking over the JS bridge. If the page never speaks within this
+  /// window — a blank render, crashed JS, or a hang that never reaches
+  /// `didFinish` — we surface the server switcher so the user is never stranded
+  /// on a broken page with no way back to server selection.
+  private static let bridgeLivenessTimeout: TimeInterval = 6
+
+  private var serverSwitcherWatchdog: Task<Void, Never>?
+
   func reload() {
     webView?.reload()
+  }
+
+  /// Arm (or re-arm) the liveness watchdog. Called whenever a navigation
+  /// begins. The switcher has just been hidden for the load; if the page never
+  /// claims it back over the bridge, the watchdog reveals it as an escape hatch.
+  func armServerSwitcherWatchdog() {
+    serverSwitcherWatchdog?.cancel()
+    serverSwitcherWatchdog = Task { @MainActor [weak self] in
+      try? await Task.sleep(nanoseconds: UInt64(Self.bridgeLivenessTimeout * 1_000_000_000))
+      guard !Task.isCancelled, let self else { return }
+      self.serverSwitcherHidden = false
+      self.serverSwitcherWatchdog = nil
+    }
+  }
+
+  /// Stand the watchdog down. Called the moment the page proves it's alive over
+  /// the bridge, and when a load fails (we route to server selection anyway).
+  func cancelServerSwitcherWatchdog() {
+    serverSwitcherWatchdog?.cancel()
+    serverSwitcherWatchdog = nil
   }
 
   func emitNotificationActivation(_ path: String) {
     guard path.starts(with: "/") else { return }
     let script =
       "window.__omnigentNativeEmitNotificationActivated?.(\(Self.javascriptString(path)));"
+    webView?.evaluateJavaScript(script)
+  }
+
+  /// Push the footprint (in CSS px, excluding the OS safe area which the web
+  /// layer adds via `env()`) of the native floating bars to the web app. The
+  /// web side folds these into its `--omnigent-inset-*` variables so page
+  /// content reserves the right amount of space — making native bar dimensions
+  /// the single source of truth instead of magic numbers duplicated in CSS.
+  func emitInsets(topBar: CGFloat, bottomBar: CGFloat) {
+    let script =
+      "window.__omnigentNativeEmitInsets?.(\(jsNumber(topBar)), \(jsNumber(bottomBar)));"
     webView?.evaluateJavaScript(script)
   }
 
@@ -47,6 +87,12 @@ final class WebViewModel: ObservableObject {
     let script =
       "window.__omnigentNativeEmitSidebarDrag?.(\(Self.javascriptString(phase)), \(clamped));"
     webView?.evaluateJavaScript(script)
+  }
+
+  /// Format a CGFloat as a bare JS number literal (no units, finite-guarded).
+  private func jsNumber(_ value: CGFloat) -> String {
+    guard value.isFinite else { return "0" }
+    return String(format: "%g", Double(value))
   }
 
   static func javascriptString(_ value: String) -> String {

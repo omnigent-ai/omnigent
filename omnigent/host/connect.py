@@ -20,6 +20,7 @@ from pathlib import Path
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
 
+from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
@@ -289,7 +290,18 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # live in HARNESS_CREDENTIAL_ENV_VARS, mirroring ANTHROPIC_API_KEY /
         # ANTHROPIC_BASE_URL. Safe to propagate: not a secret.
         "CLAUDE_CODE_USE_BEDROCK",
+        # Kubernetes config path. A filesystem path (typically
+        # ``~/.kube/config``), not a bearer secret — the file *contains*
+        # cluster certs/tokens but the env var is just a path string,
+        # analogous to ``HOME``. Without it, ``kubectl`` / helm / k9s
+        # inside the agent's shell fall back to the default path which may
+        # not match what the host owner configured (e.g. a non-standard
+        # kubeconfig location or a colon-separated multi-file list).
+        "KUBECONFIG",
     }
+    # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
+    # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
+    | set(WINDOWS_ENV_PASSTHROUGH)
 )
 # Locale family (``LC_ALL``, ``LC_CTYPE``, …) — allowed by prefix.
 _RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_")

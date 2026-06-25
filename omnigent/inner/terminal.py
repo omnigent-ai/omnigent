@@ -21,8 +21,10 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeAlias
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.runner.identity import strip_runner_auth_secrets
 
+from . import _proc
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from .egress import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .os_env import (
@@ -544,6 +546,14 @@ def _process_alive(pid: int) -> bool:
         e.g. ``48213``.
     :returns: ``True`` when a process with that pid exists.
     """
+    # POSIX uses ``os.kill(pid, 0)`` so a killed-but-not-yet-reaped zombie
+    # still counts as present (matches ``process_manager._pid_alive``). The
+    # ``_proc.process_alive`` psutil probe treats a zombie as gone and can
+    # transiently miss a live process, which raced the orphan sweep against a
+    # just-exited owner. ``os.kill(pid, 0)`` can't be used on Windows (maps to
+    # TerminateProcess and would kill the target), so fall back to psutil there.
+    if IS_WINDOWS:
+        return _proc.process_alive(pid)
     if pid <= 0:
         return False
     try:
@@ -725,6 +735,8 @@ class TerminalInstance:
         if the same key also appears in ``env``, the strip wins.
         Intentional: ``env_unset`` is a leak-prevention boundary,
         not a soft default.
+    :param inherit_env: Whether to start from ``os.environ`` before applying
+        ``env`` / ``env_unset``.
     :param sandbox_policy: Optional sandbox wrapper policy.
     :param conversation_link: Optional web UI link for the owning
         conversation, e.g. ``"/c/conv_abc123"``.
@@ -746,6 +758,7 @@ class TerminalInstance:
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     env_unset: list[str] = field(default_factory=list)
+    inherit_env: bool = True
     sandbox_policy: SandboxPolicy | None = None
     conversation_link: str | None = None
     # Egress allow-list to enforce for this terminal. Populated
@@ -889,7 +902,10 @@ class TerminalInstance:
         # commands outside the sandbox. The host-side control plane
         # addresses the socket via ``self.socket_path`` directly and never
         # needs the env var; any inherited value is stripped below too.
-        env = dict(os.environ)
+        if self.inherit_env:
+            env = os.environ.copy()
+        else:
+            env = {}
         env.pop("OMNIGENT_TMUX_SOCK", None)
         # Apply per-terminal env overrides (takes precedence over inherited env).
         env.update(self.env)
@@ -1705,6 +1721,12 @@ def create_terminal_instance(
     :returns: A :class:`TerminalCreateResult` carrying the new instance
         and the resolved cwd to pass to ``launch()``.
     """
+    if IS_WINDOWS:
+        raise RuntimeError(
+            "Native terminal harnesses (tmux/PTY) are not supported on Windows. "
+            "Run an SDK-based harness via `omnigent run <agent.yaml>` (e.g. the "
+            "claude-sdk, cursor, copilot, or codex harness) or use the web UI."
+        )
     if not _tmux_available():
         raise RuntimeError("tmux is not installed or not on PATH")
 
@@ -1788,6 +1810,7 @@ def create_terminal_instance(
         args=list(spec.args),
         env=dict(spec.env),
         env_unset=list(spec.env_unset),
+        inherit_env=spec.inherit_env,
         sandbox_policy=sandbox,
         conversation_link=conversation_link,
         egress_rules=egress_rules,

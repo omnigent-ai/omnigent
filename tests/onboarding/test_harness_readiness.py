@@ -80,7 +80,8 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
 
 # CLI-wrapping harnesses are gated on their binary being on PATH. Native Cursor
 # (``omni cursor``) joins the list: it wraps the ``cursor-agent`` CLI, unlike the
-# SDK ``cursor`` harness which gates on a key (covered separately below).
+# SDK ``cursor`` harness which gates on a key (covered separately below). Native
+# Kiro wraps the standalone ``kiro-cli`` binary.
 @pytest.mark.parametrize(
     "harness",
     [
@@ -92,8 +93,11 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "pi",
         "cursor-native",
         "native-cursor",
+        "kiro-native",
+        "native-kiro",
         "goose-native",
         "native-goose",
+        "hermes",
     ],
 )
 def test_cli_harness_configured_only_when_binary_installed(
@@ -144,6 +148,9 @@ def test_configured_harness_map_covers_all_spellings(
         # Native Cursor (``omni cursor``) — gates on the cursor-agent CLI.
         "cursor-native",
         "native-cursor",
+        # Native Kiro (``omni kiro``) — gates on the kiro-cli binary.
+        "kiro-native",
+        "native-kiro",
         # Goose — native TUI (``omni goose``) + headless ACP harness; both gate
         # on the goose CLI.
         "goose",
@@ -153,6 +160,15 @@ def test_configured_harness_map_covers_all_spellings(
         "antigravity",
         "agy",
         "google-antigravity",
+        # Kimi Code CLI + alias.
+        "kimi",
+        "kimi-code",
+        # Native Kimi (``omnigent kimi``) — gates on the kimi CLI.
+        "kimi-native",
+        "native-kimi",
+        # Native Antigravity (agy) CLI-wrapping harness, both spellings.
+        "antigravity-native",
+        "native-antigravity",
         # Native OpenCode harness + its user-facing aliases.
         "opencode-native",
         "native-opencode",
@@ -166,6 +182,11 @@ def test_configured_harness_map_covers_all_spellings(
         # Copilot SDK harness + its user-facing alias.
         "copilot",
         "github-copilot",
+        # Hermes — headless subprocess harness (``hermes``) + native TUI
+        # (``hermes-native`` / ``native-hermes``); all gate on the hermes CLI.
+        "hermes",
+        "hermes-native",
+        "native-hermes",
     }
     assert set(result) == expected_keys
 
@@ -198,20 +219,27 @@ def test_configured_harness_map_gates_only_cli_harnesses(
     # package and gates on a configured ``CURSOR_API_KEY``, not a binary —
     # covered separately. Native Cursor (``cursor-native`` / ``native-cursor``)
     # wraps the ``cursor-agent`` CLI, so it IS gated on the binary.)
+    # antigravity-native is also gated (it wraps the ``agy`` CLI); with no
+    # binary it reads False before its credential check is even reached.
     for cli in (
         "claude-native",
         "native-claude",
-        "codex",
-        "codex-native",
-        "native-codex",
         "pi",
+        "kimi",
         "cursor-native",
         "native-cursor",
+        "kiro-native",
+        "native-kiro",
+        "antigravity-native",
+        "native-antigravity",
         "goose-native",
         "native-goose",
         "qwen",
+        "hermes",
     ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
+    for codex in ("codex", "codex-native", "native-codex"):
+        assert result[codex] == "binary-missing", f"{codex} should name the missing Codex binary"
 
 
 def test_configured_harness_map_all_true_with_clis(
@@ -221,14 +249,43 @@ def test_configured_harness_map_all_true_with_clis(
     gated harnesses are satisfied.
 
     The CLI harnesses pass their binary check, the SDK harnesses are ungated,
-    cursor (key-gated) is satisfied by a ``CURSOR_API_KEY`` and copilot
-    (token-gated) by a ``GH_TOKEN`` — so nothing is reported unconfigured.
+    cursor (key-gated) is satisfied by a ``CURSOR_API_KEY``, copilot
+    (token-gated) by a ``GH_TOKEN``, and antigravity-native (binary + credential
+    gated) by a detected Gemini OAuth credential — so nothing is reported
+    unconfigured.
     """
+    import omnigent.onboarding.gemini_auth as _ga
+
     _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.codex_native._codex_auth_unavailable_reason",
+        lambda: None,
+    )
     monkeypatch.setenv("CURSOR_API_KEY", "crsr_ready")
+    # antigravity-native also needs a credential (not just the ``agy`` binary).
+    monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
     monkeypatch.setenv("GH_TOKEN", "gho_ready")
     result = configured_harness_map()
     assert all(result.values())
+
+
+def test_kimi_readiness_keys_off_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kimi is configured iff the ``kimi`` binary is on PATH.
+
+    Kimi authenticates against Moonshot AI's backend via ``kimi login`` (OAuth
+    or a Moonshot API key), which the daemon cannot inspect — so readiness
+    keys off binary presence, and the alias ``kimi-code`` resolves to the
+    same verdict via canonicalization.
+    """
+    _no_clis_installed(monkeypatch)
+    assert harness_is_configured("kimi") is False
+    assert harness_is_configured("kimi-code") is False
+
+    _all_clis_installed(monkeypatch)
+    assert harness_is_configured("kimi") is True
+    assert harness_is_configured("kimi-code") is True
 
 
 def test_cursor_readiness_keys_off_api_key(

@@ -53,7 +53,7 @@ import {
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
-import { CompactionMarker } from "@/components/blocks/StatusBlocks";
+import { CompactionMarker, RoutingDecisionChip } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
@@ -63,6 +63,7 @@ import { validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
 import {
   isIOSShell,
+  onNativeSidebarDrag,
   onNativeViewModeChanged,
   setNativeServerSwitcherHidden,
   setNativeViewMode,
@@ -126,6 +127,7 @@ import {
   isCostRoutingSession,
   parseCostRoutingVerdict,
 } from "@/components/CostRoutingControl";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
@@ -137,6 +139,12 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { SessionImage } from "@/components/SessionImage";
+import {
+  CodexGoalControl,
+  CodexGoalStatusPill,
+  useCodexGoalState,
+  type CodexGoal,
+} from "@/components/codex";
 
 const ATTACHED_RE = /\[Attached:[^\]]*\]\s*/g;
 
@@ -731,7 +739,11 @@ export function ChatPage() {
   );
   // Orchestrator-only: polly's children inherit its agentName, so the gate
   // needs the session predicate (parent linkage), not a bare name check.
-  const costRoutingEligible = isCostRoutingSession(activeSession);
+  const serverInfo = useServerInfo();
+  const costRoutingEligible =
+    serverInfo !== "loading" &&
+    serverInfo.smart_routing_enabled &&
+    isCostRoutingSession(activeSession);
 
   // Non-null only when the active session is a sub-agent (child): the
   // composer then peeks a "Chatting with sub-agent …" tray and the
@@ -975,6 +987,7 @@ export function ChatPage() {
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
+      showCodexGoal={shouldShowCodexGoalControl(capabilitySource)}
       costRoutingVerdict={costRoutingVerdict}
       costRoutingEligible={costRoutingEligible}
       subAgentLabel={subAgentLabel}
@@ -1201,6 +1214,8 @@ interface MainAgentSurfaceProps {
   codexModelOptions: readonly CodexModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  /** Show the Codex Goal control. */
+  showCodexGoal?: boolean;
   /** Latest advisor verdict for the cost-routing pill; null when none. */
   costRoutingVerdict: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
@@ -1274,6 +1289,7 @@ function MainAgentSurface({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showCodexGoal = false,
   costRoutingVerdict,
   costRoutingEligible,
   subAgentLabel,
@@ -1380,6 +1396,45 @@ function MainAgentSurface({
   // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
   // read and drive the scroll.
   const [scroller, setScroller] = useState<ConversationScroller | null>(null);
+  // While the iOS edge-swipe is driving the sidebar drawer, make the transcript
+  // ignore the finger so it doesn't scroll along with the drag. On iOS the page
+  // is viewport-locked, so the transcript scrolls as an inner overflow:auto
+  // element (`scroller.el`) that the native shell can't reach via
+  // webView.scrollView — it has to be frozen here in the DOM. The native drag
+  // stream marks when a drag is live; for its duration the scroller stops
+  // responding to touch (pointer-events:none), its overflow is locked, and its
+  // scroll offset is pinned so neither a finger-drag nor leftover momentum can
+  // move it. Everything is restored when the drag settles (open/close).
+  useEffect(() => {
+    const el = scroller?.el;
+    if (!el) return;
+    let frozenTop: number | null = null;
+    const pin = () => {
+      if (frozenTop != null) el.scrollTop = frozenTop;
+    };
+    const freeze = () => {
+      if (frozenTop != null) return;
+      frozenTop = el.scrollTop;
+      el.style.pointerEvents = "none";
+      el.style.overflowY = "hidden";
+      el.addEventListener("scroll", pin);
+    };
+    const thaw = () => {
+      if (frozenTop == null) return;
+      el.removeEventListener("scroll", pin);
+      el.style.pointerEvents = "";
+      el.style.overflowY = "auto";
+      frozenTop = null;
+    };
+    const unsubscribe = onNativeSidebarDrag((phase) => {
+      if (phase === "begin" || phase === "move") freeze();
+      else thaw();
+    });
+    return () => {
+      unsubscribe();
+      thaw();
+    };
+  }, [scroller]);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
   const handleSend = useCallback(
     (text: string, files?: File[]) => {
@@ -1454,6 +1509,7 @@ function MainAgentSurface({
           >
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
+            <PreserveScrollDistanceOnResize />
             <ConversationScrollRefBridge onScroller={setScroller} />
             <HistoryAutoLoader
               hasMoreHistory={hasMoreHistory}
@@ -1589,6 +1645,7 @@ function MainAgentSurface({
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
         showCodexPlanMode={showCodexPlanMode}
+        showCodexGoal={showCodexGoal}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
         reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
@@ -1737,6 +1794,76 @@ function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
     scrollToBottom("instant");
     requestAnimationFrame(() => scrollToBottom("instant"));
   }, [nonce, scrollToBottom]);
+
+  return null;
+}
+
+/**
+ * Preserves the transcript's distance-from-bottom whenever its scroll container
+ * resizes on the iOS shell — so the content you're looking at stays put while
+ * the soft keyboard opens/closes (and while the composer grows on focus).
+ *
+ * Two things resize the container, and neither is handled by `use-stick-to-
+ * bottom` (which only re-anchors on *content* resize): the keyboard, via
+ * `useIOSViewportLock` shrinking the app-shell; and the composer growing taller
+ * when focused (its send row / status line), which steals flex height from the
+ * transcript a couple of lines at a time — *without* firing a visualViewport
+ * resize. Watching only visualViewport missed the composer growth, which is why
+ * the transcript crept up ~2 lines on focus.
+ *
+ * So we watch the scroll container itself with a `ResizeObserver` and, on any
+ * size change, hold the scroll position relative to the bottom constant:
+ * `scrollTop = scrollHeight - clientHeight - distance`. `distance` is tracked
+ * from genuine user scrolls only — scrolls that coincide with a dimension change
+ * (the resize's own clamp, or our restore) are ignored so they can't corrupt it.
+ * At the bottom (distance 0) you stay at the bottom; scrolled up reading
+ * history, you keep seeing the same messages. New messages still go through the
+ * library (content resize doesn't change the container's box). Stateless across
+ * any number of keyboard cycles.
+ */
+function PreserveScrollDistanceOnResize() {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef?: React.RefObject<HTMLElement>;
+  };
+  const scrollRef = ctx.scrollRef;
+
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    const el = scrollRef?.current;
+    if (!el) return;
+
+    const measure = () => el.scrollHeight - el.clientHeight - el.scrollTop;
+    let distance = Math.max(0, measure());
+    let prevSH = el.scrollHeight;
+    let prevCH = el.clientHeight;
+
+    const onScroll = () => {
+      const sh = el.scrollHeight;
+      const ch = el.clientHeight;
+      // A scroll that lands on the same frame as a size change is resize-induced
+      // (the browser's clamp, or our own restore below) — not the user. Skip it
+      // so it can't overwrite the distance we're trying to preserve.
+      if (sh !== prevSH || ch !== prevCH) {
+        prevSH = sh;
+        prevCH = ch;
+        return;
+      }
+      distance = Math.max(0, measure());
+    };
+
+    const observer = new ResizeObserver(() => {
+      el.scrollTop = el.scrollHeight - el.clientHeight - distance;
+      prevSH = el.scrollHeight;
+      prevCH = el.clientHeight;
+    });
+
+    el.addEventListener("scroll", onScroll, { passive: true });
+    observer.observe(el);
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      observer.disconnect();
+    };
+  }, [scrollRef]);
 
   return null;
 }
@@ -2023,10 +2150,14 @@ export function JumpToTopButton({
 
   return (
     <div
+      // top 50px centers the pill on the chat-scroll-fade border (the mask ramps
+      // 48px→80px), just below the h-14 ChatHeader. z-40 > header z-30. On the
+      // iOS shell the header and fade border shift down by the safe-area inset
+      // (see .chat-scroll-fade in index.css), so add --omnigent-inset-top here
+      // too to keep the pill centered on the border. The var is 0px off-shell.
+      style={{ top: "calc(50px + var(--omnigent-inset-top))" }}
       className={cn(
-        // top-[50px]: centers the pill on the chat-scroll-fade border (the mask
-        // ramps 48px→80px), just below the h-14 ChatHeader. z-40 > header z-30.
-        "pointer-events-none absolute inset-x-0 top-[50px] z-40 flex justify-center transition-opacity duration-150",
+        "pointer-events-none absolute inset-x-0 z-40 flex justify-center transition-opacity duration-150",
         visible ? "opacity-100" : "opacity-0",
       )}
     >
@@ -2074,6 +2205,7 @@ function bubbleKey(bubble: Bubble): string {
   if (bubble.kind === "user") return `user:${bubble.stableKey ?? bubble.itemId}`;
   if (bubble.kind === "compaction_loading") return `compaction_loading:${bubble.itemId}`;
   if (bubble.kind === "compaction") return `compaction:${bubble.itemId}`;
+  if (bubble.kind === "routing_decision") return `routing_decision:${bubble.itemId}`;
   return `assistant:${bubble.stableId}`;
 }
 
@@ -2515,6 +2647,16 @@ export const BubbleView = memo(
       );
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
+    if (bubble.kind === "routing_decision") {
+      return (
+        <RoutingDecisionChip
+          model={bubble.model}
+          tier={bubble.tier}
+          applied={bubble.applied}
+          rationale={bubble.rationale}
+        />
+      );
+    }
     return <AssistantBubble bubble={bubble} />;
   },
   (prev, next) => bubblesEqual(prev.bubble, next.bubble),
@@ -2778,6 +2920,8 @@ interface ComposerProps {
   codexModelOptions: readonly CodexModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  /** Show the Codex Goal control. */
+  showCodexGoal?: boolean;
   /**
    * Terminal-first session (Chat/Terminal pill present). Presentation
    * only: tightens the composer's bottom padding to `pb-1.5` so it sits
@@ -2986,6 +3130,35 @@ export function formatModelEffortStatusLabel(
 }
 
 /**
+ * Identity label for the composer status tray: which harness/agent is
+ * running this session. Native vendor wrappers read as the bare vendor
+ * name ("Claude" / "Codex"); SDK/bundle agents read as the agent name
+ * with the brain harness in parens ("Polly (Pi)"). This moved OUT of the
+ * picker trigger (which now shows model/effort) — the trigger is the
+ * model/effort control, so the harness identity belongs in the read-only
+ * shelf below.
+ *
+ * @param modelPickerKind - Native picker family, when the session is a
+ *   claude-/codex-/cursor-native wrapper.
+ * @param agentName - Bound agent name (lowercase slug), if any.
+ * @param sessionHarness - Effective brain harness id (override-aware).
+ * @returns Display label, or ``null`` when nothing is known.
+ */
+export function composerHarnessLabel(
+  modelPickerKind: NativeModelPickerKind | null,
+  agentName: string | null | undefined,
+  sessionHarness: string | null,
+): string | null {
+  if (modelPickerKind === "claude") return "Claude";
+  if (modelPickerKind === "codex") return "Codex";
+  if (modelPickerKind === "cursor") return "Cursor";
+  const display = agentName ? agentDisplayLabel(agentName) : null;
+  const harness = sessionHarness ? (BRAIN_HARNESS_LABELS[sessionHarness] ?? null) : null;
+  if (display && harness) return `${display} (${harness})`;
+  return display ?? harness;
+}
+
+/**
  * Status-line tray tucked behind the composer card: the worktree branch
  * on the left (truncated to an ellipsis so the tray never wraps), the
  * model/effort + context ring on the right. Shares the card's background so the two
@@ -2997,35 +3170,33 @@ export function formatModelEffortStatusLabel(
  * the session has nothing to report. Session cost lives in the header
  * agent-info popover (the "i" button), not here.
  */
-function ComposerStatusLine() {
+function ComposerStatusLine({
+  harnessLabel,
+  codexGoal,
+}: {
+  harnessLabel: string | null;
+  codexGoal: CodexGoal | null;
+}) {
   const conversationId = useChatStore((s) => s.conversationId);
   const contextWindow = useChatStore((s) => s.contextWindow);
   const tokensUsed = useChatStore((s) => s.tokensUsed);
-  const selectedEffort = useChatStore((s) => s.selectedEffort);
-  const selectedModel = useChatStore((s) => s.selectedModel);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
-  const llmModel = useChatStore((s) => s.llmModel);
-  const codexModelOptions = useChatStore((s) => s.codexModelOptions);
   // Seeded from the session snapshot on bind (chatStore.sessionBindingPatch),
   // alongside contextWindow — so the branch reads from the same store as
   // the other status-line values rather than a separate fetch.
   const gitBranch = useChatStore((s) => s.gitBranch);
-  // qwen/goose/cursor/pi/opencode native sessions pick their model inside the
-  // vendor TUI, so Omnigent's bound `llmModel` is just an unused default
-  // (it would read e.g. "claude-sonnet-4-6" on a Qwen session). Hide the
-  // model/effort label for them; claude-/codex-native keep it (real picker).
-  const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
 
   const showBranch = !!conversationId && !!gitBranch;
-  const modelEffortLabel =
-    conversationId && !nativeVendorOwnsModel
-      ? formatModelEffortStatusLabel(selectedModel ?? llmModel, selectedEffort, codexModelOptions)
-      : null;
+  // The harness/agent identity (e.g. "Claude", "Polly (Pi)") lives here now;
+  // the picker trigger above owns the model/effort label since it's the
+  // control that changes them.
+  const showHarness = !!conversationId && harnessLabel !== null;
   const showPlanMode = !!conversationId && codexPlanMode;
+  const showGoal = !!conversationId && codexGoal != null;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showBranch && !showPlanMode && !showRing && modelEffortLabel === null) return null;
+  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHarness) return null;
 
   return (
     <div
@@ -3067,13 +3238,14 @@ function ComposerStatusLine() {
             <span>Plan mode</span>
           </span>
         )}
-        {modelEffortLabel && (
+        {showGoal && codexGoal && <CodexGoalStatusPill goal={codexGoal} />}
+        {showHarness && harnessLabel && (
           <span
-            data-testid="composer-model-effort"
+            data-testid="composer-harness"
             className="max-w-36 truncate text-xs text-muted-foreground sm:max-w-52"
-            title={modelEffortLabel}
+            title={harnessLabel}
           >
-            {modelEffortLabel}
+            {harnessLabel}
           </span>
         )}
         {showRing && <ContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} />}
@@ -3179,6 +3351,7 @@ export function Composer({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showCodexGoal = false,
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
@@ -3232,12 +3405,24 @@ export function Composer({
   // Per-session cost-control switch, hydrated from the snapshot on bind.
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
+  // Harness/agent identity shown in the status tray below the card. The
+  // picker trigger owns model/effort now, so the identity moves here.
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const harnessLabel = composerHarnessLabel(
+    modelPickerKind,
+    agents?.find((a) => a.id === selectedAgentId)?.name ?? agents?.[0]?.name ?? null,
+    sessionHarness,
+  );
 
   // Preserve unsent text + file attachments per session so switching
   // tabs and coming back restores the draft. The drafts map lives at
   // module scope (not useRef) because Composer unmounts during the
   // loading gate between session switches.
   const conversationId = useChatStore((s) => s.conversationId);
+  const { goal: codexGoal, setGoal: setCodexGoal } = useCodexGoalState(
+    conversationId,
+    showCodexGoal,
+  );
   const valueRef = useRef(value);
   valueRef.current = value;
   const filesRef = useRef(files);
@@ -3992,8 +4177,7 @@ export function Composer({
           </div>
           {/* Cost toggle + agent picker + Send — right side */}
           <div className="flex min-w-0 items-center gap-0.5">
-            {/* Temporarily hidden (#3021): re-enable by removing the false gate. */}
-            {false && costRoutingEligible && (
+            {costRoutingEligible && (
               <IntelligentModelControl
                 value={costControlModeOverride}
                 onChange={(mode) =>
@@ -4036,6 +4220,14 @@ export function Composer({
                   {codexPlanMode ? "Exit Plan mode" : "Enter Plan mode"}
                 </TooltipContent>
               </Tooltip>
+            )}
+            {showCodexGoal && (
+              <CodexGoalControl
+                conversationId={conversationId}
+                readOnly={isReadOnly}
+                goal={codexGoal}
+                onGoalChange={setCodexGoal}
+              />
             )}
             <AgentPicker
               agents={agents}
@@ -4080,7 +4272,7 @@ export function Composer({
           </div>
         </div>
       </div>
-      <ComposerStatusLine />
+      <ComposerStatusLine harnessLabel={harnessLabel} codexGoal={codexGoal} />
     </form>
   );
 }
@@ -4246,7 +4438,7 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
-type NativeModelPickerKind = "claude" | "codex";
+type NativeModelPickerKind = "claude" | "codex" | "cursor";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4308,6 +4500,8 @@ export function modelPickerKindForConv(
       return "claude";
     case "codex-native-ui":
       return "codex";
+    case "cursor-native-ui":
+      return "cursor";
     default:
       return null;
   }
@@ -4333,6 +4527,19 @@ export function shouldShowEffortPicker(
 }
 
 export function shouldShowCodexPlanModeControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isCodexNativeSession(conv);
+}
+
+/**
+ * True when the Codex Goal control should be visible.
+ *
+ * @param conv - Session or sidebar row carrying labels. ``null`` or missing
+ *   labels fail closed.
+ * @returns True only for Codex-native wrapper sessions.
+ */
+export function shouldShowCodexGoalControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
   return isCodexNativeSession(conv);
@@ -4404,12 +4611,17 @@ function AgentPicker({
   const hasAgents = !!agents && agents.length > 0;
   const selectedEffort = useChatStore((s) => s.selectedEffort);
   const selectedModel = useChatStore((s) => s.selectedModel);
+  const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const llmModel = useChatStore((s) => s.llmModel);
 
+  // Codex and cursor both populate the picker from the server-provided
+  // ``codexModelOptions`` channel (the snapshot's ``model_options`` field);
+  // claude uses the static local catalog.
+  const usesServerModelOptions = modelPickerKind === "codex" || modelPickerKind === "cursor";
   const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
     modelPickerKind === "claude"
       ? CLAUDE_NATIVE_MODELS
-      : modelPickerKind === "codex"
+      : usesServerModelOptions
         ? codexModelOptions
         : [];
   const isNativeModelPicker = modelPickerKind !== null;
@@ -4421,38 +4633,68 @@ function AgentPicker({
   const showAgents = !isNativeModelPicker && (agents?.length ?? 0) > 1;
   const rawAgentName = agents?.find((a) => a.id === selectedId)?.name ?? agents?.[0]?.name;
   const agentDisplayName = rawAgentName ? agentDisplayLabel(rawAgentName) : rawAgentName;
-  // Effective brain harness from the session snapshot (override-aware).
-  // Only the SDK brain harnesses get a pill suffix — native wrappers
-  // already use their own "Claude" branch below.
-  const sessionHarness = useChatStore((s) => s.sessionHarness);
-  const harnessLabel = sessionHarness ? (BRAIN_HARNESS_LABELS[sessionHarness] ?? null) : null;
 
-  // Build the pill piece-by-piece so empty selections don't leave
-  // stray separators.
-  const effortLabel = showEffort && selectedEffort ? formatEffortLabel(selectedEffort) : null;
+  // The trigger now names what this control changes: model + effort. The
+  // harness/agent identity moved to the status tray below the card.
+  // qwen/goose/cursor/pi/opencode native wrappers pick their model inside
+  // the vendor TUI, so the bound `llmModel` is an unused default — don't
+  // surface it as if it were live; claude-/codex-native and SDK agents
+  // resolve to a real model.
+  const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
+  // cursor-native is a vendor-owns-model wrapper, but unlike qwen/goose/pi/
+  // opencode it mirrors its live TUI model into the session override
+  // (`sessionModelOverride` / `model_override`), kept current both by the
+  // forwarder's terminal→web mirror and by web-side picks. Surface *that* as
+  // the live model — never the cross-session sticky `selectedModel` (a pick
+  // carried over from some other session) nor the meaningless `llmModel`
+  // default. The other vendor-owns wrappers have no Omnigent-visible model and
+  // stay null.
+  const pickerSelectedModel = modelPickerKind === "cursor" ? sessionModelOverride : selectedModel;
+  const effectiveModel = nativeVendorOwnsModel
+    ? modelPickerKind === "cursor"
+      ? sessionModelOverride
+      : null
+    : (selectedModel ?? llmModel);
+  const modelLabel = formatStatusModelLabel(effectiveModel, codexModelOptions);
+  const effortTriggerLabel =
+    showEffort && selectedEffort
+      ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
+      : null;
   const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort;
 
-  let triggerLabel: string;
+  // Model in foreground (black), effort in muted (grey). Static fallbacks
+  // first; the final `else` returns null so a session with nothing to show
+  // and nothing to switch doesn't render an empty disabled pill — its
+  // identity is carried by the status tray below.
+  let triggerContent: React.ReactNode;
   if (isLoading) {
-    triggerLabel = "Loading…";
+    triggerContent = "Loading…";
   } else if (!hasAgents) {
-    triggerLabel = "No agents";
-  } else if (modelPickerKind === "claude") {
-    // Native sessions are always scoped to the bound vendor agent. Show just
-    // the vendor name in the pill — model and effort remain selectable in the
-    // dropdown, so spelling them out here only costs horizontal space.
-    triggerLabel = "Claude";
-  } else if (modelPickerKind === "codex") {
-    triggerLabel = "Codex";
-  } else {
-    // The harness reads as part of the identity — "Polly (Pi)" — while
-    // effort stays a separate " · "-joined segment.
-    const nameWithHarness =
-      agentDisplayName && harnessLabel ? `${agentDisplayName} (${harnessLabel})` : agentDisplayName;
-    const parts = [nameWithHarness, effortLabel].filter(
-      (p): p is string => p != null && p.length > 0,
+    triggerContent = "No agents";
+  } else if (modelLabel) {
+    triggerContent = (
+      <>
+        <span className="text-foreground">{modelLabel}</span>
+        {effortTriggerLabel && <span className="text-muted-foreground"> {effortTriggerLabel}</span>}
+      </>
     );
-    triggerLabel = parts.join(" · ");
+  } else if (effortTriggerLabel) {
+    // Vendor owns the model but effort is still switchable from the web UI.
+    triggerContent = <span className="text-muted-foreground">{effortTriggerLabel}</span>;
+  } else if (showAgents) {
+    // No model/effort to surface, but the user can still switch agents —
+    // label the trigger with the current agent so the switcher reads clearly.
+    triggerContent = agentDisplayName;
+  } else if (hasPickerActions) {
+    // The live model/effort isn't resolved yet (e.g. a claude-/codex-native
+    // session before the snapshot fills llmModel/selectedEffort: the generated
+    // spec may carry no executor model and no sticky/override is set), but the
+    // dropdown still has model rows to switch. Keep the trigger rendered — and
+    // the model dropdown + bare-`/model` open path reachable — with a stable
+    // identity fallback rather than hiding the picker entirely.
+    triggerContent = agentDisplayName ?? "Model";
+  } else {
+    return null;
   }
 
   return (
@@ -4466,7 +4708,7 @@ function AgentPicker({
           data-testid="agent-picker-trigger"
           className="h-7 min-w-0 shrink gap-1.5 px-2 text-muted-foreground hover:text-foreground"
         >
-          <span className="min-w-0 truncate text-xs tabular-nums">{triggerLabel}</span>
+          <span className="min-w-0 truncate text-xs tabular-nums">{triggerContent}</span>
           {hasPickerActions && <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />}
         </Button>
       </DropdownMenuTrigger>
@@ -4502,10 +4744,10 @@ function AgentPicker({
             {!isNativeModelPicker && <DropdownMenuSeparator className="my-1" />}
             <PickerSectionHeader>Models</PickerSectionHeader>
             {modelOptions.map((m) => {
-              const isExplicit = selectedModel === m.id;
+              const isExplicit = pickerSelectedModel === m.id;
               const isImplicit =
-                selectedModel === null &&
-                (modelPickerKind === "codex"
+                pickerSelectedModel === null &&
+                (usesServerModelOptions
                   ? findCodexModelOption(codexModelOptions, llmModel)?.id === m.id
                   : isModelImplicitlySelected(m.id, llmModel));
               const isActive = isExplicit || isImplicit;
@@ -4527,7 +4769,7 @@ function AgentPicker({
                   )}
                 >
                   <span className="flex-1 truncate">
-                    {modelPickerKind === "codex" ? (m.displayName ?? m.id) : m.label}
+                    {usesServerModelOptions ? (m.displayName ?? m.id) : m.label}
                   </span>
                 </DropdownMenuItem>
               );

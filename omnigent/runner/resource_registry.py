@@ -52,8 +52,16 @@ CLAUDE_NATIVE_TERMINAL_ROLE = "claude-native"
 PI_NATIVE_TERMINAL_ROLE = "pi-native"
 OPENCODE_NATIVE_TERMINAL_ROLE = "opencode-native"
 CURSOR_NATIVE_TERMINAL_ROLE = "cursor-native"
+KIRO_NATIVE_TERMINAL_ROLE = "kiro-native"
 GOOSE_NATIVE_TERMINAL_ROLE = "goose-native"
+# Role marker for the runner-owned native Antigravity (agy) TUI terminal.
+# A generic terminal launched with ``terminal=antigravity`` shares the same
+# public resource id, so the ensure path uses this private marker to tell a
+# runner-owned agy TUI apart from an arbitrary terminal before reusing it.
+ANTIGRAVITY_NATIVE_TERMINAL_ROLE = "antigravity-native"
 QWEN_NATIVE_TERMINAL_ROLE = "qwen-native"
+KIMI_NATIVE_TERMINAL_ROLE = "kimi-native"
+HERMES_NATIVE_TERMINAL_ROLE = "hermes-native"
 # Role marker for the embedded Omnigent REPL terminal auto-created for
 # runner-hosted SDK sessions (``omnigent attach`` in a tmux pane — the
 # SDK mirror of the native terminals above). The attach WebSocket uses
@@ -373,6 +381,23 @@ class SessionResourceRegistry:
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         """
         self._set_session_status_memo(session_id, "running")
+
+    def note_external_session_status(self, session_id: str, status: str) -> None:
+        """Record a terminal-observed external status for exit classification.
+
+        Structured native forwarders can know turn completion more reliably than
+        a PTY diff heuristic. Keep the required-terminal exit memo aligned so a
+        terminal that closes after a forwarded ``idle`` edge is treated as a
+        clean shutdown, while ``running`` / ``waiting`` still classify a later
+        exit as mid-turn.
+
+        :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+        :param status: External native status, e.g. ``"running"`` or ``"idle"``.
+        """
+        if status == "idle":
+            self._set_session_status_memo(session_id, "idle")
+        elif status in {"running", "waiting"}:
+            self._set_session_status_memo(session_id, "running")
 
     @property
     def terminal_registry(self) -> TerminalRegistry | None:
@@ -964,6 +989,7 @@ class SessionResourceRegistry:
             # after the paste), so — like pi/claude — the PTY watcher is its only
             # status source. Without this the web "Working…" badge never clears.
             CURSOR_NATIVE_TERMINAL_ROLE,
+            KIRO_NATIVE_TERMINAL_ROLE,
             # goose-native injects then returns (its forwarder only mirrors the
             # transcript, not status), so the PTY watcher is its status source too.
             GOOSE_NATIVE_TERMINAL_ROLE,
@@ -971,6 +997,14 @@ class SessionResourceRegistry:
             # JSON event transcript, not status), so the PTY watcher is its
             # status source too.
             QWEN_NATIVE_TERMINAL_ROLE,
+            # kimi-native also has no forwarder/hook (the injection run_turn
+            # returns right after the tmux paste), so the PTY watcher is its
+            # only running/idle status source — same as cursor/pi/claude.
+            KIMI_NATIVE_TERMINAL_ROLE,
+            # hermes-native injects then returns (its forwarder only mirrors the
+            # SQLite transcript, not status), so the PTY watcher is its status
+            # source too.
+            HERMES_NATIVE_TERMINAL_ROLE,
         }
         if activity_publisher is None and not emit_status and exit_publisher is None:
             return

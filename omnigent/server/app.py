@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import mimetypes
 import os
 import tarfile
 from collections.abc import AsyncIterator, Awaitable
@@ -18,11 +19,15 @@ from starlette.responses import Response
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from omnigent._platform import resolve_repo_symlink
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native_coding_agents import (
+    ANTIGRAVITY_NATIVE_CODING_AGENT,
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    KIMI_NATIVE_CODING_AGENT,
+    KIRO_NATIVE_CODING_AGENT,
     OPENCODE_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
     QWEN_NATIVE_CODING_AGENT,
@@ -50,6 +55,7 @@ from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
+from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
 from omnigent.server.routes.sessions import (
     SessionLiveness,
@@ -71,17 +77,48 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
+
+
+def _register_web_mimetypes() -> None:
+    """Pin Content-Type for web UI assets regardless of the OS MIME registry.
+
+    Starlette's ``StaticFiles`` derives ``Content-Type`` from
+    ``mimetypes.guess_type``. On Windows that consults the registry, where
+    ``.js`` is frequently mapped to ``text/plain`` — so the browser refuses to
+    execute the SPA's ES modules ("Loading module … was blocked because of a
+    disallowed MIME type"). Registering the web types explicitly makes the
+    bundled UI serve correctly on every platform and removes the dependency on
+    a machine's registry configuration.
+    """
+    for ext, ctype in (
+        (".js", "text/javascript"),
+        (".mjs", "text/javascript"),
+        (".css", "text/css"),
+        (".json", "application/json"),
+        (".map", "application/json"),
+        (".wasm", "application/wasm"),
+        (".svg", "image/svg+xml"),
+    ):
+        mimetypes.add_type(ctype, ext)
+
+
+_register_web_mimetypes()
+
 _WEB_UI_DIST = Path(__file__).parent / "static" / "web-ui"
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
+_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1"})
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _CLAUDE_NATIVE_AGENT_NAME = CLAUDE_NATIVE_CODING_AGENT.agent_name
 _CODEX_NATIVE_AGENT_NAME = CODEX_NATIVE_CODING_AGENT.agent_name
 _PI_NATIVE_AGENT_NAME = PI_NATIVE_CODING_AGENT.agent_name
 _OPENCODE_NATIVE_AGENT_NAME = OPENCODE_NATIVE_CODING_AGENT.agent_name
 _CURSOR_NATIVE_AGENT_NAME = CURSOR_NATIVE_CODING_AGENT.agent_name
+_KIRO_NATIVE_AGENT_NAME = KIRO_NATIVE_CODING_AGENT.agent_name
+_ANTIGRAVITY_NATIVE_AGENT_NAME = ANTIGRAVITY_NATIVE_CODING_AGENT.agent_name
 _QWEN_NATIVE_AGENT_NAME = QWEN_NATIVE_CODING_AGENT.agent_name
+_KIMI_NATIVE_AGENT_NAME = KIMI_NATIVE_CODING_AGENT.agent_name
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
@@ -89,8 +126,10 @@ _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 # omnigent.resources.examples (see pyproject package-data), so they resolve
 # in both a repo checkout and an installed wheel. The presence check in each
 # seeder is a safety net.
-_DEBBY_BUNDLE_SOURCE = Path(_examples_resources.__file__).parent / "debby"
-_POLLY_BUNDLE_SOURCE = Path(_examples_resources.__file__).parent / "polly"
+# resolve_repo_symlink dereferences the packaged symlink on a no-symlink
+# Windows checkout (where Git leaves it as a stub text file); a no-op elsewhere.
+_DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
+_POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
 
 
 class _FastAPICallNext(Protocol):
@@ -358,7 +397,10 @@ def _ensure_default_agents(
     _ensure_default_pi_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_opencode_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_cursor_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_kiro_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_antigravity_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_qwen_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_kimi_native_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
@@ -649,6 +691,78 @@ def _ensure_default_cursor_agent(
     )
 
 
+def _build_kiro_native_bundle() -> bytes:
+    """Build a gzipped tarball of the kiro-native-ui agent spec."""
+    import tempfile
+
+    from omnigent.kiro_native import _materialize_kiro_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_kiro_agent_spec(Path(tmpdir), model=None)
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_kiro_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """Register or refresh the kiro-native-ui agent."""
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_KIRO_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_kiro_native_bundle(),
+    )
+
+
+def _ensure_default_antigravity_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register or refresh the antigravity-native-ui agent.
+
+    Called during server lifespan startup so the Web UI can offer Antigravity
+    as a built-in native-terminal agent (the ``agy`` TUI), alongside Claude
+    Code / Codex / Pi. Content-aware via :func:`_ensure_builtin_agent`: a new
+    wheel with a changed spec refreshes the row in place rather than being
+    ignored.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_ANTIGRAVITY_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_antigravity_native_bundle(),
+    )
+
+
+def _build_antigravity_native_bundle() -> bytes:
+    """
+    Build a gzipped tarball of the antigravity-native-ui agent spec.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    from omnigent.antigravity_native import _materialize_antigravity_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_antigravity_agent_spec(Path(tmpdir))
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
 def _build_qwen_native_bundle() -> bytes:
     """
     Build a gzipped tarball of the qwen-native-ui agent spec.
@@ -689,6 +803,49 @@ def _ensure_default_qwen_agent(
         agent_cache,
         name=_QWEN_NATIVE_AGENT_NAME,
         bundle_bytes=_build_qwen_native_bundle(),
+    )
+
+
+def _build_kimi_native_bundle() -> bytes:
+    """
+    Build a gzipped tarball of the kimi-native-ui agent spec.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    from omnigent.kimi_native import _materialize_kimi_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_kimi_agent_spec(Path(tmpdir))
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_kimi_native_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register or refresh the kimi-native-ui agent.
+
+    Called during server lifespan startup so the Web UI offers Kimi as a
+    built-in native-terminal agent on every deployment (not only after the
+    ``omnigent kimi`` CLI first registers it). Content-aware via
+    :func:`_ensure_builtin_agent`.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_KIMI_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_kimi_native_bundle(),
     )
 
 
@@ -1507,6 +1664,19 @@ def create_app(
         # actually offered; None when no provider is named (embedding
         # configs may leave it unset) so the UI keeps the generic label.
         sandbox_provider = sandbox_config.provider if managed_sandboxes_enabled else None
+        # smart_routing_enabled: true when the server can route — either
+        # a RoutingClient is explicitly configured (OMNIGENT_SMART_ROUTING=1
+        # + llm: config) or the managed deployment registered a
+        # policy_llm_connection_factory (which means it has LLM capability
+        # and will supply its own RoutingClient).
+        try:
+            from omnigent.runtime._globals import _caps
+
+            smart_routing_enabled = _caps is not None and (
+                _caps.routing_client is not None or _caps.policy_llm_connection_factory is not None
+            )
+        except ImportError:
+            smart_routing_enabled = False
         return {
             "accounts_enabled": accounts_enabled,
             "login_url": login_url,
@@ -1514,6 +1684,7 @@ def create_app(
             "databricks_features": databricks_features,
             "managed_sandboxes_enabled": managed_sandboxes_enabled,
             "sandbox_provider": sandbox_provider,
+            "smart_routing_enabled": smart_routing_enabled,
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
@@ -1593,6 +1764,19 @@ def create_app(
         ),
         prefix="/v1",
         tags=["terminals"],
+    )
+    app.include_router(
+        create_session_mcp_servers_router(
+            conversation_store,
+            agent_store,
+            artifact_store,
+            agent_cache,
+            runner_router=runner_router,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["session_mcp_servers"],
     )
     if comment_store is not None:
         app.include_router(
@@ -1967,11 +2151,11 @@ class _SPAStaticFiles(StaticFiles):
     for the literal root and directory paths, so a refresh on
     ``/c/abc`` would 404.
 
-    The fallback is gated by an extension check: a path with a file
-    extension (``.js``, ``.css``, ``.png``, ``.woff2``, …) is treated as
-    an asset request and a 404 is returned verbatim — that surfaces
-    real broken-asset bugs rather than masking them with the HTML
-    shell. Extensionless paths fall back to ``index.html``.
+    The fallback is gated by an API-prefix and extension check: unmatched
+    ``/v1`` / ``/api`` / ``/auth`` / ``/health`` paths return a JSON 404,
+    and a path with a file extension (``.js``, ``.css``, ``.png``,
+    ``.woff2``, …) returns the static 404 verbatim. Other extensionless
+    paths fall back to ``index.html``.
     """
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -1992,12 +2176,39 @@ class _SPAStaticFiles(StaticFiles):
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as exc:
+            if exc.status_code == 404 and _is_web_ui_api_fallback_path(path):
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "error": {
+                            "code": ErrorCode.NOT_FOUND,
+                            "message": "Not found",
+                        }
+                    },
+                )
             if exc.status_code == 404 and "." not in path.rsplit("/", 1)[-1]:
                 served_path = "index.html"
                 response = await super().get_response("index.html", scope)
             else:
                 raise
         return _apply_web_ui_cache_headers(response, served_path)
+
+
+def _is_web_ui_api_fallback_path(path: str) -> bool:
+    """
+    Return whether an unmatched static path belongs to the API namespace.
+
+    The web UI is mounted at ``/`` and receives every unmatched request after
+    the routers. Without this guard, an unknown API route such as
+    ``/v1/sessions/x/codex_goal`` is served the SPA shell as ``200 text/html``,
+    which makes browser clients fail with a JSON parse error instead of a
+    route-level 404.
+
+    :param path: Static mount-relative path, e.g. ``"v1/sessions/x"``.
+    :returns: True for paths that should never fall back to ``index.html``.
+    """
+    first_segment = path.lstrip("/").split("/", 1)[0]
+    return first_segment in _WEB_UI_API_FALLBACK_PREFIXES
 
 
 class _RangeAwareGZipMiddleware(GZipMiddleware):
