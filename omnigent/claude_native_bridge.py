@@ -217,9 +217,26 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     if target.is_relative_to(cursor_root):
         return _absolute_syntactic_path(cursor_root.parent.parent)
 
+    from omnigent.antigravity_native_bridge import bridge_root as antigravity_bridge_root
+
+    # antigravity-native keeps its bridge files below ``~/.omnigent/antigravity-native``,
+    # the same ``$HOME/.omnigent/<harness>-native`` shape codex uses, so apply the
+    # identical anchor logic: in production trust ``$HOME`` and validate/chmod the
+    # two bridge-owned dirs below it (``.omnigent`` and ``antigravity-native``); in
+    # tests the monkeypatched root may differ, so trust the direct parent.
+    antigravity_root = _absolute_syntactic_path(antigravity_bridge_root())
+    if target.is_relative_to(antigravity_root):
+        trusted_parent = antigravity_root.parent
+        if (
+            antigravity_root.name == "antigravity-native"
+            and antigravity_root.parent.name == ".omnigent"
+        ):
+            trusted_parent = antigravity_root.parent.parent
+        return _absolute_syntactic_path(trusted_parent)
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
-        f"({claude_root!s}, {codex_root!s}, {cursor_root!s})"
+        f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, {antigravity_root!s})"
     )
 
 
