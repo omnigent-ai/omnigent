@@ -22,6 +22,7 @@ import {
 } from "@/hooks/useAgents";
 import type { Agent, McpServerSummary } from "@/hooks/useAgents";
 import type { ModelUsage } from "@/lib/types";
+import { showToast } from "@/components/ui/toast";
 import {
   usePolicies,
   usePolicyRegistry,
@@ -673,6 +674,14 @@ function McpServerManagerDialog({
     setFormError(null);
   }
 
+  function notifyRestart() {
+    showToast(
+      <span className="text-sm">
+        MCP servers updated. Restart the session to apply changes.
+      </span>,
+    );
+  }
+
   function handleSave() {
     const error = validateMcpForm(form);
     if (error) {
@@ -685,12 +694,20 @@ function McpServerManagerDialog({
       updateServer.mutate(
         { serverName: form.originalName, payload },
         {
-          onSuccess: resetForm,
+          onSuccess: () => {
+            resetForm();
+            notifyRestart();
+          },
         },
       );
       return;
     }
-    createServer.mutate(payload, { onSuccess: resetForm });
+    createServer.mutate(payload, {
+      onSuccess: () => {
+        resetForm();
+        notifyRestart();
+      },
+    });
   }
 
   return (
@@ -744,7 +761,7 @@ function McpServerManagerDialog({
                       variant="ghost"
                       size="icon-xs"
                       aria-label={`Delete ${server.name}`}
-                      onClick={() => deleteServer.mutate(server.name)}
+                      onClick={() => deleteServer.mutate(server.name, { onSuccess: notifyRestart })}
                       disabled={deleteServer.isPending}
                     >
                       <TrashIcon className="size-3 text-destructive" />
@@ -887,7 +904,19 @@ function McpServersSection({
       {servers.length > 0 ? (
         <McpServerList
           servers={servers}
-          onDelete={canEdit ? (name) => deleteServer.mutate(name) : undefined}
+          onDelete={
+            canEdit
+              ? (name) =>
+                  deleteServer.mutate(name, {
+                    onSuccess: () =>
+                      showToast(
+                        <span className="text-sm">
+                          MCP servers updated. Restart the session to apply changes.
+                        </span>,
+                      ),
+                  })
+              : undefined
+          }
         />
       ) : (
         <p className="text-xs text-muted-foreground">No MCP servers</p>

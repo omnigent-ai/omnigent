@@ -552,7 +552,7 @@ describe("McpServersSection", () => {
     const dialog = screen.getByRole("dialog");
     fireEvent.click(within(dialog).getByRole("button", { name: "Delete slack" }));
 
-    expect(deleteMcpMutate).toHaveBeenCalledWith("slack");
+    expect(deleteMcpMutate).toHaveBeenCalledWith("slack", expect.anything());
   });
 
   it("deletes an MCP server from the inline pill popover", () => {
@@ -563,7 +563,7 @@ describe("McpServersSection", () => {
     // Click "Remove" in the popover
     fireEvent.click(screen.getByRole("button", { name: /Remove/ }));
 
-    expect(deleteMcpMutate).toHaveBeenCalledWith("slack");
+    expect(deleteMcpMutate).toHaveBeenCalledWith("slack", expect.anything());
   });
 });
 
