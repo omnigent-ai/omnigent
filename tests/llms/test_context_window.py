@@ -99,6 +99,53 @@ def test_resolve_effective_context_window_declared_window_wins_without_override(
     )
 
 
+def test_claude_context_window_override_normalizes_id() -> None:
+    """The curated Claude override matches across all the namings the model id
+    reaches us in — gateway ``databricks-`` prefix, provider prefix, ``[1m]``
+    bracket alias, ``:tag`` suffix, and case."""
+    from omnigent.llms.context_window import _claude_context_window_override as ov
+
+    for ident in (
+        "claude-opus-4-8",
+        "databricks-claude-opus-4-8",
+        "anthropic/claude-opus-4-8",
+        "databricks/databricks-claude-opus-4-8",
+        "claude-opus-4-8[1m]",
+        "Databricks-Claude-Opus-4-8",
+        "claude-opus-4-8:beta",
+    ):
+        assert ov(ident) == 1_000_000, ident
+    # Other current 1M Claude models are covered too.
+    assert ov("databricks-claude-sonnet-4-6") == 1_000_000
+    assert ov("databricks-claude-opus-4-6") == 1_000_000
+    # Non-1M / unknown models are NOT overridden (caller continues the chain).
+    assert ov("databricks-claude-sonnet-4-5") is None
+    assert ov("databricks-gpt-5-5") is None
+    assert ov("claude-3-opus-20240229") is None
+
+
+def test_get_model_context_window_claude_1m_override_wins() -> None:
+    """A 1M Claude model resolves to 1M — the override runs before litellm /
+    the catalog (which report the 200K Anthropic base), so it wins regardless
+    of those backends."""
+    assert get_model_context_window("databricks-claude-opus-4-8") == 1_000_000
+    assert get_model_context_window("claude-opus-4-8") == 1_000_000
+
+
+def test_env_override_still_beats_claude_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``AP_CONTEXT_WINDOW_OVERRIDE`` outranks the curated Claude override."""
+    monkeypatch.setenv("AP_CONTEXT_WINDOW_OVERRIDE", "12345")
+    assert get_model_context_window("databricks-claude-opus-4-8") == 12345
+
+
+def test_resolve_effective_window_opus_4_8_defaults_to_1m() -> None:
+    """With no declared window, opus-4-8 resolves to 1M via the override; an
+    explicit spec window still wins over it."""
+    assert resolve_effective_context_window(None, "databricks-claude-opus-4-8") == 1_000_000
+    # Author-declared window is authoritative (e.g. intentionally smaller).
+    assert resolve_effective_context_window(200_000, "databricks-claude-opus-4-8") == 200_000
+
+
 def test_compute_llm_cost_prices_cache_tokens_at_their_own_rates() -> None:
     """
     Cache reads/writes are billed at their own rates, not the input rate.

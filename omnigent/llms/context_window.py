@@ -74,6 +74,49 @@ _QWEN_CONTEXT_WINDOWS: dict[str, int] = {
 }
 
 
+# Curated context windows for Claude models whose serving backends UNDER-report
+# the window. Anthropic's 1M-context Claude models (opus-4-6/4-8, sonnet-4-6) are
+# served at 1M through the Databricks AI gateway, but litellm's bundled registry
+# (and, for newer ids, the MLflow catalog) report the 200K Anthropic base — which
+# left the UI context meter mis-sized and triggered proactive compaction ~5x too
+# early. Empirically verified against the gateway: a 375K-token prompt for
+# ``databricks-claude-opus-4-8`` is accepted (HTTP 200, ``input_tokens=375019``)
+# both with and without the ``context-1m`` beta — so 1M is not gateway-gated here.
+# Keyed by the *normalized* base id (provider / ``databricks-`` prefix, ``:tag``,
+# and ``[...]`` suffix stripped — see :func:`_claude_context_window_override`).
+# Aligns with the bundled model catalog's 1M Claude entries; a spec's
+# ``executor.context_window`` always overrides this.
+_CLAUDE_1M_TOKENS: int = 1_000_000
+_CLAUDE_CONTEXT_WINDOW_OVERRIDES: dict[str, int] = {
+    "claude-opus-4-8": _CLAUDE_1M_TOKENS,
+    "claude-opus-4-6": _CLAUDE_1M_TOKENS,
+    "claude-sonnet-4-6": _CLAUDE_1M_TOKENS,
+}
+
+
+def _claude_context_window_override(model: str) -> int | None:
+    """Return a curated context window for a known under-reported Claude model.
+
+    Normalizes the id the way model strings reach us — a provider prefix
+    (``anthropic/claude-opus-4-8``), the gateway ``databricks-`` prefix
+    (``databricks-claude-opus-4-8``), an OpenRouter-style ``:tag`` suffix, and a
+    Claude Code ``[1m]`` bracket alias (``claude-opus-4-8[1m]``) — down to the
+    bare base id before matching :data:`_CLAUDE_CONTEXT_WINDOW_OVERRIDES`.
+
+    Applied BEFORE litellm / the MLflow catalog (unlike :func:`_qwen_context_window`,
+    a post-lookup fallback) because those backends actively return the wrong (200K
+    base) value for these models, so a fallback would never be reached.
+
+    :param model: The model identifier (any namespacing).
+    :returns: The override window in tokens, or ``None`` when the model isn't a
+        recognized entry (caller continues the normal resolution chain).
+    """
+    bare = model.rsplit("/", 1)[-1].split(":", 1)[0].split("[", 1)[0].strip().lower()
+    if bare.startswith("databricks-"):
+        bare = bare[len("databricks-") :]
+    return _CLAUDE_CONTEXT_WINDOW_OVERRIDES.get(bare)
+
+
 def _qwen_context_window(model: str) -> int | None:
     """Look up a Qwen model's context window from the curated table.
 
@@ -265,13 +308,16 @@ def get_model_context_window(model: str) -> int:
 
     1. ``AP_CONTEXT_WINDOW_OVERRIDE`` env var — overrides everything.
        Supports custom/self-hosted models and e2e compaction tests.
-    2. ``litellm.get_model_info()`` — fast, local, no network. Also
+    2. Curated Claude overrides (:func:`_claude_context_window_override`) —
+       for 1M-context Claude models that litellm / the catalog under-report
+       as the 200K Anthropic base. Applied before litellm so it wins.
+    3. ``litellm.get_model_info()`` — fast, local, no network. Also
        tried with the ``databricks/`` prefix for Databricks models.
-    3. MLflow GitHub Release catalog — per-provider JSON fetched from
+    4. MLflow GitHub Release catalog — per-provider JSON fetched from
        ``github.com/mlflow/mlflow/releases``. Covers models not yet
        in litellm's bundled registry, with a family-prefix fallback
        for newly released variants.
-    4. ``_DEFAULT_CONTEXT_WINDOW`` (128 K) — conservative fallback.
+    5. ``_DEFAULT_CONTEXT_WINDOW`` (128 K) — conservative fallback.
 
     :param model: The model identifier, e.g. ``"openai/gpt-4o"`` or
         ``"databricks-gpt-5-5"``.
@@ -280,6 +326,9 @@ def get_model_context_window(model: str) -> int:
     override = os.environ.get("AP_CONTEXT_WINDOW_OVERRIDE")
     if override is not None:
         return int(override)
+    claude_override = _claude_context_window_override(model)
+    if claude_override is not None:
+        return claude_override
     try:
         import litellm
     except ImportError:
