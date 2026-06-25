@@ -31,7 +31,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { registerLocalhostCors } = require("./localhost_cors");
-const { normalizeUrl, expandDatabricksWorkspaceUrl, WORKSPACE_UI_PATH } = require("./url");
+const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
@@ -862,15 +862,7 @@ function createWindow(targetUrl, opts = {}) {
   // is a fresh document); the SPA's own client-side routing keeps the same
   // document, so the injected stylesheet persists across in-app navigation.
   win.webContents.on("did-finish-load", () => {
-    let pathname = "";
-    try {
-      pathname = new URL(win.webContents.getURL()).pathname;
-    } catch {
-      return;
-    }
-    if (pathname.startsWith(WORKSPACE_UI_PATH)) {
-      void win.webContents.insertCSS(WORKSPACE_CHROME_HIDE_CSS);
-    }
+    void win.webContents.insertCSS(WORKSPACE_CHROME_HIDE_CSS);
   });
 
   win.on("closed", () => {
