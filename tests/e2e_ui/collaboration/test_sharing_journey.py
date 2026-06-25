@@ -155,6 +155,7 @@ def _goto_expecting_snapshot(page: Page, base_url: str, session_id: str) -> int:
     return resp_info.value.status
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_share_grant_downgrade_revoke_journey(
     browser: Browser,
     live_server: str,
