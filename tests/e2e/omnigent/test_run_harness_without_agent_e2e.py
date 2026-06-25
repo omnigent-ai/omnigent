@@ -197,6 +197,12 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     (installed separately via Nous Research's install script) and authenticates
     through its own provider config, not the shared gateway/profile probe
     wiring this matrix drives.
+
+    ``hermes-native`` is excluded for the union of both reasons: it is a
+    terminal-first TUI launched via ``omni hermes`` (tmux pane + bridge dir), not
+    ``omnigent run --harness hermes-native``, AND it wraps the ``hermes`` CLI
+    binary. Its coverage is the dedicated hermes-native bridge/executor/forwarder/
+    approval-mirror unit tests.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
@@ -213,5 +219,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "goose",
         "goose-native",
         "hermes",
+        "hermes-native",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

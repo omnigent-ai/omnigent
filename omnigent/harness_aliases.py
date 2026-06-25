@@ -28,6 +28,10 @@ HARNESS_ALIASES: dict[str, str] = {
     # (there is no separate SDK ``opencode`` harness, so the bare name is free).
     "opencode": "opencode-native",
     "native-opencode": "opencode-native",
+    # User-facing reversed spelling for the Hermes native-CLI (TUI) harness;
+    # canonical id is "hermes-native" (the headless subprocess harness keeps the
+    # bare "hermes" name, like goose vs goose-native).
+    "native-hermes": "hermes-native",
     # User-facing spelling for the GitHub Copilot SDK harness; the canonical id
     # is "copilot" (matches the registry / workflow type).
     "github-copilot": "copilot",
@@ -60,6 +64,11 @@ NATIVE_HARNESSES: frozenset[str] = frozenset(
         "native-qwen",
         "opencode-native",
         "native-opencode",
+        # Native Hermes (TUI) bridge used by ``omnigent hermes``; the headless
+        # subprocess counterpart is the canonical ``hermes`` harness (see
+        # HARNESS_ALIASES / runtime/harnesses/__init__.py).
+        "hermes-native",
+        "native-hermes",
     }
 )
 

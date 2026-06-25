@@ -45,6 +45,22 @@ _HERMES_OS_TOOLS = frozenset(
     {"terminal", "execute_code", "read_file", "write_file", "search_files"}
 )
 
+# Goose native tool names. Goose namespaces its built-in "developer" extension
+# tools as ``developer__<tool>``; ``shell`` is the terminal tool and
+# ``write`` / ``edit`` / ``text_editor`` / ``read_image`` / ``tree`` are the file
+# tools (names vary slightly by Goose version, so cover both the split write/edit
+# and the unified text_editor spellings).
+_GOOSE_NATIVE_OS_TOOLS = frozenset(
+    {
+        "developer__shell",
+        "developer__write",
+        "developer__edit",
+        "developer__text_editor",
+        "developer__read_image",
+        "developer__tree",
+    }
+)
+
 
 # ── Rate limiting ────────────────────────────────────────────────────────────
 
@@ -130,11 +146,12 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
         | _CURSOR_NATIVE_OS_TOOLS
         | _PI_NATIVE_OS_TOOLS
         | _HERMES_OS_TOOLS
+        | _GOOSE_NATIVE_OS_TOOLS
     )
     if tool in _all_os_tools:
         args = data.get("arguments", {})
         # Build a short preview of what the tool is doing.
-        if tool in ("sys_os_shell", "Bash", "bash", "Shell", "terminal"):
+        if tool in ("sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"):
             preview = args.get("command", "") if isinstance(args, dict) else ""
         elif tool in ("Grep", "Glob", "search_files"):
             preview = args.get("pattern", "") if isinstance(args, dict) else ""

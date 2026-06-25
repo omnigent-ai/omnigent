@@ -96,6 +96,12 @@ _CURSOR_NATIVE_HARNESSES: frozenset[str] = frozenset({"cursor-native", "native-c
 # there is no SDK variant or key to gate on.
 _GOOSE_NATIVE_HARNESSES: frozenset[str] = frozenset({"goose-native", "native-goose"})
 
+# Native Hermes harnesses. Boot the ``hermes`` TUI (``omni hermes``) and can't
+# launch without the ``hermes`` binary on ``PATH`` — gate on it, like the other
+# native CLI harnesses. Hermes owns its own auth (``hermes setup`` /
+# ``hermes model``); the headless ``hermes`` harness gates on the same binary.
+_HERMES_NATIVE_HARNESSES: frozenset[str] = frozenset({"hermes-native", "native-hermes"})
+
 # CLI-wrapping qwen harnesses. ``qwen`` / ``qwen-code`` (the ACP harness) and
 # ``qwen-native`` / ``native-qwen`` (the native TUI via ``omni qwen``) all resolve
 # to the same ``qwen`` binary (canonicalize_harness folds ``qwen-code`` → ``qwen``
@@ -173,10 +179,12 @@ def harness_is_configured(harness: str) -> bool:
         # Auth/provider state surfaces at run time via Goose's own config; the
         # daemon gates only on binary presence.
         return harness_cli_installed(GOOSE_KEY)
-    if canonical == HERMES_KEY:
-        # Hermes wraps the ``hermes`` CLI (installed via a curl script from
-        # Nous Research). Auth/provider config surfaces at run time via
-        # Hermes' own ``hermes model`` flow; gate only on binary presence.
+    if canonical in _HERMES_NATIVE_HARNESSES or canonical == HERMES_KEY:
+        # Hermes — both the native TUI (``hermes-native`` / ``native-hermes``,
+        # via ``omni hermes``) and the headless subprocess harness (``hermes``)
+        # — wraps the ``hermes`` CLI (installed via a curl script from Nous
+        # Research). Auth/provider config surfaces at run time via Hermes' own
+        # ``hermes model`` flow; gate only on binary presence.
         return harness_cli_installed(HERMES_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
@@ -254,6 +262,7 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.update(_OPENCODE_HARNESSES)
     spellings.update(_CURSOR_NATIVE_HARNESSES)
     spellings.update(_GOOSE_NATIVE_HARNESSES)
+    spellings.update(_HERMES_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary

@@ -1,16 +1,18 @@
-"""Filesystem bridge + tmux injection for the goose-native terminal harness.
+"""Filesystem bridge + tmux injection for the hermes-native terminal harness.
 
-The runner launches the ``goose session`` TUI in a private tmux pane and records
-that pane's socket + target here via :func:`write_tmux_target`. The harness
-executor then delivers Omnigent web-UI messages into the *same* pane via
-:func:`inject_user_message` (tmux bracketed paste + a single Enter) — the goose
-analog of the cursor-native tmux bridge. This is what wires the web-UI chat box
-to the running Goose TUI (and, since the web UI embeds that pane, the message
-shows in both surfaces).
+The runner launches the ``hermes`` TUI in a private tmux pane and records that
+pane's socket + target here via :func:`write_tmux_target`. The harness executor
+then delivers Omnigent web-UI messages into the *same* pane via
+:func:`inject_user_message` (tmux bracketed paste + a single Enter) — the Hermes
+analog of the goose-native tmux bridge. This is what wires the web-UI chat box to
+the running Hermes TUI (and, since the web UI embeds that pane, the message shows
+in both surfaces).
 
-Unlike cursor-native, this bridge does NOT write any vendor MCP config: Goose's
-MCP "extensions" live in ``~/.config/goose/config.yaml`` (owned by the user via
-``goose configure``), and Omnigent does not mutate user config in v1.
+The native TUI uses the user's own ``~/.hermes`` (model/provider/tools) and its
+own tool-approval prompt; Omnigent writes no vendor config here. That prompt is
+surfaced to the web UI as a synced approval card by the runner-side mirror
+(:mod:`omnigent.hermes_native_permissions`), which reads the pane via
+:func:`capture_hermes_pane` and answers it via :func:`send_hermes_pane_keys`.
 """
 
 from __future__ import annotations
@@ -26,34 +28,33 @@ from pathlib import Path
 from typing import Any
 
 #: Env var carrying the bridge dir into the harness executor process.
-BRIDGE_DIR_ENV_VAR = "HARNESS_GOOSE_NATIVE_BRIDGE_DIR"
+BRIDGE_DIR_ENV_VAR = "HARNESS_HERMES_NATIVE_BRIDGE_DIR"
 
-_BRIDGE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{os.getuid()}" / "goose-native"
+_BRIDGE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{os.getuid()}" / "hermes-native"
 _TMUX_FILE = "tmux.json"
 _TMUX_READY_TIMEOUT_S = 30.0
 _TMUX_SEND_TIMEOUT_S = 10.0
 _POLL_INTERVAL_S = 0.2
 _PASTE_SETTLE_S = 0.3
-_PASTE_BUFFER = "omnigent-goose-paste"
+_PASTE_BUFFER = "omnigent-hermes-paste"
 # How long to wait for the pasted text to become visible in the pane before
 # sending Enter — submitting before the TUI commits the paste folds the Enter
 # into the paste as a newline and the message sits unsent.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
-# Goose emits no fixed ready-prompt sentinel; readiness is detected by the pane
-# settling (no byte changes across consecutive captures). This many stable polls
-# in a row marks the input box ready. See KTD3 / R2 in the plan — refine with a
-# concrete idle marker once observed against a live `goose session`.
+# Hermes' prompt_toolkit TUI emits no fixed ready-prompt sentinel; readiness is
+# detected by the pane settling (no byte changes across consecutive captures).
+# This many stable polls in a row marks the input box ready.
 _SETTLE_STABLE_POLLS = 3
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
-    """Return the per-session bridge dir, e.g. ``/tmp/omnigent-<uid>/goose-native/<hash>``."""
+    """Return the per-session bridge dir, e.g. ``/tmp/omnigent-<uid>/hermes-native/<hash>``."""
     digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
     return _BRIDGE_ROOT / digest
 
 
 def bridge_root() -> Path:
-    """Return the configured goose-native bridge root."""
+    """Return the configured hermes-native bridge root."""
     return _BRIDGE_ROOT
 
 
@@ -64,38 +65,21 @@ def _ensure_dir(path: Path) -> None:
         os.chmod(path, 0o700)
 
 
-def build_goose_native_spawn_env(
-    session_id: str,
-    *,
-    provider: str | None = None,
-    model: str | None = None,
-) -> dict[str, str]:
-    """Build the ``HARNESS_GOOSE_NATIVE_*`` + ``GOOSE_*`` env the terminal reads.
+def build_hermes_native_spawn_env(session_id: str) -> dict[str, str]:
+    """Build the ``HARNESS_HERMES_NATIVE_*`` env the harness executor reads.
 
-    Sets the bridge dir (for the harness executor), forces the ANSI theme so the
-    pane is cheaper to scrape, and — since ``goose session`` exposes no
-    ``--provider``/``--model`` flags — pins the provider/model via env when the
-    caller resolved them. A pasted/keyring credential the user already configured
-    via ``goose configure`` is left untouched.
+    Publishes the per-session bridge dir so the
+    :class:`~omnigent.inner.hermes_native_executor.HermesNativeExecutor` can find
+    the tmux target advertised by the runner. Unlike the headless ``hermes``
+    harness this sets no model/provider env — the native TUI uses the user's own
+    ``hermes`` configuration (``hermes model``), left untouched.
 
     :param session_id: The Omnigent session id (keys the bridge dir).
-    :param provider: Optional ``GOOSE_PROVIDER`` override.
-    :param model: Optional ``GOOSE_MODEL`` override.
-    :returns: Env-var overrides for the terminal spawn.
+    :returns: Env-var overrides for the harness executor spawn.
     """
     bridge_dir = bridge_dir_for_session_id(session_id)
     _ensure_dir(bridge_dir)
-    env: dict[str, str] = {
-        BRIDGE_DIR_ENV_VAR: str(bridge_dir),
-        # 8-color ANSI output is far easier to strip than the default truecolor
-        # bat-highlighted rendering when capturing the pane.
-        "GOOSE_CLI_THEME": "ansi",
-    }
-    if provider:
-        env["GOOSE_PROVIDER"] = provider
-    if model:
-        env["GOOSE_MODEL"] = model
-    return env
+    return {BRIDGE_DIR_ENV_VAR: str(bridge_dir)}
 
 
 def write_tmux_target(
@@ -105,7 +89,7 @@ def write_tmux_target(
     tmux_target: str,
     pid: int | None = None,
 ) -> None:
-    """Advertise the tmux socket + target for the running Goose terminal."""
+    """Advertise the tmux socket + target for the running Hermes terminal."""
     _ensure_dir(bridge_dir)
     payload: dict[str, Any] = {
         "socket_path": str(socket_path),
@@ -149,7 +133,7 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
         if info is not None:
             return info
         time.sleep(_POLL_INTERVAL_S)
-    raise RuntimeError(f"goose-native tmux target was not advertised within {timeout_s:.0f}s")
+    raise RuntimeError(f"hermes-native tmux target was not advertised within {timeout_s:.0f}s")
 
 
 def _run_tmux(socket_path: str, *args: str) -> None:
@@ -234,9 +218,9 @@ def _submit_needle(content: str) -> str:
 
 
 def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
-    """Best-effort wait until the Goose input box is ready to receive a paste.
+    """Best-effort wait until the Hermes input box is ready to receive a paste.
 
-    Goose emits no fixed idle marker, so readiness is detected by the pane
+    Hermes emits no fixed idle marker, so readiness is detected by the pane
     settling: the captured contents stop changing for :data:`_SETTLE_STABLE_POLLS`
     consecutive polls (no spinner churn, no streaming output). Falls through after
     the timeout (mid-turn steering may never fully settle) rather than raising.
@@ -262,22 +246,22 @@ def inject_user_message(
     content: str,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
 ) -> None:
-    """Deliver a web-UI user message into the Goose TUI via a tmux bracketed paste.
+    """Deliver a web-UI user message into the Hermes TUI via a tmux bracketed paste.
 
     Clears any leftover draft, pastes *content* (multi-line safe via
     ``load-buffer``/``paste-buffer -p`` so interior newlines stay data, not
-    submits), settles, then submits with a *single* Enter. Goose submits on
-    Enter and inserts a newline on Ctrl+J, so exactly one Enter is sent — a
-    second would submit twice.
+    submits), settles, then submits with a *single* Enter. Hermes' prompt_toolkit
+    input submits on Enter, so exactly one Enter is sent — a second would submit
+    an empty turn.
 
-    :param bridge_dir: The goose-native bridge dir holding ``tmux.json``.
+    :param bridge_dir: The hermes-native bridge dir holding ``tmux.json``.
     :param content: User text (non-empty).
     :param timeout_s: Per-readiness-gate timeout.
     :raises RuntimeError: If the tmux target is never advertised or a tmux
         command fails.
     """
     if not content:
-        raise RuntimeError("goose-native injection requires non-empty content")
+        raise RuntimeError("hermes-native injection requires non-empty content")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
@@ -285,7 +269,7 @@ def inject_user_message(
     # pane for the full timeout and the web message is silently lost.
     if not _session_alive(socket_path, tmux_target):
         raise RuntimeError(
-            "goose terminal is no longer running (the TUI exited); restart the session"
+            "hermes terminal is no longer running (the TUI exited); restart the session"
         )
     _settle_pane(socket_path, tmux_target, timeout_s=timeout_s)
     # Clear any leftover draft: Home (C-a) + kill-to-end (C-k).
@@ -327,7 +311,7 @@ def inject_user_message(
 
 
 def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
-    """Cancel the in-flight Goose turn by sending ``Escape`` to the pane.
+    """Cancel the in-flight Hermes turn by sending ``Escape`` to the pane.
 
     The harness ``run_turn`` returns right after the paste, so the runner's
     in-process cancel floor can't reach the turn — this is the analog of
@@ -341,9 +325,9 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
 
 
 def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
-    """Hard-stop the Goose session by killing its tmux session.
+    """Hard-stop the Hermes session by killing its tmux session.
 
-    Terminates ``goose`` and the pane outright — the analog of the user manually
+    Terminates ``hermes`` and the pane outright — the analog of the user manually
     exiting the attached TUI, for the web UI's "Stop session" affordance.
 
     :raises RuntimeError: If the tmux target is not advertised or kill-session fails.
@@ -352,15 +336,15 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
 
 
-def capture_goose_pane(bridge_dir: Path) -> str | None:
-    """Return the visible Goose pane text, or ``None`` if the TUI is not running.
+def capture_hermes_pane(bridge_dir: Path) -> str | None:
+    """Return the visible Hermes pane text, or ``None`` if the TUI is not running.
 
     Used by the runner-side approval mirror
-    (:mod:`omnigent.goose_native_permissions`) to detect Goose's in-terminal
-    ``cliclack`` tool-approval prompt. ``None`` (no advertised tmux target, or a
+    (:mod:`omnigent.hermes_native_permissions`) to detect Hermes' in-terminal
+    "DANGEROUS COMMAND" approval prompt. ``None`` (no advertised tmux target, or a
     dead pane) is distinct from ``""`` (a live but empty capture).
 
-    :param bridge_dir: The goose-native bridge dir holding ``tmux.json``.
+    :param bridge_dir: The hermes-native bridge dir holding ``tmux.json``.
     :returns: The captured pane text, or ``None`` when no live pane exists.
     """
     info = read_tmux_info(bridge_dir)
@@ -372,19 +356,19 @@ def capture_goose_pane(bridge_dir: Path) -> str | None:
     return _capture_pane(socket_path, tmux_target)
 
 
-def send_goose_pane_keys(bridge_dir: Path, *keys: str) -> None:
-    """Send one or more keys to the Goose pane (tmux ``send-keys``).
+def send_hermes_pane_keys(bridge_dir: Path, *keys: str) -> None:
+    """Send one or more keys to the Hermes pane (tmux ``send-keys``).
 
-    Used by the approval mirror to drive Goose's ``cliclack`` select from a web
-    verdict, e.g. ``"Enter"`` to choose the highlighted "Allow" or ``"Down"`` to
-    move to "Deny". Each key is a tmux key name/argument (not bracketed-paste
-    data), so multi-byte keys like ``"Enter"`` / ``"Down"`` are interpreted.
+    Used by the approval mirror to answer Hermes' native prompt from a web
+    verdict, e.g. ``"o"`` to approve once or ``"d"`` to deny. Each key is a tmux
+    key name/argument (not bracketed-paste data), so multi-byte keys like
+    ``"Enter"`` are interpreted, not typed literally.
 
-    :param bridge_dir: The goose-native bridge dir holding ``tmux.json``.
-    :param keys: tmux key arguments, e.g. ``"Down"`` or ``"Enter"``.
+    :param bridge_dir: The hermes-native bridge dir holding ``tmux.json``.
+    :param keys: tmux key arguments, e.g. ``"o"`` or ``"Enter"``.
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = read_tmux_info(bridge_dir)
     if info is None:
-        raise RuntimeError("goose-native tmux target not advertised")
+        raise RuntimeError("hermes-native tmux target not advertised")
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], *keys)

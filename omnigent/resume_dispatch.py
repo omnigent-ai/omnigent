@@ -279,6 +279,15 @@ def _dispatch_wrapper(
             qwen_args=(),
         )
         return True
+    if native_agent.key == "hermes":
+        from omnigent.hermes_native import run_hermes_native
+
+        run_hermes_native(
+            server=server,
+            session_id=session_id,
+            hermes_args=(),
+        )
+        return True
     return False
 
 
