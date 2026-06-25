@@ -14,7 +14,12 @@ from typing import Any
 
 import httpx
 
-from omnigent._native_forwarder_health import record_post_failure as record_native_post_failure
+from omnigent._native_forwarder_health import (
+    note_post_success as note_native_post_success,
+)
+from omnigent._native_forwarder_health import (
+    record_post_failure as record_native_post_failure,
+)
 from omnigent._native_post_delivery import (
     RepostResult,
     append_dead_letter,
@@ -5614,6 +5619,11 @@ async def _post_session_event_inner(
                 return _PostResult(response=None, transport_error=type(exc).__name__)
             await _sleep(_post_retry_delay(attempt))
             continue
+        # An HTTP response (no transport error) proves the server is reachable,
+        # so clear any stale connectivity-failure record — otherwise a recovered
+        # connection could have an old failure misattributed to a later,
+        # unrelated idle-watchdog stall (issue #1119).
+        note_native_post_success()
         if _post_response_is_final(response, attempt, max_attempts):
             return _PostResult(response=response)
         await _sleep(_post_retry_delay(attempt))

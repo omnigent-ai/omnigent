@@ -11,9 +11,13 @@ and otherwise lost, so the user only sees a generic "wedged LLM" reason.
 The forwarder records its last exhausted POST failure here so the watchdog can
 attach the connectivity cause to the turn-failure reason (issue #1119). The
 record is process-global rather than session-keyed because one subprocess
-serves exactly one conversation; it carries a monotonic timestamp so the
-watchdog only blames connectivity for a failure recent enough to plausibly be
-the cause of the stall.
+serves exactly one conversation AND runs one turn at a time (the native UI has
+a single active turn; the watchdog attributes the recorded failure to that
+turn). It carries a monotonic timestamp so the watchdog only blames
+connectivity for a failure recent enough to plausibly be the cause of the
+stall, and a successful POST clears the slot (:func:`note_post_success`) so a
+recovered connection can't have an old failure misattributed to a later,
+unrelated stall.
 """
 
 from __future__ import annotations
@@ -43,6 +47,23 @@ def record_post_failure(event_type: str, error: BaseException) -> None:
     :returns: None.
     """
     _state["last_post_failure"] = (time.monotonic(), f"{event_type}: {error!r}")
+
+
+def note_post_success() -> None:
+    """
+    Clear the failure record after a POST that reached the server.
+
+    Called whenever a forwarder POST receives any HTTP response (2xx or even a
+    4xx/5xx — receiving a status proves the server was reachable, so the prior
+    transport failure no longer reflects current connectivity). This bounds the
+    failure to "since the last successful round-trip": if the connection is
+    still down, subsequent POSTs keep failing and re-record, so the slot stays
+    populated; once it recovers, the next success empties it and the watchdog
+    won't blame a long-resolved failure for an unrelated later stall.
+
+    :returns: None.
+    """
+    _state["last_post_failure"] = None
 
 
 def recent_post_failure(within_s: float) -> str | None:
