@@ -623,9 +623,7 @@ async def test_patch_external_session_id_http_error_logs_but_does_not_raise(
 class TestPreseedResumeState:
     """``preseed_resume_state`` pre-seeds bridge state for cold resume."""
 
-    def _seed_chat(
-        self, chats_root: Path, workspace: str, chat_id: str, rows: int = 3
-    ) -> Path:
+    def _seed_chat(self, chats_root: Path, workspace: str, chat_id: str, rows: int = 3) -> Path:
         import hashlib
 
         ws_hash = hashlib.md5(workspace.encode()).hexdigest()
@@ -710,7 +708,7 @@ class TestForwardLoopPreseedResume:
 
         def _no_discover(workspace: str, launch_ms: int) -> None:
             discover_calls.append((workspace, launch_ms))
-            return None  # should never be reached
+            return  # should never be reached
 
         monkeypatch.setattr(fwd, "_discover_store", _no_discover)
         monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)

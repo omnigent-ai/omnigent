@@ -1546,9 +1546,7 @@ async def _auto_create_cursor_terminal(
     # reloads the prior conversation. ``external_session_id`` is set by the
     # forwarder the first time it discovers the cursor chat store; absent on a
     # brand-new session, so no ``--resume`` is injected and cursor starts fresh.
-    cursor_args.extend(
-        _cursor_native_resume_args(launch_config.external_session_id, cursor_args)
-    )
+    cursor_args.extend(_cursor_native_resume_args(launch_config.external_session_id, cursor_args))
     # Honor the spec's pinned model (``--model`` flag / config.yaml ``model:``)
     # by launching cursor-agent with ``--model <model>``. An explicit model in
     # the passthrough launch args (``omnigent cursor -- --model X`` or the joined
