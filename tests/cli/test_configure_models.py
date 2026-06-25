@@ -1556,6 +1556,34 @@ def test_overview_marks_unconfigured_with_x_and_configured_without_checkmark(
     assert "no credential yet" in out
 
 
+def test_overview_lists_kiro_native_row(isolated_config, monkeypatch) -> None:
+    """Level 1: Kiro appears as an installable native harness row.
+
+    Kiro (``kiro-native``) is a native CLI harness with its own auth
+    (``kiro-cli login``), so — like Goose/Hermes — it belongs in the setup
+    overview. Absent the CLI it renders a red ✗ plus its curl install hint;
+    installed, it renders ready with the sign-in reminder. A regression that
+    drops the Kiro row (the gap this PR closes) fails here.
+    """
+    # CLI absent → Kiro row + the curl install hint. (The red ✗ marker carries an
+    # ANSI reset between the glyph and the name, so assert on the stable text.)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda family: False,
+    )
+    out = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n").output
+    assert "Kiro" in out
+    assert "cli.kiro.dev/install" in out
+
+    # CLI present → ready row naming the sign-in step (no Omnigent credential).
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda family: True,
+    )
+    out = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n").output
+    assert "kiro-cli login" in out
+
+
 def test_drill_into_uninstalled_installs_then_proceeds(isolated_config, monkeypatch) -> None:
     """Selecting an uninstalled harness → 'Yes, install' runs the install and
     proceeds to credential setup.
