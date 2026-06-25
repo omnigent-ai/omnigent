@@ -25,6 +25,7 @@ normalization, and prompt building.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -50,11 +51,6 @@ from .executor import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Cursor's public Cloud Agents API base URL. The SDK has no default for it, so
-# the cloud client must be constructed with it explicitly. Overridable via the
-# constructor for tests.
-_DEFAULT_CLOUD_BASE_URL = "https://api.cursor.com"
 
 # Cloud agents run a curated model set in Max Mode; ``composer-2.5`` is the
 # documented default. A gateway-routed (``databricks-*``) id carried by a spec
@@ -120,7 +116,6 @@ class CursorCloudExecutor(Executor):
         ref: str | None = None,
         agent_name: str | None = None,
         auto_create_pr: bool = True,
-        base_url: str = _DEFAULT_CLOUD_BASE_URL,
     ) -> None:
         self._cwd = cwd or (os_env.cwd if os_env else None)
         self._model_override = model
@@ -129,7 +124,6 @@ class CursorCloudExecutor(Executor):
         self._ref = ref
         self._agent_name = agent_name
         self._auto_create_pr = auto_create_pr
-        self._base_url = base_url
 
     # ── capability flags ──────────────────────────────────────────────
     def supports_streaming(self) -> bool:
@@ -216,9 +210,18 @@ class CursorCloudExecutor(Executor):
             logger.debug("cursor-sdk import failed: %s", exc)
             return
 
+        # Cloud runs route through the SDK's bundled bridge — the SAME entry the
+        # local cursor harness uses. A direct ``AsyncClient(base_url=...)`` hits
+        # the wrong RPC route (404). The bridge authenticates from
+        # ``CURSOR_API_KEY``; mirror our resolved key into the env for the bridge
+        # subprocess (this is a dedicated harness process) and also pass it to
+        # ``create_agent``.
+        if self._api_key:
+            os.environ["CURSOR_API_KEY"] = self._api_key
+
         client: Any = None
         try:
-            client = AsyncClient(base_url=self._base_url, auth_token=self._api_key)
+            client = await AsyncClient.launch_bridge()
             cloud = CloudAgentOptions(
                 repos=[CloudRepository(url=self._repo_url, starting_ref=self._ref)],
                 auto_create_pr=self._auto_create_pr,
@@ -232,8 +235,18 @@ class CursorCloudExecutor(Executor):
                 )
                 run = await agent.send(prompt)
             except Exception as exc:  # noqa: BLE001 — launch failure surfaced w/ onboarding hint
+                # A launch/send failure on cloud is most often the repo not
+                # having had its one-time Cursor environment set up (the API can
+                # return a bare ``internal error`` in that case), so always point
+                # the user at the dashboard onboarding step.
                 yield ExecutorError(
-                    message=_onboarding_hint(self._repo_url, f"cursor-cloud launch failed: {exc}"),
+                    message=(
+                        f"cursor-cloud launch failed: {exc}\n\nIf this repository "
+                        f"has not been set up for Cursor cloud agents yet, complete "
+                        f"the one-time environment setup at "
+                        f"{_ONBOARD_URL.format(url=self._repo_url)} (there is no API "
+                        f"to trigger it)."
+                    ),
                     retryable=False,
                 )
                 return

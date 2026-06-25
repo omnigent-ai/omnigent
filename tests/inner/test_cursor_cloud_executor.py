@@ -84,8 +84,7 @@ def _install_fake_sdk(
     ``client.create_agent`` raise, exercising the launch-failure path.
     """
     state: dict[str, Any] = {
-        "base_urls": [],
-        "auth_tokens": [],
+        "launch_bridge_calls": 0,
         "create_kwargs": [],
         "cloud_options": [],
         "repos": [],
@@ -109,9 +108,12 @@ def _install_fake_sdk(
             return _FakeRun()
 
     class _FakeClient:
-        def __init__(self, *, base_url: Any = None, auth_token: Any = None) -> None:
-            state["base_urls"].append(base_url)
-            state["auth_tokens"].append(auth_token)
+        @classmethod
+        async def launch_bridge(cls) -> _FakeClient:
+            # Cloud routes through the SDK's bundled bridge, the same entry the
+            # local cursor harness uses (not a direct AsyncClient(base_url=...)).
+            state["launch_bridge_calls"] += 1
+            return cls()
 
         async def create_agent(
             self, *, model: Any, api_key: Any, name: Any, cloud: Any
@@ -218,9 +220,10 @@ async def test_run_turn_happy_path_appends_pr_url(monkeypatch: pytest.MonkeyPatc
     # The prompt sent to agent.send is the first-turn prompt: the system prompt
     # prepended to the user message (see _build_cursor_prompt).
     assert state["sent"] == ["SYS\n\nfix it"]
-    # Client constructed with the cloud base URL + auth token and torn down.
-    assert state["base_urls"] == ["https://api.cursor.com"]
-    assert state["auth_tokens"] == ["crsr_x"]
+    # Cloud client came from the SDK bridge (launch_bridge), the API key was
+    # threaded to create_agent, and the bridge was torn down.
+    assert state["launch_bridge_calls"] == 1
+    assert state["create_kwargs"][0]["api_key"] == "crsr_x"
     assert state["closed"] == 1
     # The repo URL + starting ref were threaded into CloudRepository.
     assert state["repos"][0].url == "https://github.com/org/repo"
