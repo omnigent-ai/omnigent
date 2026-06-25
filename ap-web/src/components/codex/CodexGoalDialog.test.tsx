@@ -190,8 +190,39 @@ describe("CodexGoalDialog", () => {
   it("surfaces API errors", async () => {
     mockGetCodexGoal.mockRejectedValueOnce(new Error("runner is asleep"));
     renderDialog({ goal: null });
-
     expect(await screen.findByText("Could not read goal: runner is asleep")).toBeInTheDocument();
+  });
+
+  it("keeps in-progress edits when the goal prop updates outside a save", async () => {
+    const onGoalChange = vi.fn();
+    const { rerender } = render(
+      <CodexGoalDialog
+        open
+        onOpenChange={vi.fn()}
+        conversationId="conv_codex"
+        readOnly={false}
+        goal={ACTIVE_GOAL}
+        onGoalChange={onGoalChange}
+      />,
+    );
+    await waitFor(() => expect(mockGetCodexGoal).toHaveBeenCalled());
+
+    fireEvent.change(screen.getByTestId("codex-goal-objective"), {
+      target: { value: "Work in progress" },
+    });
+
+    rerender(
+      <CodexGoalDialog
+        open
+        onOpenChange={vi.fn()}
+        conversationId="conv_codex"
+        readOnly={false}
+        goal={{ ...ACTIVE_GOAL, tokensUsed: 9999 }}
+        onGoalChange={onGoalChange}
+      />,
+    );
+
+    expect(screen.getByTestId("codex-goal-objective")).toHaveValue("Work in progress");
   });
 });
 
