@@ -1633,6 +1633,74 @@ def _build_cursor_spawn_env(
     return env
 
 
+def _build_cursor_cloud_spawn_env(
+    spec: AgentSpec,
+    *,
+    cwd: Path | None = None,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build the ``HARNESS_CURSOR_CLOUD_*`` env-var dict the cursor-cloud wrap reads.
+
+    Mirrors :func:`_build_cursor_spawn_env`'s auth precedence (the cloud harness
+    shares the Cursor ``crsr_`` key), and additionally resolves the GitHub repo
+    URL + starting ref the cloud agent clones. Repo/ref default to the session
+    ``cwd``'s ``origin`` remote and current branch; explicit overrides are read
+    from ``OMNIGENT_CURSOR_CLOUD_REPO`` / ``OMNIGENT_CURSOR_CLOUD_REF`` when set.
+    A repo that cannot be resolved is left unset here so the executor surfaces a
+    clear turn-time error rather than failing the spawn.
+
+    :param spec: The agent spec.
+    :param cwd: Session working directory (read for the ``origin`` remote).
+    :param workdir: The bundle's on-disk path (unused by cloud; kept for
+        dispatch-signature parity).
+    :returns: A dict of env-var overrides.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_CURSOR_CLOUD_MODEL"] = model
+
+    # Auth: identical precedence to the local cursor builder — explicit spec
+    # api-key auth wins, else a stored cursor key, else an ambient CURSOR_API_KEY.
+    if isinstance(spec.executor.auth, ApiKeyAuth):
+        env["HARNESS_CURSOR_CLOUD_API_KEY"] = spec.executor.auth.api_key
+    elif spec.executor.auth is None:
+        from omnigent.onboarding.cursor_auth import resolve_cursor_api_key
+
+        stored_key = resolve_cursor_api_key()
+        if stored_key:
+            env["HARNESS_CURSOR_CLOUD_API_KEY"] = stored_key
+        else:
+            ambient_key = os.environ.get("CURSOR_API_KEY")
+            if ambient_key and ambient_key.strip():
+                env["HARNESS_CURSOR_CLOUD_API_KEY"] = ambient_key.strip()
+
+    # Repo/ref: cwd origin remote by default, explicit override via env.
+    from omnigent.cursor_cloud_repo import RepoResolutionError, resolve_cursor_cloud_repo
+
+    try:
+        resolved = resolve_cursor_cloud_repo(
+            cwd,
+            repo_override=os.environ.get("OMNIGENT_CURSOR_CLOUD_REPO"),
+            ref_override=os.environ.get("OMNIGENT_CURSOR_CLOUD_REF"),
+        )
+    except RepoResolutionError:
+        resolved = None
+    if resolved is not None:
+        env["HARNESS_CURSOR_CLOUD_REPO"] = resolved.url
+        if resolved.ref:
+            env["HARNESS_CURSOR_CLOUD_REF"] = resolved.ref
+
+    if cwd is not None:
+        env["HARNESS_CURSOR_CLOUD_CWD"] = str(cwd)
+    if spec.name:
+        env["HARNESS_CURSOR_CLOUD_AGENT_NAME"] = spec.name
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_CURSOR_CLOUD_OS_ENV"] = os_env_payload
+    return env
+
+
 def _build_kimi_spawn_env(
     spec: AgentSpec,
     *,

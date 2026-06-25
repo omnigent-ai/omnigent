@@ -16463,6 +16463,7 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "pi": "HARNESS_PI_MODEL",
     "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
     "cursor": "HARNESS_CURSOR_MODEL",
+    "cursor-cloud": "HARNESS_CURSOR_CLOUD_MODEL",
     # cursor-native is intentionally omitted here (and from
     # model_override._SDK_MODEL_OVERRIDE_HARNESSES): like the other native CLIs
     # (claude-native, codex-native) it honors the spec model via a launch
@@ -16508,6 +16509,7 @@ def _build_spawn_env_from_spec(
             _build_claude_sdk_spawn_env,
             _build_codex_spawn_env,
             _build_copilot_spawn_env,
+            _build_cursor_cloud_spawn_env,
             _build_cursor_spawn_env,
             _build_goose_spawn_env,
             _build_kimi_spawn_env,
@@ -16526,6 +16528,8 @@ def _build_spawn_env_from_spec(
             env = _build_openai_agents_sdk_spawn_env(spec)
         elif harness == "cursor":
             env = _build_cursor_spawn_env(spec, workdir=workdir)
+        elif harness == "cursor-cloud":
+            env = _build_cursor_cloud_spawn_env(spec, cwd=cwd, workdir=workdir)
         elif harness == "antigravity":
             env = _build_antigravity_spawn_env(spec)
         elif harness == "kimi":

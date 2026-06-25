@@ -66,6 +66,11 @@ _HARNESS_MODULES: dict[str, str] = {
     # cursor harness wrap (Cursor's ``cursor-agent`` CLI, headless). See
     # omnigent/inner/cursor_harness.py.
     "cursor": "omnigent.inner.cursor_harness",
+    # cursor-cloud harness wrap. Launches Cursor Cloud / Background Agent runs
+    # via the cursor-sdk against a GitHub repo (clones in a cloud VM, pushes a
+    # branch / opens a PR) — NOT a native TUI, so it is NOT in
+    # ``NATIVE_HARNESSES``. See omnigent/inner/cursor_cloud_harness.py.
+    "cursor-cloud": "omnigent.inner.cursor_cloud_harness",
     # Kimi Code CLI harness wrap (Moonshot AI's ``kimi`` CLI, headless). See
     # omnigent/inner/kimi_harness.py. Drives ``kimi --print --output-format
     # stream-json`` per turn; resumes via ``--session <uuid>`` captured from
