@@ -19,6 +19,8 @@ export interface FileViewPreferences {
   diffLayout: "unified" | "split";
   /** Preferred mode for previewable (markdown/html) files. */
   previewableViewMode: "editor" | "preview" | "source";
+  /** Whether whitespace-only changes are hidden in the diff view. */
+  hideWhitespace: boolean;
 }
 
 const STORAGE_KEY = "omnigent:file-view-preferences";
@@ -27,6 +29,7 @@ export const DEFAULT_FILE_VIEW_PREFERENCES: FileViewPreferences = {
   diffActive: false,
   diffLayout: "unified",
   previewableViewMode: "editor",
+  hideWhitespace: false,
 };
 
 /**
@@ -54,6 +57,10 @@ export function readFileViewPreferences(): FileViewPreferences {
         p.previewableViewMode === "preview" || p.previewableViewMode === "source"
           ? p.previewableViewMode
           : "editor",
+      hideWhitespace:
+        typeof p.hideWhitespace === "boolean"
+          ? p.hideWhitespace
+          : DEFAULT_FILE_VIEW_PREFERENCES.hideWhitespace,
     };
   } catch {
     return DEFAULT_FILE_VIEW_PREFERENCES;

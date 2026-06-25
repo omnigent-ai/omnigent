@@ -31,6 +31,7 @@ import {
   Columns2Icon,
   DownloadIcon,
   EyeIcon,
+  EyeOffIcon,
   FileDiffIcon,
   Link2Icon,
   Loader2Icon,
@@ -602,6 +603,9 @@ function FileViewerBody({
   const [diffLayout, setDiffLayout] = useState<"unified" | "split">(
     () => persistedPrefsRef.current.diffLayout,
   );
+  const [hideWhitespace, setHideWhitespace] = useState(
+    () => persistedPrefsRef.current.hideWhitespace,
+  );
   const [previewableViewMode, setPreviewableViewMode] = useState<"editor" | "preview" | "source">(
     () => persistedPrefsRef.current.previewableViewMode,
   );
@@ -610,8 +614,8 @@ function FileViewerBody({
   // is intentionally excluded — it's contextual (per-open), not a sticky
   // preference. Idempotent on mount (writes back the seeded values).
   useEffect(() => {
-    writeFileViewPreferences({ diffActive, diffLayout, previewableViewMode });
-  }, [diffActive, diffLayout, previewableViewMode]);
+    writeFileViewPreferences({ diffActive, diffLayout, previewableViewMode, hideWhitespace });
+  }, [diffActive, diffLayout, previewableViewMode, hideWhitespace]);
   // Non-markdown previewable (HTML): "editor" falls back to "preview" — no rich-text mode.
   // Markdown: "preview" is removed; treat as "source" if somehow set (e.g. shared state from an HTML file).
   const fileViewMode: "editor" | "preview" | "source" = isPreviewable
@@ -766,6 +770,15 @@ function FileViewerBody({
           <RowsIcon className="size-4" />
         ),
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
+    });
+  }
+  if (viewMode === "diff") {
+    toolbarActions.push({
+      key: "hide-whitespace",
+      label: hideWhitespace ? "Show whitespace changes" : "Hide whitespace changes",
+      icon: hideWhitespace ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />,
+      active: hideWhitespace,
+      onSelect: () => setHideWhitespace((prev) => !prev),
     });
   }
   toolbarActions.push({
@@ -1049,6 +1062,7 @@ function FileViewerBody({
                   after={diffQuery.data.after}
                   path={path}
                   layout={diffLayout}
+                  hideWhitespace={hideWhitespace}
                   conversationId={conversationId}
                   comments={openComments}
                   activeSelection={activeSelection}

@@ -31,6 +31,8 @@ interface MonacoDiffViewerProps {
   path: string;
   /** How hunks are rendered: side-by-side ("split") or inline ("unified"). */
   layout: "unified" | "split";
+  /** Whether whitespace-only changes are hidden. */
+  hideWhitespace: boolean;
   conversationId: string;
   /** Saved comments — highlighted on the modified side. */
   comments: Comment[];
@@ -53,6 +55,7 @@ export function MonacoDiffViewer({
   after,
   path,
   layout,
+  hideWhitespace,
   conversationId,
   comments,
   activeSelection,
@@ -144,11 +147,12 @@ export function MonacoDiffViewer({
       fontSize: 12,
       automaticLayout: true,
       renderOverviewRuler: false,
+      ignoreTrimWhitespace: hideWhitespace,
       // Collapse long unchanged runs into expandable bands (like the old pierre
       // diff / GitHub) so only changed hunks + a few context lines are shown.
       hideUnchangedRegions: { enabled: true, contextLineCount: 3 },
     }),
-    [layout],
+    [layout, hideWhitespace],
   );
 
   return (

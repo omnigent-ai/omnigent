@@ -23,6 +23,7 @@ describe("fileViewPreferences", () => {
       diffActive: true,
       diffLayout: "split",
       previewableViewMode: "source",
+      hideWhitespace: true,
     });
     // The exact object written must come back — proves both the write
     // serialized and the read parsed/validated every field correctly.
@@ -30,6 +31,7 @@ describe("fileViewPreferences", () => {
       diffActive: true,
       diffLayout: "split",
       previewableViewMode: "source",
+      hideWhitespace: true,
     });
   });
 
@@ -57,6 +59,7 @@ describe("fileViewPreferences", () => {
       diffActive: true,
       diffLayout: "unified",
       previewableViewMode: "editor",
+      hideWhitespace: false,
     });
   });
 });
