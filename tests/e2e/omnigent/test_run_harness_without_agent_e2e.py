@@ -193,6 +193,23 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     not ``omnigent run --harness qwen-native``. Its coverage is the dedicated
     qwen-native bridge/executor/forwarder unit tests.
 
+    ``kiro-native`` is excluded for the same reason as ``goose-native`` /
+    ``qwen-native`` / ``cursor-native``: it is a terminal-first TUI launched via
+    ``omni kiro`` (tmux pane + bridge dir), not ``omnigent run --harness
+    kiro-native``. Its coverage is the dedicated kiro-native bridge/executor/
+    forwarder unit tests plus the ``test_native_kiro_render_parity`` e2e_ui suite.
+
+    ``kimi`` is excluded for the same reason as ``hermes``: it requires the
+    ``kimi`` CLI binary (installed via Moonshot's curl installer) and
+    authenticates through ``kimi login`` (OAuth or a Moonshot API key), not the
+    shared Databricks gateway/profile probe wiring this matrix drives.
+
+    ``kimi-native`` is excluded for the same reason as ``goose-native`` /
+    ``qwen-native`` / ``kiro-native``: it is a terminal-first TUI launched via
+    ``omni kimi`` (tmux pane + bridge dir), not ``omnigent run --harness
+    kimi-native``. Its coverage is the dedicated kimi-native bridge/executor/
+    forwarder/approval unit tests plus the Kimi picker e2e_ui suite.
+
     ``hermes`` is excluded because it requires the ``hermes`` CLI binary
     (installed separately via Nous Research's install script) and authenticates
     through its own provider config, not the shared gateway/profile probe
@@ -218,6 +235,9 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "qwen-native",
         "goose",
         "goose-native",
+        "kiro-native",
+        "kimi",
+        "kimi-native",
         "hermes",
         "hermes-native",
     }

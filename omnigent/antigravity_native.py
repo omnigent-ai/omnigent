@@ -293,7 +293,10 @@ def _materialize_antigravity_agent_spec(tmpdir: Path) -> Path:
         "executor": {"harness": "antigravity-native"},
         # Opt the native session into the child-session spawn writes so the
         # wrapped agy can author agent configs and launch them as sub-agent
-        # sessions. The relay derives its advertised tool set from this spec.
+        # sessions. The Omnigent MCP relay (wired in #1194 — see
+        # ``antigravity_native_bridge.write_mcp_config`` and the runner's
+        # ``_ensure_comment_relay_started``) derives its advertised
+        # ``sys_session_*`` write surface from this ``spawn: true`` gate.
         "spawn": True,
         # Without an ``os_env`` block the runner's filesystem APIs 404 (see
         # ``_require_os_env`` in ``omnigent/runner/app.py``). agy already
@@ -305,9 +308,11 @@ def _materialize_antigravity_agent_spec(tmpdir: Path) -> Path:
             "cwd": ".",
             "sandbox": {"type": "none"},
         },
-        # Declare a default shell terminal so the relay advertises the
-        # ``sys_terminal_*`` family to the wrapped agy (the relay's gate is
-        # a non-empty ``terminals:`` block on this spec).
+        # Declare a default shell terminal so the Omnigent MCP relay advertises
+        # the ``sys_terminal_*`` family to the wrapped agy (the relay's gate is
+        # a non-empty ``terminals:`` block on this spec). This also feeds the
+        # web-UI new-terminal affordance (``server/routes/sessions.py``), so it
+        # is not inert even independent of the relay.
         "terminals": {
             "shell": {
                 "command": "bash",
