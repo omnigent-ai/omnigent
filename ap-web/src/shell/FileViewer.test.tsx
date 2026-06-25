@@ -23,7 +23,12 @@ import type { Comment } from "@/hooks/useComments";
 // ── Mock heavy child components ───────────────────────────────────────────────
 
 vi.mock("./CodeViewer", () => ({
-  CodeViewer: () => <div data-testid="code-viewer" />,
+  // Surface the resolved viewMode so the view-mode tests can assert how
+  // FileViewer routed a given file/preference without pulling in the real
+  // (Monaco/Streamdown/TipTap) viewer tree.
+  CodeViewer: ({ viewMode }: { viewMode?: string }) => (
+    <div data-testid="code-viewer" data-view-mode={viewMode} />
+  ),
 }));
 
 vi.mock("./CommentsPanel", () => ({
@@ -1005,5 +1010,46 @@ describe("FileViewer keyboard shortcut — Alt+← / Alt+→", () => {
     expect(onNavigateTo).not.toHaveBeenCalled();
 
     document.body.removeChild(input);
+  });
+});
+
+describe("FileViewer markdown/HTML view modes", () => {
+  function currentViewMode(): string | null {
+    return screen.getByTestId("code-viewer").getAttribute("data-view-mode");
+  }
+
+  it("opens a .md file in read-only preview by default", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open: true, path: "notes.md" });
+    expect(currentViewMode()).toBe("preview");
+  });
+
+  it("cycles markdown preview → editor → source → preview via the toolbar toggle", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open: true, path: "notes.md" });
+    expect(currentViewMode()).toBe("preview");
+
+    // The toggle button's accessible name describes the destination mode.
+    fireEvent.click(screen.getByRole("button", { name: "Rich text editor" }));
+    expect(currentViewMode()).toBe("editor");
+
+    fireEvent.click(screen.getByRole("button", { name: "View source" }));
+    expect(currentViewMode()).toBe("source");
+
+    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+    expect(currentViewMode()).toBe("preview");
+  });
+
+  it("toggles HTML between preview and source only (no rich-text editor mode)", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open: true, path: "page.html" });
+    expect(currentViewMode()).toBe("preview");
+
+    fireEvent.click(screen.getByRole("button", { name: "View source" }));
+    expect(currentViewMode()).toBe("source");
+
+    // Back to preview — never enters "editor" (which markdown has but HTML lacks).
+    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+    expect(currentViewMode()).toBe("preview");
   });
 });

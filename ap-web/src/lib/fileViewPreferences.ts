@@ -28,7 +28,12 @@ const STORAGE_KEY = "omnigent:file-view-preferences";
 export const DEFAULT_FILE_VIEW_PREFERENCES: FileViewPreferences = {
   diffActive: false,
   diffLayout: "unified",
-  previewableViewMode: "editor",
+  // Default rendered view for previewable (markdown/html) files. "preview"
+  // opens both in their read-only render. Markdown additionally supports an
+  // editable "editor" mode and "source"; HTML has no editor and collapses
+  // "editor" → "preview" (see FileViewer). Flip this to "editor" to make .md
+  // open directly in the rich-text editor instead — HTML is unaffected.
+  previewableViewMode: "preview",
   hideWhitespace: false,
 };
 

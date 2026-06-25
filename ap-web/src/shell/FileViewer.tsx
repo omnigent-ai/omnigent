@@ -616,15 +616,16 @@ function FileViewerBody({
   useEffect(() => {
     writeFileViewPreferences({ diffActive, diffLayout, previewableViewMode, hideWhitespace });
   }, [diffActive, diffLayout, previewableViewMode, hideWhitespace]);
-  // Non-markdown previewable (HTML): "editor" falls back to "preview" — no rich-text mode.
-  // Markdown: "preview" is removed; treat as "source" if somehow set (e.g. shared state from an HTML file).
-  const fileViewMode: "editor" | "preview" | "source" = isPreviewable
-    ? lang !== "markdown" && previewableViewMode === "editor"
-      ? "preview"
-      : lang === "markdown" && previewableViewMode === "preview"
-        ? "source"
-        : previewableViewMode
-    : "source";
+  // Markdown supports all three modes (preview / editor / source). HTML has no
+  // rich-text editor, so "editor" collapses to "preview". Non-previewable files
+  // always render as source.
+  const fileViewMode: "editor" | "preview" | "source" = !isPreviewable
+    ? "source"
+    : lang === "markdown"
+      ? previewableViewMode
+      : previewableViewMode === "editor"
+        ? "preview"
+        : previewableViewMode;
   // Derived effective view mode — diff takes priority when active and available.
   const viewMode: "editor" | "preview" | "source" | "diff" =
     diffActive && isDiffAvailable ? "diff" : fileViewMode;
@@ -695,38 +696,32 @@ function FileViewerBody({
   };
   const toolbarActions: ToolbarAction[] = [];
   if (isPreviewable && viewMode !== "diff") {
-    const previewLabel =
+    // The button advances to the next view mode; its icon/label describe that
+    // destination. Markdown cycles through all three (preview → editor → source
+    // → preview); HTML has no rich-text editor, so it toggles preview ↔ source.
+    const nextMode: "editor" | "preview" | "source" =
       lang === "markdown"
-        ? viewMode === "editor"
-          ? "Source view"
-          : "Rich text editor"
+        ? viewMode === "preview"
+          ? "editor"
+          : viewMode === "editor"
+            ? "source"
+            : "preview"
         : viewMode === "preview"
-          ? "View source"
-          : "View preview";
+          ? "source"
+          : "preview";
+    const nextModeMeta: Record<
+      "editor" | "preview" | "source",
+      { label: string; icon: ReactNode }
+    > = {
+      preview: { label: "View preview", icon: <EyeIcon className="size-4" /> },
+      editor: { label: "Rich text editor", icon: <PencilLineIcon className="size-4" /> },
+      source: { label: "View source", icon: <CodeIcon className="size-4" /> },
+    };
     toolbarActions.push({
       key: "preview",
-      label: previewLabel,
-      icon:
-        lang === "markdown" ? (
-          viewMode === "editor" ? (
-            <CodeIcon className="size-4" />
-          ) : (
-            <PencilLineIcon className="size-4" />
-          )
-        ) : viewMode === "preview" ? (
-          <CodeIcon className="size-4" />
-        ) : (
-          <EyeIcon className="size-4" />
-        ),
-      onSelect: () => {
-        if (lang === "markdown") {
-          guardDirty(() =>
-            setPreviewableViewMode((mode) => (mode === "editor" ? "source" : "editor")),
-          );
-        } else {
-          setPreviewableViewMode((mode) => (mode === "preview" ? "source" : "preview"));
-        }
-      },
+      label: nextModeMeta[nextMode].label,
+      icon: nextModeMeta[nextMode].icon,
+      onSelect: () => guardDirty(() => setPreviewableViewMode(nextMode)),
     });
   }
   // HTML artifacts can be popped out into their own browser tab for full-window

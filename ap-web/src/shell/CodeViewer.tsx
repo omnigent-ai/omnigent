@@ -30,8 +30,7 @@ import {
 } from "lucide-react";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { highlightCode } from "@/components/ai-elements/code-block";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { MessageResponse } from "@/components/ai-elements/message";
 import { type Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
@@ -65,16 +64,23 @@ const MonacoCodeEditor = lazy(() =>
 );
 
 // ---------------------------------------------------------------------------
-// MarkdownPreview — read-only render of Markdown content via react-markdown + GFM
+// MarkdownPreview — read-only render of Markdown content
 // ---------------------------------------------------------------------------
 
 // Width of the line-number gutter — must match the `w-12` Tailwind class on the gutter div.
 const GUTTER_WIDTH = 48;
 
+// Reuse the chat message renderer (Streamdown + remark-gfm, hardened rehype
+// plugins, code highlighting, mermaid/math/CJK) so a previewed .md file looks
+// exactly like the same Markdown rendered in chat — task lists, tables, fenced
+// code, emoji — and inherits the shared `[data-streamdown="*"]` styling in
+// index.css. Because Streamdown emits plain DOM (no iframe, unlike the HTML
+// preview), this also renders inside the iOS WKWebView shell, where the
+// sandboxed HTML preview cannot. Text sizing mirrors chat's MessageContent.
 function MarkdownPreview({ content }: { content: string }) {
   return (
-    <div className="px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+    <div className="h-full overflow-auto px-6 py-4 text-[0.9375rem] leading-6">
+      <MessageResponse>{content}</MessageResponse>
     </div>
   );
 }

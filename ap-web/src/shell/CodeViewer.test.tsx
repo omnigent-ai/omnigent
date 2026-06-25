@@ -320,3 +320,28 @@ describe("CodeViewer image rendering", () => {
     expect(await screen.findByAltText("data.txt")).toBeDefined();
   });
 });
+
+describe("CodeViewer markdown preview (Streamdown)", () => {
+  it("renders Markdown via Streamdown in preview mode — headings + GFM task lists, not raw source or Monaco", () => {
+    const md = "# Title\n\n- [x] done\n- [ ] todo\n";
+    const { container } = renderViewer(md, true, "notes.md", { viewMode: "preview" });
+
+    // The heading is rendered as a Streamdown element, so the literal "# Title"
+    // source never appears — i.e. this is the rendered preview, not source.
+    const heading = container.querySelector('[data-streamdown="heading-1"]');
+    expect(heading?.textContent).toContain("Title");
+    expect(screen.queryByText("# Title")).toBeNull();
+
+    // GFM task list: remark-gfm tags each item `task-list-item` with a checkbox
+    // whose checked state reflects [x] vs [ ] (this is what PR #721's CSS targets).
+    const checkboxes = container.querySelectorAll<HTMLInputElement>(
+      '[data-streamdown="list-item"].task-list-item input[type="checkbox"]',
+    );
+    expect(checkboxes.length).toBe(2);
+    expect(checkboxes[0].checked).toBe(true);
+    expect(checkboxes[1].checked).toBe(false);
+
+    // Preview must not fall through to the Monaco source editor.
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+  });
+});
