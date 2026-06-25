@@ -675,6 +675,9 @@ function ConversationList({
   // Archived sessions are surfaced on the Settings page, not here, so they
   // don't count toward the sidebar's empty-state threshold.
   const totalVisible = sections.pinned.length + sections.sessions.length + sections.shared.length;
+  const hasExpandedPaginatedSection =
+    (sections.sessions.length > 0 && !effectiveCollapsedSections.includes("Recent")) ||
+    (sections.shared.length > 0 && !effectiveCollapsedSections.includes("Shared with me"));
 
   // Section structure comes from the muted micro-headers + whitespace
   // alone (Linear-style) — no divider rules between groups.
@@ -728,9 +731,9 @@ function ConversationList({
           )}
           {/* Archived sessions are no longer listed here — they live on the
               Settings page ("Archived chats"), reachable from the footer. */}
-          {/* Pagination extends the Recent list, so the button hides with
-              it — a Load more under a collapsed group reads orphaned. */}
-          {hasMorePages && !effectiveCollapsedSections.includes("Recent") && (
+          {/* Pagination extends the loaded session sections, so the button
+              hides when every pagination target is collapsed. */}
+          {hasMorePages && hasExpandedPaginatedSection && (
             <button
               type="button"
               disabled={conversationsQuery.isFetchingNextPage}

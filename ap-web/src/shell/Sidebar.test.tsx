@@ -320,6 +320,31 @@ describe("Sidebar load-more vs collapsed Recent", () => {
     fireEvent.click(screen.getByRole("button", { name: "Recent" }));
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
   });
+
+  it("hides Load more when the only paginated section is collapsed", () => {
+    const rows = [conv("conv_shared", "Claude Code", { permission_level: 2 })];
+    useConvMock.mockImplementation(
+      () =>
+        ({
+          data: {
+            pages: [{ data: rows, first_id: rows[0]!.id, last_id: rows[0]!.id, has_more: true }],
+            pageParams: [undefined],
+          },
+          isLoading: false,
+          isError: false,
+          error: null,
+          fetchNextPage: vi.fn(),
+          hasNextPage: true,
+          isFetchingNextPage: false,
+        }) as unknown as ReturnType<typeof useConversations>,
+    );
+    renderSidebar();
+
+    expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Shared with me" }));
+    expect(screen.queryByText("conv_shared")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+  });
 });
 
 describe("Sidebar mobile overlay background", () => {
