@@ -152,6 +152,22 @@ def build_cursor_launch(
     return NativeCursorLaunch(executable=executable, argv=[executable, *cursor_args])
 
 
+def _inject_mode_arg(
+    cursor_args: tuple[str, ...],
+    mode: str | None,
+) -> tuple[str, ...]:
+    """Return *cursor_args* with ``--mode <mode>`` prepended when appropriate.
+
+    No-op when *mode* is ``None`` or ``--mode`` / ``--plan`` is already present
+    in *cursor_args* (user-supplied value wins).
+    """
+    if mode is None:
+        return cursor_args
+    if any(arg in ("--mode", "--plan") or arg.startswith("--mode=") for arg in cursor_args):
+        return cursor_args
+    return ("--mode", mode) + cursor_args
+
+
 def run_cursor_native(
     *,
     server: str | None,
@@ -159,6 +175,7 @@ def run_cursor_native(
     cursor_args: tuple[str, ...],
     resume_picker: bool = False,
     auto_open_conversation: bool = False,
+    mode: str | None = None,
 ) -> None:
     """
     Launch the Cursor TUI in an Omnigent terminal.
@@ -169,6 +186,8 @@ def run_cursor_native(
     :param resume_picker: ``True`` runs the cursor-native picker.
     :param auto_open_conversation: When ``True``, open the browser
         conversation URL after launch.
+    :param mode: Optional cursor-agent execution mode (``"plan"`` or ``"ask"``).
+        Injected as ``--mode <mode>`` unless already present in *cursor_args*.
     :returns: None after the terminal attach session ends.
     """
     _preflight_local_tools()
@@ -177,6 +196,7 @@ def run_cursor_native(
             "Cursor requires a resolved Omnigent server URL. The CLI should call "
             "_ensure_backend before run_cursor_native."
         )
+    effective_cursor_args = _inject_mode_arg(cursor_args, mode)
     with TemporaryDirectory(prefix="omnigent-cursor-native-") as tmpdir:
         spec_path = _materialize_cursor_agent_spec(Path(tmpdir))
         _run_with_remote_server(
@@ -184,7 +204,7 @@ def run_cursor_native(
             spec_path,
             session_id=session_id,
             resume_picker=resume_picker,
-            cursor_args=cursor_args,
+            cursor_args=effective_cursor_args,
             auto_open_conversation=auto_open_conversation,
         )
 
