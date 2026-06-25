@@ -1,11 +1,12 @@
-"""Tests for the optional OpenCode worker in the debby spec.
+"""Guards that the shipped example agents ship **no** OpenCode worker.
 
-polly intentionally ships **no** OpenCode worker: shipping a sub-agent whose
-``opencode-native`` harness older clients don't recognize made every old
-runner/host fail to launch *any* polly (the version-skew incident behind
-omnigent-ai/omnigent#1145). polly was reverted to its three-worker roster
-(claude_code / codex / pi) and the negative test below guards that. debby keeps
-the optional OpenCode perspective (default fanout is still claude + gpt).
+Both polly and debby once declared an optional ``opencode`` sub-agent
+(``harness: opencode-native``). Shipping a sub-agent whose harness older
+clients don't recognize made every old runner/host fail to launch the agent at
+all — the version-skew incident behind omnigent-ai/omnigent#1145. Both were
+reverted to their original rosters (polly: claude_code / codex / pi; debby:
+claude / gpt), and the negative tests below guard that OpenCode does not creep
+back into either shipped spec.
 """
 
 from __future__ import annotations
@@ -47,17 +48,18 @@ def test_polly_does_not_declare_opencode_worker() -> None:
         assert "opencode-native" not in (_config(sub).get("allowed_harnesses") or [])
 
 
-def test_debby_declares_opencode_perspective() -> None:
+def test_debby_does_not_declare_opencode_head() -> None:
+    """debby stays opencode-free, so an older client can load it without skew.
+
+    debby is reverted to its two-head roster (claude + gpt). Re-adding an
+    ``opencode`` head (or any ``opencode-native`` harness override) would
+    reintroduce the harness that broke old clients on spec validation.
+    """
     subs = _sub_agents("debby")
-    assert "opencode" in subs
-    cfg = _config(subs["opencode"])
-    assert cfg.get("harness") == "opencode-native"
-    # Default fanout is still the two heads.
-    assert "claude" in subs
-    assert "gpt" in subs
-
-
-def test_debby_prompt_keeps_opencode_optional() -> None:
-    config = (_REPO_ROOT / "examples" / "debby" / "config.yaml").read_text(encoding="utf-8")
-    assert "Optional OpenCode perspective" in config
-    assert "do not dispatch" in config.lower()
+    assert "opencode" not in subs
+    assert {"claude", "gpt"} <= set(subs)
+    config_text = (_REPO_ROOT / "examples" / "debby" / "config.yaml").read_text(encoding="utf-8")
+    assert "opencode" not in config_text.lower()
+    # No head re-introduces opencode-native via a harness override either.
+    for sub in subs.values():
+        assert "opencode-native" not in (_config(sub).get("allowed_harnesses") or [])

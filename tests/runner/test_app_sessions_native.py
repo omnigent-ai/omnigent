@@ -5780,6 +5780,89 @@ async def test_compaction_item_in_history_expands_and_discards_prior() -> None:
 
 
 @pytest.mark.asyncio
+async def test_error_item_in_history_is_surfaced_as_error_block_not_dropped() -> None:
+    """History loading surfaces ``error`` items as typed ERROR blocks, not dropped (#1108).
+
+    Breakage this catches: ``_convert_raw_items_to_input`` used to drop every
+    item that wasn't message / function_call / function_call_output, so an
+    ``error`` item recorded for a failed turn vanished on history reload — the
+    next turn replayed as if the failure had never happened ("silent success").
+
+    The converter now preserves each error item as a typed ``error`` item
+    (the ``ErrorData`` shape: ``source`` / ``code`` / ``message``). The fix is
+    specifically NOT a synthetic user-role ``input_text`` message: that would
+    keep the text visible but mis-attribute the failure to the user's input
+    and lose the error semantics. This test pins the typed-error shape and
+    guards against a regression back to the user-message shim.
+    """
+    import asyncio as _aio
+
+    history = [
+        {
+            "id": "item_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "do the thing"}],
+        },
+        {
+            "id": "item_2",
+            "type": "error",
+            "response_id": "resp_failed",
+            "source": "execution",
+            "code": "codex_turn_error",
+            "message": "401 Unauthorized: ChatGPT login expired",
+        },
+        {
+            "id": "item_3",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "try again"}],
+        },
+    ]
+    app, _pm, hc = _build_recovery_app(history)
+
+    async with _runner_client(app) as client:
+        # Trailing user message → crash recovery starts a turn, replaying history.
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_err_1", "agent_id": "ag_1"},
+        )
+        assert resp.status_code == 201
+        assert resp.json()["status"] == "running"
+        await _aio.sleep(0.5)
+
+    assert len(hc.posted_bodies) == 1, (
+        f"Expected 1 harness POST (recovery turn), got {len(hc.posted_bodies)}."
+    )
+    content = hc.posted_bodies[0].get("content", [])
+    error_items = [
+        item for item in content if isinstance(item, dict) and item.get("type") == "error"
+    ]
+    # The error item survived the converter as a typed ERROR block.
+    assert len(error_items) == 1, (
+        "Expected exactly one typed 'error' item in the converted history; "
+        f"got {len(error_items)}. If 0, the error item was dropped (the "
+        "silent-success regression) or wrongly mapped to another type."
+    )
+    error_item = error_items[0]
+    assert error_item["message"] == "401 Unauthorized: ChatGPT login expired"
+    # The stable code/source round-trip so the failure stays attributable.
+    assert error_item["code"] == "codex_turn_error"
+    assert error_item["source"] == "execution"
+    # Crucially, the error is NOT mis-attributed as a user input_text message.
+    user_texts = [
+        block.get("text", "")
+        for item in content
+        if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "user"
+        for block in (item.get("content") or [])
+        if isinstance(block, dict)
+    ]
+    assert not any("401 Unauthorized" in text for text in user_texts), (
+        "Error text leaked into a user message — it must be a typed error block, not user input."
+    )
+
+
+@pytest.mark.asyncio
 async def test_crash_recovery_with_compaction_uses_post_compaction_history() -> None:
     """Crash recovery after compaction sees only post-compaction items.
 

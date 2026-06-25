@@ -1884,10 +1884,18 @@ class SessionLiveness:
         Used only to choose what the open view shows when
         ``runner_online`` is ``False``; never participates in the
         reachability decision.
+    :param host_version: Version string from the bound host's
+        ``host.hello`` frame, e.g. ``"0.1.0"`` — surfaced in the
+        session info popover. ``None`` when the session has no host
+        binding, the host is offline, or its version isn't resolvable
+        on this replica (the version lives in the in-memory host
+        registry, not the hosts table, so a host connected to another
+        replica reads ``None`` here).
     """
 
     runner_online: bool
     host_online: bool | None
+    host_version: str | None = None
 
 
 def _build_session_list_item(
@@ -14021,6 +14029,19 @@ def create_sessions_router(
             with contextlib.suppress(RuntimeError):
                 await websocket.close()
 
+    # ── Codex-native goal controls ───────────────────────────────
+
+    from omnigent.server.routes.codex.sessions import register_codex_session_routes
+
+    register_codex_session_routes(
+        router,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
+        runner_exit_reports=runner_exit_reports,
+    )
+
     # ── PATCH /sessions/{session_id} ────────────────────────────
 
     @router.patch(
@@ -17939,7 +17960,27 @@ def create_sessions_router(
                     "external_session_status data.response_id must be a string",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            _publish_status(session_id, status, response_id=response_id)
+            # Surface the failure reason a native forwarder carries so a
+            # top-level session sees it on its own status edge and persisted
+            # last_task_error, not only the sub-agent parent-inbox path.
+            output = body.data.get("output")
+            status_error: ErrorDetail | None = None
+            if status == "failed" and isinstance(output, str) and output.strip():
+                status_error = ErrorDetail(
+                    code=(
+                        "codex_reauth_required"
+                        if body.data.get("reauth_required") is True
+                        else "codex_turn_error"
+                    ),
+                    message=output.strip(),
+                )
+            if status_error is not None:
+                await _persist_session_status_error_labels(
+                    session_id, status_error, conversation_store
+                )
+            elif status == "running":
+                await _persist_session_status_error_labels(session_id, None, conversation_store)
+            _publish_status(session_id, status, status_error, response_id=response_id)
             forward_body = body.model_dump()
             forward_body["data"] = await _enrich_idle_status_with_subagent_output(
                 forward_body["data"], status, session_id, conversation_store

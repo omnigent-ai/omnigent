@@ -1,4 +1,4 @@
-import { type DragEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type DragEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -414,8 +414,77 @@ export function harnessUnconfiguredOnHost(
   harness: string | null | undefined,
   host: Host | undefined | null,
 ): boolean {
-  if (!harness || !host?.configured_harnesses) return false;
-  return host.configured_harnesses[harness] === false;
+  return harnessUnavailableReasonOnHost(harness, host) !== null;
+}
+
+function isCodexHarness(harness: string): boolean {
+  return harness === "codex" || harness === "codex-native" || harness === "native-codex";
+}
+
+export function harnessUnavailableReasonOnHost(
+  harness: string | null | undefined,
+  host: Host | undefined | null,
+): string | null {
+  if (!harness || !host?.configured_harnesses) return null;
+  const availability = host.configured_harnesses[harness];
+  if (availability === false) return isCodexHarness(harness) ? "binary-missing" : "unconfigured";
+  if (
+    isCodexHarness(harness) &&
+    (availability === "binary-missing" || availability === "needs-auth")
+  ) {
+    return availability;
+  }
+  // Unknown future reason strings fall through to no warning until the UI knows their copy.
+  return null;
+}
+
+export function harnessWarningBadgeText(reason: string | null): string {
+  if (reason === "binary-missing") return "binary missing";
+  if (reason === "needs-auth") return "needs auth";
+  return "needs setup";
+}
+
+export function harnessWarningMessageText(
+  agentName: string | undefined,
+  hostName: string | undefined,
+  reason: string | null,
+): string {
+  if (reason === "needs-auth") {
+    return `${agentName} needs Codex authentication on ${hostName} — run codex login on that machine.`;
+  }
+  if (reason === "binary-missing") {
+    return `${agentName} is missing the Codex binary on ${hostName} — run omnigent setup on that machine.`;
+  }
+  return `${agentName} isn't configured on ${hostName} — run omnigent setup on that machine.`;
+}
+
+function harnessWarningMessage(
+  agentName: string | undefined,
+  hostName: string | undefined,
+  reason: string | null,
+): ReactNode {
+  if (reason === "needs-auth") {
+    return (
+      <>
+        {agentName} needs Codex authentication on {hostName} — run <code>codex login</code> on that
+        machine.
+      </>
+    );
+  }
+  if (reason === "binary-missing") {
+    return (
+      <>
+        {agentName} is missing the Codex binary on {hostName} — run <code>omnigent setup</code> on
+        that machine.
+      </>
+    );
+  }
+  return (
+    <>
+      {agentName} isn&apos;t configured on {hostName} — run <code>omnigent setup</code> on that
+      machine.
+    </>
+  );
 }
 
 /**
@@ -742,7 +811,7 @@ function BrainHarnessOptions({
                 className="border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
                 data-testid={`new-chat-landing-harness-warning-${id}`}
               >
-                needs setup
+                {harnessWarningBadgeText(harnessUnavailableReasonOnHost(id, host))}
               </Badge>
             )}
           </DropdownMenuRadioItem>
@@ -999,6 +1068,10 @@ export function NewChatLandingScreen() {
     selectedAgent?.harness,
     harnessWarningHost,
   );
+  const selectedAgentUnavailableReason = harnessUnavailableReasonOnHost(
+    selectedAgent?.harness,
+    harnessWarningHost,
+  );
   const workspaceTrimmed = workspace.trim();
   const workspaceValid = isValidWorkspace(workspace);
   const isCloudHost =
@@ -1212,7 +1285,9 @@ export function NewChatLandingScreen() {
             className="ml-auto self-center border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
             data-testid={`new-chat-landing-agent-warning-${agent.id}`}
           >
-            needs setup
+            {harnessWarningBadgeText(
+              harnessUnavailableReasonOnHost(agent.harness, harnessWarningHost),
+            )}
           </Badge>
         )}
       </DropdownMenuItem>
@@ -2075,8 +2150,11 @@ export function NewChatLandingScreen() {
             >
               <TriangleAlertIcon className="size-3.5 shrink-0" />
               <span>
-                {selectedAgent?.display_name} isn&apos;t configured on {harnessWarningHost?.name} —
-                run <code>omnigent setup</code> on that machine.
+                {harnessWarningMessage(
+                  selectedAgent?.display_name,
+                  harnessWarningHost?.name,
+                  selectedAgentUnavailableReason,
+                )}
               </span>
             </p>
           )}

@@ -30,10 +30,13 @@ export interface RunnerHealthInput {
 // Liveness for one session as the poll (and the stream) report it.
 // `runner_online` is strict — true only while a runner tunnel is
 // registered. `host_online` reports the host tunnel independently, and is
-// `null` when the session has no host_id.
+// `null` when the session has no host_id. `host_version` is the bound
+// host's reported version (info-popover footer), `null` when there's no
+// host binding or the version isn't resolvable server-side.
 export interface SessionLiveness {
   runner_online: boolean;
   host_online: boolean | null;
+  host_version: string | null;
 }
 
 const POLL_INTERVAL_MS = 10_000;
@@ -41,7 +44,10 @@ const POLL_INTERVAL_MS = 10_000;
 const POLL_MAX_INTERVAL_MS = 60_000;
 
 interface BatchHealthResponse {
-  sessions?: Record<string, { runner_online: boolean; host_online?: boolean | null }>;
+  sessions?: Record<
+    string,
+    { runner_online: boolean; host_online?: boolean | null; host_version?: string | null }
+  >;
 }
 
 /**
@@ -99,6 +105,7 @@ export function useRunnerHealth(
                 next.set(id, {
                   runner_online: entry.runner_online,
                   host_online: entry.host_online ?? null,
+                  host_version: entry.host_version ?? null,
                 });
               }
             }

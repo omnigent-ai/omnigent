@@ -443,6 +443,21 @@
         "title": "ChildSessionSummary",
         "type": "object"
       },
+      "ClearCodexGoalResponse": {
+        "description": "Response body for `DELETE /v1/sessions/{id}/codex_goal`.",
+        "properties": {
+          "cleared": {
+            "description": "`True` when Codex removed an existing goal; `False` when no goal was present.",
+            "title": "Cleared",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cleared"
+        ],
+        "title": "ClearCodexGoalResponse",
+        "type": "object"
+      },
       "ClientTaskCancelEvent": {
         "description": "Server-side request that the client cancel a tunneled tool call.\n\nEmitted by `omnigent/runtime/workflow.py` when a parent\ncancellation needs to propagate to a long-running async client\ntool. Wire shape matches `workflow.py:4258-4266`.",
         "properties": {
@@ -488,6 +503,105 @@
           "task_id"
         ],
         "title": "ClientTaskCancelEvent",
+        "type": "object"
+      },
+      "CodexGoalObject": {
+        "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's `ThreadGoal` shape using Omnigent's\nsnake-case API convention. `created_at` and `updated_at` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.",
+        "properties": {
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix timestamp when the goal was created, e.g. `1776272400`. `None` when not provided by Codex.",
+            "title": "Created At"
+          },
+          "objective": {
+            "description": "Goal objective text, e.g. `\"Finish the migration and keep tests green\"`.",
+            "title": "Objective",
+            "type": "string"
+          },
+          "status": {
+            "description": "Raw Codex goal lifecycle status, e.g. `\"active\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "thread_id": {
+            "description": "Codex app-server thread id, e.g. `\"thr_123\"`.",
+            "title": "Thread Id",
+            "type": "string"
+          },
+          "time_used_seconds": {
+            "description": "Wall-clock seconds spent on this goal, e.g. `60`.",
+            "minimum": 0.0,
+            "title": "Time Used Seconds",
+            "type": "integer"
+          },
+          "token_budget": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional token budget, e.g. `40000`. `None` means no explicit budget is set.",
+            "title": "Token Budget"
+          },
+          "tokens_used": {
+            "description": "Tokens spent while pursuing this goal, e.g. `1024`.",
+            "minimum": 0.0,
+            "title": "Tokens Used",
+            "type": "integer"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix timestamp when the goal was last updated, e.g. `1776272460`. `None` when not provided by Codex.",
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "thread_id",
+          "objective",
+          "status",
+          "tokens_used",
+          "time_used_seconds"
+        ],
+        "title": "CodexGoalObject",
+        "type": "object"
+      },
+      "CodexGoalResponse": {
+        "description": "Response body for reading or setting a Codex-native session goal.",
+        "properties": {
+          "goal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CodexGoalObject"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Current goal state, or `None` when the session has no persisted Codex goal."
+          }
+        },
+        "required": [
+          "goal"
+        ],
+        "title": "CodexGoalResponse",
         "type": "object"
       },
       "CompactionCompletedEvent": {
@@ -4876,6 +4990,53 @@
         "title": "SessionUsageEvent",
         "type": "object"
       },
+      "SetCodexGoalRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `PUT /v1/sessions/{id}/codex_goal`.",
+        "properties": {
+          "objective": {
+            "description": "Goal objective text, e.g. `\"Finish the migration and keep tests green\"`. Must be non-empty after trimming and no longer than 4000 characters, matching Codex app-server's goal contract.",
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Objective",
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "active",
+                  "paused"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional user-selected goal status. `\"active\"` starts or resumes the goal, and `\"paused\"` stores it paused. Omit this field to preserve Codex's current lifecycle state.",
+            "title": "Status"
+          },
+          "token_budget": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional positive token budget, e.g. `40000`. Explicit JSON `null` clears the Codex goal budget; omitting the field leaves it absent from the forwarded request.",
+            "title": "Token Budget"
+          }
+        },
+        "required": [
+          "objective"
+        ],
+        "title": "SetCodexGoalRequest",
+        "type": "object"
+      },
       "SkillSummary": {
         "description": "Safe subset of a discovered skill for API exposure.\n\nSurfaces the skill name and one-line description so clients\n(e.g. the web composer's slash-command menu) can list which\nskills the session has access to. The full skill `content`\nis intentionally omitted \u2014 it's only loaded server-side when\nthe harness invokes the skill, and it can be large.",
         "properties": {
@@ -5140,6 +5301,26 @@
           "session_id"
         ],
         "title": "TurnStartedEvent",
+        "type": "object"
+      },
+      "UpdateCodexGoalStatusRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `PATCH /v1/sessions/{id}/codex_goal/status`.\n\nCodex app-server represents pause/resume as `thread/goal/set` status\nupdates. Omnigent exposes the two user-driven transitions explicitly:\n`\"paused\"` pauses an active goal, and `\"active\"` resumes a paused,\nblocked, or usage-limited goal.",
+        "properties": {
+          "status": {
+            "description": "Target Codex goal status, either `\"paused\"` or `\"active\"`.",
+            "enum": [
+              "active",
+              "paused"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "UpdateCodexGoalStatusRequest",
         "type": "object"
       },
       "UpdateCommentRequest": {
@@ -5640,7 +5821,7 @@
     },
     "/health": {
       "get": {
-        "description": "Liveness check with optional session-scoped runner status.\n\nWithout session params, returns `{\"status\": \"ok\"}` (bare\nliveness). With `session_id`, adds a single `session`\nobject. With `session_ids` (comma-separated), adds a\n`sessions` dict keyed by id \u2014 used by the sidebar to\nbatch-check all visible sessions in one request. The batch\npath runs a single SQL `IN` query, not N per-id round-trips.\n\nEach per-session object carries both `runner_online` (strict\nrunner reachability) and `host_online` (host tunnel live, or\n`None` when the session has no host binding) \u2014 see\n`~omnigent.server.routes.sessions.SessionLiveness`.\n\n**Returns:** `{\"status\": \"ok\"}` with optional `session` and/or `sessions` fields. Each session object has shape `{\"runner_online\": bool, \"host_online\": bool | None}` (the single `session` object also includes its `id`).",
+        "description": "Liveness check with optional session-scoped runner status.\n\nWithout session params, returns `{\"status\": \"ok\"}` (bare\nliveness). With `session_id`, adds a single `session`\nobject. With `session_ids` (comma-separated), adds a\n`sessions` dict keyed by id \u2014 used by the sidebar to\nbatch-check all visible sessions in one request. The batch\npath runs a single SQL `IN` query, not N per-id round-trips.\n\nEach per-session object carries both `runner_online` (strict\nrunner reachability) and `host_online` (host tunnel live, or\n`None` when the session has no host binding) \u2014 see\n`~omnigent.server.routes.sessions.SessionLiveness`.\n\n**Returns:** `{\"status\": \"ok\"}` with optional `session` and/or `sessions` fields. Each session object has shape `{\"runner_online\": bool, \"host_online\": bool | None, \"host_version\": str | None}` (the single `session` object also includes its `id`). `host_version` is the bound host's reported version, or `None` when there's no host binding / the version isn't resolvable on this replica.",
         "operationId": "health_health_get",
         "parameters": [
           {
@@ -6187,7 +6368,7 @@
     },
     "/v1/info": {
       "get": {
-        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`), and the short sandbox\nprovider name (`sandbox_provider`) the web UI labels the\nnew-session sandbox option with.",
+        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`), the short sandbox\nprovider name (`sandbox_provider`) the web UI labels the\nnew-session sandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
         "operationId": "info_v1_info_get",
         "responses": {
           "200": {
@@ -7377,6 +7558,198 @@
           }
         },
         "summary": "List Child Sessions",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/codex_goal": {
+      "delete": {
+        "description": "Clear the current Codex app-server goal.\n\n**Returns:** Whether Codex removed an existing goal.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for non-Codex sessions, 404 for missing sessions, or 503 when no live Codex runner can clear the goal.",
+        "operationId": "clear_codex_goal_v1_sessions__session_id__codex_goal_delete",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClearCodexGoalResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clear Codex Goal",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "get": {
+        "description": "Read the current Codex app-server goal for a Codex-native session.\n\n**Returns:** Current Codex goal state, or `goal=None` when no goal is set.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for non-Codex sessions, 404 for missing sessions, or 503 when no live Codex runner can read the goal.",
+        "operationId": "get_codex_goal_v1_sessions__session_id__codex_goal_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodexGoalResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Codex Goal",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "put": {
+        "description": "Set or replace the current Codex app-server goal.\n\n**Parameters**\n\n- `body` \u2014 Goal objective, optional token budget, and optional user-selected status.\n\n**Returns:** Current Codex goal state after the update.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for non-Codex sessions or blank objectives, 404 for missing sessions, or 503 when no live Codex runner can update the goal.",
+        "operationId": "set_codex_goal_v1_sessions__session_id__codex_goal_put",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetCodexGoalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodexGoalResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Codex Goal",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/codex_goal/status": {
+      "patch": {
+        "description": "Pause or resume the current Codex app-server goal.\n\nCodex exposes this through `thread/goal/set` with only a status\nfield. The Omnigent API keeps that distinct from objective/budget\nedits so callers can implement Pause/Resume controls without\nresending the goal text.\n\n**Parameters**\n\n- `body` \u2014 Target status. `\"paused\"` pauses the goal and `\"active\"` resumes it.\n\n**Returns:** Current Codex goal state after the status update.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for non-Codex sessions, 404 for missing sessions, or 503 when no live Codex runner can update the goal.",
+        "operationId": "update_codex_goal_status_v1_sessions__session_id__codex_goal_status_patch",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateCodexGoalStatusRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodexGoalResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Codex Goal Status",
         "tags": [
           "sessions"
         ]
