@@ -88,12 +88,14 @@ class PreparedCursorTerminal:
         terminal was reused (the live-reattach path: prior chat is
         intact).
     :param cold_resumed: ``True`` when resuming an existing Omnigent
-        session whose terminal had already exited, so a *fresh*
-        ``cursor-agent`` TUI was launched with none of the prior turns.
-        Cursor records no resumable chat id, so this is genuinely a new
-        chat - distinct from a brand-new session (``resolved_session_id
-        is None``) and from a live reattach. Drives the honest
-        cold-resume stderr hint. Note: cursor deliberately treats
+        session whose terminal had already exited, so a new
+        ``cursor-agent`` TUI is launched. The forwarder persisted the
+        cursor chat id as ``external_session_id``, so the runner relaunches
+        with ``--resume <chatId>`` and the prior conversation is reloaded
+        (cursor reuses its chat store across ``--resume``). Distinct from a
+        brand-new session (``resolved_session_id is None``) and from a live
+        reattach. Drives the cold-resume stderr hint. Note: cursor
+        deliberately treats
         ``cold_resumed`` and ``reattached`` as mutually exclusive (the
         cold-resume path leaves ``reattached`` at its ``False`` default)
         - unlike ``claude_native`` which models them independently. This
@@ -284,7 +286,10 @@ def _run_with_remote_server(
                 warn=lambda message: click.echo(message, err=True),
             )
             if prepared.cold_resumed:
-                echo_native_cold_resume_hint(agent_label="Cursor")
+                # cursor reuses its chat store across ``cursor-agent --resume``
+                # and the runner injects ``--resume <chatId>`` on cold resume, so
+                # the prior conversation is reloaded rather than lost.
+                echo_native_cold_resume_hint(agent_label="Cursor", restored=True)
             await _attach_terminal_resource(prepared)
             if resolved_session_id is None:
                 echo_native_resume_hint(

@@ -15,6 +15,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import sys
 import tempfile
 import time
@@ -3889,22 +3890,42 @@ def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
     return model
 
 
+#: cursor chat ids are UUIDs (hex + dashes). Validate the persisted
+#: ``external_session_id`` against this shape before feeding it back to
+#: ``cursor-agent --resume`` / storing it durably — defense-in-depth mirroring
+#: codex's ``_CODEX_THREAD_ID_RE`` guard, so a malformed discovery result can
+#: never reach the argv or pin the session to a junk id.
+_CURSOR_CHAT_ID_RE = re.compile(r"^[0-9a-fA-F-]+$")
+
+
 def _cursor_native_resume_args(chat_id: str | None, existing_args: list[str]) -> list[str]:
     """Return ``["--resume", chat_id]`` for a cursor-native cold resume, or ``[]``.
 
     The forwarder persists the cursor chat id as ``external_session_id`` after
     it first discovers the chat store. On a cold resume (terminal has exited)
     this id is injected here so cursor-agent reloads the prior conversation.
+    cursor-agent reuses the same chat id/store across ``--resume`` (verified
+    empirically), so the persisted id stays valid for the life of the session.
 
     :param chat_id: The cursor chat id stored as ``external_session_id``, or
         ``None`` for a brand-new session where the forwarder hasn't run yet.
     :param existing_args: Already-built cursor-agent args; ``--resume`` is
-        skipped when the user already passed one via passthrough launch args.
+        skipped when the user already passed one (``--resume X`` or the joined
+        ``--resume=X`` form) via passthrough launch args.
     :returns: ``["--resume", chat_id]`` or ``[]``.
     """
-    if chat_id and "--resume" not in existing_args:
-        return ["--resume", chat_id]
-    return []
+    if not chat_id:
+        return []
+    if not _CURSOR_CHAT_ID_RE.fullmatch(chat_id):
+        _logger.warning(
+            "cursor-native: persisted chat id %r is not a well-formed cursor "
+            "chat id; not injecting --resume.",
+            chat_id,
+        )
+        return []
+    if any(arg == "--resume" or arg.startswith("--resume=") for arg in existing_args):
+        return []
+    return ["--resume", chat_id]
 
 
 def _agent_os_env_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> Any | None:
@@ -5679,8 +5700,6 @@ def _is_context_overflow_error(event: dict[str, Any]) -> tuple[int, int] | None:
     msg = str(error.get("message", "")).lower()
     if not any(pat in msg for pat in _CONTEXT_OVERFLOW_PATTERNS):
         return None
-    import re
-
     actual_gt_max = re.search(r"(\d{4,})\D*>\D*(\d{4,})", msg)
     if actual_gt_max is not None:
         return int(actual_gt_max.group(2)), int(actual_gt_max.group(1))
