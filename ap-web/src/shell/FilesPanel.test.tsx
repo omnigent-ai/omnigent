@@ -833,6 +833,7 @@ describe("FilesPanel tree (Explore) search", () => {
           conversationId="conv_tree_search_loading"
           showHidden={false}
           changedFiles={[]}
+          sort="alpha"
           searchQuery="test"
           searchResults={undefined}
           isSearching={true}
@@ -861,6 +862,7 @@ describe("FilesPanel tree (Explore) search", () => {
           conversationId="conv_tree_align"
           showHidden={false}
           changedFiles={[]}
+          sort="alpha"
         />
       </TooltipProvider>,
     );
@@ -1008,6 +1010,7 @@ describe("FilesPanel tree (Explore) search", () => {
           conversationId="conv_tree_search_error"
           showHidden={false}
           changedFiles={[]}
+          sort="alpha"
           searchQuery="test"
           searchResults={undefined}
           isSearching={false}
@@ -1196,5 +1199,18 @@ describe("FilesPanel tree (Explore) search", () => {
 
     expect(screen.getByRole("textbox", { name: "files to include" })).toHaveValue("");
     expect(screen.getByRole("textbox", { name: "files to exclude" })).toHaveValue("");
+  });
+});
+
+describe("FilesPanel sort control", () => {
+  it("renders the sort selector in the All (tree) view", () => {
+    // Sort applies to the All tree too, not just the Changed list (trigger is
+    // labeled "Sort: <active>").
+    renderPanel({
+      conversationId: "conv_all_sort",
+      files: [file("a.txt")],
+      flatView: false,
+    });
+    expect(screen.getByRole("button", { name: /^Sort:/ })).toBeInTheDocument();
   });
 });

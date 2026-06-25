@@ -9,6 +9,7 @@ import {
 import { cn } from "@/lib/utils";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
+import { type ChangedSort, compareChangedFiles, type SortableFile } from "./FlatFileList";
 import { formatBytes, gitStatusLabel, gitStatusLetter } from "./fileStatusUtils";
 import { FileDownloadButton } from "./FileDownloadButton";
 import { useCursorTooltip } from "./useCursorTooltip";
@@ -54,6 +55,10 @@ interface DirNode {
   /** Full path from workspace root, e.g. "src/utils". Used for lazy loading. */
   path: string;
   children: TreeNode[];
+  /** Directory mtime when known (from an explicit directory listing entry), so
+   *  directories can participate in the "last edited" sort. Undefined for dirs
+   *  synthesized from a nested file's path, which carry no mtime of their own. */
+  modifiedAt?: number | null;
   /** When true the children come from an explicit directory entry and must be
    *  fetched on demand rather than being statically known from file paths. */
   lazy?: boolean;
@@ -61,7 +66,30 @@ interface DirNode {
 
 type TreeNode = FileNode | DirNode;
 
-function buildTree(files: WorkspaceFile[]): TreeNode[] {
+/** Project a tree node onto the shape the shared file comparator sorts by.
+ *  Directories have a name and (when known) an mtime, but never a size. */
+function nodeSortable(node: TreeNode): SortableFile {
+  if (node.type === "file") return node.file;
+  return { name: node.name, path: node.path, bytes: null, modified_at: node.modifiedAt ?? null };
+}
+
+/**
+ * Comparator for sibling tree nodes. Directories are grouped ahead of files
+ * (the file-explorer default), and within each group entries are ordered by the
+ * chosen criterion via the shared `compareChangedFiles` comparator — so the All
+ * tree and the Changed list order entries identically. Directories carry an
+ * mtime (so "last edited" reorders them) but no size, so under a size sort they
+ * fall back to name among themselves.
+ */
+function compareTreeNodes(sort: ChangedSort) {
+  const compareFiles = compareChangedFiles(sort);
+  return (a: TreeNode, b: TreeNode): number => {
+    if (a.type !== b.type) return a.type === "dir" ? -1 : 1;
+    return compareFiles(nodeSortable(a), nodeSortable(b));
+  };
+}
+
+function buildTree(files: WorkspaceFile[], sort: ChangedSort = "alpha"): TreeNode[] {
   const root: DirNode = { type: "dir", name: "", path: "", children: [] };
 
   for (const file of files) {
@@ -89,6 +117,7 @@ function buildTree(files: WorkspaceFile[]): TreeNode[] {
           name: lastName,
           path: file.path,
           children: [],
+          modifiedAt: file.modified_at,
           lazy: true,
         });
       }
@@ -108,16 +137,14 @@ function buildTree(files: WorkspaceFile[]): TreeNode[] {
     node.children.push({ type: "file", name: parts[parts.length - 1], file });
   }
 
-  function sort(node: DirNode) {
-    node.children.sort((a, b) => {
-      if (a.type !== b.type) return a.type === "dir" ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    });
+  const compare = compareTreeNodes(sort);
+  function sortTree(node: DirNode) {
+    node.children.sort(compare);
     for (const child of node.children) {
-      if (child.type === "dir") sort(child);
+      if (child.type === "dir") sortTree(child);
     }
   }
-  sort(root);
+  sortTree(root);
 
   return root.children;
 }
@@ -163,6 +190,7 @@ export function FolderTree({
   showHidden,
   onShowHidden,
   changedFiles,
+  sort,
   runnerWentOffline = false,
   searchQuery = "",
   searchResults,
@@ -180,6 +208,8 @@ export function FolderTree({
   /** Called when the user clicks "Show hidden files" in the search results. */
   onShowHidden?: () => void;
   changedFiles: WorkspaceChangedFile[] | undefined;
+  /** Active sort order, shared with the Changed list so both views agree. */
+  sort: ChangedSort;
   /**
    * Runner went offline after being connected (session status "failed",
    * e.g. host restarted) — show the reconnect hint. False for a session
@@ -303,7 +333,7 @@ export function FolderTree({
     return (
       <TooltipProvider>
         <ul className="flex flex-col gap-0.5">
-          {visibleResults.map((file) => (
+          {[...visibleResults].sort(compareChangedFiles(sort)).map((file) => (
             <SearchResultRow
               key={file.path}
               file={file}
@@ -338,7 +368,7 @@ export function FolderTree({
     return <p className="px-2 py-1 text-muted-foreground text-xs">No files in workspace</p>;
   }
 
-  const tree = buildTree(files);
+  const tree = buildTree(files, sort);
   const visibleTree = showHidden ? tree : tree.filter((n) => !n.name.startsWith("."));
   if (visibleTree.length === 0) {
     return (
@@ -362,6 +392,7 @@ export function FolderTree({
             showHidden={showHidden}
             changedFileMap={changedFileMap}
             dirtyDirMap={dirtyDirMap}
+            sort={sort}
           />
         ))}
       </ul>
@@ -545,6 +576,7 @@ function TreeNodeRow({
   showHidden,
   changedFileMap,
   dirtyDirMap,
+  sort,
 }: {
   node: TreeNode;
   depth: number;
@@ -555,6 +587,7 @@ function TreeNodeRow({
   showHidden: boolean;
   changedFileMap: Map<string, WorkspaceChangedFile["status"]>;
   dirtyDirMap: Map<string, WorkspaceChangedFile["status"]>;
+  sort: ChangedSort;
 }) {
   const open = node.type === "dir" && expandedPaths.has(node.path);
   const isLazyDir = node.type === "dir" && node.lazy === true;
@@ -582,12 +615,21 @@ function TreeNodeRow({
   // time); otherwise use the statically known children.
   const rawChildNodes: TreeNode[] =
     isLazyDir && lazyData
-      ? lazyData.map((file): TreeNode => {
-          if (file.type === "directory") {
-            return { type: "dir", name: file.name, path: file.path, children: [], lazy: true };
-          }
-          return { type: "file", name: file.name, file };
-        })
+      ? lazyData
+          .map((file): TreeNode => {
+            if (file.type === "directory") {
+              return {
+                type: "dir",
+                name: file.name,
+                path: file.path,
+                children: [],
+                modifiedAt: file.modified_at,
+                lazy: true,
+              };
+            }
+            return { type: "file", name: file.name, file };
+          })
+          .sort(compareTreeNodes(sort))
       : node.children;
   const childNodes = showHidden
     ? rawChildNodes
@@ -666,6 +708,7 @@ function TreeNodeRow({
               showHidden={showHidden}
               changedFileMap={changedFileMap}
               dirtyDirMap={dirtyDirMap}
+              sort={sort}
             />
           ))}
         </ul>
