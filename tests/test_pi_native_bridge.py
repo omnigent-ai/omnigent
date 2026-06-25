@@ -46,6 +46,53 @@ def test_enqueue_preserves_send_order_across_types(tmp_path: Path) -> None:
     assert second in files[2], files
 
 
+def test_enqueue_compact_payload_shape(tmp_path: Path) -> None:
+    """A queued compact request round-trips as well-formed JSON the extension reads.
+
+    The extension dispatches on ``payload.type == "compact"`` and feeds
+    ``payload.custom_instructions`` (when present) to Pi's
+    ``ctx.compact({customInstructions})``. The id must equal the returned
+    ``compact_`` id (the extension dedups on it).
+    """
+    bridge_dir = tmp_path / "bridge"
+    (bridge_dir / "inbox").mkdir(parents=True)
+
+    compact_id = pi_native_bridge.enqueue_compact(bridge_dir)
+
+    (path,) = list((bridge_dir / "inbox").glob("*.json"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["id"] == compact_id
+    assert compact_id.startswith("compact_")
+    assert payload["type"] == "compact"
+    assert isinstance(payload["created_at"], (int, float))
+    # No instructions given → key omitted so the extension uses Pi's default
+    # summarisation rather than passing an empty customInstructions string.
+    assert "custom_instructions" not in payload
+
+
+def test_enqueue_compact_includes_custom_instructions(tmp_path: Path) -> None:
+    """Non-blank custom instructions ride along; blank ones are dropped.
+
+    Pi's ``compact({customInstructions})`` focuses the summary on the given
+    text. An empty/whitespace string must be dropped so it doesn't override
+    Pi's default summarisation with a no-op instruction.
+    """
+    bridge_dir = tmp_path / "bridge"
+    (bridge_dir / "inbox").mkdir(parents=True)
+
+    pi_native_bridge.enqueue_compact(bridge_dir, "focus on the refactor")
+    pi_native_bridge.enqueue_compact(bridge_dir, "   ")
+
+    payloads = sorted(
+        (json.loads(p.read_text(encoding="utf-8")) for p in (bridge_dir / "inbox").glob("*.json")),
+        key=lambda payload: payload["created_at"],
+    )
+    assert len(payloads) == 2, payloads
+    with_instructions = [p for p in payloads if "custom_instructions" in p]
+    assert len(with_instructions) == 1, payloads
+    assert with_instructions[0]["custom_instructions"] == "focus on the refactor"
+
+
 def test_enqueue_user_message_payload_shape(tmp_path: Path) -> None:
     """A queued user message round-trips as well-formed JSON the extension reads.
 

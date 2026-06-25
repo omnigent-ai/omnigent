@@ -193,7 +193,61 @@ function interruptActiveContext(ctx) {
   }
 }
 
-function startInboxPoller(pi, config, handleInterrupt) {
+/**
+ * Trigger Pi's own context compaction on the resident ExtensionContext.
+ *
+ * Pi owns its context window inside this TUI process, so explicit /compact
+ * must run here (the Omnigent server's AP-side compaction would only
+ * summarise the transcript mirror and desync the two). ctx.compact() is
+ * fire-and-forget (returns void); Pi summarises older messages and appends a
+ * CompactionEntry to the session. We bracket it with external_compaction_status
+ * events the server republishes as response.compaction.* SSE, so the web UI's
+ * "Compacting conversation…" spinner tracks Pi's real progress: in_progress on
+ * submit, then completed/failed from Pi's onComplete/onError callbacks.
+ *
+ * Returns true once compaction was submitted (a completed/failed edge will
+ * follow), or false when no compactable context is available — the caller
+ * publishes the failed edge so the spinner is never stranded.
+ */
+function triggerCompaction(config, ctx, customInstructions) {
+  if (!ctx || typeof ctx.compact !== "function") return false;
+  const options = {
+    onComplete: () => {
+      postEvent(config, {
+        type: "external_compaction_status",
+        data: { status: "completed" },
+      });
+    },
+    onError: (_error) => {
+      postEvent(config, {
+        type: "external_compaction_status",
+        data: { status: "failed" },
+      });
+    },
+  };
+  if (typeof customInstructions === "string" && customInstructions.trim()) {
+    options.customInstructions = customInstructions;
+  }
+  try {
+    // Raise the spinner first: ctx.compact() is fire-and-forget, so the
+    // in_progress edge must precede it to bracket the async work. If compact()
+    // throws synchronously the catch publishes failed to dismiss the spinner.
+    postEvent(config, {
+      type: "external_compaction_status",
+      data: { status: "in_progress" },
+    });
+    ctx.compact(options);
+    return true;
+  } catch (_err) {
+    postEvent(config, {
+      type: "external_compaction_status",
+      data: { status: "failed" },
+    });
+    return false;
+  }
+}
+
+function startInboxPoller(pi, config, handleInterrupt, handleCompact) {
   if (!config || !config.inboxDir || pi.__omnigentInboxPoller) return;
   // Bound the dedup set (FIFO eviction) — delivered files are unlinked, so a
   // long-lived TUI mustn't grow it unboundedly.
@@ -295,6 +349,21 @@ function startInboxPoller(pi, config, handleInterrupt) {
         // already in flight still gets aborted via replay without poisoning the
         // next freshly-started turn.
         if (typeof handleInterrupt === "function") handleInterrupt();
+      }
+      if (payload.type === "compact") {
+        // A compact request is point-in-time like an interrupt: make one
+        // delivery attempt against the resident context, then always consume
+        // the file (below). handleCompact publishes the in_progress /
+        // completed / failed compaction edges itself (so the web UI spinner is
+        // never stranded), so there is nothing to retry — leaving the file
+        // would re-trigger compaction every tick.
+        if (typeof handleCompact === "function") {
+          handleCompact(
+            typeof payload.custom_instructions === "string"
+              ? payload.custom_instructions
+              : undefined,
+          );
+        }
       }
       if (id !== null) rememberSeen(id);
       try {
@@ -480,7 +549,13 @@ module.exports = function (pi) {
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
     setOmnigentStatus(config, ctx, "linked");
-    startInboxPoller(pi, config, () => requestInterrupt(latestContext));
+    startInboxPoller(
+      pi,
+      config,
+      () => requestInterrupt(latestContext),
+      (customInstructions) =>
+        triggerCompaction(config, latestContext, customInstructions),
+    );
     const nativeSessionId =
       ctx && ctx.sessionManager && ctx.sessionManager.getSessionId
         ? ctx.sessionManager.getSessionId()
