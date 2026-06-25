@@ -242,3 +242,44 @@ class TestInjectModelGate:
             cursor_native_bridge.inject_model_command(bridge_dir, model="gpt-5.2")
 
         assert ["-t", _TARGET, "Enter"] not in _send_keys_calls(captured)
+
+
+class TestHooksConfig:
+    """The ``hooks.json`` that registers cursor's per-turn usage ``stop`` hook."""
+
+    def test_build_hooks_config_shape(self) -> None:
+        cfg = cursor_native_bridge.build_hooks_config(
+            Path("/tmp/bridge"), python_executable="/usr/bin/python3"
+        )
+        assert cfg["version"] == 1
+        hooks = cfg["hooks"]["stop"]
+        assert len(hooks) == 1
+        command = hooks[0]["command"]
+        # The recorder is invoked isolated (-I) on the usage module, with the
+        # absolute bridge dir baked in so it writes where the forwarder reads.
+        assert "-I" in command
+        assert "omnigent.cursor_native_usage" in command
+        assert "record-usage" in command
+        assert "/tmp/bridge" in command
+        assert command.startswith("/usr/bin/python3")
+
+    def test_build_hooks_config_quotes_spaced_paths(self) -> None:
+        cfg = cursor_native_bridge.build_hooks_config(
+            Path("/tmp/dir with space"), python_executable="/usr/bin/python3"
+        )
+        command = cfg["hooks"]["stop"][0]["command"]
+        # A shell-quoted path keeps the spaced bridge dir a single argv token.
+        assert "'/tmp/dir with space'" in command
+
+    def test_write_hooks_config_writes_project_scoped_file(self, tmp_path: Path) -> None:
+        import json
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        bridge_dir = tmp_path / "bridge"
+        path = cursor_native_bridge.write_hooks_config(workspace, bridge_dir)
+        assert path == workspace / ".cursor" / "hooks.json"
+        payload = json.loads(path.read_text())
+        assert payload["hooks"]["stop"][0]["command"].endswith(str(bridge_dir))
+        # No leftover temp file from the atomic write.
+        assert not (workspace / ".cursor" / "hooks.json.tmp").exists()

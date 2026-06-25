@@ -32,6 +32,7 @@ _BRIDGE_ROOT = Path(tempfile.gettempdir()) / f"omnigent-{stable_user_id()}" / "c
 _TMUX_FILE = "tmux.json"
 _BRIDGE_CONFIG_FILE = "bridge.json"
 _MCP_CONFIG_FILE = "mcp.json"
+_HOOKS_CONFIG_FILE = "hooks.json"
 _MCP_SERVER_NAME = "omnigent"
 _CURSOR_AUTO_APPROVE_TOOLS = [
     "list_comments",
@@ -191,6 +192,59 @@ def write_mcp_config(
     os.replace(tmp, path)
     enable_mcp_for_workspace(workspace)
     allow_mcp_tools_in_cli_config()
+    return path
+
+
+def build_hooks_config(
+    bridge_dir: Path, *, python_executable: str | None = None
+) -> dict[str, Any]:
+    """Build Cursor's ``.cursor/hooks.json`` registering the usage ``stop`` hook.
+
+    cursor-agent fires the ``stop`` hook once per completed turn with a JSON
+    payload (on stdin) carrying that turn's token usage — the only surface where
+    the interactive TUI exposes usage. The hook command runs
+    ``omnigent.cursor_native_usage record-usage``, which appends the usage to
+    ``<bridge_dir>/cursor_usage.jsonl`` for the runner's usage forwarder to tail
+    and post as ``external_session_usage`` (lighting up the web Session-cost
+    badge). Bakes the absolute ``--bridge-dir`` so the recorder writes where the
+    forwarder reads, regardless of the hook's working directory.
+    """
+    import shlex
+
+    python = python_executable or sys.executable
+    command = " ".join(
+        shlex.quote(part)
+        for part in (
+            python,
+            "-I",
+            "-m",
+            "omnigent.cursor_native_usage",
+            "record-usage",
+            "--bridge-dir",
+            str(bridge_dir),
+        )
+    )
+    return {"version": 1, "hooks": {"stop": [{"command": command}]}}
+
+
+def write_hooks_config(
+    workspace: Path,
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> Path:
+    """Write the workspace-scoped Cursor ``hooks.json`` capturing per-turn usage.
+
+    Sibling of :func:`write_mcp_config`: project-scoped Cursor config the TUI
+    loads on launch in a trusted workspace. Returns the written path.
+    """
+    cursor_dir = workspace / ".cursor"
+    cursor_dir.mkdir(parents=True, exist_ok=True)
+    path = cursor_dir / _HOOKS_CONFIG_FILE
+    payload = build_hooks_config(bridge_dir, python_executable=python_executable)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
     return path
 
 
