@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
@@ -743,6 +744,53 @@ async def test_layer2_failure_falls_back_to_layer3(monkeypatch: pytest.MonkeyPat
     )
     # Some messages must have been returned (Layer 3 truncated, not emptied).
     assert len(result.messages) > 0
+
+
+@pytest.mark.asyncio
+async def test_layer2_401_logs_auth_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A 401 during Layer 2 should name the auth/config problem before
+    falling back to Layer 3.
+    """
+    call_idx = [0]
+
+    def mock_count_tokens(msgs: list[dict[str, Any]], model: str) -> int:
+        """
+        Trigger Layer 2, then let Layer 3 finish after one truncation pass.
+        """
+        call_idx[0] += 1
+        return 10001 if call_idx[0] <= 2 else 50
+
+    monkeypatch.setattr("omnigent.runtime.compaction.count_tokens", mock_count_tokens)
+
+    async def _raise_unauthorized(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Raise an LLM error shaped like a provider HTTP 401."""
+        raise RetryableLLMError("Unauthorized", code="401")
+
+    monkeypatch.setattr(
+        "omnigent.runtime.compaction.summarize_history",
+        _raise_unauthorized,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runtime.compaction"):
+        result = await compact(
+            [_user_msg_dict("first"), _assistant_msg_dict()],
+            [_user_msg("msg_u1"), _assistant_msg("msg_a1")],
+            config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
+            context_window=12500,
+            system_token_budget=0,
+            model="openai/gpt-4o",
+            task_id="task_401",
+            llm_client=_RaisesIfCalled(),
+        )
+
+    assert result.summary_metadata is None
+    assert "HTTP 401 Unauthorized" in caplog.text
+    assert "configured LLM credentials/base URL" in caplog.text
+    assert "task_401" in caplog.text
 
 
 @pytest.mark.asyncio
