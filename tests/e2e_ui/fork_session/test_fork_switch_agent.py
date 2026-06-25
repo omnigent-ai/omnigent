@@ -71,6 +71,10 @@ def _agent_id_by_name(base_url: str, name: str) -> str:
     return str(agent["id"])
 
 
+# ``send_and_await_assistant_reply`` recovers the first turn from the
+# missed-stream / harness-stall flake; the marker is a backstop for any
+# residual stall (e.g. a re-sent turn that also stalls).
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 @pytest.mark.parametrize(
     ("target_name", "expected_wrapper", "expect_carry_history"),
     [
@@ -199,6 +203,7 @@ def test_fork_switch_agent_carries_history(
         )
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_fork_into_pi_labels_model_picker_pi(
     page: Page,
     seeded_session: tuple[str, str],

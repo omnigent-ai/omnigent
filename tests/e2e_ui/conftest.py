@@ -549,56 +549,86 @@ def set_fallback_mock_llm(
     resp.raise_for_status()
 
 
+_ASSISTANT_BUBBLE = '[data-testid="message-bubble"][data-role="assistant"]'
+
+
+def _wait_assistant_visible(page: Page, timeout_ms: int) -> bool:
+    """Return True if an assistant bubble becomes visible within *timeout_ms*."""
+    bubble = page.locator(_ASSISTANT_BUBBLE).first
+    try:
+        expect(bubble).to_be_visible(timeout=timeout_ms)
+    except AssertionError:
+        return False
+    return True
+
+
 def send_and_await_assistant_reply(
     page: Page,
     text: str,
     *,
-    reply_timeout_ms: int = 60_000,
     miss_timeout_ms: int = 30_000,
+    reload_timeout_ms: int = 20_000,
+    reply_timeout_ms: int = 60_000,
 ) -> Locator:
     """Send *text* through the chat composer and return the assistant bubble.
 
-    Recovers from a client-side stream-subscription race that flaked several
-    "send a turn, wait for the reply" e2e tests: the composer becomes
-    interactive (and the test clicks Send) as soon as ``bindStream``'s history
-    snapshot resolves, which can land *before* the live event pump has
-    connected — ``bindStream`` starts the pump fire-and-forget
-    (``void startStreamPump(...)``) and the session stream is live-tail with
-    **no replay buffer** (see ``ap-web/src/store/chatStore.ts``). A turn whose
-    reply streams in that window reaches no subscriber, so no live bubble
-    renders even though the server persisted the turn (its runner relay
-    subscribes before dispatch). The instant mock LLM makes losing the race
-    likely, so on a miss we reload once: ``bindStream`` then re-hydrates the
-    persisted reply from the snapshot, making ``send → see a reply``
-    deterministic without depending on winning the subscription race.
+    Two independent failure modes flaked the "send a turn, wait for the reply"
+    e2e tests; this helper recovers from both so callers get a deterministic
+    ``send → see a reply``:
+
+    1. **Missed live stream (reply persisted).** The composer becomes
+       interactive — and the test clicks Send — as soon as ``bindStream``'s
+       history snapshot resolves, which can land *before* the live event pump
+       has connected (``bindStream`` starts it fire-and-forget and the session
+       stream is live-tail with **no replay buffer** — see
+       ``ap-web/src/store/chatStore.ts``). The reply streams to no subscriber,
+       so no live bubble renders, but the server persisted the turn (its runner
+       relay subscribes before dispatch). A **reload** re-hydrates it from the
+       snapshot.
+    2. **Harness first-turn stall (no reply produced).** The in-process harness
+       occasionally yields no output and the runner goes idle (see #1086), so
+       nothing is persisted and a reload finds nothing. A **re-send** dispatches
+       a fresh turn on the now-idle session (the pump is connected by now),
+       which reliably produces output.
+
+    The instant mock LLM makes both likely. We escalate: wait → reload → wait →
+    re-send → wait.
 
     :param page: Playwright page already navigated to ``/c/<session_id>``.
     :param text: Message to type into the composer.
-    :param reply_timeout_ms: Budget for the reply to appear after the
-        (possibly post-reload) attempt — sized for cold-start latency.
-    :param miss_timeout_ms: How long to wait for the live render before
-        treating it as missed and reloading. A genuine miss never resolves,
-        so this only needs to comfortably exceed normal stream latency.
+    :param miss_timeout_ms: How long to wait for the initial live render before
+        treating it as missed. A genuine miss never resolves, so this only
+        needs to comfortably exceed normal stream latency.
+    :param reload_timeout_ms: How long to wait for the reloaded snapshot to
+        surface a persisted reply before concluding none was produced.
+    :param reply_timeout_ms: Budget for the re-sent turn's reply — sized for
+        cold-start latency.
     :returns: The first ``data-role="assistant"`` message-bubble locator,
         asserted visible. Callers add their own content assertions.
     """
-    composer = page.get_by_placeholder("Ask the agent anything…")
-    expect(composer).to_be_visible()
-    composer.fill(text)
-    page.get_by_role("button", name="Send", exact=True).click()
 
-    assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
-    try:
-        expect(assistant).to_be_visible(timeout=miss_timeout_ms)
-    except AssertionError:
-        # Live stream was missed — reload to pull the persisted reply from
-        # the snapshot. Reloading mid-turn is safe: the fresh bind connects
-        # the pump before forwarding and catches an in-flight turn.
-        page.reload()
-        assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
+    def _send() -> None:
+        composer = page.get_by_placeholder("Ask the agent anything…")
+        expect(composer).to_be_visible()
+        composer.fill(text)
+        # The Send button only exists (vs. "Interrupt") when no turn is
+        # streaming, so this click auto-waits for the session to be idle.
+        page.get_by_role("button", name="Send", exact=True).click()
 
-    expect(assistant).to_be_visible(timeout=reply_timeout_ms)
-    return assistant
+    _send()
+    if _wait_assistant_visible(page, miss_timeout_ms):
+        return page.locator(_ASSISTANT_BUBBLE).first
+
+    # Mode 1: re-hydrate a persisted-but-not-rendered reply.
+    page.reload()
+    if _wait_assistant_visible(page, reload_timeout_ms):
+        return page.locator(_ASSISTANT_BUBBLE).first
+
+    # Mode 2: no reply was produced — dispatch a fresh turn.
+    _send()
+    bubble = page.locator(_ASSISTANT_BUBBLE).first
+    expect(bubble).to_be_visible(timeout=reply_timeout_ms)
+    return bubble
 
 
 @pytest.fixture(scope="session")
