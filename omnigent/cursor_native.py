@@ -165,7 +165,7 @@ def _inject_mode_arg(
         return cursor_args
     if any(arg in ("--mode", "--plan") or arg.startswith("--mode=") for arg in cursor_args):
         return cursor_args
-    return ("--mode", mode) + cursor_args
+    return ("--mode", mode, *cursor_args)
 
 
 def run_cursor_native(
