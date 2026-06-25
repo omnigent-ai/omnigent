@@ -1080,6 +1080,7 @@ function ConversationRow({
           {relativeTime(conversation.updated_at * 1000)}
         </span>
       )}
+      {/* Pin button: desktop-only (hidden on mobile; use kebab menu instead). */}
       {!selectionMode && (
         <Button
           type="button"
@@ -1089,6 +1090,7 @@ function ConversationRow({
           data-testid="quick-pin-conversation"
           className={cn(
             "-translate-y-1/2 absolute top-1/2 right-9 transition-opacity",
+            "hidden md:block",
             "md:opacity-0 md:group-hover:opacity-100",
             "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
           )}
@@ -1131,6 +1133,15 @@ function ConversationRow({
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="min-w-36">
+            {/* Pin/Unpin — mobile-only; desktop has the quick-pin button. */}
+            <DropdownMenuItem
+              data-testid="pin-conversation"
+              className="md:hidden"
+              onSelect={() => onTogglePinned(conversation.id)}
+            >
+              {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+              {isPinned ? "Unpin" : "Pin"}
+            </DropdownMenuItem>
             {isOwner ? (
               <DropdownMenuItem data-testid="archive-conversation" onSelect={runArchive}>
                 {isArchived ? (
