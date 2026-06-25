@@ -70,19 +70,64 @@ export function agentDisplayLabel(name: string): string {
 }
 
 /** Compact pill row listing MCP servers attached to an agent. */
-export function McpServerList({ servers }: { servers: McpServerSummary[] }) {
+export function McpServerList({
+  servers,
+  onDelete,
+}: {
+  servers: McpServerSummary[];
+  onDelete?: (name: string) => void;
+}) {
   return (
     <div className="flex flex-wrap gap-1">
-      {servers.map((srv) => (
-        <span
-          key={srv.name}
-          title={srv.description ?? srv.name}
-          className="flex items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
-        >
-          <ServerIcon className="size-2.5 shrink-0" />
-          {srv.name}
-        </span>
-      ))}
+      {servers.map((srv) =>
+        onDelete ? (
+          <Popover key={srv.name}>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                className="flex cursor-pointer items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:bg-muted/80"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <ServerIcon className="size-2.5 shrink-0" />
+                {srv.name}
+              </button>
+            </PopoverTrigger>
+            <PopoverContent
+              side="top"
+              align="start"
+              className="w-64"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center gap-1.5">
+                  <ServerIcon className="size-3.5 text-muted-foreground" />
+                  <span className="font-medium text-sm">{srv.name}</span>
+                </div>
+                {srv.description && (
+                  <p className="text-xs text-muted-foreground">{srv.description}</p>
+                )}
+                <button
+                  type="button"
+                  onClick={() => onDelete(srv.name)}
+                  className="flex items-center gap-1 self-end rounded px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
+                >
+                  <TrashIcon className="size-3" />
+                  Remove
+                </button>
+              </div>
+            </PopoverContent>
+          </Popover>
+        ) : (
+          <span
+            key={srv.name}
+            title={srv.description ?? srv.name}
+            className="flex items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
+          >
+            <ServerIcon className="size-2.5 shrink-0" />
+            {srv.name}
+          </span>
+        ),
+      )}
     </div>
   );
 }
@@ -812,14 +857,16 @@ function McpServersSection({
   editable: boolean;
 }) {
   const [managerOpen, setManagerOpen] = useState(false);
-  const showSection = servers.length > 0 || (sessionId && editable);
+  const canEdit = !!(sessionId && editable);
+  const deleteServer = useDeleteMcpServer(canEdit ? sessionId : "");
+  const showSection = servers.length > 0 || canEdit;
   if (!showSection) return null;
 
   return (
     <div className="flex flex-col gap-1.5">
       <div className="flex items-center justify-between">
         <SectionLabel>Tools</SectionLabel>
-        {sessionId && editable && (
+        {canEdit && (
           <button
             type="button"
             onClick={() => setManagerOpen(true)}
@@ -832,13 +879,16 @@ function McpServersSection({
         )}
       </div>
       {servers.length > 0 ? (
-        <McpServerList servers={servers} />
+        <McpServerList
+          servers={servers}
+          onDelete={canEdit ? (name) => deleteServer.mutate(name) : undefined}
+        />
       ) : (
         <p className="text-xs text-muted-foreground">No MCP servers</p>
       )}
-      {sessionId && editable && (
+      {canEdit && (
         <McpServerManagerDialog
-          sessionId={sessionId}
+          sessionId={sessionId!}
           servers={servers}
           open={managerOpen}
           onOpenChange={setManagerOpen}

@@ -455,6 +455,17 @@ describe("McpServersSection", () => {
 
     expect(deleteMcpMutate).toHaveBeenCalledWith("slack");
   });
+
+  it("deletes an MCP server from the inline pill popover", () => {
+    renderContent("conv_mcp");
+
+    // Click the pill to open its popover
+    fireEvent.click(screen.getByRole("button", { name: "slack" }));
+    // Click "Remove" in the popover
+    fireEvent.click(screen.getByRole("button", { name: /Remove/ }));
+
+    expect(deleteMcpMutate).toHaveBeenCalledWith("slack");
+  });
 });
 
 describe("agentDisplayLabel", () => {
