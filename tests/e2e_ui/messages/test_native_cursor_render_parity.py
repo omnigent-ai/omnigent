@@ -38,13 +38,30 @@ logged in (a dev box, or a CI job that installs ``cursor-agent`` and provides a
 ``CURSOR_API_KEY`` secret). The ``native_cursor_session`` fixture launches the
 TUI with ``-f`` so the unattended tmux pane never blocks on Cursor's
 workspace-trust / per-tool approval prompts.
+
+CI coverage without a Cursor account
+------------------------------------
+Because the live test above skips wherever Cursor is not logged in — i.e. on
+every PR — :func:`test_native_cursor_mirror_renders_without_live_agent` covers
+the same Omnigent-owned half (the forwarder mirroring cursor's transcript OUT as
+conversation items the SPA renders as bubbles) with no live ``cursor-agent`` and
+no LLM. ``cursor-agent`` has no OpenAI-compatible / custom-endpoint shim (see
+``omnigent.inner.cursor_harness``), so it cannot be pointed at the mock LLM the
+custom-agent suites use; instead this test seeds a cursor chat store and runs the
+real :func:`omnigent.cursor_native_forwarder.forward_cursor_store_to_session`
+against the spawned server, so the mirror→server→web path runs on every PR.
 """
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import logging
 import os
 import shutil
+import sqlite3
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -52,6 +69,8 @@ from pathlib import Path
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from omnigent import cursor_native_forwarder as fwd
 
 # Reuse the custom-agent suite's helpers — both surfaces render from the same
 # canonical transcript, so parity / dedup / ordering are asserted identically.
@@ -112,7 +131,11 @@ def _cursor_unavailable_reason() -> str | None:
     return None
 
 
-pytestmark = pytest.mark.skipif(
+# Gate the LIVE render-parity test (it drives a real cursor-agent TUI) on a
+# usable Cursor login. This is a per-test mark, NOT a module-level ``pytestmark``,
+# so the store-stub mirror test below — which needs no live agent — still runs in
+# CI on every PR. See ``test_native_cursor_mirror_renders_without_live_agent``.
+_requires_live_cursor = pytest.mark.skipif(
     _cursor_unavailable_reason() is not None,
     reason=_cursor_unavailable_reason() or "",
 )
@@ -206,6 +229,7 @@ def _wait_marker_in_transcript(
     )
 
 
+@_requires_live_cursor
 @pytest.mark.timeout(900)
 def test_native_cursor_message_render_parity(
     page: Page,
@@ -287,3 +311,190 @@ def test_native_cursor_message_render_parity(
     _assert_no_duplicate_render(page, user_markers, assistant_tokens)
     _assert_transcript_parity(base_url, session_id, user_markers, assistant_tokens)
     _log.info("all turns verified: render parity + no-duplicate-render + transcript parity")
+
+
+def _seed_cursor_store(store_path: Path, user_marker: str, assistant_token: str) -> None:
+    """Write a minimal cursor-agent chat store: one user turn and its reply.
+
+    Reproduces the content-addressed ``blobs`` layout a live ``cursor-agent``
+    writes — ``id`` is a content hash, ``data`` is the message JSON — so the real
+    forwarder reads it exactly as it would a live chat. The user text carries
+    cursor's ``<user_query>…</user_query>`` framing (the forwarder unwraps it).
+
+    The 64-char ``sha256`` blob ids are load-bearing: they make the forwarder's
+    ``cursor:<blob_id>`` 71 chars, so this drives the response_id cap through the
+    real POST path — the exact field that overflowed ``conversation_items``'
+    ``VARCHAR(64)`` and wedged the mirror in production.
+
+    :param store_path: Destination ``store.db`` path.
+    :param user_marker: Unique token embedded in the user message.
+    :param assistant_token: Unique token embedded in the assistant reply.
+    """
+    rows = [
+        (
+            hashlib.sha256(b"cursor-mirror-user").hexdigest(),
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"<user_query>\n{user_marker}\n</user_query>"}
+                ],
+            },
+        ),
+        (
+            hashlib.sha256(b"cursor-mirror-assistant").hexdigest(),
+            {"role": "assistant", "content": [{"type": "text", "text": assistant_token}]},
+        ),
+    ]
+    con = sqlite3.connect(str(store_path))
+    try:
+        con.execute("CREATE TABLE blobs(id TEXT PRIMARY KEY, data BLOB)")
+        for blob_id, payload in rows:
+            con.execute(
+                "INSERT INTO blobs(id, data) VALUES(?, ?)",
+                (blob_id, json.dumps(payload).encode("utf-8")),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+async def _mirror_seeded_store(
+    base_url: str,
+    session_id: str,
+    store_path: Path,
+    bridge_dir: Path,
+    *,
+    user_marker: str,
+    assistant_token: str,
+    timeout_s: float = 60.0,
+) -> None:
+    """Run the real forwarder against *store_path* until both seeds are mirrored.
+
+    Drives :func:`forward_cursor_store_to_session` exactly as the runner does
+    (``headers={}``, ``auth=None`` — the e2e server runs with auth disabled),
+    polling the canonical items API until the user marker and assistant token are
+    both persisted, then cancelling the forwarder. The caller stubs
+    ``_discover_store`` / ``_chat_claimed_by_other`` so the forwarder binds the
+    seeded store without scanning ``~/.cursor`` or launching ``cursor-agent``.
+
+    :raises AssertionError: If the seeds never reach the transcript in time —
+        i.e. the forwarder failed to mirror (e.g. a wedged / rejected POST).
+    """
+    task = asyncio.create_task(
+        fwd.forward_cursor_store_to_session(
+            base_url=base_url,
+            headers={},
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            agent_name="cursor-native-ui",
+            workspace="/seeded/cursor/workspace",
+            launch_epoch_ms=0,
+            poll_interval_s=0.05,
+            auth=None,
+        )
+    )
+    deadline = time.monotonic() + timeout_s
+    try:
+        async with httpx.AsyncClient(base_url=base_url, timeout=10.0) as client:
+            while time.monotonic() < deadline:
+                resp = await client.get(
+                    f"/v1/sessions/{session_id}/items",
+                    params={"limit": 100, "order": "asc"},
+                )
+                body = str(resp.json().get("data", [])) if resp.status_code == 200 else ""
+                if user_marker in body and assistant_token in body:
+                    return
+                await asyncio.sleep(0.1)
+        raise AssertionError(
+            f"forwarder did not mirror the seeded store into session {session_id} "
+            f"within {timeout_s}s — marker/token never reached the transcript."
+        )
+    finally:
+        task.cancel()
+        # Drain the cancelled task (return_exceptions swallows its CancelledError).
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def _run_coro_in_thread(coro) -> None:
+    """Run *coro* to completion in a dedicated event loop on a worker thread.
+
+    The e2e test body runs under pytest-playwright's sync API, which already
+    holds a running event loop on the test thread — so ``asyncio.run`` raises
+    "cannot be called from a running event loop". Driving the forwarder
+    coroutine in its own thread + loop sidesteps that and re-raises any failure
+    (e.g. the mirror-timeout ``AssertionError``) on the caller's thread.
+
+    :param coro: An awaitable to run to completion.
+    """
+    failure: list[BaseException] = []
+
+    def _target() -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(coro)
+        except Exception as exc:  # surfaced on the test thread below
+            failure.append(exc)
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=_target)
+    thread.start()
+    thread.join()
+    if failure:
+        raise failure[0]
+
+
+@pytest.mark.timeout(300)
+def test_native_cursor_mirror_renders_without_live_agent(
+    page: Page,
+    seeded_session: tuple[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cursor's forwarder mirrors its chat store into the web chat — in CI.
+
+    The live render-parity test above needs a real ``cursor-agent`` + Cursor
+    login, so it skips on every PR. This covers the SAME Omnigent-owned path —
+    the forwarder mirroring cursor's transcript OUT as conversation items the SPA
+    renders as bubbles — with no live agent and no LLM: seed a cursor chat store,
+    run the real ``forward_cursor_store_to_session`` against the spawned server,
+    and assert the content streams through to the web chat (one user + one
+    assistant bubble, once each, matching the canonical transcript). Guards the
+    mirror→server→web path the response_id-truncation fix lives on.
+    """
+    base_url, session_id = seeded_session
+    store_path = tmp_path / "store.db"
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    nonce = uuid.uuid4().hex[:8]
+    user_marker = f"usr-{nonce}"
+    assistant_token = f"ast-{nonce}"
+    _seed_cursor_store(store_path, user_marker, assistant_token)
+
+    # Bind the seeded store directly: stub discovery (no ~/.cursor scan, no live
+    # cursor-agent) and the sibling-claim guard. Everything else — the read,
+    # item build, capped response_id, and POST — runs for real.
+    monkeypatch.setattr(fwd, "_discover_store", lambda workspace, launch_ms: store_path)
+    monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *args, **kwargs: False)
+    _run_coro_in_thread(
+        _mirror_seeded_store(
+            base_url,
+            session_id,
+            store_path,
+            bridge_dir,
+            user_marker=user_marker,
+            assistant_token=assistant_token,
+        )
+    )
+    _log.info("forwarder mirrored seeded store into session=%s", session_id)
+
+    # The mirrored turn must surface in the web chat as one user + one assistant
+    # bubble (the "content streams through" property), exactly once each.
+    page.goto(f"{base_url}/c/{session_id}")
+    _ensure_chat_view(page)
+    expect(page.locator(_ASSISTANT, has_text=assistant_token).first).to_be_visible(timeout=30_000)
+    expect(page.locator(_USER, has_text=user_marker).first).to_be_visible(timeout=30_000)
+    expect(page.locator(_USER, has_text=user_marker)).to_have_count(1)
+    expect(page.locator(_ASSISTANT, has_text=assistant_token)).to_have_count(1)
+    # …and match the canonical transcript the TUI renders from, once and in order.
+    _assert_transcript_parity(base_url, session_id, [user_marker], [assistant_token])

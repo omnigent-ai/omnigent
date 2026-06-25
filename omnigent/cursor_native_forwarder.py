@@ -41,6 +41,8 @@ from pathlib import Path
 
 import httpx
 
+from omnigent._native_post_delivery import post_may_have_been_delivered
+
 _logger = logging.getLogger(__name__)
 
 #: Seconds between store polls. Cursor turns run for many seconds/minutes in the
@@ -48,6 +50,29 @@ _logger = logging.getLogger(__name__)
 #: latency; ~0.7s keeps the chat view feeling live.
 _DEFAULT_POLL_INTERVAL_S = 0.7
 _POST_TIMEOUT_S = 30.0
+
+#: Max length of a mirrored item's ``response_id``. The server stores it in
+#: ``conversation_items.response_id``, a ``VARCHAR(64)`` (see
+#: ``omnigent.db.db_models.SqlConversationItem``). cursor's content-address blob
+#: id is itself a 64-char hash, so an un-capped ``cursor:<blob_id>`` is 71 chars
+#: and overflows the column — every mirror POST then 500s and, because the poll
+#: loop only advances its high-water rowid after a successful POST, the forwarder
+#: wedges on that one message and re-posts it forever. Cap at the column width.
+#: ``response_id`` is a non-unique, non-dedup grouping label, so truncation can in
+#: theory alias two blobs onto one id — that only groups two messages under one UI
+#: response, never data loss.
+_RESPONSE_ID_MAX_LEN = 64
+
+#: Consecutive server rejections (a 4xx, or a 5xx such as a failed DB insert) of
+#: a single mirror item the poll loop tolerates before it logs and skips past
+#: that item. Without this bound a rejected POST never advances ``last_rowid``,
+#: so the loop re-POSTs the same item every ``_DEFAULT_POLL_INTERVAL_S`` forever
+#: — mirroring nothing after it and flooding the app. A connection-level failure
+#: (server unreachable) is deliberately NOT counted here: that is not the item's
+#: fault, so it retries indefinitely rather than drop the conversation. At the
+#: ~0.7s poll cadence this is a few seconds of retrying — enough to ride out a
+#: brief transient rejection while staying firmly bounded.
+_MAX_ITEM_POST_ATTEMPTS = 5
 
 # Supervisor backoff (mirrors claude_native_forwarder.supervise_forwarder).
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
@@ -399,7 +424,7 @@ def _blob_to_item(rowid: int, blob_id: str, data: object, agent_name: str) -> _M
     if not isinstance(obj, dict):
         return None
     role = obj.get("role")
-    response_id = f"cursor:{blob_id}"
+    response_id = f"cursor:{blob_id}"[:_RESPONSE_ID_MAX_LEN]
     if role == "user":
         prompt = _unwrap_user_query(_content_text(obj.get("content")))
         if not prompt:
@@ -466,6 +491,15 @@ async def forward_cursor_store_to_session(
     re-posting; if discovery resolves a *different* store than the persisted one
     (a cold resume relaunched a fresh chat), the cursor resets to that store.
 
+    A failed item POST never silently re-posts forever: a server *rejection* (a
+    4xx, or a 5xx such as a failed DB insert) is retried for up to
+    ``_MAX_ITEM_POST_ATTEMPTS`` polls and then skipped so one poison item can't
+    wedge the mirror — or flood the app — indefinitely; an *ambiguous* failure
+    (request sent, response lost) is skipped at once since external items aren't
+    deduped and a retry could duplicate the bubble; a *connection* failure
+    (server unreachable) is retried indefinitely so an outage never drops the
+    conversation.
+
     :param base_url: Omnigent server base URL.
     :param headers: Static HTTP headers (auth normally via ``auth``).
     :param session_id: Omnigent session/conversation id.
@@ -480,6 +514,11 @@ async def forward_cursor_store_to_session(
     persisted = _read_state(bridge_dir)
     store_path: Path | None = None
     last_rowid = 0
+    # Bounded-retry-then-skip guard (see the post loop below): the rowid whose
+    # POST is currently being rejected and how many consecutive rejections it
+    # has seen. Reset whenever the cursor advances past an item.
+    failed_rowid = 0
+    failed_attempts = 0
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
@@ -527,9 +566,73 @@ async def forward_cursor_store_to_session(
                         )
                         for item in items:
                             if item.item_type:
-                                await _post_conversation_item(
-                                    client, session_id=session_id, item=item
-                                )
+                                try:
+                                    await _post_conversation_item(
+                                        client, session_id=session_id, item=item
+                                    )
+                                except httpx.HTTPError as exc:
+                                    if post_may_have_been_delivered(exc):
+                                        # Ambiguous: the request was sent but its
+                                        # response was lost, so the server may have
+                                        # already committed this item. External
+                                        # items aren't deduped, so re-posting would
+                                        # duplicate the web bubble — skip past it.
+                                        _logger.warning(
+                                            "cursor forwarder skipping item after an "
+                                            "ambiguous POST failure (may already be "
+                                            "committed); session=%s rowid=%s",
+                                            session_id,
+                                            item.rowid,
+                                            exc_info=True,
+                                        )
+                                    elif isinstance(exc, httpx.HTTPStatusError):
+                                        # The server received and rejected the item
+                                        # (a 4xx, or a 5xx like the response_id
+                                        # truncation that wedged the mirror). Retry
+                                        # a bounded number of polls, then skip so one
+                                        # poison item can't wedge the mirror — and
+                                        # flood the app — forever.
+                                        if item.rowid != failed_rowid:
+                                            failed_rowid, failed_attempts = item.rowid, 0
+                                        failed_attempts += 1
+                                        if failed_attempts < _MAX_ITEM_POST_ATTEMPTS:
+                                            _logger.warning(
+                                                "cursor forwarder POST rejected (HTTP "
+                                                "%s); retrying; session=%s rowid=%s "
+                                                "attempt=%s",
+                                                exc.response.status_code,
+                                                session_id,
+                                                item.rowid,
+                                                failed_attempts,
+                                            )
+                                            break  # retry this item before any after it
+                                        _logger.error(
+                                            "cursor forwarder dropping item after %s "
+                                            "rejected POSTs (HTTP %s); mirror would "
+                                            "otherwise wedge; session=%s rowid=%s",
+                                            failed_attempts,
+                                            exc.response.status_code,
+                                            session_id,
+                                            item.rowid,
+                                        )
+                                    else:
+                                        # Connection-level failure: the server is
+                                        # unreachable, which is not this item's
+                                        # fault. Retry indefinitely so an outage
+                                        # never drops the conversation; the poll
+                                        # cadence and supervisor ride it out.
+                                        _logger.warning(
+                                            "cursor forwarder POST could not reach the "
+                                            "server; retrying; session=%s rowid=%s",
+                                            session_id,
+                                            item.rowid,
+                                            exc_info=True,
+                                        )
+                                        break
+                            # Reached on a successful post, an ambiguous-delivery
+                            # skip, a quarantine, or a non-posted sentinel row:
+                            # advance past this item and reset the failure counter.
+                            failed_rowid = failed_attempts = 0
                             last_rowid = item.rowid
                             _write_state(
                                 bridge_dir,

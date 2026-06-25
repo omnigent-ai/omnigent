@@ -437,10 +437,10 @@ describe("Composer effort slash-command visibility", () => {
     render(<Composer {...composerProps({ showEffort: false, isNativeWrapper: true })} />);
     fireEvent.change(textarea(), { target: { value: "/" } });
 
-    // Row testids — the active entry ("/compact") also renders in the
-    // detail card, so a text query would double-match.
+    // Row testids — /compact is hidden for non-native-wrapper sessions,
+    // so verify /context is present instead.
     expect(screen.queryByTestId("slash-menu-item-effort")).toBeNull();
-    expect(screen.getByTestId("slash-menu-item-compact")).toBeInTheDocument();
+    expect(screen.getByTestId("slash-menu-item-context")).toBeInTheDocument();
   });
 
   it("shows /model in suggestions for in-process and picker-backed native sessions", () => {

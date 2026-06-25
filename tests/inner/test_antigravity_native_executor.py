@@ -205,7 +205,8 @@ def test_run_turn_flattens_content_blocks(tmp_path: Path, injected: dict[str, ob
                         "role": "user",
                         "content": [
                             {"type": "input_text", "text": "line one"},
-                            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                            # malformed data URI (no comma) -> not materialized
+                            {"type": "input_image", "image_url": "data:image/png;base64"},
                             {"type": "input_text", "text": "line two"},
                         ],
                     }
@@ -260,6 +261,76 @@ def test_run_turn_no_user_text_errors(tmp_path: Path, injected: dict[str, object
     assert _injected(injected) == []
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+
+
+# a tiny valid base64 PNG data URI (1x1 pixel), materialized to disk + referenced
+_PNG_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
+
+def test_run_turn_image_attachment_materialized(
+    tmp_path: Path, injected: dict[str, object]
+) -> None:
+    """An image block is written to the bridge dir and referenced by path."""
+    _seed_state(tmp_path)
+
+    async def _drive() -> list[ExecutorEvent]:
+        return [
+            event
+            async for event in _executor(tmp_path).run_turn(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_image", "image_url": _PNG_DATA_URI},
+                            {"type": "input_text", "text": "describe this"},
+                        ],
+                    }
+                ],
+                tools=[],
+                system_prompt="",
+            )
+        ]
+
+    events = asyncio.run(_drive())
+    content = _injected(injected)[0]["content"]
+    assert isinstance(content, str)
+    # attachment marker is prepended ahead of the typed text
+    assert content.startswith("[Attached: ")
+    assert str(tmp_path) in content
+    assert content.endswith("describe this")
+    assert isinstance(events[0], TurnComplete)
+
+
+def test_run_turn_attachment_only_no_longer_errors(
+    tmp_path: Path, injected: dict[str, object]
+) -> None:
+    """An attachment-only turn injects the marker instead of hard-erroring."""
+    _seed_state(tmp_path)
+
+    async def _drive() -> list[ExecutorEvent]:
+        return [
+            event
+            async for event in _executor(tmp_path).run_turn(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_image", "image_url": _PNG_DATA_URI}],
+                    }
+                ],
+                tools=[],
+                system_prompt="",
+            )
+        ]
+
+    events = asyncio.run(_drive())
+    content = _injected(injected)[0]["content"]
+    assert isinstance(content, str)
+    assert content.startswith("[Attached: ")
+    assert isinstance(events[0], TurnComplete)
+    assert not any(isinstance(event, ExecutorError) for event in events)
 
 
 # ---------------------------------------------------------------------------
@@ -653,28 +724,30 @@ def test_run_turn_unsupported_effort_surfaces_error(
 # ---------------------------------------------------------------------------
 
 
-def test_content_to_text_handles_string_blocks_none_and_other() -> None:
+def test_content_to_text_handles_string_blocks_none_and_other(tmp_path: Path) -> None:
     """
     Flattening covers every content shape the executor may receive.
 
     A plain string passes through; ``input_text``/``text`` blocks join by newline
-    while image/file blocks are dropped (the text turn is text-only); ``None``
+    while an unmaterializable image/file block contributes nothing; ``None``
     yields ``""``; any other shape falls back to a JSON encoding rather than
     crashing.
     """
     from omnigent.inner.antigravity_native_executor import _content_to_text
 
-    assert _content_to_text("  hello  ") == "hello"
+    assert _content_to_text("  hello  ", tmp_path) == "hello"
     assert (
         _content_to_text(
             [
                 {"type": "input_text", "text": "a"},
-                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                # malformed data URI (no comma) -> not materialized
+                {"type": "input_image", "image_url": "data:image/png;base64"},
                 {"type": "text", "text": "b"},
-            ]
+            ],
+            tmp_path,
         )
         == "a\nb"
     )
-    assert _content_to_text(None) == ""
+    assert _content_to_text(None, tmp_path) == ""
     # Defensive fallback for an unexpected shape: encoded, not crashed.
-    assert _content_to_text(123) == "123"
+    assert _content_to_text(123, tmp_path) == "123"
