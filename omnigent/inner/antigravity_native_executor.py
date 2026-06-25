@@ -53,8 +53,9 @@ stay informational on this write path — agy's own model selection determines t
 turn's model and thinking budget and cannot be overridden from here.
 
 Attachment note: the RPC turn text takes plain text, so an image/file attachment
-on a web turn is reduced to its text part (any prose the user typed). Inline
-image/file bytes are not forwarded to agy through this path.
+on a web turn is materialized to a file under the bridge dir and referenced by
+absolute path (``[Attached: <path>]``) so agy can open it with its Read tool —
+mirroring cursor-native. Any prose the user typed is sent alongside the marker.
 """
 
 from __future__ import annotations
@@ -153,7 +154,7 @@ class AntigravityNativeExecutor(Executor):
             when there was no text to send or delivery failed.
         """
         del session_key
-        text = _content_to_text(content)
+        text = _content_to_text(content, self._bridge_dir)
         if not text:
             return False
         outcome = await self._deliver(text)
@@ -250,7 +251,7 @@ class AntigravityNativeExecutor(Executor):
             except PermanentLLMError as exc:
                 yield ExecutorError(message=str(exc))
                 return
-        text = _latest_user_text(messages)
+        text = _latest_user_text(messages, self._bridge_dir)
         if not text:
             yield ExecutorError(message="Antigravity native turn had no user text to send")
             return
@@ -536,47 +537,60 @@ def _dig(obj: object, *keys: str) -> object:
     return current
 
 
-def _latest_user_text(messages: list[Message]) -> str:
+def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     """
     Extract the latest user message's text from the executor message list.
 
     :param messages: Executor message list.
+    :param bridge_dir: Bridge directory; image/file attachments are
+        materialized underneath it and referenced by path.
     :returns: The user's text (string + content-block shapes flattened), or
         ``""`` when there is no user text to send.
     """
     for message in reversed(messages):
         if message.get("role") == "user":
-            return _content_to_text(message.get("content"))
+            return _content_to_text(message.get("content"), bridge_dir)
     return ""
 
 
-def _content_to_text(content: EnqueuedContent) -> str:
+def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
     """
     Flatten executor message content into plain text for the agy turn-send.
 
-    The RPC turn text carries only text, so this extracts the textual parts and
-    drops attachments. A plain string passes through. A list of content blocks
-    contributes every ``input_text`` / ``text`` block, joined by newlines;
-    ``input_image`` / ``input_file`` blocks are skipped (their bytes cannot be
-    sent through this path — at minimum the typed text is sent).
+    The RPC turn text carries only text. A plain string passes through. A list
+    of content blocks contributes every ``input_text`` / ``text`` block;
+    ``input_image`` / ``input_file`` blocks carrying a base64 data URI are
+    materialized to the bridge dir and referenced by absolute path
+    (``[Attached: <path>]``) so agy can open them with its Read tool — otherwise
+    web-UI attachments are silently dropped. Mirrors cursor-native.
 
     :param content: Message content — a string, a list of content blocks like
         ``{"type": "input_text", "text": "..."}``, or other.
+    :param bridge_dir: Bridge directory; attachments are materialized underneath
+        it and referenced by path.
     :returns: The flattened text, stripped of leading/trailing whitespace, or
         ``""`` when no text is present.
     """
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
-        parts: list[str] = []
+        from omnigent.inner.native_attachments import materialize_attachment
+
+        attachment_lines: list[str] = []
+        text_parts: list[str] = []
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") in {"input_text", "text"}:
+            block_type = block.get("type", "")
+            if block_type in ("input_text", "text"):
                 text = block.get("text")
                 if isinstance(text, str) and text:
-                    parts.append(text)
-        return "\n".join(parts).strip()
+                    text_parts.append(text)
+            elif block_type in ("input_image", "input_file"):
+                path = materialize_attachment(block, bridge_dir)
+                if path is not None:
+                    attachment_lines.append(f"[Attached: {path}]")
+        return "\n".join(attachment_lines + text_parts).strip()
     if content is None:
         return ""
     return json.dumps(content, ensure_ascii=True)
