@@ -227,6 +227,16 @@ def normalize_model_for_provider(model: str, provider_kind: str | None) -> str:
     return model
 
 
+# goose-native is the lone native-harness exception: goose has no ``--model``
+# flag and its provider/model live in the user's ``goose configure`` keyring, so
+# Omnigent cannot reliably override them — a ``GOOSE_MODEL`` Omnigent sets could
+# mismatch the user's configured provider. goose-native uses whatever
+# ``goose configure`` set; model-switching users should pick the headless
+# ``goose`` harness. (canonicalize_harness maps ``native-goose`` here too.)
+# See docs/goose-native-gap-plan.md §4.1.
+_MODEL_OVERRIDE_UNSUPPORTED_NATIVE: frozenset[str] = frozenset({"goose-native"})
+
+
 def harness_supports_model_override(harness: str | None) -> bool:
     """
     Return whether *harness* has per-session model-override plumbing.
@@ -242,6 +252,8 @@ def harness_supports_model_override(harness: str | None) -> bool:
     :returns: ``True`` when the override reaches the harness process.
     """
     if harness is None:
+        return False
+    if canonicalize_harness(harness) in _MODEL_OVERRIDE_UNSUPPORTED_NATIVE:
         return False
     return (
         is_native_harness(harness)

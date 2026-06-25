@@ -17,6 +17,11 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+from omnigent.cursor_native_bridge import (
+    clear_fork_preamble,
+    read_fork_preamble,
+    wrap_fork_preamble,
+)
 from omnigent.goose_native_bridge import BRIDGE_DIR_ENV_VAR, inject_user_message
 from omnigent.inner.executor import (
     Executor,
@@ -83,12 +88,23 @@ class GooseNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="goose native turn had no user text to send")
             return
+        # A fork into goose carries history as a text preamble: a fresh
+        # ``goose session --name <fork>`` has no prior history of its own, so the
+        # runner stashed the copied turns and we prepend them to the FIRST
+        # injected message. READ it here but only CLEAR after a successful inject
+        # (a failed/retried turn must keep the history). The forwarder strips the
+        # sentinel block when mirroring this turn back, so it isn't duplicated.
+        preamble = read_fork_preamble(self._bridge_dir)
+        if preamble:
+            text = wrap_fork_preamble(preamble, text)
         try:
             async with self._inject_lock:
                 await asyncio.to_thread(inject_user_message, self._bridge_dir, content=text)
         except RuntimeError as exc:
             yield ExecutorError(message=str(exc))
             return
+        if preamble:
+            clear_fork_preamble(self._bridge_dir)
         yield TurnComplete(response=None)
 
 

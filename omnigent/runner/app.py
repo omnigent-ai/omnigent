@@ -1963,11 +1963,39 @@ async def _auto_create_goose_terminal(
     # re-creating, so old and new tasks can't both mirror (double-posting), and
     # drop the prior terminal's stale forward cursor.
     await _cancel_auto_forwarder_task(session_id)
+    from omnigent.cursor_native_bridge import clear_fork_preamble
+    from omnigent.goose_native_audit import clear_goose_audit_state
     from omnigent.goose_native_bridge import bridge_dir_for_session_id, write_tmux_target
     from omnigent.goose_native_forwarder import clear_goose_bridge_state
+    from omnigent.goose_native_usage import clear_goose_usage_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
     clear_goose_bridge_state(bridge_dir)
+    clear_goose_usage_state(bridge_dir)
+    clear_goose_audit_state(bridge_dir)
+    # Drop any stale fork preamble; the fork-carry block below re-writes it when
+    # this launch is actually a fork.
+    clear_fork_preamble(bridge_dir)
+
+    # Wire the Omnigent MCP server so goose gets the sys_*/comment/web tools the
+    # other native harnesses expose. goose loads it as a stdio extension; we point
+    # ``--with-extension`` at a launcher named ``omnigent_mcp`` (goose names a
+    # stdio extension after the command basename) that execs the SAME shared
+    # ``serve-mcp`` stdio server claude/codex/cursor use. ``bridge.json`` (token)
+    # lets serve-mcp boot; the runner-side relay (``ensure_comment_relay`` below)
+    # writes ``tool_relay.json``. Calls flow through the §3 policy gate like any
+    # tool. Offloaded to threads (file I/O) and done BEFORE launch so goose sees
+    # the launcher on startup.
+    from omnigent.codex_native_bridge import write_mcp_bridge_config
+    from omnigent.goose_native_bridge import (
+        goose_mcp_extension_value,
+        write_goose_mcp_launcher,
+        write_goose_policy_plugin,
+    )
+
+    await asyncio.to_thread(write_mcp_bridge_config, bridge_dir)
+    await asyncio.to_thread(write_goose_mcp_launcher, bridge_dir)
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args); reused here, not Pi-specific.
@@ -1976,15 +2004,53 @@ async def _auto_create_goose_terminal(
         server_client=server_client,
     )
     workspace = os.path.realpath(str(launch_config.workspace))
+
+    # Register the Omnigent PreToolUse policy hook as a PROJECT-SCOPE goose plugin
+    # in the workspace (``<workspace>/.agents/plugins/omnigent-policy``). goose
+    # discovers it from its cwd and runs on its REAL home, so credentials resolve
+    # via the OS keyring exactly as the user's own ``goose`` does. (An isolated
+    # ``GOOSE_PATH_ROOT`` home was tried first but broke startup: goose couldn't
+    # read the keychain key and died, so the terminal never went ready.) The
+    # plugin is git-excluded so it never shows in ``git status``.
+    await asyncio.to_thread(write_goose_policy_plugin, Path(workspace))
+
+    # A fork into goose carries history as a text preamble: a fresh
+    # ``goose session --name <fork>`` has no prior history, so render the copied
+    # Omnigent items and stash them; the executor prepends them to the fork's
+    # first injected message (the forwarder strips the sentinel block on mirror).
+    # Reuses the shared cursor-native fork helpers. Best-effort — a failure just
+    # starts the fork without prior context.
+    if launch_config.fork_carry_history and server_client is not None:
+        try:
+            from omnigent.claude_native import _fetch_all_session_items_for_claude_resume
+            from omnigent.cursor_native_bridge import write_fork_preamble
+
+            fork_items = await _fetch_all_session_items_for_claude_resume(
+                server_client, session_id
+            )
+            write_fork_preamble(bridge_dir, _cursor_fork_history_preamble(fork_items))
+        except Exception:  # noqa: BLE001 — context carry-over is best-effort
+            _logger.warning(
+                "goose-native: could not build fork history preamble (session=%s).",
+                session_id,
+                exc_info=True,
+            )
+
     goose_command = resolve_goose_executable()
-    # GOOSE_MODE=smart_approve so Goose prompts in its TUI before sensitive tools
-    # (its native approval, which shows in the terminal and the web's embedded
-    # terminal). Goose's default mode is Auto (no prompt), so we set this for the
-    # approval flow to appear at all. Provider/model come from `goose configure`.
+    # GOOSE_MODE=auto: goose runs tools without its own in-TUI confirmation — the
+    # Omnigent PreToolUse policy hook (the project-scope plugin written above) is
+    # the gate now, blocking on a DENY verdict whether the turn came from the web
+    # composer OR was typed directly into the embedded terminal (goose's
+    # PreToolUse hook is blocking). ``_OMNIGENT_*`` let the hook reach the policy
+    # endpoint (the hook subprocess inherits this env). goose runs on its real
+    # home, so provider/model/auth come from the user's own ``goose configure`` +
+    # OS keyring (NO GOOSE_PATH_ROOT — isolating the home broke keychain auth).
     goose_env: dict[str, str] = {
         "GOOSE_CLI_THEME": "ansi",
         "GOOSE_TELEMETRY_OFF": "1",
-        "GOOSE_MODE": "smart_approve",
+        "GOOSE_MODE": "auto",
+        "_OMNIGENT_SERVER_URL": server_url,
+        "_OMNIGENT_SESSION_ID": session_id,
     }
     # Launch-unique Goose session name. `goose session --name X` (without
     # --resume) creates a NEW sessions row each launch (verified, Goose 1.38),
@@ -1998,6 +2064,10 @@ async def _auto_create_goose_terminal(
         "session",
         "--name",
         goose_session_name,
+        # Omnigent MCP server (stdio launcher named ``omnigent_mcp``). User
+        # passthrough args stay last so an explicit user extension/flag wins.
+        "--with-extension",
+        goose_mcp_extension_value(bridge_dir),
         *(launch_config.terminal_launch_args or []),
     ]
     terminal_view = await resource_registry.launch_required_terminal(
@@ -2011,9 +2081,10 @@ async def _auto_create_goose_terminal(
             args=goose_args,
             # ANSI theme keeps the pane cheap to scrape; GOOSE_TELEMETRY_OFF
             # suppresses Goose's first-run "share usage data?" prompt, which
-            # would otherwise block the headless pane on a fresh install;
-            # GOOSE_MODE=smart_approve turns on Goose's own in-TUI approval. Goose's
-            # provider/model come from the user's own `goose configure` (KTD4).
+            # would otherwise block the headless pane on a fresh install. Tool
+            # gating is the Omnigent PreToolUse policy hook (GOOSE_MODE=auto, no
+            # in-TUI prompt). Provider/model/auth come from the user's own
+            # `goose configure` + OS keyring (goose's real home; see goose_env).
             env=goose_env,
             scrollback=100_000,
             tmux_allow_passthrough=True,
@@ -2045,11 +2116,12 @@ async def _auto_create_goose_terminal(
     # server URL + refresh-capable auth.
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
-    server_url = _required_runner_env("RUNNER_SERVER_URL")
+    # ``server_url`` was resolved above (for the policy-hook env).
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
+    from omnigent.goose_native_audit import supervise_goose_audit_forwarder
     from omnigent.goose_native_forwarder import supervise_goose_forwarder
-    from omnigent.goose_native_permissions import supervise_goose_approval_mirror
+    from omnigent.goose_native_usage import supervise_goose_usage_forwarder
 
     if server_client is not None and ensure_comment_relay is not None:
         await ensure_comment_relay(
@@ -2059,13 +2131,19 @@ async def _auto_create_goose_terminal(
         )
 
     async def _supervise_goose_native_bridges() -> None:
-        """Run the transcript forwarder and the approval mirror together.
+        """Run the goose-native bridges together (forwarder/usage/audit).
 
-        Both are per-session, runner-owned, restart-on-failure; gathering them
+        All are per-session, runner-owned, restart-on-failure; gathering them
         under one task keeps a single registration/cancellation handle for
         teardown. The forwarder mirrors Goose's transcript onto the conversation;
-        the approval mirror surfaces Goose's cliclack tool-confirmation prompt as
-        a web elicitation (see :mod:`omnigent.goose_native_permissions`).
+        the usage poller mirrors Goose's accumulated token/cost totals onto the
+        session-cost badge (see :mod:`omnigent.goose_native_usage`); the audit
+        poller records tool-RESULT policy decisions (observability only — goose
+        has no post-exec hook to block on; see :mod:`omnigent.goose_native_audit`).
+        Tool-CALL policy enforcement is NOT here — it's the goose PreToolUse
+        project-scope plugin hook (:mod:`omnigent.inner.goose_policy_hook`), which
+        blocks inside goose's own loop. The pollers read goose's default
+        sessions.db (goose runs on its real home).
         """
         await asyncio.gather(
             supervise_goose_forwarder(
@@ -2077,11 +2155,20 @@ async def _auto_create_goose_terminal(
                 goose_session_name=goose_session_name,
                 auth=_runner_auth,
             ),
-            supervise_goose_approval_mirror(
+            supervise_goose_usage_forwarder(
                 base_url=server_url,
                 headers={},
                 session_id=session_id,
                 bridge_dir=bridge_dir,
+                goose_session_name=goose_session_name,
+                auth=_runner_auth,
+            ),
+            supervise_goose_audit_forwarder(
+                base_url=server_url,
+                headers={},
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                goose_session_name=goose_session_name,
                 auth=_runner_auth,
             ),
         )
@@ -2092,7 +2179,8 @@ async def _auto_create_goose_terminal(
     )
     _register_auto_forwarder_task(session_id, _forwarder_task)
     _logger.info(
-        "Auto-created goose terminal + forwarder/approval-mirror for session %s; task=%s",
+        "Auto-created goose terminal + forwarder/usage/audit (policy via PreToolUse hook) "
+        "for session %s; task=%s",
         session_id,
         _forwarder_task.get_name(),
     )

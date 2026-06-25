@@ -8,9 +8,12 @@ analog of the cursor-native tmux bridge. This is what wires the web-UI chat box
 to the running Goose TUI (and, since the web UI embeds that pane, the message
 shows in both surfaces).
 
-Unlike cursor-native, this bridge does NOT write any vendor MCP config: Goose's
-MCP "extensions" live in ``~/.config/goose/config.yaml`` (owned by the user via
-``goose configure``), and Omnigent does not mutate user config in v1.
+This bridge does NOT mutate the user's ``~/.config/goose/config.yaml`` (their own
+``goose configure`` extensions stay theirs). It DOES connect the Omnigent MCP
+server at launch via a per-session stdio launcher (:func:`write_goose_mcp_launcher`)
+that goose loads with ``--with-extension`` — the same shared ``serve-mcp`` the
+other native harnesses use — so goose gets the Omnigent ``sys_*`` / comment / web
+tools without touching user config.
 """
 
 from __future__ import annotations
@@ -19,7 +22,9 @@ import contextlib
 import hashlib
 import json
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -29,6 +34,14 @@ from omnigent._platform import stable_user_id
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_GOOSE_NATIVE_BRIDGE_DIR"
+
+#: The extension name Omnigent's MCP server is exposed under inside goose. goose
+#: derives a stdio extension's name from the launch command's *basename* (see
+#: goose-cli ``parse_stdio_extension``) and offers no flag to set it, so the
+#: launcher below MUST be named exactly this. Tools then surface to the model as
+#: ``omnigent_mcp__<tool>`` and the store records ``_meta.goose_extension`` ==
+#: this value (the hook the policy mirror can key an Omnigent-MCP skip on).
+MCP_EXTENSION_NAME = "omnigent_mcp"
 
 _BRIDGE_ROOT = Path(tempfile.gettempdir()) / f"omnigent-{stable_user_id()}" / "goose-native"
 _TMUX_FILE = "tmux.json"
@@ -57,6 +70,124 @@ def bridge_dir_for_session_id(session_id: str) -> Path:
 def bridge_root() -> Path:
     """Return the configured goose-native bridge root."""
     return _BRIDGE_ROOT
+
+
+def write_goose_mcp_launcher(bridge_dir: Path, *, python_executable: str | None = None) -> Path:
+    """Write the executable launcher goose's ``--with-extension`` points at.
+
+    goose names a stdio extension after its command's basename and has no flag to
+    override it, so to get a clean, collision-free name (tools surface as
+    ``omnigent_mcp__<tool>`` rather than ``python__<tool>``) we point goose at a
+    tiny launcher literally named :data:`MCP_EXTENSION_NAME`. It execs the same
+    shared ``serve-mcp`` stdio MCP server the other native harnesses use, which
+    reads ``bridge.json`` (token) + ``tool_relay.json`` from *bridge_dir*.
+
+    :param bridge_dir: The goose-native bridge dir (also holds ``bridge.json``).
+    :param python_executable: Python to exec; defaults to :data:`sys.executable`.
+    :returns: The launcher path to pass as the ``--with-extension`` value.
+    """
+    _ensure_dir(bridge_dir)
+    python = python_executable or sys.executable
+    launcher = bridge_dir / MCP_EXTENSION_NAME
+    script = (
+        "#!/bin/sh\n"
+        f'exec "{python}" -m omnigent.claude_native_bridge serve-mcp '
+        f'--bridge-dir "{bridge_dir}"\n'
+    )
+    tmp = bridge_dir / (MCP_EXTENSION_NAME + ".tmp")
+    tmp.write_text(script, encoding="utf-8")
+    tmp.chmod(0o755)
+    os.replace(tmp, launcher)
+    return launcher
+
+
+def goose_mcp_extension_value(bridge_dir: Path) -> str:
+    """Return the ``--with-extension`` value (the launcher path) for *bridge_dir*."""
+    return str(bridge_dir / MCP_EXTENSION_NAME)
+
+
+#: Plugin name (a project-scope goose plugin) carrying the Omnigent policy hook.
+POLICY_PLUGIN_NAME = "omnigent-policy"
+
+
+def goose_policy_plugin_dir(workspace: Path) -> Path:
+    """Return the Omnigent policy plugin dir for *workspace* (project scope).
+
+    goose discovers plugins from ``<project_root>/.agents/plugins/<name>/`` (with
+    ``project_root`` = goose's cwd = the session workspace) and loads their
+    ``hooks/hooks.json`` (plugins/discovery.rs + hooks/mod.rs). Using project
+    scope keeps goose on its REAL home, so credentials resolve via the OS keyring
+    exactly as the user's own ``goose`` does — an isolated ``GOOSE_PATH_ROOT``
+    home broke that (goose couldn't read the keychain key and died on startup).
+    """
+    return workspace / ".agents" / "plugins" / POLICY_PLUGIN_NAME
+
+
+def goose_policy_plugin_hooks_file(workspace: Path) -> Path:
+    """Return the ``hooks.json`` path for the project-scope Omnigent policy plugin."""
+    return goose_policy_plugin_dir(workspace) / "hooks" / "hooks.json"
+
+
+def write_goose_policy_plugin(workspace: Path, *, python_executable: str | None = None) -> Path:
+    """Write the project-scope Omnigent policy plugin's ``hooks.json``.
+
+    Registers a ``PreToolUse`` command hook so goose evaluates every tool call
+    against Omnigent policy (block on DENY) — the goose analog of claude-/hermes-
+    native policy hooks. goose auto-enables a newly discovered plugin and runs the
+    command via ``sh`` with the terminal's env inherited (so the hook reads
+    ``_OMNIGENT_SERVER_URL`` / ``_OMNIGENT_SESSION_ID``). Best-effort git-excludes
+    the plugin so it never shows in the user's ``git status``.
+
+    :param workspace: The goose session's workspace (goose's cwd / project root).
+    :param python_executable: Python to run the hook; defaults to
+        :data:`sys.executable`.
+    :returns: The written ``hooks.json`` path.
+    """
+    python = python_executable or sys.executable
+    hooks_file = goose_policy_plugin_hooks_file(workspace)
+    hooks_file.parent.mkdir(parents=True, exist_ok=True)
+    config = {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f'"{python}" -m omnigent.inner.goose_policy_hook',
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+    tmp = hooks_file.parent / "hooks.json.tmp"
+    tmp.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    os.replace(tmp, hooks_file)
+    _git_exclude_policy_plugin(workspace)
+    return hooks_file
+
+
+def _git_exclude_policy_plugin(workspace: Path) -> None:
+    """Best-effort add the policy plugin to ``.git/info/exclude`` (local ignore)."""
+    git_dir = workspace / ".git"
+    if not git_dir.is_dir():
+        return
+    entry = f".agents/plugins/{POLICY_PLUGIN_NAME}/"
+    exclude = git_dir / "info" / "exclude"
+    with contextlib.suppress(OSError):
+        existing = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
+        if entry not in existing.splitlines():
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            with open(exclude, "a", encoding="utf-8") as handle:
+                handle.write(
+                    ("" if existing.endswith("\n") or not existing else "\n") + entry + "\n"
+                )
+
+
+def clear_goose_policy_plugin(workspace: Path) -> None:
+    """Remove the project-scope policy plugin dir (teardown / clean re-launch)."""
+    with contextlib.suppress(OSError):
+        shutil.rmtree(goose_policy_plugin_dir(workspace), ignore_errors=True)
 
 
 def _ensure_dir(path: Path) -> None:
@@ -357,10 +488,9 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
 def capture_goose_pane(bridge_dir: Path) -> str | None:
     """Return the visible Goose pane text, or ``None`` if the TUI is not running.
 
-    Used by the runner-side approval mirror
-    (:mod:`omnigent.goose_native_permissions`) to detect Goose's in-terminal
-    ``cliclack`` tool-approval prompt. ``None`` (no advertised tmux target, or a
-    dead pane) is distinct from ``""`` (a live but empty capture).
+    A general tmux-pane read for the goose-native terminal. ``None`` (no
+    advertised tmux target, or a dead pane) is distinct from ``""`` (a live but
+    empty capture).
 
     :param bridge_dir: The goose-native bridge dir holding ``tmux.json``.
     :returns: The captured pane text, or ``None`` when no live pane exists.

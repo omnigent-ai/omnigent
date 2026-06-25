@@ -369,6 +369,32 @@ def test_trusted_parent_accepts_qwen_native_bridge_dir(
     assert trusted == claude_native_bridge._absolute_syntactic_path(qwen_root.parent.parent)
 
 
+def test_trusted_parent_accepts_goose_native_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The relay's bridge-root allowlist accepts goose-native bridge dirs.
+
+    goose-native points goose's ``--with-extension`` at this serve-mcp, which
+    writes its bridge files under ``$TMPDIR/omnigent-<uid>/goose-native``. Without
+    the goose-native branch, serve-mcp raises ``not under an allowed bridge root``
+    and the extension fails to start (observed live). Pins the regression.
+    """
+    from omnigent import goose_native_bridge
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    goose_root = tmp_path / "omnigent-test" / "goose-native"
+    monkeypatch.setattr(goose_native_bridge, "_BRIDGE_ROOT", goose_root)
+
+    target = claude_native_bridge._absolute_syntactic_path(goose_root / "abc123")
+    trusted = claude_native_bridge._trusted_parent_for_bridge_dir(target)
+
+    # Same anchor as cursor-native: the uid-scoped temp dir's parent.
+    assert trusted == claude_native_bridge._absolute_syntactic_path(goose_root.parent.parent)
+
+
 def test_trusted_parent_rejects_path_outside_all_roots_and_names_qwen(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

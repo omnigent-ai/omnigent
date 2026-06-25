@@ -37,6 +37,8 @@ from pathlib import Path
 
 import httpx
 
+from omnigent.cursor_native_bridge import FORK_HISTORY_CLOSE_TAG, FORK_HISTORY_OPEN_TAG
+
 _logger = logging.getLogger(__name__)
 
 #: Seconds between store polls. Goose flushes a ``messages`` row per agentic
@@ -74,6 +76,20 @@ def _warn_sqlite_once(context: str, exc: sqlite3.Error) -> None:
 # before pasting into the TUI; strip them from the mirrored bubble (the path is
 # an internal bridge detail).
 _ATTACHMENT_MARKER_RE = re.compile(r"\[Attached:[^\]]*\]")
+
+# On a fork into goose, the executor prepends the prior conversation to the first
+# user message, fenced in <omnigent_fork_history>…</omnigent_fork_history>
+# (cursor_native_bridge.wrap_fork_preamble — shared across native harnesses).
+# goose stores it in the user message; strip the whole block so the mirrored
+# bubble shows only the user's real text (the copied history already lives in the
+# Omnigent timeline from the fork). Non-greedy → stops at the first (real) close
+# tag; the trailing alternative degrades an unterminated block to end-of-text.
+# Mirrors :data:`omnigent.cursor_native_forwarder._FORK_HISTORY_RE`.
+_FORK_HISTORY_RE = re.compile(
+    rf"{re.escape(FORK_HISTORY_OPEN_TAG)}.*?{re.escape(FORK_HISTORY_CLOSE_TAG)}"
+    rf"|{re.escape(FORK_HISTORY_OPEN_TAG)}.*",
+    re.DOTALL,
+)
 
 
 def default_sessions_db() -> Path:
@@ -177,14 +193,106 @@ def _resolve_goose_session_id(db_path: Path, session_name: str) -> str | None:
     return row[0] if row and isinstance(row[0], str) else None
 
 
+@dataclass(frozen=True)
+class PendingToolCall:
+    """A goose tool call awaiting in-terminal approval, read from the store.
+
+    Goose persists the assistant message (carrying its ``toolRequest`` parts)
+    *before* it blocks on the cliclack confirmation (verified against goose's
+    reply loop: the message is added to the store, then the ``ToolConfirmation``
+    is emitted), so the structured call is readable at prompt time — no scraping
+    the tool name/args off the pane.
+
+    :param request_id: The goose tool-request id (correlates to a later
+        ``toolResponse`` once executed or denied).
+    :param name: The bare tool name (e.g. ``shell``), as goose stores it.
+    :param arguments: The tool arguments object.
+    :param extension: The owning goose extension (``_meta.goose_extension``),
+        used to recognise Omnigent-MCP tools that the relay already gates.
+    """
+
+    request_id: str
+    name: str
+    arguments: dict[str, object]
+    extension: str | None
+
+
+def _tool_request_from_part(part: object) -> PendingToolCall | None:
+    """Parse one ``{"type":"toolRequest",...}`` content part, or ``None``.
+
+    Shape (verified against a live ``sessions.db``)::
+
+        {"type":"toolRequest","id":"toolu_…",
+         "toolCall":{"status":"success","value":{"name":"shell",
+                     "arguments":{"command":"…"}}},
+         "_meta":{"goose_extension":"developer"}}
+    """
+    if not isinstance(part, dict) or part.get("type") != "toolRequest":
+        return None
+    request_id = part.get("id")
+    if not isinstance(request_id, str) or not request_id:
+        return None
+    call = part.get("toolCall")
+    # ``toolCall`` is a serialized ``Result``; only a success carries name/args.
+    if not isinstance(call, dict) or call.get("status") != "success":
+        return None
+    value = call.get("value")
+    if not isinstance(value, dict):
+        return None
+    name = value.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    arguments = value.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = {}
+    extension = None
+    meta = part.get("_meta")
+    if isinstance(meta, dict):
+        ext = meta.get("goose_extension")
+        if isinstance(ext, str) and ext:
+            extension = ext
+    return PendingToolCall(
+        request_id=request_id, name=name, arguments=arguments, extension=extension
+    )
+
+
 @dataclass
 class _MirrorItem:
-    """One conversation item ready to POST, plus the message id that produced it."""
+    """One conversation item ready to POST, plus the message id that produced it.
+
+    :param reasoning_text: Thinking (chain-of-thought) text from the same row, if
+        any. Posted as a transient ``external_output_reasoning_delta`` BEFORE the
+        conversation item, so the web UI paints a "thinking" block that the
+        following assistant message finalizes. ``item_type`` may be empty (a
+        reasoning-only row) while ``reasoning_text`` is set.
+    """
 
     msg_id: int
     item_type: str
     item_data: dict[str, object]
     response_id: str
+    reasoning_text: str | None = None
+
+
+def _content_reasoning(content_json: str) -> str:
+    """Extract concatenated thinking text from a Goose ``content_json`` value.
+
+    Goose persists model reasoning as ``{"type":"thinking","thinking":"…"}`` parts
+    (verified against a live ``sessions.db``); redacted thinking
+    (``{"type":"redactedThinking"}``) carries no readable text and is skipped.
+    """
+    try:
+        obj = json.loads(content_json)
+    except ValueError:
+        return ""
+    parts = obj if isinstance(obj, list) else [obj]
+    chunks: list[str] = []
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") == "thinking":
+            thinking = part.get("thinking")
+            if isinstance(thinking, str) and thinking:
+                chunks.append(thinking)
+    return "".join(chunks).strip()
 
 
 def _content_text(content_json: str) -> str:
@@ -242,6 +350,10 @@ def _message_to_item(
     text = _ATTACHMENT_MARKER_RE.sub("", _content_text(content_json)).strip()
     response_id = f"goose:{msg_id}"
     if role == "user":
+        # A fork's first user message carries the prior conversation as a fenced
+        # preamble (see the executor); strip it so the bubble shows only the
+        # user's real text — the copied history is already in the timeline.
+        text = _FORK_HISTORY_RE.sub("", text).strip()
         if not text:
             return None
         return _MirrorItem(
@@ -251,8 +363,20 @@ def _message_to_item(
             response_id=response_id,
         )
     if role == "assistant":
+        reasoning = _content_reasoning(content_json) or None
         if not text:
-            return None  # tool-only / reasoning-only turn with no prose
+            # A reasoning-only step (thinking, then tools) still surfaces its
+            # thinking; the conversation item is empty (item_type="") so only the
+            # reasoning delta posts, and the cursor advances.
+            if reasoning:
+                return _MirrorItem(
+                    msg_id=msg_id,
+                    item_type="",
+                    item_data={},
+                    response_id="",
+                    reasoning_text=reasoning,
+                )
+            return None  # tool-only turn with no prose or thinking
         return _MirrorItem(
             msg_id=msg_id,
             item_type="message",
@@ -262,6 +386,7 @@ def _message_to_item(
                 "content": [{"type": "output_text", "text": text}],
             },
             response_id=response_id,
+            reasoning_text=reasoning,
         )
     return None  # tool / system / other scaffolding
 
@@ -311,6 +436,24 @@ async def _post_conversation_item(
                 "item_data": item.item_data,
                 "response_id": item.response_id,
             },
+        },
+    )
+    resp.raise_for_status()
+
+
+async def _post_reasoning_delta(client: httpx.AsyncClient, *, session_id: str, text: str) -> None:
+    """POST a row's thinking as one transient ``external_output_reasoning_delta``.
+
+    Goose persists the complete thinking block (not token deltas), so the whole
+    text goes as a single ``started=True`` delta; the assistant message posted
+    next finalizes the painted block. Reasoning is never a persisted conversation
+    item (the same contract as every other harness), so this is fire-and-forget.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_output_reasoning_delta",
+            "data": {"delta": text, "started": True},
         },
     )
     resp.raise_for_status()
@@ -373,6 +516,12 @@ async def forward_goose_store_to_session(
                         _read_new_items, db, goose_session_id, last_id, agent_name
                     )
                     for item in items:
+                        # Paint thinking first so the message that follows finalizes
+                        # the reasoning block.
+                        if item.reasoning_text:
+                            await _post_reasoning_delta(
+                                client, session_id=session_id, text=item.reasoning_text
+                            )
                         if item.item_type:
                             await _post_conversation_item(client, session_id=session_id, item=item)
                         last_id = item.msg_id

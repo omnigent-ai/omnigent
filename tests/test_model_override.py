@@ -126,6 +126,18 @@ def test_harness_supports_model_override_false_for_unplumbed(harness: str | None
     assert harness_supports_model_override(harness) is False
 
 
+@pytest.mark.parametrize("harness", ["goose-native", "native-goose"])
+def test_goose_native_reports_no_model_override(harness: str) -> None:
+    """
+    goose-native is the native exception: goose owns its provider/model via
+    ``goose configure`` (no ``--model`` flag; Omnigent can't know the configured
+    provider), so it must NOT advertise model override — the picker would
+    otherwise offer a value that is silently dropped or mismatches the provider.
+    Model-switching users pick the headless ``goose`` harness instead.
+    """
+    assert harness_supports_model_override(harness) is False
+
+
 class TestModelFamilyMismatch:
     """model_family_mismatch enforces vendor families per harness."""
 
