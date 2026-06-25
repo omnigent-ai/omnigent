@@ -15136,6 +15136,8 @@ def create_sessions_router(
 
     @router.post(
         "/sessions/{session_id}/hooks/antigravity-elicitation-request",
+        # Internal harness callback webhook — hidden from the public API reference.
+        include_in_schema=False,
         response_model=None,
         # CSRF hardening: body is parsed via request.json(); require a JSON
         # Content-Type so a cross-site text/plain request can't reach it.
@@ -15321,6 +15323,8 @@ def create_sessions_router(
 
     @router.post(
         "/sessions/{session_id}/hooks/native-permission-request",
+        # Internal harness callback webhook — hidden from the public API reference.
+        include_in_schema=False,
         response_model=None,
         dependencies=[Depends(require_json_content_type)],
     )
