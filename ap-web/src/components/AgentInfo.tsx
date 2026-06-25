@@ -703,9 +703,9 @@ function McpServerManagerDialog({
         <div className="grid gap-4 pt-1 md:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
           <div className="flex min-w-0 flex-col gap-1.5">
             <SectionLabel>Servers</SectionLabel>
-            <div className="flex max-h-56 flex-col divide-y divide-border overflow-y-auto rounded border border-border">
-              {servers.length > 0 ? (
-                servers.map((server) => (
+            {servers.length > 0 ? (
+              <div className="flex max-h-56 flex-col divide-y divide-border overflow-y-auto rounded border border-border">
+                {servers.map((server) => (
                   <div key={server.name} className="flex min-w-0 items-center gap-1.5 px-2 py-2">
                     <ServerIcon className="size-3.5 shrink-0 text-muted-foreground" />
                     <button
@@ -744,11 +744,11 @@ function McpServerManagerDialog({
                       <TrashIcon className="size-3 text-destructive" />
                     </Button>
                   </div>
-                ))
-              ) : (
-                <p className="px-2 py-3 text-xs text-muted-foreground">No MCP servers</p>
-              )}
-            </div>
+                ))}
+              </div>
+            ) : (
+              <p className="py-3 text-xs text-muted-foreground">No MCP servers</p>
+            )}
             {form.originalName && (
               <Button type="button" variant="ghost" size="sm" onClick={resetForm}>
                 <PlusIcon className="size-3.5" />
