@@ -24,6 +24,8 @@ import {
   CornerDownRightIcon,
   FileTextIcon,
   FlaskConicalIcon,
+  ListIcon,
+  NetworkIcon,
   PlusIcon,
   ScanSearchIcon,
   SearchIcon,
@@ -40,8 +42,10 @@ import { NessieIcon } from "@/components/icons/NessieIcon";
 import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
+import { Button } from "@/components/ui/button";
 import { RunningDot } from "@/components/RunningDot";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { SubagentsGraphView } from "./SubagentsGraphView";
 import { useSession } from "@/hooks/useSession";
 import type { SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -88,6 +92,8 @@ interface SubagentsPanelProps {
   rootSessionId: string;
 }
 
+type ViewMode = "list" | "graph";
+
 export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
   // Every list in the tree polls at TREE_POLL_MS as a staleness floor;
   // stream pushes remain the fast path. The stream only carries
@@ -99,6 +105,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   // child); the poll + stream together surface that.
   const { children, isLoading, error } = useChildSessions(rootSessionId, TREE_POLL_MS);
   const [addOpen, setAddOpen] = useState(false);
+  const [viewMode, setViewMode] = useState<ViewMode>("list");
 
   // Loading/error states only surface when there's no cached data to
   // show alongside the "main" row. Once any data is available we
@@ -118,8 +125,18 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
     );
   }
 
+  if (viewMode === "graph") {
+    return (
+      <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
+        <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+        <SubagentsGraphView conversationId={conversationId} rootSessionId={rootSessionId} />
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
+      <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
       <button
         type="button"
         data-testid="add-agent-button"
@@ -135,11 +152,42 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
           <SubagentRow key={child.id} child={child} depth={1} conversationId={conversationId} />
         ))}
       </ul>
-      {/* Mounted only while open so a closed rail issues no /v1/agents
-          fetch and carries none of the dialog's query dependencies. */}
       {addOpen && (
         <AddAgentDialog parentSessionId={rootSessionId} open={addOpen} onOpenChange={setAddOpen} />
       )}
+    </div>
+  );
+}
+
+function ViewModeToggle({
+  viewMode,
+  onViewModeChange,
+}: {
+  viewMode: ViewMode;
+  onViewModeChange: (mode: ViewMode) => void;
+}) {
+  return (
+    <div className="flex shrink-0 items-center justify-end gap-0.5 border-b px-2 py-1">
+      <Button
+        variant={viewMode === "list" ? "secondary" : "ghost"}
+        size="icon-xs"
+        onClick={() => onViewModeChange("list")}
+        aria-label="List view"
+        title="List view"
+        data-testid="view-mode-list"
+      >
+        <ListIcon className="size-3.5" />
+      </Button>
+      <Button
+        variant={viewMode === "graph" ? "secondary" : "ghost"}
+        size="icon-xs"
+        onClick={() => onViewModeChange("graph")}
+        aria-label="Graph view"
+        title="Graph view"
+        data-testid="view-mode-graph"
+      >
+        <NetworkIcon className="size-3.5" />
+      </Button>
     </div>
   );
 }
