@@ -4477,6 +4477,14 @@ function AgentPicker({
     // No model/effort to surface, but the user can still switch agents —
     // label the trigger with the current agent so the switcher reads clearly.
     triggerContent = agentDisplayName;
+  } else if (hasPickerActions) {
+    // The live model/effort isn't resolved yet (e.g. a claude-/codex-native
+    // session before the snapshot fills llmModel/selectedEffort: the generated
+    // spec may carry no executor model and no sticky/override is set), but the
+    // dropdown still has model rows to switch. Keep the trigger rendered — and
+    // the model dropdown + bare-`/model` open path reachable — with a stable
+    // identity fallback rather than hiding the picker entirely.
+    triggerContent = agentDisplayName ?? "Model";
   } else {
     return null;
   }
