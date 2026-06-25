@@ -5408,7 +5408,8 @@ def resume(
 # into a materialized copy of the spec before the server starts.
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
-    "'cursor', 'kimi', "
+    "'cursor', 'cursor-cloud' (Cursor Cloud / background agents — runs in "
+    "Cursor's cloud against a GitHub repo, opens a PR), 'kimi', "
     "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', 'goose', or 'copilot'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
@@ -5440,6 +5441,10 @@ _DEFAULT_HARNESS_PROMPTS = {
     ),
     "cursor": (
         "You are Cursor, running through Omnigent. Help the user with software engineering tasks."
+    ),
+    "cursor-cloud": (
+        "You are a Cursor Cloud background agent, running through Omnigent. "
+        "Help the user with software engineering tasks."
     ),
     "kimi": (
         "You are Kimi Code, running through Omnigent. "
@@ -10890,6 +10895,12 @@ def _run_configure_harnesses_interactive() -> None:
     # is outside the anthropic/openai machinery), so it dispatches to its own
     # credential manager rather than ``_manage_harness_providers``.
     _ANTIGRAVITY = "\x00antigravity"
+    # Sentinel marking the Cursor Cloud row — Cursor Cloud / Background Agents
+    # run in Cursor's cloud against a GitHub repo via the same ``cursor-sdk`` and
+    # the same ``CURSOR_API_KEY`` as the SDK Cursor harness, so it dispatches to
+    # the shared Cursor key flow (``_manage_cursor_harness``) rather than a
+    # separate credential of its own.
+    _CURSOR_CLOUD = "\x00cursor-cloud"
     # Sentinel marking the Qwen Code row — like Antigravity/Cursor it is not a
     # provider family (its v1 auth is the CLI's own env vars / ``/auth`` flow,
     # not an Omnigent credential), so it dispatches to its own drill-in.
@@ -10990,6 +11001,22 @@ def _run_configure_harnesses_interactive() -> None:
             options.append(f"  {cursor_sub}")
             selectable.append(False)
             row_target.append(None)
+        # Cursor Cloud / Background Agents: runs in Cursor's cloud against a
+        # GitHub repo (opens a PR) via the same ``cursor-sdk`` and the same
+        # ``CURSOR_API_KEY`` as the SDK Cursor harness — no separate secret. So
+        # readiness mirrors Cursor's (the shared key), and its row dispatches to
+        # the same key flow.
+        options.append(f"{'  ' if cursor_key_set else '[red]✗[/] '}Cursor Cloud")
+        selectable.append(True)
+        row_target.append(_CURSOR_CLOUD)
+        cursor_cloud_sub = (
+            "[green]✓[/] shares the Cursor API key"
+            if cursor_key_set
+            else "[dim]shares the Cursor API key — open to add one[/]"
+        )
+        options.append(f"  {cursor_cloud_sub}")
+        selectable.append(False)
+        row_target.append(None)
         # Antigravity (Gemini-native, no provider family): like Cursor, readiness
         # is just whether a Gemini key is configured (``antigravity:`` block or
         # ambient env); its drill-in manages that key. Vertex specs need no key,
@@ -11214,6 +11241,9 @@ def _run_configure_harnesses_interactive() -> None:
             return
         target = row_target[idx]
         if target == CURSOR_KEY:
+            _manage_cursor_harness()
+        elif target == _CURSOR_CLOUD:
+            # Cursor Cloud shares the Cursor API key — route to the same flow.
             _manage_cursor_harness()
         elif target == COPILOT_KEY:
             _manage_copilot_harness()
