@@ -4650,11 +4650,19 @@ function AgentPicker({
   // default. The other vendor-owns wrappers have no Omnigent-visible model and
   // stay null.
   const pickerSelectedModel = modelPickerKind === "cursor" ? sessionModelOverride : selectedModel;
+  // SDK/bundle agents (no native picker) never have the cross-session sticky
+  // applied to them, so their live model is the session's own — the applied
+  // override or the bound default — never `selectedModel` (a pick carried over
+  // from an unrelated session, e.g. a gpt-5.5 left from a Codex session showing
+  // on a Claude-SDK agent like Polly). claude-/codex-native keep `selectedModel`:
+  // there the sticky IS the applied model.
+  const nonNativeModel =
+    modelPickerKind === null ? (sessionModelOverride ?? llmModel) : (selectedModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
     ? modelPickerKind === "cursor"
       ? sessionModelOverride
       : null
-    : (selectedModel ?? llmModel);
+    : nonNativeModel;
   const modelLabel = formatStatusModelLabel(effectiveModel, codexModelOptions);
   const effortTriggerLabel =
     showEffort && selectedEffort
