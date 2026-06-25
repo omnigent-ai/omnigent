@@ -74,3 +74,20 @@ def test_clear_forgets_the_record() -> None:
     health.record_post_failure("external_session_status", httpx.ConnectError("boom"))
     health.clear()
     assert health.recent_post_failure(60.0) is None
+
+
+def test_note_post_success_clears_a_prior_failure() -> None:
+    """A successful POST clears the slot so a recovered connection isn't blamed.
+
+    Guards the misattribution fix: once connectivity returns and a POST gets a
+    response, the recorded failure must not survive to be attached to a later,
+    unrelated idle-watchdog stall.
+    """
+    health.clear()
+    try:
+        health.record_post_failure("external_session_status", httpx.ConnectError("boom"))
+        assert health.recent_post_failure(60.0) is not None
+        health.note_post_success()
+        assert health.recent_post_failure(60.0) is None
+    finally:
+        health.clear()

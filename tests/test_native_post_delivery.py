@@ -103,3 +103,50 @@ async def test_retry_loop_records_exhausted_connectivity_failure_for_watchdog() 
         assert "No route to host" in detail
     finally:
         health.clear()
+
+
+async def test_retry_loop_success_clears_a_prior_connectivity_failure() -> None:
+    """A successful POST clears a previously recorded connectivity failure.
+
+    Misattribution guard for issue #1119: once the server is reachable again,
+    the retry loop must empty the failure slot so the idle watchdog can't blame
+    a long-resolved outage for a later, unrelated stall.
+    """
+    from omnigent import _native_forwarder_health as health
+    from omnigent._native_post_delivery import post_session_event_with_retry
+
+    class _Ok:
+        """Stub client whose POST always succeeds with 200."""
+
+        async def post(self, url: str, *, json: object) -> httpx.Response:
+            """Return a 200 response."""
+            del json
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    async def _no_sleep(_: float) -> None:
+        """No-op sleep."""
+
+    health.clear()
+    try:
+        # Simulate an earlier outage still on record.
+        health.record_post_failure(
+            "external_session_status", httpx.ConnectError("No route to host")
+        )
+        assert health.recent_post_failure(60.0) is not None
+        response = await post_session_event_with_retry(
+            client=_Ok(),  # type: ignore[arg-type]
+            url="/v1/sessions/conv_x/events",
+            payload={"type": "external_session_status", "data": {}},
+            event_type="external_session_status",
+            max_attempts=2,
+            retry_status_codes=frozenset(),
+            sleep=_no_sleep,
+            retry_delay=lambda _attempt: 0.0,
+            logger_name="test.native_post_delivery",
+        )
+        assert response is not None
+        assert response.status_code == 200
+        # The successful round-trip must have cleared the stale failure.
+        assert health.recent_post_failure(60.0) is None
+    finally:
+        health.clear()

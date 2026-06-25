@@ -24,7 +24,12 @@ from collections.abc import Callable, Coroutine
 
 import httpx
 
-from omnigent._native_forwarder_health import record_post_failure as record_native_post_failure
+from omnigent._native_forwarder_health import (
+    note_post_success as note_native_post_success,
+)
+from omnigent._native_forwarder_health import (
+    record_post_failure as record_native_post_failure,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -141,6 +146,11 @@ async def post_session_event_with_retry(
                 return None
             await sleep(retry_delay(attempt))
             continue
+        # Reaching here means the POST got an HTTP response (no transport
+        # error), proving the server is reachable — clear any stale
+        # connectivity-failure record so the watchdog can't later misattribute
+        # it to an unrelated stall (issue #1119).
+        note_native_post_success()
         if response.status_code < 400:
             return response
         if response.status_code not in retry_status_codes:
