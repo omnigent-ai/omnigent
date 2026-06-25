@@ -2023,10 +2023,14 @@ export function JumpToTopButton({
 
   return (
     <div
+      // top 50px centers the pill on the chat-scroll-fade border (the mask ramps
+      // 48px→80px), just below the h-14 ChatHeader. z-40 > header z-30. On the
+      // iOS shell the header and fade border shift down by the safe-area inset
+      // (see .chat-scroll-fade in index.css), so add --omnigent-inset-top here
+      // too to keep the pill centered on the border. The var is 0px off-shell.
+      style={{ top: "calc(50px + var(--omnigent-inset-top))" }}
       className={cn(
-        // top-[50px]: centers the pill on the chat-scroll-fade border (the mask
-        // ramps 48px→80px), just below the h-14 ChatHeader. z-40 > header z-30.
-        "pointer-events-none absolute inset-x-0 top-[50px] z-40 flex justify-center transition-opacity duration-150",
+        "pointer-events-none absolute inset-x-0 z-40 flex justify-center transition-opacity duration-150",
         visible ? "opacity-100" : "opacity-0",
       )}
     >
