@@ -372,6 +372,7 @@ def _build_startup_header(
     from omnigent.onboarding.detected import effective_config_with_detected
     from omnigent.onboarding.provider_config import (
         describe_active_credential,
+        first_available_provider,
         load_config,
         surface_default_provider,
     )
@@ -397,7 +398,24 @@ def _build_startup_header(
             # pi scope, else the cross-family fallback).
             entry = surface_default_provider(config, fam)
             if entry is None:
-                label = "not configured"
+                # No default for this surface — but a launch falls back to the
+                # first credential that can serve it (the same
+                # first_available_provider the runtime spawn-env builders use).
+                # Name it so the header tells the truth: no default was chosen,
+                # yet the head WILL launch through this one.
+                fallback = first_available_provider(config, fam)
+                if fallback is None:
+                    label = "not configured"
+                else:
+                    cred_text = credential_label(
+                        fallback.kind,
+                        fallback.name,
+                        profile=fallback.profile,
+                        display_name=fallback.display_name,
+                    )
+                    label = (
+                        f"no default → will use {_header_glyph(fallback.kind)} {cred_text}"
+                    ).strip()
             else:
                 cred_text = credential_label(
                     entry.kind,
