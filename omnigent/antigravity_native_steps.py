@@ -662,6 +662,45 @@ def _user_message_event(*, text: str) -> OutboundEvent:
     )
 
 
+def _planner_error_event(
+    *, conversation_id: str, step_idx: int, step: dict[str, object]
+) -> OutboundEvent:
+    """
+    Build a committed assistant ``message`` item for an ERROR planner step.
+
+    A model/turn ERROR is otherwise dropped (the planner branch only commits at
+    DONE), so the turn looks like a silent empty reply. Surface a visible marker —
+    preferring any ``plannerResponse`` error text, falling back to a generic
+    message — mirroring the tool-level marker (:func:`_tool_error_output`). The
+    reader pairs this with a ``failed`` session-status edge.
+
+    :param conversation_id: agy conversation id (namespaces the response id).
+    :param step_idx: The ERROR planner step's index.
+    :param step: The ERROR PLANNER_RESPONSE step.
+    :returns: One ``external_conversation_item`` event (role ``"assistant"``).
+    """
+    detail = ""
+    planner = step.get("plannerResponse")
+    if isinstance(planner, dict):
+        err = planner.get("error") or planner.get("errorMessage")
+        if isinstance(err, str) and err.strip():
+            detail = f": {err.strip()}"
+    text = f"[antigravity: the model did not complete this turn (status ERROR){detail}]"
+    return OutboundEvent(
+        event_type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "assistant",
+                "agent": _AGENT_NAME,
+                "content": [{"type": "output_text", "text": text}],
+            },
+            "response_id": _response_id(conversation_id, step_idx),
+        },
+        step_index=step_idx,
+    )
+
+
 def _function_call_events(
     *,
     conversation_id: str,
@@ -949,6 +988,20 @@ def map_step_to_events(
     # with the FINAL text, on both the stream and poll paths. ERROR/other non-DONE →
     # no committed item (any partial already streamed as deltas).
     if step_type == _TYPE_PLANNER_RESPONSE:
+        if status == _STATUS_ERROR:
+            # A model/turn ERROR (safety block, rate-limit, provider overload,
+            # internal error) must surface as a VISIBLE error item — otherwise the
+            # turn clears to idle with no text and is indistinguishable from a
+            # normal empty reply (the user sees nothing; no retry hint). Emit a
+            # committed error message (the reader also closes the turn as FAILED).
+            idx = _step_index(step)
+            return [
+                _planner_error_event(
+                    conversation_id=conversation_id,
+                    step_idx=idx if idx is not None else 0,
+                    step=step,
+                )
+            ]
         if status != _STATUS_DONE:
             return []
         # Treat absent stepIndex as 0 (proto omits zero-valued scalar).

@@ -1056,6 +1056,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "AWS_SECRET_ACCESS_KEY": "aws-secret",
         "SOME_RANDOM_VAR": "x",
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
+        "KUBECONFIG": "/home/alice/.kube/config",
     }
 
     env = _build_runner_env(
@@ -1089,6 +1090,9 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # must reach the runner without also forcing
     # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``.
     assert env["OMNIGENT_CLAUDE_SDK_NO_SANDBOX"] == "1"
+    # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
+    # need it to resolve the user's cluster contexts and namespaces.
+    assert env["KUBECONFIG"] == "/home/alice/.kube/config"
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env

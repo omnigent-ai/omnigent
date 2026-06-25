@@ -131,6 +131,11 @@ e2b = ["e2b>=2.26,<3"]
 # Self-hosted gRPC gateway; the SDK pulls grpcio + protobuf. Same
 # lazy-import posture as above. Pre-1.0 SDK: pin minor.
 openshell = ["openshell>=0.0.7,<1"]
+# On-demand Kubernetes runner Pod launcher (server-managed
+# `sandbox.provider: kubernetes`). The launcher module ships in the base
+# package and imports the official client lazily, so only users of the
+# provider need this extra.
+kubernetes = ["kubernetes>=36,<37"]
 # MLflow tracing is opt-in: tracing is disabled by default and the
 # server degrades gracefully when mlflow is absent, so the (heavy) mlflow
 # dependency only installs for users who want it (`omnigent[tracing]`).
@@ -552,6 +557,12 @@ ignore_missing_imports = true
 # as modal above.
 [[tool.mypy.overrides]]
 module = "boxlite.*"
+ignore_missing_imports = true
+
+# kubernetes is an optional dep (the `kubernetes` extra); same lazy-import
+# posture as modal above. urllib3 rides in via the kubernetes client.
+[[tool.mypy.overrides]]
+module = "kubernetes.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

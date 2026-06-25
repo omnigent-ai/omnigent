@@ -102,7 +102,7 @@ automatically — Omnigent needs no extra configuration.
 Sandboxes boot from `ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI
 from the `host` target of [`deploy/docker/Dockerfile`](../docker/Dockerfile) with
 Omnigent and its dependencies preinstalled — including the coding-harness CLIs
-(`claude`, `codex`, `pi`), so agents on any harness run without an in-sandbox
+(`claude`, `codex`, `pi`, `kiro-cli`), so agents on any harness run without an in-sandbox
 install. OpenShell injects its own supervisor as the container entrypoint.
 
 The `host` target also carries the two things OpenShell's image contract requires

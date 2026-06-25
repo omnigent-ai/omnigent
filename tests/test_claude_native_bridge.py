@@ -3440,6 +3440,69 @@ async def test_start_tool_relay_accepts_codex_native_bridge_root(
 
 
 @pytest.mark.asyncio
+async def test_start_tool_relay_accepts_antigravity_native_bridge_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Relay startup accepts Antigravity-native's persistent bridge root (#1194).
+
+    Antigravity-native reuses the Claude MCP relay but stores bridge files in
+    ``~/.omnigent/antigravity-native`` (the same ``$HOME/.omnigent/<harness>``
+    shape codex uses). A regression in :func:`_trusted_parent_for_bridge_dir`
+    would reject the bridge dir, the relay would fail to write
+    ``tool_relay.json``, and the wrapped agy would get no ``sys_*`` tools.
+
+    :param tmp_path: Pytest temp directory used as an isolated user
+        state parent.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent import antigravity_native_bridge
+
+    antigravity_root = tmp_path / ".omnigent" / "antigravity-native"
+    monkeypatch.setattr("omnigent.antigravity_native_bridge._BRIDGE_ROOT", antigravity_root)
+    bridge_dir = antigravity_native_bridge.prepare_bridge_dir("conv_agy")
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+
+    async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """
+        Return an empty result for the unused relay tool callback.
+
+        :param name: Tool name, e.g. ``"sys_session_list"``.
+        :param arguments: Tool arguments.
+        :returns: Empty tool result.
+        """
+        del name, arguments
+        return {}
+
+    relay = None
+    try:
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[
+                {
+                    "name": "sys_session_create",
+                    "description": "Spawn an Omnigent sub-agent session.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_executor=_executor,
+            loop=asyncio.get_running_loop(),
+        )
+
+        assert relay_file.exists(), (
+            "Antigravity-native relay did not write tool_relay.json under the "
+            "persistent bridge root"
+        )
+        relay_info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert relay_info["tools"][0]["name"] == "sys_session_create"
+    finally:
+        if relay is not None:
+            relay.close()
+
+
+@pytest.mark.asyncio
 async def test_relay_close_keeps_advertisement_owned_by_newer_relay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
