@@ -1454,8 +1454,9 @@ async def _resolve_pi_resume_session(
 
     # Case 1: cold resume of a session that already has a captured Pi id.
     if launch_config.external_session_id is not None:
+        built: Path | None = None
         try:
-            await ensure_local_pi_resume_session(
+            built = await ensure_local_pi_resume_session(
                 server_client,
                 session_id=session_id,
                 external_session_id=launch_config.external_session_id,
@@ -1464,11 +1465,26 @@ async def _resolve_pi_resume_session(
                 model=model,
             )
         except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
+            built = None
             _logger.warning(
-                "Could not synthesize Pi resume session for %s; launching without history",
+                "Could not synthesize Pi resume session for %s; launching fresh",
                 session_id,
                 exc_info=True,
             )
+        # Only launch with ``--session <id>`` when a session file actually
+        # exists/was written. ``ensure_local_pi_resume_session`` returns
+        # ``None`` when nothing resumable was produced (missing/cleared bridge
+        # dir, empty history, or a transient fetch/write failure caught above).
+        # Returning the captured id regardless would emit ``pi --session <id>``
+        # for a file that does not exist — Pi then exits instead of launching,
+        # defeating the best-effort fallback this function promises. Fall back
+        # to a fresh session (return ``None``) in that case.
+        if built is None:
+            _logger.info(
+                "Pi cold-resume produced no local session file for %s; launching fresh",
+                session_id,
+            )
+            return None
         return launch_config.external_session_id
 
     # Case 2: forked clone bound to a pi-native target with no captured session
