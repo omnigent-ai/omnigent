@@ -87,7 +87,10 @@ OMNIGENT_HARNESSES = frozenset(
         "codex-native",
         "copilot",
         "cursor",
+        "kimi",
+        "kimi-native",
         "cursor-native",
+        "kiro-native",
         "goose",
         "goose-native",
         "hermes",
@@ -105,17 +108,20 @@ OMNIGENT_HARNESSES = frozenset(
 OMNIGENT_HARNESS_ALIASES = frozenset(
     {
         "claude",
+        "native-kiro",
         "native-pi",
         "native-antigravity",
         "native-goose",
         "openai-agents-sdk",
         "agy",
         "google-antigravity",
+        "kimi-code",
         "qwen-code",
         "opencode",
         "native-opencode",
         "native-hermes",
         "github-copilot",
+        "native-kimi",
     }
 )
 _OMNIGENT_ACCEPTED_HARNESSES = OMNIGENT_HARNESSES | OMNIGENT_HARNESS_ALIASES

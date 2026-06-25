@@ -7,11 +7,14 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 _logger = logging.getLogger(__name__)
 
@@ -239,6 +242,268 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(bridge_dir, 0o700)
     return bridge_dir
+
+
+# ── Omnigent MCP relay wiring (sys_* tools) ──────────────────────────────────
+#
+# agy is otherwise tool-isolated from Omnigent: unlike claude/codex/cursor it
+# wires no MCP relay, so the wrapped agy cannot reach any ``sys_*`` tool (spawn
+# sub-agent sessions, drive Omnigent terminals, list agents/models, ``sys_os_*``).
+# This section wires the SAME relay cursor #742 uses — the shared
+# ``omnigent.claude_native_bridge serve-mcp`` stdio server — into agy.
+#
+# THE CONFIG-SCOPING FOOTGUN. agy has no ``--mcp-config`` flag and ignores every
+# ``ANTIGRAVITY_*`` env knob; it loads MCP servers from a single HOME-GLOBAL file,
+# ``$HOME/.gemini/config/mcp_config.json`` — the *same* file the user's
+# interactive agy reads (verified empirically against agy 1.0.12). Writing that
+# file directly would (a) clobber/pollute the user's interactive agy config and
+# (b) be incorrect under concurrency: the relay command is bridge-dir-specific, so
+# two antigravity-native sessions (or a session + the user's interactive agy)
+# would fight over the one global file.
+#
+# CHOSEN DESIGN — per-session ISOLATED HOME. The runner launches agy with
+# ``HOME`` pointed at a per-bridge-dir tree (:func:`agy_home_dir`) seeded with a
+# COPY of the user's OAuth token + onboarding/migration markers and a
+# bridge-scoped ``config/mcp_config.json`` written by :func:`write_mcp_config`.
+# This (1) NEVER touches the user's real ``~/.gemini``, (2) gives each session its
+# own ``mcp_config.json`` so concurrent sessions never clobber one another, and
+# (3) was verified live: agy under the isolated HOME does NOT re-demand OAuth and
+# its ``/mcp`` panel shows ``✓ omnigent`` with the ``sys_*`` tools discovered. agy
+# resolves ``GeminiDir`` from ``$HOME/.gemini`` (its hardcoded default), so the
+# only thing the isolated HOME relocates is the *config + state* tree; auth still
+# works because the seeded token is a copy of the user's real one.
+_MCP_CONFIG_DIR = "config"
+_MCP_CONFIG_FILE = "mcp_config.json"
+_BRIDGE_CONFIG_FILE = "bridge.json"
+_MCP_SERVER_NAME = "omnigent"
+# agy auto-approves a relay tool when it is named in the server's ``enabledTools``
+# allowlist (agy's per-server MCP schema; mirrors cursor's ``autoApprove``).
+# Omnigent's own TOOL_CALL policy + elicitation gate still applies on the server
+# side, so auto-approving the agy-side MCP gate only avoids a hidden in-terminal
+# prompt blocking the call before Omnigent ever sees it.
+_AGY_ENABLED_TOOLS = [
+    "list_comments",
+    "sys_add_policy",
+    "sys_agent_download",
+    "sys_agent_get",
+    "sys_agent_list",
+    "sys_call_async",
+    "sys_cancel_async",
+    "sys_cancel_task",
+    "sys_list_models",
+    "sys_os_edit",
+    "sys_os_read",
+    "sys_os_shell",
+    "sys_os_write",
+    "sys_policy_registry",
+    "sys_session_close",
+    "sys_session_create",
+    "sys_session_get_history",
+    "sys_session_get_info",
+    "sys_session_list",
+    "sys_session_send",
+    "sys_terminal_close",
+    "sys_terminal_launch",
+    "sys_terminal_list",
+    "sys_terminal_read",
+    "sys_terminal_send",
+    "update_comment",
+]
+
+# Files copied from the user's real ``~/.gemini`` into the per-session isolated
+# HOME so agy does not re-run OAuth / onboarding. The OAuth token is the only
+# secret; it is COPIED (the real file is never moved or modified). Missing files
+# are skipped (agy regenerates onboarding/migration state, and a missing token
+# only means agy re-auths in that session — never a corruption of the real tree).
+_AGY_SEED_FILES = (
+    Path("antigravity-cli") / "antigravity-oauth-token",
+    Path("antigravity-cli") / "installation_id",
+)
+
+
+def agy_home_dir(bridge_dir: Path) -> Path:
+    """Return the per-session isolated ``HOME`` for an agy launch.
+
+    A subdirectory of *bridge_dir* so it is naturally per-session (the bridge dir
+    is hash-scoped to the bridge id) and torn down with the bridge. agy reads its
+    MCP config + state from ``$HOME/.gemini``; pinning ``HOME`` here keeps the
+    relay's ``mcp_config.json`` out of the user's real ``~/.gemini`` and prevents
+    two concurrent sessions from sharing one global config.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :returns: Absolute path to this session's isolated agy HOME.
+    """
+    return bridge_dir / "agy-home"
+
+
+def build_mcp_config(
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> dict[str, Any]:
+    """Build agy's ``mcp_config.json`` payload for the Omnigent relay server.
+
+    Mirrors cursor #742's :func:`omnigent.cursor_native_bridge.build_mcp_config`
+    but emits agy's per-server MCP schema (lowercase ``command`` / ``args`` /
+    ``env`` keys plus ``enabledTools``, agy's auto-approve allowlist — verified
+    against agy 1.0.12's config struct) under the top-level ``mcpServers`` key.
+    The server command is the SAME shared relay claude/codex/cursor use:
+    ``<python> -I -m omnigent.claude_native_bridge serve-mcp --bridge-dir <dir>``.
+
+    **HOME pinning (critical for the isolated-HOME design).** agy spawns this relay
+    as a child, so the relay inherits agy's environment — including the per-session
+    isolated ``HOME`` agy runs under. But the relay validates its ``--bridge-dir``
+    against ``bridge_root()`` (``$HOME/.omnigent/antigravity-native``), which must
+    resolve to the RUNNER's real home where the bridge dir actually lives — not the
+    isolated agy HOME (a child of the bridge dir). So the relay's ``env`` pins
+    ``HOME`` back to the runner's real home. ``-I`` does not clear ``HOME``; it only
+    ignores ``PYTHON*`` vars and user site-packages, so this override takes effect.
+
+    :param bridge_dir: Native Antigravity bridge directory whose relay this
+        config points at.
+    :param python_executable: Python interpreter for the relay command;
+        defaults to the current interpreter (``sys.executable``).
+    :returns: The ``mcp_config.json`` payload as a dict.
+    """
+    python = python_executable or sys.executable
+    return {
+        "mcpServers": {
+            _MCP_SERVER_NAME: {
+                "command": python,
+                "args": [
+                    "-I",
+                    "-m",
+                    "omnigent.claude_native_bridge",
+                    "serve-mcp",
+                    "--bridge-dir",
+                    str(bridge_dir),
+                ],
+                "enabledTools": list(_AGY_ENABLED_TOOLS),
+                "env": {
+                    "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+                    # Pin the relay to the RUNNER's real home so its bridge-root
+                    # validation matches where the bridge dir lives (agy runs under
+                    # an isolated HOME; the relay must not inherit it). See docstring.
+                    "HOME": str(Path.home()),
+                },
+            }
+        }
+    }
+
+
+def write_mcp_bridge_config(bridge_dir: Path) -> None:
+    """Write the token config the shared Omnigent MCP relay requires.
+
+    The relay's ``serve-mcp`` reads ``<bridge_dir>/bridge.json`` for a token that
+    authorizes its localhost control endpoint. Idempotent: an existing token is
+    left untouched so a resume/clear does not rotate a live relay's token.
+    Mirrors :func:`omnigent.cursor_native_bridge.write_mcp_bridge_config`.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :returns: None.
+    """
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    config_path = bridge_dir / _BRIDGE_CONFIG_FILE
+    if config_path.exists():
+        return
+    payload = {"token": secrets.token_urlsafe(32)}
+    tmp = bridge_dir / (_BRIDGE_CONFIG_FILE + ".tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, config_path)
+
+
+def write_mcp_config(
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> Path:
+    """Write the per-session agy MCP config + relay token into the isolated HOME.
+
+    Writes (1) ``bridge.json`` (the relay token) into *bridge_dir* and (2) the
+    ``mcp_config.json`` for the Omnigent relay into the per-session isolated agy
+    HOME at ``<agy_home>/.gemini/config/mcp_config.json`` — the path agy actually
+    loads MCP servers from. Because the HOME is per-session and never the user's
+    real ``~``, this never clobbers the user's interactive agy config and two
+    concurrent sessions never share one config. Mirrors cursor #742's
+    :func:`omnigent.cursor_native_bridge.write_mcp_config`, adapted to agy's
+    HOME-global config path + isolated-HOME scoping.
+
+    :param bridge_dir: Native Antigravity bridge directory (holds ``bridge.json``
+        and the isolated agy HOME).
+    :param python_executable: Python interpreter for the relay command;
+        defaults to the current interpreter.
+    :returns: Absolute path to the written ``mcp_config.json``.
+    """
+    write_mcp_bridge_config(bridge_dir)
+    config_dir = agy_home_dir(bridge_dir) / ".gemini" / _MCP_CONFIG_DIR
+    config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = config_dir / _MCP_CONFIG_FILE
+    payload = build_mcp_config(bridge_dir, python_executable=python_executable)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def seed_isolated_agy_home(bridge_dir: Path) -> dict[str, str]:
+    """Seed the per-session isolated agy HOME and return the launch env override.
+
+    Copies the user's real agy OAuth token + onboarding/migration state (NEVER
+    moving or modifying the real files) into ``<bridge_dir>/agy-home/.gemini`` so
+    a launch under this isolated HOME does not re-demand OAuth or re-run the
+    onboarding wizard. The relay's ``mcp_config.json`` is written separately by
+    :func:`write_mcp_config` so it lands in this same isolated tree rather than
+    the user's real ``~/.gemini`` (the footgun this whole design avoids).
+
+    Verified live (agy 1.0.12): under this isolated HOME agy logs in as the real
+    user from the seeded token and its ``/mcp`` panel shows ``✓ omnigent`` with the
+    ``sys_*`` tools discovered.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :returns: An env-override mapping (``{"HOME": <iso_home>}``) to layer onto the
+        agy launch environment.
+    """
+    real_home = Path.home()
+    iso_home = agy_home_dir(bridge_dir)
+    iso_gemini = iso_home / ".gemini"
+    (iso_gemini / "antigravity-cli" / "cache").mkdir(mode=0o700, parents=True, exist_ok=True)
+    (iso_gemini / _MCP_CONFIG_DIR).mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    # Copy the auth token + installation id (best-effort: a missing token only
+    # means agy re-auths this session; the real files are never touched).
+    for rel in _AGY_SEED_FILES:
+        src = real_home / ".gemini" / rel
+        if not src.is_file():
+            continue
+        dst = iso_gemini / rel
+        dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            dst.write_bytes(src.read_bytes())
+            os.chmod(dst, 0o600)
+
+    # Seed the onboarding-complete marker so the first-run wizard never blocks a
+    # headless launch (same state ``ensure_agy_onboarding_complete`` writes).
+    onboarding = iso_gemini / "antigravity-cli" / "cache" / "onboarding.json"
+    with contextlib.suppress(OSError):
+        onboarding.write_text(
+            json.dumps(
+                {
+                    "consumerOnboardingComplete": True,
+                    "enterpriseOnboardingComplete": False,
+                    "onboardingComplete": True,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    # Seed the migration marker so agy does not churn a from-scratch migration on
+    # first launch under the fresh HOME (cosmetic; agy creates it itself otherwise).
+    with contextlib.suppress(OSError):
+        (iso_gemini / _MCP_CONFIG_DIR / ".migrated").touch()
+
+    return {"HOME": str(iso_home)}
 
 
 def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) -> None:
@@ -815,3 +1080,53 @@ def inject_user_message_via_tui(
             time.sleep(_TMUX_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
     _submit_and_verify(socket_path, tmux_target)
+
+
+def send_interaction_keys_via_tui(
+    bridge_dir: Path,
+    *keys: str,
+) -> None:
+    """
+    Send raw key arguments to the agy TUI pane to answer its in-process prompt.
+
+    The companion to :func:`inject_user_message_via_tui` for the OTHER thing the
+    attended agy TUI maintains in parallel with the RPC step state: its
+    **in-process permission / question prompt**. When agy runs attended (the
+    web/mobile path types every turn into the TUI), an approval surfaces in the
+    Omnigent web UI AND as agy's own numbered TUI prompt ("Do you want to
+    proceed?", 1.Yes … 4.No). Delivering the verdict over
+    :func:`omnigent.antigravity_native_rpc.handle_user_interaction` flips the
+    backend trajectory step to DONE and the command runs, but the **TUI prompt
+    for that interaction can stay open** — and the next typed turn then lands in
+    that stale prompt's filter/amend buffer instead of starting a fresh turn
+    (live-verified; see ``docs/claude/antigravity-rpc-spike-notes.md`` §"attended
+    TUI"). So the bridge ALSO types the selection into the pane to dismiss the
+    prompt, mirroring cursor-native's
+    :func:`omnigent.cursor_native_bridge.send_cursor_pane_keys`.
+
+    Each argument is a tmux ``send-keys`` key argument — a bare ``"1"`` / ``"4"``
+    selects a numbered option, ``"Enter"`` confirms, ``"Escape"`` cancels — sent
+    in order as ONE ``send-keys`` invocation so the digit and its Enter cannot be
+    reordered or split across the pane's input handling. Keys are interpreted by
+    tmux (no ``-l``), so named keys like ``Enter`` / ``Escape`` work.
+
+    :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
+    :param keys: Ordered tmux key arguments, e.g. ``("1", "Enter")`` to approve.
+    :returns: None.
+    :raises RuntimeError: When the tmux target is not advertised, the agy TUI has
+        exited, or the ``send-keys`` invocation fails.
+    """
+    if not keys:
+        raise RuntimeError("antigravity-native TUI selection requires at least one key")
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        raise RuntimeError(
+            "antigravity-native tmux target not advertised (is the agy terminal running?)"
+        )
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "the agy terminal is no longer running (the TUI exited); restart the session"
+        )
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)

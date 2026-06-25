@@ -10,6 +10,7 @@ import pytest
 from omnigent.server.routes._antigravity_elicitation import (
     to_elicitation_params,
     to_interaction_payload,
+    to_tui_selection_keys,
 )
 from omnigent.server.schemas import ElicitationResult
 
@@ -385,6 +386,78 @@ class TestToInteractionPayloadPermission:
         result = ElicitationResult(action="cancel")
         payload = to_interaction_payload("permission", result, self._spec())
         assert payload == {"permission": {"allow": False}}
+
+
+# ── to_tui_selection_keys: web verdict → agy TUI keystrokes (#1200) ──
+
+
+class TestToTuiSelectionKeysPermission:
+    """Tests for permission verdict → agy TUI numbered-prompt keystrokes."""
+
+    def _spec(self) -> dict[str, object]:
+        spec = _PERMISSION_PENDING["spec"]
+        assert isinstance(spec, dict)
+        return spec
+
+    def test_accept_types_option_1_then_enter(self) -> None:
+        """Approve → option 1 ("Yes") + Enter (the always-safe choice)."""
+        result = ElicitationResult(action="accept")
+        assert to_tui_selection_keys("permission", result, self._spec()) == ["1", "Enter"]
+
+    def test_decline_types_option_4_then_enter(self) -> None:
+        """Reject → option 4 ("No") + Enter."""
+        result = ElicitationResult(action="decline")
+        assert to_tui_selection_keys("permission", result, self._spec()) == ["4", "Enter"]
+
+    def test_cancel_types_option_4_then_enter(self) -> None:
+        """Cancel maps to the reject option, like the RPC ``allow: False`` path."""
+        result = ElicitationResult(action="cancel")
+        assert to_tui_selection_keys("permission", result, self._spec()) == ["4", "Enter"]
+
+
+class TestToTuiSelectionKeysAskQuestion:
+    """Tests for ask_question verdict → agy TUI numbered-prompt keystrokes."""
+
+    def _spec(self) -> dict[str, object]:
+        spec = _ASK_QUESTION_PENDING["spec"]
+        assert isinstance(spec, dict)
+        return spec
+
+    def test_accept_types_selected_option_id_then_enter(self) -> None:
+        """A single-select answer types its option id + Enter."""
+        result = ElicitationResult(action="accept", content={"0": "CLI tool"})
+        assert to_tui_selection_keys("ask_question", result, self._spec()) == ["2", "Enter"]
+
+    def test_multi_select_types_all_ids_then_enter(self) -> None:
+        """A multi-select answer types every selected option id, then Enter."""
+        spec = _MULTI_SELECT_PENDING["spec"]
+        assert isinstance(spec, dict)
+        result = ElicitationResult(action="accept", content={"0": ["React", "Angular"]})
+        assert to_tui_selection_keys("ask_question", result, spec) == ["1", "3", "Enter"]
+
+    def test_decline_types_escape(self) -> None:
+        """A decline (no concrete option id) dismisses the TUI prompt with Escape."""
+        result = ElicitationResult(action="decline")
+        assert to_tui_selection_keys("ask_question", result, self._spec()) == ["Escape"]
+
+    def test_write_in_only_answer_types_escape(self) -> None:
+        """An answer that is purely free-form (no matching option id) → Escape.
+
+        agy's TUI numbered prompt cannot accept a write-in by digit; the RPC
+        ``writeInResponse`` carries the text, so the keystroke just dismisses the
+        stale TUI surface.
+        """
+        result = ElicitationResult(action="accept", content={"0": "Something custom"})
+        assert to_tui_selection_keys("ask_question", result, self._spec()) == ["Escape"]
+
+
+class TestToTuiSelectionKeysUnknownKind:
+    """Guard against unknown interaction kinds in the TUI-key mapper."""
+
+    def test_unknown_kind_raises(self) -> None:
+        result = ElicitationResult(action="accept")
+        with pytest.raises(ValueError, match="unknown_kind"):
+            to_tui_selection_keys("unknown_kind", result, {})
 
 
 # ── unknown kind guard ───────────────────────────────────────────────
