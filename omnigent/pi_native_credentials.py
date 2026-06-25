@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from omnigent.model_override import normalize_model_for_provider
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     CHAT_WIRE_API,
@@ -163,6 +164,17 @@ def _inline_family_pi_provider(
         resolved_model = model or entry.family_default_model(family_name)
         if not resolved_model:
             continue
+        # A session model override can arrive as a Databricks-gateway id
+        # (``databricks-claude-opus-4-7``) — that prefix only routes through the
+        # Databricks AI Gateway (``_databricks_pi_provider``). This family is
+        # vendor-direct (key / inline gateway / local Anthropic|OpenAI endpoint),
+        # so strip the mechanical ``databricks-`` prefix to the bare vendor id
+        # the endpoint can actually route. ``normalize_model_for_provider`` is
+        # prefix-mechanical: it only strips ``databricks-claude-*``/
+        # ``databricks-gpt-*`` and passes non-mechanical ids (e.g.
+        # ``zai-org/GLM-4.7``) and already-bare ids through unchanged. Family
+        # defaults are bare, so the no-override path is unaffected.
+        resolved_model = normalize_model_for_provider(resolved_model, KEY_KIND)
         return PiProviderConfig(
             provider_id=_PI_PROVIDER_ID,
             base_url=family.base_url,

@@ -8,7 +8,10 @@ import {
   deriveHomeDir,
   deriveRepoName,
   describeCreateError,
+  harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
+  harnessWarningBadgeText,
+  harnessWarningMessageText,
   isValidSandboxRepoUrl,
   isValidWorkspace,
   matchSkillInvocation,
@@ -375,7 +378,7 @@ describe("describeCreateError", () => {
 });
 
 describe("harnessUnconfiguredOnHost", () => {
-  const hostWith = (configured: Record<string, boolean> | null | undefined): Host =>
+  const hostWith = (configured: Record<string, boolean | string> | null | undefined): Host =>
     ({
       host_id: "host_1",
       name: "laptop",
@@ -385,10 +388,41 @@ describe("harnessUnconfiguredOnHost", () => {
     }) as Host;
 
   it("warns only on an explicit false from the host", () => {
-    const host = hostWith({ "claude-sdk": true, codex: false });
+    const testHost = hostWith({ "claude-sdk": true, codex: false });
     // Explicit false → warn; explicit true → no warning.
-    expect(harnessUnconfiguredOnHost("codex", host)).toBe(true);
-    expect(harnessUnconfiguredOnHost("claude-sdk", host)).toBe(false);
+    expect(harnessUnconfiguredOnHost("codex", testHost)).toBe(true);
+    expect(harnessUnconfiguredOnHost("claude-sdk", testHost)).toBe(false);
+  });
+
+  it("keeps legacy non-codex false availability generic", () => {
+    const testHost = hostWith({ "claude-native": false });
+    const reason = harnessUnavailableReasonOnHost("claude-native", testHost);
+    expect(reason).toBe("unconfigured");
+    expect(harnessWarningBadgeText(reason)).toBe("needs setup");
+    expect(harnessWarningMessageText("Claude Code", "laptop", reason)).toBe(
+      "Claude Code isn't configured on laptop — run omnigent setup on that machine.",
+    );
+  });
+
+  it("surfaces structured codex unavailable reasons", () => {
+    const testHost = hostWith({ codex: "needs-auth", "codex-native": "binary-missing" });
+    expect(harnessUnconfiguredOnHost("codex", testHost)).toBe(true);
+    expect(harnessUnavailableReasonOnHost("codex", testHost)).toBe("needs-auth");
+    expect(harnessUnavailableReasonOnHost("codex-native", testHost)).toBe("binary-missing");
+    expect(harnessWarningBadgeText("needs-auth")).toBe("needs auth");
+    expect(harnessWarningMessageText("Codex", "laptop", "needs-auth")).toBe(
+      "Codex needs Codex authentication on laptop — run codex login on that machine.",
+    );
+    expect(harnessWarningBadgeText("binary-missing")).toBe("binary missing");
+    expect(harnessWarningMessageText("Codex", "laptop", "binary-missing")).toBe(
+      "Codex is missing the Codex binary on laptop — run omnigent setup on that machine.",
+    );
+  });
+
+  it("ignores unknown future reason strings", () => {
+    expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "future-reason" }))).toBe(
+      null,
+    );
   });
 
   it("never warns when readiness is unknown", () => {
@@ -544,6 +578,8 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}) {
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    server_version: null,
+    smart_routing_enabled: false,
     ...infoOverrides,
   };
   return render(

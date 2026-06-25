@@ -304,3 +304,149 @@ def test_anthropic_family_ignores_wire_api() -> None:
     assert provider.base_url == "https://api.anthropic.com"
     assert provider.model == "claude-4"
     assert provider.api_key == "sk-test"
+
+
+def test_model_override_beats_databricks_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A session model override wins over the Databricks gateway default.
+
+    This is the spec-driven model-override path: the runner reads the agent
+    spec's ``executor.model`` and threads it into ``resolve_pi_native_provider``,
+    so the rendered ``models.json`` selects the requested model rather than the
+    ``databricks-claude-sonnet-4-6`` default.
+    """
+    from omnigent.inner import databricks_executor
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+
+    provider = creds.resolve_pi_native_provider(
+        model="databricks-claude-opus-4-7", config_loader=_databricks_config
+    )
+
+    assert provider is not None
+    assert provider.model == "databricks-claude-opus-4-7"
+    # The override flows all the way into the rendered models.json.
+    cfg = provider.to_models_config()
+    assert cfg["providers"]["omnigent"]["models"] == [{"id": "databricks-claude-opus-4-7"}]
+
+
+def test_model_override_beats_inline_family_default() -> None:
+    """A session model override wins over an inline family's default model."""
+    config = {
+        "providers": {
+            "anthropic": {
+                "kind": "key",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "sk-test",
+                    "models": {"default": "claude-sonnet-4-6"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="claude-opus-4-7", config_loader=lambda: config
+    )
+    assert provider is not None
+    assert provider.model == "claude-opus-4-7"
+    cfg = provider.to_models_config()
+    assert cfg["providers"]["omnigent"]["models"] == [{"id": "claude-opus-4-7"}]
+
+
+def test_databricks_prefixed_override_normalized_for_inline_anthropic() -> None:
+    """A ``databricks-`` override against an inline Anthropic key provider strips.
+
+    The spec's ``executor.model`` may be a Databricks-gateway id
+    (``databricks-claude-opus-4-7``). That prefix only routes through the
+    Databricks AI Gateway; an inline vendor-direct provider (here a
+    key-kind ``api.anthropic.com``) cannot route it. The resolver must
+    mechanically strip the prefix so the rendered ``models.json`` selects the
+    bare ``claude-opus-4-7`` id the endpoint understands.
+    """
+    config = {
+        "providers": {
+            "anthropic": {
+                "kind": "key",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "sk-test",
+                    "models": {"default": "claude-sonnet-4-6"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="databricks-claude-opus-4-7", config_loader=lambda: config
+    )
+    assert provider is not None
+    # The gateway prefix is stripped for the vendor-direct Anthropic endpoint.
+    assert provider.model == "claude-opus-4-7"
+    cfg = provider.to_models_config()
+    assert cfg["providers"]["omnigent"]["models"] == [{"id": "claude-opus-4-7"}]
+
+
+def test_databricks_prefixed_override_normalized_for_inline_openai() -> None:
+    """A ``databricks-`` override against an inline OpenAI provider strips too.
+
+    Same contract as the Anthropic case for the OpenAI family: a
+    ``databricks-gpt-*`` id is a gateway spelling the vendor-direct OpenAI
+    endpoint cannot route, so the prefix is stripped to the bare ``gpt-*`` id.
+    """
+    config = {
+        "providers": {
+            "openai-gateway": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "sk-test",
+                    "models": {"default": "gpt-4o"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="databricks-gpt-5-4", config_loader=lambda: config
+    )
+    assert provider is not None
+    assert provider.api == "openai-responses"
+    # The gateway prefix is stripped for the vendor-direct OpenAI endpoint.
+    assert provider.model == "gpt-5-4"
+    cfg = provider.to_models_config()
+    assert cfg["providers"]["omnigent"]["models"] == [{"id": "gpt-5-4"}]
+
+
+def test_inline_family_passes_non_mechanical_override_through() -> None:
+    """A non-mechanical override (slash-shaped) passes through unchanged.
+
+    ``normalize_model_for_provider`` only strips mechanical
+    ``databricks-claude-*``/``databricks-gpt-*`` ids; a custom inline-gateway
+    id like ``zai-org/GLM-4.7`` has no gateway counterpart and must survive
+    verbatim so the inline endpoint can route it.
+    """
+    config = {
+        "providers": {
+            "deepinfra": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "https://api.deepinfra.com/v1/openai",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                    "models": {"default": "zai-org/GLM-4.7"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="zai-org/GLM-4.7", config_loader=lambda: config
+    )
+    assert provider is not None
+    assert provider.model == "zai-org/GLM-4.7"
+    cfg = provider.to_models_config()
+    assert cfg["providers"]["omnigent"]["models"] == [{"id": "zai-org/GLM-4.7"}]

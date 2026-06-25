@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
@@ -371,6 +372,7 @@ def _build_startup_header(
     from omnigent.onboarding.detected import effective_config_with_detected
     from omnigent.onboarding.provider_config import (
         describe_active_credential,
+        first_available_provider,
         load_config,
         surface_default_provider,
     )
@@ -396,7 +398,24 @@ def _build_startup_header(
             # pi scope, else the cross-family fallback).
             entry = surface_default_provider(config, fam)
             if entry is None:
-                label = "not configured"
+                # No default for this surface — but a launch falls back to the
+                # first credential that can serve it (the same
+                # first_available_provider the runtime spawn-env builders use).
+                # Name it so the header tells the truth: no default was chosen,
+                # yet the head WILL launch through this one.
+                fallback = first_available_provider(config, fam)
+                if fallback is None:
+                    label = "not configured"
+                else:
+                    cred_text = credential_label(
+                        fallback.kind,
+                        fallback.name,
+                        profile=fallback.profile,
+                        display_name=fallback.display_name,
+                    )
+                    label = (
+                        f"no default → will use {_header_glyph(fallback.kind)} {cred_text}"
+                    ).strip()
             else:
                 cred_text = credential_label(
                     entry.kind,
@@ -5661,8 +5680,12 @@ def _render_context_tree(
         + _CONTEXT_COIN_BUF * buf_coins
     )
 
-    free_tokens = max(context_window - message_tokens, 0)
     buf_tokens = int(context_window * buf_frac)
+    # Free space excludes the compaction buffer so the three rows partition the
+    # window (Messages + Free + Buffer = window) and each row's token count
+    # agrees with its own percentage. (Previously free omitted the buffer, so it
+    # read e.g. "920,150 tokens (72%)" — a count that is 92% of the window.)
+    free_tokens = max(context_window - message_tokens - buf_tokens, 0)
     used_pct = used_frac * 100.0
 
     tree.add(
@@ -7972,6 +7995,13 @@ def _render_history_item(
 _SLASH_COMMAND_ALIASES: frozenset[str] = frozenset({"/?", "/exit"})
 
 
+# A skill name must read as a slash-command token: an alphanumeric start then
+# word chars, ``:`` (Claude ``plugin:skill``), or ``-`` (Cursor ``plugin--skill``).
+# Rejects whitespace, ``/``, and control characters. Mirrors the web composer's
+# SLASH_COMMAND_RE so the terminal and the menu agree on what is a command.
+_SKILL_COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9][\w:-]*$")
+
+
 def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     """
     Auto-register each discovered skill as a REPL slash command.
@@ -7981,6 +8011,12 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     global :data:`COMMANDS` registry. Collisions are skipped with a
     warning log so built-in commands always win.
 
+    Skills marked ``user-invocable: false`` are skipped — they are
+    internal orchestration skills, not user-typeable slash commands, so
+    they must not appear in the REPL's slash-command/autocomplete surface
+    (the same contract the web composer menu honors). The skill stays
+    loadable by the agent itself; only the user-facing command is hidden.
+
     :param skills: The agent's parsed skill list.
     :returns: List of registered command names (e.g. ``["/code-review"]``).
         Callers should pass this to :func:`unregister_skill_commands`
@@ -7988,6 +8024,17 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     """
     registered: list[str] = []
     for skill in skills:
+        if not skill.user_invocable:
+            continue
+        if not _SKILL_COMMAND_NAME_RE.match(skill.name):
+            # A name with whitespace, ``/``, or control chars yields an
+            # uninvocable or colliding command — skip + warn rather than
+            # register garbage. Mirrors the web composer's SLASH_COMMAND_RE.
+            _log.warning(
+                "Skill %r skipped: name is not a valid slash-command token",
+                skill.name,
+            )
+            continue
         cmd_name = f"/{skill.name}"
         if cmd_name in COMMANDS:
             _log.warning(

@@ -1038,6 +1038,31 @@ def get_default_provider(config: dict[str, object], family: str) -> ProviderEntr
     return candidates[0]
 
 
+def first_available_provider(config: dict[str, object], family: str) -> ProviderEntry | None:
+    """
+    Return the first configured provider that can serve *family*, or ``None``.
+
+    Unlike :func:`get_default_provider` (which requires an explicit
+    ``default:``), this returns the first provider whose served families
+    include *family* regardless of default status — the credential a launch
+    falls back to when no default is configured for the family. Shared by the
+    runtime spawn-env builders (so a head still launches) and the REPL startup
+    creds line (so the readout names exactly what the launch will use), keeping
+    the two provably in agreement.
+
+    :param config: The parsed config mapping, optionally merged with ambient
+        detections (:func:`effective_config_with_detected`).
+    :param family: The model family / surface, e.g. ``"openai"`` or
+        :data:`PI_SURFACE`.
+    :returns: The first :class:`ProviderEntry` serving *family*, in config
+        order, or ``None`` when none serves it.
+    """
+    for entry in load_providers(config).values():
+        if family in provider_families(entry):
+            return entry
+    return None
+
+
 def default_provider_for_harness(config: dict[str, object], harness: str) -> ProviderEntry | None:
     """Return the default provider for *harness* (resolving its family).
 

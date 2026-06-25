@@ -7,7 +7,7 @@
 // fetches the full `AgentObject` for a single session via
 // `GET /v1/sessions/{sessionId}/agent`.
 
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 
 export interface McpServerSummary {
@@ -46,6 +46,8 @@ export interface Agent {
   harness?: string | null;
   /** MCP server declarations from the agent spec. Empty when none configured. */
   mcp_servers?: McpServerSummary[];
+  /** Whether the active session's agent bundle can be edited through the UI. */
+  mcp_servers_editable?: boolean;
   /** Guardrails policies declared on the agent. Empty when none configured. */
   policies?: PolicySummary[];
   /** Terminal names declared in the spec's `terminals:` block, in
@@ -117,6 +119,7 @@ interface AgentObjectWire {
   description?: string | null;
   harness?: string | null;
   mcp_servers?: McpServerSummary[];
+  mcp_servers_editable?: boolean;
   policies?: PolicySummary[];
   terminals?: string[];
 }
@@ -137,6 +140,7 @@ async function fetchSessionAgent(sessionId: string): Promise<Agent> {
     description: json.description,
     harness: json.harness ?? null,
     mcp_servers: json.mcp_servers,
+    mcp_servers_editable: json.mcp_servers_editable,
     policies: json.policies,
     terminals: json.terminals,
   };
@@ -153,5 +157,95 @@ export function useSessionAgent(sessionId: string | null) {
     queryFn: () => fetchSessionAgent(sessionId!),
     enabled: sessionId !== null,
     staleTime: Infinity,
+  });
+}
+
+export interface UpsertMcpServerInput {
+  name: string;
+  transport: "http" | "stdio";
+  description?: string | null;
+  url?: string | null;
+  command?: string | null;
+  args?: string[];
+}
+
+async function parseMutationError(res: Response): Promise<Error> {
+  try {
+    const body = (await res.json()) as { error?: { message?: string }; detail?: unknown };
+    if (body.error?.message) return new Error(body.error.message);
+    if (typeof body.detail === "string") return new Error(body.detail);
+  } catch {
+    // Fall through to the status text.
+  }
+  return new Error(`${res.status} ${res.statusText}`);
+}
+
+function sessionAgentQueryKey(sessionId: string) {
+  return ["session-agent", sessionId];
+}
+
+function invalidateSessionAgent(queryClient: ReturnType<typeof useQueryClient>, sessionId: string) {
+  void queryClient.invalidateQueries({ queryKey: sessionAgentQueryKey(sessionId) });
+}
+
+export function useCreateMcpServer(sessionId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (payload: UpsertMcpServerInput) => {
+      const res = await authenticatedFetch(
+        `/v1/sessions/${encodeURIComponent(sessionId)}/agent/mcp-servers`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        },
+      );
+      if (!res.ok) throw await parseMutationError(res);
+      return (await res.json()) as McpServerSummary;
+    },
+    onSuccess: () => invalidateSessionAgent(queryClient, sessionId),
+  });
+}
+
+export function useUpdateMcpServer(sessionId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      serverName,
+      payload,
+    }: {
+      serverName: string;
+      payload: UpsertMcpServerInput;
+    }) => {
+      const res = await authenticatedFetch(
+        `/v1/sessions/${encodeURIComponent(sessionId)}/agent/mcp-servers/${encodeURIComponent(
+          serverName,
+        )}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        },
+      );
+      if (!res.ok) throw await parseMutationError(res);
+      return (await res.json()) as McpServerSummary;
+    },
+    onSuccess: () => invalidateSessionAgent(queryClient, sessionId),
+  });
+}
+
+export function useDeleteMcpServer(sessionId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (serverName: string) => {
+      const res = await authenticatedFetch(
+        `/v1/sessions/${encodeURIComponent(sessionId)}/agent/mcp-servers/${encodeURIComponent(
+          serverName,
+        )}`,
+        { method: "DELETE" },
+      );
+      if (!res.ok) throw await parseMutationError(res);
+    },
+    onSuccess: () => invalidateSessionAgent(queryClient, sessionId),
   });
 }

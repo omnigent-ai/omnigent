@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
@@ -418,6 +418,114 @@ describe("Composer slash-command submit routing", () => {
 
     expect(setModel).toHaveBeenCalledWith("gpt-5.4");
     expect(onSend).not.toHaveBeenCalled();
+  });
+});
+
+describe("AgentPicker trigger label", () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      conversationId: "conv_test",
+      skills: [],
+      selectedModel: null,
+      selectedEffort: null,
+      llmModel: null,
+      codexModelOptions: [],
+      nativeVendorOwnsModel: false,
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("shows the model in the foreground and effort muted (model/effort swapped into the trigger)", () => {
+    useChatStore.setState({ selectedModel: "opus", selectedEffort: "high" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+        })}
+      />,
+    );
+    const trigger = screen.getByTestId("agent-picker-trigger");
+    expect(trigger).toHaveTextContent("Opus");
+    expect(trigger).toHaveTextContent("High");
+    // The harness identity ("Claude") is NOT in the trigger anymore — it
+    // moved to the status tray below.
+    expect(trigger).not.toHaveTextContent("Claude");
+    // Model black, effort grey.
+    expect(within(trigger).getByText("Opus")).toHaveClass("text-foreground");
+    expect(within(trigger).getByText("High")).toHaveClass("text-muted-foreground");
+  });
+
+  it("still renders an enabled trigger when the model/effort label is unresolved", () => {
+    // Regression guard: a claude-native session before the snapshot fills
+    // llmModel/selectedEffort has no model label, no effort label, and no
+    // agent switcher — but CLAUDE_NATIVE_MODELS still gives the dropdown
+    // model rows to switch (hasPickerActions). The trigger must NOT vanish
+    // (which would also take the model dropdown and the bare-`/model` path
+    // with it); it falls back to a stable identity label and stays enabled.
+    useChatStore.setState({ selectedModel: null, selectedEffort: null, llmModel: null });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          showEffort: false,
+        })}
+      />,
+    );
+    const trigger = screen.getByTestId("agent-picker-trigger");
+    expect(trigger).toBeVisible();
+    // Enabled because there are still model rows to switch — so the dropdown
+    // (and the bare-`/model` open path) stays reachable.
+    expect(trigger).toBeEnabled();
+    // Falls back to the bound agent's display label rather than rendering empty.
+    expect(trigger).toHaveTextContent("Claude");
+  });
+
+  it("surfaces a cursor-native session's model from the override, not the cross-session sticky", () => {
+    // cursor-native is a vendor-owns-model wrapper, so `nativeVendorOwnsModel`
+    // is true and the bound `llmModel` is a meaningless default. Its live model
+    // is mirrored into the session override (`sessionModelOverride`), NOT the
+    // cross-session sticky `selectedModel`. The trigger must read the real
+    // session model ("Composer 2.5"), not the stale sticky pick carried over
+    // from another session. Effort is NOT shown — cursor effort control is
+    // dropped for now (showEffort=false), so the pill is model-only.
+    useChatStore.setState({
+      nativeVendorOwnsModel: true,
+      selectedModel: "opus-4.5", // stale cross-session sticky — must be ignored
+      sessionModelOverride: "composer-2.5",
+      selectedEffort: "low",
+      llmModel: "fable", // meaningless vendor default — must not surface
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "cursor" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "cursor",
+          showModels: true,
+          showEffort: false, // cursor effort control is dropped for now
+          codexModelOptions: [
+            { id: "composer-2.5", displayName: "Composer 2.5" },
+            { id: "opus-4.5", displayName: "Opus 4.5" },
+          ],
+        })}
+      />,
+    );
+    const trigger = screen.getByTestId("agent-picker-trigger");
+    expect(trigger).toHaveTextContent("Composer 2.5");
+    // Neither the stale sticky, the meaningless vendor default, nor any effort leaks in.
+    expect(trigger).not.toHaveTextContent("Opus 4.5");
+    expect(trigger).not.toHaveTextContent("fable");
+    expect(trigger).not.toHaveTextContent("Low");
+    expect(within(trigger).getByText("Composer 2.5")).toHaveClass("text-foreground");
   });
 });
 

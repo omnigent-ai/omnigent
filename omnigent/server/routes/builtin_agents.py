@@ -104,6 +104,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         updated_at=agent.updated_at,
         harness=harness,
         mcp_servers=mcp_servers,
+        mcp_servers_editable=False,
         skills=skills,
         terminals=terminals,
     )
