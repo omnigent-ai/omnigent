@@ -2,6 +2,7 @@
 // it reads at a glance; running/unseen stay as compact dots. Verbose copy
 // (incl. the approval count) lives in the tooltip.
 
+import type { ReactElement } from "react";
 import { RunningDot } from "@/components/RunningDot";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -16,7 +17,7 @@ interface Visual {
   kind: SessionState["kind"];
   ariaLabel: string;
   tooltip: string;
-  render: () => JSX.Element;
+  render: () => ReactElement;
 }
 
 function describe(state: SessionState): Visual {
