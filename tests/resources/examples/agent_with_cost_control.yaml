@@ -1,0 +1,54 @@
+# Demo: cost-control tier routing via the cost_control_classifier policy.
+#
+# Classifies each session's first user message into a tier and routes
+# to a cheaper or more expensive model. Requires the server to have an
+# llm: config block (the classifier calls the server-level LLM).
+#
+# Usage:
+#   # Start the server with an llm: config:
+#   omnigents server --config <server_config_with_llm.yaml>
+#
+#   # Run the agent against the server:
+#   omnigents run tests/resources/examples/agent_with_cost_control.yaml \
+#       --server http://localhost:8000
+#
+#   # Simple question → cheap tier (haiku):
+#   > What's the capital of France?
+#
+#   # Complex question → expensive tier (opus):
+#   > Design a microservice architecture for a real-time analytics pipeline
+
+name: agent_with_cost_control
+prompt: |
+  You are a helpful assistant. Answer the user's question concisely.
+
+executor:
+  harness: openai-agents
+  model: databricks-gpt-5-5-mini
+  auth:
+    type: databricks
+    profile: oss
+
+policies:
+  cost_control:
+    type: function
+    function:
+      path: omnigents.policies.builtins.routing.cost_control_classifier
+      arguments:
+        rubric: |
+          Use the EXPENSIVE tier for: multi-step reasoning, architecture
+          design, complex debugging, large refactors, research synthesis.
+          Use the MEDIUM tier for: moderate coding tasks, explanations
+          requiring some depth, multi-paragraph writing.
+          Use the CHEAP tier for: simple lookups, greetings, short Q&A,
+          single-fact answers, status checks.
+        tiers:
+          cheap:
+            model: databricks-claude-haiku-4-5
+            harness: claude-sdk
+          medium:
+            model: databricks-claude-sonnet-4-6
+            harness: openai-agents
+          expensive:
+            model: databricks-claude-opus-4-8
+            harness: claude-sdk

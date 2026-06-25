@@ -355,6 +355,32 @@ export interface ChatState {
    */
   tokensUsed: number | null;
   /**
+   * Cost-control advisor's chosen tier for this session
+   * (``"cheap"`` | ``"expensive"``), hydrated from the
+   * ``cost_control.tier`` session label. ``null`` when the agent
+   * has no cost-control routing or the advisor hasn't run yet.
+   */
+  costControlTier: string | null;
+  /**
+   * The concrete model the advisor's tier resolved to (e.g.
+   * ``"databricks-claude-opus-4-7"``), from the ``cost_control.model``
+   * session label. ``null`` when no advisor routing applies.
+   */
+  costControlModel: string | null;
+  /**
+   * Whether the post-first-turn cost-control label refetch has already
+   * run for this session. The advisor judges once, on the first user
+   * turn, and persists ``cost_control.tier`` / ``.model`` labels
+   * server-side *after* the stream bound — so the bind-time snapshot
+   * misses them. When the first turn's ``session.status: running``
+   * arrives (the labels already exist by then) we refetch once to
+   * surface the advisor pick live, while the response streams; this flag
+   * stops the refetch from re-firing every turn on agents that have no
+   * cost-control routing (where the labels never appear). Reset on
+   * conversation switch.
+   */
+  costControlChecked: boolean;
+  /**
    * Cumulative session spend in USD, server-computed (the same total
    * the cost-budget policy gates on). Seeded from the session snapshot
    * and updated by ``session.usage`` SSE events. ``null`` when the
@@ -706,6 +732,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   sessionHarness: null,
   contextWindow: null,
   tokensUsed: null,
+  costControlTier: null,
+  costControlModel: null,
+  costControlChecked: false,
   sessionCostUsd: null,
   sessionUsageByModel: null,
   gitBranch: null,
@@ -1182,6 +1211,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         codexPlanMode: false,
         contextWindow: null,
         tokensUsed: null,
+        costControlTier: null,
+        costControlModel: null,
+        costControlChecked: false,
         sessionCostUsd: null,
         sessionUsageByModel: null,
         gitBranch: null,
@@ -1964,6 +1996,8 @@ async function bindStream(
         // handoff (fired above, silent) shows immediately.
         sessionModelOverride: effectiveSessionOverride,
         tokensUsed: session.lastTotalTokens ?? null,
+        costControlTier: session.labels?.["cost_control.tier"] ?? null,
+        costControlModel: session.labels?.["cost_control.model"] ?? null,
         sessionCostUsd: session.totalCostUsd ?? null,
         sessionUsageByModel: session.usageByModel ?? null,
         todos: (session.todos ?? []) as Array<{
@@ -3315,6 +3349,56 @@ function removeFromPendingStash(
  *
  * No-op for events outside the `session.*` family.
  */
+/**
+ * Refetch the current session's cost-control labels once, after the
+ * first turn, so the advisor pill surfaces live without a reload.
+ *
+ * The advisor runs server-side on the first user turn and writes the
+ * ``cost_control.tier`` / ``cost_control.model`` labels *after* the SSE
+ * stream bound — so {@link bindStream}'s snapshot never saw them. The
+ * judge writes them *before* the turn dispatches, so they already exist
+ * by the time the turn's first ``session.status: running`` arrives — we
+ * trigger this there so the pill appears *while the response streams*,
+ * with ``response_completed`` kept as a fallback (e.g. a missed running
+ * event on reconnect). The once-per-session gate makes whichever fires
+ * first win.
+ *
+ * Gated so it runs at most once per session:
+ * - ``costControlChecked`` is flipped true up front (before the await)
+ *   so concurrent triggers (running + completed) can't fan out into
+ *   parallel fetches.
+ * - Skipped when a tier is already known (reload of an established
+ *   session hydrated it at bind).
+ *
+ * The result is applied only if the user is still on the same
+ * conversation — a fetch that resolves after a navigate-away must not
+ * write another session's pill.
+ */
+async function maybeRefetchCostControlLabels(): Promise<void> {
+  const { conversationId, costControlChecked, costControlTier } = useChatStore.getState();
+  if (conversationId === null || costControlChecked || costControlTier !== null) return;
+  // Claim the one-shot slot before awaiting so concurrent completions
+  // don't each launch a fetch.
+  useChatStore.setState({ costControlChecked: true });
+  let session: Session;
+  try {
+    session = await getSession(conversationId);
+  } catch {
+    // Transient snapshot fetch failure — leave the pill hidden. The
+    // labels still hydrate on the next bind (reload / navigate-back).
+    return;
+  }
+  const tier = session.labels?.["cost_control.tier"] ?? null;
+  if (tier === null) return;
+  // Drop the result if the user navigated away while the fetch was in
+  // flight — the store now describes a different conversation.
+  if (useChatStore.getState().conversationId !== conversationId) return;
+  useChatStore.setState({
+    costControlTier: tier,
+    costControlModel: session.labels?.["cost_control.model"] ?? null,
+  });
+}
+
 export function handleSessionEvent(event: StreamEvent): void {
   switch (event.type) {
     case "response_completed":
@@ -3329,6 +3413,12 @@ export function handleSessionEvent(event: StreamEvent): void {
           useChatStore.setState({ tokensUsed: ringTokens });
         }
       }
+      // The cost-control advisor judges once, on the first user turn, and
+      // persists its tier/model labels server-side — but only after the
+      // stream had already bound, so the bind-time snapshot missed them.
+      // Refetch the labels once now so the advisor pill appears live
+      // (no reload). See `costControlChecked` for the once-per-session gate.
+      void maybeRefetchCostControlLabels();
       return;
     case "session_todos":
       // Replace the todo list entirely — each event carries the full
@@ -3601,6 +3691,15 @@ export function handleSessionEvent(event: StreamEvent): void {
             queryKey: ["session", event.conversationId],
           });
         }
+      }
+      // Surface the cost-control advisor pick as soon as the turn STARTS,
+      // not just at completion. The judge writes the tier/model labels
+      // server-side before the turn dispatches, so by the time a
+      // `running`/`waiting` status arrives they already exist — refetch once
+      // here (gated once-per-session in the helper) so the pill appears
+      // while the response is still streaming, not after it ends.
+      if (event.status === "running" || event.status === "waiting") {
+        void maybeRefetchCostControlLabels();
       }
       return;
     }

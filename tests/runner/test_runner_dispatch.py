@@ -305,6 +305,13 @@ class _FakeProcessManager:
             raise AssertionError("get_client should not be called")
         return self._harness_client
 
+    def current_harness(self, conversation_id: str) -> str | None:
+        """Return ``None`` — fake manager doesn't track harness names."""
+        return None
+
+    async def release(self, conversation_id: str) -> None:
+        """No-op release."""
+
 
 @pytest.fixture
 async def started_manager() -> AsyncIterator[HarnessProcessManager]:
@@ -459,6 +466,13 @@ class _RecordingProcessManager:
         self._reached.set()
         return _FakeHarnessClient([])
 
+    def current_harness(self, conversation_id: str) -> str | None:
+        """Return ``None`` — recording manager doesn't track harness names."""
+        return None
+
+    async def release(self, conversation_id: str) -> None:
+        """No-op release."""
+
 
 @pytest.mark.asyncio
 async def test_runner_resolves_agent_from_server_snapshot_when_msg_lacks_agent_id() -> None:
@@ -599,6 +613,13 @@ class _ContentCapturingProcessManager:
         """
         del conversation_id, harness_name, env
         return _ContentCapturingHarnessClient(self._captured, self._reached)
+
+    def current_harness(self, conversation_id: str) -> str | None:
+        """Return ``None`` — capturing manager doesn't track harness names."""
+        return None
+
+    async def release(self, conversation_id: str) -> None:
+        """No-op release."""
 
 
 class _ContentCapturingHarnessClient:

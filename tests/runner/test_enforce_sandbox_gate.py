@@ -93,6 +93,10 @@ class _FakeProcessManager:
         """
         return True
 
+    def current_harness(self, conversation_id: str) -> str | None:
+        """Return ``None`` — fake manager doesn't track harness names."""
+        return None
+
     async def release(self, conversation_id: str) -> None:
         """No-op release stub.
 

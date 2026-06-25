@@ -11820,6 +11820,11 @@ def create_runner_app(
                 or cached_spec.executor.type
             )
             harness_name = canonicalize_harness(h) or h
+            # Cost-control cross-harness routing: the server may direct
+            # this session onto a different harness than the spec declares.
+            _cc_harness = msg_body.get("harness_override")
+            if _cc_harness:
+                harness_name = canonicalize_harness(_cc_harness) or _cc_harness
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
                 harness_name,
@@ -12265,6 +12270,23 @@ def create_runner_app(
                 await process_manager.release(conv_id)
         if agent_version is not None:
             _version_cache[conv_id] = agent_version
+
+        # Cost-control cross-harness routing: when the resolved harness
+        # differs from the one currently spawned for this session, tear
+        # the old subprocess down so ``get_client`` respawns onto the
+        # requested harness. The classifier picks a harness once per
+        # session — the verdict is persisted as a label and reused —
+        # so this fires at most once. Conversation history lives in
+        # the store, not the subprocess, so the respawn loses no context.
+        _active_harness = process_manager.current_harness(conv_id)
+        if _active_harness is not None and _active_harness != harness_name:
+            _logger.info(
+                "cost_control: session %s switching harness %s -> %s; respawning",
+                conv_id,
+                _active_harness,
+                harness_name,
+            )
+            await process_manager.release(conv_id)
 
         try:
             client = await process_manager.get_client(conv_id, harness_name, env=spawn_env)

@@ -850,6 +850,9 @@ async def test_runner_shutdown_closes_terminal_registry(
         async def shutdown(self) -> None:
             self.shutdown_called = True
 
+        def current_harness(self, conversation_id: str) -> str | None:
+            return None
+
     def _terminal_registry_factory(
         *,
         conversation_link_base_url: str | None = None,

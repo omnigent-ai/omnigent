@@ -482,14 +482,15 @@ async def test_different_message_not_cached() -> None:
 
 def test_registry_entry_well_formed() -> None:
     """
-    The ``POLICY_REGISTRY`` has one entry with the expected handler
-    path and kind, and ``expensive_models`` is required.
+    The ``POLICY_REGISTRY`` has entries for both routing policies with
+    the expected handler paths and kinds.
 
     What breaks if this fails: the server startup scan won't
-    discover the routing policy, or operators can omit the
-    required ``expensive_models`` parameter.
+    discover the routing policies, or operators can omit required
+    parameters.
     """
-    assert len(POLICY_REGISTRY) == 1
+    # 2 = deny_trivial_to_expensive_model + cost_control_classifier
+    assert len(POLICY_REGISTRY) == 2
     entry = POLICY_REGISTRY[0]
     assert entry["handler"] == (
         "omnigent.policies.builtins.routing.deny_trivial_to_expensive_model"
@@ -498,3 +499,11 @@ def test_registry_entry_well_formed() -> None:
     schema = entry["params_schema"]
     assert "expensive_models" in schema["properties"]
     assert "expensive_models" in schema["required"]
+
+    cc_entry = POLICY_REGISTRY[1]
+    assert cc_entry["handler"] == ("omnigents.policies.builtins.routing.cost_control_classifier")
+    assert cc_entry["kind"] == "factory"
+    cc_schema = cc_entry["params_schema"]
+    # Both factory params are required.
+    assert "rubric" in cc_schema["required"]
+    assert "tiers" in cc_schema["required"]

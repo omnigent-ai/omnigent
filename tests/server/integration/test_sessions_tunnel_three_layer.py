@@ -151,6 +151,10 @@ class FakeProcessManager:
         self._apps.pop(conversation_id, None)
         self._in_flight.pop(conversation_id, None)
 
+    def current_harness(self, conversation_id: str) -> str | None:
+        """Return ``None`` — fake manager doesn't track harness names."""
+        return None
+
     async def forward_cancel(self, conversation_id: str) -> None:
         # EchoHarness completes synchronously; cancellation is not
         # exercised by the happy-path test. A future tunneled

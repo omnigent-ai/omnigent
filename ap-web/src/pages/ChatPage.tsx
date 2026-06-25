@@ -76,6 +76,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
+import { AdvisorBadge } from "@/components/AdvisorBadge";
 import { agentDisplayLabel } from "@/components/AgentInfo";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { useConversations } from "@/hooks/useConversations";
@@ -747,7 +748,14 @@ export function ChatPage() {
   // + shimmer/pill) for the main chat and is suppressed mid-elicitation or
   // when the runner is known offline.
   const isWorking = !hasPendingElicitation && computeIsWorking(sessionStatus);
-  const showsWorking = computeShowsWorking(sessionStatus, { hasPendingElicitation, runnerOnline });
+  const showsWorking = computeShowsWorking(sessionStatus, {
+    hasPendingElicitation,
+    runnerOnline,
+    // Light up the moment we send locally, before the server's
+    // `session.status: running` arrives — closes the first-turn
+    // judge gap. `status` is the local optimistic streaming flag.
+    localStreaming: status === "streaming",
+  });
 
   // A fork of a coding session carries the source id in this label (set by
   // fork_conversation). It is provenance — it persists after the clone is
@@ -4131,6 +4139,8 @@ export function Composer({
                 if (commandError !== null) setCommandError(null);
               }}
             />
+            <ComposerUsageIndicators />
+            <AdvisorBadge />
           </div>
           {/* Cost toggle + agent picker + Send — right side */}
           <div className="flex min-w-0 items-center gap-0.5">
@@ -4245,15 +4255,25 @@ export function computeIsWorking(sessionStatus: SessionStatus): boolean {
  * @param options.runnerOnline - Runner liveness: ``true`` online, ``false``
  *   known offline, ``undefined`` before the health poll resolves. Only known
  *   offline suppresses the indicator.
+ * @param options.localStreaming - ``true`` the instant the local client sends,
+ *   before the server's ``session.status: running`` arrives (it lags the
+ *   POST — by seconds on the first turn, where the cost-control judge runs
+ *   synchronously before dispatch). Lights the indicator immediately so the
+ *   user isn't left staring at a sent message with no feedback. ``send`` sets
+ *   it; every terminal/error path clears it, so it can't stick.
  * @returns ``true`` when the main session's own status should render Working.
  */
 export function computeShowsWorking(
   sessionStatus: SessionStatus,
-  options: { hasPendingElicitation: boolean; runnerOnline: boolean | undefined },
+  options: {
+    hasPendingElicitation: boolean;
+    runnerOnline: boolean | undefined;
+    localStreaming: boolean;
+  },
 ): boolean {
   if (options.runnerOnline === false) return false;
   if (options.hasPendingElicitation) return false;
-  return computeIsWorking(sessionStatus);
+  return computeIsWorking(sessionStatus) || options.localStreaming;
 }
 
 /**

@@ -7983,6 +7983,45 @@ async def _persist_session_event(
     return item_id
 
 
+@dataclass(frozen=True)
+class _CostControlRoute:
+    """
+    Resolved cost-control routing from persisted labels.
+
+    :param model: The chosen tier's model id, e.g.
+        ``"databricks-claude-opus-4-7"``.
+    :param harness: The chosen tier's harness, or ``None`` when
+        the classifier didn't set one (inherit executor default).
+    """
+
+    model: str
+    harness: str | None
+
+
+def _resolve_cost_control_route(
+    conv: Conversation,
+) -> _CostControlRoute | None:
+    """
+    Read cost-control labels and resolve the route.
+
+    The ``cost_control_classifier`` builtin policy writes
+    ``cost_control.model`` (and optionally ``cost_control.harness``)
+    during ``_evaluate_input_policy``. This function reads them back.
+    Returns ``None`` when no model label exists (classifier hasn't
+    run, abstained, or the agent doesn't use cost-control routing).
+
+    :param conv: The conversation entity (freshly loaded after
+        input-policy evaluation so its labels include the
+        classifier's writes).
+    :returns: A :class:`_CostControlRoute`, or ``None``.
+    """
+    model = conv.labels.get("cost_control.model")
+    if not model:
+        return None
+    harness = conv.labels.get("cost_control.harness") or None
+    return _CostControlRoute(model=model, harness=harness)
+
+
 async def _forward_event_to_runner(
     session_id: str,
     conv: Conversation,
@@ -7994,6 +8033,7 @@ async def _forward_event_to_runner(
     artifact_store: ArtifactStore | None = None,
     has_mcp_servers: bool = False,
     created_by: str | None = None,
+    cost_control_route: _CostControlRoute | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -8115,15 +8155,29 @@ async def _forward_event_to_runner(
     # and the model can't invoke client-side Read/Write/Glob/etc.
     if body.tools:
         runner_body["tools"] = body.tools
-    # Per-event override wins; fall back to the persisted column so a
-    # UI / REPL PATCH applies even when the client doesn't repeat
-    # model_override on every event. ``is not None`` over ``or`` per
-    # the no-invented-defaults rule.
-    effective_runner_override = (
-        body.model_override if body.model_override is not None else conv.model_override
+    # Per-event override wins; fall back to the persisted column; fall
+    # back to the cost-control classifier's route. ``is not None`` over
+    # ``or`` per the no-invented-defaults rule.
+    _using_cost_control = (
+        body.model_override is None
+        and conv.model_override is None
+        and cost_control_route is not None
     )
+    if body.model_override is not None:
+        effective_runner_override = body.model_override
+    elif conv.model_override is not None:
+        effective_runner_override = conv.model_override
+    elif _using_cost_control:
+        effective_runner_override = cost_control_route.model
+    else:
+        effective_runner_override = None
     if effective_runner_override is not None:
         runner_body["model_override"] = effective_runner_override
+    # Cross-harness routing: when the classified tier names a harness
+    # (and the user did not override the model), tell the runner which
+    # harness to (re)spawn onto for this session.
+    if _using_cost_control and cost_control_route.harness is not None:
+        runner_body["harness_override"] = cost_control_route.harness
     # Per-session brain-harness override — create-time only, so no
     # per-event value exists; the persisted column is the source.
     if conv.harness_override is not None:
@@ -8184,6 +8238,7 @@ async def _dispatch_session_event_to_runner(
     has_mcp_servers: bool = False,
     created_by: str | None = None,
     runner_router: RunnerRouter | None = None,
+    cost_control_route: _CostControlRoute | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -8318,6 +8373,7 @@ async def _dispatch_session_event_to_runner(
         artifact_store=artifact_store,
         has_mcp_servers=has_mcp_servers,
         created_by=created_by,
+        cost_control_route=cost_control_route,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
@@ -17903,6 +17959,24 @@ def create_sessions_router(
                 created_by=_attribution_user(user_id),
             )
             return {"queued": True, "item_id": item_id}
+        # ── Cost-control tier routing ──────────────────────────────
+        # The cost_control_classifier policy may have written
+        # cost_control.model / cost_control.harness labels during
+        # _evaluate_input_policy above. Only re-read if the
+        # already-loaded conv has (or might have) the label — skip
+        # the extra DB round-trip for the vast majority of agents
+        # that don't use cost-control routing.
+        _cc_route: _CostControlRoute | None = None
+        if "cost_control.model" in conv.labels:
+            # Label already present from a prior turn — read directly.
+            _cc_route = _resolve_cost_control_route(conv)
+        elif body.type == "message" and body.data.get("role") == "user":
+            # First turn: the classifier may have just written labels
+            # during _evaluate_input_policy — re-read to pick them up
+            # (the in-memory conv predates the policy write).
+            _fresh_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if _fresh_conv is not None:
+                _cc_route = _resolve_cost_control_route(_fresh_conv)
         dispatch = await _dispatch_session_event_to_runner(
             session_id,
             conv,
@@ -17915,6 +17989,7 @@ def create_sessions_router(
             has_mcp_servers=_has_mcp_servers,
             created_by=_attribution_user(user_id),
             runner_router=runner_router,
+            cost_control_route=_cc_route,
         )
         response: dict[str, Any] = {"queued": True}
         if dispatch.item_id is not None:

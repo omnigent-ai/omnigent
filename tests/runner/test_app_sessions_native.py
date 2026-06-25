@@ -250,6 +250,10 @@ class _FakeProcessManager:
         self.cancelled.append(conversation_id)
         return True
 
+    def current_harness(self, conversation_id: str) -> str | None:
+        """Return ``None`` — fake manager doesn't track harness names."""
+        return None
+
     async def release(self, conversation_id: str) -> None:
         """Record a release and remove the session."""
         self.released.append(conversation_id)

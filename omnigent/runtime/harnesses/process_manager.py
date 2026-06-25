@@ -685,6 +685,24 @@ class HarnessProcessManager:
         """
         return conversation_id in self._in_flight_response_ids
 
+    def current_harness(self, conversation_id: str) -> str | None:
+        """
+        Return the harness name of the live subprocess for a session.
+
+        The single source of truth for "which harness is spawned right
+        now" — read by the cost-control cross-harness path to decide
+        whether a tier's harness differs from the running one and a
+        respawn (``release`` + ``get_client``) is needed.
+
+        :param conversation_id: AP-allocated conversation id,
+            e.g. ``"conv_abc123"``.
+        :returns: The spawned harness name (e.g. ``"claude-sdk"``), or
+            ``None`` when no subprocess is currently registered for the
+            session (never spawned, or already released).
+        """
+        entry = self._entries.get(conversation_id)
+        return entry.harness if entry is not None else None
+
     async def release(self, conversation_id: str) -> None:
         """
         Terminate and unregister the subprocess for a conversation.
