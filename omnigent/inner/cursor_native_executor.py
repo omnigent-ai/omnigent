@@ -17,7 +17,12 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from omnigent.cursor_native_bridge import BRIDGE_DIR_ENV_VAR, inject_user_message
+from omnigent.cursor_native_bridge import (
+    BRIDGE_DIR_ENV_VAR,
+    inject_user_message,
+    take_fork_preamble,
+    wrap_fork_preamble,
+)
 from omnigent.inner.executor import (
     Executor,
     ExecutorConfig,
@@ -83,6 +88,16 @@ class CursorNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="cursor native turn had no user text to send")
             return
+        # A fork into cursor carries history as a text preamble: cursor's
+        # conversation is server-backed (no local store to seed for --resume), so
+        # the runner stashed the prior turns and we prepend them to the FIRST
+        # injected message. ``take_fork_preamble`` consumes the file, so later
+        # turns inject the plain user text. The forwarder strips the sentinel
+        # block when mirroring this turn back, so the copied history isn't
+        # duplicated in the Omnigent timeline.
+        preamble = take_fork_preamble(self._bridge_dir)
+        if preamble:
+            text = wrap_fork_preamble(preamble, text)
         try:
             async with self._inject_lock:
                 await asyncio.to_thread(inject_user_message, self._bridge_dir, content=text)

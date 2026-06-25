@@ -76,6 +76,25 @@ class TestUnwrapUserQuery:
         raw = "<user_query>\n[Attached: /tmp/x/img.png]\ndescribe this\n</user_query>"
         assert fwd._unwrap_user_query(raw) == "describe this"
 
+    def test_strips_fork_history_preamble_block(self) -> None:
+        # A fork into cursor prepends the prior conversation, fenced. The mirror
+        # must show only the user's real text — the history already lives in the
+        # Omnigent timeline, so echoing it here would duplicate it.
+        from omnigent.cursor_native_bridge import (
+            FORK_HISTORY_CLOSE_TAG,
+            FORK_HISTORY_OPEN_TAG,
+        )
+
+        raw = (
+            "<user_query>\n"
+            f"{FORK_HISTORY_OPEN_TAG}\n"
+            "Conversation so far:\nuser: earlier\nassistant: ok\n"
+            f"{FORK_HISTORY_CLOSE_TAG}\n\n"
+            "now do the real thing\n"
+            "</user_query>"
+        )
+        assert fwd._unwrap_user_query(raw) == "now do the real thing"
+
 
 class TestContentText:
     def test_string_content(self) -> None:

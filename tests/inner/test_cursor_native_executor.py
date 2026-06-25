@@ -16,6 +16,8 @@ import pytest
 
 from omnigent.cursor_native_bridge import (
     BRIDGE_DIR_ENV_VAR,
+    FORK_HISTORY_CLOSE_TAG,
+    FORK_HISTORY_OPEN_TAG,
     _paste_payload_bytes,
     allow_mcp_tools_in_cli_config,
     approve_mcp_server_for_workspace,
@@ -25,10 +27,14 @@ from omnigent.cursor_native_bridge import (
     cursor_project_key,
     enable_mcp_for_workspace,
     read_tmux_info,
+    take_fork_preamble,
+    wrap_fork_preamble,
+    write_fork_preamble,
     write_mcp_bridge_config,
     write_mcp_config,
     write_tmux_target,
 )
+from omnigent.inner import cursor_native_executor as cne
 from omnigent.inner.cursor_native_executor import (
     CursorNativeExecutor,
     _content_to_text,
@@ -80,6 +86,75 @@ class TestExecutorCapabilities:
         assert ex.supports_streaming() is False
         # Web-UI messages can be injected mid-turn (steering).
         assert ex.supports_live_message_queue() is True
+
+
+class TestForkPreamble:
+    """The fork preamble file + sentinel framing (text-prefix replay)."""
+
+    def test_write_take_round_trip_is_once_only(self, tmp_path: Path) -> None:
+        write_fork_preamble(tmp_path, "Conversation so far:\nuser: hi")
+        # First read returns it; the file is consumed so the second read is None.
+        assert take_fork_preamble(tmp_path) == "Conversation so far:\nuser: hi"
+        assert take_fork_preamble(tmp_path) is None
+
+    def test_empty_preamble_is_not_written(self, tmp_path: Path) -> None:
+        write_fork_preamble(tmp_path, "")
+        assert take_fork_preamble(tmp_path) is None
+
+    def test_take_missing_is_none(self, tmp_path: Path) -> None:
+        assert take_fork_preamble(tmp_path) is None
+
+    def test_wrap_fences_preamble_before_user_text(self) -> None:
+        wrapped = wrap_fork_preamble("Conversation so far:\nuser: hi", "do it")
+        assert wrapped.startswith(FORK_HISTORY_OPEN_TAG)
+        assert FORK_HISTORY_CLOSE_TAG in wrapped
+        # The user's real text follows the fenced block.
+        assert wrapped.endswith("do it")
+        assert wrapped.index(FORK_HISTORY_CLOSE_TAG) < wrapped.index("do it")
+
+
+class TestRunTurnPreambleInjection:
+    """run_turn prepends the fork preamble to the FIRST injected message only."""
+
+    @pytest.mark.asyncio
+    async def test_first_turn_injects_preamble_then_consumes_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        injected: list[str] = []
+        monkeypatch.setattr(
+            cne,
+            "inject_user_message",
+            lambda bridge_dir, content: injected.append(content),
+        )
+        write_fork_preamble(tmp_path, "You: earlier")
+        ex = CursorNativeExecutor(bridge_dir=tmp_path)
+
+        # First turn: the preamble rides into the injected text, fenced.
+        async for _ in ex.run_turn([{"role": "user", "content": "first"}], [], ""):
+            pass
+        assert FORK_HISTORY_OPEN_TAG in injected[0]
+        assert "You: earlier" in injected[0]
+        assert injected[0].endswith("first")
+
+        # Second turn: preamble consumed -> plain user text only.
+        async for _ in ex.run_turn([{"role": "user", "content": "second"}], [], ""):
+            pass
+        assert injected[1] == "second"
+
+    @pytest.mark.asyncio
+    async def test_no_preamble_injects_plain_text(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        injected: list[str] = []
+        monkeypatch.setattr(
+            cne,
+            "inject_user_message",
+            lambda bridge_dir, content: injected.append(content),
+        )
+        ex = CursorNativeExecutor(bridge_dir=tmp_path)
+        async for _ in ex.run_turn([{"role": "user", "content": "hello"}], [], ""):
+            pass
+        assert injected == ["hello"]
 
 
 class TestPastePayload:
