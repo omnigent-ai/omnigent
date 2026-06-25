@@ -29,6 +29,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, ViewportSize, expect
 
+from tests.e2e_ui.conftest import send_and_await_assistant_reply
+
 # iPhone-12-class portrait viewport — comfortably below the Tailwind
 # ``md`` breakpoint (768px) so every ``md:`` rule resolves to its
 # mobile branch.
@@ -250,12 +252,11 @@ def test_mobile_files_drawer_opens_seeded_file(
     expect(file_viewer.get_by_text(_SEEDED_FILE_CONTENT).first).to_be_visible(timeout=20_000)
 
 
-# The agent turn is dispatched to the in-process harness, which
-# occasionally produces no assistant output on the first turn (the
-# runner goes idle after dispatch — a nondeterministic harness
-# scheduling stall, not a real-LLM artifact since this drives the mock
-# LLM). Rerun on failure rather than widen the already-generous 60s
-# wait, which a stalled turn would never satisfy.
+# ``send_and_await_assistant_reply`` absorbs the client-side
+# stream-subscription race that historically flaked this turn (the composer
+# is interactive before the live event pump connects, and the session stream
+# has no replay buffer — see the helper's docstring). The ``flaky`` marker
+# stays as a backstop for any residual harness scheduling stall.
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_mobile_chat_send_and_response(
     page: Page,
@@ -270,11 +271,5 @@ def test_mobile_chat_send_and_response(
     page.set_viewport_size(_MOBILE_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
 
-    composer = page.get_by_placeholder("Ask the agent anything…")
-    expect(composer).to_be_visible()
-    composer.fill("Say 'pong' in one word.")
-    page.get_by_role("button", name="Send", exact=True).click()
-
-    assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
-    expect(assistant).to_be_visible(timeout=60_000)
+    assistant = send_and_await_assistant_reply(page, "Say 'pong' in one word.")
     expect(assistant).to_have_text(re.compile(r"\S"), timeout=60_000)

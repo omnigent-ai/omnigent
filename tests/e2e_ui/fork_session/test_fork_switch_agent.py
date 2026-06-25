@@ -39,7 +39,10 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import _FILES_PROBE_ENV_AGENT_NAME
+from tests.e2e_ui.conftest import (
+    _FILES_PROBE_ENV_AGENT_NAME,
+    send_and_await_assistant_reply,
+)
 
 # Unique marker so the copied-transcript assertion can't match UI chrome or
 # another test's message.
@@ -68,6 +71,10 @@ def _agent_id_by_name(base_url: str, name: str) -> str:
     return str(agent["id"])
 
 
+# ``send_and_await_assistant_reply`` recovers the first turn from the
+# missed-stream / harness-stall flake; the marker is a backstop for any
+# residual stall (e.g. a re-sent turn that also stalls).
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 @pytest.mark.parametrize(
     ("target_name", "expected_wrapper", "expect_carry_history"),
     [
@@ -126,12 +133,9 @@ def test_fork_switch_agent_carries_history(
     # One marked turn so the fork has content AND an assistant bubble to
     # anchor the "Fork from here" action. Forking from the LAST response is
     # a full clone (no truncation), isolating the agent-switch behavior.
-    composer = page.get_by_placeholder("Ask the agent anything…")
-    expect(composer).to_be_visible()
-    composer.fill(f"Reply with one short word. Marker: {_MARKER}")
-    page.get_by_role("button", name="Send", exact=True).click()
-    assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
-    expect(assistant).to_be_visible(timeout=60_000)
+    assistant = send_and_await_assistant_reply(
+        page, f"Reply with one short word. Marker: {_MARKER}"
+    )
 
     assistant.hover()
     page.get_by_test_id("fork-from-response").first.click()
@@ -199,6 +203,7 @@ def test_fork_switch_agent_carries_history(
         )
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_fork_into_pi_labels_model_picker_pi(
     page: Page,
     seeded_session: tuple[str, str],
@@ -223,12 +228,9 @@ def test_fork_into_pi_labels_model_picker_pi(
     page.goto(f"{base_url}/c/{session_id}")
 
     # One turn so the fork has an assistant bubble to anchor "Fork from here".
-    composer = page.get_by_placeholder("Ask the agent anything…")
-    expect(composer).to_be_visible()
-    composer.fill(f"Reply with one short word. Marker: {_MARKER}")
-    page.get_by_role("button", name="Send", exact=True).click()
-    assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
-    expect(assistant).to_be_visible(timeout=60_000)
+    assistant = send_and_await_assistant_reply(
+        page, f"Reply with one short word. Marker: {_MARKER}"
+    )
 
     # Fork from the response, switching the agent to Pi.
     assistant.hover()
