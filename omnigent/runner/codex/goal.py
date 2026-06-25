@@ -59,6 +59,7 @@ class CodexGoalRunner:
         API uses snake_case, so normalize the goal at the runner boundary
         before returning it through ``/events``.
         """
+
         def required_str(name: str) -> str:
             value = goal.get(name)
             if not isinstance(value, str):

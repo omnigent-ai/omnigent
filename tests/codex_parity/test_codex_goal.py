@@ -63,7 +63,7 @@ class _CodexGoalConversationStore:
                     "omnigent.ui": "terminal",
                     "omnigent.wrapper": "codex-native-ui",
                 },
-            )
+            ),
         }
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
