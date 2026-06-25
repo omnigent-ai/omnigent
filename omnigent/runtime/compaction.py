@@ -735,6 +735,39 @@ def _history_idx_to_msg_idx(
     return msg_idx
 
 
+def _exception_status_code(exc: BaseException) -> int | None:
+    """
+    Return the first HTTP-like status code attached to *exc*.
+
+    Provider SDKs and runner calls surface auth failures through
+    different exception shapes (``response.status_code``,
+    ``status_code``, or string ``code``). Walk the exception chain so
+    wrapped OpenAI/httpx errors still classify correctly.
+
+    :param exc: Exception raised during summarization.
+    :returns: HTTP status code, e.g. ``401``, or ``None``.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        response_status = getattr(response, "status_code", None)
+        if isinstance(response_status, int):
+            return response_status
+        status_code = getattr(current, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code
+        code = getattr(current, "code", None)
+        if isinstance(code, int):
+            return code
+        if isinstance(code, str) and code.isdigit():
+            return int(code)
+        next_exc = current.__cause__ or current.__context__
+        current = next_exc if isinstance(next_exc, BaseException) else None
+    return None
+
+
 async def _run_layer2(
     messages: list[dict[str, Any]],
     history: list[ConversationItem],
@@ -799,12 +832,21 @@ async def _run_layer2(
             model,
             **summarize_kwargs,
         )
-    except Exception:
-        _logger.warning(
-            "Layer 2 summarisation failed for task %s — falling back to Layer 3",
-            task_id,
-            exc_info=True,
-        )
+    except Exception as exc:
+        if _exception_status_code(exc) == 401:
+            _logger.warning(
+                "Layer 2 summarisation received HTTP 401 Unauthorized for task %s; "
+                "check the configured LLM credentials/base URL before relying on "
+                "Layer 3 truncation fallback",
+                task_id,
+                exc_info=True,
+            )
+        else:
+            _logger.warning(
+                "Layer 2 summarisation failed for task %s — falling back to Layer 3",
+                task_id,
+                exc_info=True,
+            )
         if fail_on_error:
             raise
         return None
