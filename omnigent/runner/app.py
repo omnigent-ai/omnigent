@@ -2166,25 +2166,39 @@ async def _auto_create_kiro_terminal(
     server_url = _required_runner_env("RUNNER_SERVER_URL")
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
+    from omnigent.kiro_native_permissions import supervise_kiro_permission_mirror
     from omnigent.kiro_native_session_forwarder import supervise_kiro_session_forwarder
 
+    async def _supervise_kiro_native_bridges() -> None:
+        """Run the Kiro transcript forwarder and permission mirror together."""
+        await asyncio.gather(
+            supervise_kiro_session_forwarder(
+                base_url=server_url,
+                headers={},
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                agent_name="kiro-native-ui",
+                workspace=workspace,
+                launch_epoch_ms=launch_epoch_ms,
+                expected_session_id=launch_config.external_session_id,
+                auth=_runner_auth,
+            ),
+            supervise_kiro_permission_mirror(
+                base_url=server_url,
+                headers={},
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                auth=_runner_auth,
+            ),
+        )
+
     _forwarder_task = asyncio.create_task(
-        supervise_kiro_session_forwarder(
-            base_url=server_url,
-            headers={},
-            session_id=session_id,
-            bridge_dir=bridge_dir,
-            agent_name="kiro-native-ui",
-            workspace=workspace,
-            launch_epoch_ms=launch_epoch_ms,
-            expected_session_id=launch_config.external_session_id,
-            auth=_runner_auth,
-        ),
-        name=f"kiro-session-forwarder-{session_id}",
+        _supervise_kiro_native_bridges(),
+        name=f"kiro-bridges-{session_id}",
     )
     _register_auto_forwarder_task(session_id, _forwarder_task)
     _logger.info(
-        "Auto-created kiro terminal + session forwarder for session %s; forwarder_task=%s",
+        "Auto-created kiro terminal + forwarder/permission-mirror for session %s; task=%s",
         session_id,
         _forwarder_task.get_name(),
     )
