@@ -11918,7 +11918,8 @@ def create_runner_app(
                     # tools (no double-underscore separator) and append
                     # the fresh MCP schemas.
                     _builtin_tools = [
-                        t for t in _session_tool_schemas.get(conv, [])
+                        t
+                        for t in _session_tool_schemas.get(conv, [])
                         if not (isinstance(t, dict) and "__" in (t.get("name") or ""))
                     ]
                     _session_tool_schemas[conv] = _builtin_tools + list(mcp_result.schemas)

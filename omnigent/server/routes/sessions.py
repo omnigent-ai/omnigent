@@ -18512,8 +18512,7 @@ def create_sessions_router(
             harness=harness,
             mcp_servers=mcp_servers,
             mcp_servers_editable=(
-                agent.session_id is not None
-                and not (harness or "").endswith("-native")
+                agent.session_id is not None and not (harness or "").endswith("-native")
             ),
             policies=policies,
             skills=skills,

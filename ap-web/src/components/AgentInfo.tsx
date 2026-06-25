@@ -676,9 +676,7 @@ function McpServerManagerDialog({
 
   function notifyRestart() {
     showToast(
-      <span className="text-sm">
-        MCP servers updated. Restart the session to apply changes.
-      </span>,
+      <span className="text-sm">MCP servers updated. Restart the session to apply changes.</span>,
     );
   }
 
@@ -858,7 +856,12 @@ function McpServerManagerDialog({
                 <XIcon className="size-3.5" />
                 Clear
               </Button>
-              <Button type="button" size="sm" onClick={handleSave} disabled={saving || validateMcpForm(form) !== null}>
+              <Button
+                type="button"
+                size="sm"
+                onClick={handleSave}
+                disabled={saving || validateMcpForm(form) !== null}
+              >
                 <SaveIcon className="size-3.5" />
                 {saving ? "Saving..." : "Save"}
               </Button>
