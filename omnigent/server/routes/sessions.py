@@ -10386,11 +10386,17 @@ async def _stream_live_events(
     reconcile pre-subscribe state via the snapshot endpoint
     (``GET /v1/sessions/{id}``) and dedupe by item id.
 
-    On client disconnect the subscribe loop breaks; the
-    ``finally`` block emits a ``[DONE]`` sentinel so well-behaved
-    SSE consumers see a clean stream termination. The pub-sub
-    layer auto-cleans this generator's subscriber slot in its own
-    ``finally`` when iteration exits.
+    On a graceful close — the subscribe loop returns, or this route
+    detects a disconnect and breaks — a ``[DONE]`` sentinel is emitted
+    after the loop so well-behaved SSE consumers see a clean stream
+    termination. The sentinel is deliberately NOT in the ``finally``
+    block: a hard disconnect makes the ASGI server ``aclose()`` this
+    generator, and yielding during the resulting ``GeneratorExit``
+    teardown raises ``RuntimeError: async generator ignored
+    GeneratorExit`` (issue #1117). The ``finally`` does only
+    synchronous presence cleanup. The pub-sub layer auto-cleans this
+    generator's subscriber slot in its own ``finally`` when iteration
+    exits.
 
     Each emitted dict is validated against
     :data:`ServerStreamEvent` at the wire boundary so a runtime
@@ -10472,16 +10478,31 @@ async def _stream_live_events(
                 )
             validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
             yield _format_sse(event_type, validated.model_dump())
+        # Graceful termination only: the subscribe loop returned (its own
+        # ``[DONE]`` sentinel) or we broke out after detecting a disconnect.
+        # The sentinel is emitted HERE, not in ``finally``, on purpose. A
+        # hard client disconnect makes the ASGI server call ``aclose()`` on
+        # this generator, which throws ``GeneratorExit`` into the suspended
+        # ``yield`` above. Yielding again while that ``GeneratorExit`` is
+        # propagating — which a ``yield`` in ``finally`` would do — raises
+        # ``RuntimeError: async generator ignored GeneratorExit`` and leaves
+        # an orphaned ``athrow`` task whose exception is never retrieved
+        # (issue #1117). Keeping the sentinel outside ``finally`` lets the
+        # forced teardown unwind cleanly while still emitting ``[DONE]`` on
+        # every graceful close.
+        yield "data: [DONE]\n\n"
     finally:
-        # The non-None checks besides presence_token's are type
-        # narrowing only: a minted token implies both were set above.
+        # Synchronous-only cleanup: it must run on both graceful close and
+        # forced ``GeneratorExit`` teardown, so it cannot ``yield`` or
+        # ``await`` anything (see above). The non-None checks besides
+        # presence_token's are type narrowing only: a minted token implies
+        # both were set above.
         if (
             presence_token is not None
             and viewer_user_id is not None
             and presence_root_id is not None
         ):
             presence.disconnect(presence_root_id, viewer_user_id, presence_token)
-        yield "data: [DONE]\n\n"
 
 
 # Bounds for per-session native-terminal pass-through args
