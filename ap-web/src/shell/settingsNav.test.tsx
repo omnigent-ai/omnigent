@@ -47,10 +47,14 @@ describe("settingsNavGroups", () => {
   });
 
   it("includes Account (leading) only when accounts auth is enabled", () => {
-    expect(settingsNavGroups(false).flatMap((g) => g.items).map((i) => i.id)).not.toContain(
-      "account",
-    );
-    const withAccounts = settingsNavGroups(true).flatMap((g) => g.items).map((i) => i.id);
+    expect(
+      settingsNavGroups(false)
+        .flatMap((g) => g.items)
+        .map((i) => i.id),
+    ).not.toContain("account");
+    const withAccounts = settingsNavGroups(true)
+      .flatMap((g) => g.items)
+      .map((i) => i.id);
     expect(withAccounts).toContain("account");
     // Account leads its group — it's the most-visited section on accounts deploys.
     expect(withAccounts[0]).toBe("account");
