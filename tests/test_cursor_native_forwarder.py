@@ -620,6 +620,139 @@ async def test_patch_external_session_id_http_error_logs_but_does_not_raise(
     assert caplog.records
 
 
+class TestPreseedResumeState:
+    """``preseed_resume_state`` pre-seeds bridge state for cold resume."""
+
+    def _seed_chat(
+        self, chats_root: Path, workspace: str, chat_id: str, rows: int = 3
+    ) -> Path:
+        import hashlib
+
+        ws_hash = hashlib.md5(workspace.encode()).hexdigest()
+        chat_dir = chats_root / ws_hash / chat_id
+        chat_dir.mkdir(parents=True)
+        store = chat_dir / "store.db"
+        writer = _make_store(
+            store,
+            [(f"b{i}", _user(f"<user_query>\nmsg{i}\n</user_query>")) for i in range(rows)],
+        )
+        writer.close()
+        return store
+
+    def test_returns_false_when_store_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path / "chats")
+        bridge_dir = tmp_path / "bridge"
+        bridge_dir.mkdir()
+        result = fwd.preseed_resume_state(bridge_dir, "/ws", "no-such-chat", 1_000)
+        assert result is False
+        assert fwd._read_state(bridge_dir).store_path is None
+
+    def test_writes_store_path_and_current_rowid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path / "chats")
+        store = self._seed_chat(tmp_path / "chats", "/ws", "chat-abc", rows=5)
+        bridge_dir = tmp_path / "bridge"
+        bridge_dir.mkdir()
+
+        result = fwd.preseed_resume_state(bridge_dir, "/ws", "chat-abc", launch_epoch_ms=99_000)
+
+        assert result is True
+        state = fwd._read_state(bridge_dir)
+        assert state.store_path == str(store)
+        assert state.last_rowid == 5  # all 5 rows already in store
+        assert state.launch_epoch_ms == 99_000
+
+    def test_empty_store_seeds_rowid_zero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path / "chats")
+        self._seed_chat(tmp_path / "chats", "/ws", "chat-empty", rows=0)
+        bridge_dir = tmp_path / "bridge"
+        bridge_dir.mkdir()
+
+        fwd.preseed_resume_state(bridge_dir, "/ws", "chat-empty", launch_epoch_ms=1_000)
+
+        assert fwd._read_state(bridge_dir).last_rowid == 0
+
+
+class TestForwardLoopPreseedResume:
+    """Forwarder uses pre-seeded bridge state on cold resume, skipping discovery."""
+
+    @pytest.mark.asyncio
+    async def test_uses_preseed_store_without_discover(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When bridge state is pre-seeded, forwarder skips _discover_store."""
+        chat_id = "preseeded-chat-uuid"
+        store = tmp_path / chat_id / "store.db"
+        store.parent.mkdir(parents=True)
+        writer = _make_store(
+            store,
+            [
+                ("old", _user("<user_query>\nold message\n</user_query>")),  # rowid 1 (pre-resume)
+                ("new", _user("<user_query>\nnew message\n</user_query>")),  # rowid 2 (new)
+            ],
+        )
+        writer.close()
+
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        bridge_dir.mkdir(parents=True)
+        # Pre-seed: rowid 1 already mirrored (old history), start from there.
+        fwd._write_state(
+            bridge_dir,
+            fwd._ForwardState(store_path=str(store), last_rowid=1, launch_epoch_ms=999_000),
+        )
+
+        discover_calls: list = []
+
+        def _no_discover(workspace: str, launch_ms: int) -> None:
+            discover_calls.append((workspace, launch_ms))
+            return None  # should never be reached
+
+        monkeypatch.setattr(fwd, "_discover_store", _no_discover)
+        monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
+
+        delivered: list[fwd._MirrorItem] = []
+
+        async def _collect(client: object, *, session_id: str, item: fwd._MirrorItem) -> None:
+            delivered.append(item)
+
+        monkeypatch.setattr(fwd, "_post_conversation_item", _collect)
+        monkeypatch.setattr(fwd, "_patch_external_session_id", lambda *a, **k: None)
+
+        task = asyncio.create_task(
+            fwd.forward_cursor_store_to_session(
+                base_url="http://test",
+                headers={},
+                session_id="conv_1",
+                bridge_dir=bridge_dir,
+                agent_name="cursor-native-ui",
+                workspace="/ws",
+                launch_epoch_ms=1_000_000,  # far future — discovery would find nothing
+                poll_interval_s=0.001,
+            )
+        )
+        try:
+            for _ in range(2000):
+                if delivered:
+                    break
+                await asyncio.sleep(0.001)
+            else:
+                raise AssertionError("forwarder never mirrored the new message")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        # Only the NEW message (rowid 2) was mirrored; old history was skipped.
+        assert len(delivered) == 1
+        assert delivered[0].item_data["content"][0]["text"] == "new message"
+        # _discover_store was never called (pre-seed took the fast path).
+        assert not discover_calls
+
+
 class TestForwardLoopExternalSessionId:
     """The poll loop patches external_session_id once when the store is found."""
 

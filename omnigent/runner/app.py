@@ -1511,10 +1511,9 @@ async def _auto_create_cursor_terminal(
         bridge_dir_for_session_id,
         write_mcp_config,
     )
-    from omnigent.cursor_native_forwarder import clear_cursor_bridge_state
+    from omnigent.cursor_native_forwarder import clear_cursor_bridge_state, preseed_resume_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
-    clear_cursor_bridge_state(bridge_dir)
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args); reused here, not Pi-specific.
@@ -1526,6 +1525,18 @@ async def _auto_create_cursor_terminal(
     # cursor TUI's cwd and the forwarder hash the SAME path — cursor keys its
     # chat store dir on ``md5(cwd)``, and a mismatch would hide the store.
     workspace = os.path.realpath(str(launch_config.workspace))
+    # On cold resume, pre-seed the bridge state with the known store path and
+    # current rowid so the forwarder skips launch-recency discovery (the existing
+    # chat store predates this launch and would fail _discover_store's floor check).
+    # On a fresh start, clear any stale state from a prior terminal so the old
+    # and new forwarders can't double-post the same chat.
+    resume_chat_id = launch_config.external_session_id
+    if resume_chat_id and preseed_resume_state(
+        bridge_dir, workspace, resume_chat_id, launch_epoch_ms
+    ):
+        pass  # forwarder will pick up the pre-seeded store path
+    else:
+        clear_cursor_bridge_state(bridge_dir)
     write_mcp_config(Path(workspace), bridge_dir)
     cursor_command = resolve_cursor_executable()
     cursor_args = list(launch_config.terminal_launch_args or [])
