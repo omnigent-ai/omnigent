@@ -284,3 +284,59 @@ async def test_me_header_mode_behaviors(
     # Reserved name is rejected (returns None → route returns null).
     assert reserved.status_code == 200
     assert reserved.json() == {"user_id": None}
+
+
+async def test_web_ui_serves_pwa_service_worker_and_manifest(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    PWA assets are served correctly from the SPA static mount.
+
+    ``sw.js`` must be ``no-cache`` so a deploy is picked up promptly — a
+    stale service worker would defeat prompt-to-reload — and
+    ``manifest.webmanifest`` must carry ``application/manifest+json`` or the
+    browser silently refuses to install the app.
+
+    :param runtime_init: Fixture that initializes the runtime with a mock LLM.
+    :param db_uri: Test database URI.
+    :param tmp_path: Pytest temporary directory fixture.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    web_ui_dist = tmp_path / "web-ui"
+    web_ui_dist.mkdir(parents=True)
+    (web_ui_dist / "index.html").write_text("<!doctype html><div id='root'></div>")
+    (web_ui_dist / "sw.js").write_text("self.addEventListener('install', () => {});")
+    (web_ui_dist / "manifest.webmanifest").write_text('{"name":"Omnigent"}')
+    (web_ui_dist / "version.json").write_text('{"build":"testbuild"}')
+
+    monkeypatch.setattr(app_module, "_WEB_UI_DIST", web_ui_dist)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = app_module.create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        sw = await client.get("/sw.js")
+        manifest = await client.get("/manifest.webmanifest")
+        version = await client.get("/version.json")
+
+    assert sw.status_code == 200
+    assert sw.headers["cache-control"] == app_module._WEB_UI_HTML_CACHE_CONTROL
+    assert manifest.status_code == 200
+    assert manifest.headers["content-type"].startswith("application/manifest+json")
+    # version.json is the SW's cache sentinel: if the static mount ever stopped
+    # serving it, the SW install would fail and the update prompt never fire. It
+    # is no-cache for the same reason as sw.js — a stale sentinel must not linger.
+    assert version.status_code == 200
+    assert version.headers["cache-control"] == app_module._WEB_UI_HTML_CACHE_CONTROL

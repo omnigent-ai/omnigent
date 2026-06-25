@@ -73,6 +73,12 @@
       "rules": {
         "no-restricted-globals": "off"
       }
+    },
+    {
+      "files": ["sw-src/**"],
+      "rules": {
+        "no-restricted-globals": "off"
+      }
     }
   ],
   "ignorePatterns": ["dist", "node_modules", "src/components/ui", "src/components/ai-elements"]
