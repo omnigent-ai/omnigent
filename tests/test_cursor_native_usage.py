@@ -124,8 +124,14 @@ class TestRecordUsageCli:
         # importable, mirroring the installed-package resolution in production.
         env = {"PYTHONPATH": str(Path(__file__).resolve().parents[1])}
         proc = subprocess.run(
-            [sys.executable, "-m", "omnigent.cursor_native_usage", "record-usage",
-             "--bridge-dir", str(tmp_path)],
+            [
+                sys.executable,
+                "-m",
+                "omnigent.cursor_native_usage",
+                "record-usage",
+                "--bridge-dir",
+                str(tmp_path),
+            ],
             input=json.dumps(_TURN1),
             capture_output=True,
             text=True,
