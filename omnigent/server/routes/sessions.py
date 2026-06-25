@@ -15296,6 +15296,18 @@ def create_sessions_router(
         operation_type = payload.get("operation_type")
         if not isinstance(operation_type, str) or not operation_type:
             operation_type = "tool"
+        # Structured AskQuestion payload (cursor's multiple-choice tool): when
+        # present, stamp it as the ``ask_user_question`` extra so the web UI
+        # renders the interactive form from it directly. ``content_preview`` is
+        # hard-capped at 1024 chars, which truncates a multi-question payload and
+        # breaks the preview-parse fallback — the structured field has no such
+        # cap and is the authoritative source the UI consumes when present.
+        extras: dict[str, Any] = {}
+        ask_user_question = payload.get("ask_user_question")
+        if isinstance(ask_user_question, dict) and isinstance(
+            ask_user_question.get("questions"), list
+        ):
+            extras["ask_user_question"] = ask_user_question
         params = ElicitationRequestParams(
             mode="form",
             message=message,
@@ -15304,6 +15316,7 @@ def create_sessions_router(
             phase="pre_tool_use",
             policy_name="cursor_native_permission",
             content_preview=content_preview,
+            **extras,
         )
         result = await _publish_and_wait_for_harness_elicitation(
             request,
