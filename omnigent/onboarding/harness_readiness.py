@@ -243,6 +243,44 @@ def harness_is_configured(harness: str) -> bool:
     return True
 
 
+def harness_credential_satisfied(harness: str) -> bool:
+    """Return whether *harness*'s file-based credential is present.
+
+    The credential half of :func:`harness_is_configured`, **without** the
+    binary check. Only families in :data:`_FAMILY_CREDENTIAL_CHECK` — today
+    just the antigravity family (``agy``), which has no non-interactive login
+    and authenticates via a browser OAuth on first run — have a credential
+    axis; every other harness returns ``True`` (it has no separately-checkable
+    credential here, so this never blocks it).
+
+    Callers that already verify the binary separately (e.g. the sub-agent
+    dispatch gate, which probes ``missing_harness_cli`` first) use this to add
+    *only* the credential axis without re-gating on binary presence — so a
+    binary-less host (CI, or a host dispatching to a remote child) is not
+    falsely told claude/codex/pi are unconfigured.
+
+    :param harness: A harness id, e.g. ``"antigravity-native"``,
+        ``"claude-native"``, or ``"codex"``.
+    :returns: ``False`` only when *harness* belongs to a credential-gated
+        family AND that credential is absent; ``True`` otherwise (no credential
+        axis, or the credential is present).
+    """
+    canonical = _canonical_harness(harness)
+    if (
+        canonical not in _HARNESS_FAMILY
+        and canonical not in _PI_HARNESSES
+        and canonical not in _OPENCODE_HARNESSES
+        and canonical not in _QWEN_HARNESSES
+    ):
+        # Unknown / SDK harness — no install metadata, so no credential axis to
+        # assess here. Fail open, matching ``harness_is_configured``.
+        return True
+    credential_check = _FAMILY_CREDENTIAL_CHECK.get(_install_key(canonical))
+    if credential_check is None:
+        return True
+    return credential_check()
+
+
 def configured_harness_map() -> dict[str, bool]:
     """Return per-harness readiness for every accepted harness spelling.
 

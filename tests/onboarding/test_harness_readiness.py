@@ -10,6 +10,7 @@ import yaml
 import omnigent.onboarding.harness_install as hi
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
+    harness_credential_satisfied,
     harness_is_configured,
 )
 
@@ -276,6 +277,40 @@ def test_cursor_readiness_keys_off_api_key(
         yaml.safe_dump({"cursor": {"api_key_ref": "env:MY_CURSOR_KEY"}})
     )
     assert harness_is_configured("cursor") is True
+
+
+def test_harness_credential_satisfied_scoped_to_credential_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The credential-only check gates agy on its OAuth and nothing else.
+
+    ``harness_credential_satisfied`` is the credential half of
+    ``harness_is_configured`` WITHOUT the binary check, used by the sub-agent
+    dispatch gate (which probes the binary separately). It must apply ONLY to
+    families in ``_FAMILY_CREDENTIAL_CHECK`` — today just the antigravity family
+    — so a binary-less host is never told claude/codex/pi are unconfigured by
+    this axis. Crucially, the verdict must be independent of binary presence:
+    here no CLI is installed, yet the credential-less families still read True.
+    """
+    import omnigent.onboarding.gemini_auth as _ga
+
+    _no_clis_installed(monkeypatch)
+    # Credential-less families: no credential axis → always True, even with no
+    # binary (binary presence is the dispatch gate's separate concern).
+    for credential_less in ("claude-native", "codex-native", "pi", "qwen", "opencode-native"):
+        assert harness_credential_satisfied(credential_less) is True, credential_less
+
+    # antigravity-native is the one credential-gated family: it tracks the
+    # gemini OAuth verdict, NOT the binary (which is absent here).
+    monkeypatch.setattr(_ga, "gemini_login_detected", lambda: False)
+    assert harness_credential_satisfied("antigravity-native") is False
+    assert harness_credential_satisfied("native-antigravity") is False
+    monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
+    assert harness_credential_satisfied("antigravity-native") is True
+
+    # Unknown / SDK harnesses fail open (no install metadata to assess).
+    assert harness_credential_satisfied("some-future-harness") is True
+    assert harness_credential_satisfied("claude-sdk") is True
 
 
 def test_native_cursor_keys_off_binary_not_api_key(
