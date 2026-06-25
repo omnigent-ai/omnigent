@@ -10,8 +10,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
+from omnigent.inner import createos_os_env as mod
 from omnigent.inner.createos_os_env import CreateosOSEnvironment, _Http
 from omnigent.inner.datamodel import OSEnvSpec
 
@@ -28,8 +30,6 @@ class _StubHttp:
     def get_bytes(self, path: str, params: dict[str, str]) -> bytes:
         key = params["path"]
         if key not in self.files:
-            import httpx
-
             req = httpx.Request("GET", "http://x")
             resp = httpx.Response(404, request=req)
             raise httpx.HTTPStatusError("not found", request=req, response=resp)
@@ -76,7 +76,7 @@ async def test_write_then_read_roundtrip() -> None:
     env = _env(http)
     w = await env.write("notes.txt", "line1\nline2\n")
     assert w["ok"] is True
-    assert w["bytes_written"] == len("line1\nline2\n".encode())
+    assert w["bytes_written"] == len(b"line1\nline2\n")
     assert http.files["/root/notes.txt"] == b"line1\nline2\n"
 
     r = await env.read("notes.txt")
@@ -153,9 +153,31 @@ def test_close_is_idempotent_and_destroys() -> None:
 
 
 def test_http_unwrap_jsend_envelope() -> None:
-    import httpx
-
     req = httpx.Request("GET", "http://x")
     resp = httpx.Response(200, json={"status": "success", "data": {"id": "z"}}, request=req)
     http = _Http("http://x", "k")
     assert http._unwrap(resp) == {"id": "z"}
+
+
+def test_create_sync_registers_atexit_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """create_sync registers close() with atexit so an interpreter exit
+    that skips __del__ still destroys the billable remote VM."""
+
+    class _FakeHttp:
+        def __init__(self, base_url: str, api_key: str) -> None:
+            pass
+
+        def post(self, path: str, body: Any = None) -> Any:
+            return {"id": "sbx_atexit"}
+
+        def close(self) -> None:
+            pass
+
+    registered: list[Any] = []
+    monkeypatch.setattr(mod, "_Http", _FakeHttp)
+    monkeypatch.setattr(mod, "_poll_until_running", lambda http, sandbox_id: None)
+    monkeypatch.setattr(mod.atexit, "register", lambda fn: registered.append(fn))
+
+    env = mod.CreateosOSEnvironment.create_sync(OSEnvSpec(type="createos", createos_api_key="k"))
+    assert env._sandbox_id == "sbx_atexit"
+    assert env.close in registered

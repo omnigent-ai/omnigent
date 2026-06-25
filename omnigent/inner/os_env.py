@@ -839,6 +839,7 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
         return None
     if spec.type == "createos":
         from .createos_os_env import CreateosOSEnvironment
+
         return CreateosOSEnvironment.create_sync(spec)
     if spec.type != "caller_process":
         raise NotImplementedError(f"os_env type '{spec.type}' is not implemented")

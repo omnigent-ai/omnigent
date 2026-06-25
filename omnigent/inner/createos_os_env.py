@@ -14,6 +14,7 @@ Endpoints used:
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import shlex
@@ -149,12 +150,15 @@ class CreateosOSEnvironment(OSEnvironment):
             http.close()
             raise
 
-        return cls(
+        env = cls(
             spec=spec,
             cwd=Path(spec.cwd or "/root"),
             _sandbox_id=sandbox_id,
             _http=http,
         )
+        # __del__ may not run at interpreter exit; close() is idempotent.
+        atexit.register(env.close)
+        return env
 
     def _abs(self, path: str) -> str:
         p = Path(path)
