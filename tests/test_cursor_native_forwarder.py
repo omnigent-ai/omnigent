@@ -158,6 +158,27 @@ class TestBlobToItem:
     def test_binary_merkle_node_is_skipped(self) -> None:
         assert fwd._blob_to_item(3, "bid", b"\n \x92\xc0\xa6w\xef&", "a") is None
 
+    def test_summary_rollup_becomes_compaction_completed(self) -> None:
+        # After /summarize finishes, cursor collapses the prior history into a
+        # user blob whose content is a plain STRING (not a [{type:text}] list)
+        # starting with the marker. It must surface as a compaction-completed
+        # signal — the only durable cue that the in-pane compaction finished —
+        # not as a chat bubble.
+        blob = self._blob(
+            {"role": "user", "content": f"{fwd._COMPACTION_SUMMARY_PREFIX} Summary:\n1. ..."}
+        )
+        item = fwd._blob_to_item(12, "bid", blob, "cursor-native-ui")
+        assert item is not None
+        assert item.item_type == "compaction_completed"
+        assert item.item_data == {}
+
+    def test_plain_string_user_without_marker_is_skipped(self) -> None:
+        # A bare-string user content that ISN'T the summary rollup has no
+        # <user_query> wrapper, so it is neither a chat bubble nor a compaction
+        # signal — skipped, exactly as before.
+        blob = self._blob({"role": "user", "content": "just some unwrapped context"})
+        assert fwd._blob_to_item(2, "bid", blob, "a") is None
+
 
 class TestReadNewItems:
     def test_reads_live_wal_store(self, tmp_path: Path) -> None:
@@ -866,3 +887,104 @@ class TestForwardLoopExternalSessionId:
             await asyncio.gather(task, return_exceptions=True)
 
         assert patch_count == 1
+
+
+class TestCompactionCompletedForwarding:
+    """The forwarder maps cursor's post-/summarize rollup blob to a
+    ``external_compaction_status`` 'completed' edge.
+
+    The runner raises the web UI's "Compacting…" spinner when it submits
+    ``/summarize`` but cannot tell when cursor actually finishes (cursor-agent
+    has no compaction hook). The forwarder closes that gap: when it tails the
+    summary rollup blob out of the store it posts the completion, so the
+    permanent "Conversation compacted" marker tracks cursor's real progress
+    instead of flashing the instant the command was submitted.
+    """
+
+    @pytest.mark.asyncio
+    async def test_summary_blob_posts_compaction_completed_not_a_bubble(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Store: a normal user turn (rowid 1) then the post-/summarize rollup
+        # (rowid 2, a plain-string user blob with the marker prefix).
+        store = tmp_path / "store.db"
+        writer = _make_store(
+            store,
+            [
+                ("b1", _user("<user_query>\nhi\n</user_query>")),
+                (
+                    "b2",
+                    {
+                        "role": "user",
+                        "content": f"{fwd._COMPACTION_SUMMARY_PREFIX} Summary:\n1. ...",
+                    },
+                ),
+            ],
+        )
+        writer.close()
+
+        completions: list[str] = []
+
+        async def _fake_compaction(client: object, *, session_id: str, status: str) -> None:
+            completions.append(status)
+
+        monkeypatch.setattr(fwd, "_post_external_compaction_status", _fake_compaction)
+
+        poster = _FakePoster(lambda item: None)
+        bridge = await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            poster,
+            until=lambda b: bool(completions) and fwd._read_state(b).last_rowid >= 2,
+        )
+
+        # The rollup fired exactly one 'completed' edge — the web UI marker.
+        assert completions == ["completed"]
+        # It was NOT mirrored as a chat bubble (only the real user turn was).
+        assert [it.rowid for it in poster.delivered] == [1]
+        assert all(it.item_type == "message" for it in poster.delivered)
+        # The cursor advanced past the rollup so it never re-fires completion.
+        assert fwd._read_state(bridge).last_rowid == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_completion_post_does_not_wedge_the_mirror(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A failed completion POST must not wedge the loop: unlike a chat item it
+        # carries no content to lose, so the cursor advances past it regardless
+        # (the spinner just lingers). A later message must still mirror.
+        store = tmp_path / "store.db"
+        writer = _make_store(
+            store,
+            [
+                (
+                    "b1",
+                    {
+                        "role": "user",
+                        "content": f"{fwd._COMPACTION_SUMMARY_PREFIX} Summary:\n1. ...",
+                    },
+                ),
+                ("b2", _user("<user_query>\nnext\n</user_query>")),
+            ],
+        )
+        writer.close()
+
+        async def _failing_compaction(client: object, *, session_id: str, status: str) -> None:
+            raise _http_status_error(500)
+
+        monkeypatch.setattr(fwd, "_post_external_compaction_status", _failing_compaction)
+
+        poster = _FakePoster(lambda item: None)
+        bridge = await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            poster,
+            until=lambda b: fwd._read_state(b).last_rowid >= 2,
+        )
+
+        # The message after the (failed) completion still mirrored, and the
+        # cursor advanced past both — no wedge, no infinite re-post.
+        assert [it.rowid for it in poster.delivered] == [2]
+        assert fwd._read_state(bridge).last_rowid == 2

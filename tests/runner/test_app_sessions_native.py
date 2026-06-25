@@ -11057,6 +11057,206 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
 
 
 @pytest.mark.asyncio
+async def test_events_compact_on_cursor_native_pastes_summarize_and_raises_spinner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    POST ``/events`` with ``{"type":"compact"}`` on a cursor-native
+    session submits ``/summarize`` via bracketed paste, returns 200, and
+    raises the "Compacting…" spinner — but does NOT complete it.
+
+    cursor-agent manages its own context window in the TUI, so explicit
+    compaction must run there (its built-in ``/summarize`` command) rather
+    than as AP-side compaction — the same rationale as the claude-native
+    path.  The 200 (not 204) is load-bearing: the Omnigent server reads it to
+    skip its own ``_run_compact_locked`` (which 400s on the LLM-less native
+    pseudo-agent).
+
+    Two properties are pinned here:
+
+    1. **The command must go through the bracketed-paste path**
+       (``inject_user_message``), NOT a ``send-keys``-typed slash command.
+       Typing the literal ``/summarize`` opens cursor-agent's slash-command
+       autocomplete dropdown, and the single submit Enter then confirms the
+       highlighted completion instead of submitting the command — so the
+       command was never sent (the original bug, seen as ``/summarize`` left
+       sitting in the input box).
+    2. **The handler raises the spinner but must NOT complete it.** It publishes
+       ``response.compaction.in_progress`` (→ "Compacting conversation…") only.
+       cursor-agent runs the summarization asynchronously in the pane after the
+       submit, so completing here would flash "Conversation compacted" while
+       the TUI is still summarizing.  The ``completed`` edge is emitted later by
+       the cursor forwarder when it observes the summary blob (covered by
+       ``tests/test_cursor_native_forwarder.py``).
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
+
+    captured: list[tuple[Any, str, float]] = []
+
+    def _fake_inject(bridge_dir: Any, *, content: str, timeout_s: float) -> None:
+        """Record the bracketed-paste call without touching tmux."""
+        captured.append((bridge_dir, content, timeout_s))
+
+    monkeypatch.setattr(cursor_native_bridge, "inject_user_message", _fake_inject)
+
+    cursor_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the cursor-native spec for any agent_id."""
+        del agent_id, session_id
+        return cursor_native_spec
+
+    conv_id = "conv_cursor_compact"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        # Drain creation-time events so the drain below isolates only what
+        # /compact emits.
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+    # 200 = cursor-native dispatch routed to the compact handler and the paste
+    # succeeded. 204 would mean the dispatch fell through to the in-process
+    # no-op branch (the original gap) → Omnigent runs its own compaction and 400s.
+    assert resp.status_code == 200, (
+        f"Cursor-native compact must return 200 from /events; got {resp.status_code}: {resp.text}"
+    )
+    # Exactly one paste call. 0 = dispatch missed the cursor branch.
+    assert len(captured) == 1, (
+        f"Expected one inject_user_message call from cursor compact, got {len(captured)}."
+    )
+    bridge_dir, content, timeout_s = captured[0]
+    assert bridge_dir == cursor_native_bridge.bridge_dir_for_session_id(conv_id)
+    # The literal ``/summarize`` is cursor-agent's compaction command. It is
+    # delivered as *paste content*, not a typed slash command, so the
+    # autocomplete dropdown never opens and the submit Enter sends the command.
+    assert content == "/summarize", f"Expected '/summarize' paste content, got {content!r}."
+    # 1.0s short timeout: a missing tmux target means the pane isn't attached,
+    # so there is no live cursor TUI to compact.
+    assert timeout_s == 1.0
+
+    # The handler raises the spinner (in_progress) but must NOT complete it —
+    # completion is the forwarder's job once the summary blob actually lands.
+    # A regression re-adding ``completed`` here would flash the permanent
+    # "Conversation compacted" marker while the TUI is still summarizing.
+    compaction_types = [
+        e.get("type") for e in queued_events if str(e.get("type", "")).startswith("response.compaction")
+    ]
+    assert compaction_types == ["response.compaction.in_progress"], (
+        f"Handler must publish only in_progress (forwarder completes it); got {compaction_types!r}."
+    )
+    in_progress = next(e for e in queued_events if e.get("type") == "response.compaction.in_progress")
+    assert in_progress.get("task_id") == conv_id, (
+        f"in_progress must carry the session id as task_id; got {in_progress!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_cursor_native_503_dismisses_spinner_when_bridge_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Bridge-not-ready RuntimeError surfaces as 503 and dismisses the spinner.
+
+    When the cursor TUI pane isn't attached there is no live cursor to
+    compact, so the handler returns 503 with ``cursor_native_compact_failed``.
+    Crucially it must also publish ``response.compaction.failed`` so the web
+    UI dismisses the "Compacting…" spinner the ``in_progress`` event raised —
+    otherwise the spinner is stranded forever — and must NOT publish
+    ``completed`` (the history was never compacted, so no permanent marker).
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
+
+    def _fake_inject(bridge_dir: Any, *, content: str, timeout_s: float) -> None:
+        """Simulate the bridge-not-ready path (pane not attached)."""
+        del bridge_dir, content, timeout_s
+        raise RuntimeError("tmux target is not advertised")
+
+    monkeypatch.setattr(cursor_native_bridge, "inject_user_message", _fake_inject)
+
+    cursor_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the cursor-native spec for any agent_id."""
+        del agent_id, session_id
+        return cursor_native_spec
+
+    conv_id = "conv_cursor_compact_fail"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+    assert resp.status_code == 503, (
+        f"Cursor-native compact with no live pane must return 503; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    body = resp.json()
+    assert body.get("error") == "cursor_native_compact_failed", (
+        f"503 body must carry the cursor bridge-failure error code; got {body!r}"
+    )
+
+    compaction_types = [
+        e.get("type") for e in queued_events if str(e.get("type", "")).startswith("response.compaction")
+    ]
+    # in_progress raised the spinner; failed must dismiss it. completed must
+    # never fire — the history was not compacted.
+    assert compaction_types == [
+        "response.compaction.in_progress",
+        "response.compaction.failed",
+    ], f"Expected in_progress then failed (no completed); got {compaction_types!r}."
+
+
+@pytest.mark.asyncio
 async def test_events_compact_on_non_native_session_is_204_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
