@@ -16,7 +16,7 @@ export type NativeCodingAgentIconKind =
   | "antigravity"
   | "kimi"
   | "hermes";
-export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
+export type NativeCodingAgentCapability = "permissionMode" | "approvalMode" | "cursorMode";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
@@ -68,6 +68,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Cursor",
     iconKind: "cursor",
     sortRank: 30,
+    capabilities: ["cursorMode"],
   },
   {
     key: "pi",

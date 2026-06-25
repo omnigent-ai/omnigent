@@ -113,6 +113,47 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
   },
 ];
 
+// Cursor execution modes. "default" sends no flags; other values map to CLI
+// args passed via terminal_launch_args. Keep in sync with `cursor-agent --help`.
+const CURSOR_NATIVE_DEFAULT_EXEC_MODE = "default";
+const CURSOR_NATIVE_EXEC_MODES: {
+  value: string;
+  label: string;
+  description: string;
+  args: string[];
+}[] = [
+  {
+    value: "default",
+    label: "Default",
+    description: "Normal agent mode; prompts before running commands",
+    args: [],
+  },
+  {
+    value: "auto-review",
+    label: "Auto-review",
+    description: "Smart Auto: auto-runs safe tool calls and prompts for the rest",
+    args: ["--auto-review"],
+  },
+  {
+    value: "plan",
+    label: "Plan",
+    description: "Read-only planning; analyzes and proposes plans, no edits",
+    args: ["--mode", "plan"],
+  },
+  {
+    value: "ask",
+    label: "Ask",
+    description: "Q&A style; explains and answers questions (read-only)",
+    args: ["--mode", "ask"],
+  },
+  {
+    value: "yolo",
+    label: "Yolo",
+    description: "Runs everything without prompts or safety checks",
+    args: ["--yolo"],
+  },
+];
+
 // Codex approval presets matching the `/permissions` TUI popup.
 // Each preset bundles a sandbox profile + approval policy, mirroring
 // codex-rs/utils/approval-presets/src/lib.rs. "default" is the auto
@@ -615,6 +656,52 @@ function ApprovalModeOptions({
 }
 
 /**
+ * Cursor execution-mode radio rows, rendered inside the Advanced settings
+ * menu in the composer footer. Mirror of {@link PermissionModeOptions}
+ * for the Cursor native agent.
+ *
+ * @param value Currently selected mode, e.g. ``"default"``.
+ * @param onValueChange Selection callback (receives the mode value).
+ */
+function CursorModeOptions({
+  value,
+  onValueChange,
+}: {
+  value: string;
+  onValueChange: (mode: string) => void;
+}) {
+  const [previewed, setPreviewed] = useState<string | null>(null);
+  const detail = CURSOR_NATIVE_EXEC_MODES.find(
+    (m) => m.value === (previewed ?? value),
+  )?.description;
+  return (
+    <>
+      <DropdownMenuRadioGroup value={value} onValueChange={onValueChange}>
+        {CURSOR_NATIVE_EXEC_MODES.map((mode) => (
+          <DropdownMenuRadioItem
+            key={mode.value}
+            value={mode.value}
+            data-testid={`new-chat-landing-cursor-mode-${mode.value}`}
+            onFocus={() => setPreviewed(mode.value)}
+            onPointerEnter={() => setPreviewed(mode.value)}
+            className="rounded-sm pl-2 py-1 text-xs"
+          >
+            {mode.label}
+          </DropdownMenuRadioItem>
+        ))}
+      </DropdownMenuRadioGroup>
+      <DropdownMenuSeparator />
+      <p
+        data-testid="new-chat-landing-cursor-mode-detail"
+        className="min-h-5 px-2 pt-0.5 pb-1 text-xs leading-relaxed text-muted-foreground"
+      >
+        {detail}
+      </p>
+    </>
+  );
+}
+
+/**
  * Brain-harness radio rows for an overridable bundle agent, rendered
  * inside the Advanced settings menu in the composer footer.
  *
@@ -803,6 +890,9 @@ export function NewChatLandingScreen() {
   // the codex-native wrapper; ignored otherwise. Lives in the footer
   // tray's Advanced settings menu.
   const [approvalMode, setApprovalMode] = useState<string>(CODEX_NATIVE_DEFAULT_APPROVAL_MODE);
+  // Execution mode for Cursor (cursor-agent --mode / --yolo). Only meaningful
+  // for the cursor-native wrapper; ignored otherwise.
+  const [cursorExecMode, setCursorExecMode] = useState<string>(CURSOR_NATIVE_DEFAULT_EXEC_MODE);
   // Per-session brain-harness override for bundle agents (polly / debby).
   // null = the agent spec's declared harness (no override sent); cleared on
   // every agent switch so a pick never leaks across agents.
@@ -893,6 +983,7 @@ export function NewChatLandingScreen() {
       : agentList.find((a) => a.id === effectiveAgentId);
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
+  const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
   // Native-terminal agents interpret slash commands inside their own CLI
   // (the runner injects the text verbatim), so the landing composer must
   // not intercept them — no skills menu, no slash_command routing.
@@ -1044,6 +1135,8 @@ export function NewChatLandingScreen() {
     CLAUDE_NATIVE_PERMISSION_MODES.find((m) => m.value === permissionMode)?.label ?? permissionMode;
   const approvalModeLabel =
     CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ?? approvalMode;
+  const cursorExecModeLabel =
+    CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.label ?? cursorExecMode;
   // Effective brain harness for the selected agent: the user's pick, else
   // the spec's declared harness. null for non-overridable agents (native
   // wrappers, agents whose spec failed to load).
@@ -1060,9 +1153,11 @@ export function NewChatLandingScreen() {
       ? `${selectedAgent.display_name} (${permissionModeLabel})`
       : supportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
         ? `${selectedAgent.display_name} (${approvalModeLabel})`
-        : pickedHarness != null
-          ? `${selectedAgent.display_name} (${BRAIN_HARNESS_LABELS[pickedHarness] ?? pickedHarness})`
-          : selectedAgent.display_name
+        : supportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
+          ? `${selectedAgent.display_name} (${cursorExecModeLabel})`
+          : pickedHarness != null
+            ? `${selectedAgent.display_name} (${BRAIN_HARNESS_LABELS[pickedHarness] ?? pickedHarness})`
+            : selectedAgent.display_name
     : "Select agent";
 
   /**
@@ -1162,6 +1257,7 @@ export function NewChatLandingScreen() {
       const nativeLabels = nativeWrapperLabelsForAgent(agent);
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
+      const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
 
       let data: { id: string };
 
@@ -1218,7 +1314,7 @@ export function NewChatLandingScreen() {
             // The values are the registered wrapper ids the runner keys off —
             // they must match the wrapper registry, not the agent display name.
             labels: nativeLabels,
-            // Permission / approval mode → CLI flag pair, persisted as
+            // Permission / approval / cursor mode → CLI flag pair, persisted as
             // terminal_launch_args. Omitted for the default and non-native agents.
             terminal_launch_args:
               agentSupportsPermissionMode &&
@@ -1226,7 +1322,9 @@ export function NewChatLandingScreen() {
                 ? ["--permission-mode", permissionMode]
                 : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
                   ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
-                  : undefined,
+                  : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
+                    ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
+                    : undefined,
             // Cost-control switch from the "Cost Optimized" pill; polly-only
             // (cost control is a polly feature) and omitted when unset so the
             // session defers to the spec default.
@@ -1901,11 +1999,12 @@ export function NewChatLandingScreen() {
 
               {/* Advanced settings chip — per-agent knobs that don't warrant
                 their own chip: the brain-harness override (bundle agents),
-                Claude Code's permission mode, and Codex's approval mode.
-                Hidden when the selected agent has none. */}
+                Claude Code's permission mode, Codex's approval mode, and
+                Cursor's execution mode. Hidden when the selected agent has none. */}
               {(selectedAgentDefaultHarness != null ||
                 supportsPermissionMode ||
-                supportsApprovalMode) && (
+                supportsApprovalMode ||
+                supportsCursorMode) && (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <button
@@ -1960,6 +2059,23 @@ export function NewChatLandingScreen() {
                           Approval mode
                         </div>
                         <ApprovalModeOptions value={approvalMode} onValueChange={setApprovalMode} />
+                      </>
+                    )}
+                    {/* Execution mode (Cursor only) — cursor-native has no
+                      overridable harness, so the two sections never co-render
+                      today; the separator covers a future agent with both. */}
+                    {supportsCursorMode && (
+                      <>
+                        {(selectedAgentDefaultHarness != null ||
+                          supportsPermissionMode ||
+                          supportsApprovalMode) && <DropdownMenuSeparator />}
+                        <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
+                          Execution mode
+                        </div>
+                        <CursorModeOptions
+                          value={cursorExecMode}
+                          onValueChange={setCursorExecMode}
+                        />
                       </>
                     )}
                   </DropdownMenuContent>

@@ -4650,11 +4650,23 @@ def _ensure_bundled_agent_brain_credential(name: str) -> None:
     hidden=True,
     help="Deprecated alias for ``--resume <id>``; kept for one release.",
 )
+@click.option(
+    "--mode",
+    "mode",
+    default=None,
+    type=click.Choice(["plan", "ask"]),
+    help=(
+        "Start cursor-agent in the given execution mode. "
+        "``plan``: read-only/planning (analyze, propose plans, no edits). "
+        "``ask``: Q&A style for explanations and questions (read-only)."
+    ),
+)
 @click.argument("cursor_args", nargs=-1, type=click.UNPROCESSED)
 def cursor(
     server: str | None,
     resume: str | None,
     session_id: str | None,
+    mode: str | None,
     cursor_args: tuple[str, ...],
 ) -> None:
     """Launch the Cursor TUI in an Omnigent terminal.
@@ -4664,6 +4676,8 @@ def cursor(
       omnigent cursor
       omnigent cursor --resume conv_abc123
       omnigent cursor --resume                 # interactive picker
+      omnigent cursor --mode plan              # start in plan (read-only) mode
+      omnigent cursor --mode ask               # start in ask (Q&A) mode
     """
     choice = _split_resume_value(resume)
     if session_id is not None and (choice.picker or choice.conversation_id is not None):
@@ -4690,6 +4704,7 @@ def cursor(
         resume_picker=choice.picker,
         cursor_args=cursor_args,
         auto_open_conversation=auto_open_conversation,
+        mode=mode,
     )
 
 
