@@ -56,6 +56,7 @@ function renderDiff(props: {
   before: string | null;
   after: string | null;
   layout: "unified" | "split";
+  hideWhitespace?: boolean;
 }) {
   return render(
     <MonacoDiffViewer
@@ -63,6 +64,7 @@ function renderDiff(props: {
       after={props.after}
       path="src/a.ts"
       layout={props.layout}
+      hideWhitespace={props.hideWhitespace ?? false}
       conversationId="conv_1"
       comments={[]}
       activeSelection={null}
