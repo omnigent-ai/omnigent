@@ -17,13 +17,46 @@ All gaps from the review are closed in one PR:
 
 Each was live-verified against `opencode serve` 1.17.7 where the wire was uncertain.
 
-**Deferred (bonus, not in the original gap list):** opencode's separate
-`question.v2` interactive input-request surface (free-form multi-choice
-questions, distinct from tool-approval). Surfacing it to the web requires a
-live `question.v2` fixture + the server form-elicitation hook (mirroring
-`codex_native_elicitation`), and must coexist with the TUI (first-answer-wins,
-like the permission card) — a naive intercept would break TUI interactivity.
-Tracked as a follow-up; the tool-approval elicitation path is unaffected.
+**Bonus (not in the original gap list) — `question.asked` interactive input:**
+opencode's `question` tool (the model asking the *user* a multiple-choice
+question, distinct from tool-approval) blocks the turn until answered. This was
+characterized live against `opencode serve` 1.17.7 (built+run from source at
+HEAD `b60c0a5`) so the integration is grounded in the real wire, not the schema
+name:
+
+- **Real event is `question.asked`** (not `question.v2.asked`, despite the
+  `QuestionV2*` schema names). Payload:
+  `{id, sessionID, questions:[{question, header, options:[{label, description}], multiple}], tool:{messageID, callID}}`.
+- **Reply is GLOBAL, not session-scoped:** `POST /question/{id}/reply` with
+  `{answers: [[label], …]}` (one inner list per question; single-choice → a
+  one-element list). Live-verified: `{"answers": [["Tabs"]]}` → `200` →
+  `question.replied` → `session.idle`. `POST /question/{id}/reject` unblocks
+  without an answer. (The session-scoped path returns the web SPA, not an API
+  route.)
+- The web AskUserQuestion card already parses **exactly** this shape via
+  `_parse_questions_with_options` (`{question, header, options:[{label,
+  description}], multiSelect}`), so the forward leg is a near-direct mapping.
+
+**Landed in this PR (foundation):** the live-verified client methods
+`OpenCodeClient.reply_question(request_id, answers)` /
+`reject_question(request_id)` (unit-tested), wrapping the two endpoints above.
+
+**Deferred to a follow-up (the web round-trip):** wiring a forwarder
+`_on_question_asked` handler + a server **form-elicitation hook** that publishes
+the AskUserQuestion card and replies via the client methods. Two parts cannot be
+closed from opencode source alone and need the live web UI:
+1. **TUI coexistence (race safety).** Like the permission card, a TUI user can
+   answer the same question directly; the handler must reuse the
+   `_signal_terminal_resolved_harness_elicitation` race guard (first-answer-wins)
+   or a naive web intercept breaks TUI interactivity.
+2. **Answer mapping.** `ElicitationResult.content` is an MCP-shaped
+   `{field: value}` map; opencode wants opencode's *ordered* `[[label]]`.
+   Single-question single-select is a deterministic, safe map; multi-question
+   ordering must be verified against a real web verdict before shipping.
+
+The tool-approval elicitation path (`permission.asked`) is unaffected by this
+gap. See the QA plan for the manual web round-trip needed to promote the
+follow-up.
 
 ## Background
 
@@ -146,7 +179,7 @@ All land in `opencode_native_forwarder.py` / `opencode_native_provider.py` /
 - **Effort:** M–L · **Risk:** low–medium.
 
 ### 7. Elicitation (verify) + Policies (verify/harden)
-- **Elicitation:** ✓ solid (full permission.v2 round-trip, fail-closed, tested). Harden: (C1) the typed `transport.reply_permission` is dead code parallel to the live forwarder path — unify or delete to prevent drift; (C2) a failed `POST .../reply` is swallowed → opencode-side hang — retry/reconcile via `GET /session/{id}/permission`. **New (C3):** handle the separate `question.v2.asked` input-request surface (currently ignored) as a form elicitation. Effort S (C1) / M (C2, C3).
+- **Elicitation:** ✓ solid (full permission.v2 round-trip, fail-closed, tested). Harden: (C1) the typed `transport.reply_permission` is dead code parallel to the live forwarder path — unify or delete to prevent drift; (C2) a failed `POST .../reply` is swallowed → opencode-side hang — retry/reconcile via `GET /session/{id}/permission`. **New (C3):** handle the separate `question.asked` input-request surface (currently ignored) as a form elicitation — **foundation landed** (`reply_question`/`reject_question`, live-verified + tested); the forwarder handler + server form-hook + TUI race guard remain (see the bonus section). Effort S (C1) / M (C2, C3).
 - **Policies:** ✓ wired (allow/deny/ask all honored). Reactive only — coverage bounded by opencode's permission surface; no pre-tool hook, no TOOL_RESULT phase. Force-ask via the synthesized config (clarification 2) closes the coverage hole; document the reactive model. Effort S.
 
 ## Recommended sequence
@@ -167,4 +200,4 @@ server changes except the compact-dispatch arm in #1).
 1. `/sync/history` request-body shape — verify against the live server before choosing it for resume rehydration (vs. re-injecting via `POST /session/{id}/message`).
 2. opencode's behavior for back-dated/non-executing history messages (cost, ordering, tool-call representation) — gates resume Option A.
 3. Whether to ever build the MCP relay (central TOOL_RESULT gating) — deferred; native config + force-ask is the plan.
-4. `question.v2` payload (`QuestionV2Info`/`QuestionV2Tool`) — capture a real fixture to shape the form-elicitation mapping (C3).
+4. ~~`question.v2` payload — capture a real fixture to shape the form-elicitation mapping (C3).~~ **Resolved:** real event is `question.asked` with `{questions:[{question, header, options:[{label,description}], multiple}], tool}`; reply via GLOBAL `POST /question/{id}/reply {answers:[[label]]}` (live-verified). Foundation client methods landed; the web round-trip + TUI race guard remain the follow-up (see the bonus section above).
