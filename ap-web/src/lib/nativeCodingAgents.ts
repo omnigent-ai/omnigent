@@ -10,6 +10,7 @@ export type NativeCodingAgentIconKind =
   | "opencode"
   | "pi"
   | "cursor"
+  | "kiro"
   | "goose"
   | "qwen"
   | "antigravity"
@@ -78,6 +79,15 @@ export const NATIVE_CODING_AGENTS = [
     sortRank: 40,
   },
   {
+    key: "kiro",
+    agentName: "kiro-native-ui",
+    harness: "kiro-native",
+    wrapperLabel: "kiro-native-ui",
+    displayName: "Kiro",
+    iconKind: "kiro",
+    sortRank: 50,
+  },
+  {
     // Antigravity's native CLI (Gemini-family). Mirrors the server's
     // canonical `antigravity-native` harness and the `antigravity-native-ui`
     // wrapper the runner keys off to boot the terminal. Added ALONGSIDE the
@@ -98,7 +108,7 @@ export const NATIVE_CODING_AGENTS = [
     wrapperLabel: "goose-native-ui",
     displayName: "Goose",
     iconKind: "goose",
-    sortRank: 50,
+    sortRank: 60,
   },
   {
     // qwen has no brand glyph yet, so it falls back to the generic bot icon
@@ -154,6 +164,7 @@ const BY_WRAPPER: Map<string, NativeCodingAgentSpec> = new Map(
 const HARNESS_ALIASES: Record<string, string> = {
   "native-pi": "pi-native",
   "native-cursor": "cursor-native",
+  "native-kiro": "kiro-native",
   "native-antigravity": "antigravity-native",
   "native-goose": "goose-native",
   "native-qwen": "qwen-native",

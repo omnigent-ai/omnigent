@@ -80,7 +80,8 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
 
 # CLI-wrapping harnesses are gated on their binary being on PATH. Native Cursor
 # (``omni cursor``) joins the list: it wraps the ``cursor-agent`` CLI, unlike the
-# SDK ``cursor`` harness which gates on a key (covered separately below).
+# SDK ``cursor`` harness which gates on a key (covered separately below). Native
+# Kiro wraps the standalone ``kiro-cli`` binary.
 @pytest.mark.parametrize(
     "harness",
     [
@@ -92,6 +93,8 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "pi",
         "cursor-native",
         "native-cursor",
+        "kiro-native",
+        "native-kiro",
         "goose-native",
         "native-goose",
         "hermes",
@@ -145,6 +148,9 @@ def test_configured_harness_map_covers_all_spellings(
         # Native Cursor (``omni cursor``) — gates on the cursor-agent CLI.
         "cursor-native",
         "native-cursor",
+        # Native Kiro (``omni kiro``) — gates on the kiro-cli binary.
+        "kiro-native",
+        "native-kiro",
         # Goose — native TUI (``omni goose``) + headless ACP harness; both gate
         # on the goose CLI.
         "goose",
@@ -225,6 +231,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "kimi",
         "cursor-native",
         "native-cursor",
+        "kiro-native",
+        "native-kiro",
         "antigravity-native",
         "native-antigravity",
         "goose-native",

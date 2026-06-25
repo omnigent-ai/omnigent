@@ -90,6 +90,7 @@ OMNIGENT_HARNESSES = frozenset(
         "kimi",
         "kimi-native",
         "cursor-native",
+        "kiro-native",
         "goose",
         "goose-native",
         "hermes",
@@ -107,6 +108,7 @@ OMNIGENT_HARNESSES = frozenset(
 OMNIGENT_HARNESS_ALIASES = frozenset(
     {
         "claude",
+        "native-kiro",
         "native-pi",
         "native-antigravity",
         "native-goose",

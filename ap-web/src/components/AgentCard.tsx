@@ -34,6 +34,7 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   if (nativeAgent?.iconKind === "opencode") return OpenCodeIcon;
   if (nativeAgent?.iconKind === "pi") return PiIcon;
   if (nativeAgent?.iconKind === "cursor") return CursorIcon;
+  if (nativeAgent?.iconKind === "kiro") return CursorIcon;
   if (nativeAgent?.iconKind === "goose") return GooseIcon;
   if (nativeAgent?.iconKind === "kimi") return KimiIcon;
   if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
@@ -42,6 +43,7 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   if (agent.harness?.includes("claude")) return ClaudeIcon;
   // Both the SDK "cursor" harness and "cursor-native" get the Cursor glyph.
   if (agent.harness?.includes("cursor")) return CursorIcon;
+  if (agent.harness?.includes("kiro")) return CursorIcon;
   if (agent.harness?.includes("goose")) return GooseIcon;
   // Both the SDK "kimi"/"kimi-code" harness and "kimi-native" get the Kimi glyph.
   if (agent.harness?.includes("kimi")) return KimiIcon;

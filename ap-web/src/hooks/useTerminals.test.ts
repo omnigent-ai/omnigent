@@ -483,6 +483,12 @@ describe("inventoryTerminals", () => {
     session: "main",
     running: true,
   };
+  const kiroPane: TerminalInfo = {
+    id: "terminal_kiro_main",
+    name: "kiro",
+    session: "main",
+    running: true,
+  };
   const goosePane: TerminalInfo = {
     id: "terminal_goose_main",
     name: "goose",
@@ -532,6 +538,13 @@ describe("inventoryTerminals", () => {
     // same failure mode as the pi pane above — leaked into Shells and hid
     // the Chat/Terminal pill in Terminal view.
     expect(inventoryTerminals([cursorPane, bash], true)).toEqual([bash]);
+  });
+
+  it("drops the kiro vendor pane for native Kiro sessions", () => {
+    // Regression: terminal_kiro_main was missing from AGENT_TERMINAL_IDS,
+    // so Kiro's Terminal pill opened a shell view with an X close button
+    // instead of preserving the Chat/Terminal toggle.
+    expect(inventoryTerminals([kiroPane, bash], true)).toEqual([bash]);
   });
 
   it("drops the goose vendor pane for native Goose sessions", () => {
@@ -619,7 +632,8 @@ describe("isAgentTerminalKey", () => {
     expect(isAgentTerminalKey("terminal:terminal_pi_main")).toBe(true);
     // cursor-native: same regression class as pi above.
     expect(isAgentTerminalKey("terminal:terminal_cursor_main")).toBe(true);
-    // goose-/qwen-native: same regression class as pi/cursor above.
+    // kiro-/goose-/qwen-native: same regression class as cursor/pi above.
+    expect(isAgentTerminalKey("terminal:terminal_kiro_main")).toBe(true);
     expect(isAgentTerminalKey("terminal:terminal_goose_main")).toBe(true);
     expect(isAgentTerminalKey("terminal:terminal_qwen_main")).toBe(true);
   });

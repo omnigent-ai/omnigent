@@ -67,8 +67,11 @@ class TestRowToItem:
             assert _row_to_item(0, row) is None
 
     def test_non_user_turn_prompt_skipped(self) -> None:
-        row = {"type": "turn.prompt", "input": [{"type": "text", "text": "x"}],
-               "origin": {"kind": "system"}}
+        row = {
+            "type": "turn.prompt",
+            "input": [{"type": "text", "text": "x"}],
+            "origin": {"kind": "system"},
+        }
         assert _row_to_item(0, row) is None
 
 
@@ -77,14 +80,20 @@ class TestReadNewItems:
         def _part(uuid: str, part_type: str, text: str) -> dict[str, object]:
             return {
                 "type": "context.append_loop_event",
-                "event": {"type": "content.part", "uuid": uuid,
-                          "part": {"type": part_type, "text": text}},
+                "event": {
+                    "type": "content.part",
+                    "uuid": uuid,
+                    "part": {"type": part_type, "text": text},
+                },
             }
 
         rows = [
             {"type": "metadata", "protocol_version": 1},
-            {"type": "turn.prompt", "input": [{"type": "text", "text": "hi"}],
-             "origin": {"kind": "user"}},
+            {
+                "type": "turn.prompt",
+                "input": [{"type": "text", "text": "hi"}],
+                "origin": {"kind": "user"},
+            },
             _part("u1", "think", "…"),
             _part("u2", "text", "hello!"),
         ]

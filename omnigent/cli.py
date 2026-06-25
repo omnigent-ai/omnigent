@@ -1184,6 +1184,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "hermes",
         "host",
         "kimi",
+        "kiro",
         "lakebox",
         "login",
         "opencode",
@@ -4690,6 +4691,159 @@ def cursor(
         cursor_args=cursor_args,
         auto_open_conversation=auto_open_conversation,
     )
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch the Kiro TUI, and attaches this TTY. "
+        'Pass --server "" to auto-spawn a persistent local server in the '
+        "background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to kiro-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.option("--model", default=None, help="Kiro model to use for the native chat.")
+@click.option("--effort", default=None, help="Kiro effort level to use for the native chat.")
+@click.option("--agent", "kiro_agent", default=None, help="Kiro agent to use for the native chat.")
+@click.option(
+    "--trust-tools",
+    "trust_tools",
+    multiple=True,
+    metavar="TOOL",
+    help="Trust a specific Kiro tool. May be passed multiple times.",
+)
+@click.option(
+    "--trust-all-tools",
+    is_flag=True,
+    default=False,
+    help="Explicitly trust all Kiro tools for this local launch.",
+)
+@click.option(
+    "-p",
+    "--prompt",
+    default=None,
+    help="Send this as the initial Kiro chat input when the TUI starts.",
+)
+@click.argument("kiro_args", nargs=-1, type=click.UNPROCESSED)
+def kiro(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    model: str | None,
+    effort: str | None,
+    kiro_agent: str | None,
+    trust_tools: tuple[str, ...],
+    trust_all_tools: bool,
+    prompt: str | None,
+    kiro_args: tuple[str, ...],
+) -> None:
+    """Launch the Kiro TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent kiro
+      omnigent kiro --resume conv_abc123
+      omnigent kiro --resume                  # interactive picker
+      omnigent kiro --model auto -p "review this repo"
+    """
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+    _reject_reserved_kiro_resume_args(kiro_args)
+
+    from omnigent.kiro_native import run_kiro_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    if model is None:
+        model = cfg.get("model")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+    launch_args = _build_kiro_launch_args(
+        effort=effort,
+        kiro_agent=kiro_agent,
+        trust_tools=trust_tools,
+        trust_all_tools=trust_all_tools,
+        passthrough_args=kiro_args,
+    )
+
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+
+    run_kiro_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        kiro_args=launch_args,
+        model=model,
+        prompt=prompt,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+def _reject_reserved_kiro_resume_args(kiro_args: tuple[str, ...]) -> None:
+    """Reject Kiro-owned resume flags in passthrough args."""
+    reserved = {"--resume", "--resume-id", "--resume-picker"}
+    if any(arg == flag or arg.startswith(f"{flag}=") for arg in kiro_args for flag in reserved):
+        raise click.UsageError(
+            "Kiro resume flags are reserved for Omnigent resume handling; use "
+            "`omnigent kiro --resume [CONVERSATION]` instead."
+        )
+
+
+def _build_kiro_launch_args(
+    *,
+    effort: str | None,
+    kiro_agent: str | None,
+    trust_tools: tuple[str, ...],
+    trust_all_tools: bool,
+    passthrough_args: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Build mapped Kiro CLI args for the runner-owned terminal launch."""
+    args: list[str] = []
+    if effort:
+        args.extend(["--effort", effort])
+    if kiro_agent:
+        args.extend(["--agent", kiro_agent])
+    for tool in trust_tools:
+        args.extend(["--trust-tools", tool])
+    if trust_all_tools:
+        args.append("--trust-all-tools")
+    args.extend(passthrough_args)
+    return tuple(args)
 
 
 @cli.command(

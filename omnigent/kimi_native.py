@@ -200,8 +200,7 @@ def _materialize_kimi_agent_spec(tmpdir: Path) -> Path:
     raw: dict[str, Any] = {
         "name": _AGENT_NAME,
         "prompt": (
-            "Kimi is running in the session terminal. The user drives the "
-            "kimi TUI directly."
+            "Kimi is running in the session terminal. The user drives the kimi TUI directly."
         ),
         "executor": {"harness": "kimi-native"},
         "spawn": True,
@@ -486,8 +485,7 @@ async def _wait_for_kimi_terminal_ready(
             return terminal
         await asyncio.sleep(0.2)
     raise click.ClickException(
-        f"The runner did not create the Kimi terminal for {session_id!r} "
-        f"within {timeout_s:.0f}s."
+        f"The runner did not create the Kimi terminal for {session_id!r} within {timeout_s:.0f}s."
     )
 
 

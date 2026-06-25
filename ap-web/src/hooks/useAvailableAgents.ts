@@ -3,6 +3,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import { agentRootName } from "@/lib/forkHarness";
 import { capitalizeAgentName } from "@/lib/agentLabels";
 import {
+  nativeCodingAgentForAvailableAgent,
   nativeCodingAgentForAgentName,
   nativeCodingAgentForHarness,
 } from "@/lib/nativeCodingAgents";
@@ -40,6 +41,29 @@ function displayNameForAgent(name: string, harness?: string | null): string {
   );
 }
 
+function dedupeNativeAgents(agents: AvailableAgent[]): AvailableAgent[] {
+  const result: AvailableAgent[] = [];
+  const nativeIndex = new Map<string, number>();
+  for (const agent of agents) {
+    const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
+    if (nativeAgent?.key !== "kiro") {
+      result.push(agent);
+      continue;
+    }
+    const existingIndex = nativeIndex.get(nativeAgent.key);
+    if (existingIndex === undefined) {
+      nativeIndex.set(nativeAgent.key, result.length);
+      result.push(agent);
+      continue;
+    }
+    const existing = result[existingIndex];
+    if (agent.name === nativeAgent.agentName && existing.name !== nativeAgent.agentName) {
+      result[existingIndex] = agent;
+    }
+  }
+  return result;
+}
+
 /** Wire row of the built-in list, GET /v1/agents. */
 interface BuiltinAgentWire {
   id: string;
@@ -64,14 +88,16 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
   const res = await authenticatedFetch("/v1/agents");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as { data: BuiltinAgentWire[] };
-  return body.data.map((a) => ({
-    id: a.id,
-    name: a.name,
-    display_name: displayNameForAgent(a.name, a.harness),
-    description: a.description ?? null,
-    harness: a.harness ?? null,
-    skills: a.skills ?? [],
-  }));
+  return dedupeNativeAgents(
+    body.data.map((a) => ({
+      id: a.id,
+      name: a.name,
+      display_name: displayNameForAgent(a.name, a.harness),
+      description: a.description ?? null,
+      harness: a.harness ?? null,
+      skills: a.skills ?? [],
+    })),
+  );
 }
 
 /**
@@ -192,6 +218,10 @@ async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
   ]);
   const builtinIds = new Set(builtins.map((a) => a.id));
   const builtinNames = new Set(builtins.map((a) => a.name));
+  const hasKiroBuiltin = builtins.some(
+    (a) => nativeCodingAgentForAvailableAgent(a)?.key === "kiro",
+  );
+  const kiroLegacyNames = new Set(["kiro"]);
   // One row per custom base name, newest session first (scan order):
   // same-named agent_ids are per-session mints of the same agent, and
   // identical-name rows are indistinguishable in the picker anyway.
@@ -203,9 +233,15 @@ async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
     // the clone would slip past the shadow check and pollute the picker.
     const base = agentRootName(agent.agentName);
     if (builtinIds.has(agent.agentId) || builtinNames.has(base)) continue;
+    if (hasKiroBuiltin && kiroLegacyNames.has(base.toLocaleLowerCase())) continue;
     if (!customByName.has(base)) customByName.set(base, agent);
   }
-  const enriched = await Promise.all(Array.from(customByName.values()).map(enrichSessionAgent));
+  const enriched = (
+    await Promise.all(Array.from(customByName.values()).map(enrichSessionAgent))
+  ).filter((agent) => {
+    const nativeKey = nativeCodingAgentForAvailableAgent(agent)?.key;
+    return nativeKey !== "kiro" || !hasKiroBuiltin;
+  });
   // Built-ins first; custom agents follow in scan order (newest session
   // first). NewChatDialog's display-order sort is stable, so unranked
   // custom names keep this relative order.

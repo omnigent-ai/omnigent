@@ -41,9 +41,12 @@ Omnigent lets you:
   conversation to continue on their own.
 
 - **☁️ Run agents in cloud sandboxes.** No laptop required: run sessions in
-  disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io), or
-  [Islo](https://islo.dev) sandboxes, launched from the CLI or provisioned by
-  the server per session (*managed hosts*).
+  disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
+  [Islo](https://islo.dev), [E2B](https://e2b.dev),
+  [CoreWeave](https://docs.coreweave.com/products/sandboxes),
+  [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
+  or [Boxlite](https://github.com/boxlite-ai/boxlite) sandboxes, launched from the
+  CLI or provisioned by the server per session (*managed hosts*).
 
 - **🛡️ Govern your agents.** Create
   [policies](#6-govern-your-agents-with-policies) to pause for your approval
@@ -94,15 +97,18 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 - **Node.js 22 LTS or newer** with **`npm`**, for the Claude, Codex, and Pi
   coding harnesses. `omnigent run` installs the harness CLI you pick.
   https://docs.npmjs.com/downloading-and-installing-node-js-and-npm
-- **`tmux`**, required by the native `omnigent claude` / `omnigent codex`
+- **Kiro CLI** (optional), for `omnigent kiro`: install with
+  `curl -fsSL https://cli.kiro.dev/install | bash`, then sign in with Kiro.
+- **`tmux`**, required by the native `omnigent claude` / `omnigent codex` /
+  `omnigent kiro`
   wrappers (`brew install tmux` / `apt install tmux`; the installer offers
   to install it for you).
 - **`bubblewrap`** (`bwrap`), **Linux only**. The native `omnigent claude` /
-  `omnigent codex` and `pi` harnesses wrap each agent terminal in a `bwrap`
-  OS-sandbox; on Linux that isolation is mandatory, so a missing `bwrap`
-  binary makes those terminals fail to start (`apt install bubblewrap`; the
-  installer offers to install it for you). macOS uses the built-in `seatbelt`
-  sandbox and needs nothing extra.
+  `omnigent codex` / `omnigent kiro` and `pi` harnesses wrap each agent
+  terminal in a `bwrap` OS-sandbox; on Linux that isolation is mandatory, so a
+  missing `bwrap` binary makes those terminals fail to start
+  (`apt install bubblewrap`; the installer offers to install it for you). macOS
+  uses the built-in `seatbelt` sandbox and needs nothing extra.
 - **Databricks** (optional). To use a Databricks workspace as your model
   provider, install Omnigent with the `databricks` extra:
   `uv tool install "omnigent[databricks]"` — or pass it to the bootstrap
@@ -161,6 +167,7 @@ Or launch a specific agent runtime, or your own agent:
 ```bash
 omnigent claude                      # Claude Code, in a session your team can join
 omnigent codex                       # Codex
+omnigent kiro                        # Kiro CLI
 omnigent kimi                        # Kimi Code (https://kimi.com), headless
 omnigent run path/to/agent.yaml      # your own agent (see "Write your own agent")
 ```
@@ -377,7 +384,7 @@ name: my_agent
 prompt: You are a helpful data analyst.
 
 executor:
-  harness: claude-sdk          # or: claude-native, codex, codex-native, cursor, cursor-native, openai-agents, pi, pi-native, antigravity, qwen, kimi, copilot
+  harness: claude-sdk          # or: claude-native, codex, codex-native, cursor, cursor-native, kiro-native, openai-agents, pi, pi-native, antigravity, qwen, kimi, copilot
 
 tools:
   # A local Python function (schema auto-generated from the signature)

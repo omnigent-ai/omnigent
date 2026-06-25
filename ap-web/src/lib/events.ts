@@ -359,6 +359,10 @@ export interface ErrorEvent {
   source: string;
   toolName: string | null;
   error: ErrorInfo;
+  /** Server-assigned item id when parsed from `response.output_item.done`. */
+  itemId?: string;
+  /** Server-assigned response id when parsed from `response.output_item.done`. */
+  responseId?: string;
 }
 
 // ── Compaction ───────────────────────────────────────────

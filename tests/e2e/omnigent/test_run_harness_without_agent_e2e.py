@@ -193,6 +193,12 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     not ``omnigent run --harness qwen-native``. Its coverage is the dedicated
     qwen-native bridge/executor/forwarder unit tests.
 
+    ``kiro-native`` is excluded for the same reason as ``goose-native`` /
+    ``qwen-native`` / ``cursor-native``: it is a terminal-first TUI launched via
+    ``omni kiro`` (tmux pane + bridge dir), not ``omnigent run --harness
+    kiro-native``. Its coverage is the dedicated kiro-native bridge/executor/
+    forwarder unit tests plus the ``test_native_kiro_render_parity`` e2e_ui suite.
+
     ``hermes`` is excluded because it requires the ``hermes`` CLI binary
     (installed separately via Nous Research's install script) and authenticates
     through its own provider config, not the shared gateway/profile probe
@@ -218,6 +224,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "qwen-native",
         "goose",
         "goose-native",
+        "kiro-native",
         "hermes",
         "hermes-native",
     }

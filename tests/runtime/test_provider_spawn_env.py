@@ -1026,9 +1026,7 @@ def test_kimi_spawn_env_threads_spec_model_only(config_home: Path) -> None:
     assert env == {"HARNESS_KIMI_MODEL": "kimi-k2-turbo"}
 
 
-def test_kimi_cwd_threads_through_as_subprocess_cwd(
-    config_home: Path, tmp_path: Path
-) -> None:
+def test_kimi_cwd_threads_through_as_subprocess_cwd(config_home: Path, tmp_path: Path) -> None:
     """``cwd`` (the session workspace) lands in ``HARNESS_KIMI_CWD`` so kimi's
     subprocess operates on the user's project — NOT the /tmp agent bundle dir.
 

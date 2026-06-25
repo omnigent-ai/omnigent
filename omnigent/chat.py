@@ -1049,6 +1049,14 @@ def _redirect_native_resume_if_needed(
             progress=progress,
         )
         return True
+    if native_agent.key == "kiro":
+        _run_kiro_native_resume_redirect(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            auto_open_conversation=auto_open_conversation,
+            progress=progress,
+        )
+        return True
     if native_agent.key == "cursor":
         _run_cursor_native_resume_redirect(
             base_url=base_url,
@@ -1192,6 +1200,30 @@ def _run_pi_native_resume_redirect(
         server=base_url,
         session_id=conversation_id,
         pi_args=(),
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+def _run_kiro_native_resume_redirect(
+    *,
+    base_url: str,
+    conversation_id: str,
+    auto_open_conversation: bool,
+    progress: RunnerStartupProgress | None,
+) -> None:
+    """Hand a kiro-native conversation back to ``omnigent kiro``."""
+    _finish_native_redirect_progress(
+        progress=progress,
+        conversation_id=conversation_id,
+        wrapper_name="kiro-native",
+        native_command="kiro",
+    )
+    from omnigent.kiro_native import run_kiro_native
+
+    run_kiro_native(
+        server=base_url,
+        session_id=conversation_id,
+        kiro_args=(),
         auto_open_conversation=auto_open_conversation,
     )
 

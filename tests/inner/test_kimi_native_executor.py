@@ -157,17 +157,13 @@ class TestApprovalKeystroke:
         assert inject_approval_keystroke(tmp_path, key=DENY_KEY) is True
         assert sent[0] == ("send-keys", "-t", "main", DENY_KEY)
 
-    def test_skips_when_menu_absent(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_skips_when_menu_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # Prompt already answered in the terminal → marker gone → no keystroke.
         sent = self._stub_tmux(monkeypatch, pane="● Hello! How can I help?")
         assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is False
         assert sent == []
 
-    def test_skips_when_tui_exited(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_skips_when_tui_exited(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         sent = self._stub_tmux(monkeypatch, pane="▶ 1. Approve once", alive=False)
         assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is False
         assert sent == []

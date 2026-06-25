@@ -146,10 +146,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
             sys.stdout.write(json.dumps(out))
         return 0
 
-    url = (
-        f"{ap_server_url.rstrip('/')}"
-        f"/v1/sessions/{_url_component(session_id)}/policies/evaluate"
-    )
+    url = f"{ap_server_url.rstrip('/')}/v1/sessions/{_url_component(session_id)}/policies/evaluate"
     resp = post_evaluate_with_retry(
         url, headers, eval_request, _EVALUATE_POLICY_TIMEOUT_S, "kimi evaluate-policy hook"
     )

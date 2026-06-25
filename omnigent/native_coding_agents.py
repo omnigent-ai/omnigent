@@ -12,6 +12,7 @@ from omnigent._wrapper_labels import (
     GOOSE_NATIVE_WRAPPER_VALUE,
     HERMES_NATIVE_WRAPPER_VALUE,
     KIMI_NATIVE_WRAPPER_VALUE,
+    KIRO_NATIVE_WRAPPER_VALUE,
     OPENCODE_NATIVE_WRAPPER_VALUE,
     PI_NATIVE_WRAPPER_VALUE,
     QWEN_NATIVE_WRAPPER_VALUE,
@@ -91,6 +92,15 @@ CURSOR_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="cursor",
 )
 
+KIRO_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="kiro",
+    display_name="Kiro",
+    agent_name="kiro-native-ui",
+    harness="kiro-native",
+    wrapper_label=KIRO_NATIVE_WRAPPER_VALUE,
+    terminal_name="kiro",
+)
+
 GOOSE_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="goose",
     display_name="Goose",
@@ -141,6 +151,7 @@ NATIVE_CODING_AGENTS: tuple[NativeCodingAgent, ...] = (
     PI_NATIVE_CODING_AGENT,
     OPENCODE_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    KIRO_NATIVE_CODING_AGENT,
     GOOSE_NATIVE_CODING_AGENT,
     ANTIGRAVITY_NATIVE_CODING_AGENT,
     QWEN_NATIVE_CODING_AGENT,

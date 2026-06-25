@@ -49,7 +49,7 @@ resolved from the YAML file's directory.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, pi, antigravity, qwen, kimi, copilot, hermes, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
@@ -65,6 +65,11 @@ gateway / `auth.type: databricks` does not apply. Authenticate it with
 `CURSOR_API_KEY` (or a prior `cursor-agent login`), optionally pinned via
 `auth: {type: api_key, api_key: ${CURSOR_API_KEY}}`, and choose a Cursor model
 id (e.g. `auto`, `gpt-5`) rather than a `databricks-*` id.
+
+The `kiro-native` harness is the native Kiro CLI terminal path used by
+`omnigent kiro`. It requires `kiro-cli` on `PATH` and Kiro's own login/auth; it
+does not use Databricks, OpenAI, or Anthropic provider credentials. Plain
+`harness: kiro` is not a generic Omnigent harness id.
 
 ### Antigravity (Gemini)
 

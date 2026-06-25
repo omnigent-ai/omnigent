@@ -312,6 +312,7 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
   if (nativeAgent?.iconKind === "opencode") return OpenCodeIcon;
   if (nativeAgent?.iconKind === "pi") return PiIcon;
   if (nativeAgent?.iconKind === "cursor") return CursorIcon;
+  if (nativeAgent?.iconKind === "kiro") return CursorIcon;
   if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
   if (nativeAgent?.iconKind === "goose") return GooseIcon;
   if (nativeAgent?.iconKind === "kimi") return KimiIcon;
@@ -476,7 +477,8 @@ function iconForWrapperOrHarness(
   if (iconKind === "claude" || harness?.includes("claude")) return ClaudeIcon;
   if (iconKind === "codex" || harness?.includes("codex")) return CodexIcon;
   if (iconKind === "opencode" || harness?.includes("opencode")) return OpenCodeIcon;
-  if (iconKind === "cursor" || harness?.includes("cursor")) return CursorIcon;
+  if (iconKind === "cursor" || iconKind === "kiro" || harness?.includes("cursor"))
+    return CursorIcon;
   if (iconKind === "goose" || harness?.includes("goose")) return GooseIcon;
   if (iconKind === "kimi" || harness?.includes("kimi")) return KimiIcon;
   if (iconKind === "antigravity" || harness?.includes("antigravity")) return AntigravityIcon;

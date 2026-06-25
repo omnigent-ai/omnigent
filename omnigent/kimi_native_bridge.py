@@ -81,7 +81,6 @@ def build_kimi_native_spawn_env(session_id: str) -> dict[str, str]:
     }
 
 
-
 def write_hook_config(
     bridge_dir: Path,
     *,

@@ -98,6 +98,16 @@ def test_cursor_install_spec_is_login_only_no_npm() -> None:
     assert spec.login_status_key == "isAuthenticated"
 
 
+def test_kiro_install_spec_is_manual_installer_no_npm() -> None:
+    """Kiro ships as a standalone native installer, not an npm package."""
+    spec = hi.harness_install_spec(hi.KIRO_KEY)
+    assert spec is not None
+    assert spec.display == "Kiro"
+    assert spec.binary == "kiro-cli"
+    assert spec.package is None
+    assert spec.install_hint == "curl -fsSL https://cli.kiro.dev/install | bash"
+
+
 def test_antigravity_install_spec_status_only_no_npm() -> None:
     """Antigravity (agy) ships via a shell installer (no npm) and has no login
     subcommand — the user signs in by launching ``agy`` once. It DOES expose a
@@ -134,14 +144,16 @@ def test_harness_setup_hint_antigravity_surfaces_sign_in() -> None:
 
 
 def test_install_command_rejects_non_npm_harness() -> None:
-    """A non-npm harness (cursor) has no npm install command; asking for one is
+    """A non-npm harness has no npm install command; asking for one is
     a loud error so the caller shows its ``install_hint`` instead."""
     with pytest.raises(ValueError):
         hi.harness_install_command(hi.CURSOR_KEY)
+    with pytest.raises(ValueError):
+        hi.harness_install_command(hi.KIRO_KEY)
 
 
 def test_install_harness_cli_noop_for_non_npm(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``install_harness_cli`` never shells npm for a non-npm CLI (cursor).
+    """``install_harness_cli`` never shells npm for a non-npm CLI.
 
     It returns ``False`` without spawning anything, so the menu falls back to
     the manual ``install_hint`` rather than running a bogus npm command.
@@ -153,6 +165,7 @@ def test_install_harness_cli_noop_for_non_npm(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(hi.subprocess, "run", _explode)
     assert hi.install_harness_cli(hi.CURSOR_KEY) is False
+    assert hi.install_harness_cli(hi.KIRO_KEY) is False
 
 
 def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
@@ -172,6 +185,8 @@ def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
         # ``cursor`` harness, which needs no binary — see the test below).
         ("cursor-native", "cursor-agent"),
         ("native-cursor", "cursor-agent"),
+        ("kiro-native", "kiro-cli"),
+        ("native-kiro", "kiro-cli"),
     ],
 )
 def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:
@@ -199,6 +214,15 @@ def test_setup_hint_for_native_cursor_points_at_vendor_installer(harness: str) -
     assert "cursor-agent" in hint
     assert "cursor.com/install" in hint
     assert "cursor-agent login" in hint
+    assert "omnigent setup" not in hint
+
+
+@pytest.mark.parametrize("harness", ["kiro-native", "native-kiro"])
+def test_setup_hint_for_native_kiro_points_at_vendor_installer(harness: str) -> None:
+    """Native Kiro's missing-binary hint names Kiro's installer, not setup."""
+    hint = hi.harness_setup_hint(harness)
+    assert "kiro-cli" in hint
+    assert "cli.kiro.dev/install" in hint
     assert "omnigent setup" not in hint
 
 

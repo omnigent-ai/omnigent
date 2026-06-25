@@ -25,6 +25,7 @@ from omnigent.native_coding_agents import (
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
     KIMI_NATIVE_CODING_AGENT,
+    KIRO_NATIVE_CODING_AGENT,
     OPENCODE_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
     QWEN_NATIVE_CODING_AGENT,
@@ -83,6 +84,7 @@ _CODEX_NATIVE_AGENT_NAME = CODEX_NATIVE_CODING_AGENT.agent_name
 _PI_NATIVE_AGENT_NAME = PI_NATIVE_CODING_AGENT.agent_name
 _OPENCODE_NATIVE_AGENT_NAME = OPENCODE_NATIVE_CODING_AGENT.agent_name
 _CURSOR_NATIVE_AGENT_NAME = CURSOR_NATIVE_CODING_AGENT.agent_name
+_KIRO_NATIVE_AGENT_NAME = KIRO_NATIVE_CODING_AGENT.agent_name
 _ANTIGRAVITY_NATIVE_AGENT_NAME = ANTIGRAVITY_NATIVE_CODING_AGENT.agent_name
 _QWEN_NATIVE_AGENT_NAME = QWEN_NATIVE_CODING_AGENT.agent_name
 _KIMI_NATIVE_AGENT_NAME = KIMI_NATIVE_CODING_AGENT.agent_name
@@ -362,6 +364,7 @@ def _ensure_default_agents(
     _ensure_default_pi_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_opencode_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_cursor_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_kiro_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_antigravity_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_qwen_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_kimi_native_agent(agent_store, artifact_store, agent_cache)
@@ -652,6 +655,34 @@ def _ensure_default_cursor_agent(
         agent_cache,
         name=_CURSOR_NATIVE_AGENT_NAME,
         bundle_bytes=_build_cursor_native_bundle(),
+    )
+
+
+def _build_kiro_native_bundle() -> bytes:
+    """Build a gzipped tarball of the kiro-native-ui agent spec."""
+    import tempfile
+
+    from omnigent.kiro_native import _materialize_kiro_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_kiro_agent_spec(Path(tmpdir), model=None)
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_kiro_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """Register or refresh the kiro-native-ui agent."""
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_KIRO_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_kiro_native_bundle(),
     )
 
 
