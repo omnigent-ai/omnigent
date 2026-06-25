@@ -15742,6 +15742,21 @@ def create_runner_app(
                     agent_id = snapshot.agent_id
 
         _clear_session_agent_caches(session_id, agent_id)
+
+        # Release the harness subprocess so the next turn spawns a
+        # fresh one with the updated tool list. The Claude SDK client
+        # bakes mcp_servers at creation time — without this, new MCP
+        # tools added via the UI won't appear in the API's tools array.
+        if process_manager is not None:
+            try:
+                await process_manager.release(session_id)
+            except Exception:  # noqa: BLE001
+                _logger.debug(
+                    "harness release after agent-cache reset failed for %s",
+                    session_id,
+                    exc_info=True,
+                )
+
         return JSONResponse(
             status_code=200,
             content={
