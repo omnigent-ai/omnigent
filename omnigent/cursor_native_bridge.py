@@ -118,6 +118,122 @@ def _ensure_dir(path: Path) -> None:
         os.chmod(path, 0o700)
 
 
+#: File the runner drops into a fork's bridge dir holding the prior-conversation
+#: text preamble, consumed once by the executor on the first injected message.
+#: cursor's conversation is server-backed (a synthesized local store.db is NOT
+#: loaded by ``cursor-agent --resume``), so a fork carries history by replaying
+#: the prior turns as a text prefix on the first message (text-prefix replay).
+_FORK_PREAMBLE_FILE = "fork_preamble.txt"
+#: Sentinel framing the replayed history inside the first injected message. The
+#: cursor agent reads the wrapped context, but the forwarder strips this block
+#: when mirroring the user turn back to Omnigent so the copied history isn't
+#: duplicated in the timeline (see cursor_native_forwarder._unwrap_user_query).
+FORK_HISTORY_OPEN_TAG = "<omnigent_fork_history>"
+FORK_HISTORY_CLOSE_TAG = "</omnigent_fork_history>"
+
+
+def write_fork_preamble(bridge_dir: Path, preamble: str) -> None:
+    """Persist a fork's prior-conversation preamble for the executor to consume.
+
+    :param bridge_dir: The session's cursor-native bridge dir.
+    :param preamble: Rendered prior-conversation text (``""`` is not written).
+    """
+    if not preamble:
+        return
+    _ensure_dir(bridge_dir)
+    (bridge_dir / _FORK_PREAMBLE_FILE).write_text(preamble, encoding="utf-8")
+
+
+def read_fork_preamble(bridge_dir: Path) -> str | None:
+    """Read the fork preamble WITHOUT consuming it (else ``None``).
+
+    Read and clear are deliberately split: the executor reads the preamble,
+    injects it, and only calls :func:`clear_fork_preamble` on a SUCCESSFUL
+    injection. Consuming on read would lose the forked history permanently if
+    the first injection fails (e.g. the TUI exited) and the turn is retried.
+
+    :param bridge_dir: The session's cursor-native bridge dir.
+    :returns: The preamble text, or ``None`` when absent/empty.
+    """
+    try:
+        text = (bridge_dir / _FORK_PREAMBLE_FILE).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    return text or None
+
+
+def clear_fork_preamble(bridge_dir: Path) -> None:
+    """Remove the fork preamble so it rides only the FIRST injected message.
+
+    Called by the executor only after a turn's injection succeeds; subsequent
+    turns then inject the plain user text. A no-op when the file is absent.
+
+    :param bridge_dir: The session's cursor-native bridge dir.
+    """
+    with contextlib.suppress(OSError):
+        (bridge_dir / _FORK_PREAMBLE_FILE).unlink()
+
+
+#: Human-readable lead-in / sign-off framing the replayed transcript inside the
+#: sentinel, so the block reads as a contained "here's the prior conversation"
+#: note rather than a raw dump. The cursor agent sees this context; the forwarder
+#: strips the whole sentinel block from the mirrored web bubble.
+_FORK_HISTORY_HEADER = "This session was forked. Here is the conversation so far:"
+_FORK_HISTORY_FOOTER = "(End of prior conversation. Please continue from here.)"
+
+
+def _neutralize_fork_sentinels(text: str) -> str:
+    """Defang any literal fork sentinel tags inside replayed transcript text.
+
+    The preamble is rendered from prior user/assistant turns verbatim, so a turn
+    could literally contain ``<omnigent_fork_history>`` /
+    ``</omnigent_fork_history>`` (a user typed it, pasted logs, etc.). If left
+    intact, an embedded close tag would let the forwarder's strip stop early and
+    leak the rest of the transcript into the mirrored web bubble. Replacing the
+    angle brackets guarantees the framed block contains exactly ONE real
+    open/close pair, so the (non-greedy) strip is unambiguous. The bracketed form
+    stays readable for the cursor agent.
+
+    :param text: Rendered transcript text.
+    :returns: The text with any literal sentinel tags defanged.
+    """
+    return text.replace(FORK_HISTORY_OPEN_TAG, "[omnigent_fork_history]").replace(
+        FORK_HISTORY_CLOSE_TAG, "[/omnigent_fork_history]"
+    )
+
+
+def wrap_fork_preamble(preamble: str, user_text: str) -> str:
+    """Combine a fork preamble with the latest user text for one injection.
+
+    The transcript is framed by a human lead-in / sign-off and fenced in
+    :data:`FORK_HISTORY_OPEN_TAG` / :data:`FORK_HISTORY_CLOSE_TAG`. cursor can't
+    reconstruct native chat bubbles from a fork (its conversation is
+    server-backed), so this is the closest single-message analog: the agent
+    reads the framed transcript as context, and the forwarder strips the whole
+    sentinel block from the mirrored user turn so the copied history isn't
+    duplicated in the Omnigent timeline.
+
+    Any literal sentinel tags inside *preamble* are defanged
+    (:func:`_neutralize_fork_sentinels`) so the framed block holds exactly one
+    real open/close pair — this keeps the forwarder's non-greedy strip
+    unambiguous and prevents embedded tags from leaking history. *user_text* is
+    left untouched (it sits after the close tag; the non-greedy strip stops at
+    the real close, so a tag in the user's own message is preserved).
+
+    :param preamble: Rendered prior-conversation transcript.
+    :param user_text: The user's first message in the fork.
+    :returns: The framed, fenced transcript followed by the user text.
+    """
+    return (
+        f"{FORK_HISTORY_OPEN_TAG}\n"
+        f"{_FORK_HISTORY_HEADER}\n\n"
+        f"{_neutralize_fork_sentinels(preamble)}\n\n"
+        f"{_FORK_HISTORY_FOOTER}\n"
+        f"{FORK_HISTORY_CLOSE_TAG}\n\n"
+        f"{user_text}"
+    )
+
+
 def build_cursor_native_spawn_env(session_id: str) -> dict[str, str]:
     """Build the ``HARNESS_CURSOR_NATIVE_*`` env the harness executor reads."""
     bridge_dir = bridge_dir_for_session_id(session_id)

@@ -42,6 +42,7 @@ from pathlib import Path
 import httpx
 
 from omnigent._native_post_delivery import post_may_have_been_delivered
+from omnigent.cursor_native_bridge import FORK_HISTORY_CLOSE_TAG, FORK_HISTORY_OPEN_TAG
 
 _logger = logging.getLogger(__name__)
 
@@ -101,6 +102,25 @@ _USER_QUERY_RE = re.compile(r"<user_query>(.*?)</user_query>", re.DOTALL)
 # before pasting into the TUI; cursor stores them inside the user_query, so
 # strip them from the mirrored bubble (the path is an internal bridge detail).
 _ATTACHMENT_MARKER_RE = re.compile(r"\[Attached:[^\]]*\]")
+# On a fork into cursor, the executor prepends the prior conversation to the
+# first user message, fenced in <omnigent_fork_history>…</omnigent_fork_history>
+# (cursor_native_bridge.wrap_fork_preamble). cursor stores it inside the
+# user_query; strip the whole block so the mirrored bubble shows only the user's
+# real text — the copied history already lives in the Omnigent timeline, so
+# echoing it here would duplicate it.
+#
+# The match is non-greedy so it stops at the FIRST close tag: that is always the
+# real one, because wrap_fork_preamble defangs any literal sentinels inside the
+# replayed transcript (so the block holds exactly one real open/close pair), and
+# stopping at the first close preserves a tag in the user's own message that
+# sits after it. The trailing alternative strips an UNTERMINATED open block (a
+# truncated paste with no close tag) to end-of-text, so it degrades gracefully
+# instead of mirroring the whole raw block.
+_FORK_HISTORY_RE = re.compile(
+    rf"{re.escape(FORK_HISTORY_OPEN_TAG)}.*?{re.escape(FORK_HISTORY_CLOSE_TAG)}"
+    rf"|{re.escape(FORK_HISTORY_OPEN_TAG)}.*",
+    re.DOTALL,
+)
 
 # When an in-pane ``/summarize`` finishes, cursor-agent collapses the prior
 # history into a single user blob whose plain-string ``content`` starts with
@@ -434,7 +454,8 @@ def _unwrap_user_query(text: str) -> str | None:
     match = _USER_QUERY_RE.search(text)
     if match is None:
         return None
-    inner = _ATTACHMENT_MARKER_RE.sub("", _strip_control_chars(match.group(1)))
+    inner = _FORK_HISTORY_RE.sub("", _strip_control_chars(match.group(1)))
+    inner = _ATTACHMENT_MARKER_RE.sub("", inner)
     return inner.strip() or None
 
 

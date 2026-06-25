@@ -39,6 +39,8 @@ describe("isNativeHarness", () => {
     ["native-claude", true],
     ["codex-native", true],
     ["native-codex", true],
+    ["cursor-native", true],
+    ["native-cursor", true],
     ["pi-native", true],
     ["native-pi", true],
     // Antigravity-native spellings are native too — aligned with Python
@@ -87,6 +89,10 @@ describe("forkTargetCarriesHistory", () => {
     ["native-claude"],
     ["codex-native"],
     ["native-codex"],
+    // Cursor is native but server-backed: a fork carries history as a text
+    // preamble (text-prefix replay), so it must be offered in the picker too.
+    ["cursor-native"],
+    ["native-cursor"],
     // Pi is native but multi-family (no single harnessFamily) — it must
     // still be offered, or the fork/switch-agent pickers silently drop it.
     ["pi-native"],

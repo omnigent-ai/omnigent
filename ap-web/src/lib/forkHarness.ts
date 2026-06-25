@@ -9,6 +9,11 @@
 //     the source's native transcript when the source is same-family native,
 //     else building one from the copied Omnigent items (a format-agnostic
 //     conversion, so the source harness doesn't matter).
+//   - Cursor is native but server-backed: a synthesized local store is NOT
+//     loaded by `cursor-agent --resume`, so the runner replays the prior turns
+//     as a text preamble on the fork's first message (text-prefix replay). The
+//     turns appear as one context block in the Cursor TUI rather than as
+//     reconstructed bubbles, but the agent gets the full prior context.
 //
 // Native targets carry history from any source: the rollout synthesizer
 // writes the session_meta fields codex ≥ 0.133 requires (timestamp,
@@ -49,10 +54,11 @@ export function harnessFamily(
 }
 
 /**
- * Whether a harness is a native CLI harness (Claude Code / Codex / Pi /
- * Antigravity). Mirrors Python `NATIVE_HARNESSES` (`omnigent/harness_aliases.py`)
- * — including both native-antigravity spellings (the in-process `antigravity`
- * SDK harness is NOT native) — so both sides classify the same set.
+ * Whether a harness is a native CLI harness (Claude Code / Codex / Cursor /
+ * Pi / Antigravity). Mirrors Python `NATIVE_HARNESSES`
+ * (`omnigent/harness_aliases.py`) — including both native-antigravity spellings
+ * (the in-process `antigravity` SDK harness is NOT native) — so both sides
+ * classify the same set.
  */
 export function isNativeHarness(harness: string | null | undefined): boolean {
   return (
@@ -60,6 +66,8 @@ export function isNativeHarness(harness: string | null | undefined): boolean {
     harness === "native-claude" ||
     harness === "codex-native" ||
     harness === "native-codex" ||
+    harness === "cursor-native" ||
+    harness === "native-cursor" ||
     harness === "pi-native" ||
     harness === "native-pi" ||
     harness === "antigravity-native" ||
