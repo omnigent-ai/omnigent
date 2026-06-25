@@ -2984,6 +2984,34 @@ export function formatModelEffortStatusLabel(
 }
 
 /**
+ * Identity label for the composer status tray: which harness/agent is
+ * running this session. Native vendor wrappers read as the bare vendor
+ * name ("Claude" / "Codex"); SDK/bundle agents read as the agent name
+ * with the brain harness in parens ("Polly (Pi)"). This moved OUT of the
+ * picker trigger (which now shows model/effort) — the trigger is the
+ * model/effort control, so the harness identity belongs in the read-only
+ * shelf below.
+ *
+ * @param modelPickerKind - Native picker family, when the session is a
+ *   claude-/codex-native wrapper.
+ * @param agentName - Bound agent name (lowercase slug), if any.
+ * @param sessionHarness - Effective brain harness id (override-aware).
+ * @returns Display label, or ``null`` when nothing is known.
+ */
+export function composerHarnessLabel(
+  modelPickerKind: NativeModelPickerKind | null,
+  agentName: string | null | undefined,
+  sessionHarness: string | null,
+): string | null {
+  if (modelPickerKind === "claude") return "Claude";
+  if (modelPickerKind === "codex") return "Codex";
+  const display = agentName ? agentDisplayLabel(agentName) : null;
+  const harness = sessionHarness ? (BRAIN_HARNESS_LABELS[sessionHarness] ?? null) : null;
+  if (display && harness) return `${display} (${harness})`;
+  return display ?? harness;
+}
+
+/**
  * Status-line tray tucked behind the composer card: the worktree branch
  * on the left (truncated to an ellipsis so the tray never wraps), the
  * model/effort + context ring on the right. Shares the card's background so the two
@@ -2995,35 +3023,26 @@ export function formatModelEffortStatusLabel(
  * the session has nothing to report. Session cost lives in the header
  * agent-info popover (the "i" button), not here.
  */
-function ComposerStatusLine() {
+function ComposerStatusLine({ harnessLabel }: { harnessLabel: string | null }) {
   const conversationId = useChatStore((s) => s.conversationId);
   const contextWindow = useChatStore((s) => s.contextWindow);
   const tokensUsed = useChatStore((s) => s.tokensUsed);
-  const selectedEffort = useChatStore((s) => s.selectedEffort);
-  const selectedModel = useChatStore((s) => s.selectedModel);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
-  const llmModel = useChatStore((s) => s.llmModel);
-  const codexModelOptions = useChatStore((s) => s.codexModelOptions);
   // Seeded from the session snapshot on bind (chatStore.sessionBindingPatch),
   // alongside contextWindow — so the branch reads from the same store as
   // the other status-line values rather than a separate fetch.
   const gitBranch = useChatStore((s) => s.gitBranch);
-  // qwen/goose/cursor/pi/opencode native sessions pick their model inside the
-  // vendor TUI, so Omnigent's bound `llmModel` is just an unused default
-  // (it would read e.g. "claude-sonnet-4-6" on a Qwen session). Hide the
-  // model/effort label for them; claude-/codex-native keep it (real picker).
-  const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
 
   const showBranch = !!conversationId && !!gitBranch;
-  const modelEffortLabel =
-    conversationId && !nativeVendorOwnsModel
-      ? formatModelEffortStatusLabel(selectedModel ?? llmModel, selectedEffort, codexModelOptions)
-      : null;
+  // The harness/agent identity (e.g. "Claude", "Polly (Pi)") lives here now;
+  // the picker trigger above owns the model/effort label since it's the
+  // control that changes them.
+  const showHarness = !!conversationId && harnessLabel !== null;
   const showPlanMode = !!conversationId && codexPlanMode;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showBranch && !showPlanMode && !showRing && modelEffortLabel === null) return null;
+  if (!showBranch && !showPlanMode && !showRing && !showHarness) return null;
 
   return (
     <div
@@ -3065,13 +3084,13 @@ function ComposerStatusLine() {
             <span>Plan mode</span>
           </span>
         )}
-        {modelEffortLabel && (
+        {showHarness && harnessLabel && (
           <span
-            data-testid="composer-model-effort"
+            data-testid="composer-harness"
             className="max-w-36 truncate text-xs text-muted-foreground sm:max-w-52"
-            title={modelEffortLabel}
+            title={harnessLabel}
           >
-            {modelEffortLabel}
+            {harnessLabel}
           </span>
         )}
         {showRing && <ContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} />}
@@ -3230,6 +3249,14 @@ export function Composer({
   // Per-session cost-control switch, hydrated from the snapshot on bind.
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
+  // Harness/agent identity shown in the status tray below the card. The
+  // picker trigger owns model/effort now, so the identity moves here.
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const harnessLabel = composerHarnessLabel(
+    modelPickerKind,
+    agents?.find((a) => a.id === selectedAgentId)?.name ?? agents?.[0]?.name ?? null,
+    sessionHarness,
+  );
 
   // Preserve unsent text + file attachments per session so switching
   // tabs and coming back restores the draft. The drafts map lives at
@@ -4070,7 +4097,7 @@ export function Composer({
           </div>
         </div>
       </div>
-      <ComposerStatusLine />
+      <ComposerStatusLine harnessLabel={harnessLabel} />
     </form>
   );
 }
@@ -4411,38 +4438,47 @@ function AgentPicker({
   const showAgents = !isNativeModelPicker && (agents?.length ?? 0) > 1;
   const rawAgentName = agents?.find((a) => a.id === selectedId)?.name ?? agents?.[0]?.name;
   const agentDisplayName = rawAgentName ? agentDisplayLabel(rawAgentName) : rawAgentName;
-  // Effective brain harness from the session snapshot (override-aware).
-  // Only the SDK brain harnesses get a pill suffix — native wrappers
-  // already use their own "Claude" branch below.
-  const sessionHarness = useChatStore((s) => s.sessionHarness);
-  const harnessLabel = sessionHarness ? (BRAIN_HARNESS_LABELS[sessionHarness] ?? null) : null;
 
-  // Build the pill piece-by-piece so empty selections don't leave
-  // stray separators.
-  const effortLabel = showEffort && selectedEffort ? formatEffortLabel(selectedEffort) : null;
+  // The trigger now names what this control changes: model + effort. The
+  // harness/agent identity moved to the status tray below the card.
+  // qwen/goose/cursor/pi/opencode native wrappers pick their model inside
+  // the vendor TUI, so the bound `llmModel` is an unused default — don't
+  // surface it as if it were live; claude-/codex-native and SDK agents
+  // resolve to a real model.
+  const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
+  const effectiveModel = nativeVendorOwnsModel ? null : (selectedModel ?? llmModel);
+  const modelLabel = formatStatusModelLabel(effectiveModel, codexModelOptions);
+  const effortTriggerLabel =
+    showEffort && selectedEffort
+      ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
+      : null;
   const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort;
 
-  let triggerLabel: string;
+  // Model in foreground (black), effort in muted (grey). Static fallbacks
+  // first; the final `else` returns null so a session with nothing to show
+  // and nothing to switch doesn't render an empty disabled pill — its
+  // identity is carried by the status tray below.
+  let triggerContent: React.ReactNode;
   if (isLoading) {
-    triggerLabel = "Loading…";
+    triggerContent = "Loading…";
   } else if (!hasAgents) {
-    triggerLabel = "No agents";
-  } else if (modelPickerKind === "claude") {
-    // Native sessions are always scoped to the bound vendor agent. Show just
-    // the vendor name in the pill — model and effort remain selectable in the
-    // dropdown, so spelling them out here only costs horizontal space.
-    triggerLabel = "Claude";
-  } else if (modelPickerKind === "codex") {
-    triggerLabel = "Codex";
-  } else {
-    // The harness reads as part of the identity — "Polly (Pi)" — while
-    // effort stays a separate " · "-joined segment.
-    const nameWithHarness =
-      agentDisplayName && harnessLabel ? `${agentDisplayName} (${harnessLabel})` : agentDisplayName;
-    const parts = [nameWithHarness, effortLabel].filter(
-      (p): p is string => p != null && p.length > 0,
+    triggerContent = "No agents";
+  } else if (modelLabel) {
+    triggerContent = (
+      <>
+        <span className="text-foreground">{modelLabel}</span>
+        {effortTriggerLabel && <span className="text-muted-foreground"> {effortTriggerLabel}</span>}
+      </>
     );
-    triggerLabel = parts.join(" · ");
+  } else if (effortTriggerLabel) {
+    // Vendor owns the model but effort is still switchable from the web UI.
+    triggerContent = <span className="text-muted-foreground">{effortTriggerLabel}</span>;
+  } else if (showAgents) {
+    // No model/effort to surface, but the user can still switch agents —
+    // label the trigger with the current agent so the switcher reads clearly.
+    triggerContent = agentDisplayName;
+  } else {
+    return null;
   }
 
   return (
@@ -4456,7 +4492,7 @@ function AgentPicker({
           data-testid="agent-picker-trigger"
           className="h-7 min-w-0 shrink gap-1.5 px-2 text-muted-foreground hover:text-foreground"
         >
-          <span className="min-w-0 truncate text-xs tabular-nums">{triggerLabel}</span>
+          <span className="min-w-0 truncate text-xs tabular-nums">{triggerContent}</span>
           {hasPickerActions && <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />}
         </Button>
       </DropdownMenuTrigger>

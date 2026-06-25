@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
@@ -414,6 +414,47 @@ describe("Composer slash-command submit routing", () => {
 
     expect(setModel).toHaveBeenCalledWith("gpt-5.4");
     expect(onSend).not.toHaveBeenCalled();
+  });
+});
+
+describe("AgentPicker trigger label", () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      conversationId: "conv_test",
+      skills: [],
+      selectedModel: null,
+      selectedEffort: null,
+      llmModel: null,
+      codexModelOptions: [],
+      nativeVendorOwnsModel: false,
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("shows the model in the foreground and effort muted (model/effort swapped into the trigger)", () => {
+    useChatStore.setState({ selectedModel: "opus", selectedEffort: "high" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+        })}
+      />,
+    );
+    const trigger = screen.getByTestId("agent-picker-trigger");
+    expect(trigger).toHaveTextContent("Opus");
+    expect(trigger).toHaveTextContent("High");
+    // The harness identity ("Claude") is NOT in the trigger anymore — it
+    // moved to the status tray below.
+    expect(trigger).not.toHaveTextContent("Claude");
+    // Model black, effort grey.
+    expect(within(trigger).getByText("Opus")).toHaveClass("text-foreground");
+    expect(within(trigger).getByText("High")).toHaveClass("text-muted-foreground");
   });
 });
 
