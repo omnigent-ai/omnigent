@@ -1534,9 +1534,11 @@ async def _auto_create_cursor_terminal(
     from omnigent.cursor_native_bridge import (
         approve_mcp_server_for_workspace,
         bridge_dir_for_session_id,
+        write_hooks_config,
         write_mcp_config,
     )
     from omnigent.cursor_native_forwarder import clear_cursor_bridge_state, preseed_resume_state
+    from omnigent.cursor_native_usage import clear_cursor_usage_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
 
@@ -1581,6 +1583,10 @@ async def _auto_create_cursor_terminal(
     )
     if not preseeded:
         clear_cursor_bridge_state(bridge_dir)
+        # Drop any prior terminal's usage log/state so the new forwarder starts
+        # the cumulative count clean. Preserved across a preseeded resume (the
+        # accumulator's generation-id dedup makes re-reading the log safe).
+        clear_cursor_usage_state(bridge_dir)
         if resume_chat_id is not None:
             _logger.warning(
                 "cursor-native: could not pre-seed prior chat store for %r; "
@@ -1590,6 +1596,9 @@ async def _auto_create_cursor_terminal(
             )
             resume_chat_id = None
     write_mcp_config(Path(workspace), bridge_dir)
+    # Register the cursor ``stop`` hook that captures per-turn token usage into
+    # the bridge dir for the usage forwarder below (see cursor_native_usage).
+    write_hooks_config(Path(workspace), bridge_dir)
     cursor_command = resolve_cursor_executable()
     cursor_args = list(launch_config.terminal_launch_args or [])
     if "--approve-mcps" not in cursor_args:
@@ -1664,6 +1673,7 @@ async def _auto_create_cursor_terminal(
 
     from omnigent.cursor_native_forwarder import supervise_cursor_forwarder
     from omnigent.cursor_native_permissions import supervise_cursor_transcript_elicitations
+    from omnigent.cursor_native_usage import supervise_cursor_usage_forwarder
 
     if server_client is not None and ensure_comment_relay is not None:
         await ensure_comment_relay(
@@ -1684,7 +1694,9 @@ async def _auto_create_cursor_terminal(
         prompts as web elicitations by tailing the chat store for pending tool
         calls (see :mod:`omnigent.cursor_native_permissions`) — more reliable
         than scraping the rendered pane, which misses prompts whose wording
-        falls outside its regex.
+        falls outside its regex; the usage forwarder tails the ``stop``-hook
+        usage log and posts cumulative token usage / cost (see
+        :mod:`omnigent.cursor_native_usage`).
         """
         await asyncio.gather(
             supervise_cursor_forwarder(
@@ -1704,6 +1716,13 @@ async def _auto_create_cursor_terminal(
                 bridge_dir=bridge_dir,
                 workspace=workspace,
                 launch_epoch_ms=launch_epoch_ms,
+                auth=_runner_auth,
+            ),
+            supervise_cursor_usage_forwarder(
+                base_url=server_url,
+                headers={},
+                session_id=session_id,
+                bridge_dir=bridge_dir,
                 auth=_runner_auth,
             ),
         )
