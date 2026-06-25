@@ -244,10 +244,19 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
         # bridge-owned directories below it.
         return _absolute_syntactic_path(qwen_root.parent.parent)
 
+    from omnigent.hermes_native_bridge import bridge_root as hermes_bridge_root
+
+    hermes_root = _absolute_syntactic_path(hermes_bridge_root())
+    if target.is_relative_to(hermes_root):
+        # Same shape as cursor-native ($TMPDIR/omnigent-<uid>/hermes-native): trust
+        # the uid-scoped temp dir's parent and validate/chmod the two
+        # bridge-owned directories below it.
+        return _absolute_syntactic_path(hermes_root.parent.parent)
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, "
-        f"{antigravity_root!s}, {qwen_root!s})"
+        f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s})"
     )
 
 

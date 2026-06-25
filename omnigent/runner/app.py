@@ -54,6 +54,7 @@ from omnigent.llms.summarize import (
 from omnigent.model_override import validate_model_override
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runner import pending_approvals
+from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
@@ -1972,11 +1973,21 @@ async def _auto_create_hermes_terminal(
     # re-creating, so old and new tasks can't both mirror (double-posting), and
     # drop the prior terminal's stale forward cursor.
     await _cancel_auto_forwarder_task(session_id)
-    from omnigent.hermes_native_bridge import bridge_dir_for_session_id, write_tmux_target
+    from omnigent.hermes_native_bridge import (
+        bridge_dir_for_session_id,
+        read_hermes_home,
+        write_policy_hook_config,
+        write_tmux_target,
+    )
     from omnigent.hermes_native_forwarder import clear_hermes_bridge_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
     clear_hermes_bridge_state(bridge_dir)
+
+    # Write a per-session HERMES_HOME with the Omnigent policy hook so the
+    # native TUI evaluates tool calls against Omnigent policies.
+    _hermes_server_url = _required_runner_env("RUNNER_SERVER_URL")
+    write_policy_hook_config(bridge_dir, _hermes_server_url, session_id)
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args); reused here, not Pi-specific.
@@ -1992,6 +2003,12 @@ async def _auto_create_hermes_terminal(
     # cursor (clear_hermes_bridge_state above) starts it at that row's first row.
     launch_epoch_s = time.time()
     hermes_args = [*(launch_config.terminal_launch_args or [])]
+    # If a per-session HERMES_HOME was written (policy hook), pass it via env
+    # so the TUI picks up the hook config alongside its own approval prompt.
+    _hermes_terminal_env: dict[str, str] = {}
+    _hermes_home_path = read_hermes_home(bridge_dir)
+    if _hermes_home_path is not None:
+        _hermes_terminal_env["HERMES_HOME"] = str(_hermes_home_path)
     terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
         terminal_name="hermes",
@@ -2001,13 +2018,7 @@ async def _auto_create_hermes_terminal(
             os_env=OSEnvSpec(type="caller_process", cwd=workspace),
             command=hermes_command,
             args=hermes_args,
-            # No env overrides: Hermes uses the user's own ~/.hermes (model,
-            # provider, tools, and its native tool-approval prompt — which appears
-            # in the TUI and the web's embedded terminal). No NO_COLOR (an earlier
-            # NO_COLOR=1 rendered the gold TUI white); no HERMES_YOLO_MODE (that
-            # suppressed Hermes' own approval). The bridge captures the pane with
-            # ``tmux capture-pane -p`` (ANSI stripped), so colour never interferes.
-            env={},
+            env=_hermes_terminal_env,
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
@@ -2041,6 +2052,7 @@ async def _auto_create_hermes_terminal(
     server_url = _required_runner_env("RUNNER_SERVER_URL")
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
+    from omnigent.hermes_native_bridge import read_hermes_home
     from omnigent.hermes_native_forwarder import supervise_hermes_forwarder
     from omnigent.hermes_native_permissions import supervise_hermes_approval_mirror
 
@@ -2060,6 +2072,11 @@ async def _auto_create_hermes_terminal(
         the approval mirror surfaces Hermes' dangerous-command prompt as a web
         elicitation (see :mod:`omnigent.hermes_native_permissions`).
         """
+        # When a per-session HERMES_HOME is configured (policy hooks / MCP),
+        # Hermes writes its state.db there, not ~/.hermes.  Point the
+        # forwarder at the right database so it can discover the session.
+        _hermes_home = read_hermes_home(bridge_dir)
+        _state_db = _hermes_home / "state.db" if _hermes_home is not None else None
         await asyncio.gather(
             supervise_hermes_forwarder(
                 base_url=server_url,
@@ -2069,8 +2086,7 @@ async def _auto_create_hermes_terminal(
                 agent_name="hermes-native-ui",
                 workspace=workspace,
                 launch_epoch_s=launch_epoch_s,
-                # The native TUI uses the user's ~/.hermes, so the forwarder tails
-                # the default store there (default_state_db()).
+                db_path=_state_db,
                 auth=_runner_auth,
             ),
             supervise_hermes_approval_mirror(
@@ -7926,8 +7942,18 @@ def create_runner_app(
 
                 spawn_env = build_goose_native_spawn_env(session_id)
             if harness_name == "hermes-native" and spawn_env is None:
-                from omnigent.hermes_native_bridge import build_hermes_native_spawn_env
+                from omnigent.hermes_native_bridge import (
+                    bridge_dir_for_session_id as _hermes_bridge_dir,
+                )
+                from omnigent.hermes_native_bridge import (
+                    build_hermes_native_spawn_env,
+                    write_policy_hook_config,
+                )
 
+                _h_server_url = os.environ.get(
+                    "RUNNER_SERVER_URL", "http://localhost:6767"
+                ).rstrip("/")
+                write_policy_hook_config(_hermes_bridge_dir(session_id), _h_server_url, session_id)
                 spawn_env = build_hermes_native_spawn_env(session_id)
             if harness_name == "qwen-native" and spawn_env is None:
                 from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
@@ -9642,6 +9668,12 @@ def create_runner_app(
             return None
         return state
 
+    codex_goal_runner = CodexGoalRunner(
+        bridge_state_for_session=_codex_native_bridge_state_for_session,
+        client_safe_error_detail=_client_safe_error_detail,
+        logger=_logger,
+    )
+
     async def _handle_codex_native_interrupt(conv_id: str) -> Response:
         """
         Stop a codex-native turn via Codex app-server ``turn/interrupt``.
@@ -10849,6 +10881,36 @@ def create_runner_app(
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
         # Submit.
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
+
+    async def _handle_hermes_native_compact(conv_id: str) -> Response:
+        """Type ``/compress`` into the Hermes TUI pane.
+
+        Hermes' ``/compress`` slash command compacts the conversation context,
+        analogous to Claude Code's ``/compact``. Returns 200 on successful
+        injection so the Omnigent server knows the control was handled in the
+        terminal and skips its own AP-side compaction.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 200 once ``/compress`` has been typed into the pane.
+            503 if the tmux target isn't yet advertised.
+        """
+        from omnigent.hermes_native_bridge import (
+            bridge_dir_for_session_id,
+            inject_compress_command,
+        )
+
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            await asyncio.to_thread(inject_compress_command, bridge_dir, timeout_s=1.0)
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "hermes_native_compact_failed",
+                    "detail": _client_safe_error_detail(exc, context="hermes-native compact"),
+                },
+            )
+        return Response(status_code=200)
 
     async def _handle_claude_native_cost_popup(
         conv_id: str,
@@ -12619,8 +12681,18 @@ def create_runner_app(
 
             spawn_env = build_goose_native_spawn_env(conv_id)
         if harness_name == "hermes-native" and spawn_env is None:
-            from omnigent.hermes_native_bridge import build_hermes_native_spawn_env
+            from omnigent.hermes_native_bridge import (
+                bridge_dir_for_session_id as _hermes_bridge_dir2,
+            )
+            from omnigent.hermes_native_bridge import (
+                build_hermes_native_spawn_env,
+                write_policy_hook_config,
+            )
 
+            _h_server_url2 = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip(
+                "/"
+            )
+            write_policy_hook_config(_hermes_bridge_dir2(conv_id), _h_server_url2, conv_id)
             spawn_env = build_hermes_native_spawn_env(conv_id)
         if harness_name == "qwen-native" and spawn_env is None:
             from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
@@ -13730,6 +13802,15 @@ def create_runner_app(
                 )
             return Response(status_code=204)
 
+        codex_goal_response = await codex_goal_runner.handle_event(
+            conversation_id,
+            body_type,
+            body,
+            session_harness_name=_session_harness_name,
+        )
+        if codex_goal_response is not None:
+            return codex_goal_response
+
         if body_type == "compact":
             # Omnigent server forwards explicit /compact here. claude-native
             # and codex-native inject the slash command into the tmux
@@ -13744,6 +13825,8 @@ def create_runner_app(
                 return await _handle_codex_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "cursor-native":
                 return await _handle_cursor_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "hermes-native":
+                return await _handle_hermes_native_compact(conversation_id)
             return Response(status_code=204)
 
         if body_type == "cost_approval_popup":

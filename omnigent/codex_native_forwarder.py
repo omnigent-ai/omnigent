@@ -61,6 +61,11 @@ _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _DELTA_FLUSH_INTERVAL_SECONDS = 0.05
 _DELTA_FLUSH_CHAR_THRESHOLD = 64
 _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE = "external_reasoning_effort_change"
+# Transient reasoning (chain-of-thought) delta — the reasoning analogue of
+# ``external_output_text_delta``. Nothing is persisted; it publishes
+# ``response.reasoning_text.delta`` (preceded by ``response.reasoning.started``
+# when ``data.started`` is true) so the web UI paints a live reasoning block.
+_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE = "external_output_reasoning_delta"
 _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE = "external_codex_collaboration_mode_change"
 # Per-attempt client budget for the elicitation long-poll, slightly above
 # the server-side wait (``_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S``) so
@@ -276,6 +281,13 @@ class _CodexForwarderState:
     completed_plan_text_by_turn: dict[str, str] = field(default_factory=dict)
     plan_thread_by_turn: dict[str, str] = field(default_factory=dict)
     prompted_plan_turns: set[str] = field(default_factory=set)
+    # Codex reasoning item id whose live deltas are currently being mirrored.
+    # When a delta arrives for a different item, it opens a new reasoning
+    # block (``started=True`` → ``response.reasoning.started``). Reset at each
+    # ``turn/started`` so the next turn's first reasoning delta opens a fresh
+    # block. Reasoning is transient — it has no completed conversation item;
+    # the block finalizes when the turn's assistant message arrives.
+    reasoning_stream_item_id: str | None = None
 
     def note_resume_response(self, response: CodexMessage) -> None:
         """
@@ -2389,6 +2401,9 @@ async def _maybe_handle_turn_event(
             await delta_coalescer.flush()
         await _handle_turn_started(client, session_id, bridge_dir, params)
         if forwarder_state is not None:
+            # A new turn opens a fresh reasoning block: the next reasoning
+            # delta must emit ``response.reasoning.started`` again.
+            forwarder_state.reasoning_stream_item_id = None
             # An in-TUI ``/model`` switch writes config.toml (the cost-policy
             # source of truth) but emits no notification. Re-read it at turn
             # start so a switch made since the last turn lands ``model_override``
@@ -2490,6 +2505,13 @@ async def _maybe_handle_delta_event(
             delta_coalescer,
             forwarder_state,
         )
+        return True
+    if method in {"item/reasoning/textDelta", "item/reasoning/summaryTextDelta"}:
+        # Flush any buffered assistant text first so a reasoning delta never
+        # jumps ahead of earlier-streamed answer text in arrival order.
+        if delta_coalescer is not None:
+            await delta_coalescer.flush()
+        await _handle_reasoning_delta(client, session_id, params, forwarder_state)
         return True
     return False
 
@@ -4624,6 +4646,85 @@ async def _post_output_text_delta(
         data=data,
     )
     _log_failed_session_event_post("external_output_text_delta", response)
+
+
+async def _handle_reasoning_delta(
+    client: httpx.AsyncClient,
+    session_id: str,
+    params: dict[str, Any],
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """
+    Forward one live Codex reasoning (chain-of-thought) delta to AP.
+
+    Codex emits ``item/reasoning/textDelta`` and
+    ``item/reasoning/summaryTextDelta`` while it thinks. Omnigent has no
+    completed reasoning conversation item — the reasoning block is
+    transient and is finalized when the turn's assistant message arrives —
+    so this only publishes a transient ``external_output_reasoning_delta``
+    so the web UI paints a live "thinking" block, matching the in-process
+    executor's wire shape (#1254). The first delta of a reasoning item
+    opens the block (``started=True`` → ``response.reasoning.started``).
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param params: Codex reasoning delta params, e.g.
+        ``{"turnId": "turn_123", "itemId": "item_r", "delta": "Let me"}``.
+    :param forwarder_state: Optional forwarder state tracking which
+        reasoning item is currently open (for the ``started`` edge).
+    :returns: None.
+    """
+    delta = params.get("delta")
+    if not isinstance(delta, str):
+        _logger.warning(
+            "Codex reasoning delta missing string delta: turn_id=%s",
+            _turn_id_from_payload(params),
+        )
+        return
+    item_id = _item_id_from_delta_params(params)
+    started = False
+    if forwarder_state is not None:
+        if item_id is not None:
+            started = forwarder_state.reasoning_stream_item_id != item_id
+            forwarder_state.reasoning_stream_item_id = item_id
+        else:
+            # Codex reasoning deltas normally carry an itemId; if one is
+            # missing, ``None`` on state means no block is open yet.
+            # ``""`` marks "open, id unknown" so later id-less deltas in the
+            # same block don't re-open it.
+            started = forwarder_state.reasoning_stream_item_id is None
+            forwarder_state.reasoning_stream_item_id = ""
+    # An empty, non-opening delta carries nothing to render.
+    if not delta and not started:
+        return
+    await _post_output_reasoning_delta(client, session_id, delta, started=started)
+
+
+async def _post_output_reasoning_delta(
+    client: httpx.AsyncClient,
+    session_id: str,
+    delta: str,
+    *,
+    started: bool,
+) -> None:
+    """
+    Publish a transient Codex reasoning delta.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param delta: Reasoning text fragment, e.g. ``"Let me think"``.
+    :param started: Whether this opens a new reasoning block; when
+        ``True`` the server precedes the delta with a single
+        ``response.reasoning.started`` SSE.
+    :returns: None.
+    """
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
+        data={"delta": delta, "started": started},
+    )
+    _log_failed_session_event_post(_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE, response)
 
 
 async def _post_session_interrupted(
