@@ -5291,10 +5291,10 @@ async def _get_runner_client(
             return routed.client
         except (LookupError, httpx.HTTPError, OmnigentError):
             _logger.debug(
-                "No runner bound for session=%s",
+                "No runner bound via router for session=%s; "
+                "falling back to in-process runner client",
                 session_id,
             )
-            return None
     return cast("httpx.AsyncClient | None", get_runner_client())
 
 
