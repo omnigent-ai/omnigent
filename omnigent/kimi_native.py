@@ -555,7 +555,7 @@ async def _attach_terminal_resource(prepared: PreparedKimiTerminal) -> None:
 
 async def _attach_direct_tmux(socket_path: Path, tmux_target: str) -> None:
     """Attach the current terminal directly to the runner-owned tmux pane."""
-    env = dict(os.environ)
+    env = os.environ.copy()
     env.pop("TMUX", None)
     process = await asyncio.create_subprocess_exec(
         "tmux",

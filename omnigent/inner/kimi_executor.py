@@ -238,7 +238,7 @@ class KimiExecutor(Executor):
         ``HARNESS_KIMI_*`` knobs are read on the wrap side and
         translated into CLI flags.
         """
-        return dict(os.environ)
+        return os.environ.copy()
 
     def _sandbox_launch_path(self, spawn_env_names: Sequence[str]) -> str:
         """Return the path to spawn for kimi — sandbox launcher or bare binary.
