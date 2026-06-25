@@ -5,14 +5,24 @@ import { useEffect, useRef, useState } from "react";
 import {
   CheckIcon,
   CopyIcon,
+  PencilIcon,
   InfoIcon,
   PlusIcon,
+  SaveIcon,
   ServerIcon,
   ShieldCheckIcon,
   TrashIcon,
+  XIcon,
 } from "lucide-react";
+import {
+  useCreateMcpServer,
+  useDeleteMcpServer,
+  useUpdateMcpServer,
+  type UpsertMcpServerInput,
+} from "@/hooks/useAgents";
 import type { Agent, McpServerSummary } from "@/hooks/useAgents";
 import type { ModelUsage } from "@/lib/types";
+import { showToast } from "@/components/ui/toast";
 import {
   usePolicies,
   usePolicyRegistry,
@@ -23,6 +33,8 @@ import {
 import { useSessionOwner } from "@/hooks/usePermissions";
 import { getCurrentUserId } from "@/lib/identity";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Dialog,
   DialogContent,
@@ -61,19 +73,64 @@ export function agentDisplayLabel(name: string): string {
 }
 
 /** Compact pill row listing MCP servers attached to an agent. */
-export function McpServerList({ servers }: { servers: McpServerSummary[] }) {
+export function McpServerList({
+  servers,
+  onDelete,
+}: {
+  servers: McpServerSummary[];
+  onDelete?: (name: string) => void;
+}) {
   return (
     <div className="flex flex-wrap gap-1">
-      {servers.map((srv) => (
-        <span
-          key={srv.name}
-          title={srv.description ?? srv.name}
-          className="flex items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
-        >
-          <ServerIcon className="size-2.5 shrink-0" />
-          {srv.name}
-        </span>
-      ))}
+      {servers.map((srv) =>
+        onDelete ? (
+          <Popover key={srv.name}>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                className="flex cursor-pointer items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:bg-muted/80"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <ServerIcon className="size-2.5 shrink-0" />
+                {srv.name}
+              </button>
+            </PopoverTrigger>
+            <PopoverContent
+              side="top"
+              align="start"
+              className="w-64"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center gap-1.5">
+                  <ServerIcon className="size-3.5 text-muted-foreground" />
+                  <span className="font-medium text-sm">{srv.name}</span>
+                </div>
+                {srv.description && (
+                  <p className="text-xs text-muted-foreground">{srv.description}</p>
+                )}
+                <button
+                  type="button"
+                  onClick={() => onDelete(srv.name)}
+                  className="flex items-center gap-1 self-end rounded px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
+                >
+                  <TrashIcon className="size-3" />
+                  Remove
+                </button>
+              </div>
+            </PopoverContent>
+          </Popover>
+        ) : (
+          <span
+            key={srv.name}
+            title={srv.description ?? srv.name}
+            className="flex items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
+          >
+            <ServerIcon className="size-2.5 shrink-0" />
+            {srv.name}
+          </span>
+        ),
+      )}
     </div>
   );
 }
@@ -511,6 +568,375 @@ function AddPolicyDialog({
 }
 
 // ---------------------------------------------------------------------------
+// MCP server management
+// ---------------------------------------------------------------------------
+
+interface McpFormState {
+  originalName: string | null;
+  name: string;
+  transport: "http" | "stdio";
+  description: string;
+  url: string;
+  command: string;
+  argsText: string;
+}
+
+const EMPTY_MCP_FORM: McpFormState = {
+  originalName: null,
+  name: "",
+  transport: "http",
+  description: "",
+  url: "",
+  command: "",
+  argsText: "",
+};
+
+function mcpFormFromServer(server: McpServerSummary): McpFormState {
+  return {
+    originalName: server.name,
+    name: server.name,
+    transport: server.transport === "stdio" ? "stdio" : "http",
+    description: server.description ?? "",
+    url: server.url ?? "",
+    command: server.command ?? "",
+    argsText: (server.args ?? []).join("\n"),
+  };
+}
+
+function payloadFromMcpForm(form: McpFormState): UpsertMcpServerInput {
+  const base = {
+    name: form.name.trim(),
+    transport: form.transport,
+    description: form.description.trim() || null,
+  };
+  if (form.transport === "http") {
+    return {
+      ...base,
+      transport: "http",
+      url: form.url.trim(),
+      command: null,
+      args: [],
+    };
+  }
+  return {
+    ...base,
+    transport: "stdio",
+    url: null,
+    command: form.command.trim(),
+    args: form.argsText
+      .split("\n")
+      .map((arg) => arg.trim())
+      .filter(Boolean),
+  };
+}
+
+function validateMcpForm(form: McpFormState): string | null {
+  const name = form.name.trim();
+  if (!name) return "Name is required.";
+  if (!/^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}$/.test(name)) {
+    return "Name can use letters, numbers, dots, dashes, and underscores.";
+  }
+  if (form.transport === "http") {
+    const url = form.url.trim();
+    if (!url) return "URL is required.";
+    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+      return "URL must start with http:// or https://.";
+    }
+  }
+  if (form.transport === "stdio" && !form.command.trim()) {
+    return "Command is required.";
+  }
+  return null;
+}
+
+function McpServerManagerDialog({
+  sessionId,
+  servers,
+  open,
+  onOpenChange,
+}: {
+  sessionId: string;
+  servers: McpServerSummary[];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const [form, setForm] = useState<McpFormState>(EMPTY_MCP_FORM);
+  const [formError, setFormError] = useState<string | null>(null);
+  const createServer = useCreateMcpServer(sessionId);
+  const updateServer = useUpdateMcpServer(sessionId);
+  const deleteServer = useDeleteMcpServer(sessionId);
+  const mutationError =
+    createServer.error?.message ?? updateServer.error?.message ?? deleteServer.error?.message;
+  const saving = createServer.isPending || updateServer.isPending;
+
+  function resetForm() {
+    setForm(EMPTY_MCP_FORM);
+    setFormError(null);
+  }
+
+  function notifyRestart() {
+    showToast(
+      <span className="text-sm">MCP servers updated. Restart the session to apply changes.</span>,
+    );
+  }
+
+  function handleSave() {
+    const error = validateMcpForm(form);
+    if (error) {
+      setFormError(error);
+      return;
+    }
+    const payload = payloadFromMcpForm(form);
+    setFormError(null);
+    if (form.originalName) {
+      updateServer.mutate(
+        { serverName: form.originalName, payload },
+        {
+          onSuccess: () => {
+            resetForm();
+            notifyRestart();
+          },
+        },
+      );
+      return;
+    }
+    createServer.mutate(payload, {
+      onSuccess: () => {
+        resetForm();
+        notifyRestart();
+      },
+    });
+  }
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        onOpenChange(next);
+        if (!next) resetForm();
+      }}
+    >
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Manage MCP Servers</DialogTitle>
+          <DialogDescription>Add, edit, or remove MCP servers for this session.</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4 pt-1 md:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+          <div className="flex min-w-0 flex-col gap-1.5">
+            <SectionLabel>Servers</SectionLabel>
+            {servers.length > 0 ? (
+              <div className="flex max-h-56 flex-col divide-y divide-border overflow-y-auto rounded border border-border">
+                {servers.map((server) => (
+                  <div key={server.name} className="flex min-w-0 items-center gap-1.5 px-2 py-2">
+                    <ServerIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setForm(mcpFormFromServer(server));
+                        setFormError(null);
+                      }}
+                      className="min-w-0 flex-1 text-left"
+                    >
+                      <span className="block truncate font-mono text-xs">{server.name}</span>
+                      <span className="block truncate text-[11px] text-muted-foreground">
+                        {server.transport}
+                      </span>
+                    </button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label={`Edit ${server.name}`}
+                      onClick={() => {
+                        setForm(mcpFormFromServer(server));
+                        setFormError(null);
+                      }}
+                    >
+                      <PencilIcon className="size-3" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label={`Delete ${server.name}`}
+                      onClick={() => deleteServer.mutate(server.name, { onSuccess: notifyRestart })}
+                      disabled={deleteServer.isPending}
+                    >
+                      <TrashIcon className="size-3 text-destructive" />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="py-3 text-xs text-muted-foreground">No MCP servers</p>
+            )}
+            {form.originalName && (
+              <Button type="button" variant="ghost" size="sm" onClick={resetForm}>
+                <PlusIcon className="size-3.5" />
+                New server
+              </Button>
+            )}
+          </div>
+
+          <div className="flex min-w-0 flex-col gap-2">
+            <SectionLabel>{form.originalName ? "Edit Server" : "New Server"}</SectionLabel>
+            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+              Name
+              <Input
+                value={form.name}
+                onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))}
+                className="font-mono"
+                placeholder="github"
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+              Transport
+              <select
+                value={form.transport}
+                onChange={(e) =>
+                  setForm((prev) => ({
+                    ...prev,
+                    transport: e.target.value === "stdio" ? "stdio" : "http",
+                  }))
+                }
+                className="h-8 rounded-lg border border-input bg-background px-2 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+              >
+                <option value="http">HTTP</option>
+                <option value="stdio">stdio</option>
+              </select>
+            </label>
+            {form.transport === "http" ? (
+              <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                URL
+                <Input
+                  value={form.url}
+                  onChange={(e) => setForm((prev) => ({ ...prev, url: e.target.value }))}
+                  placeholder="https://example.com/sse"
+                />
+              </label>
+            ) : (
+              <>
+                <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                  Command
+                  <Input
+                    value={form.command}
+                    onChange={(e) => setForm((prev) => ({ ...prev, command: e.target.value }))}
+                    placeholder="npx"
+                  />
+                </label>
+                <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                  Args
+                  <Textarea
+                    value={form.argsText}
+                    onChange={(e) => setForm((prev) => ({ ...prev, argsText: e.target.value }))}
+                    className="min-h-20 font-mono text-xs"
+                    placeholder={"-y\n@modelcontextprotocol/server-github"}
+                  />
+                </label>
+              </>
+            )}
+            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+              Description
+              <Input
+                value={form.description}
+                onChange={(e) => setForm((prev) => ({ ...prev, description: e.target.value }))}
+                placeholder="Optional"
+              />
+            </label>
+            {(formError || mutationError) && (
+              <div
+                role="alert"
+                className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              >
+                {formError ?? mutationError}
+              </div>
+            )}
+            <div className="flex justify-end gap-2 pt-1">
+              <Button type="button" variant="ghost" size="sm" onClick={resetForm}>
+                <XIcon className="size-3.5" />
+                Clear
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                onClick={handleSave}
+                disabled={saving || validateMcpForm(form) !== null}
+              >
+                <SaveIcon className="size-3.5" />
+                {saving ? "Saving..." : "Save"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function McpServersSection({
+  sessionId,
+  servers,
+  editable,
+}: {
+  sessionId?: string | null;
+  servers: McpServerSummary[];
+  editable: boolean;
+}) {
+  const [managerOpen, setManagerOpen] = useState(false);
+  const canEdit = !!(sessionId && editable);
+  const deleteServer = useDeleteMcpServer(canEdit ? sessionId : "");
+  const showSection = servers.length > 0 || canEdit;
+  if (!showSection) return null;
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center justify-between">
+        <SectionLabel>Tools</SectionLabel>
+        {canEdit && (
+          <button
+            type="button"
+            onClick={() => setManagerOpen(true)}
+            className="rounded p-0.5 hover:bg-muted"
+            title="Manage MCP servers"
+            aria-label="Manage MCP servers"
+          >
+            <PlusIcon className="size-3 text-muted-foreground" />
+          </button>
+        )}
+      </div>
+      {servers.length > 0 ? (
+        <McpServerList
+          servers={servers}
+          onDelete={
+            canEdit
+              ? (name) =>
+                  deleteServer.mutate(name, {
+                    onSuccess: () =>
+                      showToast(
+                        <span className="text-sm">
+                          MCP servers updated. Restart the session to apply changes.
+                        </span>,
+                      ),
+                  })
+              : undefined
+          }
+        />
+      ) : (
+        <p className="text-xs text-muted-foreground">No MCP servers</p>
+      )}
+      {canEdit && (
+        <McpServerManagerDialog
+          sessionId={sessionId!}
+          servers={servers}
+          open={managerOpen}
+          onOpenChange={setManagerOpen}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Session policies section (user-editable only)
 // ---------------------------------------------------------------------------
 
@@ -624,6 +1050,7 @@ export function agentHasInfo(agent: Agent | undefined, sessionId?: string | null
  */
 export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
   const servers = agent?.mcp_servers ?? [];
+  const mcpEditable = agent?.mcp_servers_editable === true;
   const displayName = agent ? agentDisplayLabel(agent.name) : null;
   const [sessionIdCopied, setSessionIdCopied] = useState(false);
   const copyResetTimeoutRef = useRef<number | null>(null);
@@ -728,12 +1155,7 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
       {sessionId && usageByModel != null && Object.keys(usageByModel).length > 0 && (
         <ModelUsageBreakdown usageByModel={usageByModel} />
       )}
-      {servers.length > 0 && (
-        <div className="flex flex-col gap-1.5">
-          <SectionLabel>Tools</SectionLabel>
-          <McpServerList servers={servers} />
-        </div>
-      )}
+      <McpServersSection sessionId={sessionId} servers={servers} editable={mcpEditable} />
       {sessionId && <SessionPoliciesSection sessionId={sessionId} />}
     </div>
   );

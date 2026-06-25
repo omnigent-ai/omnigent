@@ -48,6 +48,9 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
 // both stay hidden — tests that exercise the agent-info path set a return.
 vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
+  useCreateMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
+  useUpdateMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
+  useDeleteMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
 }));
 
 vi.mock("./Sidebar", () => ({

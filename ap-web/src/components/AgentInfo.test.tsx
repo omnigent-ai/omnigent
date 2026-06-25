@@ -13,6 +13,15 @@ const { addMutate, deleteMutate, copyTextMock } = vi.hoisted(() => ({
   deleteMutate: vi.fn(),
   copyTextMock: vi.fn(() => Promise.resolve()),
 }));
+const { createMcpMutate, updateMcpMutate, deleteMcpMutate } = vi.hoisted(() => ({
+  createMcpMutate: vi.fn((_payload, options?: { onSuccess?: () => void }) =>
+    options?.onSuccess?.(),
+  ),
+  updateMcpMutate: vi.fn((_payload, options?: { onSuccess?: () => void }) =>
+    options?.onSuccess?.(),
+  ),
+  deleteMcpMutate: vi.fn(),
+}));
 const policiesData = { current: [] as unknown[] };
 const registryData = { current: [] as unknown[] };
 // Session owner + viewer identity, controllable per test. Dereferenced lazily
@@ -26,6 +35,11 @@ vi.mock("@/hooks/usePolicies", () => ({
   usePolicyRegistry: () => ({ data: registryData.current }),
   useAddPolicy: () => ({ mutate: addMutate, isPending: false, isError: false, error: null }),
   useDeletePolicy: () => ({ mutate: deleteMutate }),
+}));
+vi.mock("@/hooks/useAgents", () => ({
+  useCreateMcpServer: () => ({ mutate: createMcpMutate, isPending: false, error: null }),
+  useUpdateMcpServer: () => ({ mutate: updateMcpMutate, isPending: false, error: null }),
+  useDeleteMcpServer: () => ({ mutate: deleteMcpMutate, isPending: false, error: null }),
 }));
 vi.mock("@/hooks/usePermissions", () => ({
   useSessionOwner: () => ({ data: ownerData.current }),
@@ -41,6 +55,9 @@ import { AgentInfoButton, AgentInfoContent, agentDisplayLabel } from "./AgentInf
 afterEach(() => {
   cleanup();
   copyTextMock.mockClear();
+  createMcpMutate.mockClear();
+  updateMcpMutate.mockClear();
+  deleteMcpMutate.mockClear();
   ownerData.current = null;
   viewerData.current = null;
 });
@@ -76,6 +93,7 @@ const AGENT_WITH_BOTH: Agent = {
   id: "agent_1",
   name: "databricks_coding_agent",
   description: "Codes against Databricks.",
+  mcp_servers_editable: true,
   mcp_servers: [
     { name: "slack", transport: "http", description: "Slack MCP", url: "https://example/slack" },
     { name: "jira", transport: "stdio", command: "jira-mcp" },
@@ -472,6 +490,80 @@ describe("SessionPoliciesSection", () => {
     expect(
       within(dialog).getByText("All available policies are already applied."),
     ).toBeInTheDocument();
+  });
+});
+
+describe("McpServersSection", () => {
+  beforeEach(() => {
+    createMcpMutate.mockClear();
+    updateMcpMutate.mockClear();
+    deleteMcpMutate.mockClear();
+  });
+
+  it("creates an HTTP MCP server from the manager dialog", () => {
+    renderContent("conv_mcp");
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("Name"), { target: { value: "github" } });
+    fireEvent.change(within(dialog).getByLabelText("URL"), {
+      target: { value: "https://example.com/sse" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Save/ }));
+
+    expect(createMcpMutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "github",
+        transport: "http",
+        url: "https://example.com/sse",
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("updates an existing stdio MCP server", () => {
+    renderContent("conv_mcp");
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Edit jira" }));
+    fireEvent.change(within(dialog).getByLabelText("Command"), {
+      target: { value: "jira-mcp-new" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Save/ }));
+
+    expect(updateMcpMutate).toHaveBeenCalledWith(
+      {
+        serverName: "jira",
+        payload: expect.objectContaining({
+          name: "jira",
+          transport: "stdio",
+          command: "jira-mcp-new",
+        }),
+      },
+      expect.anything(),
+    );
+  });
+
+  it("deletes an MCP server from the manager dialog", () => {
+    renderContent("conv_mcp");
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete slack" }));
+
+    expect(deleteMcpMutate).toHaveBeenCalledWith("slack", expect.anything());
+  });
+
+  it("deletes an MCP server from the inline pill popover", () => {
+    renderContent("conv_mcp");
+
+    // Click the pill to open its popover
+    fireEvent.click(screen.getByRole("button", { name: "slack" }));
+    // Click "Remove" in the popover
+    fireEvent.click(screen.getByRole("button", { name: /Remove/ }));
+
+    expect(deleteMcpMutate).toHaveBeenCalledWith("slack", expect.anything());
   });
 });
 

@@ -22,6 +22,8 @@ server-side session policy, not just optimistic local state.
 from __future__ import annotations
 
 import re
+import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -29,6 +31,8 @@ from playwright.sync_api import Page, expect
 
 _COMPOSER = "Ask the agent anything…"
 _AGENT_INFO_TRIGGER = '[data-testid="agent-info-trigger"]'
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_ECHO_MCP_SERVER = _REPO_ROOT / "tests" / "tools" / "fixtures" / "echo_stdio_mcp_server.py"
 
 
 def _callable_registry_policy(base_url: str) -> dict:
@@ -83,6 +87,37 @@ def _user_policy_by_name(base_url: str, session_id: str, name: str) -> dict | No
         if policy["source"] == "session" and policy["name"] == name:
             return policy
     return None
+
+
+def _agent_mcp_names(base_url: str, session_id: str) -> set[str]:
+    """Names of MCP servers on the session's bound agent."""
+    resp = httpx.get(f"{base_url}/v1/sessions/{session_id}/agent", timeout=10.0)
+    resp.raise_for_status()
+    return {server["name"] for server in resp.json()["mcp_servers"]}
+
+
+def _post_mcp_rpc(
+    base_url: str,
+    session_id: str,
+    method: str,
+    params: dict | None = None,
+) -> dict:
+    """POST one JSON-RPC request to the session MCP proxy and return result."""
+    resp = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}},
+        timeout=45.0,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    assert "error" not in body, body
+    return body["result"]
+
+
+def _runner_mcp_tool_names(base_url: str, session_id: str) -> set[str]:
+    """Namespaced MCP tool names visible through the runner MCP proxy."""
+    result = _post_mcp_rpc(base_url, session_id, "tools/list")
+    return {tool["name"] for tool in result["tools"]}
 
 
 def _open_popover(page: Page) -> None:
@@ -187,6 +222,68 @@ def test_agent_info_policy_integer_params_validate_and_submit(
     stored_policy = _user_policy_by_name(base_url, session_id, stored_name)
     assert stored_policy is not None
     assert stored_policy["factory_params"] == {"limit": 100}
+
+
+def test_agent_info_mcp_server_add_and_remove(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Popover → manage MCP servers → add → REST reflects it → delete."""
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+    assert not _agent_mcp_names(base_url, session_id), "session started with MCP servers"
+
+    _open_popover(page)
+    page.get_by_role("button", name="Manage MCP servers").click()
+    dialog = page.get_by_role("dialog").filter(has=page.get_by_text("Manage MCP Servers"))
+    expect(dialog).to_be_visible(timeout=15_000)
+    dialog.get_by_label("Name").fill("ui-search")
+    dialog.get_by_label("URL").fill("https://example.com/sse")
+    dialog.get_by_role("button", name="Save").click()
+
+    _wait_for(lambda: _agent_mcp_names(base_url, session_id) == {"ui-search"})
+    expect(dialog.get_by_role("button", name="Edit ui-search")).to_be_visible(timeout=15_000)
+
+    dialog.get_by_role("button", name="Delete ui-search").click()
+    _wait_for(lambda: not _agent_mcp_names(base_url, session_id))
+
+
+def test_agent_info_mcp_server_added_to_running_session_is_callable(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Add a stdio MCP after runner bind; the runner must see and call it."""
+    base_url, session_id = seeded_session
+    assert _ECHO_MCP_SERVER.is_file()
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+    assert not _agent_mcp_names(base_url, session_id), "session started with MCP servers"
+
+    _open_popover(page)
+    page.get_by_role("button", name="Manage MCP servers").click()
+    dialog = page.get_by_role("dialog").filter(has=page.get_by_text("Manage MCP Servers"))
+    expect(dialog).to_be_visible(timeout=15_000)
+    dialog.get_by_label("Name").fill("echo_mcp")
+    dialog.get_by_label("Transport").select_option("stdio")
+    dialog.get_by_label("Command").fill(sys.executable)
+    dialog.get_by_label("Args").fill(str(_ECHO_MCP_SERVER))
+    dialog.get_by_role("button", name="Save").click()
+
+    _wait_for(lambda: _agent_mcp_names(base_url, session_id) == {"echo_mcp"})
+    _wait_for(
+        lambda: "echo_mcp__echo" in _runner_mcp_tool_names(base_url, session_id),
+        timeout_s=45.0,
+    )
+    result = _post_mcp_rpc(
+        base_url,
+        session_id,
+        "tools/call",
+        {"name": "echo_mcp__echo", "arguments": {"text": "ui-runtime-probe"}},
+    )
+    assert result["content"] == [{"type": "text", "text": "echo: ui-runtime-probe"}]
 
 
 def _wait_for(predicate, *, timeout_s: float = 15.0, interval_s: float = 0.25) -> None:
