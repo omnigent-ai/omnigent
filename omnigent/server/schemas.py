@@ -1944,6 +1944,26 @@ class SessionListItem(BaseModel):
     comments_updated_at: int | None = None
 
 
+class SessionList(BaseModel):
+    """Paginated list of sessions; ``data`` is a page of ``SessionListItem``."""
+
+    object: Literal["list"] = "list"
+    data: list[SessionListItem] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
+class ChildSessionList(BaseModel):
+    """Paginated list of child sessions; ``data`` is a page of ``ChildSessionSummary``."""
+
+    object: Literal["list"] = "list"
+    data: list[ChildSessionSummary] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
 # ── Permissions ────────────────────────────────────────────────────
 
 
