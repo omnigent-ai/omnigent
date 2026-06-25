@@ -188,27 +188,6 @@ os_env:
 Prefer the narrowest filesystem and network access that supports the task. Do
 not pass secrets through the environment unless the tool genuinely needs them.
 
-### Remote sandbox (`type: createos`)
-
-Run file I/O and shell commands inside a remote CreateOS sandbox VM instead of
-local helper subprocesses. Omnigent provisions the VM on first use and destroys
-it on close.
-
-```yaml
-os_env:
-  type: createos
-  cwd: /root          # working dir inside the VM (default: /root)
-  shape: s-4vcpu-4gb  # VM size (default: s-4vcpu-4gb)
-  rootfs: ubuntu-22.04 # optional root filesystem image
-  # api_key / base_url fall back to env vars when omitted:
-  #   CREATEOS_API_KEY   (required)
-  #   CREATEOS_BASE_URL  (default: https://api.sb.createos.sh)
-```
-
-The API key is required; supply it via `os_env.api_key` or the
-`CREATEOS_API_KEY` environment variable. The `sandbox:` block does not apply to
-`type: createos` — isolation is provided by the remote VM.
-
 You usually don't need to choose a `sandbox.type` — omit it and Omnigent picks
 the platform default (`linux_bwrap` on Linux, `darwin_seatbelt` on macOS), so the
 same YAML works across platforms. For the full set of sandbox options, how to
