@@ -10554,6 +10554,75 @@ def create_runner_app(
             )
         return Response(status_code=200)
 
+    async def _handle_cursor_native_compact(conv_id: str) -> Response:
+        """
+        Inject ``/summarize`` into the cursor-agent TUI pane.
+
+        cursor-native sessions manage their own context window inside the
+        cursor-agent TUI.  Explicit compaction must be handled there (via
+        cursor-agent's built-in ``/summarize`` slash command) rather than as
+        AP-side compaction, which would only summarise the transcript mirror
+        and desync the two context windows — the same rationale as
+        :func:`_handle_claude_native_compact`.
+
+        cursor-agent has no compaction hook (the way Claude Code's
+        ``PreCompact`` / ``SessionStart`` hooks drive claude-native's
+        ``external_compaction_status`` forwarding), so completion can't be
+        observed here — the summarization runs asynchronously in the pane after
+        we submit ``/summarize``.  This handler only *starts* it: publish
+        ``response.compaction.in_progress`` so the web UI raises its "Compacting
+        conversation…" spinner, then submit the command.  The matching
+        ``completed`` edge is emitted later by
+        :mod:`omnigent.cursor_native_forwarder` when it observes cursor write the
+        ``[Previous conversation summary]:`` rollup blob to its store — so the
+        permanent "Conversation compacted" marker tracks cursor's real progress
+        instead of firing the instant the command was submitted.  If the
+        injection fails we publish ``response.compaction.failed`` so the spinner
+        is dismissed rather than stranded (no summary blob will ever arrive to
+        complete it).  Returns 200 so the Omnigent server knows the control was
+        handled in the terminal and skips its own AP-side compaction.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 200 once ``/summarize`` has been submitted into the pane.
+            503 if the tmux target isn't yet advertised (the pane is not
+            attached, so there is nothing to compact).
+        """
+        from omnigent.cursor_native_bridge import bridge_dir_for_session_id, inject_user_message
+
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        _publish_event(conv_id, {"type": "response.compaction.in_progress", "task_id": conv_id})
+        try:
+            # inject_user_message uses bracketed paste, which bypasses cursor-agent's
+            # slash-command autocomplete dropdown. send-keys typing the literal
+            # ``/summarize`` opens that dropdown, and the single submit Enter then
+            # confirms the highlighted completion instead of submitting the command,
+            # so the command was never sent (the original bug).
+            await asyncio.to_thread(
+                inject_user_message,
+                bridge_dir,
+                content="/summarize",
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError, OSError) as exc:
+            # Dismiss the spinner the in_progress event raised — the history
+            # was not compacted, so no permanent marker should be left, and no
+            # summary blob will arrive for the forwarder to complete it.
+            #
+            # OSError is in scope (unlike the claude-native analog): cursor's
+            # ``inject_user_message`` writes the paste payload to a tempfile in
+            # ``bridge_dir`` first, so a filesystem fault (disk full, perms, dir
+            # gone) raises OSError. Without it here that escapes after in_progress
+            # already fired, stranding the spinner with no failed/completed edge.
+            _publish_event(conv_id, {"type": "response.compaction.failed", "task_id": conv_id})
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "cursor_native_compact_failed",
+                    "detail": _client_safe_error_detail(exc, context="cursor-native compact"),
+                },
+            )
+        return Response(status_code=200)
+
     def _inject_codex_compact(socket_path: str, target: str) -> None:
         """
         Blocking helper: type ``/compact`` into a codex tmux pane.
@@ -13427,6 +13496,8 @@ def create_runner_app(
                 return await _handle_claude_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "codex-native":
                 return await _handle_codex_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "cursor-native":
+                return await _handle_cursor_native_compact(conversation_id)
             return Response(status_code=204)
 
         if body_type == "cost_approval_popup":

@@ -102,6 +102,16 @@ _USER_QUERY_RE = re.compile(r"<user_query>(.*?)</user_query>", re.DOTALL)
 # strip them from the mirrored bubble (the path is an internal bridge detail).
 _ATTACHMENT_MARKER_RE = re.compile(r"\[Attached:[^\]]*\]")
 
+# When an in-pane ``/summarize`` finishes, cursor-agent collapses the prior
+# history into a single user blob whose plain-string ``content`` starts with
+# this marker (verified against ``~/.cursor/chats/.../store.db``). Real user
+# turns are a ``[{type:text}]`` list, never a bare string, so this prefix
+# unambiguously identifies the post-compaction rollup. It is the only durable
+# signal that the compaction the web UI requested has actually completed —
+# cursor-agent has no compaction hook the way Claude Code does — so the
+# forwarder maps it to an ``external_compaction_status`` "completed" edge.
+_COMPACTION_SUMMARY_PREFIX = "[Previous conversation summary]:"
+
 
 @dataclass
 class _ForwardState:
@@ -492,7 +502,19 @@ def _blob_to_item(rowid: int, blob_id: str, data: object, agent_name: str) -> _M
     role = obj.get("role")
     response_id = f"cursor:{blob_id}"[:_RESPONSE_ID_MAX_LEN]
     if role == "user":
-        prompt = _unwrap_user_query(_content_text(obj.get("content")))
+        content = obj.get("content")
+        # cursor writes the post-/summarize history rollup as a user blob with a
+        # plain-string content (real user turns are a ``[{type:text}]`` list).
+        # Surface it as a compaction-completed signal, not a chat bubble, so the
+        # forwarder can tell the web UI the compaction actually finished.
+        if isinstance(content, str) and content.startswith(_COMPACTION_SUMMARY_PREFIX):
+            return _MirrorItem(
+                rowid=rowid,
+                item_type="compaction_completed",
+                item_data={},
+                response_id=response_id,
+            )
+        prompt = _unwrap_user_query(_content_text(content))
         if not prompt:
             return None
         return _MirrorItem(
@@ -558,6 +580,34 @@ async def _post_conversation_item(
                 "item_data": item.item_data,
                 "response_id": item.response_id,
             },
+        },
+    )
+    resp.raise_for_status()
+
+
+async def _post_external_compaction_status(
+    client: httpx.AsyncClient, *, session_id: str, status: str
+) -> None:
+    """POST one ``external_compaction_status`` event to the Sessions API.
+
+    The server republishes this as the ``response.compaction.completed`` SSE the
+    web UI already renders, upgrading the "Compacting conversation…" spinner
+    (raised by the runner when it submitted ``/summarize``) to the permanent
+    "Conversation compacted" marker. Posting it only when the summary blob
+    actually appears is what makes the marker track cursor-agent's real
+    progress instead of firing the instant the command was submitted. Mirrors
+    :func:`omnigent.claude_native_forwarder._post_external_compaction_status`.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param status: Compaction status value, e.g. ``"completed"``.
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_compaction_status",
+            "data": {"status": status},
         },
     )
     resp.raise_for_status()
@@ -697,6 +747,45 @@ async def forward_cursor_store_to_session(
                             _read_new_items, store_path, last_rowid, agent_name
                         )
                         for item in items:
+                            if item.item_type == "compaction_completed":
+                                # cursor finished /summarize: tell the web UI so
+                                # its "Compacting…" spinner upgrades to the
+                                # permanent marker. Best-effort — a failed post
+                                # only leaves the spinner lingering; unlike a
+                                # chat item it carries no content to lose, so we
+                                # never retry-wedge the mirror on it. Advance the
+                                # cursor either way. NOTE: this also swallows
+                                # connection-level errors (a server blip at
+                                # exactly the rollup blob loses the completion
+                                # for good, since the cursor persists past it) —
+                                # strictly less resilient than the chat path,
+                                # which retries connection loss forever. Matches
+                                # the claude forwarder's best-effort posture and
+                                # never desyncs the mirror, so it is acceptable.
+                                try:
+                                    await _post_external_compaction_status(
+                                        client, session_id=session_id, status="completed"
+                                    )
+                                except httpx.HTTPError:
+                                    _logger.warning(
+                                        "cursor forwarder could not post "
+                                        "compaction-completed; the web UI spinner "
+                                        "may linger; session=%s rowid=%s",
+                                        session_id,
+                                        item.rowid,
+                                        exc_info=True,
+                                    )
+                                failed_rowid = failed_attempts = 0
+                                last_rowid = item.rowid
+                                _write_state(
+                                    bridge_dir,
+                                    _ForwardState(
+                                        store_path=str(store_path),
+                                        last_rowid=last_rowid,
+                                        launch_epoch_ms=launch_epoch_ms,
+                                    ),
+                                )
+                                continue
                             if item.item_type:
                                 try:
                                     await _post_conversation_item(
