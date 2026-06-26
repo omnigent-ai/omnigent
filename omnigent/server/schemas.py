@@ -1903,11 +1903,18 @@ class SessionForkRequest(BaseModel):
         the last item of that response are copied — items after it are
         dropped from the fork. When ``None`` (default), the full history
         is copied.
+    :param model_override: Model id to launch the fork on, e.g.
+        ``"databricks-gpt-5-4-mini"`` — the "restart with model" path.
+        Overrides the model the fork would otherwise inherit from the
+        source; the value is validated and family-checked against the
+        fork's harness. When ``None`` (default), the fork keeps the
+        source's model (within the same provider family).
     """
 
     title: str | None = None
     agent_id: str | None = None
     up_to_response_id: str | None = None
+    model_override: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2719,6 +2726,46 @@ class SessionCreatedEvent(_SSEEventBase):
     child_session_id: str
     agent_id: str | None = None
     parent_session_id: str | None = None
+
+
+class SessionSupersededEvent(_SSEEventBase):
+    """
+    This conversation was superseded by another and clients should
+    follow to it.
+
+    Emitted by ``_publish_session_superseded`` in
+    ``omnigent/server/routes/sessions.py`` when the claude-native
+    forwarder rotates a session away on a Claude ``/clear`` (the old
+    conversation keeps its history but the live terminal moves to a
+    fresh conversation — see ``_post_clear_supersession`` in
+    ``omnigent/claude_native_forwarder.py``). A client actively viewing
+    the superseded conversation auto-redirects to ``target_conversation_id``.
+
+    Category: **transient** (SSE-only), live-only by design. There is no
+    SSE replay: a client that connects after the rotation does not get
+    this event. The durable counterpart is the persisted notice message
+    appended to the old conversation (a ``message`` item linking to the
+    new conversation), which a reloading client renders instead of being
+    force-redirected.
+
+    The wire shape is FLAT (not enveloped):
+    ``{"type": "session.superseded", "conversation_id": <old>,
+    "target_conversation_id": <new>, "reason": "clear"}``.
+
+    :param type: Always ``"session.superseded"``.
+    :param conversation_id: The superseded (old) conversation id this
+        event rides the stream of, e.g. ``"conv_old"``.
+    :param target_conversation_id: The conversation to follow to, e.g.
+        ``"conv_new"``.
+    :param reason: Why the session was superseded. Currently always
+        ``"clear"`` (a Claude Code ``/clear``); kept as a field so the
+        client can branch on future supersession causes.
+    """
+
+    type: Literal["session.superseded"]
+    conversation_id: str
+    target_conversation_id: str
+    reason: Literal["clear"] = "clear"
 
 
 # ── Response pass-through events (response.*) ──────────────────────
@@ -3614,6 +3661,7 @@ ServerStreamEvent = Annotated[
     | SessionInputConsumedEvent
     | SessionInterruptedEvent
     | SessionCreatedEvent
+    | SessionSupersededEvent
     | SessionPresenceEvent
     # ── Transient (SSE-only) — session resource lifecycle ─────
     | SessionResourceCreatedEvent

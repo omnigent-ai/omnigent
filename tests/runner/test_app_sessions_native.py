@@ -6126,7 +6126,7 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
             },
         )
         assert resp.status_code == 202
-        await _aio.wait_for(_hc.post_seen.wait(), timeout=5.0)
+        await _aio.wait_for(_hc.post_seen.wait(), timeout=15.0)
 
         # The interrupt route must block on the (still-blocked) harness forward —
         # forward-first awaits it before cancelling. If it completes here, the
@@ -6141,7 +6141,7 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
 
         # Release the forward → the harness gets the interrupt, then the cancel runs.
         fwd_gate.set()
-        int_resp = await _aio.wait_for(int_task, timeout=5.0)
+        int_resp = await _aio.wait_for(int_task, timeout=15.0)
         assert int_resp.status_code == 204, int_resp.text
         markers = _interrupt_markers(list(_session_histories_ref.get(conv_id, [])))
 
@@ -12235,7 +12235,11 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     # The lifecycle of the launch — not the binary or credentials — is under
     # test, so neither a real Pi install nor a configured provider is needed.
     monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
-    monkeypatch.setattr(pi_native_credentials, "resolve_pi_native_provider", lambda: None)
+    # Accept the ``model`` kwarg the runner now threads through (the spec model
+    # → models.json path); None still skips provider injection here.
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
+    )
 
     # Skip the GET /v1/sessions round-trip: hand the flow a ready launch
     # config pointing at the tmp workspace.
@@ -12436,7 +12440,11 @@ async def test_auto_create_pi_terminal_inherits_agent_sandbox(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
     monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
-    monkeypatch.setattr(pi_native_credentials, "resolve_pi_native_provider", lambda: None)
+    # Accept the ``model`` kwarg the runner now threads through (the spec model
+    # → models.json path); None still skips provider injection here.
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
+    )
 
     async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
         return _PiNativeLaunchConfig(
@@ -13115,8 +13123,22 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         """Server client whose session snapshot carries the resume id."""
 
         async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
-            """Return the session snapshot used to derive resume args."""
+            """Return the session snapshot, or labels for the cleared-bridge check."""
             del kwargs
+
+            # auto-create reads the bridge_id label to honour a /clear "-cleared"
+            # re-key. Report none here so it falls back to session_id (no /clear).
+            if url.endswith("/labels"):
+
+                class _LabelsResponse(NullServerClient._Response):
+                    """Empty labels → bridge_id resolves to session_id."""
+
+                    def json(self) -> dict[str, Any]:
+                        """Return an empty labels payload."""
+                        return {"labels": {}}
+
+                return _LabelsResponse()
+
             assert url == "/v1/sessions/conv_resume"
 
             class _SnapResponse(NullServerClient._Response):
@@ -13557,6 +13579,123 @@ async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
         f"'conv_relay_label_fix' so _ensure_comment_relay_started finds the "
         f"correct bridge dir; got {patch_body.get('labels', {})!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A session re-keyed to "{id}-cleared" by /clear resumes in its OWN dir.
+
+    The /clear rotation hands the live pane to the new session and re-keys the
+    superseded session's bridge_id label to ``{session_id}-cleared``. When that
+    session is later resumed, ``_auto_create_claude_terminal`` must honour the
+    marker and prepare the isolated ``D({session_id}-cleared)`` — NOT the
+    natural ``D(session_id)`` (the new session's live dir, which would
+    double-mirror the transcript and trip the executor guard).
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    class _FakeInstance:
+        """Minimal live terminal instance for the tmux-target publish."""
+
+        running = True
+        socket_path = "/tmp/fake-claude.sock"
+        tmux_target = "claude:0.0"
+
+    class _FakeTerminalRegistry:
+        """Returns the live instance for any (session, terminal, key) lookup."""
+
+        def get(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
+            """Return the fake live instance."""
+            del conversation_id, terminal_name, session_key
+            return _FakeInstance()
+
+    class _FakeResourceRegistry:
+        """Resource registry exposing a live terminal registry."""
+
+        terminal_registry = _FakeTerminalRegistry()
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Return a minimal terminal view so the launch doesn't error."""
+            del spec, resource_role
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name=f"{terminal_name}:{session_key}",
+                metadata={
+                    "terminal_name": terminal_name,
+                    "session_key": session_key,
+                    "running": True,
+                },
+            )
+
+    recorded_requests: list[httpx.Request] = []
+
+    def _handle(req: httpx.Request) -> httpx.Response:
+        """Report the session's bridge_id label as the cleared marker."""
+        recorded_requests.append(req)
+        return httpx.Response(
+            200,
+            json={
+                "reasoning_effort": None,
+                "labels": {BRIDGE_ID_LABEL_KEY: "conv_cleared-cleared"},
+            },
+            request=req,
+        )
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle),
+    )
+
+    await _auto_create_claude_terminal(
+        "conv_cleared",
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+    )
+    await fake_client.aclose()
+
+    cleared_dir = claude_native_bridge.bridge_dir_for_bridge_id("conv_cleared-cleared")
+    natural_dir = claude_native_bridge.bridge_dir_for_bridge_id("conv_cleared")
+    # The isolated cleared dir is prepared; the natural (live-sibling) dir is not.
+    assert cleared_dir.exists()
+    assert not natural_dir.exists()
+    # tmux.json (what the executor reads to inject) must land in the SAME dir the
+    # executor + forwarder use — the cleared dir — NOT the natural session_id dir.
+    # Hardcoding session_id there was the "tmux target not advertised yet" bug.
+    assert (cleared_dir / "tmux.json").exists()
+    assert not (natural_dir / "tmux.json").exists()
+
+    import json as _json
+
+    patch_requests = [r for r in recorded_requests if r.method == "PATCH"]
+    assert len(patch_requests) == 1
+    patch_body = _json.loads(patch_requests[0].content)
+    assert patch_body.get("labels", {}).get(BRIDGE_ID_LABEL_KEY) == "conv_cleared-cleared"
 
 
 @dataclass

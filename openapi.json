@@ -2842,6 +2842,7 @@
             "session.sandbox_status": "#/components/schemas/SessionSandboxStatusEvent",
             "session.skills": "#/components/schemas/SessionSkillsEvent",
             "session.status": "#/components/schemas/SessionStatusEvent",
+            "session.superseded": "#/components/schemas/SessionSupersededEvent",
             "session.terminal.activity": "#/components/schemas/SessionTerminalActivityEvent",
             "session.terminal_pending": "#/components/schemas/SessionTerminalPendingEvent",
             "session.todos": "#/components/schemas/SessionTodosEvent",
@@ -2895,6 +2896,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionCreatedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionSupersededEvent"
           },
           {
             "$ref": "#/components/schemas/SessionPresenceEvent"
@@ -3251,6 +3255,18 @@
             ],
             "description": "Built-in agent to bind the fork to, switching it away from the source's agent/harness (e.g. fork a Claude session into a Codex one, or a Claude-SDK session into Claude Code). When `None`, the fork keeps the source's agent. Must be a built-in agent (one listed by `GET /v1/agents`).",
             "title": "Agent Id"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model id to launch the fork on, e.g. `\"databricks-gpt-5-4-mini\"` \u2014 the \"restart with model\" path. Overrides the model the fork would otherwise inherit from the source; the value is validated and family-checked against the fork's harness. When `None` (default), the fork keeps the source's model (within the same provider family).",
+            "title": "Model Override"
           },
           "title": {
             "anyOf": [
@@ -4737,6 +4753,53 @@
           "status"
         ],
         "title": "SessionStatusEvent",
+        "type": "object"
+      },
+      "SessionSupersededEvent": {
+        "description": "This conversation was superseded by another and clients should\nfollow to it.\n\nEmitted by `_publish_session_superseded` in\n`omnigent/server/routes/sessions.py` when the claude-native\nforwarder rotates a session away on a Claude `/clear` (the old\nconversation keeps its history but the live terminal moves to a\nfresh conversation \u2014 see `_post_clear_supersession` in\n`omnigent/claude_native_forwarder.py`). A client actively viewing\nthe superseded conversation auto-redirects to `target_conversation_id`.\n\nCategory: **transient** (SSE-only), live-only by design. There is no\nSSE replay: a client that connects after the rotation does not get\nthis event. The durable counterpart is the persisted notice message\nappended to the old conversation (a `message` item linking to the\nnew conversation), which a reloading client renders instead of being\nforce-redirected.\n\nThe wire shape is FLAT (not enveloped):\n`{\"type\": \"session.superseded\", \"conversation_id\": <old>, \"target_conversation_id\": <new>, \"reason\": \"clear\"}`.",
+        "properties": {
+          "conversation_id": {
+            "description": "The superseded (old) conversation id this event rides the stream of, e.g. `\"conv_old\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "reason": {
+            "const": "clear",
+            "default": "clear",
+            "description": "Why the session was superseded. Currently always `\"clear\"` (a Claude Code `/clear`); kept as a field so the client can branch on future supersession causes.",
+            "title": "Reason",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "target_conversation_id": {
+            "description": "The conversation to follow to, e.g. `\"conv_new\"`.",
+            "title": "Target Conversation Id",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.superseded",
+            "description": "Always `\"session.superseded\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "target_conversation_id"
+        ],
+        "title": "SessionSupersededEvent",
         "type": "object"
       },
       "SessionSwitchAgentRequest": {

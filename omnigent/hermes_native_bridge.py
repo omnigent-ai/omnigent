@@ -30,10 +30,12 @@ import logging
 import os
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +59,125 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # detected by the pane settling (no byte changes across consecutive captures).
 # This many stable polls in a row marks the input box ready.
 _SETTLE_STABLE_POLLS = 3
+
+
+def mint_hermes_session_id() -> str:
+    """Generate a fresh Hermes session id (UUID4 string)."""
+    return str(uuid.uuid4())
+
+
+_SESSIONS_DDL = """\
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    cwd TEXT,
+    started_at REAL NOT NULL
+);
+"""
+
+_MESSAGES_DDL = """\
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT,
+    tool_call_id TEXT,
+    tool_calls TEXT,
+    tool_name TEXT,
+    timestamp REAL NOT NULL DEFAULT 0,
+    token_count INTEGER,
+    finish_reason TEXT,
+    reasoning TEXT,
+    reasoning_content TEXT,
+    reasoning_details TEXT,
+    codex_reasoning_items TEXT,
+    codex_message_items TEXT,
+    platform_message_id TEXT,
+    observed INTEGER DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    compacted INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+
+def clone_hermes_session(
+    source_db: Path,
+    target_db: Path,
+    source_session_id: str,
+    target_session_id: str,
+    *,
+    workspace: str | None = None,
+) -> None:
+    """Clone a Hermes session from *source_db* into *target_db* under a new id.
+
+    Copies the ``sessions`` row (remapping ``id`` and optionally ``cwd``) and
+    all ``messages`` rows (remapping ``session_id``). The target database and
+    its tables are created if they don't already exist.
+
+    :param source_db: Path to the source Hermes ``state.db`` (opened read-only).
+    :param target_db: Path to the target Hermes ``state.db`` (created if absent).
+    :param source_session_id: Hermes session id in the source database.
+    :param target_session_id: New session id for the cloned rows.
+    :param workspace: If provided, overrides ``cwd`` on the cloned session row.
+    """
+    src_conn = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
+    try:
+        target_db.parent.mkdir(parents=True, exist_ok=True)
+        tgt_conn = sqlite3.connect(str(target_db))
+        try:
+            tgt_conn.execute(_SESSIONS_DDL)
+            tgt_conn.execute(_MESSAGES_DDL)
+
+            # Copy session row.
+            row = src_conn.execute(
+                "SELECT id, source, cwd, started_at FROM sessions WHERE id = ?",
+                (source_session_id,),
+            ).fetchone()
+            if row is None:
+                _logger.warning(
+                    "Source hermes session %s not found in %s; skipping clone",
+                    source_session_id,
+                    source_db,
+                )
+                return
+            _id, source, cwd, _started_at = row
+            tgt_conn.execute(
+                "INSERT INTO sessions (id, source, cwd, started_at) VALUES (?, ?, ?, ?)",
+                (
+                    target_session_id,
+                    source,
+                    workspace if workspace is not None else cwd,
+                    # Use current time so the forwarder's started_at floor
+                    # discovery can find this cloned session.
+                    time.time(),
+                ),
+            )
+
+            # Copy message rows.
+            msg_rows = src_conn.execute(
+                "SELECT session_id, role, content, tool_call_id, tool_calls, tool_name, "
+                "timestamp, token_count, finish_reason, reasoning, reasoning_content, "
+                "reasoning_details, codex_reasoning_items, codex_message_items, "
+                "platform_message_id, observed, active, compacted "
+                "FROM messages WHERE session_id = ? ORDER BY id",
+                (source_session_id,),
+            ).fetchall()
+            for msg in msg_rows:
+                tgt_conn.execute(
+                    "INSERT INTO messages (session_id, role, content, tool_call_id, "
+                    "tool_calls, tool_name, timestamp, token_count, finish_reason, "
+                    "reasoning, reasoning_content, reasoning_details, "
+                    "codex_reasoning_items, codex_message_items, platform_message_id, "
+                    "observed, active, compacted) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (target_session_id, *msg[1:]),
+                )
+
+            tgt_conn.commit()
+        finally:
+            tgt_conn.close()
+    finally:
+        src_conn.close()
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
