@@ -33,22 +33,38 @@ class AgentStore(ABC):
         name: str,
         bundle_location: str,
         description: str | None = None,
+        owner: str | None = None,
     ) -> Agent:
         """
-        Register a new template agent. Name must be unique among
-        template agents and raises if a template with that name
-        already exists.
+        Register a new agent. ``owner=None`` registers an operator
+        built-in/template agent (names unique among built-ins);
+        ``owner`` set registers a standalone user agent (names unique
+        per owner). Raises on a name collision within that scope.
 
         :param agent_id: Pre-generated unique agent identifier,
             e.g. ``"ag_0f1a2b3c..."``. Caller generates this so
             the bundle location can be computed before persisting.
-        :param name: Human-readable agent name. Must be unique
-            among template agents, e.g. ``"code-assistant"``.
+        :param name: Human-readable agent name. Unique among built-ins
+            when ``owner`` is ``None``, else unique per owner.
         :param bundle_location: Artifact store key for the bundle,
             e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
         :param description: Optional free-text description of the
             agent's purpose.
+        :param owner: Owning user id for a standalone agent, e.g.
+            ``"alice@example.com"``; ``None`` for an operator built-in.
         :returns: The newly created :class:`Agent`.
+        """
+        ...
+
+    @abstractmethod
+    def list_for_owner(self, owner: str) -> list[Agent]:
+        """
+        List standalone agents owned by ``owner`` (``session_id IS NULL``
+        and ``owner`` matching), newest-first. Excludes operator
+        built-ins and session-scoped agents.
+
+        :param owner: Owning user id, e.g. ``"alice@example.com"``.
+        :returns: The owner's standalone agents.
         """
         ...
 

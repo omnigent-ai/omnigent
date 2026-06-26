@@ -28,6 +28,11 @@ class Agent:
         ``None`` if the agent has never been updated.
     :param session_id: Owning conversation/session id for
         session-scoped agents. ``None`` for template agents.
+    :param owner: User id that owns this agent, e.g.
+        ``"alice@example.com"``. Set for standalone user-created agents
+        (managed via the agents CRUD API); ``None`` for operator-seeded
+        built-in/template agents (visible to everyone) and for
+        session-scoped agents (which inherit access from their session).
     """
 
     id: str
@@ -38,6 +43,7 @@ class Agent:
     description: str | None = None
     updated_at: int | None = None
     session_id: str | None = None
+    owner: str | None = None
 
 
 @dataclass

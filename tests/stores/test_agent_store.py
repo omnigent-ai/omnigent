@@ -267,3 +267,75 @@ def test_delete_nonexistent_returns_false(agent_store: SqlAlchemyAgentStore) -> 
     """delete returns False for an ID that was never created."""
     result = agent_store.delete("ag_never_existed")
     assert result is False
+
+
+# ── Standalone, owner-scoped agents (agents-as-first-class-entity) ──────
+
+
+def test_owner_scoped_create_and_list_for_owner(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A standalone agent has an owner and is returned by list_for_owner."""
+    created = agent_store.create(
+        agent_id="ag_alice_research",
+        name="research",
+        bundle_location="ag_alice_research/h",
+        owner="alice@example.com",
+    )
+    assert created.owner == "alice@example.com"
+
+    mine = agent_store.list_for_owner("alice@example.com")
+    assert [a.id for a in mine] == ["ag_alice_research"]
+
+
+def test_owned_agents_are_not_builtins(agent_store: SqlAlchemyAgentStore) -> None:
+    """Owned standalone agents must not leak into built-in discovery APIs.
+
+    ``list()`` and ``get_by_name()`` back the built-in picker; an owned
+    agent appearing there would expose one user's agent to everyone.
+    """
+    agent_store.create(
+        agent_id="ag_owned_only",
+        name="private-helper",
+        bundle_location="ag_owned_only/h",
+        owner="alice@example.com",
+    )
+    assert "ag_owned_only" not in [a.id for a in agent_store.list().data]
+    assert agent_store.get_by_name("private-helper") is None
+
+
+def test_owner_isolation_and_per_owner_name_uniqueness(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """Different owners are isolated and may reuse the same agent name."""
+    agent_store.create(
+        agent_id="ag_alice_dup",
+        name="shared-name",
+        bundle_location="ag_alice_dup/h",
+        owner="alice@example.com",
+    )
+    # Same name under a different owner is allowed (per-owner uniqueness).
+    agent_store.create(
+        agent_id="ag_bob_dup",
+        name="shared-name",
+        bundle_location="ag_bob_dup/h",
+        owner="bob@example.com",
+    )
+    assert [a.id for a in agent_store.list_for_owner("alice@example.com")] == ["ag_alice_dup"]
+    assert [a.id for a in agent_store.list_for_owner("bob@example.com")] == ["ag_bob_dup"]
+
+
+def test_builtin_and_owned_can_share_a_name(agent_store: SqlAlchemyAgentStore) -> None:
+    """A built-in and an owned agent may share a name without colliding."""
+    agent_store.create(agent_id="ag_builtin_dup", name="dup", bundle_location="ag_builtin_dup/h")
+    agent_store.create(
+        agent_id="ag_owned_dup",
+        name="dup",
+        bundle_location="ag_owned_dup/h",
+        owner="alice@example.com",
+    )
+    # Built-in lookup resolves to the built-in, ignoring the owned one.
+    found = agent_store.get_by_name("dup")
+    assert found is not None
+    assert found.id == "ag_builtin_dup"
+    assert [a.id for a in agent_store.list_for_owner("alice@example.com")] == ["ag_owned_dup"]

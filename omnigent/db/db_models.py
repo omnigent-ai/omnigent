@@ -63,16 +63,34 @@ class SqlAgent(Base):
         ForeignKey("conversations.id", ondelete="CASCADE"),
         nullable=True,
     )
+    # User that owns a standalone agent (managed via the agents CRUD API).
+    # NULL for operator-seeded built-in/template agents (global, visible to
+    # everyone) and for session-scoped agents (which inherit access from the
+    # session). See entities/agent.py for the access model.
+    owner: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     __table_args__ = (
         Index("ix_agents_created_at", "created_at"),
+        # Operator built-ins (no owner, no session) keep globally-unique
+        # names — they back ``get_by_name`` and the built-in picker.
         Index(
-            "ix_agents_template_name",
+            "ix_agents_builtin_name",
             "name",
             unique=True,
-            sqlite_where=text("session_id IS NULL"),
-            postgresql_where=text("session_id IS NULL"),
+            sqlite_where=text("session_id IS NULL AND owner IS NULL"),
+            postgresql_where=text("session_id IS NULL AND owner IS NULL"),
         ),
+        # Standalone user agents are unique per (owner, name) so different
+        # users can each have an agent with the same name.
+        Index(
+            "ix_agents_owner_name",
+            "owner",
+            "name",
+            unique=True,
+            sqlite_where=text("session_id IS NULL AND owner IS NOT NULL"),
+            postgresql_where=text("session_id IS NULL AND owner IS NOT NULL"),
+        ),
+        Index("ix_agents_owner", "owner"),
         Index("ix_agents_session_id", "session_id", unique=True),
     )
 
