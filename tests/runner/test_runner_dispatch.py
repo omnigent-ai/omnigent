@@ -327,6 +327,14 @@ class _FakeProcessManager:
             raise AssertionError("get_client should not be called")
         return self._harness_client
 
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        """Reaper in-flight marker — no-op for this stub (issue #1414)."""
+        del conversation_id, response_id
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        """Reaper in-flight clear — no-op for this stub (issue #1414)."""
+        del conversation_id
+
 
 @pytest.fixture
 async def started_manager() -> AsyncIterator[HarnessProcessManager]:
@@ -481,6 +489,14 @@ class _RecordingProcessManager:
         self._reached.set()
         return _FakeHarnessClient([])
 
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        """Reaper in-flight marker — no-op for this stub (issue #1414)."""
+        del conversation_id, response_id
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        """Reaper in-flight clear — no-op for this stub (issue #1414)."""
+        del conversation_id
+
 
 @pytest.mark.asyncio
 async def test_runner_resolves_agent_from_server_snapshot_when_msg_lacks_agent_id() -> None:
@@ -621,6 +637,14 @@ class _ContentCapturingProcessManager:
         """
         del conversation_id, harness_name, env
         return _ContentCapturingHarnessClient(self._captured, self._reached)
+
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        """Reaper in-flight marker — no-op for this stub (issue #1414)."""
+        del conversation_id, response_id
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        """Reaper in-flight clear — no-op for this stub (issue #1414)."""
+        del conversation_id
 
 
 class _ContentCapturingHarnessClient:

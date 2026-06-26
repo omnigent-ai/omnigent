@@ -519,6 +519,57 @@ async def test_idle_reaper_releases_stale_entries(
         await fast.shutdown()
 
 
+async def test_idle_reaper_skips_in_flight_turn(
+    register_test_harness: None,
+    short_tmp_parent: Path,
+) -> None:
+    """A conversation with a live harness turn is never reaped mid-flight.
+
+    Regression test for #1414. ``last_used_at`` is stamped once per turn at
+    ``get_client``, so a turn that runs longer than ``idle_timeout_s`` looks
+    "idle" to the reaper. The only guard against killing it —
+    ``conv_id in _in_flight_response_ids`` — had no writers and was always
+    empty, so long turns were ``SIGTERM``'d mid-stream. ``mark_in_flight`` /
+    ``clear_in_flight`` populate that guard (the runner calls them from
+    ``proxy_stream`` on ``response.created`` and from ``_on_proxy_stream_end``).
+
+    Marks a turn in-flight, holds it well past the 2 s idle window across many
+    reaper passes, and asserts the subprocess survives; then clears the marker
+    and asserts the now-genuinely-idle entry is reaped (so the fix doesn't
+    leak entries that never get reclaimed — the inverse failure, cf. #1349).
+    """
+    fast = HarnessProcessManager(
+        idle_timeout_s=2.0,
+        reaper_interval_s=0.1,
+        tmp_parent=short_tmp_parent,
+    )
+    await fast.start()
+    try:
+        await fast.get_client("conv_a", _TEST_HARNESS_NAME)
+        socket_path = fast.instance_dir / "conv-conv_a.sock"
+        assert socket_path.exists()
+        # Mark the turn live, as the runner does on ``response.created``.
+        fast.mark_in_flight("conv_a", "resp_x")
+        assert fast.has_active_turn("conv_a")
+        # Hold past the 2 s idle window across ~40 reaper passes (~4 s). An
+        # unguarded reaper would have reaped this stale-looking entry; the
+        # in-flight guard must keep the subprocess alive the whole time.
+        for _ in range(40):
+            await asyncio.sleep(0.1)
+            assert socket_path.exists(), "in-flight turn was reaped mid-flight"
+        # Turn ends: clear the marker (as ``_on_proxy_stream_end`` does). The
+        # entry is now genuinely idle and must become reapable.
+        fast.clear_in_flight("conv_a")
+        assert not fast.has_active_turn("conv_a")
+        for _ in range(60):
+            if not socket_path.exists():
+                break
+            await asyncio.sleep(0.1)
+        assert not socket_path.exists()
+    finally:
+        await fast.shutdown()
+
+
 async def test_orphan_sweep_removes_dead_omnigent_dirs(
     short_tmp_parent: Path,
 ) -> None:

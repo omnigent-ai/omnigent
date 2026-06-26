@@ -12267,6 +12267,13 @@ def create_runner_app(
         _active_turns.pop(conv_id, None)
         # Turn ended: clear the live marker so a concurrent forward is skipped.
         _live_response_id.pop(conv_id, None)
+        # Mirror the clear onto the process manager's in-flight map so the
+        # idle reaper can reap the (now genuinely idle) entry once its idle
+        # window elapses. Reached on every terminal path, so a dropped or
+        # late terminal SSE event can't strand a permanently-marked entry
+        # (which would never be reaped — the inverse of #1414, cf. #1349).
+        if process_manager is not None:
+            process_manager.clear_in_flight(conv_id)
         # Skip the idle transient when a buffered message will start a
         # continuation turn immediately — `_check_and_start_next_turn`
         # publishes "running" microseconds later, and the in-between idle
@@ -13924,6 +13931,13 @@ def create_runner_app(
                                         _resp_to_conv[_response_id] = conv_id
                                         # Mark the turn live for the forward gate.
                                         _live_response_id[conv_id] = _response_id
+                                        # Register the live turn with the process
+                                        # manager so its idle reaper skips this
+                                        # conversation while it is streaming (and
+                                        # forward_cancel can resolve the harness
+                                        # response id). Cleared in
+                                        # _on_proxy_stream_end. See issue #1414.
+                                        process_manager.mark_in_flight(conv_id, _response_id)
 
                                 # Defer publish for action_required
                                 # events that the runner dispatches
@@ -14105,6 +14119,39 @@ def create_runner_app(
                                         ) = await _resolve_turn_spec_lazy()
                                         if _lazy_err is not None:
                                             _err_type, _err_msg = _lazy_err
+                                            # Finalize the turn like the two
+                                            # sibling spec-error early-returns
+                                            # above (eager-error, non-200): a
+                                            # bare return here exits the
+                                            # generator cleanly, so without this
+                                            # no _on_proxy_stream_end runs and
+                                            # the turn's terminal bookkeeping
+                                            # (status publish + clearing the
+                                            # live/in-flight markers) is skipped,
+                                            # stranding the idle-reaper guard
+                                            # (#1414/#1349). Reachable on a
+                                            # transient resolver failure: the
+                                            # setup-phase resolution fails (so
+                                            # _session_spec_cache stays empty)
+                                            # but the harness resolution
+                                            # succeeds (so the turn streams),
+                                            # then this lazy dispatch resolution
+                                            # fails again.
+                                            _fail = {
+                                                "type": "response.failed",
+                                                "error": {
+                                                    "message": _err_msg,
+                                                    "type": _err_type,
+                                                },
+                                            }
+                                            _publish_event(conv_id, _fail)
+                                            _on_proxy_stream_end(
+                                                conv_id,
+                                                error={
+                                                    "message": _err_msg,
+                                                    "type": _err_type,
+                                                },
+                                            )
                                             yield _response_failed_event(
                                                 {"message": _err_msg, "type": _err_type}
                                             )

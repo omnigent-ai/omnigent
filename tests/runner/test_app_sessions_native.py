@@ -225,6 +225,11 @@ class _FakeProcessManager:
         self.released: list[str] = []
         self.cancelled: list[str] = []
         self.get_client_calls: list[tuple[str, str, dict[str, str] | None]] = []
+        # In-flight tracking the runner wires up on response.created /
+        # stream end (issue #1414). Recorded so tests can assert the
+        # idle reaper's guard is actually populated for a live turn.
+        self.marked_in_flight: list[tuple[str, str]] = []
+        self.cleared_in_flight: list[str] = []
 
     async def get_client(
         self, conversation_id: str, harness: str, env: Any = None
@@ -245,6 +250,16 @@ class _FakeProcessManager:
     def mark_turn_active(self, conversation_id: str) -> None:
         """Mark a conversation as having an active turn (test helper)."""
         self._active_turns.add(conversation_id)
+
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        """Record a live turn, mirroring the real manager's reaper guard."""
+        self.marked_in_flight.append((conversation_id, response_id))
+        self._active_turns.add(conversation_id)
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        """Clear the live-turn marker at stream end."""
+        self.cleared_in_flight.append(conversation_id)
+        self._active_turns.discard(conversation_id)
 
     async def forward_cancel(self, conversation_id: str) -> bool:
         """Record a cancel and return ``True``."""
@@ -819,6 +834,343 @@ async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
         "dispatch must use the resolved bundle workdir, not runner_workspace "
         f"({workspace!r}); got {captured_workspaces[0]!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_marks_and_clears_in_flight_turn() -> None:
+    """proxy_stream registers the live turn with the process manager.
+
+    Regression test for #1414. The idle reaper skips conversations present in
+    the manager's ``_in_flight_response_ids``, but that map had no writers, so
+    a turn running past the idle window was reaped mid-stream. The runner must
+    call ``mark_in_flight`` on ``response.created`` (so the reaper spares the
+    live turn) and ``clear_in_flight`` at stream end (so the now-idle entry can
+    later be reclaimed — not leaked, cf. #1349). Before the fix the runner
+    never called either, so both recorded lists stay empty.
+    """
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_live"}}),
+        _sse({"type": "response.completed", "response": {"id": "resp_live"}}),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+    spec = AgentSpec(spec_version=1, name="plain-agent")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/conv_live/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_live",
+                "model": "plain-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert resp.status_code == 202
+        # Wait for the background turn to finish (clear runs at stream end).
+        for _ in range(100):
+            if pm.cleared_in_flight:
+                break
+            await asyncio.sleep(0.05)
+
+    # Live turn was registered with the reaper's in-flight guard on
+    # response.created, then cleared once the stream ended.
+    assert pm.marked_in_flight == [("conv_live", "resp_live")], pm.marked_in_flight
+    assert pm.cleared_in_flight == ["conv_live"], pm.cleared_in_flight
+
+
+class _StreamErrorHarnessClient(_ScriptedHarnessClient):
+    """Harness whose stream yields its frames then drops mid-stream.
+
+    Mirrors the production reaper-kill failure: after ``response.created``
+    the per-conversation client is force-closed and ``aiter_text`` raises
+    ``httpx.ReadError``, which proxy_stream surfaces as the
+    "Harness stream connection error." terminal failure.
+    """
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        """Return a context manager whose stream errors after the frames."""
+        del method, url, timeout
+        self.posted_bodies.append(json)
+        frames = self._sse_frames
+
+        class _ErrCtx:
+            status_code = 200
+
+            async def __aenter__(self) -> _StreamErrorHarnessClient._ErrHandle:
+                return _StreamErrorHarnessClient._ErrHandle(frames)
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        return _ErrCtx()
+
+    class _ErrHandle:
+        """Stream handle that raises ``ReadError`` after yielding its frames."""
+
+        status_code = 200
+
+        def __init__(self, frames: list[str]) -> None:
+            """Store the frames to yield before erroring."""
+            self._frames = frames
+
+        async def aiter_text(self) -> AsyncIterator[str]:
+            """Yield each scripted frame, then drop the stream mid-flight."""
+            for frame in self._frames:
+                yield frame
+            raise httpx.ReadError("harness subprocess closed mid-stream")
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_clears_in_flight_when_stream_errors() -> None:
+    """clear_in_flight fires even when a turn ends abnormally.
+
+    The fix clears the reaper's in-flight marker in ``_on_proxy_stream_end``,
+    which is reached on every terminal path — not only on ``response.completed``.
+    A turn that streams ``response.created`` and then drops mid-stream (exactly
+    the reaper-kill failure: ``httpx.ReadError`` → "Harness stream connection
+    error.") must still clear the marker; a missed clear would leave the entry
+    permanently in-flight and therefore never reaped — the inverse of #1414
+    (cf. #1349).
+    """
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_drop"}}),
+    ]
+    harness_client = _StreamErrorHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+    spec = AgentSpec(spec_version=1, name="plain-agent")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/conv_drop/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_drop",
+                "model": "plain-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert resp.status_code == 202
+        # Wait for the background turn to error out (clear runs at stream end).
+        for _ in range(100):
+            if pm.cleared_in_flight:
+                break
+            await asyncio.sleep(0.05)
+
+    # Marked live on response.created, then cleared despite the mid-stream drop.
+    assert pm.marked_in_flight == [("conv_drop", "resp_drop")], pm.marked_in_flight
+    assert pm.cleared_in_flight == ["conv_drop"], pm.cleared_in_flight
+
+
+@pytest.mark.asyncio
+async def test_stop_session_clears_in_flight_marker() -> None:
+    """A mid-stream cancel clears the reaper's in-flight marker.
+
+    Guards the in-flight-tracking contract against a #1349-class inverse leak:
+    because ``mark_in_flight`` (set on ``response.created``) *persists*, a
+    cancel must still clear it, or ``has_active_turn`` stays true and the idle
+    reaper skips the subprocess forever. The clear happens because cancelling
+    the turn task raises ``CancelledError`` into ``_run_turn_bg``'s handler,
+    which runs ``_on_proxy_stream_end`` (→ ``clear_in_flight``). This test locks
+    that path so a future change to the cancel teardown can't silently strand
+    the marker.
+    """
+    import asyncio as _aio
+
+    gate = _aio.Event()  # never set → harness blocks after response.created
+    app, pm, hc = _build_interrupt_app(gate)
+    conv_id = "conv_stop_clear"
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_stop",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "blocked"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert resp.status_code == 202
+        # Wait until response.created is processed (marker set), then stop.
+        await _aio.wait_for(hc.post_seen.wait(), timeout=5.0)
+        for _ in range(100):
+            if pm.marked_in_flight:
+                break
+            await _aio.sleep(0.05)
+        assert pm.marked_in_flight == [(conv_id, "resp_int")], pm.marked_in_flight
+
+        stop_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "stop_session"},
+        )
+        assert stop_resp.status_code == 204, stop_resp.text
+        gate.set()  # release the blocked stream so teardown completes cleanly
+        for _ in range(100):
+            if pm.cleared_in_flight:
+                break
+            await _aio.sleep(0.05)
+
+    # The cancel teardown must have cleared the marker (else the reaper would
+    # skip this subprocess forever and has_active_turn would stay true). Clear
+    # is idempotent, so it may fire on more than one teardown path — what
+    # matters is the end state: marked, then cleared, no longer active.
+    assert conv_id in pm.cleared_in_flight, pm.cleared_in_flight
+    assert not pm.has_active_turn(conv_id)
+
+
+class _SignalOnCreatedHarnessClient(_ScriptedHarnessClient):
+    """Streams its frames, firing an event the moment ``response.created`` is sent.
+
+    Lets a test distinguish the lazy turn-spec resolution (which runs only after
+    the harness has started streaming) from the eager setup-phase resolutions
+    that precede it.
+    """
+
+    def __init__(self, sse_frames: list[str], created: asyncio.Event) -> None:
+        """Store the frames and the event to fire on ``response.created``."""
+        super().__init__(sse_frames)
+        self._created = created
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        """Return a context manager that signals once ``response.created`` is sent."""
+        del method, url, timeout
+        self.posted_bodies.append(json)
+        frames = self._sse_frames
+        created = self._created
+
+        class _Ctx:
+            status_code = 200
+
+            async def __aenter__(self) -> _SignalOnCreatedHarnessClient._Handle:
+                return _SignalOnCreatedHarnessClient._Handle(frames, created)
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        return _Ctx()
+
+    class _Handle:
+        """Stream handle that fires *created* right after the ``response.created`` frame."""
+
+        status_code = 200
+
+        def __init__(self, frames: list[str], created: asyncio.Event) -> None:
+            """Store the frames and the response.created signal."""
+            self._frames = frames
+            self._created = created
+
+        async def aiter_text(self) -> AsyncIterator[str]:
+            """Yield each frame, signalling once ``response.created`` has been sent."""
+            for frame in self._frames:
+                yield frame
+                if '"response.created"' in frame:
+                    self._created.set()
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_clears_in_flight_on_lazy_spec_error() -> None:
+    """A lazy turn-spec resolution failure mid-dispatch still clears the marker.
+
+    Regression for a #1349-class inverse leak. For a non-MCP agent the turn
+    spec is resolved lazily at tool-dispatch time — after ``response.created``
+    has already set the in-flight marker. A transient resolver failure there
+    drives ``proxy_stream``'s lazy-spec-error early ``return``, which (unlike a
+    stream error or a cancel) exits the generator *cleanly* — so neither the
+    drain nor ``_run_turn_bg``'s ``CancelledError`` handler runs
+    ``_on_proxy_stream_end``. Routing that early return through
+    ``_on_proxy_stream_end`` is what clears the marker; without it the reaper
+    skips the subprocess forever and ``has_active_turn`` stays true.
+
+    The resolver is gated on ``response.created`` so it succeeds for the two
+    setup-phase resolutions (spec cache + harness pick) — letting the turn
+    stream — and fails only on the lazy dispatch call.
+    """
+    import asyncio as _aio
+
+    created = _aio.Event()
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_lazy"}}),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "status": "action_required",
+                    "name": "sys_list_models",
+                    "call_id": "call_lazy",
+                    "arguments": "{}",
+                },
+            }
+        ),
+        _sse({"type": "response.completed", "response": {"id": "resp_lazy"}}),
+    ]
+    harness_client = _SignalOnCreatedHarnessClient(sse_frames, created)
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        # Before the harness streams response.created the two setup-phase
+        # resolutions run: return None (uncached spec → default harness) so the
+        # turn streams without populating _session_spec_cache. Once streaming
+        # has started the only caller is the lazy dispatch resolution — fail it.
+        del agent_id, session_id
+        if created.is_set():
+            raise RuntimeError("transient lazy spec resolution failure")
+        return None
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    conv_id = "conv_lazy"
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_lazy",
+                "model": "plain-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert resp.status_code == 202
+        # Wait for the background turn to finish; the marker should be cleared.
+        for _ in range(100):
+            if pm.cleared_in_flight:
+                break
+            await _aio.sleep(0.05)
+
+    # Marked live on response.created; the lazy-spec-error early return must
+    # still finalize the turn and clear the marker.
+    assert pm.marked_in_flight == [(conv_id, "resp_lazy")], pm.marked_in_flight
+    assert conv_id in pm.cleared_in_flight, pm.cleared_in_flight
+    assert not pm.has_active_turn(conv_id)
 
 
 @pytest.mark.asyncio
