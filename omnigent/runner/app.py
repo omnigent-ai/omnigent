@@ -4170,17 +4170,12 @@ async def _resolve_claude_resume_bridge_id(
     So when ``D(session_id)`` is owned by a live sibling, return an isolated
     bridge id: reuse the dir a prior resume already forked (named by the
     session's current ``bridge_id`` label) when that dir is free or already
-    ours, so repeated resumes converge; otherwise mint a fresh, unique id and
-    PERSIST it to the bridge_id label. Persisting on mint is what makes every
-    resolver in this resume converge on the SAME dir: the executor spawn_env
-    (session-init), auto-create, and the message dispatch all call this, and the
-    later ones reuse the minted id via the label instead of each minting their
-    own. The decision is driven by the on-disk ``active_session_id``, which is
+    ours, so repeated resumes converge; otherwise mint a fresh, unique id. The
+    decision is driven entirely by the on-disk ``active_session_id``, which is
     visible across runner processes (unlike the in-memory registries).
 
-    :param server_client: Omnigent server client — resolves the session's
-        current ``bridge_id`` label on the collision path and persists a freshly
-        minted fork.
+    :param server_client: Omnigent server client, used only on the collision
+        path to resolve the session's current ``bridge_id`` label.
     :param session_id: The session being (re)started, e.g. ``"conv_old"``.
     :returns: The bridge id to key this session's bridge dir on — ``session_id``
         in the common case, otherwise an isolated ``f"{session_id}-clr-…"``
@@ -4189,7 +4184,6 @@ async def _resolve_claude_resume_bridge_id(
     import secrets
 
     from omnigent.claude_native_bridge import (
-        BRIDGE_ID_LABEL_KEY,
         bridge_dir_for_bridge_id,
         read_active_session_id,
     )
@@ -4209,16 +4203,7 @@ async def _resolve_claude_resume_bridge_id(
             # A prior resume already forked this session onto its own dir and it
             # is still free/ours — reuse it so repeated resumes don't leak dirs.
             return prior_label
-    chosen = f"{session_id}-clr-{secrets.token_hex(4)}"
-    # Persist immediately so the other resolvers in this resume converge on it.
-    try:
-        await server_client.patch(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            json={"labels": {BRIDGE_ID_LABEL_KEY: chosen}},
-        )
-    except httpx.HTTPError:
-        _logger.debug("Could not persist forked bridge_id label for %s", session_id)
-    return chosen
+    return f"{session_id}-clr-{secrets.token_hex(4)}"
 
 
 async def _auto_create_claude_terminal(
@@ -7667,13 +7652,7 @@ def create_runner_app(
                     build_claude_native_spawn_env,
                 )
 
-                # Fork-aware (see _resolve_claude_resume_bridge_id): after a
-                # /clear the old session's natural dir is owned by the new
-                # session, so this resolves+persists an isolated bridge so the
-                # executor injects into the SAME dir auto-create launches the
-                # resumed TUI in — not the live sibling's (which would trip the
-                # "session no longer active after /clear" guard).
-                bridge_id = await _resolve_claude_resume_bridge_id(
+                bridge_id = await _claude_native_bridge_id_for_session(
                     server_client=server_client,
                     session_id=session_id,
                 )
@@ -12173,11 +12152,7 @@ def create_runner_app(
         if harness_name == "claude-native" and spawn_env is None:
             from omnigent.claude_native_bridge import build_claude_native_spawn_env
 
-            # Fork-aware so a message to a post-/clear OLD session injects into
-            # the isolated resumed bridge, not the live sibling's shared one
-            # (converges with the session-init spawn_env + auto-create via the
-            # persisted bridge_id label).
-            bridge_id = await _resolve_claude_resume_bridge_id(
+            bridge_id = await _claude_native_bridge_id_for_session(
                 server_client=server_client,
                 session_id=conv_id,
             )

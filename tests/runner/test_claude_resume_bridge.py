@@ -47,17 +47,6 @@ def _label_returning(label: str):
     return _inner
 
 
-class _RecordingClient:
-    """Minimal async client capturing the resolver's persist PATCH."""
-
-    def __init__(self) -> None:
-        self.patches: list[tuple[str, dict]] = []
-
-    async def patch(self, url: str, *, json: dict) -> None:
-        """Record a label-persist PATCH and return nothing (best-effort)."""
-        self.patches.append((url, json))
-
-
 @pytest.mark.asyncio
 async def test_fresh_session_uses_session_id(tmp_path: Path) -> None:
     """No bridge dir on disk yet → keep the natural session_id bridge."""
@@ -77,23 +66,14 @@ async def test_reconnect_reuses_own_bridge(tmp_path: Path) -> None:
 async def test_collision_forks_to_fresh_bridge(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """D(conv_a) owned by sibling conv_b, label still conv_a → mint + persist."""
+    """D(conv_a) owned by sibling conv_b, label still conv_a → mint a fresh id."""
     _seed_bridge("conv_a", "conv_b", tmp_path)
     monkeypatch.setattr(
         runner_app, "_claude_native_bridge_id_for_session", _label_returning("conv_a")
     )
-    client = _RecordingClient()
-    result = await _resolve_claude_resume_bridge_id(server_client=client, session_id="conv_a")
+    result = await _resolve_claude_resume_bridge_id(server_client=object(), session_id="conv_a")
     assert result != "conv_a"
     assert result.startswith("conv_a-clr-")
-    # The fork is persisted to the bridge_id label so auto-create + the message
-    # executor converge on the same isolated dir.
-    assert client.patches == [
-        (
-            "/v1/sessions/conv_a",
-            {"labels": {"omnigent.claude_native.bridge_id": result}},
-        )
-    ]
 
 
 @pytest.mark.asyncio
@@ -124,13 +104,6 @@ async def test_collision_prior_fork_taken_mints_fresh(
         "_claude_native_bridge_id_for_session",
         _label_returning("conv_a-clr-cafe"),
     )
-    client = _RecordingClient()
-    result = await _resolve_claude_resume_bridge_id(server_client=client, session_id="conv_a")
+    result = await _resolve_claude_resume_bridge_id(server_client=object(), session_id="conv_a")
     assert result.startswith("conv_a-clr-")
     assert result != "conv_a-clr-cafe"
-    assert client.patches == [
-        (
-            "/v1/sessions/conv_a",
-            {"labels": {"omnigent.claude_native.bridge_id": result}},
-        )
-    ]
