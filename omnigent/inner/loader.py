@@ -117,41 +117,52 @@ def load_agent_def(
 
 
 def _reject_unregistered_policy_handlers(data: YamlData) -> None:
-    """Reject ``type: function`` policies whose handler is not registered.
+    """Reject unregistered policy handlers and server-runtime tool callables.
 
-    Scans the raw YAML ``policies:`` mapping for handler dotted paths
-    that are not in the policy registry and raises before any import or
-    factory call. Tool ``callable:`` paths are intentionally *not*
-    scanned — they are a separate surface and are not invoked at parse
-    time. See :func:`load_agent_def` for why this only runs on the
-    untrusted bundle-upload path.
+    Scans the raw YAML ``policies:`` mapping for handler dotted paths not
+    in the policy registry, and the ``tools:`` mapping for server-runtime
+    ``callable:`` paths (GHSA-756x-9hf6-q4h4), raising before any import
+    or factory call. See :func:`load_agent_def` for why this only runs on
+    the untrusted bundle-upload path.
 
     :param data: The raw agent YAML dict (pre-parse). Non-dict input
         (malformed YAML) is ignored here and left for the parser to
         reject.
     :raises ValueError: If a function policy names an unregistered
-        handler, e.g. ``"subprocess.Popen"``.
+        handler, or a server-runtime tool declares a callable.
     """
     from omnigent.policies.registry import is_registered_handler
 
     if not isinstance(data, dict):
         return
     policies = data.get("policies")
-    if not isinstance(policies, dict):
-        return
-    for pname, pdata in policies.items():
-        if not isinstance(pdata, dict):
-            continue
-        if pdata.get("type", "function") != "function":
-            continue
-        handler = pdata.get("handler") or pdata.get("callable")
-        if isinstance(handler, str) and not is_registered_handler(handler):
-            raise ValueError(
-                f"Policy {pname!r}: handler {handler!r} is not a registered policy "
-                f"handler. Uploaded agent bundles may only use handlers from the "
-                f"policy registry; a server admin must add custom handlers via the "
-                f"'policy_modules' config."
-            )
+    if isinstance(policies, dict):
+        for pname, pdata in policies.items():
+            if not isinstance(pdata, dict):
+                continue
+            if pdata.get("type", "function") != "function":
+                continue
+            handler = pdata.get("handler") or pdata.get("callable")
+            if isinstance(handler, str) and not is_registered_handler(handler):
+                raise ValueError(
+                    f"Policy {pname!r}: handler {handler!r} is not a registered policy "
+                    f"handler. Uploaded agent bundles may only use handlers from the "
+                    f"policy registry; a server admin must add custom handlers via the "
+                    f"'policy_modules' config."
+                )
+    tools = data.get("tools")
+    if isinstance(tools, dict):
+        for tname, tdata in tools.items():
+            if not isinstance(tdata, dict):
+                continue
+            callable_path = tdata.get("callable")
+            if isinstance(callable_path, str) and tdata.get("runtime", "server") != "client":
+                raise ValueError(
+                    f"Tool {tname!r}: server-runtime callable {callable_path!r} is not "
+                    f"allowed in an uploaded agent bundle. Use a 'client' runtime tool or "
+                    f"a Unity Catalog function; server-side callables require a trusted "
+                    f"(single-user/local) server."
+                )
 
 
 def _read_contained_file(root: Path, value: str) -> str | None:

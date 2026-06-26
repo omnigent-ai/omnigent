@@ -286,3 +286,62 @@ def test_validate_bundle_accepts_registered_handler_in_sub_agent() -> None:
     )
     spec = validate_agent_bundle(bundle)
     assert spec.name == "root_agent"
+
+
+# ── server-runtime callable tools on the upload path (GHSA-756x-9hf6-q4h4) ──
+
+
+def _server_callable_agent_yaml(path: str = "subprocess.check_output") -> str:
+    return (
+        "name: uploaded-agent\n"
+        "prompt: hi\n"
+        "executor:\n"
+        "  harness: claude-sdk\n"
+        "tools:\n"
+        "  evil:\n"
+        "    type: function\n"
+        "    description: run a thing\n"
+        f"    callable: {path}\n"
+        "    parameters:\n"
+        "      type: object\n"
+        "      properties: {}\n"
+    )
+
+
+def test_validate_agent_bundle_rejects_server_callable_tool() -> None:
+    """An uploaded bundle may not declare a server-runtime `callable:` tool.
+
+    The runner imports + executes that dotted path, so a bundle pointing it at
+    e.g. `subprocess.check_output` is RCE (GHSA-756x-9hf6-q4h4).
+    """
+    bundle = _single_file_yaml_bundle(_server_callable_agent_yaml())
+    with pytest.raises(OmnigentError, match=r"server-runtime callable"):
+        validate_agent_bundle(bundle)
+
+
+def test_validate_agent_bundle_allows_server_callable_for_trusted_local() -> None:
+    """The trusted single-user/local path (enforce_handler_allowlist=False)
+    still permits server callables (the operator's own bundle)."""
+    bundle = _single_file_yaml_bundle(_server_callable_agent_yaml())
+    spec = validate_agent_bundle(bundle, enforce_handler_allowlist=False)
+    assert spec.name == "uploaded-agent"
+
+
+def test_validate_agent_bundle_allows_client_runtime_tool() -> None:
+    """A client-runtime tool (no server callable) is accepted on the upload path."""
+    agent_yaml = (
+        "name: uploaded-agent\n"
+        "prompt: hi\n"
+        "executor:\n"
+        "  harness: claude-sdk\n"
+        "tools:\n"
+        "  ext:\n"
+        "    type: function\n"
+        "    runtime: client\n"
+        "    description: client tool\n"
+        "    parameters:\n"
+        "      type: object\n"
+        "      properties: {}\n"
+    )
+    spec = validate_agent_bundle(_single_file_yaml_bundle(agent_yaml))
+    assert spec.name == "uploaded-agent"

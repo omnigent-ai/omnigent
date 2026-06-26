@@ -308,6 +308,7 @@ def load(
         # The single-file omnigent YAML path is guarded earlier, inside
         # the loader, because that loader executes factories at parse.
         _reject_unregistered_spec_policy_handlers(spec)
+        _reject_server_callable_tools(spec)
     return spec
 
 
@@ -401,3 +402,26 @@ def _reject_unregistered_spec_policy_handlers(spec: AgentSpec) -> None:
                 )
     for sub_agent in spec.sub_agents:
         _reject_unregistered_spec_policy_handlers(sub_agent)
+
+
+def _reject_server_callable_tools(spec: AgentSpec) -> None:
+    """Reject server-runtime ``callable:`` tools in an uploaded bundle.
+
+    Server-runtime tools import + execute an arbitrary dotted path
+    (GHSA-756x-9hf6-q4h4), so they are a trusted/operator-only feature.
+    Used on the untrusted upload path only. Recurses into ``sub_agents``.
+
+    :param spec: The parsed agent spec (or sub-agent) to scan.
+    :raises OmnigentError: If a server-runtime tool declares a callable.
+    """
+    for tool in spec.local_tools or []:
+        if tool.runtime == ToolRuntime.SERVER and tool.path:
+            raise OmnigentError(
+                f"Tool {tool.name!r}: server-runtime callable {tool.path!r} is not "
+                f"allowed in an uploaded agent bundle. Use a 'client' runtime tool "
+                f"or a Unity Catalog function; server-side callables require a "
+                f"trusted (single-user/local) server.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+    for sub_agent in spec.sub_agents:
+        _reject_server_callable_tools(sub_agent)
