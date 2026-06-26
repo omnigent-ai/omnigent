@@ -1575,6 +1575,44 @@ def test_build_startup_header_subscription_credential(tmp_path, monkeypatch) -> 
     assert header.description == "A test agent"
 
 
+def test_build_startup_header_creds_line_hints_first_available(tmp_path, monkeypatch) -> None:
+    """
+    A surface with no default names the credential the launch will fall back to.
+
+    The Databricks-only GPT-head scenario: a multi-family agent (anthropic +
+    openai) where the ``openai`` surface has NO default, but a Databricks
+    workspace that serves openai is configured. The creds line must not read a
+    bare "not configured" — the head WILL launch through that workspace (the
+    runtime spawn-env fallback), so the header names it: "no default → will use
+    …". Header and launch resolve it through the same
+    :func:`first_available_provider`, so the readout cannot disagree with what
+    actually launches.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  claude-subscription:\n"
+        "    kind: subscription\n"
+        "    cli: claude\n"
+        "    default: anthropic\n"
+        "  databricks:\n"  # serves openai, but is NOT marked the openai default
+        "    kind: databricks\n"
+        "    profile: gtm-ws\n"
+    )
+    header = _build_startup_header(
+        "claude-sdk", "Two-headed brainstorming partner.", ["anthropic", "openai"]
+    )
+    assert header.creds_line is not None
+    # anthropic has its explicit default; openai has none → the hint names the
+    # first-available credential the launch falls back to (the Databricks ws).
+    assert "Claude → Subscription" in header.creds_line
+    assert "Codex → no default → will use 🧱 Databricks (gtm-ws)" in header.creds_line
+
+
 def test_build_startup_header_creds_line_includes_pi_surface(tmp_path, monkeypatch) -> None:
     """
     The per-surface creds line resolves the pi surface's effective default.
@@ -2110,6 +2148,41 @@ async def test_registered_skill_command_uses_structured_slash_command() -> None:
     rendered = "\n".join(str(item) for item in host.output_calls)
     assert "review this plan" in rendered
     assert "load_skill" not in rendered
+
+
+def test_register_skill_commands_skips_non_user_invocable() -> None:
+    """``user-invocable: false`` skills are not registered as REPL slash commands."""
+    from omnigent.repl import _repl as repl_mod
+
+    invocable = SkillSpec(name="visible-skill", description="d", content="c")
+    internal = SkillSpec(name="internal-skill", description="d", content="c", user_invocable=False)
+    registered = repl_mod.register_skill_commands([invocable, internal])
+    try:
+        assert "/visible-skill" in registered
+        assert "/internal-skill" not in registered
+        assert "/internal-skill" not in repl_mod.COMMANDS
+    finally:
+        repl_mod.unregister_skill_commands(registered)
+
+
+def test_register_skill_commands_skips_invalid_command_names() -> None:
+    """Skill names that aren't valid slash-command tokens are skipped + not registered."""
+    from omnigent.repl import _repl as repl_mod
+
+    valid = SkillSpec(name="superpowers:using-superpowers", description="d", content="c")
+    namespaced = SkillSpec(name="fe-innovate--innovate", description="d", content="c")
+    spacey = SkillSpec(name="bad name", description="d", content="c")
+    slashy = SkillSpec(name="etc/hosts", description="d", content="c")
+    registered = repl_mod.register_skill_commands([valid, namespaced, spacey, slashy])
+    try:
+        assert "/superpowers:using-superpowers" in registered  # ``:`` namespace ok
+        assert "/fe-innovate--innovate" in registered  # ``--`` namespace ok
+        assert "/bad name" not in registered
+        assert "/etc/hosts" not in registered
+        assert "/bad name" not in repl_mod.COMMANDS
+        assert "/etc/hosts" not in repl_mod.COMMANDS
+    finally:
+        repl_mod.unregister_skill_commands(registered)
 
 
 def test_consume_pending_local_skill_slash_command_only_suppresses_match() -> None:

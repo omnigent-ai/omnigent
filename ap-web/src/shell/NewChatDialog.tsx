@@ -20,6 +20,8 @@ import {
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -187,6 +189,20 @@ const CODEX_NATIVE_APPROVAL_MODES: {
     args: ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
   },
 ];
+
+// Conversation-label key for the DANGEROUS codex full-bypass opt-in. When
+// set to "1" the runner launches Codex with
+// `--dangerously-bypass-approvals-and-sandbox` (no approval prompts, no
+// command sandbox) — see omnigent.stores.conversation_store
+// CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY. Stored as a label (cheap thread
+// metadata) so it survives reload. Mutually exclusive in spirit with the
+// approval-mode presets above: when bypass is on the runner strips any
+// `--sandbox` / `--ask-for-approval` flags those presets would emit.
+const CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox";
+// The exact phrase a user must TYPE (not just click) to arm full bypass.
+// A typed confirmation makes the dangerous mode impossible to enable by an
+// accidental click; the toggle stays off until this is entered verbatim.
+const CODEX_NATIVE_BYPASS_SANDBOX_CONFIRM_PHRASE = "bypass sandbox";
 
 function HostOption({ host }: { host: Host }) {
   const isOnline = host.status === "online";
@@ -725,6 +741,94 @@ function ApprovalModeOptions({
 }
 
 /**
+ * DANGEROUS full-bypass opt-in for the Codex-native agent, rendered inside
+ * the Advanced settings menu in the composer footer below the approval-mode
+ * rows.
+ *
+ * Enabling this launches Codex with
+ * ``--dangerously-bypass-approvals-and-sandbox`` — no approval prompts and
+ * no command sandbox. To make that impossible to enable accidentally the
+ * Switch is disabled until the user TYPES the confirmation phrase verbatim;
+ * only then can it be flipped on. While on, a persistent red banner warns
+ * that approvals and the sandbox are disabled. Turning it off (or clearing
+ * the phrase) immediately disarms it.
+ *
+ * @param enabled Whether full bypass is currently armed.
+ * @param onEnabledChange Callback toggling the armed state.
+ */
+function BypassSandboxOption({
+  enabled,
+  onEnabledChange,
+}: {
+  enabled: boolean;
+  onEnabledChange: (enabled: boolean) => void;
+}) {
+  const [confirmText, setConfirmText] = useState<string>("");
+  // VERBATIM match — no trim, no case-folding. The user must type exactly the
+  // phrase we display (CODEX_NATIVE_BYPASS_SANDBOX_CONFIRM_PHRASE); a stray
+  // space or different case must NOT arm this dangerous mode.
+  const phraseMatches = confirmText === CODEX_NATIVE_BYPASS_SANDBOX_CONFIRM_PHRASE;
+  // The toggle can only be flipped ON once the phrase matches; it can always
+  // be flipped OFF. A click while unconfirmed is ignored (defense in depth on
+  // top of the disabled attribute).
+  const canToggleOn = phraseMatches || enabled;
+  return (
+    <div className="px-2 py-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 text-xs font-medium text-destructive">
+          <TriangleAlertIcon className="size-3.5 shrink-0" />
+          <span>Bypass approvals &amp; sandbox</span>
+        </div>
+        <Switch
+          size="sm"
+          checked={enabled}
+          disabled={!canToggleOn}
+          data-testid="new-chat-landing-bypass-sandbox-switch"
+          aria-label="Bypass approvals and sandbox"
+          onCheckedChange={(next) => {
+            // Guard: never let it arm without a verbatim confirmation.
+            if (next && !phraseMatches) return;
+            onEnabledChange(next);
+          }}
+        />
+      </div>
+      <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+        Runs Codex with no approval prompts and no command sandbox. To enable, type{" "}
+        <span className="font-semibold">{CODEX_NATIVE_BYPASS_SANDBOX_CONFIRM_PHRASE}</span> below.
+      </p>
+      {!enabled && (
+        <Input
+          value={confirmText}
+          onChange={(e) => setConfirmText(e.target.value)}
+          placeholder={CODEX_NATIVE_BYPASS_SANDBOX_CONFIRM_PHRASE}
+          spellCheck={false}
+          autoCapitalize="off"
+          autoCorrect="off"
+          className="mt-1.5 h-7 text-xs"
+          data-testid="new-chat-landing-bypass-sandbox-confirm"
+          aria-label="Type the confirmation phrase to enable bypass"
+          // Don't let typing here steer the menu's typeahead focus.
+          onKeyDown={(e) => e.stopPropagation()}
+        />
+      )}
+      {enabled && (
+        <div
+          role="alert"
+          data-testid="new-chat-landing-bypass-sandbox-banner"
+          className="mt-1.5 flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-[11px] font-medium leading-relaxed text-destructive"
+        >
+          <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+          <span>
+            Danger: this session runs Codex with approvals and the sandbox disabled. It can edit any
+            file and run any command without asking.
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
  * Cursor execution-mode radio rows, rendered inside the Advanced settings
  * menu in the composer footer. Mirror of {@link PermissionModeOptions}
  * for the Cursor native agent.
@@ -960,6 +1064,12 @@ export function NewChatLandingScreen() {
   // the codex-native wrapper; ignored otherwise. Lives in the footer
   // tray's Advanced settings menu.
   const [approvalMode, setApprovalMode] = useState<string>(CODEX_NATIVE_DEFAULT_APPROVAL_MODE);
+  // DANGEROUS codex full-bypass opt-in (Codex only). OFF by default and only
+  // flippable on after the user types the confirmation phrase, so it can
+  // never be enabled by an accidental click. Persisted as a conversation
+  // label so it survives reload. When on, a persistent red banner warns and
+  // the runner ignores the approval-mode preset's flags.
+  const [bypassSandbox, setBypassSandbox] = useState<boolean>(false);
   // Execution mode for Cursor (cursor-agent --mode / --yolo). Only meaningful
   // for the cursor-native wrapper; ignored otherwise.
   const [cursorExecMode, setCursorExecMode] = useState<string>(CURSOR_NATIVE_DEFAULT_EXEC_MODE);
@@ -1054,6 +1164,16 @@ export function NewChatLandingScreen() {
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
+  // Defense in depth for the DANGEROUS bypass toggle: never let an armed
+  // bypass carry across an agent change. Switching the picker to another
+  // agent — or away from Codex and back — must require the typed confirmation
+  // again, the same per-context re-opt-in the store enforces for fork /
+  // agent-switch (CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY is instance-scoped).
+  // Keyed on the effective agent id so it also fires when a persisted pick
+  // resolves to a different agent on mount.
+  useEffect(() => {
+    setBypassSandbox(false);
+  }, [effectiveAgentId]);
   // Native-terminal agents interpret slash commands inside their own CLI
   // (the runner injects the text verbatim), so the landing composer must
   // not intercept them — no skills menu, no slash_command routing.
@@ -1379,7 +1499,21 @@ export function NewChatLandingScreen() {
                     ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
                     : undefined,
                 }),
-            labels: nativeLabels,
+            // Native terminal agents open terminal-first: `omnigent.ui:
+            // terminal` tells the UI to render the terminal wrapper, and
+            // `omnigent.wrapper` selects which CLI bridge the runner launches.
+            // The values are the registered wrapper ids the runner keys off —
+            // they must match the wrapper registry, not the agent display name.
+            // The DANGEROUS codex full-bypass opt-in rides along as an extra
+            // label (only when the toggle is armed for a codex-native agent)
+            // so the runner launches with --dangerously-bypass-approvals-and-
+            // sandbox and the choice survives reload.
+            labels:
+              agentSupportsApprovalMode && bypassSandbox
+                ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+                : nativeLabels,
+            // Permission / approval / cursor mode → CLI flag pair, persisted as
+            // terminal_launch_args. Omitted for the default and non-native agents.
             terminal_launch_args:
               agentSupportsPermissionMode &&
               permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
@@ -2113,6 +2247,11 @@ export function NewChatLandingScreen() {
                           Approval mode
                         </div>
                         <ApprovalModeOptions value={approvalMode} onValueChange={setApprovalMode} />
+                        <DropdownMenuSeparator />
+                        <BypassSandboxOption
+                          enabled={bypassSandbox}
+                          onEnabledChange={setBypassSandbox}
+                        />
                       </>
                     )}
                     {/* Execution mode (Cursor only) — cursor-native has no
@@ -2155,6 +2294,25 @@ export function NewChatLandingScreen() {
                   harnessWarningHost?.name,
                   selectedAgentUnavailableReason,
                 )}
+              </span>
+            </p>
+          )}
+
+          {/* Persistent danger banner — stays under the composer while full
+              bypass is armed (the in-menu banner vanishes when the Advanced
+              tray closes), so the dangerous stance is always visible before
+              the session is created. Gated on the codex-native capability so
+              a stale toggle from a since-switched agent can't show it. */}
+          {supportsApprovalMode && bypassSandbox && (
+            <p
+              role="alert"
+              className="flex items-center gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium text-destructive"
+              data-testid="new-chat-landing-bypass-sandbox-active-banner"
+            >
+              <TriangleAlertIcon className="size-3.5 shrink-0" />
+              <span>
+                Codex will run with approvals and the sandbox disabled — it can edit any file and
+                run any command without asking.
               </span>
             </p>
           )}

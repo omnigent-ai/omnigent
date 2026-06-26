@@ -1175,6 +1175,96 @@ class TestSystemMessages(unittest.TestCase):
             self.assertIsInstance(events[0], ExecutorError)
             self.assertIn("authentication failed", events[0].message)
             self.assertIn("401", events[0].message)
+            # Non-gateway executor should suggest checking CLI login, not databrickscfg
+            self.assertIn("claude /status", events[0].message)
+            self.assertNotIn("databrickscfg", events[0].message)
+
+        _run(_t())
+
+    def test_auth_retry_databricks_gateway_mentions_databrickscfg(self):
+        """Databricks-profile gateway auth errors should mention ~/.databrickscfg."""
+        from claude_agent_sdk.types import (
+            ClaudeAgentOptions as SDKClaudeAgentOptions,
+        )
+        from claude_agent_sdk.types import (
+            StreamEvent as SDKStreamEvent,
+        )
+        from claude_agent_sdk.types import (
+            SystemMessage as SDKSystemMessage,
+        )
+
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        class _Sentinel:
+            pass
+
+        class _FakeSDK:
+            AssistantMessage = _Sentinel
+            ResultMessage = _Sentinel
+            UserMessage = _Sentinel
+            SystemMessage = SDKSystemMessage
+            StreamEvent = SDKStreamEvent
+            ClaudeAgentOptions = SDKClaudeAgentOptions
+            messages = [
+                SDKSystemMessage(
+                    subtype="api_retry",
+                    data={
+                        "type": "system",
+                        "subtype": "api_retry",
+                        "attempt": 1,
+                        "max_retries": 10,
+                        "retry_delay_ms": 500,
+                        "error_status": 401,
+                        "error": "authentication_failed",
+                    },
+                )
+            ]
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    return None
+
+                async def receive_response(self):
+                    for message in _FakeSDK.messages:
+                        yield message
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            # Create a gateway executor that uses a Databricks profile path.
+            # gateway=True + no host/base_url overrides → _gateway_uses_databricks_profile is True.
+            # Patch _resolve_gateway_env to avoid needing a real ~/.databrickscfg.
+            with patch(
+                "omnigent.inner.claude_sdk_executor._resolve_gateway_env",
+                return_value={
+                    "ANTHROPIC_BASE_URL": "https://host/ai-gateway/anthropic",
+                    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "900000",
+                    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+                    "OMNIGENT_CLAUDE_API_KEY_HELPER": "databricks auth token ...",
+                },
+            ):
+                executor = ClaudeSDKExecutor(gateway=True)
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "hello"}],
+                        [],
+                        "",
+                    )
+                ]
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], ExecutorError)
+            self.assertIn("authentication failed", events[0].message)
+            # Databricks gateway should mention databrickscfg
+            self.assertIn("databrickscfg", events[0].message)
 
         _run(_t())
 

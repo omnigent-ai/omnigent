@@ -1882,10 +1882,18 @@ class SessionLiveness:
         Used only to choose what the open view shows when
         ``runner_online`` is ``False``; never participates in the
         reachability decision.
+    :param host_version: Version string from the bound host's
+        ``host.hello`` frame, e.g. ``"0.1.0"`` — surfaced in the
+        session info popover. ``None`` when the session has no host
+        binding, the host is offline, or its version isn't resolvable
+        on this replica (the version lives in the in-memory host
+        registry, not the hosts table, so a host connected to another
+        replica reads ``None`` here).
     """
 
     runner_online: bool
     host_online: bool | None
+    host_version: str | None = None
 
 
 def _build_session_list_item(
@@ -2600,7 +2608,22 @@ def _resolve_harness(conv: Conversation | None) -> str | None:
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
         executor = loaded.spec.executor
-        harness = executor.config.get("harness") or executor.type
+        # For a bundled-agent head sub-agent, report the HEAD's own harness,
+        # not the bundle brain's — `harness` is this session's provider family
+        # (a gpt head runs codex, not the claude-sdk brain). Falls back to the
+        # brain harness when the head declares none or can't be matched.
+        if conv.sub_agent_name:
+            sub = next(
+                (s for s in loaded.spec.sub_agents if s.name == conv.sub_agent_name),
+                None,
+            )
+            if sub is not None:
+                executor = sub.executor
+        harness = (
+            executor.config.get("harness")
+            or loaded.spec.executor.config.get("harness")
+            or executor.type
+        )
         return canonicalize_harness(harness) or harness
     except (KeyError, AttributeError, ValueError, ImportError, OSError):
         return None
@@ -3886,6 +3909,45 @@ def _spawn_native_approval_popup_forward(
             {
                 "type": "cost_approval_popup",
                 "elicitation_id": elicitation_id,
+                "message": message,
+                "policy_name": policy_name,
+            },
+        )
+
+    task = asyncio.create_task(_forward())
+    _native_popup_forward_tasks.add(task)
+    task.add_done_callback(_native_popup_forward_tasks.discard)
+
+
+def _spawn_native_blocked_notice_forward(
+    session_id: str, message: str, policy_name: str | None = None
+) -> None:
+    """
+    Ask the bound runner to pop an INFORMATIONAL hard-block notice on the pane.
+
+    The request-phase HARD-DENY counterpart of
+    :func:`_spawn_native_approval_popup_forward`: no approve/decline (the prompt
+    is blocked). opencode can only hard-block a prompt by its policy plugin
+    throwing, which opencode renders as a generic "Unexpected server error";
+    this forwards the policy reason so the runner can surface it as a dismissable
+    tmux popup on the opencode pane. Fire-and-forget; the runner dispatch is
+    harness-gated (only ``opencode-native`` pops — claude/codex already show a
+    clean ``UserPromptSubmit`` block, so they no-op).
+
+    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
+    :param message: The block reason shown in the popup.
+    :param policy_name: Deciding policy, rendered as the popup header. ``None``
+        falls back to a generic header on the runner.
+    :returns: None. Forwarding failures (runner offline / none bound) are
+        swallowed and never affect the verdict.
+    """
+
+    async def _forward() -> None:
+        await _forward_session_change_to_runner(
+            session_id,
+            _server_runner_router,
+            {
+                "type": "policy_blocked_notice",
                 "message": message,
                 "policy_name": policy_name,
             },
@@ -9674,9 +9736,9 @@ def _agent_is_native(agent: Agent) -> bool:
 
     Loads the agent's spec to read its ``harness_kind``. Native targets run
     a vendor TUI in a terminal (claude-native / codex-native / pi-native /
-    cursor-native). This is broader than "can replay fork history" — only
-    claude/codex native carry the transcript-rebuild path; use
-    ``_agent_carries_native_fork_history`` for that narrower gate. Returns
+    cursor-native). This is broader than "can replay fork history" — every
+    native harness except cursor-native carries the session-file-rebuild path;
+    use ``_agent_carries_native_fork_history`` for that narrower gate. Returns
     ``False`` when the bundle can't be loaded (treated as non-native).
 
     :param agent: The agent whose harness to classify.
@@ -9697,37 +9759,48 @@ def _agent_is_native(agent: Agent) -> bool:
 
 # Native harnesses that rebuild a resumable on-disk transcript from the copied
 # Omnigent items and relaunch the CLI with --resume, so prior turns reappear as
-# native chat history. Used by BOTH fork and switch-agent. Both spellings are
-# listed because canonicalize_harness passes the reversed native ids through
-# unchanged (only "native-pi" is aliased) — same reasoning as
-# model_override._CLAUDE_FAMILY_HARNESSES.
+# native chat history. Used by BOTH fork and switch-agent. claude/codex are
+# listed in both spellings because canonicalize_harness passes their reversed
+# native ids through unchanged; pi-native needs only the one canonical id
+# ("native-pi" is aliased to "pi-native") — same reasoning as
+# model_override._CLAUDE_FAMILY_HARNESSES. pi-native rebuilds the Pi CLI's JSONL
+# session file from copied items (omnigent/pi_native_resume.py), the same
+# file-based mechanism claude/codex use.
 #
 # cursor is intentionally absent here: its conversation is server-backed (a
 # synthesized/cloned local store.db is NOT loaded by `cursor-agent --resume`),
 # so it can't rebuild a transcript. Instead a FORK carries cursor history as a
 # text preamble (see _CURSOR_FORK_HISTORY_HARNESSES below) — switch-agent keeps
-# the current fresh-launch behavior. pi has no carry-history path yet.
+# the current fresh-launch behavior.
 _FORK_HISTORY_NATIVE_HARNESSES: frozenset[str] = frozenset(
-    {"claude-native", "native-claude", "codex-native", "native-codex"}
+    {"claude-native", "native-claude", "codex-native", "native-codex", "pi-native"}
 )
 
 # Native harnesses that carry FORK history as a text preamble (text-prefix
 # replay) instead of a rebuilt transcript. Fork-only — switch-agent does not
-# use this set, so switching into cursor still launches fresh. The runner
-# branches on the harness to choose preamble vs transcript rebuild (see
-# _auto_create_cursor_terminal / cursor_native_executor).
-_CURSOR_FORK_HISTORY_HARNESSES: frozenset[str] = frozenset({"cursor-native", "native-cursor"})
+# use this set, so switching into one still launches fresh. The runner branches
+# on the harness to choose preamble vs transcript rebuild (see
+# _auto_create_cursor_terminal / cursor_native_executor and the opencode
+# resume/fork rehydration in _auto_create_opencode_terminal). opencode-native
+# joins cursor here: opencode has no history-import API, so a fork seeds prior
+# context as a noReply preamble rather than a rebuilt session.
+_CURSOR_FORK_HISTORY_HARNESSES: frozenset[str] = frozenset(
+    {"cursor-native", "native-cursor", "opencode-native", "native-opencode"}
+)
 
 
 def _agent_carries_native_fork_history(agent: Agent) -> bool:
     """Return whether *agent*'s native harness rebuilds a fork's transcript.
 
-    Only claude-native / codex-native record a resumable native session and can
-    rebuild a fork's transcript from the copied Omnigent items. Used by both
-    fork and switch-agent. cursor carries fork history a different way (a text
-    preamble, fork-only — see :func:`_agent_carries_cursor_fork_history`); pi has
-    no carry-history path yet. Returns ``False`` when the bundle can't be loaded
-    (treated as non-carrying).
+    claude-native / codex-native / pi-native each record a resumable native
+    session file that the runner rebuilds from the copied Omnigent items on
+    fork/resume, so a fork bound to one of them carries prior history into the
+    native CLI. Used by both fork and switch-agent. cursor-native is a native
+    CLI but has no resumable session file to rebuild; it carries fork history a
+    different way (a text preamble, fork-only — see
+    :func:`_agent_carries_cursor_fork_history`), so stamping
+    ``carry_history_into_native`` for it here would be a false promise. Returns
+    ``False`` when the bundle can't be loaded (treated as non-carrying).
 
     :param agent: The agent whose harness to classify.
     :returns: ``True`` only for transcript-rebuild native harnesses.
@@ -9746,16 +9819,17 @@ def _agent_carries_native_fork_history(agent: Agent) -> bool:
 
 
 def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
-    """Return whether *agent* is cursor-native (carries FORK history via preamble).
+    """Return whether *agent*'s native harness carries FORK history via preamble.
 
-    Cursor's conversation is server-backed, so a fork can't seed a local store
-    for ``--resume``; instead the runner replays the prior turns as a text
-    preamble on the fork's first message. Fork-only — switch-agent does not call
-    this, so switching into cursor still launches fresh. Returns ``False`` when
-    the bundle can't be loaded.
+    Cursor's conversation is server-backed and opencode has no history-import
+    API, so neither can seed a local store for a rebuilt resume; instead the
+    runner replays prior turns as a text preamble on the fork (cursor: the
+    first message; opencode: a ``noReply`` context message). Fork-only —
+    switch-agent does not call this, so switching into one still launches fresh.
+    Returns ``False`` when the bundle can't be loaded.
 
     :param agent: The agent whose harness to classify.
-    :returns: ``True`` only for the cursor-native harness (either spelling).
+    :returns: ``True`` for the cursor-native / opencode-native harnesses.
     """
     from omnigent.harness_aliases import canonicalize_harness
 
@@ -9984,7 +10058,7 @@ def _build_actor(user_id: str | None) -> dict[str, str] | None:
 
 def _build_evaluation_context(
     phase: Phase,
-    data: dict[str, Any],
+    data: dict[str, Any] | str,
     event: dict[str, Any],
     *,
     actor: dict[str, str] | None = None,
@@ -10062,8 +10136,18 @@ def _build_evaluation_context(
             model=hook_model,
             harness=hook_harness,
         )
-    # REQUEST / RESPONSE — content is the user/assistant text.
-    text = data.get("text") or data.get("content") or str(data)
+    # REQUEST / RESPONSE — content is the user/assistant text. The wire ``data``
+    # is a dict for the native command hooks (``{"text"|"content": ...}``), but
+    # may be a bare string — opencode's policy plugin sends the prompt text
+    # directly for ``PHASE_REQUEST``. Accept both, and NEVER raise here: a crash
+    # 500s the evaluate endpoint, which silently fails the request/result gate
+    # OPEN (the exact symptom that let cost-over-budget terminal prompts through).
+    if isinstance(data, str):
+        text = data
+    elif isinstance(data, dict):
+        text = data.get("text") or data.get("content") or str(data)
+    else:
+        text = str(data)
     return EvaluationContext(
         phase=phase,
         content=text if isinstance(text, str) else json.dumps(text),
@@ -14529,12 +14613,13 @@ def create_sessions_router(
         # items (the converters consume Omnigent's normalized item shape, so
         # the source harness doesn't matter). SDK targets replay the
         # transcript as context regardless, so the marker is inert for them.
-        # claude/codex native rebuild the transcript; cursor native instead
-        # replays prior turns as a text preamble (its conversation is
-        # server-backed, so a local store can't be seeded — fork-only, see
-        # _agent_carries_cursor_fork_history). pi has no carry path yet, so don't
-        # stamp a promise it would break with a fresh launch. The single
-        # FORK_CARRY_HISTORY label drives both; the runner branches on harness.
+        # claude/codex/pi native rebuild the transcript (each rebuilds its
+        # resumable session file from the copied items, so all three sit in
+        # _FORK_HISTORY_NATIVE_HARNESSES); cursor native instead replays prior
+        # turns as a text preamble (its conversation is server-backed, so a
+        # local store can't be seeded — fork-only, see
+        # _agent_carries_cursor_fork_history). The single FORK_CARRY_HISTORY
+        # label drives both; the runner branches on harness.
         target_is_cursor = await asyncio.to_thread(_agent_carries_cursor_fork_history, base_agent)
         carry_history_into_native = target_is_cursor or await asyncio.to_thread(
             _agent_carries_native_fork_history, base_agent
@@ -14735,9 +14820,10 @@ def create_sessions_router(
         copy_model_settings = await asyncio.to_thread(
             _same_provider_family, current_agent, target_agent
         )
-        # Only claude/codex native can replay fork history; cursor/pi native
-        # can't (no resumable session, TUI can't import a transcript), so don't
-        # stamp a carry-history promise they'd silently break with a fresh launch.
+        # claude/codex/pi native can replay fork history (each rebuilds its
+        # resumable session file from the copied items); cursor-native can't
+        # (no resumable session file), so don't stamp a carry-history promise
+        # it would silently break with a fresh launch.
         carry_history_into_native = await asyncio.to_thread(
             _agent_carries_native_fork_history, target_agent
         )
@@ -15383,6 +15469,15 @@ def create_sessions_router(
             resp_body["reason"] = result.reason
         if result.data is not None:
             resp_body["data"] = result.data
+        # A request-phase HARD DENY (no approve option) — surface the reason as a
+        # dismissable tmux popup on the native pane. opencode hard-blocks the
+        # prompt by its plugin throwing (rendered as a generic error), so this is
+        # the clean explanation; the runner dispatch only pops for opencode
+        # (claude/codex already show a clean UserPromptSubmit block). Best-effort.
+        if result.action == PolicyAction.DENY and phase == Phase.REQUEST and not is_read_only:
+            _spawn_native_blocked_notice_forward(
+                session_id, result.reason or "Blocked by policy.", result.deciding_policy
+            )
         return Response(
             content=json.dumps(resp_body),
             media_type="application/json",
