@@ -8,8 +8,8 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from omnigent.db.db_models import SqlSessionPermission, SqlUser
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
-from omnigent.entities import ResolvedAccess, SessionPermission
-from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
+from omnigent.entities import ResolvedAccess, SessionPermission, UserRecord
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.stores.permission_store import PermissionStore
 
 
@@ -234,6 +234,20 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """Set the admin flag on an existing user. See base class for contract."""
         with self._session() as session:
             session.execute(update(SqlUser).where(SqlUser.id == user_id).values(is_admin=is_admin))
+
+    def list_users(self) -> list[UserRecord]:
+        """List real users, reserved sentinels excluded. See base class."""
+        with self._session() as session:
+            rows = (
+                session.execute(
+                    select(SqlUser.id, SqlUser.is_admin)
+                    .where(SqlUser.id.notin_([RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC]))
+                    .order_by(SqlUser.id)
+                )
+                .tuples()
+                .all()
+            )
+            return [UserRecord(user_id=uid, is_admin=bool(is_admin)) for uid, is_admin in rows]
 
     def check_access(
         self,

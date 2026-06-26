@@ -457,6 +457,52 @@ def test_is_admin_false_for_nonexistent_user(store: SqlAlchemyPermissionStore) -
     )
 
 
+# ── list_users ───────────────────────────────────────────────────────────────
+
+
+def test_list_users_empty(store: SqlAlchemyPermissionStore) -> None:
+    """``list_users`` returns [] when there are no users."""
+    assert store.list_users() == []
+
+
+def test_list_users_returns_all_sorted_with_admin_flag(
+    store: SqlAlchemyPermissionStore,
+) -> None:
+    """``list_users`` returns every user, sorted by id, with the admin flag."""
+    store.ensure_user("carol@test.com", is_admin=False)
+    store.ensure_user("alice@test.com", is_admin=True)
+    store.ensure_user("bob@test.com", is_admin=False)
+
+    users = store.list_users()
+
+    assert [u.user_id for u in users] == [
+        "alice@test.com",
+        "bob@test.com",
+        "carol@test.com",
+    ]
+    by_id = {u.user_id: u.is_admin for u in users}
+    assert by_id["alice@test.com"] is True
+    assert by_id["bob@test.com"] is False
+    assert by_id["carol@test.com"] is False
+
+
+def test_list_users_excludes_reserved_sentinels(store: SqlAlchemyPermissionStore) -> None:
+    """The reserved ``__public__`` and ``local`` rows are not real users.
+
+    ``local`` is backfilled by the session-permissions migration, so it
+    is present on every DB and must be filtered out of the admin list.
+    """
+    from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+
+    store.ensure_user("alice@test.com")
+    store.ensure_user(RESERVED_USER_PUBLIC)
+
+    ids = [u.user_id for u in store.list_users()]
+    assert "alice@test.com" in ids
+    assert RESERVED_USER_PUBLIC not in ids
+    assert RESERVED_USER_LOCAL not in ids
+
+
 # ── has_any_grants ───────────────────────────────────────────────────────────
 
 

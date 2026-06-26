@@ -50,6 +50,7 @@ from omnigent.server.performance_metrics import (
     publish_server_metrics_periodically,
     set_request_duration_for_access_log,
 )
+from omnigent.server.routes.admin import create_admin_router
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -1732,7 +1733,7 @@ def create_app(
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
-    async def me(request: Request) -> dict[str, str | None] | JSONResponse:
+    async def me(request: Request) -> dict[str, str | bool | None] | JSONResponse:
         """Return the current user's identity.
 
         Reads the user from the auth provider (same logic that
@@ -1757,7 +1758,14 @@ def create_app(
                 status_code=401,
                 content={"user_id": None, "login_url": login_url},
             )
-        return {"user_id": user_id}
+        # is_admin lets the SPA render admin chrome (the user list /
+        # session-browser) under OIDC, where the accounts Members page
+        # never mounts. Resolved live — it is never baked into the
+        # session cookie. False whenever permissions are disabled.
+        is_admin = False
+        if user_id is not None and permission_store is not None:
+            is_admin = await asyncio.to_thread(permission_store.is_admin, user_id)
+        return {"user_id": user_id, "is_admin": is_admin}
 
     app.include_router(
         create_sessions_router(
@@ -1852,6 +1860,18 @@ def create_app(
             ),
             prefix="/v1",
             tags=["default_policies"],
+        )
+    if permission_store is not None:
+        # Admin discovery surface (user list + per-user session browse).
+        # Multi-user only; in single-user mode there is nothing to admin.
+        app.include_router(
+            create_admin_router(
+                permission_store,
+                conversation_store,
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+            tags=["admin"],
         )
     app.include_router(
         create_policy_registry_router(auth_provider=auth_provider),
