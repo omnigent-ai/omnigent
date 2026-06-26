@@ -512,10 +512,14 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             await expect(trigger).to_contain_text("Sonnet")
             await expect(trigger).to_contain_text("Medium")
 
-            # Model + effort are two radio groups in one menu; selecting an item
-            # closes the menu, so reopen between the two picks.
+            # Model + effort are two radio groups in one menu; picking an item
+            # closes the menu, so reopen between the two picks. Selecting returns
+            # focus to the trigger, and a reopen click that races the close is
+            # swallowed — wait for the menu to fully close (the just-picked row
+            # detached) before reopening so the second click reliably reopens it.
             await trigger.click()
             await page.get_by_test_id("new-chat-landing-model-opus").click()
+            await expect(page.get_by_test_id("new-chat-landing-model-opus")).to_be_hidden()
             await trigger.click()
             await page.get_by_test_id("new-chat-landing-effort-high").click()
             await expect(trigger).to_contain_text("Opus")
