@@ -21,6 +21,7 @@ import {
   CircleStopIcon,
   FolderIcon,
   FolderInputIcon,
+  FolderMinusIcon,
   FolderOpenIcon,
   GitBranchIcon,
   InboxIcon,
@@ -43,6 +44,20 @@ import {
   Trash2Icon,
   XIcon,
 } from "lucide-react";
+import {
+  DndContext,
+  DragOverlay,
+  type DragEndEvent,
+  type DragStartEvent,
+  MeasuringStrategy,
+  MouseSensor,
+  pointerWithin,
+  TouchSensor,
+  useDraggable,
+  useDroppable,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
@@ -116,6 +131,8 @@ import {
   normalizePinnedConversationIds,
   orderByPinnedSequence,
   PINNED_CONVERSATION_IDS_STORAGE_KEY,
+  resolveSidebarDrop,
+  type SidebarDropTarget,
   sortByUpdatedAtDesc,
   togglePinnedConversationId,
 } from "./sidebarNav";
@@ -126,6 +143,13 @@ import {
 // on mobile it sits left of the always-visible controls (right-[4.5rem]).
 const TIME_MARKER_SLOT_CLASS =
   "-translate-y-1/2 pointer-events-none absolute top-1/2 right-[4.5rem] flex h-5 items-center transition-opacity md:right-2 md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+
+// Highlight applied to a drop target while a draggable session hovers it: a
+// subtle background tint — no border, no shadow. Keyed on --primary like the
+// row-selection highlight in this file, at /5 (half the original /10) so it's a
+// gentler gray in light mode (a gentler glow in dark mode) and reads as "active
+// area" without the heavy fill. Pair with `transition-colors` so it eases in.
+const DROP_TARGET_HIGHLIGHT = "bg-primary/5";
 
 interface SidebarProps {
   open: boolean;
@@ -678,45 +702,63 @@ function ProjectFolder({
   // chats" empty state (which would otherwise flash before rows arrive).
   const loadingFirstPage = expanded && query.isLoading;
 
+  // The whole folder (collapsed header included) is a drop target: releasing a
+  // dragged session anywhere on it files the session into this project. The
+  // `project:` prefix keeps the droppable id clear of conversation ids (the
+  // draggable ids) and the ungroup sentinel.
+  const { setNodeRef, isOver } = useDroppable({
+    id: `project:${name}`,
+    data: { type: "project", name },
+  });
+
   return (
-    <ConversationSection
-      title={name}
-      icon={
-        expanded ? (
-          <FolderOpenIcon className="size-4 shrink-0" />
-        ) : (
-          <FolderIcon className="size-4 shrink-0" />
-        )
-      }
-      marker={marker}
-      conversations={conversations}
-      pinnedConversationIds={pinnedConversationIds}
-      // Projects default collapsed: shown only when explicitly expanded.
-      collapsed={!expanded}
-      onToggleCollapsed={onToggleCollapsed}
-      onRowClick={onRowClick}
-      onTogglePinned={onTogglePinned}
-      selectionMode={selectionMode}
-      selectedIds={selectedIds}
-      onToggleSelected={onToggleSelected}
-      onProjectAssigned={onProjectAssigned}
-      emptyMessage={loadingFirstPage ? undefined : "No chats"}
-      indentRows
-      headerAction={<ProjectFolderActions projectName={name} onNavigate={onRowClick} />}
-      footer={
-        loadingFirstPage ? (
-          <p className="px-2 py-1 pl-7 text-muted-foreground text-xs">Loading…</p>
-        ) : (
-          <InfiniteScrollSentinel
-            hasMore={query.hasNextPage}
-            isFetching={query.isFetchingNextPage}
-            fetchMore={query.fetchNextPage}
-            scrollRoot={scrollRoot}
-            indent
-          />
-        )
-      }
-    />
+    <div
+      ref={setNodeRef}
+      className={cn(
+        "rounded-md transition-colors",
+        // Subtle background tint on drag-over — no border, no shadow.
+        isOver && DROP_TARGET_HIGHLIGHT,
+      )}
+    >
+      <ConversationSection
+        title={name}
+        icon={
+          expanded ? (
+            <FolderOpenIcon className="size-4 shrink-0" />
+          ) : (
+            <FolderIcon className="size-4 shrink-0" />
+          )
+        }
+        marker={marker}
+        conversations={conversations}
+        pinnedConversationIds={pinnedConversationIds}
+        // Projects default collapsed: shown only when explicitly expanded.
+        collapsed={!expanded}
+        onToggleCollapsed={onToggleCollapsed}
+        onRowClick={onRowClick}
+        onTogglePinned={onTogglePinned}
+        selectionMode={selectionMode}
+        selectedIds={selectedIds}
+        onToggleSelected={onToggleSelected}
+        onProjectAssigned={onProjectAssigned}
+        emptyMessage={loadingFirstPage ? undefined : "No chats"}
+        indentRows
+        headerAction={<ProjectFolderActions projectName={name} onNavigate={onRowClick} />}
+        footer={
+          loadingFirstPage ? (
+            <p className="px-2 py-1 pl-7 text-muted-foreground text-xs">Loading…</p>
+          ) : (
+            <InfiniteScrollSentinel
+              hasMore={query.hasNextPage}
+              isFetching={query.isFetchingNextPage}
+              fetchMore={query.fetchNextPage}
+              scrollRoot={scrollRoot}
+              indent
+            />
+          )
+        }
+      />
+    </div>
   );
 }
 
@@ -902,6 +944,103 @@ function ConversationList({
       return next;
     });
   }, []);
+
+  // ── Drag-and-drop: file sessions into / out of projects ────────────────────
+  // A session row can be dragged onto a project folder (file it there), onto the
+  // "Chats" list / a fallback strip (unfile it), or onto "Pinned" (pin it, which
+  // floats it out of its project). "Shared with me" is deliberately not a drop
+  // target — you can't file sessions there. The kebab "Move session" menu + the
+  // pin button remain the keyboard-accessible paths; DnD is a pointer
+  // enhancement on top of them, so the sensors are pointer-only.
+  const moveToProject = useMoveToProject();
+  // The session currently being dragged (id + source project + pinned state), or
+  // null. Set on drag start, cleared on end/cancel; drives the DragOverlay
+  // preview and which drop zones light up (ungroup only for a filed session, pin
+  // only for an unpinned one).
+  const [activeDrag, setActiveDrag] = useState<{
+    id: string;
+    label: string;
+    project: string | null;
+    isPinned: boolean;
+  } | null>(null);
+  // A drop-to-ungroup that turned out to remove the project's last session —
+  // held here to confirm (the implicit project vanishes with it), mirroring the
+  // kebab's "Remove from project" flow. `unpin` carries through whether the
+  // dragged session was also pinned (and so must be unpinned to leave Pinned).
+  const [pendingUngroup, setPendingUngroup] = useState<{
+    id: string;
+    project: string;
+    unpin: boolean;
+  } | null>(null);
+  // Mouse: a small drag threshold so a plain click still navigates / opens the
+  // kebab. Touch: a press-and-hold delay so scrolling the list isn't hijacked
+  // into a drag. Keyboard users use the kebab menu instead (no KeyboardSensor).
+  const sensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 8 } }),
+  );
+  const handleDragStart = useCallback((event: DragStartEvent) => {
+    const data = event.active.data.current as
+      | { label?: string; project?: string | null; isPinned?: boolean }
+      | undefined;
+    setActiveDrag({
+      id: String(event.active.id),
+      label: data?.label ?? String(event.active.id),
+      project: data?.project ?? null,
+      isPinned: data?.isPinned ?? false,
+    });
+  }, []);
+  const handleDragEnd = useCallback(
+    (event: DragEndEvent) => {
+      const dragged = activeDrag;
+      setActiveDrag(null);
+      if (!dragged) return;
+      const target = (event.over?.data.current as SidebarDropTarget | undefined) ?? null;
+      const action = resolveSidebarDrop(
+        { id: dragged.id, project: dragged.project, isPinned: dragged.isPinned },
+        target,
+      );
+      if (action.kind === "move") {
+        moveToProject.mutate({ id: dragged.id, project: action.project });
+        // Unpin a pinned session so it actually drops into the folder instead of
+        // staying floated up in Pinned (pin outranks project membership).
+        if (action.unpin) onTogglePinned(dragged.id);
+        // Open the (possibly brand-new) folder so the session is visible in it.
+        expandProject(action.project);
+        return;
+      }
+      if (action.kind === "pin" || action.kind === "unpin") {
+        // Toggle the pin: `pin` is only emitted for an unpinned session, `unpin`
+        // only for a pinned one, so a single toggle lands the intended state.
+        // Unpinning a pinned session drops it back into its project / Chats.
+        onTogglePinned(dragged.id);
+        return;
+      }
+      if (action.kind === "ungroup") {
+        const unpin = action.unpin;
+        // Removing a project's LAST session deletes the implicit project, so
+        // confirm that case (server-side check, accurate regardless of the
+        // loaded window); otherwise remove silently. Mirrors the kebab flow.
+        void (async () => {
+          let isLastSession = true;
+          try {
+            const ids = await fetchProjectSessionIds(action.project);
+            isLastSession = ids.every((id) => id === dragged.id);
+          } catch {
+            isLastSession = true;
+          }
+          if (isLastSession) {
+            setPendingUngroup({ id: dragged.id, project: action.project, unpin });
+          } else {
+            moveToProject.mutate({ id: dragged.id, project: "" });
+            if (unpin) onTogglePinned(dragged.id);
+          }
+        })();
+      }
+    },
+    [activeDrag, moveToProject, expandProject, onTogglePinned],
+  );
+
   // "Collapse all" folds every open project folder at once and remembers the
   // set, so a follow-up "Reopen previous" restores exactly what was open
   // (not every folder). The snapshot is session-only — not persisted.
@@ -1015,79 +1154,38 @@ function ConversationList({
   // alone (Linear-style) — no icons or counts in the headers, no divider
   // rules between groups.
   return (
-    <div className="flex flex-col gap-3">
-      {totalVisible === 0 ? (
-        <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
-      ) : (
-        <>
-          {sections.pinned.length > 0 && (
-            <ConversationSection
-              title="Pinned"
-              conversations={sections.pinned}
-              pinnedConversationIds={pinnedConversationIds}
-              collapsed={effectiveCollapsedSections.includes("Pinned")}
-              onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
-              onRowClick={onRowClick}
-              onTogglePinned={onTogglePinned}
-              selectionMode={selectionMode}
-              selectedIds={selectedIds}
-              onToggleSelected={onToggleSelected}
-              onProjectAssigned={expandProject}
-            />
-          )}
-          {/* Projects: a "Projects" group header, with each project rendered as
-              a collapsible folder row nested beneath it. Folders default
-              collapsed; an empty folder shows "No chats". The folder icon marks
-              a project row; the group/section headers carry no icon or count. */}
-          {sections.projectGroups.length > 0 && (
-            <SectionGroup
-              title="Projects"
-              collapsed={effectiveCollapsedSections.includes("Projects")}
-              onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-              headerAction={
-                expandedProjects.length > 0 ? (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label="Collapse all projects"
-                    data-testid="collapse-all-projects"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      collapseAllProjects();
-                    }}
-                  >
-                    <Minimize2Icon className="size-3.5" />
-                  </Button>
-                ) : reopenSnapshot.length > 0 ? (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label="Reopen previous projects"
-                    data-testid="reopen-previous-projects"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      reopenPreviousProjects();
-                    }}
-                  >
-                    <Maximize2Icon className="size-3.5" />
-                  </Button>
-                ) : null
-              }
-            >
-              {sections.projectGroups.map((group) => (
-                <ProjectFolder
-                  key={group.name}
-                  name={group.name}
-                  expanded={expandedProjects.includes(group.name)}
-                  // Best-effort marker from the globally-loaded window: a
-                  // collapsed folder hasn't fetched its own sessions yet.
-                  marker={projectMarkerState(group.conversations)}
-                  onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+    <DndContext
+      sensors={sensors}
+      collisionDetection={pointerWithin}
+      // Always-measure so the transient "remove from project" zone (mounted at
+      // drag start) is registered as a drop target without a stale layout cache.
+      measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
+      onDragStart={handleDragStart}
+      onDragEnd={handleDragEnd}
+      onDragCancel={() => setActiveDrag(null)}
+    >
+      <div className="flex flex-col gap-3">
+        {/* Removing a filed session from its project means dropping it back
+            onto the flat "Chats" list — so the Chats section itself is the
+            ungroup target (wrapped below). This top strip is only a FALLBACK
+            for when there are no ungrouped chats yet, so the Chats section
+            isn't rendered and there'd otherwise be nowhere to drop. */}
+        {activeDrag?.project != null && sections.sessions.length === 0 && <UngroupDropZone />}
+        {totalVisible === 0 ? (
+          <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
+        ) : (
+          <>
+            {sections.pinned.length > 0 && (
+              // Drop a session here to pin it — pin-precedence then floats it
+              // out of any project into this section. Active only while dragging
+              // an unpinned session; outline-only highlight.
+              <PinDropZone active={activeDrag != null && !activeDrag.isPinned}>
+                <ConversationSection
+                  title="Pinned"
+                  conversations={sections.pinned}
                   pinnedConversationIds={pinnedConversationIds}
-                  activeOverride={activeOverride}
-                  scrollRoot={scrollContainerRef}
+                  collapsed={effectiveCollapsedSections.includes("Pinned")}
+                  onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
                   onRowClick={onRowClick}
                   onTogglePinned={onTogglePinned}
                   selectionMode={selectionMode}
@@ -1095,54 +1193,250 @@ function ConversationList({
                   onToggleSelected={onToggleSelected}
                   onProjectAssigned={expandProject}
                 />
-              ))}
-            </SectionGroup>
-          )}
-          {sections.sessions.length > 0 && (
-            <ConversationSection
-              title="Chats"
-              conversations={sections.sessions}
-              pinnedConversationIds={pinnedConversationIds}
-              collapsed={effectiveCollapsedSections.includes("Chats")}
-              onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
-              onRowClick={onRowClick}
-              onTogglePinned={onTogglePinned}
-              selectionMode={selectionMode}
-              selectedIds={selectedIds}
-              onToggleSelected={onToggleSelected}
-              onProjectAssigned={expandProject}
-            />
-          )}
-          {sections.shared.length > 0 && (
-            <ConversationSection
-              title="Shared with me"
-              conversations={sections.shared}
-              pinnedConversationIds={pinnedConversationIds}
-              collapsed={effectiveCollapsedSections.includes("Shared with me")}
-              onToggleCollapsed={() => effectiveToggleSectionCollapsed("Shared with me")}
-              onRowClick={onRowClick}
-              onTogglePinned={onTogglePinned}
-              selectionMode={selectionMode}
-              selectedIds={selectedIds}
-              onToggleSelected={onToggleSelected}
-              onProjectAssigned={expandProject}
-            />
-          )}
-          {/* Archived sessions are no longer listed here — they live on the
+              </PinDropZone>
+            )}
+            {/* Projects: a "Projects" group header, with each project rendered as
+              a collapsible folder row nested beneath it. Folders default
+              collapsed; an empty folder shows "No chats". The folder icon marks
+              a project row; the group/section headers carry no icon or count. */}
+            {sections.projectGroups.length > 0 && (
+              <SectionGroup
+                title="Projects"
+                collapsed={effectiveCollapsedSections.includes("Projects")}
+                onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
+                headerAction={
+                  expandedProjects.length > 0 ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Collapse all projects"
+                      data-testid="collapse-all-projects"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        collapseAllProjects();
+                      }}
+                    >
+                      <Minimize2Icon className="size-3.5" />
+                    </Button>
+                  ) : reopenSnapshot.length > 0 ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Reopen previous projects"
+                      data-testid="reopen-previous-projects"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        reopenPreviousProjects();
+                      }}
+                    >
+                      <Maximize2Icon className="size-3.5" />
+                    </Button>
+                  ) : null
+                }
+              >
+                {sections.projectGroups.map((group) => (
+                  <ProjectFolder
+                    key={group.name}
+                    name={group.name}
+                    expanded={expandedProjects.includes(group.name)}
+                    // Best-effort marker from the globally-loaded window: a
+                    // collapsed folder hasn't fetched its own sessions yet.
+                    marker={projectMarkerState(group.conversations)}
+                    onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                    pinnedConversationIds={pinnedConversationIds}
+                    activeOverride={activeOverride}
+                    scrollRoot={scrollContainerRef}
+                    onRowClick={onRowClick}
+                    onTogglePinned={onTogglePinned}
+                    selectionMode={selectionMode}
+                    selectedIds={selectedIds}
+                    onToggleSelected={onToggleSelected}
+                    onProjectAssigned={expandProject}
+                  />
+                ))}
+              </SectionGroup>
+            )}
+            {sections.sessions.length > 0 && (
+              // Drop a session here to send it to the flat "Chats" list — where
+              // unfiled, unpinned sessions live. Active while dragging a filed
+              // session (removes it from its project) or a pinned one (unpins
+              // it), since both have somewhere to land here.
+              <ChatsDropZone
+                active={activeDrag != null && (activeDrag.project != null || activeDrag.isPinned)}
+              >
+                <ConversationSection
+                  title="Chats"
+                  conversations={sections.sessions}
+                  pinnedConversationIds={pinnedConversationIds}
+                  collapsed={effectiveCollapsedSections.includes("Chats")}
+                  onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
+                  onRowClick={onRowClick}
+                  onTogglePinned={onTogglePinned}
+                  selectionMode={selectionMode}
+                  selectedIds={selectedIds}
+                  onToggleSelected={onToggleSelected}
+                  onProjectAssigned={expandProject}
+                />
+              </ChatsDropZone>
+            )}
+            {sections.shared.length > 0 && (
+              <ConversationSection
+                title="Shared with me"
+                conversations={sections.shared}
+                pinnedConversationIds={pinnedConversationIds}
+                collapsed={effectiveCollapsedSections.includes("Shared with me")}
+                onToggleCollapsed={() => effectiveToggleSectionCollapsed("Shared with me")}
+                onRowClick={onRowClick}
+                onTogglePinned={onTogglePinned}
+                selectionMode={selectionMode}
+                selectedIds={selectedIds}
+                onToggleSelected={onToggleSelected}
+                onProjectAssigned={expandProject}
+              />
+            )}
+            {/* Archived sessions are no longer listed here — they live on the
               Settings page ("Archived chats"), reachable from the footer. */}
-          {/* Infinite-scroll sentinel for the global list. Pagination extends
+            {/* Infinite-scroll sentinel for the global list. Pagination extends
               the Chats list, so it hides with a collapsed Chats group — a loader
               under a collapsed group reads orphaned. */}
-          {!effectiveCollapsedSections.includes("Chats") && (
-            <InfiniteScrollSentinel
-              hasMore={hasMorePages}
-              isFetching={isFetchingNextPage}
-              fetchMore={fetchNextPage}
-              scrollRoot={scrollContainerRef}
-            />
-          )}
-        </>
+            {!effectiveCollapsedSections.includes("Chats") && (
+              <InfiniteScrollSentinel
+                hasMore={hasMorePages}
+                isFetching={isFetchingNextPage}
+                fetchMore={fetchNextPage}
+                scrollRoot={scrollContainerRef}
+              />
+            )}
+          </>
+        )}
+      </div>
+      {/* The dragged row's preview follows the pointer (rendered in a portal),
+          a compact card showing the session's title. */}
+      <DragOverlay dropAnimation={null}>
+        {activeDrag ? (
+          <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-sm shadow-lg">
+            {activeDrag.label}
+          </div>
+        ) : null}
+      </DragOverlay>
+      {/* Confirm a drag-to-ungroup that removes the project's last session (the
+          implicit project disappears with it). Mirrors the kebab's dialog. */}
+      <Dialog
+        open={pendingUngroup != null}
+        onOpenChange={(open) => {
+          if (!open) setPendingUngroup(null);
+        }}
+      >
+        <DialogContent onClick={(e) => e.stopPropagation()}>
+          <DialogHeader>
+            <DialogTitle>Remove from project?</DialogTitle>
+            <DialogDescription>
+              This is the only session in{" "}
+              <span className="break-all font-medium">{pendingUngroup?.project}</span>, so{" "}
+              <span className="font-medium">the project will be removed as well</span>. The session
+              itself is kept.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setPendingUngroup(null)}
+              disabled={moveToProject.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={moveToProject.isPending}
+              onClick={() => {
+                if (!pendingUngroup) return;
+                moveToProject.mutate(
+                  { id: pendingUngroup.id, project: "" },
+                  { onSuccess: () => setPendingUngroup(null) },
+                );
+                // A pinned session must also be unpinned to leave Pinned and
+                // land in the flat list.
+                if (pendingUngroup.unpin) onTogglePinned(pendingUngroup.id);
+              }}
+            >
+              Remove from project
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </DndContext>
+  );
+}
+
+/** Wraps the flat "Chats" section as an ungroup drop target: a filed session
+    released here is removed from its project (back to the flat list, where
+    unfiled sessions live). `active` gates the droppable so it only intercepts
+    drops while a filed session is being dragged — at rest it's an inert
+    wrapper. Outline-only highlight on drag-over (no background fill), matching
+    the project folders. */
+function ChatsDropZone({ active, children }: { active: boolean; children: ReactNode }) {
+  const { setNodeRef, isOver } = useDroppable({
+    id: "chats-ungroup",
+    data: { type: "ungroup" },
+    disabled: !active,
+  });
+  return (
+    <div
+      ref={setNodeRef}
+      data-testid="sidebar-chats-drop-zone"
+      className={cn("rounded-md transition-colors", active && isOver && DROP_TARGET_HIGHLIGHT)}
+    >
+      {children}
+    </div>
+  );
+}
+
+/** Wraps the "Pinned" section as a pin drop target: a session released here is
+    pinned, which (via the list's pin-precedence) floats it out of any project
+    into this section. `active` gates the droppable so it only intercepts drops
+    while dragging an unpinned session — at rest, or for an already-pinned
+    session, it's an inert wrapper. Outline-only highlight on drag-over,
+    matching the project folders and {@link ChatsDropZone}. */
+function PinDropZone({ active, children }: { active: boolean; children: ReactNode }) {
+  const { setNodeRef, isOver } = useDroppable({
+    id: "pinned-pin",
+    data: { type: "pin" },
+    disabled: !active,
+  });
+  return (
+    <div
+      ref={setNodeRef}
+      data-testid="sidebar-pin-drop-zone"
+      className={cn("rounded-md transition-colors", active && isOver && DROP_TARGET_HIGHLIGHT)}
+    >
+      {children}
+    </div>
+  );
+}
+
+/** Fallback ungroup target: a dashed strip shown at the top of the list ONLY
+    while dragging a filed session when there are no ungrouped chats (so the
+    {@link ChatsDropZone}-wrapped "Chats" section isn't rendered and there'd
+    otherwise be nowhere to drop). Releasing on it removes the session from its
+    project. The dashed border is the strip's own placeholder identity; the
+    drag-over highlight is the shared subtle background tint. */
+function UngroupDropZone() {
+  const { setNodeRef, isOver } = useDroppable({ id: "__ungroup__", data: { type: "ungroup" } });
+  return (
+    <div
+      ref={setNodeRef}
+      data-testid="sidebar-ungroup-drop-zone"
+      className={cn(
+        "flex items-center gap-1.5 rounded-md border border-dashed border-border px-2 py-1.5 text-muted-foreground text-xs transition-colors",
+        isOver && cn(DROP_TARGET_HIGHLIGHT, "text-foreground"),
       )}
+    >
+      <FolderMinusIcon className="size-3.5 shrink-0" />
+      Drop here to remove from project
     </div>
   );
 }
@@ -1788,6 +2082,46 @@ function ConversationRow({
         ? { kind: "unseen" as const }
         : derivedState;
 
+  // Drag-and-drop: a row is grabbable when the viewer can re-file it (edit
+  // permission), outside selection / archive / rename modes. Dragging it onto a
+  // project folder files it there; onto "Chats" unfiles it; onto "Pinned" pins
+  // it. The list-level <DndContext> routes the drop; the row only advertises
+  // itself and its source project + pinned state via the draggable `data`.
+  const {
+    listeners: dragListeners,
+    setNodeRef: setDragNodeRef,
+    isDragging,
+  } = useDraggable({
+    id: conversation.id,
+    data: { type: "session", label, project: currentProject, isPinned },
+    disabled: !canEdit || selectionMode || isArchived || isEditing,
+  });
+  // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
+  // on the same anchor still fires a click); swallow that one click so a drag
+  // doesn't also navigate into the session. Flagged when a drag finishes,
+  // cleared on the next tick (after the click that follows pointer-up).
+  const justDraggedRef = useRef(false);
+  const wasDraggingRef = useRef(false);
+  useEffect(() => {
+    const was = wasDraggingRef.current;
+    wasDraggingRef.current = isDragging;
+    if (was && !isDragging) {
+      justDraggedRef.current = true;
+      const timer = setTimeout(() => {
+        justDraggedRef.current = false;
+      }, 0);
+      return () => clearTimeout(timer);
+    }
+  }, [isDragging]);
+  // Merge the drag node ref with the row ref used for scroll-into-view.
+  const setRowRef = useCallback(
+    (node: HTMLLIElement | null) => {
+      rowRef.current = node;
+      setDragNodeRef(node);
+    },
+    [setDragNodeRef],
+  );
+
   if (isEditing) {
     return (
       <li>
@@ -1930,6 +2264,11 @@ function ConversationRow({
         selectionMode && isSelected && "bg-primary/5",
       )}
       onClick={(e) => {
+        // Swallow the click that trails a drag so it doesn't navigate.
+        if (justDraggedRef.current) {
+          e.preventDefault();
+          return;
+        }
         if (selectionMode) {
           e.preventDefault();
           e.stopPropagation();
@@ -1971,7 +2310,13 @@ function ConversationRow({
   );
 
   return (
-    <li ref={rowRef} className="group relative">
+    // Drag props on the <li> so the whole row is grabbable; `isDragging` dims
+    // it. `setRowRef` merges the drag node ref with the scroll-into-view ref.
+    <li
+      ref={setRowRef}
+      {...dragListeners}
+      className={cn("group relative", isDragging && "opacity-40")}
+    >
       {/* Right-click anywhere on the row opens the same actions as the kebab.
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the
