@@ -74,6 +74,14 @@ SWITCH_PREVIOUS_BUILTIN_LABEL_KEY = "omnigent.switch.previous_builtin_id"
 # normal approval/sandbox stance. See issue #657.
 CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 
+# Reserved label key that stores a session's sidebar "project" membership
+# (implicit collections — a project exists while ≥1 session carries this key).
+# Namespaced so it never collides with the user-facing "project" term or other
+# reserved keys, and is filtered out of generic label surfaces. Canonical home
+# is the store layer; the SQLAlchemy store and the server route both import it,
+# and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
+PROJECT_LABEL_KEY = "omni_project"
+
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
 # agent switch (deleted from the switched session). Two distinct reasons

@@ -51,6 +51,13 @@ vi.mock("@/hooks/useDirectorySessions", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: vi.fn(),
 }));
+// The composer's project chip lists projects via useProjects; stub it to an
+// empty list so it doesn't fire its own authenticatedFetch (which would skew
+// the create-POST call-count / call-order assertions below).
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
+  useProjects: () => ({ data: [] }),
+}));
 
 const authenticatedFetchMock = vi.mocked(authenticatedFetch);
 const useHostsMock = vi.mocked(useHosts);
@@ -567,7 +574,7 @@ function setupLandingMocks() {
   ]);
 }
 
-function renderLanding(infoOverrides: Partial<ServerInfo> = {}) {
+function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -586,7 +593,7 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}) {
     <QueryClientProvider client={client}>
       <CapabilitiesProvider info={info}>
         <TooltipProvider>
-          <MemoryRouter>
+          <MemoryRouter initialEntries={[route]}>
             <NewChatLandingScreen />
           </MemoryRouter>
         </TooltipProvider>
@@ -1145,6 +1152,74 @@ describe("NewChatLandingScreen", () => {
     } as unknown as Response);
     // The resolved create navigates without surfacing an error.
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-error")).toBeNull());
+  });
+
+  it("files the new session under a project picked in the composer chip", async () => {
+    // Both the create POST and the follow-up label PATCH read .ok / .json.
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+
+    // Open the project chip → "New project…" → type a name → commit.
+    fireEvent.click(screen.getByTestId("new-chat-landing-project-chip"));
+    fireEvent.click(screen.getByText("New project…"));
+    const nameInput = screen.getByPlaceholderText("Project name…");
+    fireEvent.change(nameInput, { target: { value: "docs" } });
+    fireEvent.keyDown(nameInput, { key: "Enter" });
+    // The chip reflects the pick.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain("docs"),
+    );
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "write the docs" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    // Create POST first, then a PATCH that sets the omni_project label on the
+    // freshly-created session id.
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
+    const [createUrl] = authenticatedFetchMock.mock.calls[0];
+    expect(createUrl).toBe("/v1/sessions");
+    const [patchUrl, patchInit] = authenticatedFetchMock.mock.calls[1];
+    expect(patchUrl).toBe("/v1/sessions/conv_new");
+    expect((patchInit as RequestInit).method).toBe("PATCH");
+    const patchBody = JSON.parse((patchInit as RequestInit).body as string) as {
+      labels: Record<string, string>;
+    };
+    expect(patchBody.labels).toEqual({ omni_project: "docs" });
+  });
+
+  it("pre-fills the project chip from the ?project= query param", async () => {
+    // The sidebar's per-project "new session" pencil lands here with the
+    // project pre-selected — the chip reflects it with no interaction.
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding({}, "/?project=Sprint%2042");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain(
+        "Sprint 42",
+      ),
+    );
+
+    // Creating a session files it under that pre-filled project.
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "kick off the sprint" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
+    const [patchUrl, patchInit] = authenticatedFetchMock.mock.calls[1];
+    expect(patchUrl).toBe("/v1/sessions/conv_new");
+    const patchBody = JSON.parse((patchInit as RequestInit).body as string) as {
+      labels: Record<string, string>;
+    };
+    expect(patchBody.labels).toEqual({ omni_project: "Sprint 42" });
   });
 
   it.each([

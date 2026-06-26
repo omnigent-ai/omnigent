@@ -11,10 +11,15 @@ import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
   renameConversation,
+  useArchiveConversation,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
   useBulkStopSessions,
   useConversations,
+  useDeleteProject,
+  useProjects,
+  useProjectSessions,
+  useMoveToProject,
   useRenameConversation,
   useStopAndDeleteConversation,
   useStopSession,
@@ -657,5 +662,249 @@ describe("useBulkStopSessions", () => {
     const err = rendered.result.current.error as any;
     expect(err.succeeded).toEqual(["conv_a"]);
     expect(err.failed).toEqual(["conv_b"]);
+  });
+});
+
+describe("useProjects", () => {
+  it("GETs /v1/sessions/projects and returns the project list", async () => {
+    const projects = ["Customer X", "Sprint 42"];
+    fetchMock.mockResolvedValueOnce(mockResponse(projects));
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useProjects(), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/projects");
+    expect(result.current.data).toEqual(projects);
+  });
+
+  it("throws on non-2xx", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useProjects(), { wrapper });
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+  });
+});
+
+describe("useProjectSessions", () => {
+  it("does not fetch while disabled (collapsed folder)", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useProjectSessions("Sprint 42", false), { wrapper });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fetches the project's non-archived sessions, newest-first, when enabled", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        data: [{ id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 9 }],
+        first_id: "conv_a",
+        last_id: "conv_a",
+        has_more: false,
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useProjectSessions("Sprint 42", true), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("/v1/sessions?");
+    expect(url).toContain("project=Sprint+42");
+    expect(url).toContain("order=desc");
+    expect(url).toContain("sort_by=updated_at");
+    expect(url).toContain("limit=20");
+    // Folders show active sessions only — archived ones leave the sidebar.
+    expect(url).not.toContain("include_archived");
+    expect(result.current.data?.pages[0]?.data[0]?.id).toBe("conv_a");
+  });
+});
+
+describe("useMoveToProject", () => {
+  it("PATCHes /v1/sessions/{id} with the project label", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "conv_move",
+        object: "conversation",
+        title: "t",
+        created_at: 0,
+        updated_at: 1,
+        labels: { omni_project: "Sprint 42" },
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_move", project: "Sprint 42" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_move");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body as string)).toEqual({ labels: { omni_project: "Sprint 42" } });
+  });
+
+  it("invalidates both the conversations and projects queries on success", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "conv_move",
+        object: "conversation",
+        title: "t",
+        created_at: 0,
+        updated_at: 1,
+        labels: {},
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_move", project: "" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // Both keys must refresh: conversations so the row re-groups into its new
+    // section, projects so the sidebar list updates.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
+  });
+});
+
+describe("useArchiveConversation", () => {
+  it("PATCHes archived and invalidates both the conversations and projects queries", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "conv_a",
+        object: "conversation",
+        title: "A",
+        created_at: 0,
+        updated_at: 10,
+        labels: { omni_project: "Sprint 42" },
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+    result.current.mutate({ id: "conv_a", archived: true });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_a");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body as string)).toEqual({ archived: true });
+    // Projects must refresh too: archiving the last live member of a project
+    // removes its folder; unarchiving restores it.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
+  });
+});
+
+describe("useDeleteProject", () => {
+  function archivedConv(id: string) {
+    return mockResponse({
+      id,
+      object: "conversation",
+      title: id,
+      created_at: 0,
+      updated_at: 10,
+      archived: true,
+      labels: { omni_project: "Sprint 42" },
+    });
+  }
+
+  it("archives every session in the project (keeping the label) and refreshes the lists", async () => {
+    // 1st call: page of project members. Then one PATCH archive per member.
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [
+            { id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 1 },
+            { id: "conv_b", object: "conversation", title: "B", created_at: 0, updated_at: 2 },
+          ],
+          first_id: "conv_a",
+          last_id: "conv_b",
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(archivedConv("conv_a"))
+      .mockResolvedValueOnce(archivedConv("conv_b"));
+
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useDeleteProject(), { wrapper });
+
+    result.current.mutate("Sprint 42");
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // The list fetch is filtered by project and includes archived members.
+    const listUrl = fetchMock.mock.calls[0][0] as string;
+    expect(listUrl).toContain("project=Sprint+42");
+    expect(listUrl).toContain("include_archived=true");
+
+    // Each member is archived via PATCH — NOT deleted, and the project label is
+    // left intact so unarchiving restores the session to its project.
+    const patches = (fetchMock.mock.calls.slice(1) as [string, RequestInit][]).map(
+      ([url, init]) => ({ url, init }),
+    );
+    expect(patches.map((p) => p.url).sort()).toEqual([
+      "/v1/sessions/conv_a",
+      "/v1/sessions/conv_b",
+    ]);
+    for (const { init } of patches) {
+      expect(init.method).toBe("PATCH");
+      expect(JSON.parse(init.body as string)).toEqual({ archived: true });
+    }
+
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
+  });
+
+  it("throws with succeeded/failed split when some archives fail", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [
+            { id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 1 },
+            { id: "conv_b", object: "conversation", title: "B", created_at: 0, updated_at: 2 },
+          ],
+          first_id: "conv_a",
+          last_id: "conv_b",
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(archivedConv("conv_a"))
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 403 }));
+
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useDeleteProject(), { wrapper });
+
+    result.current.mutate("Sprint 42");
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    const err = result.current.error as unknown as {
+      failed: string[];
+      succeeded: string[];
+      total: number;
+    };
+    expect(err.failed).toEqual(["conv_b"]);
+    expect(err.succeeded).toEqual(["conv_a"]);
+    expect(err.total).toBe(2);
   });
 });

@@ -1,18 +1,21 @@
 import { type DragEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "@/lib/routing";
+import { useNavigate, useSearchParams } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   MonitorIcon,
   MonitorCloudIcon,
+  CheckIcon,
   CircleHelpIcon,
   ChevronDownIcon,
   GitBranchIcon,
   ArrowUpIcon,
   FileTextIcon,
   FolderIcon,
+  FolderInputIcon,
   ImageIcon,
   PaperclipIcon,
   PlusIcon,
+  SearchIcon,
   TriangleAlertIcon,
   XIcon,
 } from "lucide-react";
@@ -61,6 +64,7 @@ import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { Conversation } from "@/hooks/useConversations";
+import { useProjects, PROJECT_LABEL_KEY } from "@/hooks/useConversations";
 import { OttoEyes } from "@/components/OttoEyes";
 import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
@@ -631,6 +635,127 @@ export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
 }
 
 /**
+ * The composer's "Project" chip — files the to-be-created session under a
+ * named project (an implicit collection stored as a ``conversation_labels``
+ * row with the reserved key ``omni_project``). Mirrors the sidebar kebab's
+ * project picker: a search box, the existing projects, a "No project" reset,
+ * and an inline "New project…" input. Selection is local state on the landing
+ * composer; the label is applied right after the session is created.
+ */
+function LandingProjectPicker({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (project: string) => void;
+}) {
+  const { data: projects = [] } = useProjects();
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [creatingNew, setCreatingNew] = useState(false);
+  const [newName, setNewName] = useState("");
+  const newRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (creatingNew) newRef.current?.focus();
+  }, [creatingNew]);
+
+  const filtered = search
+    ? projects.filter((name) => name.toLowerCase().includes(search.toLowerCase()))
+    : projects;
+
+  function pick(project: string) {
+    onChange(project);
+    setOpen(false);
+    setSearch("");
+    setCreatingNew(false);
+    setNewName("");
+  }
+
+  function commitNew() {
+    const name = newName.trim();
+    if (name) pick(name);
+  }
+
+  const itemClass =
+    "flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground";
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className="flex h-6 items-center gap-1.5 rounded-full px-3 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+          data-testid="new-chat-landing-project-chip"
+        >
+          <FolderInputIcon className="size-4 shrink-0" />
+          <span className={`max-w-32 truncate ${value ? "text-foreground" : ""}`}>
+            {value || "No project"}
+          </span>
+          <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-56 p-1">
+        {/* Combobox-style search: a leading magnifier inside a borderless
+            input, with a divider beneath separating it from the results. */}
+        <div className="flex items-center gap-2 border-b px-2 py-1.5">
+          <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
+          <input
+            className="w-full bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+            placeholder="Search projects"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+        </div>
+        <div className="max-h-48 overflow-y-auto">
+          <button type="button" className={itemClass} onClick={() => pick("")}>
+            <span className="flex-1 truncate">No project</span>
+            {value === "" && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
+          </button>
+          {filtered.map((name) => (
+            <button key={name} type="button" className={itemClass} onClick={() => pick(name)}>
+              <span className="flex-1 truncate">{name}</span>
+              {value === name && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
+            </button>
+          ))}
+          {filtered.length === 0 && !creatingNew && (
+            <p className="px-2 py-1.5 text-xs text-muted-foreground">No projects yet.</p>
+          )}
+        </div>
+        <div className="border-t pt-1">
+          {creatingNew ? (
+            <div className="flex items-center gap-1 px-2 py-1">
+              <input
+                ref={newRef}
+                className="flex-1 bg-transparent text-xs outline-none"
+                placeholder="Project name…"
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    commitNew();
+                  }
+                  if (e.key === "Escape") {
+                    setCreatingNew(false);
+                    setNewName("");
+                  }
+                }}
+              />
+            </div>
+          ) : (
+            <button type="button" className={itemClass} onClick={() => setCreatingNew(true)}>
+              <PlusIcon className="size-3.5 shrink-0" />
+              New project…
+            </button>
+          )}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/**
  * The home-page ("/") landing composer.
  *
  * Owns session creation end-to-end: the textarea is the first message and the
@@ -1012,6 +1137,7 @@ function ModePill({
 
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
@@ -1139,6 +1265,18 @@ export function NewChatLandingScreen() {
   const [workspace, setWorkspace] = useState<string>("");
   const [branchName, setBranchName] = useState<string>("");
   const [baseBranch, setBaseBranch] = useState<string>("");
+  // Project to file the new session under (an implicit collection stored as a
+  // conversation_labels row). Empty = unfiled. Applied right after create.
+  // Pre-filled from a `?project=` query param so the sidebar's per-project
+  // "new session" pencil can land here with the project already selected.
+  const projectParam = searchParams.get("project") ?? "";
+  const [selectedProject, setSelectedProject] = useState<string>(() => projectParam);
+  // The landing screen stays mounted while the `?project=` param changes (e.g.
+  // clicking a different project's pencil), so the lazy initializer above won't
+  // re-run — sync the selection to the param whenever it changes.
+  useEffect(() => {
+    setSelectedProject(projectParam);
+  }, [projectParam]);
   // Permission mode for Claude Code (claude --permission-mode). Only
   // meaningful for the claude-native wrapper; ignored otherwise. Lives in
   // the footer tray's Advanced settings menu.
@@ -1608,6 +1746,22 @@ export function NewChatLandingScreen() {
           return;
         }
         data = (await res.json()) as { id: string };
+      }
+      // File the new session under the chosen project (an implicit collection
+      // stored as a conversation_labels row). Awaited so the conversations
+      // refetch below already sees the label; non-fatal if it fails — the
+      // session is created either way, just unfiled.
+      if (selectedProject) {
+        try {
+          await authenticatedFetch(`/v1/sessions/${data.id}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ labels: { [PROJECT_LABEL_KEY]: selectedProject } }),
+          });
+          void queryClient.invalidateQueries({ queryKey: ["projects"] });
+        } catch {
+          // Leave the session unfiled; the user can file it from the sidebar.
+        }
       }
       // Sandbox creates have no user-picked workspace to remember.
       if (!sandboxSelected) addRecent(workspaceTrimmed);
@@ -2176,6 +2330,10 @@ export function NewChatLandingScreen() {
                   </PopoverContent>
                 </Popover>
               )}
+
+              {/* Project chip — files the session under a named project on
+                create. Sits between the working-directory and worktree chips. */}
+              <LandingProjectPicker value={selectedProject} onChange={setSelectedProject} />
 
               {/* Git worktree chip — hidden for sandbox sessions (worktree
                 creation requires a caller-supplied host_id). */}

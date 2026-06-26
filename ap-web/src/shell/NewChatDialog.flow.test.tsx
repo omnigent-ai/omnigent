@@ -34,7 +34,12 @@ const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
 // The landing screen navigates via the embed-aware routing abstraction
 // (`@/lib/routing`), not react-router directly — mock that so the create
 // flow's navigate() lands on our spy regardless of router/provider setup.
-vi.mock("@/lib/routing", () => ({ useNavigate: () => navigateMock }));
+vi.mock("@/lib/routing", () => ({
+  useNavigate: () => navigateMock,
+  // The landing screen reads `?project=` to pre-fill the project chip; this
+  // flow suite never sets one, so an empty params object is enough.
+  useSearchParams: () => [new URLSearchParams(), vi.fn()],
+}));
 
 // The screen hands the first message to ChatPage through the chatStore
 // (keyed by conversation id), not router state — assert on that call.
@@ -61,6 +66,13 @@ vi.mock("@/hooks/useDirectorySessions", () => ({
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => new Map<string, boolean>(),
+}));
+// The composer's project chip lists projects via useProjects; stub it to an
+// empty list so it doesn't fire its own authenticatedFetch (which would land
+// at mock.calls[0] and skew these create-POST call assertions).
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
+  useProjects: () => ({ data: [] }),
 }));
 
 function host(overrides: Partial<Host> = {}): Host {
