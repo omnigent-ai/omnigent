@@ -342,6 +342,12 @@ export interface ChatState {
    */
   sessionHarness: string | null;
   /**
+   * The active session's sub-agent head name (e.g. `"gpt"`), or null for a
+   * top-level session. Set from the snapshot on bind; lets a head sub-agent's
+   * composer identity name the head rather than the bundle orchestrator.
+   */
+  subAgentName: string | null;
+  /**
    * Context window size in tokens for the active session's model,
    * as looked up server-side. ``null`` before bind or when the
    * model is not in litellm's registry.
@@ -704,6 +710,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   flashItemId: null,
   llmModel: null,
   sessionHarness: null,
+  subAgentName: null,
   contextWindow: null,
   tokensUsed: null,
   sessionCostUsd: null,
@@ -1614,6 +1621,7 @@ function sessionBindingPatch(
   | "llmModel"
   | "sessionModelOverride"
   | "sessionHarness"
+  | "subAgentName"
   | "costControlModeOverride"
   | "codexPlanMode"
   | "contextWindow"
@@ -1636,6 +1644,7 @@ function sessionBindingPatch(
     llmModel: session.llmModel ?? null,
     sessionModelOverride: session.modelOverride ?? null,
     sessionHarness: session.harness ?? null,
+    subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
     codexPlanMode: codexPlanModeFromSession(session),
     contextWindow: session.contextWindow ?? null,

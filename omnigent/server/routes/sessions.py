@@ -2608,7 +2608,22 @@ def _resolve_harness(conv: Conversation | None) -> str | None:
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
         executor = loaded.spec.executor
-        harness = executor.config.get("harness") or executor.type
+        # For a bundled-agent head sub-agent, report the HEAD's own harness,
+        # not the bundle brain's — `harness` is this session's provider family
+        # (a gpt head runs codex, not the claude-sdk brain). Falls back to the
+        # brain harness when the head declares none or can't be matched.
+        if conv.sub_agent_name:
+            sub = next(
+                (s for s in loaded.spec.sub_agents if s.name == conv.sub_agent_name),
+                None,
+            )
+            if sub is not None:
+                executor = sub.executor
+        harness = (
+            executor.config.get("harness")
+            or loaded.spec.executor.config.get("harness")
+            or executor.type
+        )
         return canonicalize_harness(harness) or harness
     except (KeyError, AttributeError, ValueError, ImportError, OSError):
         return None

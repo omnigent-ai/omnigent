@@ -67,6 +67,7 @@ describe("Composer status line (branch + context ring)", () => {
       codexPlanMode: false,
       nativeVendorOwnsModel: false,
       sessionHarness: null,
+      subAgentName: null,
     });
   });
 
@@ -121,6 +122,17 @@ describe("Composer status line (branch + context ring)", () => {
     renderComposer({ agents: [{ id: "a1", name: "polly" }], selectedAgentId: "a1" });
 
     expect(screen.getByTestId("composer-harness")).toHaveTextContent("Polly (Pi)");
+  });
+
+  it("names the sub-agent head, not the bundle, for a head session", () => {
+    // A Debby GPT head session: the tray identifies the head being viewed
+    // ("Gpt"), not the bundle orchestrator ("Debby").
+    useChatStore.setState({ sessionHarness: "codex", subAgentName: "gpt" });
+    renderComposer({ agents: [{ id: "a1", name: "debby" }], selectedAgentId: "a1" });
+
+    const harness = screen.getByTestId("composer-harness");
+    expect(harness).toHaveTextContent("Gpt (Codex)");
+    expect(harness).not.toHaveTextContent("Debby");
   });
 
   it("no longer renders model/effort in the status tray (moved to the picker trigger)", () => {
