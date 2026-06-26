@@ -19391,6 +19391,14 @@ def create_sessions_router(
                 code=ErrorCode.NOT_FOUND,
             )
 
+        # Shared/template agents are read-only here;
+        # mirrors the guard in session_mcp_servers._editable_agent.
+        if agent.session_id is None:
+            raise OmnigentError(
+                "Built-in agents are read-only through this endpoint.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
         bundle_bytes = await bundle.read()
         # Run bundle validation (tar extraction + spec parse, both
         # blocking) off the event loop -- mirrors the POST
