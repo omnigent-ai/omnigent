@@ -15,6 +15,7 @@
 "use strict";
 
 const { spawn } = require("child_process");
+const net = require("net");
 
 const cli = require("./omnigent_cli");
 
@@ -26,6 +27,13 @@ const KILL_GRACE_MS = 4000;
 const CONNECTED_MARKER = "✓ Connected";
 /** Cap the in-memory per-host log so a chatty daemon can't grow unbounded. */
 const MAX_LOG_CHARS = 8000;
+/**
+ * Max time to wait for a just-stopped local server's port to free up before
+ * restarting. `omnigent server start` prefers the stable port (6767) but falls
+ * back to a free one if the old port isn't rebindable yet, which would move the
+ * server (and break the window pointed at it) — so we wait for the port first.
+ */
+const PORT_FREE_TIMEOUT_MS = 5000;
 
 /** serverUrl(normalized) -> { child, serverUrl, log } for host processes we started. */
 const hostChildren = new Map();
@@ -320,13 +328,54 @@ async function stopLocalServer(cliPath) {
 }
 
 /**
- * Restart the local server: stop (the CLI waits for it to exit), then start.
+ * Resolve once 127.0.0.1:port is bindable (i.e. free), or after `timeoutMs`.
+ * Used between a local-server stop and start so the freed port is reusable
+ * before `omnigent server start` probes it.
+ *
+ * @param {number} port
+ * @param {number} timeoutMs
+ * @returns {Promise<boolean>} true once free, false on timeout.
+ */
+function waitForPortFree(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve) => {
+    const attempt = () => {
+      const tester = net.createServer();
+      tester.once("error", () => {
+        tester.close();
+        if (Date.now() >= deadline) {
+          resolve(false);
+          return;
+        }
+        const t = setTimeout(attempt, 150);
+        if (typeof t.unref === "function") t.unref();
+      });
+      tester.once("listening", () => {
+        // Listening succeeded → the port is free. Closing a never-accepted
+        // listen socket leaves no TIME_WAIT, so `server start` can rebind it.
+        tester.close(() => resolve(true));
+      });
+      tester.listen(port, "127.0.0.1");
+    };
+    attempt();
+  });
+}
+
+/**
+ * Restart the local server, keeping it on the same port. We stop it, wait for
+ * its port to actually free (so `omnigent server start`'s preferred-port probe
+ * rebinds it instead of falling back to a new free port — which would move the
+ * URL out from under the connected window), then start.
  *
  * @param {string} cliPath
  * @returns {Promise<{ ok: boolean, url?: string, error?: string }>}
  */
 async function restartLocalServer(cliPath) {
+  const before = cli.localServerStatus();
   await stopLocalServer(cliPath);
+  if (before && Number.isInteger(before.port)) {
+    await waitForPortFree(before.port, PORT_FREE_TIMEOUT_MS);
+  }
   return startLocalServer(cliPath);
 }
 
