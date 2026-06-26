@@ -36,7 +36,7 @@ import {
   type NodeProps,
   type NodeTypes,
 } from "@xyflow/react";
-import { ArrowLeftIcon, CopyIcon, PlusIcon, SaveIcon, Trash2Icon } from "lucide-react";
+import { ArrowLeftIcon, CopyIcon, PlayIcon, PlusIcon, SaveIcon, Trash2Icon } from "lucide-react";
 import { Canvas } from "@/components/ai-elements/canvas";
 import { Controls } from "@/components/ai-elements/controls";
 import { Panel } from "@/components/ai-elements/panel";
@@ -44,7 +44,8 @@ import { MessageResponse } from "@/components/ai-elements/message";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Link, useNavigate, useParams } from "@/lib/routing";
-import { getJob, updateJob } from "@/lib/jobsStore";
+import { runJob, updateJob, useJob } from "@/lib/jobsStore";
+import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import {
   generateFlowText,
   type FlowEdge,
@@ -229,18 +230,19 @@ type OutputTab = "narrative" | "outline" | "mermaid";
 export function FlowchartPage() {
   const { jobId } = useParams<{ jobId: string }>();
   const navigate = useNavigate();
-  const job = jobId ? getJob(jobId) : undefined;
+  const { job, loading: jobLoading } = useJob(jobId);
 
   // Initial canvas: the saved job's graph if it has one, else the example
   // chart as a starting point. Computed once per mount (the builder owns the
   // working copy; Save writes it back to the job).
+  const hasGraph = !!job && (job.graph.nodes.length > 0 || (job.graph.loops?.length ?? 0) > 0);
   const initial = useMemo(() => {
-    if (job && (job.graph.nodes.length || (job.graph.loops?.length ?? 0))) {
+    if (job && hasGraph) {
       return fromFlowGraph(job.graph);
     }
     return { nodes: exampleNodes(), edges: exampleEdges() };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId]);
+  }, [jobId, job?.id, hasGraph]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>(initial.nodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(initial.edges);
@@ -248,12 +250,13 @@ export function FlowchartPage() {
   const [copied, setCopied] = useState(false);
   const [saved, setSaved] = useState(false);
 
-  // Re-seed the canvas when navigating between different jobs without unmount.
+  // Re-seed the canvas when navigating between jobs or when the job's graph
+  // finishes loading from the API (the initial fetch resolves after mount).
   useEffect(() => {
     setNodes(initial.nodes);
     setEdges(initial.edges);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId]);
+  }, [jobId, job?.id, hasGraph]);
 
   // Live regeneration — the generator is pure & cheap, so recompute on any
   // node/edge change rather than gating behind a "Generate" button.
@@ -262,10 +265,37 @@ export function FlowchartPage() {
 
   const onSave = useCallback(() => {
     if (!jobId) return;
-    updateJob(jobId, { graph });
+    void updateJob(jobId, { graph });
     setSaved(true);
     setTimeout(() => setSaved(false), 1200);
   }, [jobId, graph]);
+
+  // Agent picker: the job runs as the chosen agent (its narrative becomes that
+  // agent's first prompt). Persisted on the job via updateJob.
+  const { data: agents } = useAvailableAgents();
+  const onPickAgent = useCallback(
+    (agentId: string) => {
+      if (!jobId) return;
+      void updateJob(jobId, { agentId: agentId || null });
+    },
+    [jobId],
+  );
+
+  const [running, setRunning] = useState(false);
+  const onRun = useCallback(async () => {
+    if (!jobId) return;
+    // Persist the latest canvas first so the run uses the on-screen flow.
+    await updateJob(jobId, { graph });
+    setRunning(true);
+    try {
+      const run = await runJob(jobId);
+      if (run.sessionId) navigate(`/c/${run.sessionId}`);
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : "Failed to run job");
+    } finally {
+      setRunning(false);
+    }
+  }, [jobId, graph, navigate]);
 
   const addNode = useCallback(
     (kind: FlowNodeType) => {
@@ -357,9 +387,10 @@ export function FlowchartPage() {
 
   const hasContent = nodes.length > 0;
 
-  // A jobId that doesn't resolve (stale link / cleared storage): send the user
-  // back to the list rather than silently editing an orphaned chart.
-  if (jobId && !job) {
+  // A jobId that doesn't resolve (stale link / deleted job): send the user
+  // back to the list rather than silently editing an orphaned chart. Wait for
+  // the API fetch to settle first so the loading window doesn't flash this.
+  if (jobId && !job && !jobLoading) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
         <p className="text-sm font-medium">This flow no longer exists.</p>
@@ -382,8 +413,31 @@ export function FlowchartPage() {
         <span className="min-w-0 flex-1 truncate text-sm font-medium">
           {job?.name ?? "Flow builder"}
         </span>
+        <select
+          aria-label="Run as agent"
+          data-testid="job-agent-select"
+          value={job?.agentId ?? ""}
+          onChange={(e) => onPickAgent(e.target.value)}
+          disabled={!jobId}
+          className="h-8 rounded-md border border-input bg-background px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <option value="">Pick an agent…</option>
+          {(agents ?? []).map((a) => (
+            <option key={a.id} value={a.id}>
+              {a.display_name}
+            </option>
+          ))}
+        </select>
         <Button variant="outline" size="sm" onClick={onSave} disabled={!jobId}>
           <SaveIcon className="size-3.5" /> {saved ? "Saved!" : "Save"}
+        </Button>
+        <Button
+          size="sm"
+          onClick={onRun}
+          disabled={!jobId || !job?.agentId || running}
+          data-testid="job-run-button"
+        >
+          <PlayIcon className="size-3.5" /> {running ? "Running…" : "Run now"}
         </Button>
       </div>
 

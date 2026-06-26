@@ -24,6 +24,13 @@ from omnigent.entities.conversation import (
     synthesize_conversation_title,
 )
 from omnigent.entities.file import StoredFile
+from omnigent.entities.job import (
+    RUN_STATUS_FAILED,
+    RUN_STATUS_FINISHED,
+    RUN_STATUS_RUNNING,
+    Job,
+    Run,
+)
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import ResolvedAccess, SessionPermission
 from omnigent.entities.policy import Policy
@@ -38,6 +45,9 @@ from omnigent.entities.session_resources import (
 __all__ = [
     "DEFAULT_ENVIRONMENT_ID",
     "NON_CONTENT_ITEM_TYPES",
+    "RUN_STATUS_FAILED",
+    "RUN_STATUS_FINISHED",
+    "RUN_STATUS_RUNNING",
     "Account",
     "AccountToken",
     "Agent",
@@ -50,6 +60,7 @@ __all__ = [
     "FunctionCallData",
     "FunctionCallOutputData",
     "ItemData",
+    "Job",
     "LoadedAgent",
     "MessageData",
     "NativeToolData",
@@ -60,6 +71,7 @@ __all__ = [
     "ResolvedAccess",
     "ResourceEventData",
     "RoutingDecisionData",
+    "Run",
     "SessionPermission",
     "SessionResourceView",
     "SlashCommandData",

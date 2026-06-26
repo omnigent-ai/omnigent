@@ -53,6 +53,7 @@ from omnigent.server.performance_metrics import (
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
+from omnigent.server.routes.jobs import create_jobs_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
@@ -73,6 +74,7 @@ from omnigent.stores import (
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import SessionConnectivity
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.job_store import JobStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 
@@ -976,6 +978,7 @@ def create_app(
     permission_store: PermissionStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
+    job_store: JobStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
     extra_routers: list[tuple[Any, str, list[str]]] | None = None,
     policy_modules: list[str] | None = None,
@@ -1019,6 +1022,8 @@ def create_app(
     :param host_store: Store for host registrations. ``None``
         disables host connectivity features (list hosts, launch
         runners on remote hosts).
+    :param job_store: Store for saved jobs (workflows) and their runs.
+        ``None`` disables the Jobs/Workflows endpoints.
     :param policy_modules: Additional dotted module paths to
         scan for ``POLICY_REGISTRY`` lists at startup, e.g.
         ``["myorg.policies.safety"]``. Sourced from the server
@@ -1788,6 +1793,27 @@ def create_app(
         prefix="/v1",
         tags=["sessions"],
     )
+    if job_store is not None:
+        # Jobs/Workflows: saved node-graph workflows executed via promptgen
+        # (the rendered narrative is fed to an agent session on a run). The
+        # run path reuses the same session-create machinery as the sessions
+        # router above.
+        app.include_router(
+            create_jobs_router(
+                job_store,
+                conversation_store,
+                agent_store,
+                runner_router=runner_router,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+                agent_cache=agent_cache,
+                file_store=file_store,
+                artifact_store=artifact_store,
+                liveness_lookup=_bulk_session_liveness,
+            ),
+            prefix="/v1",
+            tags=["jobs"],
+        )
     # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
     # Successor to the removed GET /api/agents list; lists only
     # built-in (session_id IS NULL) agents for the new-session picker.

@@ -1,111 +1,149 @@
 /**
- * Jobs persistence (browser localStorage).
+ * Jobs persistence (server-backed).
  *
- * A *job* is a named, saved flow chart. The Jobs page lists jobs; opening one
- * launches the flow builder on its saved {@link FlowGraph}, and saving in the
- * builder writes back to the same job. Storage is intentionally client-side
- * only (one `localStorage` key) — no server/API involvement — mirroring the
- * original standalone prototype's persistence model.
+ * A *job* is a named, saved flow chart plus the English narrative rendered from
+ * it. The Jobs page lists jobs; opening one launches the flow builder on its
+ * saved {@link FlowGraph}, and saving in the builder writes the graph + a freshly
+ * rendered narrative back to the job. Persistence is the `/v1/jobs` API (see
+ * {@link jobsApi}); this module wraps it with a small in-memory cache so the
+ * React hooks can read synchronously and re-render on change.
  *
- * The module is framework-agnostic (plain functions over `localStorage`); the
- * React layer wraps it with {@link useJobs} for reactive reads.
+ * History: this was browser-localStorage-only in the initial flows UI prototype.
+ * It now talks to the backend so jobs (and their runs) are shared and runnable.
  */
 
 import { useCallback, useEffect, useState } from "react";
-import type { FlowGraph } from "@/lib/flowToText";
+import { type FlowGraph, generateFlowText } from "@/lib/flowToText";
+import {
+  apiCreateJob,
+  apiDeleteJob,
+  apiGetJob,
+  apiListJobs,
+  apiRunJob,
+  apiUpdateJob,
+  type Job,
+  type Run,
+} from "@/lib/jobsApi";
 
-const STORAGE_KEY = "omnigent-jobs-v1";
+export type { Job, Run } from "@/lib/jobsApi";
 
-export interface Job {
-  id: string;
-  name: string;
-  /** Epoch ms. */
-  createdAt: number;
-  updatedAt: number;
-  /** The saved flow chart this job was created from. */
-  graph: FlowGraph;
-}
-
-/** Cross-tab + same-tab change signal so `useJobs` can re-read. */
+/** Cross-component change signal so hooks re-read after a mutation. */
 const EVENT = "omnigent-jobs-changed";
+
+/** In-memory cache so `useJobs`/`useJob` can read synchronously. */
+const jobCache = new Map<string, Job>();
+let listLoaded = false;
 
 function emptyGraph(): FlowGraph {
   return { nodes: [], edges: [], loops: [] };
 }
 
-function readAll(): Job[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    // Tolerate partially-shaped entries from older writes.
-    return parsed
-      .filter((j): j is Job => j && typeof j.id === "string" && typeof j.name === "string")
-      .map((j) => ({ ...j, graph: j.graph ?? emptyGraph() }));
-  } catch {
-    return [];
-  }
-}
-
-function writeAll(jobs: Job[]): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(jobs));
-  } catch {
-    // Quota / disabled storage — nothing actionable; the in-memory list still
-    // reflects the change for this session.
-  }
-  // Notify same-tab listeners (the native `storage` event only fires in OTHER
-  // tabs). `CustomEvent` is fine in every browser the app targets.
+function emit(): void {
   window.dispatchEvent(new Event(EVENT));
 }
 
-const uid = () =>
-  `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-
-export function listJobs(): Job[] {
-  // Newest first.
-  return readAll().sort((a, b) => b.updatedAt - a.updatedAt);
-}
-
-export function getJob(id: string): Job | undefined {
-  return readAll().find((j) => j.id === id);
-}
-
-export function createJob(name: string, graph: FlowGraph = emptyGraph()): Job {
-  const now = Date.now();
-  const job: Job = { id: uid(), name: name.trim() || "Untitled flow", createdAt: now, updatedAt: now, graph };
-  writeAll([...readAll(), job]);
+function cacheJob(job: Job): Job {
+  jobCache.set(job.id, job);
   return job;
 }
 
-/** Patch name and/or graph; bumps `updatedAt`. No-op if the id is unknown. */
-export function updateJob(id: string, patch: Partial<Pick<Job, "name" | "graph">>): void {
-  const jobs = readAll();
-  const i = jobs.findIndex((j) => j.id === id);
-  if (i === -1) return;
-  jobs[i] = { ...jobs[i], ...patch, updatedAt: Date.now() };
-  writeAll(jobs);
+/** Newest-updated first. */
+function cachedList(): Job[] {
+  return [...jobCache.values()].sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
-export function deleteJob(id: string): void {
-  writeAll(readAll().filter((j) => j.id !== id));
+async function refreshList(): Promise<void> {
+  const jobs = await apiListJobs();
+  jobCache.clear();
+  for (const j of jobs) jobCache.set(j.id, j);
+  listLoaded = true;
+  emit();
+}
+
+/** Create a job, rendering its narrative from the graph. Returns the new job. */
+export async function createJob(name: string, graph: FlowGraph = emptyGraph()): Promise<Job> {
+  const { narrative } = generateFlowText(graph);
+  const job = cacheJob(await apiCreateJob({ name: name.trim() || "Untitled flow", graph, narrative }));
+  emit();
+  return job;
+}
+
+/** Patch name and/or graph; a graph change re-renders the narrative. */
+export async function updateJob(
+  id: string,
+  patch: { name?: string; graph?: FlowGraph; agentId?: string | null },
+): Promise<void> {
+  const input: { name?: string; graph?: FlowGraph; narrative?: string; agentId?: string | null } = {
+    name: patch.name,
+    agentId: patch.agentId,
+  };
+  if (patch.graph !== undefined) {
+    input.graph = patch.graph;
+    input.narrative = generateFlowText(patch.graph).narrative;
+  }
+  cacheJob(await apiUpdateJob(id, input));
+  emit();
+}
+
+export async function deleteJob(id: string): Promise<void> {
+  await apiDeleteJob(id);
+  jobCache.delete(id);
+  emit();
+}
+
+/** Trigger a run of a job; returns the created {@link Run}. */
+export async function runJob(id: string): Promise<Run> {
+  return apiRunJob(id);
 }
 
 /**
- * Reactive job list — re-reads on any create/update/delete (this tab) and on
- * `localStorage` changes from other tabs.
+ * Reactive job list — loads from the API on first use and re-reads on any
+ * create/update/delete (via the `omnigent-jobs-changed` event).
  */
 export function useJobs(): Job[] {
-  const [jobs, setJobs] = useState<Job[]>(() => listJobs());
-  const refresh = useCallback(() => setJobs(listJobs()), []);
+  const [jobs, setJobs] = useState<Job[]>(() => cachedList());
+  const refresh = useCallback(() => setJobs(cachedList()), []);
   useEffect(() => {
     window.addEventListener(EVENT, refresh);
-    window.addEventListener("storage", refresh);
-    return () => {
-      window.removeEventListener(EVENT, refresh);
-      window.removeEventListener("storage", refresh);
-    };
+    // Always refetch on mount so the list reflects server state.
+    void refreshList();
+    return () => window.removeEventListener(EVENT, refresh);
   }, [refresh]);
   return jobs;
+}
+
+/**
+ * Reactive single job. Returns the cached job (if any) plus a `loading` flag so
+ * a consumer can tell "still fetching" apart from "truly missing" (404) — the
+ * fetch resolves after mount. Fetches from the API unless the cache is already
+ * populated by a list load.
+ */
+export function useJob(id: string | undefined): { job: Job | undefined; loading: boolean } {
+  const [job, setJob] = useState<Job | undefined>(() => (id ? jobCache.get(id) : undefined));
+  const [loading, setLoading] = useState<boolean>(() => !!id && !jobCache.has(id));
+  const refresh = useCallback(() => setJob(id ? jobCache.get(id) : undefined), [id]);
+  useEffect(() => {
+    if (!id) {
+      setLoading(false);
+      return;
+    }
+    window.addEventListener(EVENT, refresh);
+    if (jobCache.has(id) && listLoaded) {
+      setLoading(false);
+    } else {
+      setLoading(true);
+      apiGetJob(id)
+        .then((j) => {
+          cacheJob(j);
+          emit();
+        })
+        .catch(() => {
+          // 404 or transient — leave the job undefined; the page shows a
+          // not-found state once loading clears.
+        })
+        .finally(() => setLoading(false));
+    }
+    return () => window.removeEventListener(EVENT, refresh);
+  }, [id, refresh]);
+  return { job, loading };
 }

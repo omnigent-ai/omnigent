@@ -787,3 +787,98 @@ class SqlUserDailyCost(Base):
     cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
     ask_approved_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
     updated_at: Mapped[int] = mapped_column(Integer)
+
+
+class SqlJob(Base):
+    """
+    SQLAlchemy model for the ``jobs`` table.
+
+    A *job* is a saved AI workflow (node graph) executed via promptgen: the
+    graph is rendered to an English narrative client-side and fed as the initial
+    prompt to a single agent session. The backend stores the graph as opaque
+    JSON and never interprets it.
+
+    :param id: Unique job identifier, e.g. ``"job_0f1a2b3c..."``.
+    :param created_at: Unix epoch seconds when the job was created.
+    :param updated_at: Unix epoch seconds of the last update.
+    :param name: Human-readable job name.
+    :param graph: Opaque flow-graph JSON (nodes/edges/loops); round-tripped
+        to the client, never parsed server-side.
+    :param narrative: English narrative rendered from ``graph`` by the client.
+        This is the prompt fed to the agent on a run.
+    :param agent_id: Agent the job runs as. ``SET NULL`` on agent deletion so
+        re-registering a built-in agent doesn't cascade-delete jobs.
+    :param harness_override: Optional harness override for the run's session.
+    :param model_override: Optional model id override for the run's session.
+    :param created_by: Owning user id, or ``None`` in single-user mode.
+    :param schedule_config: Reserved for future scheduling (cron/loops);
+        opaque JSON, unused in v1.
+    """
+
+    __tablename__ = "jobs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int] = mapped_column(Integer)
+    name: Mapped[str] = mapped_column(String(256))
+    graph: Mapped[str] = mapped_column(Text)
+    narrative: Mapped[str] = mapped_column(Text)
+    agent_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("agents.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    harness_override: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    schedule_config: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_jobs_created_by_updated_at", "created_by", "updated_at"),
+        Index("ix_jobs_updated_at", "updated_at"),
+    )
+
+
+class SqlRun(Base):
+    """
+    SQLAlchemy model for the ``runs`` table.
+
+    A *run* records one execution of a :class:`SqlJob` — it *is* an agent
+    session created from the job's narrative.
+
+    :param id: Unique run identifier, e.g. ``"run_0f1a2b3c..."``.
+    :param job_id: Owning job. ``CASCADE`` — runs are meaningless without
+        their job.
+    :param session_id: Conversation/session created for this run. ``SET NULL``
+        on session deletion so run history outlives session cleanup.
+    :param status: One of ``running`` / ``finished`` / ``failed``.
+    :param started_at: Unix epoch seconds the run was triggered.
+    :param completed_at: Unix epoch seconds of the terminal state, or ``None``
+        while running.
+    :param error: Failure detail when ``status == "failed"``.
+    :param created_by: Owning user id, or ``None`` in single-user mode.
+    """
+
+    __tablename__ = "runs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+    )
+    session_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("conversations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    status: Mapped[str] = mapped_column(String(32), default="running")
+    started_at: Mapped[int] = mapped_column(Integer)
+    completed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    __table_args__ = (
+        Index("ix_runs_job_id_started_at", "job_id", "started_at"),
+        Index("ix_runs_session_id", "session_id"),
+        Index("ix_runs_status", "status"),
+    )

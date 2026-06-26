@@ -1643,6 +1643,244 @@
         "title": "IncompleteEvent",
         "type": "object"
       },
+      "JobCreateRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `POST /v1/jobs`.\n\nA job is a saved AI workflow authored as a node graph in the web UI.\nThe graph is opaque to the backend; the client also sends the English\n`narrative` it rendered from the graph, which becomes the prompt fed\nto the agent on a run.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Agent the job runs as, or `None` if not yet bound.",
+            "title": "Agent Id"
+          },
+          "graph": {
+            "additionalProperties": true,
+            "description": "Opaque flow-graph object (nodes/edges/loops). Stored as JSON and round-tripped to the client; never parsed server-side.",
+            "title": "Graph",
+            "type": "object"
+          },
+          "harness_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional harness override for the run session.",
+            "title": "Harness Override"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional model id override for the run session.",
+            "title": "Model Override"
+          },
+          "name": {
+            "description": "Human-readable job name.",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "narrative": {
+            "description": "English narrative rendered from `graph` by the client (`flowToText.ts`).",
+            "title": "Narrative",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "graph",
+          "narrative"
+        ],
+        "title": "JobCreateRequest",
+        "type": "object"
+      },
+      "JobResponse": {
+        "description": "A job as returned by the jobs endpoints.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Agent the job runs as, or `None`.",
+            "title": "Agent Id"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "graph": {
+            "additionalProperties": true,
+            "description": "Opaque flow-graph object.",
+            "title": "Graph",
+            "type": "object"
+          },
+          "harness_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Harness override, or `None`.",
+            "title": "Harness Override"
+          },
+          "id": {
+            "description": "Unique job identifier, e.g. `\"job_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model override, or `None`.",
+            "title": "Model Override"
+          },
+          "name": {
+            "description": "Human-readable job name.",
+            "title": "Name",
+            "type": "string"
+          },
+          "narrative": {
+            "description": "English narrative fed to the agent on a run.",
+            "title": "Narrative",
+            "type": "string"
+          },
+          "object": {
+            "default": "job",
+            "description": "Always `\"job\"`.",
+            "title": "Object",
+            "type": "string"
+          },
+          "updated_at": {
+            "description": "Unix epoch seconds of the last update.",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "graph",
+          "narrative",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "JobResponse",
+        "type": "object"
+      },
+      "JobUpdateRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `PATCH /v1/jobs/{id}`. All fields optional; only\nthe provided ones are applied.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New bound agent.",
+            "title": "Agent Id"
+          },
+          "graph": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New opaque flow-graph object.",
+            "title": "Graph"
+          },
+          "harness_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New harness override.",
+            "title": "Harness Override"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New model override.",
+            "title": "Model Override"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New job name.",
+            "title": "Name"
+          },
+          "narrative": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New rendered narrative.",
+            "title": "Narrative"
+          }
+        },
+        "title": "JobUpdateRequest",
+        "type": "object"
+      },
       "LaunchRunnerRequest": {
         "description": "Request body for `POST /v1/hosts/{host_id}/runners`.",
         "properties": {
@@ -2733,6 +2971,81 @@
           "rationale"
         ],
         "title": "RoutingDecisionData",
+        "type": "object"
+      },
+      "RunResponse": {
+        "description": "A job run as returned by the run endpoints.",
+        "properties": {
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix epoch seconds of the terminal state, or `None` while running.",
+            "title": "Completed At"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Failure detail when `status == \"failed\"`, else `None`.",
+            "title": "Error"
+          },
+          "id": {
+            "description": "Unique run identifier, e.g. `\"run_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "job_id": {
+            "description": "The job this run belongs to.",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "object": {
+            "default": "run",
+            "description": "Always `\"run\"`.",
+            "title": "Object",
+            "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The session created for this run, or `None` if that session has since been deleted.",
+            "title": "Session Id"
+          },
+          "started_at": {
+            "description": "Unix epoch seconds the run was triggered.",
+            "title": "Started At",
+            "type": "integer"
+          },
+          "status": {
+            "description": "One of `\"running\"` / `\"finished\"` / `\"failed\"`. Terminal states are reconciled from the underlying session on read.",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "job_id",
+          "status",
+          "started_at"
+        ],
+        "title": "RunResponse",
         "type": "object"
       },
       "SandboxStatus": {
@@ -6443,6 +6756,306 @@
         ]
       }
     },
+    "/v1/jobs": {
+      "get": {
+        "description": "List the caller's jobs, newest-updated first.",
+        "operationId": "list_jobs_v1_jobs_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/JobResponse"
+                  },
+                  "title": "Response List Jobs V1 Jobs Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Jobs",
+        "tags": [
+          "jobs"
+        ]
+      },
+      "post": {
+        "description": "Create a job.",
+        "operationId": "create_job_v1_jobs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}": {
+      "delete": {
+        "description": "Delete a job (and, via cascade, its runs).",
+        "operationId": "delete_job_v1_jobs__job_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Job",
+        "tags": [
+          "jobs"
+        ]
+      },
+      "get": {
+        "description": "Fetch one job.",
+        "operationId": "get_job_v1_jobs__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Job",
+        "tags": [
+          "jobs"
+        ]
+      },
+      "patch": {
+        "description": "Patch a job's fields.",
+        "operationId": "update_job_v1_jobs__job_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}/run": {
+      "post": {
+        "description": "Run a job now: create a session from its narrative + record a run.",
+        "operationId": "run_job_v1_jobs__job_id__run_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}/runs": {
+      "get": {
+        "description": "List a job's runs, newest-started first, with status reconciled.",
+        "operationId": "list_runs_v1_jobs__job_id__runs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RunResponse"
+                  },
+                  "title": "Response List Runs V1 Jobs  Job Id  Runs Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Runs",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
     "/v1/me": {
       "get": {
         "description": "Return the current user's identity.\n\nReads the user from the auth provider (same logic that\nsession routes use). The frontend calls this on load to\ndiscover who it is.\n\nWhen OIDC is active and the user is unauthenticated,\nreturns 401 with a `login_url` so the frontend knows\nwhere to redirect.\n\n**Returns:** `{\"user_id\": \"alice@example.com\"}`, `{\"user_id\": null}` if unauthenticated in header mode, or 401 with `login_url` in OIDC mode.",
@@ -6779,6 +7392,49 @@
         "summary": "Runner Status",
         "tags": [
           "runners"
+        ]
+      }
+    },
+    "/v1/runs/{run_id}": {
+      "get": {
+        "description": "Fetch one run, with status reconciled from its session.",
+        "operationId": "get_run_v1_runs__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Run",
+        "tags": [
+          "jobs"
         ]
       }
     },

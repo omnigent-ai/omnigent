@@ -3783,3 +3783,113 @@ class PolicyEvaluationRequestEvent(_SSEEventBase):
 
 
 HarnessStreamEvent = ServerStreamEvent | InjectionConsumedEvent | PolicyEvaluationRequestEvent
+
+
+# ── Jobs / Workflows ──────────────────────────────────────
+
+
+class JobCreateRequest(BaseModel):
+    """
+    Request body for ``POST /v1/jobs``.
+
+    A job is a saved AI workflow authored as a node graph in the web UI.
+    The graph is opaque to the backend; the client also sends the English
+    ``narrative`` it rendered from the graph, which becomes the prompt fed
+    to the agent on a run.
+
+    :param name: Human-readable job name.
+    :param graph: Opaque flow-graph object (nodes/edges/loops). Stored as
+        JSON and round-tripped to the client; never parsed server-side.
+    :param narrative: English narrative rendered from ``graph`` by the
+        client (``flowToText.ts``).
+    :param agent_id: Agent the job runs as, or ``None`` if not yet bound.
+    :param harness_override: Optional harness override for the run session.
+    :param model_override: Optional model id override for the run session.
+    """
+
+    name: str = Field(min_length=1, max_length=256)
+    graph: dict[str, Any]
+    narrative: str
+    agent_id: str | None = None
+    harness_override: str | None = None
+    model_override: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class JobUpdateRequest(BaseModel):
+    """
+    Request body for ``PATCH /v1/jobs/{id}``. All fields optional; only
+    the provided ones are applied.
+
+    :param name: New job name.
+    :param graph: New opaque flow-graph object.
+    :param narrative: New rendered narrative.
+    :param agent_id: New bound agent.
+    :param harness_override: New harness override.
+    :param model_override: New model override.
+    """
+
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    graph: dict[str, Any] | None = None
+    narrative: str | None = None
+    agent_id: str | None = None
+    harness_override: str | None = None
+    model_override: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class JobResponse(BaseModel):
+    """
+    A job as returned by the jobs endpoints.
+
+    :param id: Unique job identifier, e.g. ``"job_abc123"``.
+    :param object: Always ``"job"``.
+    :param name: Human-readable job name.
+    :param graph: Opaque flow-graph object.
+    :param narrative: English narrative fed to the agent on a run.
+    :param agent_id: Agent the job runs as, or ``None``.
+    :param harness_override: Harness override, or ``None``.
+    :param model_override: Model override, or ``None``.
+    :param created_at: Unix epoch seconds of creation.
+    :param updated_at: Unix epoch seconds of the last update.
+    """
+
+    id: str
+    object: str = "job"
+    name: str
+    graph: dict[str, Any]
+    narrative: str
+    agent_id: str | None = None
+    harness_override: str | None = None
+    model_override: str | None = None
+    created_at: int
+    updated_at: int
+
+
+class RunResponse(BaseModel):
+    """
+    A job run as returned by the run endpoints.
+
+    :param id: Unique run identifier, e.g. ``"run_abc123"``.
+    :param object: Always ``"run"``.
+    :param job_id: The job this run belongs to.
+    :param session_id: The session created for this run, or ``None`` if
+        that session has since been deleted.
+    :param status: One of ``"running"`` / ``"finished"`` / ``"failed"``.
+        Terminal states are reconciled from the underlying session on read.
+    :param started_at: Unix epoch seconds the run was triggered.
+    :param completed_at: Unix epoch seconds of the terminal state, or
+        ``None`` while running.
+    :param error: Failure detail when ``status == "failed"``, else ``None``.
+    """
+
+    id: str
+    object: str = "run"
+    job_id: str
+    session_id: str | None = None
+    status: str
+    started_at: int
+    completed_at: int | None = None
+    error: str | None = None

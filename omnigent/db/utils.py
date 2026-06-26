@@ -633,6 +633,26 @@ def generate_task_id() -> str:
     return f"resp_{uuid.uuid4().hex}"
 
 
+def generate_job_id() -> str:
+    """
+    Generate a unique job identifier.
+
+    :returns: A string of the form ``"job_<32-char hex>"``,
+        e.g. ``"job_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    """
+    return f"job_{uuid.uuid4().hex}"
+
+
+def generate_run_id() -> str:
+    """
+    Generate a unique job-run identifier.
+
+    :returns: A string of the form ``"run_<32-char hex>"``,
+        e.g. ``"run_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    """
+    return f"run_{uuid.uuid4().hex}"
+
+
 def generate_item_id(item_type: str) -> str:
     """
     Generate a unique conversation-item identifier.

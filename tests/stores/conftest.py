@@ -11,6 +11,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.job_store.sqlalchemy_store import SqlAlchemyJobStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
 
@@ -36,6 +37,14 @@ def conversation_store(db_uri: str) -> SqlAlchemyConversationStore:
     :returns: A SqlAlchemyConversationStore backed by the test database.
     """
     return SqlAlchemyConversationStore(db_uri)
+
+
+@pytest.fixture()
+def job_store(db_uri: str) -> SqlAlchemyJobStore:
+    """
+    :returns: A SqlAlchemyJobStore backed by the test database.
+    """
+    return SqlAlchemyJobStore(db_uri)
 
 
 @pytest.fixture()

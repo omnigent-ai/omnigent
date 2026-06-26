@@ -9,22 +9,35 @@
  */
 
 import { useState } from "react";
-import { PencilIcon, PlusIcon, Trash2Icon, WorkflowIcon } from "lucide-react";
+import { PencilIcon, PlayIcon, PlusIcon, Trash2Icon, WorkflowIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link, useNavigate } from "@/lib/routing";
-import { createJob, deleteJob, updateJob, useJobs } from "@/lib/jobsStore";
+import { createJob, deleteJob, runJob, updateJob, useJobs } from "@/lib/jobsStore";
 
 export function JobsPage() {
   const jobs = useJobs();
   const navigate = useNavigate();
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const [runningId, setRunningId] = useState<string | null>(null);
 
-  const onCreate = () => {
-    const job = createJob("Untitled flow");
+  const onCreate = async () => {
+    const job = await createJob("Untitled flow");
     navigate(`/jobs/flow/${job.id}`);
+  };
+
+  const onRun = async (id: string) => {
+    setRunningId(id);
+    try {
+      const run = await runJob(id);
+      if (run.sessionId) navigate(`/c/${run.sessionId}`);
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : "Failed to run job");
+    } finally {
+      setRunningId(null);
+    }
   };
 
   const startRename = (id: string, current: string) => {
@@ -33,7 +46,7 @@ export function JobsPage() {
   };
   const commitRename = (id: string) => {
     const v = renameValue.trim();
-    if (v) updateJob(id, { name: v });
+    if (v) void updateJob(id, { name: v });
     setRenamingId(null);
   };
 
@@ -99,6 +112,15 @@ export function JobsPage() {
                   <Button
                     variant="ghost"
                     size="icon-sm"
+                    aria-label="Run job now"
+                    disabled={runningId === job.id}
+                    onClick={() => onRun(job.id)}
+                  >
+                    <PlayIcon className="size-3.5" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
                     aria-label="Rename job"
                     onClick={() => startRename(job.id, job.name)}
                   >
@@ -109,7 +131,7 @@ export function JobsPage() {
                     size="icon-sm"
                     aria-label="Delete job"
                     onClick={() => {
-                      if (window.confirm(`Delete “${job.name}”?`)) deleteJob(job.id);
+                      if (window.confirm(`Delete “${job.name}”?`)) void deleteJob(job.id);
                     }}
                   >
                     <Trash2Icon className="size-3.5" />

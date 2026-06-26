@@ -328,6 +328,7 @@ def _build_app_with_stub_stores() -> Any:
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.host_store import HostStore
+    from omnigent.stores.job_store.sqlalchemy_store import SqlAlchemyJobStore
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
     # On-disk SQLite (mkdtemp ensures uniqueness so concurrent
@@ -349,6 +350,7 @@ def _build_app_with_stub_stores() -> Any:
         # Pass stores so conditionally-mounted routes stay in the spec.
         host_store=HostStore(db_uri),
         policy_store=SqlAlchemyPolicyStore(db_uri),
+        job_store=SqlAlchemyJobStore(db_uri),
     )
 
 
