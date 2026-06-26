@@ -47,6 +47,7 @@ import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
+import { readLastModeForHarness, writeLastModeForHarness } from "@/lib/modePreferences";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { BUILTIN_AGENTS, sortAgentsForDisplay } from "@/lib/agentGrouping";
@@ -54,6 +55,7 @@ import { cn } from "@/lib/utils";
 import {
   isNativeCodingAgent,
   nativeAgentHasCapability,
+  nativeCodingAgentForAvailableAgent,
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
 import { useHosts, type Host } from "@/hooks/useHosts";
@@ -1507,6 +1509,40 @@ export function NewChatLandingScreen() {
   useEffect(() => {
     setBypassSandbox(false);
   }, [effectiveAgentId]);
+  // The selected native harness, used to persist/seed its mode pick (the
+  // mode knob is harness-specific). null for non-native agents, which have
+  // no mode knob to remember.
+  const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
+  // Seed the harness's mode knob from the user's last pick when the selected
+  // harness changes (including the first mount), so a returning user starts a
+  // new session on the mode they used last for that harness instead of the
+  // default. Keyed on the harness so an in-session edit isn't clobbered on
+  // re-render — only a harness switch reseeds.
+  useEffect(() => {
+    if (!selectedNativeHarness) return;
+    const stored = readLastModeForHarness(selectedNativeHarness);
+    // Resolve to the stored value when it's still valid for this harness,
+    // else the harness default. The else branch must RESET (not early-return)
+    // because codex-native and opencode-native share the single approvalMode
+    // state: returning early would leave the previously-selected harness's
+    // mode in place — e.g. codex's "full-access" carried onto OpenCode — and
+    // flow into the launch args unchanged. A stale value not in the current
+    // list resolves to the default for the same reason.
+    const resolve = (modes: readonly { value: string }[], dflt: string) =>
+      stored != null && modes.some((m) => m.value === stored) ? stored : dflt;
+    if (supportsPermissionMode) {
+      setPermissionMode(
+        resolve(CLAUDE_NATIVE_PERMISSION_MODES, CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE),
+      );
+    } else if (supportsApprovalMode) {
+      setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
+    } else if (supportsCursorMode) {
+      setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
+    }
+    // Reseed only on harness change; capability flags are derived from the
+    // same harness so they don't need to be deps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedNativeHarness]);
   // Native-terminal agents interpret slash commands inside their own CLI
   // (the runner injects the text verbatim), so the landing composer must
   // not intercept them — no skills menu, no slash_command routing.
@@ -2158,13 +2194,22 @@ export function NewChatLandingScreen() {
                   <ModePill label={permissionModeLabel} testId="new-chat-landing-permission-pill">
                     <PermissionModeOptions
                       value={permissionMode}
-                      onValueChange={setPermissionMode}
+                      onValueChange={(mode) => {
+                        setPermissionMode(mode);
+                        writeLastModeForHarness(selectedNativeHarness, mode);
+                      }}
                     />
                   </ModePill>
                 )}
                 {supportsApprovalMode && (
                   <ModePill label={approvalModeLabel} testId="new-chat-landing-approval-pill">
-                    <ApprovalModeOptions value={approvalMode} onValueChange={setApprovalMode} />
+                    <ApprovalModeOptions
+                      value={approvalMode}
+                      onValueChange={(mode) => {
+                        setApprovalMode(mode);
+                        writeLastModeForHarness(selectedNativeHarness, mode);
+                      }}
+                    />
                     <DropdownMenuSeparator />
                     <BypassSandboxOption
                       enabled={bypassSandbox}
@@ -2174,7 +2219,13 @@ export function NewChatLandingScreen() {
                 )}
                 {supportsCursorMode && (
                   <ModePill label={cursorExecModeLabel} testId="new-chat-landing-cursor-mode-pill">
-                    <CursorModeOptions value={cursorExecMode} onValueChange={setCursorExecMode} />
+                    <CursorModeOptions
+                      value={cursorExecMode}
+                      onValueChange={(mode) => {
+                        setCursorExecMode(mode);
+                        writeLastModeForHarness(selectedNativeHarness, mode);
+                      }}
+                    />
                   </ModePill>
                 )}
               </div>
