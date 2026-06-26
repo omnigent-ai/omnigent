@@ -897,6 +897,56 @@ describe("Sidebar mobile overlay background", () => {
   });
 });
 
+// When the active conversation changes (e.g. a freshly created session the
+// app navigates to via /c/:id), its sidebar row scrolls into view so it isn't
+// stranded below the fold. We center it with a smooth animation. jsdom doesn't
+// implement scrollIntoView, so it's spied on.
+describe("Sidebar active-row auto-scroll", () => {
+  function renderAtRoute(initialEntry: string) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[initialEntry]}>
+            <Routes>
+              <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
+              <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("scrolls the active session's row to center with a smooth animation", () => {
+    const scrollIntoView = vi.fn();
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(scrollIntoView);
+
+    mockConversations([conv("conv_top", "Claude Code"), conv("conv_active", "Claude Code")]);
+    renderAtRoute("/c/conv_active");
+
+    // The active row owns the only scrollIntoView call, centered + smooth.
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "center" });
+
+    vi.restoreAllMocks();
+  });
+
+  it("does not scroll any row when no conversation is active", () => {
+    const scrollIntoView = vi.fn();
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(scrollIntoView);
+
+    mockConversations([conv("conv_a", "Claude Code"), conv("conv_b", "Claude Code")]);
+    // Landing route "/" has no :conversationId — nothing is active, so no row
+    // should yank the list around on mount.
+    renderAtRoute("/");
+
+    expect(scrollIntoView).not.toHaveBeenCalled();
+
+    vi.restoreAllMocks();
+  });
+});
+
 describe("Sidebar collapsed marker", () => {
   // The dark-mode glass rule in index.css keys its border/blur on
   // :not([data-collapsed]) — NOT on aria-hidden, which Radix also toggles

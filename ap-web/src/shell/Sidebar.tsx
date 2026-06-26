@@ -1404,6 +1404,14 @@ function ConversationRow({
   useEffect(() => {
     activeIdRef.current = activeId;
   }, [activeId]);
+  // When this row becomes the active conversation (e.g. a freshly created
+  // session navigated to via `/c/:id`), scroll it toward the center of the
+  // sidebar so it's comfortably in view rather than pinned to an edge.
+  const rowRef = useRef<HTMLLIElement>(null);
+  useEffect(() => {
+    if (!isActive) return;
+    rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [isActive]);
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
@@ -1575,7 +1583,7 @@ function ConversationRow({
   }
 
   return (
-    <li className="group relative">
+    <li ref={rowRef} className="group relative">
       <Link
         to={selectionMode ? "#" : `/c/${conversation.id}`}
         className={cn(
