@@ -691,7 +691,7 @@ function ProjectFolder({
       onProjectAssigned={onProjectAssigned}
       emptyMessage={loadingFirstPage ? undefined : "No chats"}
       indentRows
-      headerAction={<ProjectFolderActions projectName={name} />}
+      headerAction={<ProjectFolderActions projectName={name} onNavigate={onRowClick} />}
       footer={
         loadingFirstPage ? (
           <p className="px-2 py-1 pl-7 text-muted-foreground text-xs">Loading…</p>
@@ -1253,7 +1253,11 @@ function SectionGroup({
           onToggleCollapsed={onToggleCollapsed}
         />
         {headerAction && (
-          <div className="absolute top-0.5 right-1 flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100">
+          // Desktop-only, hover/focus-revealed: a group-level bulk control
+          // (e.g. "collapse all projects") is a pointer convenience, so it
+          // stays hidden until the header is hovered and never floats on
+          // touch viewports where there's no hover.
+          <div className="absolute top-0.5 right-1 hidden items-center transition-opacity md:flex md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100">
             {headerAction}
           </div>
         )}
@@ -2153,7 +2157,15 @@ function ArchivingRow({ label }: { label: string }) {
  * links to the landing composer with `?project=<name>` so its project chip
  * lands already selected.
  */
-function ProjectFolderActions({ projectName }: { projectName: string }) {
+function ProjectFolderActions({
+  projectName,
+  onNavigate,
+}: {
+  projectName: string;
+  /** Plain-left-click nav handler — closes the mobile overlay so the
+      pre-filed new-session page isn't left hidden behind the sidebar. */
+  onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+}) {
   return (
     <div className="flex items-center">
       <ProjectFolderMenu projectName={projectName} />
@@ -2164,10 +2176,16 @@ function ProjectFolderActions({ projectName }: { projectName: string }) {
         size="icon-sm"
         aria-label={`New session in ${projectName}`}
         data-testid="project-new-session"
-        // Sits on the folder header; keep its click off the collapse toggle.
-        onClick={(e) => e.stopPropagation()}
       >
-        <Link to={`/?project=${encodeURIComponent(projectName)}`}>
+        <Link
+          to={`/?project=${encodeURIComponent(projectName)}`}
+          onClick={(e) => {
+            // Keep the click off the folder's collapse toggle, then run the
+            // shared nav handler (closes the sidebar overlay on mobile).
+            e.stopPropagation();
+            onNavigate(e);
+          }}
+        >
           <SquarePenIcon className="size-3.5" />
         </Link>
       </Button>

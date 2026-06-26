@@ -541,6 +541,30 @@ describe("Sidebar project sections", () => {
     expect(pencil.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
 
+  it("closes the mobile overlay when the project pencil is tapped", () => {
+    // jsdom's matchMedia mock reports non-desktop, so isMobileViewport() is
+    // true: a plain pencil tap must close the full-screen sidebar overlay,
+    // otherwise the pre-filed new-session page is left hidden behind it.
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    const onClose = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Sidebar open onClose={onClose} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId("project-new-session").closest("a")!);
+    expect(onClose).toHaveBeenCalled();
+  });
+
   it("starts a project folder collapsed with its rows hidden", () => {
     projectsMock.push("Customer X");
     mockConversations([
