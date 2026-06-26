@@ -1511,10 +1511,17 @@ async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
             },
         )
         assert response.status_code == 202
-        # The background turn task runs after the 202; yield until the
-        # terminal status is published (with a hard cap so a real hang
-        # regression fails the test instead of spinning forever).
-        statuses = await _drain_published_statuses(conv, until="failed", timeout=10.0)
+        # Await the background turn task directly so we know it has
+        # completed (and published its terminal status) before draining.
+        # This eliminates the race where the drain's timeout expires
+        # before the task finishes under heavy CI load.
+        turn_task = next(
+            (t for t in asyncio.all_tasks() if t.get_name() == f"turn-{conv}"),
+            None,
+        )
+        if turn_task is not None:
+            await asyncio.wait_for(turn_task, timeout=10.0)
+        statuses = await _drain_published_statuses(conv, until="failed", timeout=2.0)
 
     # The turn published "running" then "failed" — it reached a terminal
     # state and cleared. Without the fix, the setup-phase OmnigentError is
@@ -1599,7 +1606,15 @@ async def test_runner_failed_status_carries_setup_error_message(
             },
         )
         assert response.status_code == 202
-        failed_event = await _drain_failed_status_event(conv, timeout=10.0)
+        # Await the background turn task directly so we know it has
+        # completed (and published its terminal status) before draining.
+        turn_task = next(
+            (t for t in asyncio.all_tasks() if t.get_name() == f"turn-{conv}"),
+            None,
+        )
+        if turn_task is not None:
+            await asyncio.wait_for(turn_task, timeout=10.0)
+        failed_event = await _drain_failed_status_event(conv, timeout=2.0)
 
     # The failed event must carry the real setup error message — not a
     # bare status. Without the fix ``error`` is absent and the REPL

@@ -12816,6 +12816,19 @@ def create_runner_app(
         _subagent_wake_pending.discard(conv)
         try:
             await _run_turn_bg_setup_and_stream(msg_body, conv)
+        except asyncio.CancelledError as exc:
+            # Task cancellation (e.g. event-loop teardown) must still
+            # publish a terminal ``failed`` status so the session never
+            # hangs on a stale "running" turn. Re-raise after cleanup to
+            # preserve asyncio cancellation semantics.
+            _logger.error(
+                "turn cancelled for %s: %s",
+                conv,
+                exc,
+                exc_info=True,
+            )
+            _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+            raise
         except Exception as exc:
             # Any failure before the harness stream starts (e.g. a provider
             # with no resolvable model raising OmnigentError from
