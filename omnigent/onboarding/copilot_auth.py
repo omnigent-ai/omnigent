@@ -31,11 +31,10 @@ accepted by Copilot.
 from __future__ import annotations
 
 import importlib.util
-import shutil
 import subprocess
-import sys
 
 from omnigent.errors import OmnigentError
+from omnigent.onboarding.extra_install import extra_install_command
 from omnigent.onboarding.provider_config import load_config, resolve_secret
 
 # The secret-store name (and thus ``keychain:<name>``) under which a Copilot
@@ -76,7 +75,6 @@ def looks_like_github_copilot_token(value: str) -> bool:
 # ``ANTIGRAVITY_EXTRA``. The name carries literal brackets — markup-rendered
 # surfaces must escape it.
 COPILOT_EXTRA = "copilot"
-COPILOT_EXTRA_INSTALL_COMMAND = 'pip install "omnigent[copilot]"'
 
 
 def copilot_sdk_installed() -> bool:
@@ -105,20 +103,12 @@ def copilot_sdk_installed() -> bool:
 def copilot_install_command() -> list[str]:
     """Return the argv that installs the ``copilot`` extra into this env.
 
-    Prefers ``uv pip install`` when ``uv`` is on ``PATH``, else this
-    interpreter's own pip (``sys.executable -m pip``) so the package lands in the
-    running install. Carries **no index URL** — pip/uv pick up the user's
-    configured index, so a private proxy is honored without hardcoding one.
-    Mirrors :func:`omnigent.onboarding.cursor_auth.cursor_install_command`.
+    Delegates to :func:`~omnigent.onboarding.extra_install.extra_install_command`
+    which detects ``uv tool`` / ``uv`` / ``pip`` installs automatically.
 
-    :returns: The install argv, e.g.
-        ``["uv", "pip", "install", "omnigent[copilot]"]`` or
-        ``[sys.executable, "-m", "pip", "install", "omnigent[copilot]"]``.
+    :returns: The install argv.
     """
-    target = f"omnigent[{COPILOT_EXTRA}]"
-    if shutil.which("uv") is not None:
-        return ["uv", "pip", "install", target]
-    return [sys.executable, "-m", "pip", "install", target]
+    return extra_install_command(COPILOT_EXTRA)
 
 
 def install_copilot_sdk() -> bool:

@@ -9349,13 +9349,11 @@ def _prompt_install_cursor() -> str | None:
     """
     from rich.markup import escape as _rich_escape
 
-    from omnigent.onboarding.cursor_auth import (
-        CURSOR_EXTRA_INSTALL_COMMAND,
-        install_cursor_sdk,
-    )
+    from omnigent.onboarding.cursor_auth import CURSOR_EXTRA, install_cursor_sdk
+    from omnigent.onboarding.extra_install import extra_install_display
     from omnigent.onboarding.interactive import console, select
 
-    cmd = CURSOR_EXTRA_INSTALL_COMMAND
+    cmd = extra_install_display(CURSOR_EXTRA)
     # ``select`` renders text through Rich markup; escape the literal
     # ``[cursor]`` so it renders verbatim.
     cmd_markup = _rich_escape(cmd)
@@ -9367,7 +9365,7 @@ def _prompt_install_cursor() -> str | None:
             "I'll run it myself (show the command)",
         ],
         descriptions=[
-            f"Runs `{cmd_markup}` (uses uv when available), then continues.",
+            f"Runs `{cmd_markup}`, then continues.",
             "Skip the install — store the key now; the SDK can be added later.",
             "Print the command so you can install it yourself, then continue.",
         ],
@@ -9524,13 +9522,11 @@ def _prompt_install_antigravity() -> str | None:
     """
     from rich.markup import escape as _rich_escape
 
-    from omnigent.onboarding.antigravity_auth import (
-        ANTIGRAVITY_EXTRA_INSTALL_COMMAND,
-        install_antigravity_sdk,
-    )
+    from omnigent.onboarding.antigravity_auth import ANTIGRAVITY_EXTRA, install_antigravity_sdk
+    from omnigent.onboarding.extra_install import extra_install_display
     from omnigent.onboarding.interactive import console, select
 
-    cmd = ANTIGRAVITY_EXTRA_INSTALL_COMMAND
+    cmd = extra_install_display(ANTIGRAVITY_EXTRA)
     # ``select`` renders through Rich markup, so escape the literal ``[antigravity]``.
     cmd_markup = _rich_escape(cmd)
     choice = select(
@@ -9541,7 +9537,7 @@ def _prompt_install_antigravity() -> str | None:
             "I'll run it myself (show the command)",
         ],
         descriptions=[
-            f"Runs `{cmd_markup}` (uses uv when available), then continues.",
+            f"Runs `{cmd_markup}`, then continues.",
             "Skip the install — store the key now; the SDK can be added later.",
             "Print the command so you can install it yourself, then continue.",
         ],
@@ -10206,13 +10202,11 @@ def _prompt_install_copilot() -> str | None:
     """
     from rich.markup import escape as _rich_escape
 
-    from omnigent.onboarding.copilot_auth import (
-        COPILOT_EXTRA_INSTALL_COMMAND,
-        install_copilot_sdk,
-    )
+    from omnigent.onboarding.copilot_auth import COPILOT_EXTRA, install_copilot_sdk
+    from omnigent.onboarding.extra_install import extra_install_display
     from omnigent.onboarding.interactive import console, select
 
-    cmd = COPILOT_EXTRA_INSTALL_COMMAND
+    cmd = extra_install_display(COPILOT_EXTRA)
     # ``select`` renders text through Rich markup; escape the literal
     # ``[copilot]`` so it renders verbatim.
     cmd_markup = _rich_escape(cmd)
@@ -10224,7 +10218,7 @@ def _prompt_install_copilot() -> str | None:
             "I'll run it myself (show the command)",
         ],
         descriptions=[
-            f"Runs `{cmd_markup}` (uses uv when available), then continues.",
+            f"Runs `{cmd_markup}`, then continues.",
             "Skip the install — store the token now; the SDK can be added later.",
             "Print the command so you can install it yourself, then continue.",
         ],
@@ -10899,22 +10893,23 @@ def _run_configure_harnesses_interactive() -> None:
 
     from omnigent.onboarding.antigravity_auth import (
         ANTIGRAVITY_ENV_VARS,
-        ANTIGRAVITY_EXTRA_INSTALL_COMMAND,
+        ANTIGRAVITY_EXTRA,
         antigravity_api_key_configured,
         antigravity_sdk_installed,
     )
     from omnigent.onboarding.configure_models import family_label
     from omnigent.onboarding.copilot_auth import (
-        COPILOT_EXTRA_INSTALL_COMMAND,
+        COPILOT_EXTRA,
         COPILOT_TOKEN_ENV_VARS,
         copilot_github_token_configured,
         copilot_sdk_installed,
     )
     from omnigent.onboarding.cursor_auth import (
-        CURSOR_EXTRA_INSTALL_COMMAND,
+        CURSOR_EXTRA,
         cursor_api_key_configured,
         cursor_sdk_installed,
     )
+    from omnigent.onboarding.extra_install import extra_install_display
     from omnigent.onboarding.goose_auth import goose_config_summary
     from omnigent.onboarding.harness_install import (
         COPILOT_KEY,
@@ -11060,7 +11055,7 @@ def _run_configure_harnesses_interactive() -> None:
                     "Cursor",
                     "Not installed",
                     "missing",
-                    _install_hint(CURSOR_EXTRA_INSTALL_COMMAND),
+                    _install_hint(extra_install_display(CURSOR_EXTRA)),
                 ),
             )
         else:
@@ -11144,7 +11139,7 @@ def _run_configure_harnesses_interactive() -> None:
                     "Antigravity",
                     "Not installed",
                     "missing",
-                    _install_hint(ANTIGRAVITY_EXTRA_INSTALL_COMMAND),
+                    _install_hint(extra_install_display(ANTIGRAVITY_EXTRA)),
                 ),
             )
         else:
@@ -11213,7 +11208,7 @@ def _run_configure_harnesses_interactive() -> None:
                     "Copilot",
                     "Not installed",
                     "missing",
-                    _install_hint(COPILOT_EXTRA_INSTALL_COMMAND),
+                    _install_hint(extra_install_display(COPILOT_EXTRA)),
                 ),
             )
         else:

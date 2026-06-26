@@ -2511,19 +2511,18 @@ def test_cursor_overview_install_command_is_selection_only(
 ) -> None:
     """With the cursor extra absent, the Cursor row's install command is its description.
 
-    The exact ``pip install "omnigent[cursor]"`` (brackets included) is the
-    selection-only hint — the selector's per-row description, shown when the row
-    is highlighted — and is NOT baked into the always-visible row label. This is
-    the "tooltip only on selection" behavior.
+    The install command (dynamically computed) is the selection-only hint —
+    the selector's per-row description, shown when the row is highlighted —
+    and is NOT baked into the always-visible row label.
     """
     from rich.text import Text
 
     options, selectable, descriptions, _, _max_visible = _capture_setup_overview(monkeypatch)
     names = _overview_row_names(options, selectable)
     cursor = names.index("Cursor")
-    assert 'pip install "omnigent[cursor]"' in Text.from_markup(descriptions[cursor]).plain
+    assert "omnigent[cursor]" in Text.from_markup(descriptions[cursor]).plain
     # The command lives in the description only — never the always-visible row.
-    assert "pip install" not in Text.from_markup(options[cursor]).plain
+    assert "omnigent[cursor]" not in Text.from_markup(options[cursor]).plain
 
 
 def test_cursor_drillin_offers_install_when_sdk_missing(
@@ -2540,7 +2539,7 @@ def test_cursor_drillin_offers_install_when_sdk_missing(
     assert result.exit_code == 0, result.output
     out = result.output
     assert "isn't installed" in out
-    assert 'pip install "omnigent[cursor]"' in out
+    assert "omnigent[cursor]" in out
 
 
 def test_cursor_key_settable_when_sdk_missing(isolated_config, _cursor_sdk_absent) -> None:
@@ -2577,7 +2576,8 @@ def test_cursor_install_now_invokes_runner_without_index(
         calls.append(argv)
         return subprocess.CompletedProcess(args=argv, returncode=0)
 
-    monkeypatch.setattr("omnigent.onboarding.cursor_auth.shutil.which", lambda name: None)
+    monkeypatch.setattr("omnigent.onboarding.extra_install._is_uv_tool_install", lambda: False)
+    monkeypatch.setattr("omnigent.onboarding.extra_install.shutil.which", lambda name: None)
     monkeypatch.setattr("omnigent.onboarding.cursor_auth.subprocess.run", _run)
 
     # L1 3=Cursor → install offer 1=install now → key menu q=back → L1 q.
@@ -2755,19 +2755,17 @@ def test_antigravity_overview_install_command_is_selection_only(
 ) -> None:
     """With the antigravity extra absent, the Antigravity row's install command is its description.
 
-    The exact ``pip install "omnigent[antigravity]"`` (brackets included) is the
-    selection-only hint — the selector's per-row description — not baked into the
-    always-visible row. Without the SDK-detection branch the hint never appears.
+    The install command (dynamically computed) is the selection-only hint —
+    the selector's per-row description — not baked into the always-visible row.
+    Without the SDK-detection branch the hint never appears.
     """
     from rich.text import Text
 
     options, selectable, descriptions, _, _max_visible = _capture_setup_overview(monkeypatch)
     names = _overview_row_names(options, selectable)
     antigravity = names.index("Antigravity")
-    assert (
-        'pip install "omnigent[antigravity]"' in Text.from_markup(descriptions[antigravity]).plain
-    )
-    assert "pip install" not in Text.from_markup(options[antigravity]).plain
+    assert "omnigent[antigravity]" in Text.from_markup(descriptions[antigravity]).plain
+    assert "omnigent[antigravity]" not in Text.from_markup(options[antigravity]).plain
 
 
 @pytest.fixture()
@@ -2855,7 +2853,7 @@ def test_antigravity_drillin_offers_install_when_sdk_missing(
     assert result.exit_code == 0, result.output
     out = result.output
     assert "isn't installed" in out
-    assert 'pip install "omnigent[antigravity]"' in out
+    assert "omnigent[antigravity]" in out
 
 
 def test_antigravity_key_settable_when_sdk_missing(
@@ -2894,7 +2892,8 @@ def test_antigravity_install_now_invokes_runner_without_index(
         calls.append(argv)
         return subprocess.CompletedProcess(args=argv, returncode=0)
 
-    monkeypatch.setattr("omnigent.onboarding.antigravity_auth.shutil.which", lambda name: None)
+    monkeypatch.setattr("omnigent.onboarding.extra_install._is_uv_tool_install", lambda: False)
+    monkeypatch.setattr("omnigent.onboarding.extra_install.shutil.which", lambda name: None)
     monkeypatch.setattr("omnigent.onboarding.antigravity_auth.subprocess.run", _run)
 
     # L1 7=Antigravity → install offer 1=install now →
