@@ -67,26 +67,51 @@ fi
 # Build a bounded diff blob: only ap-web/** and tests/e2e_ui/** patches. Each
 # file's patch is truncated to MAX_PATCH_LINES so one huge file can't crowd out
 # the others, keeping the prompt representative across many-file PRs. An
-# overall byte cap (applied below) is a backstop for PRs with very many files.
+# overall byte cap is a backstop for PRs with very many files.
 MAX_PATCH_LINES=400
 MAX_BLOB_BYTES=60000
-# `gh api --paginate` (no --jq) merges all pages into one JSON array; pipe that
-# to jq so --argjson reaches jq (gh api itself has no --argjson flag).
-DIFF_BLOB=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
-  | jq -r --argjson max "$MAX_PATCH_LINES" '.[]
-    | select(.filename | startswith("ap-web/") or startswith("tests/e2e_ui/"))
+# Reserve a guaranteed slice of the byte budget for the tests/e2e_ui/** patches.
+# The files API returns files ALPHABETICALLY, so on a large UI PR every ap-web/**
+# patch sorts before tests/e2e_ui/** -- under a single overall byte cap the
+# ap-web patches alone (e.g. a 60KB Sidebar.tsx) would push the added test
+# patches out of the prompt entirely. The judge would then never see the
+# coverage that was actually added and (correctly, given what it saw) answer
+# needs_test=true. Build the two categories separately and cap each so neither
+# can crowd the other out, listing the test patches first.
+E2E_UI_BUDGET=$((MAX_BLOB_BYTES / 2))
+
+# `gh api --paginate` (no --jq) merges all pages into one JSON array; capture it
+# once and feed it to jq per category so --argjson reaches jq (gh api itself has
+# no --argjson flag).
+FILES_JSON=$(gh api "repos/$REPO/pulls/$PR/files" --paginate)
+
+# Emit the truncated "=== status filename ===\n<patch>" block for every file
+# whose path starts with the given prefix.
+patch_blob() {  # $1 = path prefix
+  jq -r --argjson max "$MAX_PATCH_LINES" --arg pfx "$1" '.[]
+    | select(.filename | startswith($pfx))
     | (.patch // "(no textual patch -- binary or too large)") as $p
     | ($p | split("\n")) as $lines
     | (if ($lines | length) > $max
          then (($lines[:$max] | join("\n")) + "\n... (patch truncated at \($max) lines)")
          else $p end) as $trunc
-    | "=== \(.status) \(.filename) ===\n\($trunc)"')
-# Apply the overall byte cap in-shell, NOT via `... | head -c`. Under
-# `set -o pipefail`, head closing the pipe early sends jq SIGPIPE, and that
-# broken-pipe exit aborts the whole gate on any large UI PR (diff > cap) --
-# fail-closed before the judge or the skip-label logic ever runs. Bash slicing
-# truncates the captured string with no pipe to break.
-DIFF_BLOB=${DIFF_BLOB:0:$MAX_BLOB_BYTES}
+    | "=== \(.status) \(.filename) ===\n\($trunc)"' <<< "$FILES_JSON"
+}
+
+E2E_BLOB=$(patch_blob "tests/e2e_ui/")
+AP_BLOB=$(patch_blob "ap-web/")
+
+# Cap the e2e_ui patches to their reserved slice, then let ap-web use whatever
+# of the overall budget the (usually small) e2e_ui blob left over. Apply the
+# byte caps in-shell, NOT via `... | head -c`: under `set -o pipefail`, head
+# closing the pipe early sends jq SIGPIPE, and that broken-pipe exit aborts the
+# whole gate on any large UI PR -- fail-closed before the judge or the
+# skip-label logic ever runs. Bash slicing truncates the captured string with
+# no pipe to break.
+E2E_BLOB=${E2E_BLOB:0:$E2E_UI_BUDGET}
+AP_BUDGET=$(( MAX_BLOB_BYTES - ${#E2E_BLOB} ))
+AP_BLOB=${AP_BLOB:0:$AP_BUDGET}
+DIFF_BLOB="${E2E_BLOB}"$'\n'"${AP_BLOB}"
 
 PR_TITLE=$(gh pr view "$PR" --repo "$REPO" --json title --jq '.title')
 
