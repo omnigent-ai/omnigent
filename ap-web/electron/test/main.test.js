@@ -23,9 +23,7 @@ const path = require("node:path");
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
-const liveCode = mainSource
-  .replace(/\/\*[\s\S]*?\*\//g, "")
-  .replace(/(^|[^:])\/\/.*$/gm, "$1");
+const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
 describe("workspace chrome injection wiring (src/main.js)", () => {
   it("invokes registerWorkspaceChromeHide(win.webContents) as live code", () => {
