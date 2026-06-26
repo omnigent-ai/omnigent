@@ -24,7 +24,10 @@ export function CapabilitiesProvider({
   info,
   children,
 }: {
-  info: ServerInfo;
+  // Accepts the ``"loading"`` sentinel so main.tsx can mount the tree before
+  // the boot probe resolves (the app-shell skeleton renders during that
+  // window); flips to the resolved ``ServerInfo`` once the probe settles.
+  info: CapabilitiesValue;
   children: ReactNode;
 }) {
   return <CapabilitiesContext.Provider value={info}>{children}</CapabilitiesContext.Provider>;

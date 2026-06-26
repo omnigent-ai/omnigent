@@ -4,6 +4,7 @@ import { ChatPage } from "@/pages/ChatPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
+import { AppShellSkeleton } from "@/shell/AppShellSkeleton";
 
 // Lazy-load the three accounts pages so the bundle a header / OIDC
 // deploy ships (where accounts is off) doesn't include them in the
@@ -87,11 +88,14 @@ function App({ basename }: AppProps = {}) {
   // the original relative route table.
   const prefix = basename ?? "";
   const info = useServerInfo();
-  // While the probe is in flight, render nothing — first paint is
-  // ~30ms after boot anyway, and flashing the chrome we may
-  // immediately tear down once the probe returns is worse than a
-  // tiny blank moment.
-  if (info === "loading") return null;
+  // While the probe is in flight, paint the app-shell skeleton instead of a
+  // blank screen. main.tsx mounts the tree immediately (info starts
+  // "loading") and flips info to the resolved value when the probe settles —
+  // so on a slow/missing server the user sees the shell's silhouette (rail +
+  // header + central placeholder) rather than white for up to the 1.5s probe
+  // timeout. The skeleton approximates the real geometry, so the swap to the
+  // live tree doesn't shift layout.
+  if (info === "loading") return <AppShellSkeleton />;
 
   // First-run: accounts on but no admin claimed yet. Route EVERY path to
   // the Create-admin form so the first visitor lands on it no matter how

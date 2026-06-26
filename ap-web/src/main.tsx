@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { StrictMode } from "react";
+import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import App from "./App.tsx";
@@ -41,12 +41,14 @@ void resolveIdentity();
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
 initNativeInsets();
 
-// Probe /v1/info BEFORE the first render so the route table knows
-// whether to mount accounts routes. The probe is unauthed and the
-// failure path resolves to "accounts off" — so even a stalled or
-// missing server doesn't deadlock first paint. We add a small
-// safety timeout (1.5s) so users on a flaky network still get
-// something on screen.
+// Probe /v1/info so the route table knows whether to mount accounts routes.
+// The probe is unauthed and the failure path resolves to "accounts off" — so
+// even a stalled or missing server doesn't deadlock the app. We add a small
+// safety timeout (1.5s) so the route table settles for users on a flaky
+// network. The React tree mounts IMMEDIATELY (see `Boot` below) with
+// `info: "loading"` — App renders the app-shell skeleton during this window
+// instead of a blank screen — and flips to the resolved value when this
+// settles.
 const _bootProbe: Promise<ServerInfo> = Promise.race([
   resolveServerInfo(),
   new Promise<ServerInfo>((resolve) =>
@@ -67,26 +69,48 @@ const _bootProbe: Promise<ServerInfo> = Promise.race([
   ),
 ]);
 
-void _bootProbe.then((info) => {
-  createRoot(document.getElementById("root")!).render(
-    <StrictMode>
-      <CapabilitiesProvider info={info}>
-        <QueryClientProvider client={queryClient}>
-          <ThemeProvider>
-            <TooltipProvider>
-              <ImageLightboxProvider>
-                <BrowserRouter>
-                  <SessionUpdatesProvider>
-                    <RunnerHealthProvider>
-                      <App />
-                    </RunnerHealthProvider>
-                  </SessionUpdatesProvider>
-                </BrowserRouter>
-              </ImageLightboxProvider>
-            </TooltipProvider>
-          </ThemeProvider>
-        </QueryClientProvider>
-      </CapabilitiesProvider>
-    </StrictMode>,
+// Mounts the whole provider tree immediately with `info: "loading"` so the
+// app-shell skeleton paints on the very first frame, then subscribes to the
+// boot probe and flips `info` to the resolved value when it settles. Keeping
+// the providers mounted across the swap (rather than waiting for the probe to
+// even createRoot) is what turns the old up-to-1.5s blank screen into a
+// skeleton; App reads `info` from CapabilitiesContext and renders the skeleton
+// while it is "loading".
+function Boot() {
+  const [info, setInfo] = useState<ServerInfo | "loading">("loading");
+  useEffect(() => {
+    let active = true;
+    void _bootProbe.then((resolved) => {
+      if (active) setInfo(resolved);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  return (
+    <CapabilitiesProvider info={info}>
+      <QueryClientProvider client={queryClient}>
+        <ThemeProvider>
+          <TooltipProvider>
+            <ImageLightboxProvider>
+              <BrowserRouter>
+                <SessionUpdatesProvider>
+                  <RunnerHealthProvider>
+                    <App />
+                  </RunnerHealthProvider>
+                </SessionUpdatesProvider>
+              </BrowserRouter>
+            </ImageLightboxProvider>
+          </TooltipProvider>
+        </ThemeProvider>
+      </QueryClientProvider>
+    </CapabilitiesProvider>
   );
-});
+}
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <Boot />
+  </StrictMode>,
+);
