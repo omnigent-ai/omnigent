@@ -33,6 +33,8 @@ const { pathToFileURL } = require("node:url");
 const { registerLocalhostCors } = require("./localhost_cors");
 const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
+const omnigentCli = require("./omnigent_cli");
+const serverManager = require("./server_manager");
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
@@ -538,6 +540,51 @@ function pinWindow(win, origin) {
 }
 
 /**
+ * Record (or clear) the full server URL a window is connected to. The pinned
+ * `origin` drops any path, but the host/server CLI commands need the exact URL
+ * the user connected with (e.g. a Databricks ``…/ml/omnigents`` mount), so the
+ * window keeps both.
+ *
+ * @param {BrowserWindow} win
+ * @param {string | null} serverUrl
+ */
+function setWindowServerUrl(win, serverUrl) {
+  const state = windows.get(win);
+  if (state) state.serverUrl = serverUrl;
+}
+
+/**
+ * The full server URL of the window that sent an IPC event, or null. Used by
+ * the host/server-management handlers to scope CLI commands to the window's
+ * own server.
+ *
+ * @param {Electron.IpcMainInvokeEvent | Electron.IpcMainEvent} event
+ * @returns {string | null}
+ */
+function senderServerUrl(event) {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  return (win && windows.get(win)?.serverUrl) || null;
+}
+
+/**
+ * Notify every pinned window that host/server status may have changed, so the
+ * SPA re-reads it. This is a bare ping — NOT a poll: it fires only on real
+ * events (a host child connecting or exiting, and after a control action), so
+ * there is no periodic querying of the server. The renderer reads the actual
+ * status on demand via the get-status handlers.
+ */
+function broadcastHostStatus() {
+  for (const [win, state] of windows) {
+    if (win.isDestroyed() || !state.origin || !state.serverUrl) continue;
+    try {
+      win.webContents.send("omnigent:host-status-changed");
+    } catch {
+      // Window torn down between the check and the send; ignore.
+    }
+  }
+}
+
+/**
  * The window an OS-menu / app-level action should target: the currently
  * focused shell window, falling back to any open one (or null when none).
  * Per-window IPC (e.g. the setup page persisting a URL) instead resolves the
@@ -573,6 +620,37 @@ function loadSettings() {
 function saveSettings(settings) {
   fs.mkdirSync(app.getPath("userData"), { recursive: true });
   fs.writeFileSync(settingsPath(), JSON.stringify(settings, null, 2), "utf8");
+}
+
+/**
+ * Resolve the `omnigent` CLI binary path from the user's configured override
+ * (``settings.omnigent_path``) plus the standard locations, or null when none
+ * is usable. Re-resolved on each call so a freshly-configured path takes
+ * effect without a restart.
+ *
+ * @returns {string | null}
+ */
+/**
+ * Cached CLI resolution: { configuredPath, path }. Resolving runs `command -v`
+ * (a subprocess), so we memoize the found path and only re-probe when the
+ * configured override changes or the cached binary is no longer executable —
+ * avoiding a shell-out on every status/control call.
+ */
+let cachedCli = null;
+
+function resolvedCliPath() {
+  const configured = loadSettings().omnigent_path ?? null;
+  if (
+    cachedCli &&
+    cachedCli.configuredPath === configured &&
+    cachedCli.path &&
+    omnigentCli.isExecutableFile(cachedCli.path)
+  ) {
+    return cachedCli.path;
+  }
+  const resolved = omnigentCli.resolveCliPath(configured);
+  cachedCli = { configuredPath: configured, path: resolved ? resolved.path : null };
+  return cachedCli.path;
 }
 
 /** Maximum number of entries kept in the persisted recent-servers list. */
@@ -769,6 +847,8 @@ function createWindow(targetUrl, opts = {}) {
     // Pin to the destination's origin up front; setup-page windows stay
     // unpinned (null) until the user connects them.
     origin: destinationOrigin,
+    // Full connected URL (incl. any path) for host/server CLI commands.
+    serverUrl: destination,
     ephemeral,
     badgeCount: 0,
   });
@@ -838,6 +918,9 @@ function createWindow(targetUrl, opts = {}) {
   // window, hide it by overlaying Omnigent's own root — see
   // registerWorkspaceChromeHide, which wires the inject-on-did-finish-load.
   registerWorkspaceChromeHide(win.webContents);
+
+  // The desktop never auto-connects this machine as a runner — on launch or on
+  // connect. Connecting is an explicit action from the host menu.
 
   win.on("closed", () => {
     windows.delete(win);
@@ -1134,6 +1217,87 @@ async function confirmExternalProtocol(win, url, scheme) {
 }
 
 /**
+ * Confirm — via a native, main-process dialog the web page cannot draw over,
+ * forge a click on, or auto-dismiss — that the user really wants to enroll THIS
+ * machine as a runner ("host") for the window's pinned server. Hosting executes
+ * agent code and commands the server dispatches, so the README's "opt-in and
+ * explicit" contract has to be enforced HERE, not by a click in the
+ * server-served SPA: that click is code the server controls, so a malicious or
+ * compromised server could call `controlHost("start")` from page-load JS and
+ * silently enroll the machine. The authorization must originate from a surface
+ * the page can't reach.
+ *
+ * Mirrors {@link confirmExternalProtocol}: the prompt offers Don't Allow / Allow
+ * Once / Always Allow, and "Always Allow" persists the grant per server origin
+ * in settings.json under `allowed_hosting_origins`. That remember-me button is
+ * offered only while the window's top-level page is actually on its pinned
+ * origin (a foreign page reached via redirect can be allowed once, never
+ * remembered). An already-approved origin connects with NO dialog — so a trusted
+ * server is asked exactly once and the steady-state UX is unchanged.
+ *
+ * @param {BrowserWindow | null | undefined} win The window requesting hosting.
+ * @returns {Promise<boolean>} True when hosting is authorized.
+ */
+async function confirmHostEnrollment(win) {
+  if (!win) return false;
+  const pinned = pinnedOrigin(win);
+  if (!pinned) return false;
+  // Only honor (and offer to persist) the grant while the visible top-level
+  // page is the pinned server itself — never a foreign page that reached a
+  // pinned window via redirect.
+  const onPinnedServer = originOf(win.webContents.getURL()) === pinned;
+  const approved = loadSettings().allowed_hosting_origins ?? [];
+  if (onPinnedServer && Array.isArray(approved) && approved.includes(pinned)) return true;
+
+  let host = pinned;
+  try {
+    host = new URL(pinned).host;
+  } catch {
+    // Keep the full origin string if it somehow doesn't parse.
+  }
+  // Brand the OS dialog as the app (title + bundled icon) so it reads as
+  // Omnigent's own prompt rather than an anonymous system alert; in a packaged
+  // build macOS already shows the app icon, but `electron .` (dev) shows the
+  // generic Electron tile without this.
+  const icon = nativeImage.createFromPath(ICON_PNG);
+  // macOS/iOS-style permission buttons: deny, allow this once, or allow and
+  // remember. "Always Allow" persists the grant, so it's offered only while the
+  // visible top-level page is the pinned server itself — a foreign page reached
+  // via redirect can be allowed once, but never remembered.
+  const ALLOW_ONCE = 1;
+  const ALWAYS_ALLOW = 2;
+  const buttons = onPinnedServer
+    ? ["Don't Allow", "Allow Once", "Always Allow"]
+    : ["Don't Allow", "Allow Once"];
+  const { response } = await dialog.showMessageBox(win, {
+    type: "warning",
+    icon: icon.isEmpty() ? undefined : icon,
+    title: "Omnigent",
+    message: `Allow ${host} to manage Omnigent on this machine?`,
+    detail:
+      `${pinned} wants to connect this machine as a runner. While connected, it ` +
+      `can execute agent code and commands here on its behalf.\n\n` +
+      `Only allow servers you trust.`,
+    buttons,
+    defaultId: 0, // deny is the safe default (Esc / Enter both decline)
+    cancelId: 0,
+    noLink: true,
+  });
+  if (response !== ALLOW_ONCE && response !== ALWAYS_ALLOW) return false;
+  // response === ALWAYS_ALLOW implies the 3-button (onPinnedServer) variant.
+  if (response === ALWAYS_ALLOW) {
+    const settings = loadSettings();
+    const list = Array.isArray(settings.allowed_hosting_origins)
+      ? settings.allowed_hosting_origins
+      : [];
+    if (!list.includes(pinned)) list.push(pinned);
+    settings.allowed_hosting_origins = list;
+    saveSettings(settings);
+  }
+  return true;
+}
+
+/**
  * OS-level attention cue for a notification fired while the app is frontmost,
  * where the banner is suppressed by the OS. On macOS we bounce the dock icon
  * (`informational` = a single gentle bounce); on Windows/Linux we flash the
@@ -1364,16 +1528,20 @@ function registerIpc() {
       // The user explicitly chose this server — it becomes the window's
       // trusted origin for privileged IPC and permission grants.
       pinWindow(win, new URL(target).origin);
+      setWindowServerUrl(win, target);
       win
         .loadURL(target)
         .then(() => {
           // Only a server that actually responded earns a recents slot —
           // a typo'd or unreachable URL must not show up in the
           // quick-pick list on the setup page.
-          if (ephemeral) return;
-          const settings = loadSettings();
-          rememberRecentServer(settings, target);
-          saveSettings(settings);
+          if (!ephemeral) {
+            const settings = loadSettings();
+            rememberRecentServer(settings, target);
+            saveSettings(settings);
+          }
+          // The desktop does NOT auto-connect this machine as a runner on
+          // connect — that's an explicit action from the host menu.
         })
         .catch(() => {
           // Load failure is handled by the did-fail-load fallback (setup
@@ -1442,6 +1610,7 @@ function registerIpc() {
     }
     if (win) {
       pinWindow(win, new URL(url).origin);
+      setWindowServerUrl(win, url);
       win
         .loadURL(url)
         .then(() => {
@@ -1469,6 +1638,7 @@ function registerIpc() {
     if (!win) return;
     const ephemeral = windows.get(win)?.ephemeral === true;
     pinWindow(win, null); // back on the setup page → no trusted origin
+    setWindowServerUrl(win, null);
     void win.loadFile(SETUP_PAGE, ephemeral ? { search: "ephemeral=1" } : undefined);
   });
 
@@ -1577,6 +1747,136 @@ function registerIpc() {
     signalForeground();
     return true;
   });
+
+  // -------------------------------------------------------------------------
+  // Server management — CLI detection, local server, and host connection.
+  //
+  // Setup-page handlers (CLI detection, path config, start-locally) gate on
+  // isSetupPageSender. The SPA can READ host status and REQUEST host control
+  // (gated on isPinnedOriginSender), but enrolling this machine as a runner is
+  // privileged — start/restart additionally require native, main-process user
+  // consent (confirmHostEnrollment), since the pinned-origin gate proves the
+  // caller is the server's page, not that the user asked.
+  // -------------------------------------------------------------------------
+
+  // Setup page → is the `omnigent` CLI installed and runnable? Includes the
+  // resolved path, version, and the install one-liner to show when missing.
+  ipcMain.handle("omnigent:get-cli-status", async (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("get-cli-status is only available to the setup page");
+    }
+    return omnigentCli.getCliStatus(loadSettings().omnigent_path);
+  });
+
+  // Setup page → set an explicit path to the `omnigent` binary. Persisted only
+  // when that exact path validates as a runnable omnigent (so a typo doesn't
+  // silently mask a working PATH lookup). Returns the resulting CLI status plus
+  // whether the configured path was accepted.
+  ipcMain.handle("omnigent:set-cli-path", async (event, configuredPath) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("set-cli-path is only available to the setup page");
+    }
+    const trimmed = String(configuredPath ?? "").trim();
+    const status = await omnigentCli.getCliStatus(trimmed || null);
+    const accepted = status.installed && status.source === "configured";
+    if (accepted) {
+      const settings = loadSettings();
+      settings.omnigent_path = trimmed;
+      saveSettings(settings);
+    } else if (trimmed === "") {
+      // Empty input clears any saved override (revert to PATH/candidates).
+      const settings = loadSettings();
+      delete settings.omnigent_path;
+      saveSettings(settings);
+    }
+    return { ...status, accepted };
+  });
+
+  // Setup page → native file picker for the omnigent binary. Returns the chosen
+  // path (the renderer feeds it back through set-cli-path) or null on cancel.
+  ipcMain.handle("omnigent:browse-cli-path", async (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("browse-cli-path is only available to the setup page");
+    }
+    const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
+    const result = await dialog.showOpenDialog(win ?? undefined, {
+      title: "Locate the omnigent binary",
+      properties: ["openFile"],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
+  });
+
+  // Setup page → start (or reuse) the local server. Returns its URL so the
+  // setup page can hand off to the normal setServerUrl navigation flow.
+  ipcMain.handle("omnigent:start-local-server", async (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("start-local-server is only available to the setup page");
+    }
+    const cliPath = resolvedCliPath();
+    if (!cliPath) {
+      return { ok: false, error: "The omnigent CLI was not found. Install it or set its path." };
+    }
+    return serverManager.startLocalServer(cliPath);
+  });
+
+  // SPA → this machine's identity: is the CLI installed, and its host id. Both
+  // come from local config (no `omnigent host status` subprocess), so this is
+  // instant — it lets the new-session picker tag/connect "this machine" without
+  // waiting on the slow runner-status check.
+  ipcMain.handle("omnigent:host-get-identity", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      console.warn("[omnigent] host-get-identity from untrusted sender dropped");
+      return null;
+    }
+    return { cliInstalled: Boolean(resolvedCliPath()), hostId: omnigentCli.localHostId() };
+  });
+
+  // SPA → start / stop / restart this machine's host daemon for the window's
+  // own server (the host selection menu's "connect this machine" action).
+  ipcMain.handle("omnigent:host-control", async (event, action) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("host-control is only available to a connected server page");
+    }
+    const serverUrl = senderServerUrl(event);
+    if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
+    const cliPath = resolvedCliPath();
+    if (!cliPath) {
+      return { ok: false, error: "The omnigent CLI was not found. Install it or set its path." };
+    }
+    let result;
+    if (action === "start" || action === "restart") {
+      // Enrolling this machine as a runner executes agent code locally, so it
+      // needs explicit user consent that the server's own page can't fake. The
+      // isPinnedOriginSender gate above only proves the call came FROM the
+      // pinned server's page — not that the USER asked for it — so gate
+      // start/restart on a native, main-process confirmation (persisted per
+      // origin, so a trusted server is asked just once). stop is fail-safe and
+      // stays ungated.
+      const win = BrowserWindow.fromWebContents(event.sender);
+      if (!(await confirmHostEnrollment(win))) {
+        return { ok: false, error: "Hosting wasn't approved for this server." };
+      }
+      // Ensure the CLI is authenticated for a remote server first (local needs
+      // none) — otherwise the host connect would just fail on a 401.
+      const auth = await serverManager.ensureServerAuth(cliPath, serverUrl);
+      if (!auth.ok) result = { ok: false, error: auth.error };
+      else if (action === "start")
+        result = await serverManager.ensureHostConnected(cliPath, serverUrl);
+      else result = await serverManager.restartHost(cliPath, serverUrl);
+    } else if (action === "stop") {
+      result = await serverManager.disconnectHost(cliPath, serverUrl);
+    } else {
+      result = { ok: false, error: `unknown host action '${action}'` };
+    }
+    broadcastHostStatus();
+    return result;
+  });
+
+  // Push a status ping when a host child connects or exits on its own (no
+  // polling) — the server-management module owns the subprocess and reports
+  // lifecycle changes here.
+  serverManager.onChange(broadcastHostStatus);
 }
 
 // ---------------------------------------------------------------------------
@@ -1619,5 +1919,28 @@ if (!gotLock) {
   app.on("window-all-closed", () => {
     // macOS apps typically stay alive until Cmd-Q.
     if (process.platform !== "darwin") app.quit();
+  });
+
+  // Tear down what this app started: SIGTERM any host children it spawned and
+  // stop a local server it owns. The desktop owns its host connections (the
+  // confirmed lifecycle), so quitting disconnects this machine. We defer the
+  // quit until cleanup finishes, then re-issue it.
+  let quitCleanupDone = false;
+  let quitCleanupStarted = false;
+  app.on("before-quit", (event) => {
+    if (quitCleanupDone) return;
+    // A second quit (e.g. Cmd-Q again during the SIGKILL grace window) must not
+    // re-enter shutdown() concurrently — just keep deferring until the first
+    // cleanup finishes and re-issues the quit.
+    event.preventDefault();
+    if (quitCleanupStarted) return;
+    quitCleanupStarted = true;
+    serverManager
+      .shutdown(resolvedCliPath())
+      .catch(() => {})
+      .finally(() => {
+        quitCleanupDone = true;
+        app.quit();
+      });
   });
 }

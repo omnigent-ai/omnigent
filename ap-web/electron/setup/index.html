@@ -98,16 +98,18 @@
         opacity: 0.5;
         cursor: default;
       }
+      /* Connect (to a remote server) is the secondary path, below the prominent
+         "Start locally" action that leads the card. */
       #connect {
         margin-top: 16px;
         padding: 9px 12px;
         font-weight: 500;
-        border: none;
-        background: var(--primary);
-        color: var(--primary-foreground);
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--foreground);
       }
       #connect:hover:not(:disabled) {
-        background: color-mix(in srgb, var(--primary) 90%, transparent);
+        background: color-mix(in srgb, var(--foreground) 5%, transparent);
       }
       .recents {
         margin-top: 24px;
@@ -139,6 +141,94 @@
         line-height: 1.4;
         min-height: 18px;
       }
+      /* Separator between the prominent "Start locally" action and the
+         connect-to-a-server form below it. */
+      .divider {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin: 20px 0;
+        color: var(--muted-foreground);
+        font-size: 12px;
+      }
+      .divider::before,
+      .divider::after {
+        content: "";
+        flex: 1;
+        height: 1px;
+        background: var(--border);
+      }
+      /* "Start locally" — the prominent primary action (filled), leading the
+         card above the connect form. */
+      #start-local {
+        margin-top: 0;
+        padding: 10px 12px;
+        font-weight: 600;
+        border: none;
+        background: var(--primary);
+        color: var(--primary-foreground);
+      }
+      #start-local:hover:not(:disabled) {
+        background: color-mix(in srgb, var(--primary) 90%, transparent);
+      }
+      .cli-panel {
+        margin-top: 16px;
+        padding: 12px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        font-size: 13px;
+        line-height: 1.45;
+      }
+      .cli-panel .title {
+        font-weight: 500;
+        margin: 0 0 6px;
+      }
+      .cli-panel p {
+        margin: 6px 0;
+      }
+      .cli-cmd {
+        display: flex;
+        gap: 8px;
+        align-items: stretch;
+        margin: 8px 0;
+      }
+      .cli-cmd code {
+        flex: 1;
+        padding: 6px 8px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+        background: color-mix(in srgb, var(--foreground) 5%, transparent);
+        border-radius: 6px;
+        overflow-x: auto;
+        white-space: nowrap;
+      }
+      .mini-btn,
+      .path-row button {
+        width: auto;
+        flex: none;
+        padding: 6px 12px;
+        font-size: 12px;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--foreground);
+      }
+      .path-row {
+        display: flex;
+        gap: 8px;
+        margin-top: 8px;
+      }
+      .path-row input {
+        flex: 1;
+      }
+      .cli-note {
+        margin-top: 6px;
+        font-size: 12px;
+        color: var(--muted-foreground);
+        min-height: 16px;
+      }
+      .cli-note.bad {
+        color: var(--destructive);
+      }
       /* With the native title bar hidden (titleBarStyle "hiddenInset" on
          macOS), this strip is the window's only drag surface on the setup
          page. Harmless elsewhere. */
@@ -162,9 +252,36 @@
         />
         <img class="logo" src="../../platform-assets/logos/omnigents-logo.svg" alt="Omnigents" />
       </picture>
-      <p class="sub">
-        Enter the URL of the Omnigents server. The desktop app loads its web UI directly.
-      </p>
+      <p class="sub">Run an Omnigents server on this machine, or connect to an existing one.</p>
+      <div id="local-section">
+        <button id="start-local" disabled>Start locally</button>
+
+        <div class="cli-panel" id="cli-panel" hidden>
+          <p class="title" id="cli-title"></p>
+          <div id="cli-install" hidden>
+            <p>Install the Omnigent CLI to run a server locally:</p>
+            <div class="cli-cmd">
+              <code id="cli-cmd-text"></code>
+              <button type="button" class="mini-btn" id="cli-copy">Copy</button>
+            </div>
+            <p>Already installed? Point the app at the binary:</p>
+            <div class="path-row">
+              <input
+                id="cli-path"
+                type="text"
+                placeholder="/path/to/omnigent"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <button type="button" id="cli-browse">Browse…</button>
+            </div>
+            <p class="cli-note" id="cli-path-note"></p>
+          </div>
+        </div>
+
+        <div class="divider">or connect to a server</div>
+      </div>
+
       <label for="url">Server URL</label>
       <input
         id="url"
@@ -175,6 +292,7 @@
       />
       <button id="connect">Connect</button>
       <div class="err" id="err"></div>
+
       <div class="recents" id="recents" hidden>
         <p class="recents-title">Recent servers</p>
         <div id="recents-list"></div>
@@ -273,7 +391,8 @@
         button.disabled = true;
         try {
           // setServerUrl persists the URL and navigates this window to it —
-          // after which the server's SPA takes over the window.
+          // after which the server's SPA takes over the window. Connecting this
+          // machine as a runner is done later from the host menu, not here.
           await setup.setServerUrl(value);
         } catch (e) {
           err.textContent = String(e && e.message ? e.message : e);
@@ -285,6 +404,133 @@
       input.addEventListener("keydown", (e) => {
         if (e.key === "Enter") connect();
       });
+
+      // --- Start locally + omnigent CLI detection ---------------------------
+      // "Start locally" runs `omnigent server` via the main process, then
+      // connects this window to it through the normal flow. It
+      // needs the local omnigent CLI, so we detect the CLI on load and, when
+      // it's missing, show install instructions plus a way to point at the
+      // binary. Remote Connect never depends on the CLI.
+      const startLocalBtn = document.getElementById("start-local");
+      const localSection = document.getElementById("local-section");
+      const cliPanel = document.getElementById("cli-panel");
+      const cliTitle = document.getElementById("cli-title");
+      const cliInstall = document.getElementById("cli-install");
+      const cliCmdText = document.getElementById("cli-cmd-text");
+      const cliCopy = document.getElementById("cli-copy");
+      const cliPathInput = document.getElementById("cli-path");
+      const cliBrowse = document.getElementById("cli-browse");
+      const cliPathNote = document.getElementById("cli-path-note");
+
+      // Copy without a clipboard permission: a transient off-screen textarea +
+      // execCommand works on a user gesture in the file:// setup page.
+      function copyText(text) {
+        try {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.setAttribute("readonly", "");
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+          return true;
+        } catch {
+          return false;
+        }
+      }
+
+      async function refreshCliStatus() {
+        let status;
+        try {
+          status = await setup.getCliStatus();
+        } catch {
+          return;
+        }
+        // textContent, never innerHTML: the command and version come from the
+        // main process and are rendered as inert text.
+        cliCmdText.textContent = status.installCommand || "";
+        const installed = Boolean(status.installed);
+        // Starting a local server needs the CLI; gate the button on it.
+        startLocalBtn.disabled = !installed;
+        if (installed) {
+          cliPanel.hidden = true;
+        } else {
+          cliPanel.hidden = false;
+          cliInstall.hidden = false;
+          cliTitle.textContent = "Omnigent CLI not found";
+        }
+      }
+
+      async function applyCliPath(value) {
+        const p = (value || "").trim();
+        if (p === "") return;
+        cliPathNote.className = "cli-note";
+        cliPathNote.textContent = "Checking…";
+        let result;
+        try {
+          result = await setup.setCliPath(p);
+        } catch {
+          result = { accepted: false };
+        }
+        if (result && result.accepted) {
+          cliPathNote.textContent = result.version ? `Found: ${result.version}` : "Found omnigent.";
+          await refreshCliStatus();
+        } else {
+          cliPathNote.className = "cli-note bad";
+          cliPathNote.textContent = "That path is not a runnable omnigent binary.";
+        }
+      }
+
+      if (setup.getCliStatus) {
+        cliCopy.addEventListener("click", () => {
+          if (copyText(cliCmdText.textContent)) {
+            cliCopy.textContent = "Copied";
+            setTimeout(() => {
+              cliCopy.textContent = "Copy";
+            }, 1500);
+          }
+        });
+        cliBrowse.addEventListener("click", async () => {
+          const picked = await setup.browseCliPath();
+          if (picked) {
+            cliPathInput.value = picked;
+            await applyCliPath(picked);
+          }
+        });
+        cliPathInput.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") applyCliPath(cliPathInput.value);
+        });
+        startLocalBtn.addEventListener("click", async () => {
+          err.textContent = "";
+          const prev = startLocalBtn.textContent;
+          startLocalBtn.disabled = true;
+          startLocalBtn.textContent = "Starting…";
+          try {
+            const result = await setup.startLocalServer();
+            if (result && result.ok && result.url) {
+              // Hand off to the normal connect/navigate flow; on success the
+              // window loads the server and this page goes away. Connecting this
+              // machine as a runner is done later from the host menu.
+              input.value = result.url;
+              await setup.setServerUrl(result.url);
+              return;
+            }
+            err.textContent = (result && result.error) || "Could not start the local server.";
+          } catch (e) {
+            err.textContent = String(e && e.message ? e.message : e);
+          }
+          startLocalBtn.textContent = prev;
+          startLocalBtn.disabled = false;
+        });
+        // Resolve CLI status (enables/disables Start-locally).
+        refreshCliStatus();
+      } else {
+        // Older shell without the CLI bridge: hide the whole local section.
+        localSection.hidden = true;
+      }
+
       input.focus();
     </script>
   </body>

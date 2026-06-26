@@ -59,6 +59,13 @@ import {
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
 import { useHosts, type Host } from "@/hooks/useHosts";
+import {
+  controlHost,
+  getHostIdentity,
+  isElectronShell,
+  onHostStatusChanged,
+  type HostIdentity,
+} from "@/lib/nativeBridge";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
@@ -225,23 +232,30 @@ const CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sand
 // accidental click; the toggle stays off until this is entered verbatim.
 const CODEX_NATIVE_BYPASS_SANDBOX_CONFIRM_PHRASE = "bypass sandbox";
 
-function HostOption({ host }: { host: Host }) {
+function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
   const isOnline = host.status === "online";
   return (
-    <span className="flex items-center gap-2">
+    <span className="flex min-w-0 items-center gap-2">
       {host.name.toLowerCase().includes("cloud") ? (
-        <MonitorCloudIcon className="size-4 text-muted-foreground" />
+        <MonitorCloudIcon className="size-4 shrink-0 text-muted-foreground" />
       ) : (
-        <MonitorIcon className="size-4 text-muted-foreground" />
+        <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
       )}
-      <span className="text-xs">{host.name}</span>
-      <span
-        className={`inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${isOnline ? "text-green-600" : "text-muted-foreground"}`}
-      >
-        <span
-          className={`inline-block size-1.5 rounded-full ${isOnline ? "bg-green-500" : "bg-muted-foreground"}`}
-        />
-        {host.status}
+      <span className="flex min-w-0 flex-col">
+        <span className="flex items-center gap-2">
+          <span className="truncate text-xs">{host.name}</span>
+          <span
+            className={`inline-flex shrink-0 items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${isOnline ? "text-green-600" : "text-muted-foreground"}`}
+          >
+            <span
+              className={`inline-block size-1.5 rounded-full ${isOnline ? "bg-green-500" : "bg-muted-foreground"}`}
+            />
+            {host.status}
+          </span>
+        </span>
+        {subtitle && (
+          <span className="text-[10px] leading-tight text-muted-foreground">{subtitle}</span>
+        )}
       </span>
     </span>
   );
@@ -1364,6 +1378,14 @@ export function NewChatLandingScreen() {
   // host — the server provisions a sandbox host at create time
   // (host_type: "managed"), so no host_id or workspace is sent.
   const [sandboxSelected, setSandboxSelected] = useState(false);
+  // Desktop-shell host status for THIS machine (null outside Electron), so the
+  // picker can tag the current machine and offer to auto-connect it.
+  const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
+  const [connectingThisMachine, setConnectingThisMachine] = useState(false);
+  // Defer the connect until the dropdown has actually closed (set on select,
+  // consumed in the menu's onOpenChange) — connecting while the menu is open
+  // looks janky. A ref so the close handler sees it synchronously.
+  const pendingConnectRef = useRef(false);
   // Sandbox repository inputs — composed into the managed create's
   // `workspace` string (`<url>[#<branch>]`); both blank = empty
   // server-created workspace.
@@ -1428,6 +1450,33 @@ export function NewChatLandingScreen() {
   const allHosts = hosts ?? [];
   const onlineHosts = allHosts.filter((h) => h.status === "online");
   const offlineHosts = allHosts.filter((h) => h.status === "offline");
+
+  // Identify the current desktop machine and whether we can connect it. When
+  // it's already in the host list (online or offline) we connect via that row;
+  // only when it's absent do we show a standalone "Run on this machine" item —
+  // so the machine never appears twice.
+  const thisMachineHostId = desktopHost?.hostId ?? null;
+  const thisMachineInList =
+    thisMachineHostId != null && allHosts.some((h) => h.host_id === thisMachineHostId);
+  const canConnectThisMachine = Boolean(desktopHost?.cliInstalled);
+  const showConnectThisMachine = canConnectThisMachine && !thisMachineInList;
+
+  // Track this machine's host status from the desktop shell (no-op in a browser).
+  useEffect(() => {
+    if (!isElectronShell()) return;
+    let cancelled = false;
+    const refresh = () => {
+      void getHostIdentity().then((s) => {
+        if (!cancelled) setDesktopHost(s);
+      });
+    };
+    refresh();
+    const unsubscribe = onHostStatusChanged(refresh);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
 
   // Auto-select the FIRST AVAILABLE option, mirroring the menu order, so
   // a session can be started without an explicit pick: the sandbox when
@@ -1679,9 +1728,11 @@ export function NewChatLandingScreen() {
   const workspaceLabel = workspaceTrimmed
     ? (workspaceTrimmed.split("/").filter(Boolean).pop() ?? workspaceTrimmed)
     : "Working directory";
-  const hostLabel = sandboxSelected
-    ? sandboxLabel
-    : (selectedHost?.name ?? (onlineHosts.length === 0 ? "No hosts" : "Select host"));
+  const hostLabel = connectingThisMachine
+    ? "Connecting…"
+    : sandboxSelected
+      ? sandboxLabel
+      : (selectedHost?.name ?? (onlineHosts.length === 0 ? "No hosts" : "Select host"));
   const worktreeLabel = branchName.trim() || "No worktree";
   // Sandbox repository chip label: repo name (server's clone-dir rule)
   // plus the pinned branch, e.g. "repo#main"; placeholder when unset.
@@ -1797,6 +1848,25 @@ export function NewChatLandingScreen() {
     setSelectedHostId(null);
     setWorkspace("");
     seededHostRef.current = null;
+  }
+
+  // Connect THIS desktop machine as a host for the current server, then select
+  // it — so the user doesn't have to run `omni host` in a terminal first. The
+  // bridge's controlHost resolves once the host is connected; we then read its
+  // id, refresh the host list, and pick it.
+  async function connectThisMachine() {
+    if (connectingThisMachine) return;
+    setConnectingThisMachine(true);
+    try {
+      const res = await controlHost("start");
+      if (!res.ok) return;
+      const identity = await getHostIdentity();
+      setDesktopHost(identity);
+      await queryClient.invalidateQueries({ queryKey: ["hosts"] });
+      if (identity?.hostId) selectHost(identity.hostId);
+    } finally {
+      setConnectingThisMachine(false);
+    }
   }
 
   async function handleCreate() {
@@ -2293,7 +2363,16 @@ export function NewChatLandingScreen() {
           <div className="relative z-0 -mt-9 flex w-full items-center rounded-b-2xl bg-tray/40 pt-8 pr-3 pb-2 pl-2">
             <div className="flex flex-wrap items-center gap-1">
               {/* Host chip */}
-              <DropdownMenu>
+              <DropdownMenu
+                onOpenChange={(open) => {
+                  // Run a requested "connect this machine" only once the menu
+                  // has closed.
+                  if (!open && pendingConnectRef.current) {
+                    pendingConnectRef.current = false;
+                    void connectThisMachine();
+                  }
+                }}
+              >
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
@@ -2306,7 +2385,7 @@ export function NewChatLandingScreen() {
                       <MonitorIcon className="size-4 shrink-0" />
                     )}
                     <span
-                      className={`hidden max-w-24 truncate sm:block ${sandboxSelected || selectedHost != null ? "text-foreground" : ""}`}
+                      className={`hidden max-w-24 truncate sm:block ${sandboxSelected || selectedHost != null || connectingThisMachine ? "text-foreground" : ""}`}
                     >
                       {hostLabel}
                     </span>
@@ -2365,7 +2444,7 @@ export function NewChatLandingScreen() {
                       <DropdownMenuSeparator />
                     </>
                   )}
-                  {allHosts.length === 0 && (
+                  {allHosts.length === 0 && !showConnectThisMachine && (
                     <div className="px-2 py-1.5 text-xs text-muted-foreground">
                       No hosts connected yet.
                     </div>
@@ -2377,15 +2456,65 @@ export function NewChatLandingScreen() {
                       data-active={host.host_id === selectedHostId ? "true" : undefined}
                       className="text-xs data-[active=true]:bg-accent/60"
                     >
-                      <HostOption host={host} />
+                      <HostOption
+                        host={host}
+                        subtitle={host.host_id === thisMachineHostId ? "this machine" : undefined}
+                      />
                     </DropdownMenuItem>
                   ))}
-                  {offlineHosts.map((host) => (
-                    <DropdownMenuItem key={host.host_id} disabled className="text-xs">
-                      <HostOption host={host} />
+                  {offlineHosts.map((host) => {
+                    // This machine, offline: make the row itself the connect
+                    // affordance instead of a disabled entry + a duplicate "Run
+                    // on this machine" item. Connect after the menu closes.
+                    if (host.host_id === thisMachineHostId && canConnectThisMachine) {
+                      return (
+                        <DropdownMenuItem
+                          key={host.host_id}
+                          onSelect={() => {
+                            pendingConnectRef.current = true;
+                          }}
+                          disabled={connectingThisMachine}
+                          data-testid="new-chat-landing-run-on-this-machine"
+                          className="text-xs"
+                        >
+                          <HostOption
+                            host={host}
+                            subtitle={
+                              connectingThisMachine
+                                ? "connecting…"
+                                : "this machine · select to connect"
+                            }
+                          />
+                        </DropdownMenuItem>
+                      );
+                    }
+                    return (
+                      <DropdownMenuItem key={host.host_id} disabled className="text-xs">
+                        <HostOption
+                          host={host}
+                          subtitle={host.host_id === thisMachineHostId ? "this machine" : undefined}
+                        />
+                      </DropdownMenuItem>
+                    );
+                  })}
+                  {/* Desktop shell, machine not in the list yet: offer to connect
+                    it in one click. */}
+                  {showConnectThisMachine && (
+                    <DropdownMenuItem
+                      onSelect={() => {
+                        pendingConnectRef.current = true;
+                      }}
+                      disabled={connectingThisMachine}
+                      data-testid="new-chat-landing-run-on-this-machine"
+                      className="gap-2 text-xs"
+                    >
+                      <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
+                      <span className="text-xs">
+                        {connectingThisMachine ? "Connecting this machine…" : "Run on this machine"}
+                      </span>
                     </DropdownMenuItem>
-                  ))}
-                  {allHosts.length > 0 && <DropdownMenuSeparator />}
+                  )}
+                  {(allHosts.length > 0 || showConnectThisMachine) && <DropdownMenuSeparator />}
                   {/* Persistent escape hatch: open the connect-a-host
                     instructions. Present even with zero hosts so a fresh user
                     is never stuck. */}

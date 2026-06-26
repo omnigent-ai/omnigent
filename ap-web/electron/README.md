@@ -280,6 +280,81 @@ server from this repo:
 
 Then enter `http://localhost:8000` in the setup page.
 
+## Managing servers and hosting
+
+Beyond pointing at an already-running server, the shell can drive the local
+`omnigent` CLI to start a server and register this machine as a **host** (a
+machine that runs the agent work a server dispatches). Two concepts stay
+deliberately separate:
+
+- **Server** — the backend the webview talks to (local or remote).
+- **Host** — _this machine_ executing agent work for a server. Because hosting
+  runs agent code, it is **opt-in** and **explicit**: the shell never connects
+  this machine as a runner on its own — not on connect, not on launch. You
+  connect it from the **host selection menu** inside the app (when starting a
+  chat, pick this machine), which drives `controlHost` over the bridge. That
+  request alone isn't trusted to authorize hosting: the SPA is served by the
+  server, so `start`/`restart` additionally require a **native, main-process
+  confirmation** the page can't forge or auto-dismiss (persisted per server
+  origin, so a trusted server is asked only once).
+
+### Detecting the CLI (setup page)
+
+On the setup page the shell probes for the `omnigent` binary —
+`settings.omnigent_path` first, then `PATH`, then the well-known install
+locations (`~/.local/bin`, `~/.cargo/bin`, Homebrew, `/usr/local/bin`). A
+GUI-launched app inherits a minimal `PATH`, which is why the install locations
+are probed directly. When the CLI isn't found, the page shows the install
+one-liner
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh
+```
+
+and a field to point the app at the binary (typed or via a native file picker).
+A configured path is saved to `settings.json` (`omnigent_path`) only once it
+validates as a runnable `omnigent`. Connecting to a **remote** server never
+needs the CLI — only "Start locally" and hosting do.
+
+### Start locally
+
+**"Start a server on this machine"** runs `omnigent server start` (idempotent —
+reuses a healthy one) and then connects this window to its
+`http://127.0.0.1:<port>` URL through the normal connect flow. It does not
+connect this machine as a runner — that stays an explicit step in the app.
+
+### Connecting this machine as a runner
+
+There is **no** connect-time toggle and no sidebar status row: the shell never
+connects a runner automatically. Inside the connected app, the host selection
+menu (when starting a chat) tags this machine and offers to connect it. Choosing
+it calls `controlHost("start")` over the bridge. Because that call originates in
+server-served code, the main process does not treat it as the user's consent: on
+the first `start`/`restart` for a server origin it shows a **native confirmation
+dialog** ("Allow _host_ to manage Omnigent on this machine?") with **Don't Allow**
+(default) / **Allow Once** / **Always Allow**. Only after approval does it — once
+the CLI is authenticated for the server (remote only; local needs none) — either
+adopt a daemon already serving that server (one you started by hand) or spawn
+`omnigent host --server <url>`. **Allow Once** connects this time and re-prompts
+next time; **Always Allow** records the origin in `settings.json`
+(`allowed_hosting_origins`) so later connects skip the prompt. `stop` is
+fail-safe and needs no confirmation. The same bridge exposes `stop` / `restart`.
+
+Status is read live (host connected = a live daemon process **and** an online
+host tunnel; the shell never caches it). The host surface goes through the JS
+bridge — `window.omnigentDesktop` → `getHostStatus` / `getHostIdentity` /
+`onHostStatusChanged` (read + live) and `controlHost` (start/stop/restart),
+typed in [`../src/lib/nativeBridge.ts`](../src/lib/nativeBridge.ts) and gated to
+the window's **pinned origin** like the badge/notification bridge.
+
+### Lifecycle
+
+The desktop **owns the host processes it starts**: quitting the app SIGTERMs
+them (and stops a local server it started), so closing the app disconnects this
+machine. A daemon the shell merely _adopted_ (you started it in a terminal) is
+left running on quit. Hosting is **not** restored on the next launch — you
+reconnect this machine explicitly from the host menu when you want it.
+
 ## Passkeys (WebAuthn)
 
 External security keys (e.g. a YubiKey) work out of the box: Chromium's
