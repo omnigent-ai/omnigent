@@ -107,7 +107,7 @@ def clone_hermes_session(
     target_session_id: str,
     *,
     workspace: str | None = None,
-) -> None:
+) -> int:
     """Clone a Hermes session from *source_db* into *target_db* under a new id.
 
     Copies the entire source database (preserving whatever schema Hermes uses)
@@ -121,24 +121,47 @@ def clone_hermes_session(
     :param target_session_id: New session id for the cloned rows.
     :param workspace: If provided, overrides ``cwd`` on the cloned session row.
     """
+    # Validate the source DB before copying: it must have a sessions table
+    # and contain the requested session. If not, skip the clone silently so
+    # Hermes starts fresh rather than crashing on a broken state.db.
+    try:
+        src_conn = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
+        try:
+            row = src_conn.execute(
+                "SELECT id FROM sessions WHERE id = ?",
+                (source_session_id,),
+            ).fetchone()
+        finally:
+            src_conn.close()
+    except sqlite3.Error:
+        _logger.warning(
+            "Source hermes state.db at %s is unreadable; skipping clone",
+            source_db,
+        )
+        return 0
+    if row is None:
+        _logger.warning(
+            "Source hermes session %s not found in %s; skipping clone",
+            source_session_id,
+            source_db,
+        )
+        return 0
+
     target_db.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source_db, target_db)
+    # Use SQLite's backup API instead of shutil.copy2 — Hermes uses WAL mode
+    # and may not have checkpointed, so the main .db file can be nearly empty
+    # with all data in the -wal sidecar. The backup API reads through WAL
+    # and produces a self-contained copy.
+    src_backup = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
+    tgt_backup = sqlite3.connect(str(target_db))
+    try:
+        src_backup.backup(tgt_backup)
+    finally:
+        tgt_backup.close()
+        src_backup.close()
 
     conn = sqlite3.connect(str(target_db))
     try:
-        # Verify the source session exists.
-        row = conn.execute(
-            "SELECT id FROM sessions WHERE id = ?",
-            (source_session_id,),
-        ).fetchone()
-        if row is None:
-            _logger.warning(
-                "Source hermes session %s not found in %s; skipping clone",
-                source_session_id,
-                source_db,
-            )
-            return
-
         # Remap session id and update started_at so the forwarder can
         # discover this cloned session (its floor is launch_epoch_s).
         conn.execute(
@@ -162,9 +185,19 @@ def clone_hermes_session(
         conn.execute("DELETE FROM sessions WHERE id != ?", (target_session_id,))
         conn.execute("DELETE FROM messages WHERE session_id != ?", (target_session_id,))
 
+        # Record the high-water message id so the forwarder skips cloned
+        # messages (Omnigent already has them from the fork item copy).
+        max_id_row = conn.execute(
+            "SELECT MAX(id) FROM messages WHERE session_id = ?",
+            (target_session_id,),
+        ).fetchone()
+        max_id = max_id_row[0] if max_id_row and max_id_row[0] is not None else 0
+
         conn.commit()
     finally:
         conn.close()
+
+    return max_id
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
