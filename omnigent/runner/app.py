@@ -11574,6 +11574,63 @@ def create_runner_app(
             )
         return Response(status_code=200)
 
+    async def _handle_pi_native_compact(conv_id: str) -> Response:
+        """
+        Ask the resident Pi extension to compact its own context.
+
+        Pi owns its own context window inside the already-open Pi TUI
+        process, so explicit ``/compact`` must run there. The Omnigent
+        server's own compaction path (``_run_compact_locked``) would only
+        summarise the AP-side transcript mirror — it cannot shrink Pi's
+        real context and would desync the two, plus it 400s on the
+        LLM-less pi-native pseudo-agent (the same failure mode the
+        claude-native compact handler exists to avoid).
+
+        Pi-native turns live inside that TUI process and the runner's
+        harness task only queues messages into the extension inbox and
+        returns, so there is nothing for the runner to drive directly.
+        Mirror :func:`_handle_pi_native_interrupt`: queue a ``compact``
+        inbox payload that the extension consumes in the Pi process and
+        feeds to Pi's active ``ExtensionContext.compact()``. The extension
+        emits a ``response.compaction.in_progress`` marker when it triggers
+        compaction and a ``…completed``/``…failed`` edge from Pi's
+        ``onComplete``/``onError`` callbacks, so the web UI's "Compacting
+        conversation…" spinner tracks Pi's real progress.
+
+        Returns 200 (not 204) on successful enqueue so the Omnigent server
+        knows the control was handled in the terminal and skips its own
+        AP-side compaction — the same contract the claude/codex/cursor
+        native compact handlers use. 503 if the bridge inbox could not be
+        written (the server then surfaces the failure rather than silently
+        running its own wrong compaction).
+
+        :param conv_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: 200 once the compact payload is queued; 503 if the bridge
+            inbox could not be written.
+        """
+        from omnigent.pi_native_bridge import bridge_dir_for_session_id, enqueue_compact
+
+        try:
+            await asyncio.to_thread(
+                enqueue_compact,
+                bridge_dir_for_session_id(conv_id),
+            )
+        except OSError as exc:
+            _logger.warning(
+                "Pi-native compact failed for session=%s",
+                conv_id,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "pi_native_compact_failed",
+                    "detail": _client_safe_error_detail(exc, context="pi-native compact"),
+                },
+            )
+        return Response(status_code=200)
+
     def _inject_codex_compact(socket_path: str, target: str) -> None:
         """
         Blocking helper: type ``/compact`` into a codex tmux pane.
@@ -14613,8 +14670,11 @@ def create_runner_app(
             # Omnigent server forwards explicit /compact here. claude-native
             # and codex-native inject the slash command into the tmux
             # pane so the CLI compacts its own context, and return 200
-            # to signal the control was handled in the terminal. Other
-            # harnesses 204 no-op — their explicit compaction is an
+            # to signal the control was handled in the terminal. pi-native
+            # owns its context inside the Pi TUI process too, so it queues a
+            # ``compact`` inbox payload the resident extension feeds to Pi's
+            # ``ExtensionContext.compact()`` (mirroring the interrupt path).
+            # Other harnesses 204 no-op — their explicit compaction is an
             # AP-side operation the server runs when the runner does
             # not handle the control (see ``_run_compact_locked``).
             if _session_harness_name(conversation_id) == "claude-native":
@@ -14625,6 +14685,8 @@ def create_runner_app(
                 return await _handle_opencode_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "cursor-native":
                 return await _handle_cursor_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "pi-native":
+                return await _handle_pi_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "hermes-native":
                 return await _handle_hermes_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "qwen-native":

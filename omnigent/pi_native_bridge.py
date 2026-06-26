@@ -159,6 +159,37 @@ def enqueue_interrupt(bridge_dir: Path) -> str:
     return interrupt_id
 
 
+def enqueue_compact(bridge_dir: Path, custom_instructions: str | None = None) -> str:
+    """
+    Queue a UI-originated ``/compact`` for the resident Pi extension.
+
+    Pi owns its own context window inside the already-open TUI process, so
+    explicit compaction must run there rather than as AP-side compaction
+    (which would only summarise the transcript mirror and desync the two
+    context windows). Mirrors :func:`enqueue_interrupt`: the extension
+    consumes this inbox payload in the Pi process and calls Pi's active
+    ``ExtensionContext.compact()`` (see ``docs/compaction.md`` / ``ctx.compact``
+    in the pi-coding-agent extension API), which summarises older context and
+    appends a ``CompactionEntry`` to the Pi session.
+
+    :param bridge_dir: Native Pi bridge directory.
+    :param custom_instructions: Optional text passed to Pi's
+        ``compact({customInstructions})`` to focus the summary. Empty/blank
+        values are dropped so the extension uses Pi's default summarisation.
+    :returns: Opaque compact id.
+    """
+    compact_id = f"compact_{uuid.uuid4().hex}"
+    payload: dict[str, Any] = {
+        "id": compact_id,
+        "type": "compact",
+        "created_at": time.time(),
+    }
+    if isinstance(custom_instructions, str) and custom_instructions.strip():
+        payload["custom_instructions"] = custom_instructions
+    _enqueue_payload(bridge_dir, compact_id, payload)
+    return compact_id
+
+
 def _enqueue_payload(bridge_dir: Path, item_id: str, payload: dict[str, Any]) -> None:
     inbox = bridge_dir / _INBOX_DIR
     inbox.mkdir(mode=0o700, parents=True, exist_ok=True)
