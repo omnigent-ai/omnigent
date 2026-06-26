@@ -35,6 +35,21 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
+  // Project sidebar feature: the Sidebar reads the project list and each
+  // folder fetches its own sessions. No projects in this layout test, so the
+  // folder query stays disabled/empty.
+  useProjects: () => ({ data: [] }),
+  useProjectSessions: () => ({
+    data: undefined,
+    isLoading: false,
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    fetchNextPage: vi.fn(),
+  }),
+  useMoveToProject: () => ({ mutate: vi.fn() }),
+  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  fetchProjectSessionIds: () => Promise.resolve([]),
+  PROJECT_LABEL_KEY: "omni_project",
 }));
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));

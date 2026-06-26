@@ -55,6 +55,19 @@ function seedConversations(client: QueryClient, ids: string[]): void {
   client.setQueryData(["conversations", "", false], data);
 }
 
+function seedProjectFolder(client: QueryClient, project: string, ids: string[]): void {
+  const page: ConversationsPage = {
+    data: ids.map(conv),
+    first_id: ids[0] ?? null,
+    last_id: ids.at(-1) ?? null,
+    has_more: false,
+  };
+  client.setQueryData(["project-sessions", project], {
+    pages: [page],
+    pageParams: [undefined],
+  } satisfies ConversationsInfiniteData);
+}
+
 function renderProvider(client: QueryClient, initialEntries: string[]) {
   return render(
     <QueryClientProvider client={client}>
@@ -210,6 +223,56 @@ describe("SessionUpdatesProvider comments fingerprint", () => {
     // Zero comments-key invalidations proves an unchanged fingerprint is
     // inert; a call here means every row change would refetch comments.
     expect(commentsCalls).toEqual([]);
+  });
+});
+
+describe("SessionUpdatesProvider project folders", () => {
+  it("watches sessions that live only in a project folder's cache", () => {
+    // A project folder fetches its members into ["project-sessions", <name>],
+    // separate from the global list. Those ids must still be watched so the
+    // stream delivers liveness (e.g. the "Needs response" elicitation count).
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    seedProjectFolder(client, "Sprint 42", ["conv_filed"]);
+    renderProvider(client, ["/"]);
+    expect(lastWatched()).toEqual(["conv_a", "conv_filed"]);
+  });
+
+  it("patches a project folder row in place from a changed frame", () => {
+    const client = new QueryClient();
+    seedProjectFolder(client, "Sprint 42", ["conv_filed"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    // A pending-elicitation bump must reach the folder's own cache so the row
+    // flips to "Needs response" without a refetch.
+    act(() =>
+      handler({
+        type: "changed",
+        items: [{ ...conv("conv_filed"), pending_elicitations_count: 1 }],
+      }),
+    );
+
+    const folder = client.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "Sprint 42",
+    ]);
+    expect(folder!.pages[0].data[0]!.pending_elicitations_count).toBe(1);
+  });
+
+  it("evicts a removed session from a project folder's cache", () => {
+    const client = new QueryClient();
+    seedProjectFolder(client, "Sprint 42", ["conv_filed", "conv_other"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    act(() => handler({ type: "removed", ids: ["conv_filed"] }));
+
+    const folder = client.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "Sprint 42",
+    ]);
+    expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_other"]);
   });
 });
 
