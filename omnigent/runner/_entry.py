@@ -863,7 +863,18 @@ async def _run_tunnel_from_env() -> None:
     # (single-user / no-auth, or the binding-token-only legacy path).
     managed_auth_token = os.environ.get(RUNNER_AUTH_TOKEN_ENV_VAR)
     if managed_auth_token and managed_auth_token.strip():
-        auth_token = managed_auth_token.strip()
+        managed_owner_jwt = managed_auth_token.strip()
+        auth_token = managed_owner_jwt
+        # Authenticate the runner's HTTP client too (the server_client built in
+        # create_app: spec resolution, session queries, event posts) — not just
+        # the WS tunnel. A managed sandbox has no OIDC/Databricks credential, so
+        # the default factory yields nothing and every server call 401s. A
+        # static factory returning the owner JWT feeds both the app's httpx auth
+        # and serve_tunnel's refresh below.
+        def _managed_owner_token_factory(_jwt: str = managed_owner_jwt) -> str:
+            return _jwt
+
+        auth_token_factory = _managed_owner_token_factory
     binding_token = _runner_tunnel_binding_token_from_env()
     parent_pid = _runner_parent_pid_from_env()
     runner_id = get_stable_runner_id()
