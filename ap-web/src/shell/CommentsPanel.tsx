@@ -12,7 +12,7 @@ function avatarStyle(name: string): { backgroundColor: string; color: string } {
   let hash = 0;
   for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
   return {
-    backgroundColor: `color-mix(in hsl longer hue, var(--brand-accent) ${hash % 100}%, var(--status-blue))`,
+    backgroundColor: `hsl(${hash % 360} var(--avatar-saturation) var(--avatar-lightness))`,
     color: "var(--avatar-fg)",
   };
 }

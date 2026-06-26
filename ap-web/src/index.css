@@ -215,7 +215,11 @@
   --search-highlight-current-foreground: var(--foreground);
   --selection-bg: color-mix(in srgb, var(--brand-accent) 20%, transparent);
   --selection-fg: var(--brand-accent);
-  --avatar-fg: var(--primary-foreground);
+  --markdown-selection-bg: color-mix(in srgb, #93c5fd 40%, transparent);
+  --markdown-selection-fg: var(--foreground);
+  --avatar-saturation: 60%;
+  --avatar-lightness: 50%;
+  --avatar-fg: white;
   --connection-end-fill: var(--background);
   --image-checkerboard-color: color-mix(in srgb, var(--muted-foreground) 25%, transparent);
   --shadow-color-soft: color-mix(in srgb, var(--foreground) 22%, transparent);
@@ -235,11 +239,11 @@
   --share-button-hover-mid: color-mix(in srgb, var(--brand-accent) 88%, black 12%);
   --share-button-hover-bottom: color-mix(in srgb, var(--brand-accent) 74%, black 26%);
   --share-button-foreground: var(--destructive-foreground);
-  --md-alert-note: var(--status-blue);
-  --md-alert-tip: var(--status-green);
-  --md-alert-important: var(--brand-accent);
-  --md-alert-warning: var(--status-yellow);
-  --md-alert-caution: var(--status-red);
+  --md-alert-note: #0969da;
+  --md-alert-tip: #1a7f37;
+  --md-alert-important: #8250df;
+  --md-alert-warning: #9a6700;
+  --md-alert-caution: #cf222e;
   --radius: 0.5rem;
   /* Sidebar + workspace cards are white (--card); they float on the
      * near-white .app-shell gradient canvas. --sidebar matches that
@@ -323,7 +327,11 @@
   --search-highlight-current-foreground: var(--foreground);
   --selection-bg: var(--brand-accent);
   --selection-fg: var(--primary-foreground);
-  --avatar-fg: var(--primary-foreground);
+  --markdown-selection-bg: color-mix(in srgb, #93c5fd 40%, transparent);
+  --markdown-selection-fg: var(--foreground);
+  --avatar-saturation: 60%;
+  --avatar-lightness: 50%;
+  --avatar-fg: white;
   --connection-end-fill: var(--background);
   --image-checkerboard-color: color-mix(in srgb, var(--muted-foreground) 22%, transparent);
   --shadow-color-soft: color-mix(in srgb, black 28%, transparent);
@@ -340,11 +348,11 @@
   --share-button-hover-mid: color-mix(in srgb, var(--brand-accent) 88%, black 12%);
   --share-button-hover-bottom: color-mix(in srgb, var(--brand-accent) 68%, black 32%);
   --share-button-foreground: var(--destructive-foreground);
-  --md-alert-note: var(--status-blue);
-  --md-alert-tip: var(--status-green);
-  --md-alert-important: var(--brand-accent);
-  --md-alert-warning: var(--status-yellow);
-  --md-alert-caution: var(--status-red);
+  --md-alert-note: #4493f8;
+  --md-alert-tip: #3fb950;
+  --md-alert-important: #ab7df8;
+  --md-alert-warning: #d29922;
+  --md-alert-caution: #f85149;
   /* bg-sidebar surfaces blend into the dark .app-shell gradient — a 45°
      * diagonal sweeping green (rgb 17,24,28) → purple (rgb 19,13,33);
      * --sidebar sits in the green-dominant region and stays translucent
