@@ -2988,6 +2988,12 @@ def test_fork_conversation_drops_instance_scoped_labels(
     longer active after /clear" because the bridge's active-session
     marker wasn't the clone. The fork must drop them (and re-bind its
     own runtime), while ordinary labels still copy.
+
+    The DANGEROUS codex full-bypass directive is in the same set for a
+    different reason: a fork is a new session + workspace, so re-arming
+    ``--dangerously-bypass-approvals-and-sandbox`` there with no typed
+    re-confirmation would violate the "impossible to enable accidentally"
+    contract (#657). It must be dropped so the clone opts in afresh.
     """
     agent_store.create(
         agent_id="ag_fork_instance",
@@ -3002,6 +3008,8 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.codex_native.bridge_id": source.id,
             "omnigent.last_context_tokens": "39903",
             "omnigent.last_context_window": "1000000",
+            # The dangerous bypass opt-in must NOT ride into the fork.
+            "omnigent.codex_native.bypass_sandbox": "1",
             # An ordinary, non-instance label that SHOULD carry over.
             "omnigent.wrapper": "claude-code-native-ui",
         },
@@ -3583,6 +3591,10 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
         conv_id,
         {
             instance_label: "1",
+            # DANGEROUS codex bypass opt-in: in the instance-scoped set so a
+            # switch (a new agent/harness context) drops it rather than
+            # silently re-arming bypass without a fresh typed confirmation.
+            "omnigent.codex_native.bypass_sandbox": "1",
             UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
             WRAPPER_LABEL_KEY: "claude-code-native-ui",
         },
@@ -3637,6 +3649,9 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
     assert updated.labels[FORK_CARRY_HISTORY_LABEL_KEY] == "1"
     assert updated.labels[SWITCH_PREVIOUS_BUILTIN_LABEL_KEY] == "ag_builtin_claude"
     assert instance_label not in updated.labels, "instance-scoped labels must not survive a switch"
+    assert "omnigent.codex_native.bypass_sandbox" not in updated.labels, (
+        "the dangerous bypass opt-in must not survive a switch (re-confirm per context)"
+    )
     # Transcript is untouched (in place, not copied).
     assert len(conversation_store.list_items(conv_id).data) == 1
 

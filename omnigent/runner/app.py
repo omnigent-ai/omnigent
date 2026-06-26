@@ -479,6 +479,12 @@ class _CodexNativeLaunchConfig:
         rollout exists to clone (an SDK or cross-family source) the runner
         builds the clone's rollout from the copied Omnigent items instead (see
         ``_ensure_local_codex_resume_rollout``).
+    :param bypass_sandbox: ``True`` when the session opted into Codex's
+        DANGEROUS full-bypass stance (``omnigent.codex_native.bypass_sandbox``
+        label == ``"1"``). The runner then launches the ``--remote`` TUI with
+        ``--dangerously-bypass-approvals-and-sandbox`` and aligns the
+        app-server threads (no approval prompts, no command sandbox). Default
+        ``False``. See issue #657.
     """
 
     workspace: Path
@@ -489,6 +495,7 @@ class _CodexNativeLaunchConfig:
     fork_source_id: str | None
     fork_source_external_id: str | None
     fork_carry_history: bool
+    bypass_sandbox: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -829,6 +836,7 @@ async def _codex_native_launch_config(
     # the clone has no external_session_id of its own yet (see the
     # fork-source branch in _auto_create_codex_terminal); inert otherwise.
     from omnigent.stores.conversation_store import (
+        CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
         FORK_SOURCE_LABEL_KEY,
@@ -837,6 +845,10 @@ async def _codex_native_launch_config(
     fork_source_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history = False
+    # DANGEROUS opt-in: full approval/sandbox bypass, stored as a plain
+    # conversation label ("1" to enable). Read here so the runner applies
+    # it at launch; any other value (incl. absent) leaves the normal stance.
+    bypass_sandbox = False
     labels = snapshot.get("labels")
     if isinstance(labels, dict):
         _fsi = labels.get(FORK_SOURCE_LABEL_KEY)
@@ -846,6 +858,7 @@ async def _codex_native_launch_config(
         if isinstance(_fse, str) and _fse:
             fork_source_external_id = _fse
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
+        bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
     return _CodexNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
         policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
@@ -855,6 +868,7 @@ async def _codex_native_launch_config(
         fork_source_id=fork_source_id,
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
+        bypass_sandbox=bypass_sandbox,
     )
 
 
@@ -3294,6 +3308,7 @@ async def _auto_create_codex_terminal(
         bridge_dir=bridge_dir,
         ap_server_url=launch_config.policy_server_url,
         ap_auth_headers=policy_headers,
+        bypass_sandbox=launch_config.bypass_sandbox,
     )
     app_server.listen_url = codex_ws_url
     await app_server.start()
@@ -3366,6 +3381,7 @@ async def _auto_create_codex_terminal(
                     codex_args=tuple(launch_config.terminal_launch_args or ()),
                     thread_id=launch_config.external_session_id,
                     remote_url=codex_ws_url,
+                    bypass_sandbox=launch_config.bypass_sandbox,
                     # The --remote TUI loads its own config and does not
                     # inherit the app-server's -c flags; pass the same
                     # provider/model overrides so it resolves the

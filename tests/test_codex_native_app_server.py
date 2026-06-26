@@ -226,6 +226,75 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
     assert 'databricks auth token --profile \\"oss\\"' in overrides
 
 
+def test_build_codex_native_server_without_bypass_emits_no_bypass_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The default (``bypass_sandbox=False``) writes no approval/sandbox overrides.
+
+    Guards the safe default: an app-server built without the opt-in must
+    leave Codex's normal approval-prompt + own-sandbox stance untouched, so
+    no ``approval_policy`` / ``sandbox_mode`` override leaks in. A regression
+    that always emitted them would silently disable the sandbox for every
+    native Codex session.
+    """
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+    )
+
+    overrides = "\n".join(app_server.config_overrides)
+    assert "approval_policy" not in overrides
+    assert "sandbox_mode" not in overrides
+
+
+def test_build_codex_native_server_bypass_emits_full_access_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``bypass_sandbox=True`` puts the app-server threads into the bypass stance.
+
+    The ``--remote`` TUI launched with
+    ``--dangerously-bypass-approvals-and-sandbox`` fixes the thread's
+    approval/sandbox stance, but the chat/forwarder seam drives the SAME
+    thread through the app-server, so the app-server config must match —
+    ``approval_policy="never"`` (no prompts a headless seam can't answer)
+    and ``sandbox_mode="danger-full-access"`` (commands run with no command
+    sandbox, the #657 ask). Without these the app-server-driven turns would
+    keep prompting / keep the sandbox even though the TUI bypassed it.
+    """
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+        bypass_sandbox=True,
+    )
+
+    assert 'approval_policy="never"' in app_server.config_overrides
+    assert 'sandbox_mode="danger-full-access"' in app_server.config_overrides
+
+
 def _test_app_server(
     tmp_path: Path,
     codex_home: Path,

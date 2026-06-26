@@ -120,6 +120,7 @@ async def test_happy_path_parses_full_config(monkeypatch: pytest.MonkeyPatch) ->
             "omnigent.fork.source_id": "conv_source",
             "omnigent.fork.source_external_session_id": "thread_src",
             "omnigent.fork.carry_history": "1",
+            "omnigent.codex_native.bypass_sandbox": "1",
         },
     }
     cfg = await _run(_Client(_Resp(200, snapshot)))
@@ -130,6 +131,37 @@ async def test_happy_path_parses_full_config(monkeypatch: pytest.MonkeyPatch) ->
     assert cfg.fork_source_id == "conv_source", "Fork source id should be read from labels."
     assert cfg.fork_source_external_id == "thread_src"
     assert cfg.fork_carry_history is True, "carry_history label '1' should parse to True."
+    assert cfg.bypass_sandbox is True, "bypass_sandbox label '1' should parse to True."
     assert cfg.workspace.name == "repo", (
         f"Workspace path should resolve from snapshot, got {cfg.workspace}."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "labels",
+    [
+        None,  # no labels at all
+        {},  # labels present but no bypass key
+        {"omnigent.codex_native.bypass_sandbox": "0"},  # explicit off
+        {"omnigent.codex_native.bypass_sandbox": "true"},  # only "1" arms it
+        {"omnigent.codex_native.bypass_sandbox": ""},  # empty string
+    ],
+)
+async def test_bypass_sandbox_defaults_off_unless_label_is_one(
+    monkeypatch: pytest.MonkeyPatch, labels: Any
+) -> None:
+    """
+    Fail-safe: ``bypass_sandbox`` is False unless the label is exactly ``"1"``.
+
+    The dangerous full-bypass stance must never be entered by accident, so an
+    absent label, an unrelated value, or any near-miss (``"0"``, ``"true"``,
+    ``""``) leaves Codex in its normal approval/sandbox stance. Only the
+    canonical ``"1"`` (set by the guarded web toggle) arms it.
+    """
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    snapshot: dict[str, Any] = {"workspace": "/tmp/repo"}
+    if labels is not None:
+        snapshot["labels"] = labels
+    cfg = await _run(_Client(_Resp(200, snapshot)))
+    assert cfg.bypass_sandbox is False
