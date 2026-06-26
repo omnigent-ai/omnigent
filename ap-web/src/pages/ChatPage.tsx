@@ -3414,7 +3414,10 @@ export function Composer({
     // For a sub-agent (head) session, identify the head family being viewed
     // (e.g. the GPT head → "Gpt") rather than the bundle orchestrator
     // ("Debby") — the bundle is already named in the breadcrumb / Agents rail.
-    subAgentName ?? agents?.find((a) => a.id === selectedAgentId)?.name ?? agents?.[0]?.name ?? null,
+    subAgentName ??
+      agents?.find((a) => a.id === selectedAgentId)?.name ??
+      agents?.[0]?.name ??
+      null,
     sessionHarness,
   );
 
