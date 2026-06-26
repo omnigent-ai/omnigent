@@ -242,6 +242,7 @@ from omnigent.server.schemas import (
     SessionSandboxStatusEvent,
     SessionSkillsEvent,
     SessionStatusEvent,
+    SessionSupersededEvent,
     SessionSwitchAgentRequest,
     SessionTerminalPendingEvent,
     SessionTodosEvent,
@@ -344,6 +345,16 @@ _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE: str = "external_output_reasoning_delta"
 # explicit ``session.interrupted`` edge observed outside the Omnigent
 # task runtime. Payload is empty.
 _EXTERNAL_SESSION_INTERRUPTED_TYPE: str = "external_session_interrupted"
+
+# Internal input used by the claude-native forwarder when a Claude
+# ``/clear`` rotates a session away: the old conversation keeps its
+# history but the live terminal moves to a fresh conversation. Republished
+# as a transient ``session.superseded`` SSE event so a client actively
+# viewing the old conversation auto-redirects to the new one. Live-only
+# (no replay) — the durable counterpart is the persisted notice message
+# the forwarder also appends to the old conversation. Payload:
+# ``{"target_conversation_id": "conv_new"}``.
+_EXTERNAL_SESSION_SUPERSEDED_TYPE: str = "external_session_superseded"
 
 # Internal input used by Codex-native forwarders to clear a harness
 # elicitation that another Codex client already answered. Payload:
@@ -791,6 +802,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
     _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
+    _EXTERNAL_SESSION_SUPERSEDED_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
@@ -5406,6 +5418,49 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
         if isinstance(data, dict):
             data.pop("response_id", None)
     session_stream.publish(session_id, payload)
+
+
+def _publish_session_superseded(session_id: str, target_conversation_id: str) -> None:
+    """
+    Publish a ``session.superseded`` event to the live stream.
+
+    Emitted when a Claude ``/clear`` rotates a session away (see
+    ``_post_clear_supersession`` in
+    ``omnigent/claude_native_forwarder.py``): a client actively viewing
+    ``session_id`` follows to ``target_conversation_id``. Live-only —
+    there is no SSE replay, so a client connecting after the rotation
+    relies on the persisted notice message instead.
+
+    :param session_id: The superseded (old) conversation id whose stream
+        should receive the event, e.g. ``"conv_old"``.
+    :param target_conversation_id: The conversation to redirect to, e.g.
+        ``"conv_new"``.
+    """
+    event = SessionSupersededEvent(
+        type="session.superseded",
+        conversation_id=session_id,
+        target_conversation_id=target_conversation_id,
+        reason="clear",
+    )
+    session_stream.publish(session_id, event.model_dump())
+    # Discard any unconsumed pending inputs on the superseded session — notably
+    # the ``/clear`` the user typed in the web UI. ``/clear`` is never mirrored
+    # back as a committed item (the session rotated away), so its pending entry
+    # would otherwise linger forever as a stuck optimistic bubble, re-hydrating
+    # from the snapshot on every reload of the old chat. Live viewers already
+    # drop the bubble on the ``session.superseded`` event above; this stops it
+    # coming back. We deliberately do NOT emit ``session.input.consumed`` (that
+    # would commit ``/clear`` as a user message) — the persisted clear notice
+    # already explains the rotation, so the input is simply abandoned.
+    discarded = 0
+    while pending_inputs.resolve_oldest(session_id) is not None:
+        discarded += 1
+    if discarded:
+        _logger.info(
+            "Discarded %d unconsumed pending input(s) on superseded session %s",
+            discarded,
+            session_id,
+        )
 
 
 async def _get_runner_client(
@@ -17617,6 +17672,7 @@ def create_sessions_router(
             _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
             _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
             _EXTERNAL_SESSION_INTERRUPTED_TYPE,
+            _EXTERNAL_SESSION_SUPERSEDED_TYPE,
             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
             _EXTERNAL_SESSION_STATUS_TYPE,
             _EXTERNAL_SESSION_USAGE_TYPE,
@@ -17994,6 +18050,16 @@ def create_sessions_router(
                     code=ErrorCode.INVALID_INPUT,
                 )
             _publish_interrupted(session_id, response_id=response_id)
+            return {"queued": False}
+        if body.type == _EXTERNAL_SESSION_SUPERSEDED_TYPE:
+            target_conversation_id = body.data.get("target_conversation_id")
+            if not isinstance(target_conversation_id, str) or not target_conversation_id.strip():
+                raise OmnigentError(
+                    "external_session_superseded requires a non-empty string "
+                    "data.target_conversation_id",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            _publish_session_superseded(session_id, target_conversation_id.strip())
             return {"queued": False}
         if body.type == _EXTERNAL_ELICITATION_RESOLVED_TYPE:
             elicitation_id = body.data.get("elicitation_id")

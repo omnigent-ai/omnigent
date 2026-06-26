@@ -394,7 +394,15 @@ def _create_clear_replacement_session(
     write_active_session_id(bridge_dir, new_session_id)
     clear_resp = client.patch(
         f"{ap_server_url}/v1/sessions/{url_component(old_session_id)}",
-        json={"runner_id": ""},
+        json={
+            "runner_id": "",
+            # Re-key the superseded session onto a DISTINCT "-cleared" bridge id
+            # so its later resume gets its own isolated dir instead of the new
+            # session's live one (which would double-mirror the transcript and
+            # trip the executor guard). Mirrors the async forwarder rotation;
+            # ``_auto_create_claude_terminal`` recognises this marker.
+            "labels": {BRIDGE_ID_LABEL_KEY: f"{old_session_id}-cleared"},
+        },
     )
     if clear_resp.status_code >= 400:
         print(
