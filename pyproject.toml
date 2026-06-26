@@ -63,7 +63,7 @@ dependencies = [
     # which breaks _HostGroup.parse_args's `ctx.protected_args = []`
     # (omnigents/cli.py) with "property 'protected_args' of 'Context'
     # object has no setter" on any `omni host ...` invocation.
-    "click>=8.0,<8.2",
+    "click>=8.0,<8.5",
     "fastapi>=0.100,<1",
     # pexpect/pyte back the POSIX tmux/PTY terminal stack, which is disabled
     # on Windows (no usable PTY); omnigent never imports them on the core
