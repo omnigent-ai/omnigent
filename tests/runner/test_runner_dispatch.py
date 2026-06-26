@@ -148,6 +148,28 @@ class _FakeHarnessStream:
             yield chunk
 
 
+async def _await_bg_turn_task(conv: str, *, timeout: float = 10.0) -> None:
+    """Await the fire-and-forget background turn task for *conv* before draining.
+
+    The ``POST /events`` background path returns 202 before its turn task
+    (named ``turn-{conv}``) finishes publishing the terminal ``session.status``.
+    Awaiting that task by name removes the race where a status-queue drain's
+    timeout expires under heavy CI load before the task completes. A task that
+    already finished is absent from ``asyncio.all_tasks()`` (it published its
+    terminal status synchronously on the way out), so a ``None`` lookup is a
+    safe no-op.
+
+    :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param timeout: Hard cap in seconds for awaiting the task.
+    """
+    turn_task = next(
+        (t for t in asyncio.all_tasks() if t.get_name() == f"turn-{conv}"),
+        None,
+    )
+    if turn_task is not None:
+        await asyncio.wait_for(turn_task, timeout=timeout)
+
+
 async def _drain_published_statuses(
     conv: str,
     *,
@@ -1511,16 +1533,7 @@ async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
             },
         )
         assert response.status_code == 202
-        # Await the background turn task directly so we know it has
-        # completed (and published its terminal status) before draining.
-        # This eliminates the race where the drain's timeout expires
-        # before the task finishes under heavy CI load.
-        turn_task = next(
-            (t for t in asyncio.all_tasks() if t.get_name() == f"turn-{conv}"),
-            None,
-        )
-        if turn_task is not None:
-            await asyncio.wait_for(turn_task, timeout=10.0)
+        await _await_bg_turn_task(conv)
         statuses = await _drain_published_statuses(conv, until="failed", timeout=2.0)
 
     # The turn published "running" then "failed" — it reached a terminal
@@ -1606,14 +1619,7 @@ async def test_runner_failed_status_carries_setup_error_message(
             },
         )
         assert response.status_code == 202
-        # Await the background turn task directly so we know it has
-        # completed (and published its terminal status) before draining.
-        turn_task = next(
-            (t for t in asyncio.all_tasks() if t.get_name() == f"turn-{conv}"),
-            None,
-        )
-        if turn_task is not None:
-            await asyncio.wait_for(turn_task, timeout=10.0)
+        await _await_bg_turn_task(conv)
         failed_event = await _drain_failed_status_event(conv, timeout=2.0)
 
     # The failed event must carry the real setup error message — not a
@@ -1794,7 +1800,11 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
             },
         )
         assert response.status_code == 202
-        events = await _drain_status_events(conv, until=until, timeout=10.0)
+        # Await the background turn task directly so we know it has completed
+        # (and published its terminal status) before draining — the same race
+        # guard the sibling failed-status tests use.
+        await _await_bg_turn_task(conv)
+        events = await _drain_status_events(conv, until=until, timeout=2.0)
 
     statuses = [event.get("status") for event in events]
     # The turn must reach the parametrized terminal state. Without the fix,

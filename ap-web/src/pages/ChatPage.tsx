@@ -85,7 +85,11 @@ import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useIOSNativeKeyboardVisible } from "@/hooks/useIOSNativeKeyboardInset";
 import type { MessageContentBlock } from "@/lib/blocks";
-import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import {
+  derivePermissionLevel,
+  isOwnerLevel,
+  isSessionSharedWithOthers,
+} from "@/lib/permissionsApi";
 import {
   type Bubble,
   type RenderItem,
@@ -378,21 +382,6 @@ export function shouldShowAuthorBadge(
   isSessionShared: boolean,
 ): boolean {
   return isSessionShared && author !== undefined && author !== viewerId;
-}
-
-// Shared = someone other than the viewer can see the session: another
-// principal owns it (shared with the viewer), or the viewer owns it and
-// granted access to a non-viewer principal (a user or the __public__
-// sentinel). ownerGrants is undefined until loaded / when the viewer
-// isn't the owner and can't read the manage-only grant list.
-export function isSessionSharedWithOthers(
-  owner: string | null,
-  viewerId: string | null,
-  ownerGrants: readonly { user_id: string }[] | undefined,
-): boolean {
-  if (owner !== null && viewerId !== null && owner !== viewerId) return true;
-  const viewerOwnsSession = owner !== null && owner === viewerId;
-  return viewerOwnsSession && (ownerGrants ?? []).some((g) => g.user_id !== viewerId);
 }
 
 // Author labels render only in a shared session; ChatPage provides the

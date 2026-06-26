@@ -756,14 +756,14 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
   });
 
-  it("shows permission-mode options in the Advanced menu only for the claude-native agent", () => {
+  it("shows permission-mode options behind the run-mode pill for the claude-native agent", () => {
     renderLanding();
-    // The radios live behind the footer tray's Advanced chip — absent
+    // The radios live behind the composer's left-side run-mode pill — absent
     // until the menu opens.
     expect(screen.queryByTestId("new-chat-landing-permission-plan")).toBeNull();
-    // a1 (Claude Code, claude-native) is the default agent → the footer
-    // tray surfaces the Advanced chip with the permission-mode radios.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    // a1 (Claude Code, claude-native) is the default agent → the composer
+    // surfaces the permission-mode pill with the permission-mode radios.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-pill"), { button: 0 });
     const planOption = screen.getByTestId("new-chat-landing-permission-plan");
     expect(planOption.textContent).toContain("Plan");
     // The footer line explains the SELECTED mode until a row is hovered —
@@ -773,21 +773,21 @@ describe("NewChatLandingScreen", () => {
     expect(detail.textContent).toContain("Prompts before edits and commands");
     fireEvent.pointerEnter(planOption);
     expect(detail.textContent).toContain("Plans only; makes no edits");
-    // Switch to Codex (a2: codex-native) — the Advanced chip stays visible
+    // Switch to Codex (a2: codex-native) — the run-mode pill stays visible
     // but now shows approval-mode radios instead of permission-mode radios.
-    // Close the Advanced menu first (Escape), then switch agents.
+    // Close the menu first (Escape), then switch agents.
     fireEvent.keyDown(document.activeElement!, { key: "Escape" });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    expect(screen.queryByTestId("new-chat-landing-advanced-chip")).not.toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-approval-pill")).not.toBeNull();
   });
 
-  it("shows approval-mode options in the Advanced menu for the codex-native agent", () => {
+  it("shows approval-mode options behind the run-mode pill for the codex-native agent", () => {
     renderLanding();
     // Switch to Codex first.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
     const fullAccessOption = screen.getByTestId("new-chat-landing-approval-full-access");
     expect(fullAccessOption.textContent).toContain("Full access");
     // The footer line explains the SELECTED mode until a row is hovered.
@@ -803,7 +803,7 @@ describe("NewChatLandingScreen", () => {
     // Switch to Codex, open the Advanced menu.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
     const toggle = screen.getByTestId(
       "new-chat-landing-bypass-sandbox-switch",
     ) as HTMLButtonElement;
@@ -846,7 +846,7 @@ describe("NewChatLandingScreen", () => {
     // Arm bypass on Codex (a2): type the phrase, flip the switch, close tray.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
     fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
       target: { value: "bypass sandbox" },
     });
@@ -866,7 +866,7 @@ describe("NewChatLandingScreen", () => {
     // Without the reset effect it would re-render armed from stale state.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
     const toggle = screen.getByTestId(
       "new-chat-landing-bypass-sandbox-switch",
     ) as HTMLButtonElement;
@@ -883,7 +883,7 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
     fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
       target: { value: "bypass sandbox" },
     });
