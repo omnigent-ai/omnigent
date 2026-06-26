@@ -28,6 +28,7 @@ import { ThemeProvider as NextThemesProvider } from "next-themes";
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import App from "./App";
 import { TooltipProvider } from "./components/ui/tooltip";
+import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { CapabilitiesContext } from "./lib/CapabilitiesContext";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
@@ -199,15 +200,17 @@ function OmnigentProviders({
             disableTransitionOnChange
           >
             <TooltipProvider>
-              <RoutingProvider value={routing}>
-                <EmbedCapabilitiesProvider>
-                  <SessionUpdatesProvider>
-                    <RunnerHealthProvider>
-                      <App basename={basename} />
-                    </RunnerHealthProvider>
-                  </SessionUpdatesProvider>
-                </EmbedCapabilitiesProvider>
-              </RoutingProvider>
+              <ImageLightboxProvider>
+                <RoutingProvider value={routing}>
+                  <EmbedCapabilitiesProvider>
+                    <SessionUpdatesProvider>
+                      <RunnerHealthProvider>
+                        <App basename={basename} />
+                      </RunnerHealthProvider>
+                    </SessionUpdatesProvider>
+                  </EmbedCapabilitiesProvider>
+                </RoutingProvider>
+              </ImageLightboxProvider>
             </TooltipProvider>
           </NextThemesProvider>
         </EmbeddedProvider>
