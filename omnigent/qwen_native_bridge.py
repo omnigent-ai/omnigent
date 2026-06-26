@@ -94,6 +94,26 @@ def _qwen_project_slug(workspace: Path | str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", real)
 
 
+def qwen_session_recording_path(session_id: str, workspace: Path | str) -> Path:
+    """Return the path to qwen's on-disk chat recording for *session_id*.
+
+    ``~/.qwen/projects/<project-slug>/chats/<session-id>.jsonl`` — the JSONL
+    qwen appends interactive-session events to (``--chat-recording``, on by
+    default), scoped to *workspace*'s project slug. The file may not exist yet
+    (a fresh session creates it on first event). Used both to gate ``--resume``
+    (:func:`qwen_session_recording_exists`) and to tail for the
+    ``chat_compression`` marker (see :mod:`omnigent.qwen_native_forwarder`).
+    """
+    return (
+        Path.home()
+        / ".qwen"
+        / "projects"
+        / _qwen_project_slug(workspace)
+        / "chats"
+        / f"{session_id}.jsonl"
+    )
+
+
 def qwen_session_recording_exists(session_id: str, workspace: Path | str) -> bool:
     """Return whether qwen has an on-disk chat recording for *session_id* in *workspace*.
 
@@ -114,16 +134,8 @@ def qwen_session_recording_exists(session_id: str, workspace: Path | str) -> boo
     :returns: ``True`` if a recording for *session_id* exists under *workspace*'s
         qwen project dir.
     """
-    recording = (
-        Path.home()
-        / ".qwen"
-        / "projects"
-        / _qwen_project_slug(workspace)
-        / "chats"
-        / f"{session_id}.jsonl"
-    )
     try:
-        return recording.is_file()
+        return qwen_session_recording_path(session_id, workspace).is_file()
     except OSError:
         return False
 
