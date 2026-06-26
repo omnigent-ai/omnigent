@@ -1,0 +1,139 @@
+# Dependabot configuration.
+#
+# Two jobs per ecosystem are driven from this one file:
+#   * SECURITY updates  — opened automatically whenever a dependency has an
+#     open advisory, regardless of the weekly schedule below. These are gated
+#     by the repo-level "Dependabot security updates" toggle (enabled out of
+#     band). Grouping them (see `groups: ... applies-to: security-updates`)
+#     keeps a burst of advisories from becoming a burst of PRs.
+#   * VERSION updates   — the scheduled weekly bump of out-of-date deps.
+#
+# Supply-chain stance mirrors the rest of the repo (uv.toml `exclude-newer`,
+# ap-web/.npmrc `min-release-age`): a 7-day cooldown so a freshly published —
+# possibly compromised — release is never pulled the moment it lands.
+version: 2
+
+updates:
+  # ── Python (server + runner; root uv workspace) ──────────────────────────
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+    groups:
+      python-security:
+        applies-to: security-updates
+        patterns: ["*"]
+      python-version:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # ── ap-web (React frontend) ──────────────────────────────────────────────
+  - package-ecosystem: npm
+    directory: "/ap-web"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+    groups:
+      ap-web-security:
+        applies-to: security-updates
+        patterns: ["*"]
+      ap-web-version:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # ── ap-web Electron shell ────────────────────────────────────────────────
+  - package-ecosystem: npm
+    directory: "/ap-web/electron"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+    groups:
+      electron-security:
+        applies-to: security-updates
+        patterns: ["*"]
+      electron-version:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # ── CI helper deps (.github/ci-deps) ─────────────────────────────────────
+  - package-ecosystem: npm
+    directory: "/.github/ci-deps"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      ci-deps-security:
+        applies-to: security-updates
+        patterns: ["*"]
+      ci-deps-version:
+        applies-to: version-updates
+        patterns: ["*"]
+
+  # ── Rust sidecar used by the codex-parity test fixture ───────────────────
+  - package-ecosystem: cargo
+    directory: "/tests/codex_parity/sidecar"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      sidecar-security:
+        applies-to: security-updates
+        patterns: ["*"]
+      sidecar-version:
+        applies-to: version-updates
+        patterns: ["*"]
+
+  # ── iOS app (CocoaPods/Bundler Gemfile) ──────────────────────────────────
+  - package-ecosystem: bundler
+    directory: "/ap-web/ios"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      ios-security:
+        applies-to: security-updates
+        patterns: ["*"]
+      ios-version:
+        applies-to: version-updates
+        patterns: ["*"]
+
+  # ── GitHub Actions (workflow `uses:` pins) ───────────────────────────────
+  # The repo pins actions by commit SHA; Dependabot keeps the SHAs current
+  # and surfaces advisories against the underlying action.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
+      actions-version:
+        applies-to: version-updates
+        patterns: ["*"]
