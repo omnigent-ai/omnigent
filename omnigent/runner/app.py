@@ -531,6 +531,7 @@ class _PiNativeLaunchConfig:
     server_url: str
     terminal_launch_args: list[str] | None
     external_session_id: str | None
+    fork_source_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
     model_override: str | None = None
@@ -728,12 +729,17 @@ async def _pi_native_launch_config(
     from omnigent.stores.conversation_store import (
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+        FORK_SOURCE_LABEL_KEY,
     )
 
+    fork_source_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history = False
     labels = snapshot.get("labels")
     if isinstance(labels, dict):
+        _fsi = labels.get(FORK_SOURCE_LABEL_KEY)
+        if isinstance(_fsi, str) and _fsi:
+            fork_source_id = _fsi
         _fse = labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
         if isinstance(_fse, str) and _fse:
             fork_source_external_id = _fse
@@ -753,6 +759,7 @@ async def _pi_native_launch_config(
         server_url=os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
         terminal_launch_args=terminal_launch_args,
         external_session_id=external_session_id,
+        fork_source_id=fork_source_id,
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         model_override=model_override,
@@ -2407,14 +2414,49 @@ async def _auto_create_hermes_terminal(
     # cursor (clear_hermes_bridge_state above) starts it at that row's first row.
     launch_epoch_s = time.time()
     hermes_args = [*(launch_config.terminal_launch_args or [])]
-    # Fork with history: resume the source Hermes session so the TUI
-    # loads the prior conversation context.
+    # Resolve the per-session HERMES_HOME early: the fork block below needs it
+    # to place the cloned state.db, and the env block after needs it for the
+    # HERMES_HOME env var.
+    _hermes_home_path = read_hermes_home(bridge_dir)
+    # Fork with history: clone the source Hermes session's state.db into the
+    # new session's HERMES_HOME so the TUI loads the prior conversation context
+    # under a fresh session id (true fork, not a shared --resume).
     if launch_config.fork_carry_history and launch_config.fork_source_external_id:
-        hermes_args.extend(["--resume", launch_config.fork_source_external_id])
+        from omnigent.hermes_native_bridge import (
+            clone_hermes_session,
+            mint_hermes_session_id,
+        )
+
+        # Resolve the source session's state.db from its bridge dir.
+        _source_bridge = (
+            bridge_dir_for_session_id(launch_config.fork_source_id)
+            if launch_config.fork_source_id
+            else None
+        )
+        _source_hermes_home = read_hermes_home(_source_bridge) if _source_bridge else None
+        _source_db = _source_hermes_home / "state.db" if _source_hermes_home else None
+        if _source_db is not None and _source_db.is_file():
+            _target_session_id = mint_hermes_session_id()
+            _target_db = _hermes_home_path / "state.db" if _hermes_home_path else None
+            if _target_db is not None:
+                await asyncio.to_thread(
+                    clone_hermes_session,
+                    _source_db,
+                    _target_db,
+                    launch_config.fork_source_external_id,
+                    _target_session_id,
+                    workspace=workspace,
+                )
+                hermes_args.extend(["--resume", _target_session_id])
+                _logger.info(
+                    "Cloned hermes session %s -> %s for fork; session=%s",
+                    launch_config.fork_source_external_id,
+                    _target_session_id,
+                    session_id,
+                )
     # If a per-session HERMES_HOME was written (policy hook), pass it via env
     # so the TUI picks up the hook config alongside its own approval prompt.
     _hermes_terminal_env: dict[str, str] = {}
-    _hermes_home_path = read_hermes_home(bridge_dir)
     if _hermes_home_path is not None:
         _hermes_terminal_env["HERMES_HOME"] = str(_hermes_home_path)
     terminal_view = await resource_registry.launch_required_terminal(
