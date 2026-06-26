@@ -143,6 +143,24 @@ jobs:
           sudo apt-get install -y bubblewrap tmux
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
+      # Rust toolchain + target cache for the Codex parity sidecar. The
+      # mocked_native_codex_goal_session fixture builds tests/codex_parity/
+      # sidecar via `cargo build` (it pulls openai/codex's core_test_support
+      # crate, a multi-minute cold compile). Without this cache the build runs
+      # from scratch on whichever shard collects test_codex_goal_mode, adding
+      # ~9min to that shard. Mirrors ci.yml's codex-parity job: pin the
+      # toolchain for a stable cache fingerprint, key on the sidecar Cargo.lock.
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+        with:
+          path: .tmp-codex-parity-target
+          key: codex-parity-sidecar-${{ runner.os }}-${{ hashFiles('tests/codex_parity/sidecar/Cargo.lock') }}
+
       - name: Cache Playwright browsers
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
