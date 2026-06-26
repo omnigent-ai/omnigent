@@ -9,6 +9,9 @@ table — see ``sqlalchemy_store.list_projects`` / the ``project`` filter on
 ``PATCH /v1/sessions/{id}`` with ``{labels:{omni_project}}`` (an empty value
 removes the label).
 
+The web UI move submenu is labelled "Add to project" (unfiled) or
+"Move session" (already filed); both share ``data-testid="move-to-project"``.
+
 These drive the real chain the ``Sidebar`` unit tests mock out: the kebab
 submenu → the PATCH → the refreshed ``GET /v1/sessions/projects`` and
 ``GET /v1/sessions`` lists → the row landing under (or leaving) a project
@@ -49,13 +52,13 @@ def _row(page: Page, session_id: str) -> Locator:
 
 
 def _move_to_new_project(page: Page, row: Locator, name: str) -> None:
-    """Drive the row kebab → "Change project" → "New project…" flow,
+    """Drive the row kebab → "Add to project" → "Create new project" flow,
     typing *name* and committing with Enter."""
     row.hover()
     row.get_by_test_id("conversation-actions").click()
     # Open the submenu flyout, then start the inline new-project input.
     page.get_by_test_id("move-to-project").click()
-    page.get_by_role("menuitem", name="New project…").click()
+    page.get_by_role("menuitem", name="Create new project").click()
     new_input = page.get_by_placeholder("Project name…")
     new_input.fill(name)
     new_input.press("Enter")
@@ -67,8 +70,8 @@ def test_move_session_into_new_project(
 ) -> None:
     """Creating a project from the kebab moves the row into it.
 
-    The session starts under "Chats"; after "Change project → New project…",
-    a project folder with that name appears under the "Projects" group and the
+    The session starts under "Chats"; after "Add to project → Create new
+    project", a project folder with that name appears under the "Projects" group and the
     row lives under it (once expanded) and no longer under "Chats".
     """
     base_url, session_id = seeded_session
@@ -84,12 +87,11 @@ def test_move_session_into_new_project(
 
     _move_to_new_project(page, row, project)
 
-    # The project folder appears; folders render collapsed by default, so expand
-    # it before asserting membership.
+    # The project folder appears and auto-expands on the move (so the session
+    # you just filed is revealed without a manual click).
     header = page.get_by_role("button", name=project, exact=True)
     expect(header).to_be_visible()
-    expect(header).to_have_attribute("aria-expanded", "false")
-    header.click()
+    expect(header).to_have_attribute("aria-expanded", "true")
 
     expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_be_visible()
     expect(_section(page, "Chats").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
@@ -102,7 +104,7 @@ def test_remove_session_from_project(
     """Removing a session from its project drops it back under "Chats".
 
     Moves the row into a fresh project first, then uses the kebab's
-    "Remove from project" item and asserts the row returns to "Chats".
+    "Remove from <project>" item and asserts the row returns to "Chats".
     """
     base_url, session_id = seeded_session
     title = f"e2e-proj-rm-{uuid.uuid4().hex[:8]}"
@@ -115,11 +117,12 @@ def test_remove_session_from_project(
     expect(row).to_be_visible()
     _move_to_new_project(page, row, project)
 
+    # The folder auto-expands on the move, so its row is already visible.
     header = page.get_by_role("button", name=project, exact=True)
     expect(header).to_be_visible()
-    header.click()
+    expect(header).to_have_attribute("aria-expanded", "true")
 
-    # Remove via the kebab's "Remove from project" item (only shown when the
+    # Remove via the kebab's "Remove from <project>" item (only shown when the
     # session is in a project).
     project_row = (
         _section(page, project)
@@ -129,7 +132,8 @@ def test_remove_session_from_project(
     project_row.hover()
     project_row.get_by_test_id("conversation-actions").click()
     page.get_by_test_id("move-to-project").click()
-    page.get_by_role("menuitem", name=re.compile("Remove from project")).click()
+    # The kebab item names the project it removes from ("Remove from <name>").
+    page.get_by_role("menuitem", name=re.compile(rf"Remove from {re.escape(project)}")).click()
     # Removal is confirmed (it may delete the implicit project) — accept it.
     page.get_by_role("button", name="Remove from project", exact=True).click()
 
