@@ -11,6 +11,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.mcp_server_store.sqlalchemy_store import SqlAlchemyMcpServerStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
 
@@ -20,6 +21,14 @@ def agent_store(db_uri: str) -> SqlAlchemyAgentStore:
     :returns: A SqlAlchemyAgentStore backed by the test database.
     """
     return SqlAlchemyAgentStore(db_uri)
+
+
+@pytest.fixture()
+def mcp_server_store(db_uri: str) -> SqlAlchemyMcpServerStore:
+    """
+    :returns: A SqlAlchemyMcpServerStore backed by the test database.
+    """
+    return SqlAlchemyMcpServerStore(db_uri)
 
 
 @pytest.fixture()

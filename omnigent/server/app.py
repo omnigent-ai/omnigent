@@ -53,6 +53,7 @@ from omnigent.server.performance_metrics import (
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
+from omnigent.server.routes.mcp_servers import create_mcp_servers_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
@@ -69,6 +70,7 @@ from omnigent.stores import (
     ArtifactStore,
     ConversationStore,
     FileStore,
+    McpServerStore,
 )
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import SessionConnectivity
@@ -975,6 +977,7 @@ def create_app(
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
     auth_provider: AuthProvider | None = None,
+    mcp_server_store: McpServerStore | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
     extra_routers: list[tuple[Any, str, list[str]]] | None = None,
@@ -1800,6 +1803,17 @@ def create_app(
         prefix="/v1",
         tags=["agents"],
     )
+    # Standalone, owner-scoped MCP servers: reusable connections a user
+    # registers once (and can verify) then selects when creating agents.
+    if mcp_server_store is not None:
+        app.include_router(
+            create_mcp_servers_router(
+                mcp_server_store,
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+            tags=["mcp-servers"],
+        )
     app.include_router(
         create_terminal_attach_router(
             auth_provider=auth_provider,

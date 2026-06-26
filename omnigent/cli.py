@@ -2999,6 +2999,7 @@ def server(
     # with "unable to open database file".
     _ensure_sqlite_parent_dir(db_uri)
 
+    from omnigent.stores.mcp_server_store.sqlalchemy_store import SqlAlchemyMcpServerStore
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
     agent_store = SqlAlchemyAgentStore(db_uri)
@@ -3007,6 +3008,7 @@ def server(
     comment_store = SqlAlchemyCommentStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
+    mcp_server_store = SqlAlchemyMcpServerStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
@@ -3154,6 +3156,7 @@ def server(
         runner_tunnel_tokens=_runner_tunnel_tokens,
         permission_store=permission_store,
         auth_provider=auth_provider,
+        mcp_server_store=mcp_server_store,
         host_store=host_store,
         account_store=account_store,
         policy_modules=cfg.get("policy_modules"),
