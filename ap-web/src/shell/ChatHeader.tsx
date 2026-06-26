@@ -48,9 +48,17 @@ interface MobileSessionMenuProps {
   subagentsPanelOpen: boolean;
   /** True while the mobile tasks drawer is open. */
   todosPanelOpen: boolean;
-  /** Hide the Shells entry (claude-native sub-agents only). */
-  hideTerminalsTab: boolean;
-  /** Number of open terminals (entry badge + visibility). */
+  /** True while the mobile shells drawer is open. */
+  terminalsListOpen: boolean;
+  /**
+   * Whether the Shells entry should render — mirrors the desktop rail's
+   * Shells tab gate (`railTabsAvailable.terminals`): shown when the
+   * agent declares shell access (its empty state is the "+ New shell"
+   * entry point) or once a shell exists, and hidden for claude-native
+   * sub-agents.
+   */
+  showShellsTab: boolean;
+  /** Number of open terminals (entry badge). */
   terminalsLength: number;
   /** Whether this is a claude-native session (gates the Tasks entry). */
   isClaudeNative: boolean;
@@ -71,8 +79,8 @@ interface MobileSessionMenuProps {
   agentCount: number;
   /** Open the mobile files drawer. */
   onOpenFiles: () => void;
-  /** Open the first terminal in the terminals push panel. */
-  onOpenFirstTerminal: () => void;
+  /** Open the mobile shells drawer (the InlineTerminalsSection list). */
+  onOpenShells: () => void;
   /** Open the mobile agents drawer. */
   onOpenSubagents: () => void;
   /** Open the mobile tasks drawer. */
@@ -392,6 +400,7 @@ export function ChatHeader({
           !mobileMenu.filesPanelOpen &&
           !mobileMenu.subagentsPanelOpen &&
           !mobileMenu.todosPanelOpen &&
+          !mobileMenu.terminalsListOpen &&
           (hasRailContent || mobileMenu.debugMode) && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -445,22 +454,32 @@ export function ChatHeader({
                       : mobileMenu.agentCount}
                   </span>
                 </DropdownMenuItem>
-                {/* Shells — hidden only for claude-native sub-agents,
-                    matching the desktop rail's Shells tab. The agent's
-                    own terminal (SDK REPL / native vendor pane) is
-                    excluded from the count (it's reached via the
-                    Chat/Terminal pill), so this entry appears only
-                    when real shells exist. */}
-                {!mobileMenu.hideTerminalsTab && mobileMenu.terminalsLength > 0 && (
+                {/* Shells — same gate as the desktop rail's Shells tab
+                    (``showShellsTab``): shown when the agent declares
+                    shell access or a shell exists, hidden for
+                    claude-native sub-agents. Opens the same
+                    InlineTerminalsSection list as the desktop tab in a
+                    drawer (where "+ New shell" is the empty-state entry
+                    point), rather than jumping straight into a terminal.
+                    The agent's own terminal (SDK REPL / native vendor
+                    pane) is excluded from the count, so the badge — like
+                    the desktop tab's — appears only once a real shell
+                    exists; a "0" next to a default-visible entry reads as
+                    an error state. */}
+                {mobileMenu.showShellsTab && (
                   <DropdownMenuItem
-                    onSelect={mobileMenu.onOpenFirstTerminal}
+                    onSelect={mobileMenu.onOpenShells}
                     className="gap-2.5 px-2.5 py-2 text-base"
                   >
                     <TerminalIcon className="size-4" />
                     Shells
-                    <span className={cn(TAB_BADGE_BASE, "ml-auto bg-muted text-muted-foreground")}>
-                      {mobileMenu.terminalsLength}
-                    </span>
+                    {mobileMenu.terminalsLength > 0 && (
+                      <span
+                        className={cn(TAB_BADGE_BASE, "ml-auto bg-muted text-muted-foreground")}
+                      >
+                        {mobileMenu.terminalsLength}
+                      </span>
+                    )}
                   </DropdownMenuItem>
                 )}
                 {mobileMenu.isClaudeNative && mobileMenu.todosTotal > 0 && (

@@ -2550,6 +2550,45 @@ describe("Mobile session menu", () => {
     expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
   });
 
+  it("opens the Shells drawer with the same InlineTerminalsSection list as the desktop tab", () => {
+    // Mobile parity with the desktop rail's Shells tab: the entry opens the
+    // shell *list* in a drawer (not a jump straight into a terminal), so the
+    // list's "+ New shell" row is the empty-state entry point.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "main", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_abc");
+
+    // Drawer starts closed and its list unmounted. The default desktop rail
+    // tab is Files, so no inline-terminals-section renders there yet.
+    const drawer = screen.getByTestId("shells-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(within(drawer).queryByTestId("inline-terminals-section")).toBeNull();
+
+    openSessionMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: /Shells/i }));
+
+    // Failure: openShellsList didn't set terminalsListOpen, or the entry still
+    // routed straight into a terminal instead of the list drawer.
+    const openDrawer = screen.getByTestId("shells-panel-drawer");
+    expect(openDrawer).toHaveAttribute("data-state", "open");
+    expect(within(openDrawer).getByTestId("inline-terminals-section")).toBeInTheDocument();
+
+    // Picking a row hands off to the terminal host and closes the drawer —
+    // the same onExpand path the desktop tab uses.
+    fireEvent.click(within(openDrawer).getByRole("button", { name: "rail: open terminal" }));
+    expect(screen.getByTestId("shells-panel-drawer")).toHaveAttribute("data-state", "closed");
+    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
+  });
+
   it("keeps the FAB with only the Agents entry for a minimal agent", () => {
     // available:false → no files; no shells, no todos, no debug. The
     // Agents entry is unconditional (badge = 1, the main agent), so the

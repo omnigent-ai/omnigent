@@ -51,6 +51,7 @@ import { FileViewer } from "./FileViewer";
 import { FileViewerContext } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
+import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { TitleBarServerPicker } from "./TitleBarServerPicker";
@@ -207,6 +208,10 @@ export function AppShell() {
   // on a phone they open as full-screen overlays from the session-menu FAB.
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [todosPanelOpen, setTodosPanelOpen] = useState(false);
+  // The mobile Shells drawer hosts the same InlineTerminalsSection list as
+  // the desktop rail's Shells tab; clicking a row hands off to the terminal
+  // host (TerminalsPanel / inline MainTerminalView) via ``openTerminalsPanel``.
+  const [terminalsListOpen, setTerminalsListOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) is open by default and
   // remembers its open/closed state per session — a brand-new session starts
   // open; reopening a session restores how the user last left it. Toggled
@@ -520,6 +525,7 @@ export function AppShell() {
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
     setTodosPanelOpen(false);
+    setTerminalsListOpen(false);
     setFilesPanelShowHidden(false);
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
@@ -667,6 +673,7 @@ export function AppShell() {
       setFilesPanelOpen(false); // close files drawer so the viewer is unobscured
       setSubagentsPanelOpen(false); // close mobile agents drawer
       setTodosPanelOpen(false); // close mobile tasks drawer
+      setTerminalsListOpen(false); // close mobile shells drawer
       // Pull the rail to the Files tab when parked on a tab where the viewer
       // won't render (Terminals, Subagents, Todos). The Files tab surfaces the
       // FileViewer inline, so leave it undisturbed.
@@ -850,6 +857,7 @@ export function AppShell() {
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
+    setTerminalsListOpen(false); // close mobile shells drawer (row was picked)
     setPanelInitialKey(key);
   }
 
@@ -860,6 +868,7 @@ export function AppShell() {
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
+    setTerminalsListOpen(false); // close mobile shells drawer
     setExecutionLogsKey(key);
   }
 
@@ -873,6 +882,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
+    setTerminalsListOpen(false); // close mobile shells drawer
     setFilesPanelOpen(true);
   }
 
@@ -885,6 +895,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
+    setTerminalsListOpen(false); // close mobile shells drawer
     setSubagentsPanelOpen(true);
   }
 
@@ -897,16 +908,26 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setTerminalsListOpen(false); // close mobile shells drawer
     setTodosPanelOpen(true);
   }
 
-  function openFirstTerminal() {
-    // Mobile FAB → "Terminals" routes to the first terminal so the
-    // single tap is equivalent to clicking the first row in the
-    // desktop rail's terminals card. Inventory view — the embedded
-    // REPL terminal is the pill's Terminal view, not a rail entry.
-    if (railTerminals.length === 0) return;
-    openTerminalsPanel(terminalTabKey(railTerminals[0]));
+  // Mobile FAB → "Shells" opens the same InlineTerminalsSection list as the
+  // desktop rail's Shells tab, as a full-screen drawer (not a jump straight
+  // into a terminal). Clicking a row — or the list's "+ New shell" — hands
+  // off to ``openTerminalsPanel``, which closes this drawer and opens the
+  // terminal host (the TerminalsPanel overlay, or the inline MainTerminalView
+  // in terminal-first sessions). The empty state is the list's own "+ New
+  // shell" row, exactly like the desktop tab.
+  function openShellsList() {
+    setSelectedFilePath(null); // close file viewer
+    clearFileViewerUrl();
+    setPanelInitialKey(null); // close terminals panel
+    setExecutionLogsKey(null); // close execution-logs panel
+    setFilesPanelOpen(false); // close files drawer
+    setSubagentsPanelOpen(false); // close mobile agents drawer
+    setTodosPanelOpen(false); // close mobile tasks drawer
+    setTerminalsListOpen(true);
   }
 
   function openMainExecutionLog() {
@@ -1095,7 +1116,8 @@ export function AppShell() {
                     filesPanelOpen,
                     subagentsPanelOpen,
                     todosPanelOpen,
-                    hideTerminalsTab,
+                    terminalsListOpen,
+                    showShellsTab: railTabsAvailable.terminals,
                     terminalsLength: railTerminals.length,
                     isClaudeNative,
                     todosCompleted,
@@ -1105,7 +1127,7 @@ export function AppShell() {
                     subagentsWorking,
                     agentCount,
                     onOpenFiles: openFilesPanel,
-                    onOpenFirstTerminal: openFirstTerminal,
+                    onOpenShells: openShellsList,
                     onOpenSubagents: openSubagentsPanel,
                     onOpenTodos: openTodosPanel,
                     onOpenMainExecutionLog: openMainExecutionLog,
@@ -1226,6 +1248,22 @@ export function AppShell() {
                   testId="todos-panel-drawer"
                 >
                   <TodoPanel frameless />
+                </MobilePanelDrawer>
+              )}
+              {conversationId && (
+                <MobilePanelDrawer
+                  open={terminalsListOpen}
+                  title="Shells"
+                  onClose={() => setTerminalsListOpen(false)}
+                  testId="shells-panel-drawer"
+                >
+                  {/* Same list as the desktop rail's Shells tab. ``onExpand``
+                      (a row click or "+ New shell") opens the terminal host
+                      and closes this drawer via ``openTerminalsPanel``. */}
+                  <InlineTerminalsSection
+                    conversationId={conversationId}
+                    onExpand={openTerminalsPanel}
+                  />
                 </MobilePanelDrawer>
               )}
               {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}
