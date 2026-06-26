@@ -110,7 +110,8 @@ def test_remove_label(
     row.get_by_test_id("conversation-actions").click()
     page.get_by_test_id("label-conversation").click()
 
-    remove_button = page.locator("button:has-text('Remove')")
+    dialog = page.locator("[role=dialog]")
+    remove_button = dialog.locator("button:has-text('Remove')")
     expect(remove_button).to_be_visible()
     remove_button.click()
 
