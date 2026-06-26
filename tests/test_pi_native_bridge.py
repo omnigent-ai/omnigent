@@ -120,3 +120,56 @@ def test_clear_inbox_drops_leftover_payloads(tmp_path: Path) -> None:
 def test_clear_inbox_is_a_noop_without_an_inbox(tmp_path: Path) -> None:
     """clear_inbox tolerates a bridge dir that has no inbox yet."""
     pi_native_bridge.clear_inbox(tmp_path / "nonexistent")  # must not raise
+
+
+def test_write_extension_files_embeds_tools(tmp_path: Path) -> None:
+    """write_extension_files embeds the tool list so the extension can register it.
+
+    The runner builds the session's Omnigent tool surface (sys_* tools) and
+    passes it to write_extension_files; the extension reads ``config.tools`` and
+    registers each via ``pi.registerTool``. The config must round-trip the list
+    verbatim so the schemas reach the Pi agent unchanged.
+    """
+    bridge_dir = tmp_path / "bridge"
+    tools = [
+        {
+            "name": "sys_os_read",
+            "description": "Read a file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        },
+        {
+            "name": "sys_os_shell",
+            "description": "Run a command",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    ]
+
+    _ext, cfg = pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_abc",
+        server_url="http://omnigent.test/",
+        conversation_url="http://omnigent.test/c/conv_abc",
+        auth_headers={"Authorization": "Bearer t"},
+        tools=tools,
+    )
+
+    payload = json.loads(cfg.read_text(encoding="utf-8"))
+    assert payload["sessionId"] == "conv_abc"
+    # serverUrl trailing slash is stripped so the extension can append paths.
+    assert payload["serverUrl"] == "http://omnigent.test"
+    assert payload["tools"] == tools
+
+
+def test_write_extension_files_defaults_tools_to_empty(tmp_path: Path) -> None:
+    """Omitting tools writes an empty list (Pi runs with its built-ins only)."""
+    bridge_dir = tmp_path / "bridge"
+
+    _ext, cfg = pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_abc",
+        server_url="http://omnigent.test",
+        conversation_url="http://omnigent.test/c/conv_abc",
+    )
+
+    payload = json.loads(cfg.read_text(encoding="utf-8"))
+    assert payload["tools"] == []

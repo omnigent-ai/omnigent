@@ -1819,12 +1819,33 @@ async def _auto_create_pi_terminal(
     auth_factory = _make_auth_token_factory()
     auth_token = auth_factory() if auth_factory is not None else None
     auth_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    # Build the Omnigent tool surface (sys_* tools) the Pi extension registers
+    # via pi.registerTool. Reuses the same schema set the claude-native /
+    # codex-native relay advertises, gated by the session's spec. Each tool's
+    # execute() round-trips through POST /v1/sessions/{id}/mcp, so the Pi agent
+    # can call Omnigent tools with centralized server-side policy enforcement
+    # — parity with the other native harnesses. Best-effort: a schema-build
+    # failure must not block the terminal launch, so fall back to no tools.
+    pi_tools: list[dict[str, Any]] = []
+    try:
+        from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
+
+        spec_for_tools = _unwrap_resolved_spec(agent_spec)
+        pi_tools = build_native_relay_tool_schemas(spec_for_tools)
+    except Exception:  # noqa: BLE001 — tool registration is additive
+        _logger.warning(
+            "Failed to build pi-native tool schemas for session %s; "
+            "Pi will run with its built-in tools only",
+            session_id,
+            exc_info=True,
+        )
     _extension, config = write_extension_files(
         bridge_dir,
         session_id=session_id,
         server_url=launch_config.server_url,
         conversation_url=conversation_url(launch_config.server_url, session_id),
         auth_headers=auth_headers,
+        tools=pi_tools,
     )
     pi_command = resolve_pi_executable()
     # Rebuild the local Pi session JSONL from committed Omnigent items so a
@@ -12490,25 +12511,6 @@ def create_runner_app(
             post_tools_changed,
             start_tool_relay,
         )
-        from omnigent.runner.tool_dispatch import _NATIVE_RELAY_BUILTIN_TOOLS
-        from omnigent.tools.builtins.agents import (
-            SysAgentDownloadTool,
-            SysAgentGetTool,
-            SysAgentListTool,
-        )
-        from omnigent.tools.builtins.list_comments import ListCommentsTool
-        from omnigent.tools.builtins.os_env import (
-            SysOsEditTool,
-            SysOsReadTool,
-            SysOsShellTool,
-            SysOsWriteTool,
-        )
-        from omnigent.tools.builtins.spawn import (
-            SysSessionGetHistoryTool,
-            SysSessionGetInfoTool,
-            SysSessionListTool,
-        )
-        from omnigent.tools.builtins.update_comment import UpdateCommentTool
 
         # Resolve the bridge dir. When an explicit bridge_dir is
         # provided (codex-native path), skip the claude-native bridge
@@ -12533,49 +12535,13 @@ def create_runner_app(
 
             bridge_dir = bridge_dir_for_bridge_id(bridge_id or session_id)
 
-        # Build flat tool schemas (name + description + parameters) for the
-        # native relay. start_tool_relay normalises these via
-        # _normalize_relay_tool_specs before writing tool_relay.json.
-        #
         # claude-native / codex-native ignore the harness ``tools`` list, so
         # this relay is the ONLY tool surface reaching the real CLI — tools
         # added here override the bridge's static tools of the same name,
-        # giving centralized policy evaluation on the Omnigent server. Two groups
-        # are assembled:
+        # giving centralized policy evaluation on the Omnigent server. The exact
+        # set (spec-gated builtin surface + unconditional sys_os_*) is assembled
+        # by ``build_native_relay_tool_schemas`` below.
         #
-        # 1. The runner-/server-proxied builtin surface
-        #    (``_NATIVE_RELAY_BUILTIN_TOOLS`` — comment, session read/write,
-        #    agent-discovery, and terminal families), derived from the
-        #    session's own ToolManager so the relayed set and the
-        #    spec-dependent schemas (e.g. sys_session_send's named-mode
-        #    ``agent`` enum, present only when the spec declares
-        #    sub-agents; sys_terminal_*, present only when the spec
-        #    declares ``terminals:``) exactly match what non-native
-        #    harnesses receive via ``request.tools``.
-        # 2. OS tools (``sys_os_*``), relayed unconditionally below to
-        #    override the bridge's static (non-policy-enforced) versions —
-        #    independent of the spec's ``os_env`` gate.
-        relay_schemas: list[dict[str, Any]] = []
-
-        def _append_flat_schema(function_dict: dict[str, Any]) -> None:
-            """
-            Append a tool's OpenAI ``function`` schema in flat relay shape.
-
-            :param function_dict: The ``"function"`` sub-dict of a tool
-                schema, e.g. ``{"name": "sys_session_list", "parameters":
-                {...}}``.
-            :returns: None.
-            """
-            relay_schemas.append(
-                {
-                    "name": function_dict["name"],
-                    "description": function_dict.get("description", ""),
-                    "parameters": function_dict.get(
-                        "parameters", {"type": "object", "properties": {}}
-                    ),
-                }
-            )
-
         # Resolve the session's agent spec so the relayed builtin surface
         # mirrors the spec's gating exactly. This is an await, so re-check
         # for a concurrently-started relay afterward. The relay is additive
@@ -12588,63 +12554,13 @@ def create_runner_app(
             relay_spec = None
         if session_id in _session_comment_relays:
             return
-        if relay_spec is not None:
-            from omnigent.tools.manager import ToolManager
+        # Build the flat tool schemas (name + description + parameters) for the
+        # native relay via the shared helper, which also backs pi-native's
+        # pi.registerTool surface. start_tool_relay normalises these via
+        # _normalize_relay_tool_specs before writing tool_relay.json.
+        from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
-            for _schema in ToolManager(relay_spec).get_tool_schemas():
-                _fn = _schema["function"]
-                if _fn["name"] in _NATIVE_RELAY_BUILTIN_TOOLS:
-                    _append_flat_schema(_fn)
-        else:
-            # No resolvable spec: fall back to the always-on read/discovery
-            # surface — never the opt-in spawn writes (send/close/create),
-            # whose gate (``tools.agents`` or ``spawn: true``) can't be
-            # evaluated without the spec.
-            from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool
-
-            for _cls in (
-                ListCommentsTool,
-                UpdateCommentTool,
-                SysSessionListTool,
-                SysSessionGetHistoryTool,
-                SysSessionGetInfoTool,
-                SysAgentGetTool,
-                SysAgentListTool,
-                SysAgentDownloadTool,
-                SysAddPolicyTool,
-                SysPolicyRegistryTool,
-            ):
-                _append_flat_schema(_cls().get_schema()["function"])
-
-        # Add OS tool schemas. Create a minimal OSEnvironment for schema extraction.
-        from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-        from omnigent.inner.os_env import create_os_environment
-
-        _os_spec = OSEnvSpec(
-            type="caller_process",
-            cwd=str(Path.cwd()),
-            sandbox=OSEnvSandboxSpec(type="none"),
-            fork=False,
-        )
-        try:
-            _os_env = create_os_environment(_os_spec)
-            for _tool in (
-                SysOsReadTool(_os_env),
-                SysOsWriteTool(_os_env),
-                SysOsEditTool(_os_env),
-                SysOsShellTool(_os_env),
-            ):
-                _append_flat_schema(_tool.get_schema()["function"])
-            _os_env.close()
-        except Exception:  # noqa: BLE001
-            # OS environment setup failed; relay will run without OS tools.
-            # This should not happen in practice, but we log and continue
-            # since the relay is additive.
-            _logger.debug(
-                "Could not create OSEnvironment for relay OS tool schemas; "
-                "OS tools will not be available in relay for session=%s",
-                session_id,
-            )
+        relay_schemas: list[dict[str, Any]] = build_native_relay_tool_schemas(relay_spec)
 
         # Capture session_id in the closure so concurrent sessions are
         # routed correctly.

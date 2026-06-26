@@ -190,6 +190,7 @@ def write_extension_files(
     server_url: str,
     conversation_url: str,
     auth_headers: dict[str, str] | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -200,6 +201,13 @@ def write_extension_files(
     :param conversation_url: Human-facing web conversation URL.
     :param auth_headers: HTTP headers the extension should use when posting
         terminal-originated events back to Omnigent.
+    :param tools: Flat Omnigent tool schemas
+        (``[{"name", "description", "parameters"}]``) the extension should
+        register via ``pi.registerTool``. Each tool's ``execute`` round-trips
+        the call through ``POST /v1/sessions/{id}/mcp`` (the same MCP proxy the
+        runner uses), so the Pi agent can invoke Omnigent ``sys_*`` tools with
+        centralized server-side policy enforcement. ``None``/empty registers no
+        tools (Pi falls back to its own built-in tool surface only).
     :returns: ``(extension_path, config_path)``.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -210,6 +218,7 @@ def write_extension_files(
         "bridgeDir": str(bridge_dir),
         "inboxDir": str(bridge_dir / _INBOX_DIR),
         "authHeaders": auth_headers or {},
+        "tools": tools or [],
     }
     _atomic_json(config_path(bridge_dir), payload)
     _atomic_text(extension_path(bridge_dir), _extension_source())
