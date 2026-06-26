@@ -1691,6 +1691,68 @@ def test_overview_lists_kiro_row(isolated_config, monkeypatch) -> None:
     assert "kiro-cli login" in Text.from_markup(descriptions[kiro]).plain
 
 
+@pytest.mark.parametrize(
+    "choice,manager_attr",
+    [
+        ("4", "_manage_opencode_harness"),
+        ("5", "_manage_hermes_harness"),
+        ("8", "_manage_qwen_harness"),
+        ("9", "_manage_goose_harness"),
+        ("10", "_manage_copilot_harness"),
+        ("11", "_manage_kiro_harness"),
+        ("12", "_manage_kimi_harness"),
+    ],
+)
+def test_overview_dispatches_to_correct_manager(
+    isolated_config, monkeypatch, choice: str, manager_attr: str
+) -> None:
+    """Selecting a harness routes to its drill-in, pinning position→sentinel→manager.
+
+    The ordering test asserts row *names* only, so a copy-paste slip that paired
+    the wrong sentinel with a name (e.g. ``(_QWEN, "Goose", …)``) would route
+    "Goose" to ``_manage_qwen_harness`` yet still pass the name check. This drives
+    the real numbered-fallback dispatch end-to-end for the seven harnesses whose
+    positions no other scripted-stdin test exercises (Claude/Codex/Cursor/Pi/
+    Antigravity are covered by the add/remove/key tests), so a misrouted row is
+    caught here.
+    """
+    called: list[str] = []
+    monkeypatch.setattr(
+        f"omnigent.cli.{manager_attr}", lambda *a, **k: called.append(manager_attr)
+    )
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=f"{choice}\nq\n")
+    assert result.exit_code == 0, result.output
+    assert called == [manager_attr]
+
+
+def test_overview_status_color_distinguishes_missing_from_unconfigured(
+    isolated_config, monkeypatch
+) -> None:
+    """The ✗ status color encodes *absent* (red) vs *installed-but-unconfigured* (yellow).
+
+    The kind taxonomy (``missing`` → red, ``warn`` → yellow, ``ready`` → green)
+    is the whole point of the status column, but the other overview tests assert
+    only the glyph + text. Here we capture the raw row markup (pre-render) and
+    pin the color so a regression that, say, paints an absent CLI yellow (telling
+    a user a missing tool is merely "unconfigured") fails.
+    """
+    # Installed but no credential → yellow ✗ (a usable harness awaiting setup).
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
+    )
+    options, selectable, _descriptions, _compact = _capture_setup_overview(monkeypatch)
+    codex = options[_overview_row_names(options, selectable).index("Codex")]
+    assert "[yellow]✗ No credential[/]" in codex
+
+    # CLI absent → red ✗ (nothing to use yet).
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: False
+    )
+    options, selectable, _descriptions, _compact = _capture_setup_overview(monkeypatch)
+    codex = options[_overview_row_names(options, selectable).index("Codex")]
+    assert "[red]✗ Not installed[/]" in codex
+
+
 def test_drill_into_uninstalled_installs_then_proceeds(isolated_config, monkeypatch) -> None:
     """Selecting an uninstalled harness → 'Yes, install' runs the install and
     proceeds to credential setup.
@@ -2504,6 +2566,42 @@ def test_antigravity_overview_install_command_is_selection_only(
         'pip install "omnigent[antigravity]"' in Text.from_markup(descriptions[antigravity]).plain
     )
     assert "pip install" not in Text.from_markup(options[antigravity]).plain
+
+
+@pytest.fixture()
+def _copilot_sdk_absent(monkeypatch):
+    """Force the ``github-copilot-sdk`` extra absent and clear ambient Copilot tokens.
+
+    Copilot is the third soft-SDK-extra harness (like Cursor / Antigravity): its
+    readiness is a GitHub token, and a missing SDK is surfaced as an install
+    hint rather than a hard block. This drives the unconfigured + SDK-absent
+    state so the overview row reads "Not installed" with the extra's install
+    command as its selection-only description.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr("omnigent.onboarding.copilot_auth.copilot_sdk_installed", lambda: False)
+
+
+def test_copilot_overview_install_command_is_selection_only(
+    isolated_config, _copilot_sdk_absent, monkeypatch
+) -> None:
+    """With the copilot extra absent, the Copilot row's install command is its description.
+
+    Mirrors the Cursor / Antigravity selection-only-hint contract for the third
+    soft-SDK-extra harness: the ``omnigent[copilot]`` install command is the
+    per-row description (shown only when highlighted), never baked into the
+    always-visible row label.
+    """
+    from rich.text import Text
+
+    options, selectable, descriptions, _ = _capture_setup_overview(monkeypatch)
+    names = _overview_row_names(options, selectable)
+    copilot = names.index("Copilot")
+    assert "omnigent[copilot]" in Text.from_markup(descriptions[copilot]).plain
+    assert "pip install" not in Text.from_markup(options[copilot]).plain
 
 
 def test_antigravity_drillin_offers_install_when_sdk_missing(

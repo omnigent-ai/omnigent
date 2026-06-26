@@ -11170,29 +11170,37 @@ def _run_configure_harnesses_interactive() -> None:
             rows.append((_KIMI, "Kimi Code", "Not installed", "missing", _install_hint(kimi_hint)))
         return rows
 
+    # Cap the status text so one verbose row (e.g. an OpenCode summary listing
+    # several providers) can't widen the shared column and wrap the whole table
+    # on a narrow terminal.
+    max_status_width = 30
+
     while True:
         config = _load_global_config()
         harness_rows = build_harness_rows()
         # Right-align the status column to a shared edge so the overview reads
-        # as one compact "name … status" table. Width is computed on plain text
-        # (markup excluded), with a 2-space minimum gutter on the widest row.
-        status_plain = {
-            target: f"{status_styles[kind][0]} {status_text}"
-            for target, _name, status_text, kind, _desc in harness_rows
-        }
+        # as one compact "name … status" table. Widths are computed on the plain
+        # (markup-free) glyph + status, with a 2-space minimum gutter on the
+        # widest row; the status itself is escaped when interpolated into markup
+        # so a credential label containing a ``[`` can't parse as a Rich tag
+        # (descriptions are escaped the same way).
+        prepared: list[tuple[str, str, str, str, str, str]] = []
+        for target, name, status_text, kind, desc in harness_rows:
+            if len(status_text) > max_status_width:
+                status_text = status_text[: max_status_width - 1] + "…"
+            glyph, color = status_styles[kind]
+            prepared.append((target, name, status_text, glyph, color, desc))
         content_w = max(
-            len(name) + 2 + len(status_plain[target])
-            for target, name, _status, _kind, _desc in harness_rows
+            len(name) + 2 + len(f"{glyph} {status_text}")
+            for _target, name, status_text, glyph, _color, _desc in prepared
         )
         options: list[str] = []
         selectable: list[bool] = []
         row_target: list[str | None] = []
         descriptions: list[str] = []
-        for target, name, status_text, kind, desc in harness_rows:
-            glyph, color = status_styles[kind]
-            plain = status_plain[target]
-            pad = max(1, content_w - len(name) - len(plain))
-            options.append(f"{name}{' ' * pad}[{color}]{glyph} {status_text}[/]")
+        for target, name, status_text, glyph, color, desc in prepared:
+            pad = content_w - len(name) - len(f"{glyph} {status_text}")
+            options.append(f"{name}{' ' * pad}[{color}]{glyph} {escape(status_text)}[/]")
             selectable.append(True)
             row_target.append(target)
             descriptions.append(desc)
