@@ -31,7 +31,7 @@ dependencies = [
     "pyyaml>=6.0,<7",
     "openai>=1.0,<3",
     # >=14: the `e2b` extra's SDK (>=2.26) needs rich>=14 (was >=13,<14).
-    "rich>=14,<15",
+    "rich>=14,<16",
     "prompt_toolkit>=3.0,<4",
     "mcp>=1.0,<2",
     "starlette>=0.27,<1",
