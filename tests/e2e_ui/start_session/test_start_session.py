@@ -472,6 +472,67 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_select_model_and_effort(seeded_session: tuple[str, str]) -> None:
+    """Picking a model + reasoning effort rides along to the create call.
+
+    For the Claude-native agent the composer shows a model/effort picker
+    that defaults to Claude Code's own "Sonnet / Medium". Selecting "Opus"
+    and "High" must (a) surface on the trigger as immediate feedback and
+    (b) reach ``POST /v1/sessions`` as ``model_override: "opus"`` +
+    ``reasoning_effort: "high"`` (the runner reads them as ``--model`` /
+    ``--effort`` at terminal launch).
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_model_effort(base_url, session_id))
+
+
+async def _drive_model_effort(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            # Claude Code auto-selects, so its model/effort picker is present and
+            # shows Claude Code's effective defaults (Sonnet / Medium).
+            trigger = page.get_by_test_id("new-chat-landing-model-trigger")
+            await expect(trigger).to_contain_text("Sonnet")
+            await expect(trigger).to_contain_text("Medium")
+
+            # Model + effort are two radio groups in one menu; selecting an item
+            # closes the menu, so reopen between the two picks.
+            await trigger.click()
+            await page.get_by_test_id("new-chat-landing-model-opus").click()
+            await trigger.click()
+            await page.get_by_test_id("new-chat-landing-effort-high").click()
+            await expect(trigger).to_contain_text("Opus")
+            await expect(trigger).to_contain_text("High")
+
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_claude_e2e", body
+            assert body.get("model_override") == "opus", body
+            assert body.get("reasoning_effort") == "high", body
+        finally:
+            await browser.close()
+
+
 def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> None:
     """Picking a non-default approval preset rides along to the create call.
 
