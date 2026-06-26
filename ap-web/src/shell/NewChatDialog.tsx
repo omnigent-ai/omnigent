@@ -11,11 +11,11 @@ import {
   ArrowUpIcon,
   FileTextIcon,
   FolderIcon,
-  FolderInputIcon,
   ImageIcon,
   PaperclipIcon,
   PlusIcon,
   SearchIcon,
+  TagIcon,
   TriangleAlertIcon,
   XIcon,
 } from "lucide-react";
@@ -688,14 +688,21 @@ function LandingProjectPicker({
           className="flex h-6 items-center gap-1.5 rounded-full px-3 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
           data-testid="new-chat-landing-project-chip"
         >
-          <FolderInputIcon className="size-4 shrink-0" />
+          <TagIcon className="size-4 shrink-0" />
           <span className={`max-w-32 truncate ${value ? "text-foreground" : ""}`}>
             {value || "No project"}
           </span>
           <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
         </button>
       </PopoverTrigger>
-      <PopoverContent align="start" className="w-56 p-1">
+      <PopoverContent
+        align="start"
+        className="w-56 p-1"
+        // Don't snap focus back to the chip when the popover closes after a
+        // pick — that programmatic refocus paints the browser's focus outline
+        // on the chip. Keyboard users still get the ring when they tab to it.
+        onCloseAutoFocus={(e) => e.preventDefault()}
+      >
         {/* Combobox-style search: a leading magnifier inside a borderless
             input, with a divider beneath separating it from the results. */}
         <div className="flex items-center gap-2 border-b px-2 py-1.5">
@@ -1759,6 +1766,10 @@ export function NewChatLandingScreen() {
             body: JSON.stringify({ labels: { [PROJECT_LABEL_KEY]: selectedProject } }),
           });
           void queryClient.invalidateQueries({ queryKey: ["projects"] });
+          // Refetch the target project folder's own paginated list so the new
+          // session shows up immediately (the folder fetches via
+          // useProjectSessions, separate from the global conversations list).
+          void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
         } catch {
           // Leave the session unfiled; the user can file it from the sidebar.
         }

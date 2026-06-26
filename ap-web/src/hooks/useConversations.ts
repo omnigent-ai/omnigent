@@ -407,11 +407,18 @@ export function useStopAndDeleteConversation() {
     },
     onSuccess: (_data, { id }) => {
       const ids = new Set([id]);
-      for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-        queryKey: ["conversations"],
-      })) {
-        const { data: next, removed } = removeIdsFromPages(data, ids);
-        if (removed) queryClient.setQueryData(key, next);
+      // Drop the row from the global list AND every project folder's own
+      // paginated list (["project-sessions", <name>]) — both share the same
+      // page shape. Patched in place rather than invalidated for the same
+      // reason as the global list: an immediate refetch races the server's
+      // async search reindex and can resurrect the just-deleted row.
+      for (const queryKey of [["conversations"], ["project-sessions"]]) {
+        for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+          queryKey,
+        })) {
+          const { data: next, removed } = removeIdsFromPages(data, ids);
+          if (removed) queryClient.setQueryData(key, next);
+        }
       }
       queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
       queryClient.removeQueries({ queryKey: ["session", id] });
@@ -511,11 +518,16 @@ export function useBulkDeleteConversations() {
     },
     onSuccess: (_data, ids) => {
       const idSet = new Set(ids);
-      for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-        queryKey: ["conversations"],
-      })) {
-        const { data: next, removed } = removeIdsFromPages(data, idSet);
-        if (removed) queryClient.setQueryData(key, next);
+      // Splice deleted rows out of the global list AND every project folder's
+      // own paginated list (same page shape) so filed sessions leave their
+      // folder without a refresh.
+      for (const queryKey of [["conversations"], ["project-sessions"]]) {
+        for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+          queryKey,
+        })) {
+          const { data: next, removed } = removeIdsFromPages(data, idSet);
+          if (removed) queryClient.setQueryData(key, next);
+        }
       }
       for (const id of ids) {
         queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
@@ -525,11 +537,13 @@ export function useBulkDeleteConversations() {
     onError: (err: any) => {
       if (err?.succeeded) {
         const idSet = new Set(err.succeeded as string[]);
-        for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-          queryKey: ["conversations"],
-        })) {
-          const { data: next, removed } = removeIdsFromPages(data, idSet);
-          if (removed) queryClient.setQueryData(key, next);
+        for (const queryKey of [["conversations"], ["project-sessions"]]) {
+          for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+            queryKey,
+          })) {
+            const { data: next, removed } = removeIdsFromPages(data, idSet);
+            if (removed) queryClient.setQueryData(key, next);
+          }
         }
         for (const id of err.succeeded) {
           queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });

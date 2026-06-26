@@ -1160,6 +1160,7 @@ describe("NewChatLandingScreen", () => {
       ok: true,
       json: async () => ({ id: "conv_new" }),
     } as unknown as Response);
+    const invalidateSpy = vi.spyOn(QueryClient.prototype, "invalidateQueries");
     renderLanding();
 
     // Open the project chip → "New project…" → type a name → commit.
@@ -1190,6 +1191,14 @@ describe("NewChatLandingScreen", () => {
       labels: Record<string, string>;
     };
     expect(patchBody.labels).toEqual({ omni_project: "docs" });
+
+    // The target folder fetches its own paginated list (useProjectSessions),
+    // so filing the new session must invalidate it — otherwise the row only
+    // appears after a manual refresh.
+    await waitFor(() =>
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] }),
+    );
+    invalidateSpy.mockRestore();
   });
 
   it("pre-fills the project chip from the ?project= query param", async () => {

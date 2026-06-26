@@ -284,8 +284,9 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     const queryClient = new QueryClient({
       defaultOptions: { mutations: { retry: false } },
     });
-    // Two list variants (default sidebar + archived view) plus the two
-    // long-lived per-session caches that can resurrect a deleted row.
+    // Two list variants (default sidebar + archived view), a project folder's
+    // own paginated list, plus the two long-lived per-session caches that can
+    // resurrect a deleted row.
     queryClient.setQueryData(
       ["conversations", "", false],
       infinitePage([conversation({ id: "conv_x" }), conversation({ id: "conv_other" })]),
@@ -293,6 +294,10 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     queryClient.setQueryData(
       ["conversations", "", true],
       infinitePage([conversation({ id: "conv_x" })]),
+    );
+    queryClient.setQueryData(
+      ["project-sessions", "Sprint 42"],
+      infinitePage([conversation({ id: "conv_x" }), conversation({ id: "conv_sibling" })]),
     );
     queryClient.setQueryData(["conversation-backfill", "conv_x"], conversation({ id: "conv_x" }));
     queryClient.setQueryData(["session", "conv_x"], {
@@ -333,6 +338,14 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     // Unrelated rows must survive the splice untouched.
     const base = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
     expect(base!.pages[0].data.map((c) => c.id)).toEqual(["conv_other"]);
+
+    // The project folder's own list is patched too, so a filed session
+    // disappears from its folder without a refresh — its sibling stays.
+    const folder = queryClient.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "Sprint 42",
+    ]);
+    expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_sibling"]);
   });
 
   it("drops the backfill and session snapshot caches", async () => {

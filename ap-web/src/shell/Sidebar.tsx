@@ -2102,7 +2102,7 @@ function ProjectFolderActions({ projectName }: { projectName: string }) {
         onClick={(e) => e.stopPropagation()}
       >
         <Link to={`/?project=${encodeURIComponent(projectName)}`}>
-          <PencilIcon className="size-3.5" />
+          <SquarePenIcon className="size-3.5" />
         </Link>
       </Button>
     </div>
