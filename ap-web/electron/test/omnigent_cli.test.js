@@ -16,6 +16,8 @@ const {
   parseJsonLoose,
   matchesServer,
   connectionFromStatus,
+  parseDaemonRecord,
+  daemonServerUrl,
 } = require("../src/omnigent_cli");
 
 describe("normalizeServerUrl", () => {
@@ -198,5 +200,65 @@ describe("connectionFromStatus", () => {
   it("tolerates a missing/empty daemons array", () => {
     assert.equal(connectionFromStatus(null, "https://x.com").connected, false);
     assert.equal(connectionFromStatus({}, "https://x.com").connected, false);
+  });
+});
+
+describe("parseDaemonRecord", () => {
+  it("parses a server-mode record, keeping pid/target/urls", () => {
+    assert.deepEqual(
+      parseDaemonRecord({
+        pid: 4242,
+        target: "https://x.com",
+        mode: "server",
+        server_url: "https://x.com",
+        host_id: "host_abc",
+        log_path: "/tmp/x.log",
+      }),
+      {
+        pid: 4242,
+        target: "https://x.com",
+        mode: "server",
+        server_url: "https://x.com",
+        resolved_server_url: null,
+        host_id: "host_abc",
+        log_path: "/tmp/x.log",
+      },
+    );
+  });
+
+  it("coerces a string pid (registry writes it either way)", () => {
+    assert.equal(parseDaemonRecord({ pid: "99", target: "local", mode: "local" }).pid, 99);
+  });
+
+  it("rejects malformed records", () => {
+    assert.equal(parseDaemonRecord(null), null);
+    assert.equal(parseDaemonRecord({ target: "local", mode: "local" }), null); // no pid
+    assert.equal(parseDaemonRecord({ pid: 0, target: "local", mode: "local" }), null); // bad pid
+    assert.equal(parseDaemonRecord({ pid: 5, target: "", mode: "local" }), null); // empty target
+    assert.equal(parseDaemonRecord({ pid: 5, target: "x", mode: "weird" }), null); // bad mode
+  });
+});
+
+describe("daemonServerUrl", () => {
+  it("uses resolved_server_url for a local-mode daemon, stripping trailing slash", () => {
+    assert.equal(
+      daemonServerUrl({ mode: "local", resolved_server_url: "http://127.0.0.1:6767/" }),
+      "http://127.0.0.1:6767",
+    );
+  });
+
+  it("uses server_url (then target) for a server-mode daemon", () => {
+    assert.equal(
+      daemonServerUrl({ mode: "server", server_url: "https://x.com/" }),
+      "https://x.com",
+    );
+    assert.equal(
+      daemonServerUrl({ mode: "server", server_url: null, target: "https://y.com" }),
+      "https://y.com",
+    );
+  });
+
+  it("is null for a falsy record", () => {
+    assert.equal(daemonServerUrl(null), null);
   });
 });

@@ -601,6 +601,263 @@ function connectionFromStatus(statusJson, serverUrl) {
   };
 }
 
+/**
+ * Directory holding per-target daemon registry records, mirroring
+ * `_daemon_registry_dir()` in omnigent/cli.py (`<state_dir>/daemons`).
+ *
+ * @returns {string}
+ */
+function daemonRegistryDir() {
+  return path.join(localDataDir(), "daemons");
+}
+
+/**
+ * Parse one decoded daemon registry record into the subset the desktop needs.
+ * Mirrors the validation in `_record_from_json()` (omnigent/cli.py): a usable
+ * record needs a positive integer `pid`, a non-empty `target`, and a known
+ * `mode`. Returns null for malformed records.
+ *
+ * @param {unknown} raw
+ * @returns {{
+ *   pid: number,
+ *   target: string,
+ *   mode: "local" | "server",
+ *   server_url: string | null,
+ *   resolved_server_url: string | null,
+ *   host_id: string | null,
+ *   log_path: string | null,
+ * } | null}
+ */
+function parseDaemonRecord(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const pid =
+    typeof raw.pid === "number"
+      ? raw.pid
+      : typeof raw.pid === "string"
+        ? Number.parseInt(raw.pid, 10)
+        : NaN;
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const target = typeof raw.target === "string" ? raw.target : "";
+  const mode = raw.mode === "local" || raw.mode === "server" ? raw.mode : "";
+  if (!target || !mode) return null;
+  const str = (v) => (typeof v === "string" && v ? v : null);
+  return {
+    pid,
+    target,
+    mode,
+    server_url: str(raw.server_url),
+    resolved_server_url: str(raw.resolved_server_url),
+    host_id: str(raw.host_id),
+    log_path: str(raw.log_path),
+  };
+}
+
+/**
+ * Read every daemon registry record from disk (`~/.omnigent/daemons/*.json`).
+ * This is the fast substitute for `omnigent host status --json`: it gives the
+ * daemon metadata and (with a pid-liveness check) process state without the
+ * per-session runner probes that make the CLI command slow. Tunnel health
+ * ({@link probeHostTunnel}) is layered on separately. Returns [] when the
+ * registry is absent.
+ *
+ * @returns {ReturnType<typeof parseDaemonRecord>[]}
+ */
+function readDaemonRecords() {
+  const dir = daemonRegistryDir();
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const records = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8"));
+      const rec = parseDaemonRecord(raw);
+      if (rec) records.push(rec);
+    } catch {
+      // Skip an unreadable/garbage record — a half-written file mid-rotation.
+    }
+  }
+  return records;
+}
+
+/**
+ * The Omnigent server URL a daemon record talks to, mirroring
+ * `_daemon_base_url()` (omnigent/cli.py): a local-mode daemon's URL lives in
+ * `resolved_server_url` (falling back to a healthy local server's URL); a
+ * server-mode daemon's is its `server_url`/`target`.
+ *
+ * @param {ReturnType<typeof parseDaemonRecord>} record
+ * @returns {string | null}
+ */
+function daemonServerUrl(record) {
+  if (!record) return null;
+  if (record.mode === "local") {
+    if (record.resolved_server_url) return record.resolved_server_url.replace(/\/+$/, "");
+    return localServerStatus()?.url ?? null;
+  }
+  return (record.server_url || record.target).replace(/\/+$/, "");
+}
+
+/**
+ * The bearer token to authenticate an in-process request to `serverUrl`, the
+ * subset of `_remote_headers()` (omnigent/chat.py) reproducible without the
+ * Databricks SDK: the `OMNIGENT_REMOTE_AUTH_TOKEN` env var, then a non-expired
+ * session token stored by `omnigent login` in `auth_tokens.json`. Returns null
+ * for a Databricks-pointer login (no token is stored — the SDK mints one per
+ * request) or when nothing is stored.
+ *
+ * @param {string} serverUrl
+ * @returns {string | null}
+ */
+function bearerTokenFor(serverUrl) {
+  const env = (process.env.OMNIGENT_REMOTE_AUTH_TOKEN || "").trim();
+  if (env) return env;
+  if (typeof serverUrl !== "string" || serverUrl === "") return null;
+  const key = serverUrl.replace(/\/+$/, "");
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(path.join(localDataDir(), "auth_tokens.json"), "utf8"));
+  } catch {
+    return null;
+  }
+  const entry = data && typeof data === "object" ? data[key] : null;
+  if (!entry || typeof entry !== "object") return null;
+  if (typeof entry.token === "string" && entry.token !== "") {
+    if (typeof entry.expires_at === "number" && entry.expires_at < Date.now() / 1000) return null;
+    return entry.token;
+  }
+  return null;
+}
+
+/**
+ * The "basic request" that detects whether a host's tunnel is up: a single
+ * `GET {serverUrl}/v1/hosts/{host_id}`, reading `body.status` — the same probe
+ * `_add_daemon_host_status()` (omnigent/cli.py) makes, minus the per-session
+ * runner enumeration. Loopback servers are single-user (no auth); a remote
+ * server needs a bearer ({@link bearerTokenFor}). When no bearer is obtainable
+ * (a Databricks-pointer login), returns `authMissing` so the caller can avoid
+ * falsely reporting the tunnel down.
+ *
+ * @param {string} serverUrl
+ * @param {string | null} hostId
+ * @param {{ timeoutMs?: number }} [opts]
+ * @returns {Promise<{ status: string | null, reachable: boolean, authMissing: boolean }>}
+ */
+async function probeHostTunnel(serverUrl, hostId, { timeoutMs = 2000 } = {}) {
+  if (typeof serverUrl !== "string" || !serverUrl || typeof hostId !== "string" || !hostId) {
+    return { status: null, reachable: false, authMissing: false };
+  }
+  const headers = {};
+  if (!isLoopbackServer(serverUrl)) {
+    const token = bearerTokenFor(serverUrl);
+    if (!token) return { status: null, reachable: false, authMissing: true };
+    headers.Authorization = `Bearer ${token}`;
+  }
+  const base = serverUrl.replace(/\/+$/, "");
+  const target = `${base}/v1/hosts/${encodeURIComponent(hostId)}`;
+  try {
+    const resp = await fetch(target, { headers, signal: AbortSignal.timeout(timeoutMs) });
+    if (!resp.ok) return { status: null, reachable: true, authMissing: false };
+    const body = await resp.json().catch(() => null);
+    const status = body && typeof body.status === "string" ? body.status : null;
+    return { status, reachable: true, authMissing: false };
+  } catch {
+    // Connection refused / unreachable / timed out → can't confirm the tunnel.
+    return { status: null, reachable: false, authMissing: false };
+  }
+}
+
+/**
+ * This machine's connection to `serverUrl`, resolved WITHOUT the slow `omnigent
+ * host status` subprocess: daemon metadata + process state come from the
+ * on-disk registry ({@link readDaemonRecords}), and tunnel health from one
+ * basic request ({@link probeHostTunnel}). Drop-in for the
+ * `getHostStatus` + `connectionFromStatus` pair, returning the same shape plus
+ * `verified` (false when the tunnel couldn't be probed — e.g. Databricks-pointer
+ * auth — so process-alive is reported optimistically rather than as offline).
+ *
+ * @param {string} serverUrl
+ * @param {{ probe?: boolean, timeoutMs?: number }} [opts]
+ * @returns {Promise<{
+ *   connected: boolean,
+ *   process: "online" | "offline",
+ *   hostStatus: string | null,
+ *   pid: number | null,
+ *   error: string | null,
+ *   verified: boolean,
+ * }>}
+ */
+async function getHostConnectionFast(serverUrl, { probe = true, timeoutMs = 2000 } = {}) {
+  const match = readDaemonRecords().find((r) => matchesServer(r, serverUrl)) || null;
+  if (!match) {
+    return {
+      connected: false,
+      process: "offline",
+      hostStatus: null,
+      pid: null,
+      error: null,
+      verified: true,
+    };
+  }
+  if (!isPidAlive(match.pid)) {
+    return {
+      connected: false,
+      process: "offline",
+      hostStatus: null,
+      pid: match.pid,
+      error: null,
+      verified: true,
+    };
+  }
+  // Process is alive. Without a tunnel probe we can only attest the process.
+  if (!probe) {
+    return {
+      connected: true,
+      process: "online",
+      hostStatus: null,
+      pid: match.pid,
+      error: null,
+      verified: false,
+    };
+  }
+  const hostId = match.host_id || localHostId();
+  const res = await probeHostTunnel(daemonServerUrl(match) || serverUrl, hostId, { timeoutMs });
+  if (res.authMissing) {
+    // Can't reproduce Databricks-pointer auth in-process → report the live
+    // process optimistically as connected, flagged unverified.
+    return {
+      connected: true,
+      process: "online",
+      hostStatus: null,
+      pid: match.pid,
+      error: null,
+      verified: false,
+    };
+  }
+  if (!res.reachable) {
+    return {
+      connected: false,
+      process: "online",
+      hostStatus: null,
+      pid: match.pid,
+      error: "server unreachable",
+      verified: true,
+    };
+  }
+  return {
+    connected: res.status === "online",
+    process: "online",
+    hostStatus: res.status,
+    pid: match.pid,
+    error: null,
+    verified: true,
+  };
+}
+
 module.exports = {
   INSTALL_COMMAND,
   DEFAULT_TIMEOUT_MS,
@@ -629,4 +886,11 @@ module.exports = {
   loginServer,
   matchesServer,
   connectionFromStatus,
+  daemonRegistryDir,
+  parseDaemonRecord,
+  readDaemonRecords,
+  daemonServerUrl,
+  bearerTokenFor,
+  probeHostTunnel,
+  getHostConnectionFast,
 };

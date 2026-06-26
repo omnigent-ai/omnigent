@@ -217,11 +217,11 @@ async function ensureHostConnected(cliPath, serverUrl) {
  * @returns {Promise<{ ok: boolean, ownedByDesktop: boolean, adopted?: boolean, error?: string }>}
  */
 async function connectHost(cliPath, serverUrl, key) {
-  // Query ALL daemons (no --server filter) so a local-mode daemon — whose
-  // loopback URL is only its resolved_server_url — is seen too, and adopt it
-  // rather than spawning a duplicate.
-  const status = await cli.getHostStatus(cliPath);
-  const conn = cli.connectionFromStatus(status, serverUrl);
+  // Read the on-disk daemon registry (a local-mode daemon's loopback URL is its
+  // resolved_server_url) and check pid liveness — no tunnel probe needed, the
+  // adopt decision only turns on whether a daemon process already serves this
+  // target. Avoids the slow `omnigent host status` subprocess.
+  const conn = await cli.getHostConnectionFast(serverUrl, { probe: false });
   if (conn.process === "online") {
     // A daemon is already up for this target — adopt rather than spawn.
     return { ok: true, ownedByDesktop: false, adopted: true };
@@ -501,13 +501,18 @@ async function statusFor(cliPath, serverUrl) {
       error: null,
     };
   }
-  // Query all daemons (no --server filter) so a local-mode daemon serving this
-  // loopback URL (matched via resolved_server_url) is recognized too.
-  const status = await cli.getHostStatus(cliPath);
-  const conn = cli.connectionFromStatus(status, serverUrl);
+  // Resolve from the on-disk daemon registry + one basic tunnel probe rather
+  // than `omnigent host status` (which also enumerates sessions over the
+  // network per daemon — slow). A local-mode daemon serving this loopback URL
+  // is matched via its resolved_server_url.
+  const conn = await cli.getHostConnectionFast(serverUrl);
   return {
     cliInstalled: true,
-    ...conn,
+    connected: conn.connected,
+    process: conn.process,
+    hostStatus: conn.hostStatus,
+    pid: conn.pid,
+    error: conn.error,
     hostId,
     ownedByDesktop: ownsLiveHost(key),
   };
