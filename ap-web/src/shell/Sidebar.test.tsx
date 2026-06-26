@@ -618,6 +618,38 @@ describe("Sidebar project sections", () => {
     expect(within(recentSection).getByText("conv_filed")).toBeInTheDocument();
   });
 
+  it("collapses all project folders at once and reopens the previously-open set", () => {
+    projectsMock.push("Alpha", "Beta");
+    mockConversations([
+      conv("conv_a", "Claude Code", { labels: { omni_project: "Alpha" } }),
+      conv("conv_b", "Claude Code", { labels: { omni_project: "Beta" } }),
+    ]);
+    renderSidebar();
+
+    // No collapse-all control until at least one folder is open.
+    expect(screen.queryByTestId("collapse-all-projects")).toBeNull();
+
+    // Open both folders.
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Beta/ }));
+    expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "true");
+
+    // Collapse all → every folder folds, and the control flips to "reopen".
+    fireEvent.click(screen.getByTestId("collapse-all-projects"));
+    expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("collapse-all-projects")).toBeNull();
+
+    // Reopen previous → restores exactly the set that was open.
+    fireEvent.click(screen.getByTestId("reopen-previous-projects"));
+    expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "true");
+  });
+
   it("deletes a project (and all its sessions) from the folder kebab after confirming", async () => {
     projectsMock.push("Customer X");
     mockConversations([

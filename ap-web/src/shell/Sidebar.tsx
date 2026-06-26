@@ -25,6 +25,8 @@ import {
   InboxIcon,
   ListChecksIcon,
   Loader2Icon,
+  Maximize2Icon,
+  Minimize2Icon,
   MoreHorizontalIcon,
   PanelRightOpenIcon,
   PencilIcon,
@@ -889,6 +891,23 @@ function ConversationList({
       return next;
     });
   }, []);
+  // "Collapse all" folds every open project folder at once and remembers the
+  // set, so a follow-up "Reopen previous" restores exactly what was open
+  // (not every folder). The snapshot is session-only — not persisted.
+  const [reopenSnapshot, setReopenSnapshot] = useState<string[]>([]);
+  const collapseAllProjects = useCallback(() => {
+    setExpandedProjects((prev) => {
+      setReopenSnapshot(prev);
+      writeExpandedProjectSections([]);
+      return [];
+    });
+  }, []);
+  const reopenPreviousProjects = useCallback(() => {
+    setExpandedProjects(() => {
+      writeExpandedProjectSections(reopenSnapshot);
+      return reopenSnapshot;
+    });
+  }, [reopenSnapshot]);
 
   // The project the currently-selected session is filed under, if any. Derived
   // as a primitive so the auto-expand effect below only fires when the
@@ -1014,6 +1033,37 @@ function ConversationList({
               title="Projects"
               collapsed={effectiveCollapsedSections.includes("Projects")}
               onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
+              headerAction={
+                expandedProjects.length > 0 ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label="Collapse all projects"
+                    data-testid="collapse-all-projects"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      collapseAllProjects();
+                    }}
+                  >
+                    <Minimize2Icon className="size-3.5" />
+                  </Button>
+                ) : reopenSnapshot.length > 0 ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label="Reopen previous projects"
+                    data-testid="reopen-previous-projects"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      reopenPreviousProjects();
+                    }}
+                  >
+                    <Maximize2Icon className="size-3.5" />
+                  </Button>
+                ) : null
+              }
             >
               {sections.projectGroups.map((group) => (
                 <ProjectFolder
@@ -1182,16 +1232,32 @@ function SectionGroup({
   title,
   collapsed,
   onToggleCollapsed,
+  headerAction,
   children,
 }: {
   title: string;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** Optional control overlaid at the group header's right edge (e.g. the
+      "collapse all projects" toggle). Hover/focus-revealed on desktop. */
+  headerAction?: ReactNode;
   children: ReactNode;
 }) {
   return (
     <section>
-      <SectionHeader title={title} collapsed={collapsed} onToggleCollapsed={onToggleCollapsed} />
+      <div className="group/header relative">
+        <SectionHeader
+          title={title}
+          hasAction={headerAction != null}
+          collapsed={collapsed}
+          onToggleCollapsed={onToggleCollapsed}
+        />
+        {headerAction && (
+          <div className="absolute top-0.5 right-1 flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100">
+            {headerAction}
+          </div>
+        )}
+      </div>
       {!collapsed && <div className="flex flex-col gap-0.5">{children}</div>}
     </section>
   );
