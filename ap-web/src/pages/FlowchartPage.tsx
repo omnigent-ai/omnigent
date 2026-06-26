@@ -1,277 +1,264 @@
 /**
- * Flow builder (`/jobs/flow/:jobId`).
+ * Flow builder (`/jobs/flow/:jobId`) — guided top-down stepper.
  *
- * An interactive node/edge canvas (React Flow, via the shared `Canvas`
- * wrapper) for sketching a flow chart, plus a live output panel that turns the
- * chart into three textual renderings — Narrative prose, a numbered Outline,
- * and a Mermaid `flowchart TD` definition (rendered inline via the same
- * Streamdown pipeline the chat uses).
+ * The chart is built as a vertical sequence of steps: it always begins with a
+ * Start node, and at every open point a "+" reveals the available box types
+ * (Process / Decision / Input-Output / End); picking one appends it as the next
+ * step. A Decision splits into two labelled branch lanes (Yes / No), each its
+ * own downward "+"-chain. This replaces the earlier free-form drag canvas —
+ * there are no manual edges; the tree's structure *is* the connections.
  *
- * The chart is loaded from / saved to a *job* (see {@link jobsStore}) keyed by
- * the `:jobId` route param — this is the editor reached from the Jobs page.
- * The drawing surface is React state; text generation is delegated to the
- * pure, deterministic {@link generateFlowText} in `@/lib/flowToText`. The page
- * maps React Flow's node/edge objects ↔ the generator's `FlowGraph` shape
- * (notably: loop containers are plain `loop` nodes here, and membership is the
- * generator's geometric "node center inside the box" test — independent of
- * React Flow parent/child relationships).
+ * The editable model is a {@link FlowStep} tree (see `@/lib/flowTree`),
+ * persisted on the job. For the output panel (Narrative / Outline / Mermaid)
+ * and runs, the tree is converted to the flat {@link FlowGraph} the generator
+ * consumes via {@link treeToGraph}, so nothing downstream changed.
  *
- * Node kinds (start / process / decision / io / end) match the prototype's
- * palette; double-click a node to rename it, drag from a node's right handle to
- * connect, and connecting *from a decision* prompts for the branch label.
+ * Double-click a step to rename it; double-click a branch label to edit it;
+ * each step has a delete (which removes it and everything below).
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  addEdge,
-  Handle,
-  MarkerType,
-  NodeResizer,
-  Position,
-  useEdgesState,
-  useNodesState,
-  type Connection,
-  type Edge,
-  type Node,
-  type NodeProps,
-  type NodeTypes,
-} from "@xyflow/react";
-import { ArrowLeftIcon, CopyIcon, PlayIcon, PlusIcon, SaveIcon, Trash2Icon } from "lucide-react";
-import { Canvas } from "@/components/ai-elements/canvas";
-import { Controls } from "@/components/ai-elements/controls";
-import { Panel } from "@/components/ai-elements/panel";
+  ArrowLeftIcon,
+  CheckCircle2Icon,
+  CopyIcon,
+  Loader2Icon,
+  PlayIcon,
+  PlusIcon,
+  SaveIcon,
+  Trash2Icon,
+  XCircleIcon,
+} from "lucide-react";
 import { MessageResponse } from "@/components/ai-elements/message";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Link, useNavigate, useParams } from "@/lib/routing";
-import { runJob, updateJob, useJob } from "@/lib/jobsStore";
-import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { generateFlowText } from "@/lib/flowToText";
+import type { FlowNodeType } from "@/lib/flowToText";
 import {
-  generateFlowText,
-  type FlowEdge,
-  type FlowGraph,
-  type FlowLoop,
-  type FlowNode,
-  type FlowNodeType,
-} from "@/lib/flowToText";
+  ADDABLE_TYPES,
+  attach,
+  countSteps,
+  defaultLabel,
+  deleteStep,
+  newStep,
+  setBranchLabel,
+  setLabel,
+  treeToGraph,
+  type FlowStep,
+  type Slot,
+} from "@/lib/flowTree";
+import { runJob, updateJob, useJob, type Run } from "@/lib/jobsStore";
+import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
-// Node data + per-kind presentation
+// Per-kind presentation
 // ---------------------------------------------------------------------------
-interface FlowNodeData {
-  kind: FlowNodeType;
-  label: string;
-  [key: string]: unknown;
-}
-
-const KIND_META: Record<FlowNodeType, { tag: string; defLabel: string; className: string }> = {
-  start: { tag: "Start", defLabel: "Start", className: "border-emerald-500 bg-emerald-500/10" },
-  process: { tag: "Process", defLabel: "Do something", className: "border-blue-500 bg-blue-500/10" },
-  decision: {
-    tag: "Decision",
-    defLabel: "Condition?",
-    className: "border-amber-500 bg-amber-500/10",
-  },
-  io: { tag: "Input/Output", defLabel: "Input / Output", className: "border-purple-500 bg-purple-500/10" },
-  end: { tag: "End", defLabel: "End", className: "border-red-500 bg-red-500/10" },
+const KIND_META: Record<FlowNodeType, { tag: string; box: string; chip: string }> = {
+  start: { tag: "Start", box: "border-emerald-500 bg-emerald-500/10", chip: "bg-emerald-500" },
+  process: { tag: "Process", box: "border-blue-500 bg-blue-500/10", chip: "bg-blue-500" },
+  decision: { tag: "Decision", box: "border-amber-500 bg-amber-500/10", chip: "bg-amber-500" },
+  io: { tag: "Input/Output", box: "border-purple-500 bg-purple-500/10", chip: "bg-purple-500" },
+  end: { tag: "End", box: "border-red-500 bg-red-500/10", chip: "bg-red-500" },
 };
 
-const PALETTE: FlowNodeType[] = ["start", "process", "decision", "io", "end"];
-
-let idCounter = 1;
-const uid = (p: string) => `${p}_${idCounter++}`;
-
 // ---------------------------------------------------------------------------
-// Custom node renderers
+// "+" add control — click reveals the addable box types, pick one to append.
 // ---------------------------------------------------------------------------
-function FlowNodeView({ data, selected }: NodeProps) {
-  const d = data as FlowNodeData;
-  const meta = KIND_META[d.kind];
-  const isDecision = d.kind === "decision";
-  return (
-    <div
-      className={cn(
-        "flex min-h-[54px] min-w-[120px] max-w-[280px] flex-col items-center justify-center rounded-md border-2 px-3.5 py-2.5 text-center text-sm shadow-md transition-shadow",
-        meta.className,
-        selected && "ring-2 ring-ring ring-offset-2 ring-offset-background",
-        isDecision && "rotate-0", // diamonds rendered as rounded rects for legibility
-      )}
-    >
-      <Handle type="target" position={Position.Left} className="!size-2.5 !bg-foreground/40" />
-      <span className="mb-0.5 text-[9.5px] font-bold tracking-wide text-muted-foreground uppercase">
-        {meta.tag}
-      </span>
-      <span className="break-words">{d.label || meta.defLabel}</span>
-      <Handle type="source" position={Position.Right} className="!size-2.5 !bg-foreground/40" />
-    </div>
-  );
-}
-
-function LoopNodeView({ data, selected }: NodeProps) {
-  const d = data as FlowNodeData;
-  return (
-    <div
-      className={cn(
-        "size-full rounded-xl border-2 border-dashed border-primary/60 bg-primary/5",
-        selected && "border-primary bg-primary/10",
-      )}
-    >
-      <NodeResizer minWidth={160} minHeight={120} isVisible={selected} />
-      <span className="absolute -top-3 left-3 rounded-md bg-primary px-2.5 py-0.5 text-[11px] font-bold text-primary-foreground">
-        ↻ {d.label || "loop"}
-      </span>
-    </div>
-  );
-}
-
-const nodeTypes: NodeTypes = { flow: FlowNodeView, loop: LoopNodeView };
-
-// ---------------------------------------------------------------------------
-// React Flow state → generator FlowGraph
-// ---------------------------------------------------------------------------
-function toFlowGraph(nodes: Node[], edges: Edge[]): FlowGraph {
-  const flowNodes: FlowNode[] = [];
-  const loops: FlowLoop[] = [];
-  for (const n of nodes) {
-    const d = n.data as FlowNodeData;
-    const w = n.measured?.width ?? (typeof n.width === "number" ? n.width : undefined);
-    const h = n.measured?.height ?? (typeof n.height === "number" ? n.height : undefined);
-    if (n.type === "loop") {
-      loops.push({
-        id: n.id,
-        label: d.label || "loop",
-        x: n.position.x,
-        y: n.position.y,
-        w: w ?? 320,
-        h: h ?? 200,
-      });
-    } else {
-      flowNodes.push({
-        id: n.id,
-        type: d.kind,
-        label: d.label,
-        x: n.position.x,
-        y: n.position.y,
-        w,
-        h,
-      });
-    }
+function AddStep({ onPick }: { onPick: (type: FlowNodeType) => void }) {
+  const [open, setOpen] = useState(false);
+  if (!open) {
+    return (
+      <button
+        type="button"
+        aria-label="Add step"
+        onClick={() => setOpen(true)}
+        className="flex size-8 items-center justify-center rounded-full border border-dashed border-border bg-background text-muted-foreground transition-colors hover:border-primary hover:text-primary"
+      >
+        <PlusIcon className="size-4" />
+      </button>
+    );
   }
-  const flowEdges: FlowEdge[] = edges.map((e) => ({
-    id: e.id,
-    from: e.source,
-    to: e.target,
-    label: typeof e.label === "string" ? e.label : undefined,
-  }));
-  return { nodes: flowNodes, edges: flowEdges, loops };
+  return (
+    <div className="flex flex-wrap items-center justify-center gap-1 rounded-lg border border-border bg-card p-1.5 shadow-md">
+      {ADDABLE_TYPES.map((type) => (
+        <Button
+          key={type}
+          variant="ghost"
+          size="sm"
+          onClick={() => {
+            onPick(type);
+            setOpen(false);
+          }}
+        >
+          <span className={cn("mr-1.5 inline-block size-2.5 rounded-sm", KIND_META[type].chip)} />
+          {KIND_META[type].tag}
+        </Button>
+      ))}
+      <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>
+        Cancel
+      </Button>
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
-// generator FlowGraph → React Flow state (loading a saved job)
+// Recursive step renderer — a box, a connector, then either the next "+"-chain
+// or (for decisions) two labelled branch lanes side by side.
 // ---------------------------------------------------------------------------
-function fromFlowGraph(graph: FlowGraph): { nodes: Node[]; edges: Edge[] } {
-  const loopNodes: Node[] = (graph.loops ?? []).map((L) => ({
-    id: L.id,
-    type: "loop",
-    position: { x: L.x, y: L.y },
-    data: { kind: "process", label: L.label },
-    style: { width: L.w, height: L.h },
-    zIndex: -1,
-  }));
-  const flowNodes: Node[] = graph.nodes.map((n) => ({
-    id: n.id,
-    type: "flow",
-    position: { x: n.x, y: n.y },
-    data: { kind: n.type, label: n.label },
-    ...(n.w && n.h ? { style: { width: n.w, height: n.h } } : {}),
-  }));
-  // Loop boxes first so they render behind the nodes.
-  const nodes = [...loopNodes, ...flowNodes];
-  const edges: Edge[] = graph.edges.map((e) => ({
-    id: e.id,
-    source: e.from,
-    target: e.to,
-    ...(e.label ? { label: e.label } : {}),
-    markerEnd: { type: MarkerType.ArrowClosed },
-  }));
-  return { nodes, edges };
+interface StepViewProps {
+  step: FlowStep;
+  isRoot: boolean;
+  onAdd: (parentId: string, slot: Slot, type: FlowNodeType) => void;
+  onRename: (id: string, label: string) => void;
+  onRenameBranch: (id: string, branch: "yes" | "no", label: string) => void;
+  onDelete: (id: string) => void;
 }
 
-// ---------------------------------------------------------------------------
-// Example chart (the prototype's "batch processing" loop)
-// ---------------------------------------------------------------------------
-function exampleNodes(): Node[] {
-  return [
-    { id: "n1", type: "flow", position: { x: 360, y: 40 }, data: { kind: "start", label: "Start batch" } },
-    { id: "L1", type: "loop", position: { x: 300, y: 150 }, data: { kind: "process", label: "while orders remain" }, style: { width: 360, height: 320 }, zIndex: -1, selectable: true, draggable: true },
-    { id: "n2", type: "flow", position: { x: 360, y: 190 }, data: { kind: "process", label: "Fetch next order" } },
-    { id: "n3", type: "flow", position: { x: 360, y: 300 }, data: { kind: "process", label: "Charge & ship" } },
-    { id: "n4", type: "flow", position: { x: 360, y: 400 }, data: { kind: "decision", label: "More orders?" } },
-    { id: "n5", type: "flow", position: { x: 720, y: 420 }, data: { kind: "end", label: "Batch done" } },
-  ];
+function Connector() {
+  return <div className="h-6 w-0.5 bg-muted-foreground/60" />;
 }
-function exampleEdges(): Edge[] {
-  const arrow = { markerEnd: { type: MarkerType.ArrowClosed } };
-  return [
-    { id: "e1", source: "n1", target: "n2", ...arrow },
-    { id: "e2", source: "n2", target: "n3", ...arrow },
-    { id: "e3", source: "n3", target: "n4", ...arrow },
-    { id: "e4", source: "n4", target: "n2", label: "Yes", ...arrow },
-    { id: "e5", source: "n4", target: "n5", label: "No", ...arrow },
-  ];
+
+function StepView({ step, isRoot, onAdd, onRename, onRenameBranch, onDelete }: StepViewProps) {
+  const meta = KIND_META[step.type];
+  return (
+    <div className="flex flex-col items-center">
+      {/* The box */}
+      <div
+        className={cn(
+          "group relative flex min-w-[160px] max-w-[260px] flex-col items-center rounded-md border-2 px-4 py-2.5 text-center shadow-sm",
+          meta.box,
+        )}
+        onDoubleClick={() => {
+          const v = window.prompt("Label:", step.label);
+          if (v !== null) onRename(step.id, v.trim() || defaultLabel(step.type));
+        }}
+      >
+        <span className="text-[9.5px] font-bold tracking-wide text-muted-foreground uppercase">
+          {meta.tag}
+        </span>
+        <span className="text-sm break-words">{step.label}</span>
+        {/* Delete (not on the Start root — a flow always has a Start). */}
+        {!isRoot && (
+          <button
+            type="button"
+            aria-label="Delete step"
+            onClick={() => onDelete(step.id)}
+            className="absolute -top-2 -right-2 hidden size-5 items-center justify-center rounded-full border border-border bg-background text-muted-foreground hover:text-red-500 group-hover:flex"
+          >
+            <Trash2Icon className="size-3" />
+          </button>
+        )}
+      </div>
+
+      {step.type === "decision" ? (
+        // Two branch lanes (Yes / No) joined by a fork:
+        //   trunk (down from the box) → horizontal bar → a stub into each lane.
+        // Lanes are equal-width (flex-1) with no gap, so their centers sit at
+        // 25% / 75% of the row — exactly where the fork's vertical stubs land,
+        // and the trunk meets the bar's midpoint at 50%. Spacing between lanes
+        // comes from per-lane padding so it doesn't shift those centers.
+        <>
+          <Connector />
+          <div className="flex w-full">
+            <div className="flex-1">
+              <div className="ml-auto h-4 w-1/2 border-t-2 border-l-2 border-muted-foreground/60" />
+            </div>
+            <div className="flex-1">
+              <div className="mr-auto h-4 w-1/2 border-t-2 border-r-2 border-muted-foreground/60" />
+            </div>
+          </div>
+          <div className="flex items-start">
+            {(["yes", "no"] as const).map((branch) => {
+              const child = step[branch];
+              const label = branch === "yes" ? step.yesLabel : step.noLabel;
+              return (
+                <div key={branch} className="flex flex-1 flex-col items-center px-6">
+                  <button
+                    type="button"
+                    onDoubleClick={(e) => {
+                      e.stopPropagation();
+                      const v = window.prompt("Branch label:", label);
+                      if (v !== null) onRenameBranch(step.id, branch, v.trim() || (branch === "yes" ? "Yes" : "No"));
+                    }}
+                    className="rounded-full border border-border bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground"
+                    title="Double-click to rename branch"
+                  >
+                    {label}
+                  </button>
+                  <Connector />
+                  {child ? (
+                    <StepView
+                      step={child}
+                      isRoot={false}
+                      onAdd={onAdd}
+                      onRename={onRename}
+                      onRenameBranch={onRenameBranch}
+                      onDelete={onDelete}
+                    />
+                  ) : (
+                    <AddStep onPick={(type) => onAdd(step.id, branch, type)} />
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      ) : step.type === "end" ? null : (
+        // Linear: next step or an open "+"
+        <>
+          <Connector />
+          {step.next ? (
+            <StepView
+              step={step.next}
+              isRoot={false}
+              onAdd={onAdd}
+              onRename={onRename}
+              onRenameBranch={onRenameBranch}
+              onDelete={onDelete}
+            />
+          ) : (
+            <AddStep onPick={(type) => onAdd(step.id, "next", type)} />
+          )}
+        </>
+      )}
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
-type OutputTab = "narrative" | "outline" | "mermaid";
+type OutputTab = "narrative" | "outline" | "mermaid" | "runs";
 
 export function FlowchartPage() {
   const { jobId } = useParams<{ jobId: string }>();
   const navigate = useNavigate();
+  // Reactive read so the Runs tab updates live as runs progress. The job loads
+  // from the API after mount, so `loading` distinguishes "fetching" from "404".
   const { job, loading: jobLoading } = useJob(jobId);
 
-  // Initial canvas: the saved job's graph if it has one, else the example
-  // chart as a starting point. Computed once per mount (the builder owns the
-  // working copy; Save writes it back to the job).
-  const hasGraph = !!job && (job.graph.nodes.length > 0 || (job.graph.loops?.length ?? 0) > 0);
-  const initial = useMemo(() => {
-    if (job && hasGraph) {
-      return fromFlowGraph(job.graph);
+  // The builder's working copy of the step tree. Seeded from the job once it
+  // resolves; Save writes it back. Re-seeds when the job (id or loaded tree)
+  // changes.
+  const [tree, setTree] = useState<FlowStep>(() => job?.tree ?? newStep("start"));
+  const [seededFor, setSeededFor] = useState<string | undefined>(undefined);
+  useEffect(() => {
+    // Seed once per job, when its tree first arrives.
+    if (job && job.id !== seededFor) {
+      setTree(job.tree);
+      setSeededFor(job.id);
     }
-    return { nodes: exampleNodes(), edges: exampleEdges() };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId, job?.id, hasGraph]);
+  }, [job, seededFor]);
 
-  const [nodes, setNodes, onNodesChange] = useNodesState<Node>(initial.nodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(initial.edges);
   const [tab, setTab] = useState<OutputTab>("narrative");
   const [copied, setCopied] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [running, setRunning] = useState(false);
 
-  // Re-seed the canvas when navigating between jobs or when the job's graph
-  // finishes loading from the API (the initial fetch resolves after mount).
-  useEffect(() => {
-    setNodes(initial.nodes);
-    setEdges(initial.edges);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId, job?.id, hasGraph]);
-
-  // Live regeneration — the generator is pure & cheap, so recompute on any
-  // node/edge change rather than gating behind a "Generate" button.
-  const graph = useMemo(() => toFlowGraph(nodes, edges), [nodes, edges]);
-  const result = useMemo(() => generateFlowText(graph), [graph]);
-
-  const onSave = useCallback(() => {
-    if (!jobId) return;
-    void updateJob(jobId, { graph });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 1200);
-  }, [jobId, graph]);
-
-  // Agent picker: the job runs as the chosen agent (its narrative becomes that
-  // agent's first prompt). Persisted on the job via updateJob.
+  // Agent picker: a job runs as the chosen agent (its narrative becomes that
+  // agent's first prompt). Persisted on the job.
   const { data: agents } = useAvailableAgents();
   const onPickAgent = useCallback(
     (agentId: string) => {
@@ -281,115 +268,66 @@ export function FlowchartPage() {
     [jobId],
   );
 
-  const [running, setRunning] = useState(false);
-  const onRun = useCallback(async () => {
+  // Tree → flat graph → text. Pure & cheap, recompute on every edit.
+  const result = useMemo(() => generateFlowText(treeToGraph(tree)), [tree]);
+  const stepCount = countSteps(tree);
+  const hasSteps = stepCount > 1; // more than the lone Start
+
+  // ---- tree edits ----
+  const onAdd = useCallback(
+    (parentId: string, slot: Slot, type: FlowNodeType) =>
+      setTree((t) => attach(t, parentId, slot, type)),
+    [],
+  );
+  const onRename = useCallback(
+    (id: string, label: string) => setTree((t) => setLabel(t, id, label)),
+    [],
+  );
+  const onRenameBranch = useCallback(
+    (id: string, branch: "yes" | "no", label: string) =>
+      setTree((t) => setBranchLabel(t, id, branch, label)),
+    [],
+  );
+  const onDelete = useCallback(
+    (id: string) => setTree((t) => deleteStep(t, id) ?? t),
+    [],
+  );
+
+  // ---- job actions ----
+  const onSave = useCallback(() => {
     if (!jobId) return;
-    // Persist the latest canvas first so the run uses the on-screen flow.
-    await updateJob(jobId, { graph });
+    void updateJob(jobId, { tree });
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1200);
+  }, [jobId, tree]);
+
+  const onRun = useCallback(async () => {
+    if (!jobId || running) return;
     setRunning(true);
+    setTab("runs");
     try {
+      // Persist the on-screen tree first so the run uses the current flow.
+      await updateJob(jobId, { tree });
       const run = await runJob(jobId);
-      if (run.sessionId) navigate(`/c/${run.sessionId}`);
+      if (run?.sessionId) navigate(`/c/${run.sessionId}`);
     } catch (err) {
       window.alert(err instanceof Error ? err.message : "Failed to run job");
     } finally {
       setRunning(false);
     }
-  }, [jobId, graph, navigate]);
-
-  const addNode = useCallback(
-    (kind: FlowNodeType) => {
-      const id = uid(kind);
-      setNodes((nds) => [
-        ...nds,
-        {
-          id,
-          type: "flow",
-          position: { x: 120 + (nds.length % 6) * 30, y: 100 + (nds.length % 6) * 30 },
-          data: { kind, label: KIND_META[kind].defLabel },
-        },
-      ]);
-    },
-    [setNodes],
-  );
-
-  const addLoop = useCallback(() => {
-    const label = window.prompt(
-      "Loop label (the repeat condition, e.g. 'while not empty'):",
-      "for each item",
-    );
-    if (label === null) return;
-    setNodes((nds) => [
-      ...nds,
-      {
-        id: uid("loop"),
-        type: "loop",
-        position: { x: 100, y: 100 },
-        data: { kind: "process", label: label.trim() || "loop" },
-        style: { width: 320, height: 200 },
-        zIndex: -1,
-      },
-    ]);
-  }, [setNodes]);
-
-  // Connecting from a decision prompts for the branch label (Yes/No suggested).
-  const onConnect = useCallback(
-    (conn: Connection) => {
-      const src = nodes.find((n) => n.id === conn.source);
-      let label: string | undefined;
-      if (src && (src.data as FlowNodeData).kind === "decision") {
-        const existing = edges.filter((e) => e.source === conn.source).length;
-        const suggest = existing === 0 ? "Yes" : existing === 1 ? "No" : "";
-        const v = window.prompt("Branch label for this decision path:", suggest);
-        label = v ? v.trim() : undefined;
-      }
-      setEdges((eds) =>
-        addEdge(
-          { ...conn, label, markerEnd: { type: MarkerType.ArrowClosed } },
-          eds,
-        ),
-      );
-    },
-    [nodes, edges, setEdges],
-  );
-
-  // Double-click a node to rename it (loop boxes rename their condition).
-  const onNodeDoubleClick = useCallback(
-    (_e: React.MouseEvent, node: Node) => {
-      const d = node.data as FlowNodeData;
-      const v = window.prompt("Label:", d.label ?? "");
-      if (v === null) return;
-      setNodes((nds) =>
-        nds.map((n) => (n.id === node.id ? { ...n, data: { ...n.data, label: v.trim() } } : n)),
-      );
-    },
-    [setNodes],
-  );
-
-  const loadExample = useCallback(() => {
-    setNodes(exampleNodes());
-    setEdges(exampleEdges());
-  }, [setNodes, setEdges]);
-
-  const clear = useCallback(() => {
-    if (nodes.length && !window.confirm("Clear the whole flow chart?")) return;
-    setNodes([]);
-    setEdges([]);
-  }, [nodes.length, setNodes, setEdges]);
+  }, [jobId, tree, running, navigate]);
 
   const copyOutput = useCallback(() => {
-    const text = tab === "mermaid" ? result.mermaid : tab === "outline" ? result.outline : result.narrative;
+    const text =
+      tab === "mermaid" ? result.mermaid : tab === "outline" ? result.outline : result.narrative;
     void navigator.clipboard.writeText(text).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1200);
     });
   }, [tab, result]);
 
-  const hasContent = nodes.length > 0;
-
-  // A jobId that doesn't resolve (stale link / deleted job): send the user
-  // back to the list rather than silently editing an orphaned chart. Wait for
-  // the API fetch to settle first so the loading window doesn't flash this.
+  // Stale/deleted job → bounce back to the list. Wait for the API fetch to
+  // settle first so the loading window doesn't flash this.
   if (jobId && !job && !jobLoading) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
@@ -403,8 +341,13 @@ export function FlowchartPage() {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {/* Builder header — back to Jobs, job name, save */}
-      <div className="flex items-center gap-3 border-b border-border px-4 py-2">
+      {/* Builder header — offset below the AppShell's absolute ChatHeader
+          overlay (transparent 56px bar at top-0, z-30) so its buttons receive
+          clicks; z-40 keeps it above that overlay where they meet. */}
+      <div
+        className="relative z-40 flex items-center gap-3 border-b border-border px-4 py-2"
+        style={{ marginTop: "var(--omnigent-header-height, 0px)" }}
+      >
         <Button asChild variant="ghost" size="sm">
           <Link to="/jobs">
             <ArrowLeftIcon className="size-4" /> Jobs
@@ -434,108 +377,142 @@ export function FlowchartPage() {
         <Button
           size="sm"
           onClick={onRun}
-          disabled={!jobId || !job?.agentId || running}
+          disabled={!jobId || running || !hasSteps || !job?.agentId}
           data-testid="job-run-button"
         >
-          <PlayIcon className="size-3.5" /> {running ? "Running…" : "Run now"}
+          {running ? (
+            <Loader2Icon className="size-3.5 animate-spin" />
+          ) : (
+            <PlayIcon className="size-3.5" />
+          )}
+          {running ? "Running…" : "Run now"}
         </Button>
       </div>
 
       <div className="flex min-h-0 flex-1">
-      {/* Canvas */}
-      <div className="relative min-w-0 flex-1">
-        <Canvas
-          nodes={nodes}
-          edges={edges}
-          nodeTypes={nodeTypes}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          onConnect={onConnect}
-          onNodeDoubleClick={onNodeDoubleClick}
-        >
-          <Controls />
-          <Panel position="top-left">
-            <div className="flex flex-wrap items-center gap-1">
-              {PALETTE.map((kind) => (
-                <Button key={kind} variant="ghost" size="sm" onClick={() => addNode(kind)}>
-                  <span className={cn("mr-1.5 inline-block size-2.5 rounded-sm border", KIND_META[kind].className)} />
-                  {KIND_META[kind].tag}
+        {/* Stepper canvas */}
+        <div className="min-w-0 flex-1 overflow-auto bg-[radial-gradient(circle,var(--border)_1px,transparent_1px)] [background-size:22px_22px]">
+          <div className="flex min-h-full justify-center p-10">
+            <StepView
+              step={tree}
+              isRoot
+              onAdd={onAdd}
+              onRename={onRename}
+              onRenameBranch={onRenameBranch}
+              onDelete={onDelete}
+            />
+          </div>
+        </div>
+
+        {/* Output panel */}
+        <aside className="flex w-[420px] min-w-[300px] flex-col border-l border-border bg-card">
+          <Tabs
+            value={tab}
+            onValueChange={(v) => setTab(v as OutputTab)}
+            className="flex min-h-0 flex-1 flex-col gap-0"
+          >
+            <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+              <TabsList variant="line" className="flex-1">
+                <TabsTrigger value="narrative">Narrative</TabsTrigger>
+                <TabsTrigger value="outline">Outline</TabsTrigger>
+                <TabsTrigger value="mermaid">Mermaid</TabsTrigger>
+                <TabsTrigger value="runs">
+                  Runs{job && job.runs.length > 0 ? ` (${job.runs.length})` : ""}
+                </TabsTrigger>
+              </TabsList>
+              {tab !== "runs" && (
+                <Button variant="outline" size="sm" onClick={copyOutput} disabled={!hasSteps}>
+                  <CopyIcon className="size-3.5" /> {copied ? "Copied!" : "Copy"}
                 </Button>
-              ))}
-              <span className="mx-1 h-5 w-px bg-border" />
-              <Button variant="ghost" size="sm" onClick={addLoop}>
-                <PlusIcon className="size-3.5" /> Loop
-              </Button>
-              <Button variant="ghost" size="sm" onClick={loadExample}>
-                Example
-              </Button>
-              <Button variant="ghost" size="sm" onClick={clear}>
-                <Trash2Icon className="size-3.5" /> Clear
-              </Button>
+              )}
             </div>
-          </Panel>
-        </Canvas>
-      </div>
 
-      {/* Output panel */}
-      <aside className="flex w-[420px] min-w-[300px] flex-col border-l border-border bg-card">
-        <Tabs
-          value={tab}
-          onValueChange={(v) => setTab(v as OutputTab)}
-          className="flex min-h-0 flex-1 flex-col gap-0"
-        >
-          <div className="flex items-center gap-2 border-b border-border px-3 py-2">
-            <TabsList variant="line" className="flex-1">
-              <TabsTrigger value="narrative">Narrative</TabsTrigger>
-              <TabsTrigger value="outline">Outline</TabsTrigger>
-              <TabsTrigger value="mermaid">Mermaid</TabsTrigger>
-            </TabsList>
-            <Button variant="outline" size="sm" onClick={copyOutput} disabled={!hasContent}>
-              <CopyIcon className="size-3.5" /> {copied ? "Copied!" : "Copy"}
-            </Button>
-          </div>
+            <div className="border-b border-border px-4 py-2 text-xs text-muted-foreground">
+              {hasSteps ? result.summary : "Click the + below Start to add your first step."}
+            </div>
 
-          <div className="border-b border-border px-4 py-2 text-xs text-muted-foreground">
-            {hasContent ? result.summary : "Add nodes from the toolbar to build a flow chart."}
-          </div>
-
-          <div className="min-h-0 flex-1 overflow-auto">
-            <TabsContent value="narrative" className="p-4">
-              {result.narrative ? (
-                <pre className="font-sans text-sm leading-relaxed whitespace-pre-wrap">
-                  {result.narrative}
-                </pre>
-              ) : (
-                <p className="text-sm text-muted-foreground italic">Nothing to show yet.</p>
-              )}
-            </TabsContent>
-            <TabsContent value="outline" className="p-4">
-              {result.outline ? (
-                <pre className="font-mono text-xs leading-relaxed whitespace-pre-wrap">
-                  {result.outline}
-                </pre>
-              ) : (
-                <p className="text-sm text-muted-foreground italic">Nothing to show yet.</p>
-              )}
-            </TabsContent>
-            <TabsContent value="mermaid" className="flex flex-col gap-3 p-4">
-              {result.mermaid ? (
-                <>
-                  {/* Rendered diagram (Streamdown's mermaid plugin). */}
-                  <MessageResponse>{"```mermaid\n" + result.mermaid + "\n```"}</MessageResponse>
-                  {/* Raw source for copy/paste. */}
-                  <pre className="rounded-md border border-border bg-muted/40 p-3 font-mono text-xs whitespace-pre-wrap">
-                    {result.mermaid}
+            <div className="min-h-0 flex-1 overflow-auto">
+              <TabsContent value="narrative" className="p-4">
+                {result.narrative ? (
+                  <pre className="font-sans text-sm leading-relaxed whitespace-pre-wrap">
+                    {result.narrative}
                   </pre>
-                </>
-              ) : (
-                <p className="text-sm text-muted-foreground italic">Nothing to show yet.</p>
-              )}
-            </TabsContent>
-          </div>
-        </Tabs>
-      </aside>
+                ) : (
+                  <p className="text-sm text-muted-foreground italic">Nothing to show yet.</p>
+                )}
+              </TabsContent>
+              <TabsContent value="outline" className="p-4">
+                {result.outline ? (
+                  <pre className="font-mono text-xs leading-relaxed whitespace-pre-wrap">
+                    {result.outline}
+                  </pre>
+                ) : (
+                  <p className="text-sm text-muted-foreground italic">Nothing to show yet.</p>
+                )}
+              </TabsContent>
+              <TabsContent value="mermaid" className="flex flex-col gap-3 p-4">
+                {result.mermaid ? (
+                  <>
+                    <MessageResponse>{"```mermaid\n" + result.mermaid + "\n```"}</MessageResponse>
+                    <pre className="rounded-md border border-border bg-muted/40 p-3 font-mono text-xs whitespace-pre-wrap">
+                      {result.mermaid}
+                    </pre>
+                  </>
+                ) : (
+                  <p className="text-sm text-muted-foreground italic">Nothing to show yet.</p>
+                )}
+              </TabsContent>
+              <TabsContent value="runs" className="p-4">
+                <RunsList runs={job?.runs ?? []} />
+              </TabsContent>
+            </div>
+          </Tabs>
+        </aside>
       </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Runs history (newest first) with a per-run status icon and expandable logs.
+// ---------------------------------------------------------------------------
+function RunStatusIcon({ status }: { status: Run["status"] }) {
+  if (status === "running")
+    return <Loader2Icon className="size-4 animate-spin text-muted-foreground" />;
+  if (status === "succeeded") return <CheckCircle2Icon className="size-4 text-emerald-500" />;
+  return <XCircleIcon className="size-4 text-red-500" />;
+}
+
+function RunsList({ runs }: { runs: Run[] }) {
+  const ordered = [...runs].sort((a, b) => b.startedAt - a.startedAt);
+  if (!ordered.length) {
+    return (
+      <p className="text-sm text-muted-foreground italic">
+        No runs yet. Press “Run now” to execute this flow.
+      </p>
+    );
+  }
+  return (
+    <div className="flex flex-col gap-2">
+      {ordered.map((run) => {
+        const duration =
+          run.finishedAt != null
+            ? `${((run.finishedAt - run.startedAt) / 1000).toFixed(1)}s`
+            : "…";
+        return (
+          <details key={run.id} className="rounded-md border border-border bg-background/40 p-2.5">
+            <summary className="flex cursor-pointer list-none items-center gap-2 text-sm">
+              <RunStatusIcon status={run.status} />
+              <span className="font-medium">Run #{run.number}</span>
+              <span className="text-xs text-muted-foreground capitalize">{run.status}</span>
+              <span className="ml-auto text-xs text-muted-foreground tabular-nums">{duration}</span>
+            </summary>
+            <pre className="mt-2 border-t border-border pt-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-muted-foreground">
+              {run.logs.join("\n")}
+            </pre>
+          </details>
+        );
+      })}
     </div>
   );
 }

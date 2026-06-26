@@ -13,9 +13,14 @@
  * are needed.
  */
 
-import type { FlowGraph } from "./flowToText";
 import { authenticatedFetch } from "./identity";
 import { ApiError } from "./sessionsApi";
+
+/**
+ * The flow payload is opaque to this layer and to the backend — it round-trips
+ * as JSON. The store decides its concrete shape (currently a `FlowStep` tree).
+ */
+export type FlowPayload = unknown;
 
 /** A saved job, camelCased with ms timestamps. */
 export interface Job {
@@ -24,7 +29,7 @@ export interface Job {
   /** Epoch ms. */
   createdAt: number;
   updatedAt: number;
-  graph: FlowGraph;
+  graph: FlowPayload;
   narrative: string;
   agentId: string | null;
 }
@@ -46,7 +51,7 @@ interface JobWire {
   name: string;
   created_at: number;
   updated_at: number;
-  graph: FlowGraph;
+  graph: FlowPayload;
   narrative: string;
   agent_id: string | null;
 }
@@ -67,7 +72,7 @@ function jobFromWire(w: JobWire): Job {
     name: w.name,
     createdAt: w.created_at * 1000,
     updatedAt: w.updated_at * 1000,
-    graph: w.graph ?? { nodes: [], edges: [], loops: [] },
+    graph: w.graph ?? null,
     narrative: w.narrative ?? "",
     agentId: w.agent_id ?? null,
   };
@@ -104,7 +109,7 @@ async function readJsonOrThrow<T>(res: Response): Promise<T> {
 /** Payload accepted by {@link apiCreateJob} / {@link apiUpdateJob}. */
 export interface JobInput {
   name?: string;
-  graph?: FlowGraph;
+  graph?: FlowPayload;
   narrative?: string;
   agentId?: string | null;
 }
