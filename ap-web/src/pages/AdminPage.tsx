@@ -117,9 +117,16 @@ export function AdminPage() {
               <tr>
                 <th className="px-3 py-2 font-medium">User</th>
                 <th className="px-3 py-2 font-medium">Role</th>
-                <th className="px-3 py-2 text-right font-medium">Sessions</th>
+                <th className="px-3 py-2 text-right font-medium" title="Sessions this user owns">
+                  Owned
+                </th>
                 <th className="px-3 py-2 text-right font-medium">Tokens</th>
-                <th className="px-3 py-2 text-right font-medium">Cost</th>
+                <th
+                  className="px-3 py-2 text-right font-medium"
+                  title="Cost of sessions this user owns"
+                >
+                  Cost
+                </th>
                 <th className="px-3 py-2 text-right font-medium" aria-label="actions" />
               </tr>
             </thead>
@@ -182,8 +189,11 @@ export function AdminPage() {
               Sessions for <span className="font-semibold text-foreground">{selectedUser}</span>
             </h2>
             {sessionTotals !== null && (
-              <span className="text-xs text-muted-foreground tabular-nums">
-                {sessionTotals.session_count} sessions · {formatTokens(sessionTotals.total_tokens)}{" "}
+              <span
+                className="text-xs text-muted-foreground tabular-nums"
+                title="Totals cover the sessions this user owns; cost is attributed to the owner."
+              >
+                owns {sessionTotals.session_count} · {formatTokens(sessionTotals.total_tokens)}{" "}
                 tokens ·{" "}
                 <span className="font-medium text-foreground">
                   {formatUsd(sessionTotals.cost_usd)}
@@ -201,6 +211,8 @@ export function AdminPage() {
                 <thead className="bg-muted/40 text-left text-xs uppercase text-muted-foreground">
                   <tr>
                     <th className="px-3 py-2 font-medium">Title</th>
+                    <th className="px-3 py-2 font-medium">Role</th>
+                    <th className="px-3 py-2 font-medium">Owner</th>
                     <th className="px-3 py-2 font-medium">Updated</th>
                     <th className="px-3 py-2 text-right font-medium">Tokens</th>
                     <th className="px-3 py-2 text-right font-medium">Cost</th>
@@ -216,6 +228,20 @@ export function AdminPage() {
                     >
                       <td className="px-3 py-2 align-middle font-medium">
                         {s.title ?? <span className="text-muted-foreground">Untitled</span>}
+                      </td>
+                      <td className="px-3 py-2 align-middle">
+                        {s.is_owner ? (
+                          <Badge>Owner</Badge>
+                        ) : (
+                          <Badge variant="secondary">{s.role ?? "—"}</Badge>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 align-middle text-muted-foreground">
+                        {s.is_owner ? (
+                          <span className="text-xs">—</span>
+                        ) : (
+                          (s.owner ?? <span className="text-xs">—</span>)
+                        )}
                       </td>
                       <td className="px-3 py-2 align-middle text-muted-foreground">
                         {formatEpoch(s.updated_at)}

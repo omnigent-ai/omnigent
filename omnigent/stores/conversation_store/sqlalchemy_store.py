@@ -1964,17 +1964,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             return _to_conversation(row, _fetch_labels(session, conversation_id))
 
     def usage_totals_for_user(self, user_id: str) -> UsageTotals:
-        """Sum session_usage across a user's top-level sessions. See base class."""
+        """Sum session_usage across the user's OWNED top-level sessions.
+
+        Cost is attributed to the owner (the ``LEVEL_OWNER`` grantee), so
+        a user merely invited to a session is not charged for it. See
+        base class.
+        """
         from omnigent.db.db_models import SqlSessionPermission
+        from omnigent.server.auth import LEVEL_OWNER
 
         with self._session() as session:
-            accessible_ids = select(SqlSessionPermission.conversation_id).where(
-                SqlSessionPermission.user_id == user_id
+            owned_ids = select(SqlSessionPermission.conversation_id).where(
+                SqlSessionPermission.user_id == user_id,
+                SqlSessionPermission.level >= LEVEL_OWNER,
             )
             rows = (
                 session.execute(
                     select(SqlConversation.session_usage).where(
-                        SqlConversation.id.in_(accessible_ids),
+                        SqlConversation.id.in_(owned_ids),
                         SqlConversation.kind == "default",
                     )
                 )

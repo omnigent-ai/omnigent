@@ -128,6 +128,19 @@ def _make_session_for(
     return conv.id
 
 
+def _invite(db_uri: str, session_id: str, user: str, *, level: int = 1) -> None:
+    """Grant ``user`` a non-owner role on an existing session (an invite).
+
+    :param db_uri: Per-test SQLite URI.
+    :param session_id: The session to share.
+    :param user: The invitee, e.g. ``"btallman@example.com"``.
+    :param level: Grant level (1=read, 2=edit, 3=manage).
+    """
+    perm = SqlAlchemyPermissionStore(db_uri)
+    perm.ensure_user(user)
+    perm.grant(user, session_id, level=level)
+
+
 # ── /v1/me is_admin ───────────────────────────────────────────────────────────
 
 
@@ -234,10 +247,51 @@ async def test_list_user_sessions_includes_cost(
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["sessions"][0]["cost_usd"] == pytest.approx(2.5)
-    assert body["sessions"][0]["total_tokens"] == 4200
+    sess = body["sessions"][0]
+    assert sess["cost_usd"] == pytest.approx(2.5)
+    assert sess["total_tokens"] == 4200
+    # alice owns this session.
+    assert sess["role"] == "owner"
+    assert sess["owner"] == "alice@example.com"
+    assert sess["is_owner"] is True
     assert body["totals"]["cost_usd"] == pytest.approx(2.5)
     assert body["totals"]["total_tokens"] == 4200
+
+
+async def test_cost_is_attributed_to_owner_not_invitee(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A user merely invited to a session isn't charged; the session shows role/owner.
+
+    Reproduces the btallman case: invited to a session owned by alice, btallman
+    must show a $0 rollup, and the session row must mark them a read-role
+    non-owner whose owner is alice.
+    """
+    _make_user(db_uri, "boss@example.com", is_admin=True)
+    conv_id = _make_session_for(db_uri, "alice@example.com", cost_usd=5.0, total_tokens=8000)
+    _invite(db_uri, conv_id, "btallman@example.com", level=1)  # read-only invite
+
+    # User-list rollup: cost goes to alice, not btallman.
+    users_resp = await auth_client.get("/v1/admin/users", headers=_headers("boss@example.com"))
+    by_id = {u["user_id"]: u for u in users_resp.json()["users"]}
+    assert by_id["alice@example.com"]["cost_usd"] == pytest.approx(5.0)
+    assert by_id["alice@example.com"]["session_count"] == 1
+    assert by_id["btallman@example.com"]["cost_usd"] == pytest.approx(0.0)
+    assert by_id["btallman@example.com"]["session_count"] == 0
+
+    # btallman's session view: the session appears, but labeled as a read-role
+    # invite owned by alice — and the rollup total stays $0.
+    sess_resp = await auth_client.get(
+        "/v1/admin/users/btallman@example.com/sessions",
+        headers=_headers("boss@example.com"),
+    )
+    body = sess_resp.json()
+    sess = next(s for s in body["sessions"] if s["id"] == conv_id)
+    assert sess["role"] == "read"
+    assert sess["owner"] == "alice@example.com"
+    assert sess["is_owner"] is False
+    assert body["totals"]["cost_usd"] == pytest.approx(0.0)
+    assert body["totals"]["session_count"] == 0
 
 
 async def test_list_user_sessions_forbidden_for_non_admin(

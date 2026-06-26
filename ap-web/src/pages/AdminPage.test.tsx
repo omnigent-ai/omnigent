@@ -104,6 +104,9 @@ describe("AdminPage", () => {
           updated_at: 2,
           cost_usd: 2.5,
           total_tokens: 4200,
+          role: "owner",
+          owner: "alice@example.com",
+          is_owner: true,
         },
       ],
       totals: { cost_usd: 2.5, total_tokens: 4200, session_count: 1 },
@@ -121,9 +124,52 @@ describe("AdminPage", () => {
     // The sessions panel is headed by the selected user.
     const heading = screen.getByText(/Sessions for/i);
     expect(within(heading).getByText("alice@example.com")).toBeTruthy();
-    // Per-session cost is shown in the session row.
+    // Per-session cost + owner role shown in the session row.
     const sessionRow = screen.getByTestId("admin-session-row");
     expect(within(sessionRow).getByText("$2.50")).toBeTruthy();
+    expect(within(sessionRow).getByText("Owner")).toBeTruthy();
+  });
+
+  it("marks an invited (non-owner) session with its role and owner", async () => {
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
+    vi.mocked(adminApi.listAllUsers).mockResolvedValue([
+      {
+        user_id: "btallman@example.com",
+        is_admin: false,
+        cost_usd: 0,
+        total_tokens: 0,
+        session_count: 0,
+      },
+    ]);
+    vi.mocked(adminApi.listUserSessions).mockResolvedValue({
+      sessions: [
+        {
+          id: "conv_shared",
+          title: "Shared session",
+          created_at: 1,
+          updated_at: 2,
+          cost_usd: 5,
+          total_tokens: 8000,
+          role: "read",
+          owner: "alice@example.com",
+          is_owner: false,
+        },
+      ],
+      // Invitee owns nothing → $0 rollup even though the session has cost.
+      totals: { cost_usd: 0, total_tokens: 0, session_count: 0 },
+    });
+
+    renderPage();
+
+    fireEvent.click(await screen.findByText("btallman@example.com"));
+    await waitFor(() => expect(screen.getByText("Shared session")).toBeTruthy());
+
+    const sessionRow = screen.getByTestId("admin-session-row");
+    // Role badge + the owner (alice), not btallman.
+    expect(within(sessionRow).getByText("read")).toBeTruthy();
+    expect(within(sessionRow).getByText("alice@example.com")).toBeTruthy();
+    // Owned total stays $0 for the invitee.
+    expect(screen.getByText(/owns 0/i)).toBeTruthy();
   });
 
   it("shows an error state when the user list cannot be loaded", async () => {

@@ -28,6 +28,12 @@ export interface AdminSession {
   updated_at: number;
   cost_usd: number;
   total_tokens: number;
+  /** This user's role on the session: "owner" | "manage" | "edit" | "read". */
+  role: string | null;
+  /** The session's owner (the LEVEL_OWNER grantee), or null if none. */
+  owner: string | null;
+  /** Whether this user is the session's owner. */
+  is_owner: boolean;
 }
 
 /** Aggregate usage across a user's sessions. */

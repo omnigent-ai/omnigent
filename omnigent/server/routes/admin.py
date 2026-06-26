@@ -20,13 +20,33 @@ import logging
 
 from fastapi import APIRouter, Query, Request
 
+from omnigent.entities import SessionPermission
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import LEVEL_OWNER, AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
+
+# Numeric permission level → role label shown to admins.
+_ROLE_NAMES = {1: "read", 2: "edit", 3: "manage", 4: "owner"}
+
+
+def _owner_of(grants: list[SessionPermission]) -> str | None:
+    """The owner (highest-level grantee at or above ``LEVEL_OWNER``), or None."""
+    owners = [g for g in grants if g.level >= LEVEL_OWNER]
+    if not owners:
+        return None
+    return max(owners, key=lambda g: g.level).user_id
+
+
+def _role_for(grants: list[SessionPermission], user_id: str) -> str | None:
+    """The role label for ``user_id`` on a session, from its grants."""
+    levels = [g.level for g in grants if g.user_id == user_id]
+    if not levels:
+        return None
+    return _ROLE_NAMES.get(max(levels))
 
 
 def create_admin_router(
@@ -63,11 +83,12 @@ def create_admin_router(
 
     @router.get("/admin/users")
     async def list_users(request: Request) -> dict[str, list[dict[str, object]]]:
-        """List all users (admin only), each with a usage rollup.
+        """List all users (admin only), each with an owned-usage rollup.
 
-        ``cost_usd`` / ``total_tokens`` sum the user's top-level
-        sessions — the same set ``/admin/users/{id}/sessions`` returns,
-        so a row's rollup equals the sum of that user's session rows.
+        ``cost_usd`` / ``total_tokens`` / ``session_count`` cover the
+        sessions the user OWNS — cost is attributed to the owner, so a
+        user merely invited to a session is not credited its cost (and a
+        pure-invitee shows a $0 rollup).
 
         :returns: ``{"users": [{"user_id", "is_admin", "cost_usd",
             "total_tokens", "session_count"}, ...]}``.
@@ -108,35 +129,47 @@ def create_admin_router(
         :param limit: Maximum sessions to return (1–500).
         :returns: ``{"user_id", "totals": {...}, "sessions": [{"id",
             "title", "created_at", "updated_at", "cost_usd",
-            "total_tokens"}, ...]}``. Per-session cost/tokens come from
-            each conversation's ``session_usage``; ``totals`` is the
-            user rollup (sums every session, not just this page).
+            "total_tokens", "role", "owner", "is_owner"}, ...]}``.
+            ``role`` is the user's level on that session (owner / manage
+            / edit / read); ``owner`` is the session's owner. Per-session
+            cost/tokens are the session's; ``totals`` is the user's
+            OWNED-session rollup (cost attributed to the owner), so a
+            session the user was merely invited to does not count toward
+            their total.
         """
         await _require_admin(request)
-        paged, totals = await asyncio.to_thread(
-            lambda: (
-                conversation_store.list_conversations(accessible_by=user_id, limit=limit),
-                conversation_store.usage_totals_for_user(user_id),
-            )
-        )
-        return {
-            "user_id": user_id,
-            "totals": {
-                "cost_usd": totals.cost_usd,
-                "total_tokens": totals.total_tokens,
-                "session_count": totals.session_count,
-            },
-            "sessions": [
-                {
-                    "id": c.id,
-                    "title": c.title,
-                    "created_at": c.created_at,
-                    "updated_at": c.updated_at,
-                    "cost_usd": float(c.session_usage.get("total_cost_usd") or 0.0),
-                    "total_tokens": int(c.session_usage.get("total_tokens") or 0),
-                }
-                for c in paged.data
-            ],
-        }
+
+        def _build() -> dict[str, object]:
+            paged = conversation_store.list_conversations(accessible_by=user_id, limit=limit)
+            totals = conversation_store.usage_totals_for_user(user_id)
+            grants_by_conv = permission_store.list_for_sessions([c.id for c in paged.data])
+            sessions = []
+            for c in paged.data:
+                grants = grants_by_conv.get(c.id, [])
+                owner = _owner_of(grants)
+                sessions.append(
+                    {
+                        "id": c.id,
+                        "title": c.title,
+                        "created_at": c.created_at,
+                        "updated_at": c.updated_at,
+                        "cost_usd": float(c.session_usage.get("total_cost_usd") or 0.0),
+                        "total_tokens": int(c.session_usage.get("total_tokens") or 0),
+                        "role": _role_for(grants, user_id),
+                        "owner": owner,
+                        "is_owner": owner == user_id,
+                    }
+                )
+            return {
+                "user_id": user_id,
+                "totals": {
+                    "cost_usd": totals.cost_usd,
+                    "total_tokens": totals.total_tokens,
+                    "session_count": totals.session_count,
+                },
+                "sessions": sessions,
+            }
+
+        return await asyncio.to_thread(_build)
 
     return router
