@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -279,3 +281,101 @@ def test_build_spawn_env_no_hermes_home_without_policy(tmp_path, monkeypatch) ->
     monkeypatch.setattr(b, "_BRIDGE_ROOT", tmp_path / "hermes-native")
     env = b.build_hermes_native_spawn_env("test-no-policy")
     assert "HERMES_HOME" not in env
+
+
+# -- Session cloning tests --
+
+
+def _create_source_db(db_path: Path, session_id: str) -> None:
+    """Create a minimal Hermes state.db with a session and a few messages."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(b._SESSIONS_DDL)
+    conn.execute(b._MESSAGES_DDL)
+    conn.execute(
+        "INSERT INTO sessions (id, source, cwd, started_at) VALUES (?, ?, ?, ?)",
+        (session_id, "cli", "/old/path", 1700000000.0),
+    )
+    # user message
+    conn.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp, active) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (session_id, "user", "hello", 1700000001.0, 1),
+    )
+    # assistant message
+    conn.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp, active) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (session_id, "assistant", "hi there", 1700000002.0, 1),
+    )
+    # tool message with tool_calls
+    conn.execute(
+        "INSERT INTO messages "
+        "(session_id, role, content, tool_calls, tool_name, timestamp, active) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (session_id, "tool", "result", '[{"id":"tc1"}]', "bash", 1700000003.0, 1),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_clone_hermes_session_copies_rows(tmp_path: Path) -> None:
+    source_db = tmp_path / "source" / "state.db"
+    source_db.parent.mkdir()
+    target_db = tmp_path / "target" / "state.db"
+
+    src_sid = "src-session-id"
+    tgt_sid = "tgt-session-id"
+    _create_source_db(source_db, src_sid)
+
+    b.clone_hermes_session(source_db, target_db, src_sid, tgt_sid)
+
+    # Target has the cloned session.
+    tgt = sqlite3.connect(str(target_db))
+    sess = tgt.execute("SELECT id, source, cwd, started_at FROM sessions").fetchall()
+    assert len(sess) == 1
+    assert sess[0][0] == tgt_sid
+    assert sess[0][2] == "/old/path"  # cwd preserved when workspace not given
+
+    # Target has all 3 messages with the new session_id.
+    msgs = tgt.execute("SELECT session_id, role, content FROM messages ORDER BY id").fetchall()
+    assert len(msgs) == 3
+    assert all(m[0] == tgt_sid for m in msgs)
+    assert msgs[0][1] == "user"
+    assert msgs[1][1] == "assistant"
+    assert msgs[2][1] == "tool"
+    assert msgs[2][2] == "result"
+
+    # tool_calls preserved on the tool message.
+    tool_calls = tgt.execute("SELECT tool_calls FROM messages WHERE role = 'tool'").fetchone()[0]
+    assert tool_calls == '[{"id":"tc1"}]'
+    tgt.close()
+
+    # Source is unchanged.
+    src = sqlite3.connect(str(source_db))
+    src_msgs = src.execute("SELECT session_id FROM messages").fetchall()
+    assert all(m[0] == src_sid for m in src_msgs)
+    src.close()
+
+
+def test_clone_hermes_session_remaps_workspace(tmp_path: Path) -> None:
+    source_db = tmp_path / "source" / "state.db"
+    source_db.parent.mkdir()
+    target_db = tmp_path / "target" / "state.db"
+
+    src_sid = "src-ws"
+    tgt_sid = "tgt-ws"
+    _create_source_db(source_db, src_sid)
+
+    b.clone_hermes_session(source_db, target_db, src_sid, tgt_sid, workspace="/new/path")
+
+    tgt = sqlite3.connect(str(target_db))
+    cwd = tgt.execute("SELECT cwd FROM sessions WHERE id = ?", (tgt_sid,)).fetchone()[0]
+    assert cwd == "/new/path"
+    tgt.close()
+
+
+def test_mint_hermes_session_id_returns_uuid() -> None:
+    sid = b.mint_hermes_session_id()
+    # Should be a valid UUID4 string.
+    parsed = uuid.UUID(sid, version=4)
+    assert str(parsed) == sid

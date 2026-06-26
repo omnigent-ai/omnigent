@@ -141,25 +141,46 @@ Omnigent. They relay the vendor's conversation into the Omnigent session.
 | **Reasoning** | Model reasoning/thinking tokens are forwarded |
 | **Images** | Image content is forwarded — path reference, full binary, or text-flattened |
 | **Cost tracking** | Native harness reports token usage and cost data back to Omnigent for each turn |
+| **Tool-output streaming** | Live incremental command/tool output (`outputDelta`) vs final aggregated output only |
+| **Working-tree diff** | The vendor's aggregated per-turn diff is surfaced (vs reconstructed from per-file edits) |
+| **Generated/viewed media** | Model-produced or model-viewed images are mirrored (distinct from user-supplied image input) |
+| **Vendor modes** | Vendor-specific modes (review mode, plan mode, etc.) are mirrored as status |
 
 ### Checklist for a new native harness
 
-All capabilities are **required** for a complete native harness integration:
+Capabilities are tiered by how essential they are. **P0** must work or the
+harness is non-functional. **P1** is required for a complete, parity-level
+integration — the web surface should match what the vendor TUI shows.
+**Stretch** items depend on vendor-specific signals and improve fidelity;
+they are optional and may legitimately be closed as wontfix when the vendor
+provides no signal or the data is redundant.
+
+**P0 — core (non-functional without these)**
 
 - [ ] Transport chosen and implemented (tmux TUI, app server, HTTP/SSE)
 - [ ] Connects to Omnigent MCP
-- [ ] Model override works (or document vendor lock-in)
 - [ ] Auth configured (vendor login / config)
 - [ ] Streaming forwarder works (deltas preferred; complete-only acceptable)
-- [ ] Omnigent policies enforce tool-use rules
+- [ ] Omnigent policies enforce tool-use rules (ALLOW / ASK / DENY at both tool call and tool result)
 - [ ] Native elicitation surfaces tool-approval requests to web UI
 - [ ] Interrupt aborts the running turn
 - [ ] Bidirectional sync mirrors TUI output into Omnigent conversation
-- [ ] Session commands (clear, fork, resume) work from Omnigent
-- [ ] Resume/fork rebuilds from Omnigent transcript
-- [ ] Compaction status is surfaced
-- [ ] Reasoning tokens are forwarded
-- [ ] Images are forwarded (path preferred; binary or text-flattened acceptable)
 - [ ] Cost tracking reports token usage and cost per turn
 - [ ] Unit tests cover forwarder, auth, transport
 - [ ] Mock LLM tests cover the happy path without real API calls
+
+**P1 — parity (required for a complete integration)**
+
+- [ ] Model override works at launch **and** per-prompt (or document vendor lock-in)
+- [ ] Session commands (clear, fork, resume) work from Omnigent
+- [ ] Resume/fork rebuilds from Omnigent transcript
+- [ ] Reasoning tokens are forwarded
+- [ ] Compaction status is surfaced
+- [ ] User-supplied images are forwarded (path preferred; binary or text-flattened acceptable)
+
+**Stretch — vendor-dependent fidelity**
+
+- [ ] Live tool/command output is streamed (`outputDelta`), not just final aggregated output
+- [ ] The vendor's aggregated working-tree diff is surfaced (if provided)
+- [ ] Generated/viewed media (model-produced or model-viewed images) is mirrored
+- [ ] Vendor-specific modes (review mode, plan mode, etc.) are mirrored as status

@@ -46,11 +46,15 @@ interface MobileSessionMenuProps {
   filesPanelOpen: boolean;
   /** True while the mobile agents drawer is open. */
   subagentsPanelOpen: boolean;
+  /** True while the mobile shells drawer is open. */
+  shellsPanelOpen: boolean;
   /** True while the mobile tasks drawer is open. */
   todosPanelOpen: boolean;
   /** Hide the Shells entry (claude-native sub-agents only). */
   hideTerminalsTab: boolean;
-  /** Number of open terminals (entry badge + visibility). */
+  /** Whether the Shells entry is available. */
+  showShellsTab: boolean;
+  /** Number of open terminals (entry badge). */
   terminalsLength: number;
   /** Whether this is a claude-native session (gates the Tasks entry). */
   isClaudeNative: boolean;
@@ -71,8 +75,8 @@ interface MobileSessionMenuProps {
   agentCount: number;
   /** Open the mobile files drawer. */
   onOpenFiles: () => void;
-  /** Open the first terminal in the terminals push panel. */
-  onOpenFirstTerminal: () => void;
+  /** Open the mobile shells drawer. */
+  onOpenShells: () => void;
   /** Open the mobile agents drawer. */
   onOpenSubagents: () => void;
   /** Open the mobile tasks drawer. */
@@ -101,6 +105,10 @@ interface ChatHeaderProps {
   boundAgent: Agent | undefined;
   /** Whether the Share button/menu entry should render. */
   canShare: boolean;
+  /** Whether the rendered Share controls should be disabled. */
+  shareDisabled?: boolean;
+  /** User-facing reason for the disabled Share controls. */
+  shareDisabledReason?: string;
   /** Open the share dialog. */
   onShare: () => void;
   /** Whether the agent has tools/policies worth surfacing. */
@@ -152,6 +160,8 @@ export function ChatHeader({
   conversationId,
   boundAgent,
   canShare,
+  shareDisabled = false,
+  shareDisabledReason,
   onShare,
   hasAgentInfo,
   onAgentInfo,
@@ -284,8 +294,10 @@ export function ChatHeader({
             <DropdownMenuContent align="end" className="min-w-44">
               {canShare && (
                 <DropdownMenuItem
-                  onSelect={onShare}
+                  onSelect={shareDisabled ? undefined : onShare}
+                  disabled={shareDisabled}
                   data-testid="mobile-share-session"
+                  title={shareDisabledReason}
                   className="gap-2.5 px-2.5 py-2 text-base"
                 >
                   <ShareIcon className="size-4" />
@@ -305,7 +317,33 @@ export function ChatHeader({
             </DropdownMenuContent>
           </DropdownMenu>
         )}
-        {canShare && (
+        {canShare && shareDisabled && shareDisabledReason ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              {/* Disabled buttons don't receive pointer events, so the wrapper
+                  owns hover/focus for the explanatory tooltip. */}
+              <span
+                tabIndex={0}
+                aria-label={`Share session disabled: ${shareDisabledReason}`}
+                className="hidden md:inline-flex"
+              >
+                <Button
+                  type="button"
+                  aria-label="Share session"
+                  disabled
+                  title={shareDisabledReason}
+                  // share-button-glassy (index.css) paints the pink gradient,
+                  // shadow, and white text in both light and dark mode.
+                  className="share-button-glassy h-8 rounded-full px-6 text-13 font-normal text-white"
+                >
+                  <ShareIcon className="size-4" />
+                  Share
+                </Button>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">{shareDisabledReason}</TooltipContent>
+          </Tooltip>
+        ) : canShare ? (
           <Button
             type="button"
             aria-label="Share session"
@@ -317,7 +355,7 @@ export function ChatHeader({
             <ShareIcon className="size-4" />
             Share
           </Button>
-        )}
+        ) : null}
         {conversationId && hasRailContent && (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -357,6 +395,7 @@ export function ChatHeader({
           !mobileMenu.executionLogsOpen &&
           !mobileMenu.filesPanelOpen &&
           !mobileMenu.subagentsPanelOpen &&
+          !mobileMenu.shellsPanelOpen &&
           !mobileMenu.todosPanelOpen &&
           (hasRailContent || mobileMenu.debugMode) && (
             <DropdownMenu>
@@ -411,22 +450,24 @@ export function ChatHeader({
                       : mobileMenu.agentCount}
                   </span>
                 </DropdownMenuItem>
-                {/* Shells — hidden only for claude-native sub-agents,
-                    matching the desktop rail's Shells tab. The agent's
-                    own terminal (SDK REPL / native vendor pane) is
-                    excluded from the count (it's reached via the
-                    Chat/Terminal pill), so this entry appears only
-                    when real shells exist. */}
-                {!mobileMenu.hideTerminalsTab && mobileMenu.terminalsLength > 0 && (
+                {/* Shells — mirrors the desktop rail's Shells tab: visible
+                    when a real shell exists, or when the agent spec declares
+                    shell access so the empty-state "+ New shell" affordance
+                    is reachable on mobile too. */}
+                {!mobileMenu.hideTerminalsTab && mobileMenu.showShellsTab && (
                   <DropdownMenuItem
-                    onSelect={mobileMenu.onOpenFirstTerminal}
+                    onSelect={mobileMenu.onOpenShells}
                     className="gap-2.5 px-2.5 py-2 text-base"
                   >
                     <TerminalIcon className="size-4" />
                     Shells
-                    <span className={cn(TAB_BADGE_BASE, "ml-auto bg-muted text-muted-foreground")}>
-                      {mobileMenu.terminalsLength}
-                    </span>
+                    {mobileMenu.terminalsLength > 0 && (
+                      <span
+                        className={cn(TAB_BADGE_BASE, "ml-auto bg-muted text-muted-foreground")}
+                      >
+                        {mobileMenu.terminalsLength}
+                      </span>
+                    )}
                   </DropdownMenuItem>
                 )}
                 {mobileMenu.isClaudeNative && mobileMenu.todosTotal > 0 && (

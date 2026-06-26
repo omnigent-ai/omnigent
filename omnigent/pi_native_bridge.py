@@ -159,6 +159,37 @@ def enqueue_interrupt(bridge_dir: Path) -> str:
     return interrupt_id
 
 
+def enqueue_compact(bridge_dir: Path, custom_instructions: str | None = None) -> str:
+    """
+    Queue a UI-originated ``/compact`` for the resident Pi extension.
+
+    Pi owns its own context window inside the already-open TUI process, so
+    explicit compaction must run there rather than as AP-side compaction
+    (which would only summarise the transcript mirror and desync the two
+    context windows). Mirrors :func:`enqueue_interrupt`: the extension
+    consumes this inbox payload in the Pi process and calls Pi's active
+    ``ExtensionContext.compact()`` (see ``docs/compaction.md`` / ``ctx.compact``
+    in the pi-coding-agent extension API), which summarises older context and
+    appends a ``CompactionEntry`` to the Pi session.
+
+    :param bridge_dir: Native Pi bridge directory.
+    :param custom_instructions: Optional text passed to Pi's
+        ``compact({customInstructions})`` to focus the summary. Empty/blank
+        values are dropped so the extension uses Pi's default summarisation.
+    :returns: Opaque compact id.
+    """
+    compact_id = f"compact_{uuid.uuid4().hex}"
+    payload: dict[str, Any] = {
+        "id": compact_id,
+        "type": "compact",
+        "created_at": time.time(),
+    }
+    if isinstance(custom_instructions, str) and custom_instructions.strip():
+        payload["custom_instructions"] = custom_instructions
+    _enqueue_payload(bridge_dir, compact_id, payload)
+    return compact_id
+
+
 def _enqueue_payload(bridge_dir: Path, item_id: str, payload: dict[str, Any]) -> None:
     inbox = bridge_dir / _INBOX_DIR
     inbox.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -190,6 +221,7 @@ def write_extension_files(
     server_url: str,
     conversation_url: str,
     auth_headers: dict[str, str] | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -200,6 +232,13 @@ def write_extension_files(
     :param conversation_url: Human-facing web conversation URL.
     :param auth_headers: HTTP headers the extension should use when posting
         terminal-originated events back to Omnigent.
+    :param tools: Flat Omnigent tool schemas
+        (``[{"name", "description", "parameters"}]``) the extension should
+        register via ``pi.registerTool``. Each tool's ``execute`` round-trips
+        the call through ``POST /v1/sessions/{id}/mcp`` (the same MCP proxy the
+        runner uses), so the Pi agent can invoke Omnigent ``sys_*`` tools with
+        centralized server-side policy enforcement. ``None``/empty registers no
+        tools (Pi falls back to its own built-in tool surface only).
     :returns: ``(extension_path, config_path)``.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -210,6 +249,7 @@ def write_extension_files(
         "bridgeDir": str(bridge_dir),
         "inboxDir": str(bridge_dir / _INBOX_DIR),
         "authHeaders": auth_headers or {},
+        "tools": tools or [],
     }
     _atomic_json(config_path(bridge_dir), payload)
     _atomic_text(extension_path(bridge_dir), _extension_source())

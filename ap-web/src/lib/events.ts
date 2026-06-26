@@ -782,6 +782,27 @@ export interface SessionPresenceEvent {
   viewers: SessionViewer[];
 }
 
+/**
+ * `session.superseded` — this conversation was superseded and the client
+ * should follow to `targetConversationId`.
+ *
+ * Emitted when a Claude `/clear` rotates a session away: the old
+ * conversation keeps its history but the live terminal moves to a fresh
+ * conversation. A client actively viewing the old conversation
+ * auto-redirects. Live-only (no SSE replay): a client connecting after
+ * the rotation instead renders the persisted notice message appended to
+ * the old conversation.
+ */
+export interface SessionSupersededEvent {
+  type: "session_superseded";
+  /** The superseded (old) conversation id this event rides the stream of. */
+  conversationId: string;
+  /** The conversation id to redirect to. */
+  targetConversationId: string;
+  /** Why the session was superseded. Currently always `"clear"`. */
+  reason: "clear";
+}
+
 // ── Union type for all events ────────────────────────────
 
 export type StreamEvent =
@@ -825,6 +846,7 @@ export type StreamEvent =
   | SessionInputConsumedEvent
   | SessionInterruptedEvent
   | SessionCreatedEvent
+  | SessionSupersededEvent
   | SessionResourceCreatedEvent
   | SessionResourceDeletedEvent
   | SessionChildSessionUpdatedEvent

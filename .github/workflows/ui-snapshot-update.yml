@@ -73,7 +73,7 @@ jobs:
       UV_PYTHON_PREFERENCE: only-system
     steps:
       - name: Checkout PR branch
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           # No persisted credentials anywhere in this job: it runs PR-chosen code
           # and must never have a push token on disk.
@@ -84,12 +84,12 @@ jobs:
         uses: ./.github/actions/setup-node
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
           enable-cache: true
 
       - name: Cache virtualenv
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
         with:
           path: .venv
           # Namespaced + container-scoped to match ui-snapshot.yml (built with
@@ -131,7 +131,7 @@ jobs:
         run: tar -czf "$RUNNER_TEMP/ui-snapshots.tgz" tests/e2e_ui/visual/snapshots
 
       - name: Upload regenerated baselines
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: ui-snapshot-update-${{ github.run_id }}
           path: ${{ runner.temp }}/ui-snapshots.tgz
@@ -156,7 +156,7 @@ jobs:
     steps:
       - name: Checkout PR branch
         if: needs.render.result == 'success'
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           # PR files land on disk but are never executed in this job; the push
           # token authenticates inline at the push step (not via .git/config).
@@ -165,7 +165,7 @@ jobs:
 
       - name: Download regenerated baselines
         if: needs.render.result == 'success'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           name: ui-snapshot-update-${{ github.run_id }}
           path: _ui_snapshot_artifact

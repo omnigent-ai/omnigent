@@ -30,10 +30,12 @@ import logging
 import os
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +59,145 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # detected by the pane settling (no byte changes across consecutive captures).
 # This many stable polls in a row marks the input box ready.
 _SETTLE_STABLE_POLLS = 3
+
+
+def mint_hermes_session_id() -> str:
+    """Generate a fresh Hermes session id (UUID4 string)."""
+    return str(uuid.uuid4())
+
+
+_SESSIONS_DDL = """\
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    cwd TEXT,
+    started_at REAL NOT NULL
+);
+"""
+
+_MESSAGES_DDL = """\
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT,
+    tool_call_id TEXT,
+    tool_calls TEXT,
+    tool_name TEXT,
+    timestamp REAL NOT NULL DEFAULT 0,
+    token_count INTEGER,
+    finish_reason TEXT,
+    reasoning TEXT,
+    reasoning_content TEXT,
+    reasoning_details TEXT,
+    codex_reasoning_items TEXT,
+    codex_message_items TEXT,
+    platform_message_id TEXT,
+    observed INTEGER DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    compacted INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+
+def clone_hermes_session(
+    source_db: Path,
+    target_db: Path,
+    source_session_id: str,
+    target_session_id: str,
+    *,
+    workspace: str | None = None,
+) -> int:
+    """Clone a Hermes session from *source_db* into *target_db* under a new id.
+
+    Copies the entire source database (preserving whatever schema Hermes uses)
+    then remaps the session and message rows to the new id. This avoids
+    hard-coding the schema — if Hermes adds columns (e.g. ``parent_session_id``)
+    the clone picks them up automatically.
+
+    :param source_db: Path to the source Hermes ``state.db``.
+    :param target_db: Path to the target Hermes ``state.db`` (created/overwritten).
+    :param source_session_id: Hermes session id in the source database.
+    :param target_session_id: New session id for the cloned rows.
+    :param workspace: If provided, overrides ``cwd`` on the cloned session row.
+    """
+    # Validate the source DB before copying: it must have a sessions table
+    # and contain the requested session. If not, skip the clone silently so
+    # Hermes starts fresh rather than crashing on a broken state.db.
+    try:
+        src_conn = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
+        try:
+            row = src_conn.execute(
+                "SELECT id FROM sessions WHERE id = ?",
+                (source_session_id,),
+            ).fetchone()
+        finally:
+            src_conn.close()
+    except sqlite3.Error:
+        _logger.warning(
+            "Source hermes state.db at %s is unreadable; skipping clone",
+            source_db,
+        )
+        return 0
+    if row is None:
+        _logger.warning(
+            "Source hermes session %s not found in %s; skipping clone",
+            source_session_id,
+            source_db,
+        )
+        return 0
+
+    target_db.parent.mkdir(parents=True, exist_ok=True)
+    # Use SQLite's backup API instead of shutil.copy2 — Hermes uses WAL mode
+    # and may not have checkpointed, so the main .db file can be nearly empty
+    # with all data in the -wal sidecar. The backup API reads through WAL
+    # and produces a self-contained copy.
+    src_backup = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
+    tgt_backup = sqlite3.connect(str(target_db))
+    try:
+        src_backup.backup(tgt_backup)
+    finally:
+        tgt_backup.close()
+        src_backup.close()
+
+    conn = sqlite3.connect(str(target_db))
+    try:
+        # Remap session id and update started_at so the forwarder can
+        # discover this cloned session (its floor is launch_epoch_s).
+        conn.execute(
+            "UPDATE sessions SET id = ?, started_at = ? WHERE id = ?",
+            (target_session_id, time.time(), source_session_id),
+        )
+        if workspace is not None:
+            conn.execute(
+                "UPDATE sessions SET cwd = ? WHERE id = ?",
+                (workspace, target_session_id),
+            )
+
+        # Remap message rows to the new session id.
+        conn.execute(
+            "UPDATE messages SET session_id = ? WHERE session_id = ?",
+            (target_session_id, source_session_id),
+        )
+
+        # Drop other sessions/messages that came along with the copy
+        # (the source DB may contain multiple sessions).
+        conn.execute("DELETE FROM sessions WHERE id != ?", (target_session_id,))
+        conn.execute("DELETE FROM messages WHERE session_id != ?", (target_session_id,))
+
+        # Record the high-water message id so the forwarder skips cloned
+        # messages (Omnigent already has them from the fork item copy).
+        max_id_row = conn.execute(
+            "SELECT MAX(id) FROM messages WHERE session_id = ?",
+            (target_session_id,),
+        ).fetchone()
+        max_id = max_id_row[0] if max_id_row and max_id_row[0] is not None else 0
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    return max_id
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:

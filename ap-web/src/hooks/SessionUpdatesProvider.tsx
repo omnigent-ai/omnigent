@@ -34,6 +34,12 @@ import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpd
 // flurry of cache writes a single frame can trigger.
 const DEBOUNCE_MS = 250;
 
+// A project folder's ["project-sessions", <name>] query is always the
+// non-archived, unsearched slice of that project (see useProjectSessions).
+// Live frames overlay those caches with these fixed filters so archived rows
+// drop out the same way they do from the default sidebar list.
+const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as const;
+
 /**
  * Overlay wire items onto every cached `["conversations", ...]` variant.
  *
@@ -67,6 +73,25 @@ function applyItemsToCache(
     if (queryNeedsRefetch) needsRefetch = true;
     if (next !== data) queryClient.setQueryData(key, next);
   }
+  // Each project folder fetches its own ["project-sessions", <name>] list, so
+  // streamed field updates (pending_elicitations_count → "Needs response",
+  // status, runner_online, …) must overlay those caches too — otherwise a
+  // filed session's row stays frozen at fetch time. Folders are non-archived,
+  // unsearched lists; an archived/label-changed row converges via the
+  // debounced ["project-sessions"] invalidation the caller schedules.
+  const projectEntries = queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["project-sessions"],
+  });
+  for (const [key, data] of projectEntries) {
+    const {
+      data: next,
+      found,
+      needsRefetch: queryNeedsRefetch,
+    } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, activeId);
+    for (const id of found) foundAnywhere.add(id);
+    if (queryNeedsRefetch) needsRefetch = true;
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
   return {
     missingIds: [...itemsById.keys()].filter((id) => !foundAnywhere.has(id)),
     needsRefetch,
@@ -83,14 +108,15 @@ function applyItemsToCache(
 function removeIdsFromCache(queryClient: QueryClient, ids: string[]): boolean {
   const idSet = new Set(ids);
   let removedAny = false;
-  const entries = queryClient.getQueriesData<ConversationsInfiniteData>({
-    queryKey: ["conversations"],
-  });
-  for (const [key, data] of entries) {
-    const { data: next, removed } = removeIdsFromPages(data, idSet);
-    if (removed) {
-      queryClient.setQueryData(key, next);
-      removedAny = true;
+  // Both the global lists and each project folder's own list (same page shape).
+  for (const queryKey of [["conversations"], ["project-sessions"]]) {
+    const entries = queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey });
+    for (const [key, data] of entries) {
+      const { data: next, removed } = removeIdsFromPages(data, idSet);
+      if (removed) {
+        queryClient.setQueryData(key, next);
+        removedAny = true;
+      }
     }
   }
   return removedAny;
@@ -134,7 +160,13 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     const entries = queryClient.getQueriesData<ConversationsInfiniteData>({
       queryKey: ["conversations"],
     });
-    const ids = collectConversationIds(entries.map(([, data]) => data));
+    // Project folders fetch their members into their own caches; include those
+    // ids so the server streams liveness (e.g. pending-elicitation "Needs
+    // response") for filed sessions that aren't in the global loaded window.
+    const projectEntries = queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: ["project-sessions"],
+    });
+    const ids = collectConversationIds([...entries, ...projectEntries].map(([, data]) => data));
     // Union in the open session. A directly-opened child / sub-agent
     // session is filtered out of the sidebar list, so it's absent from
     // every cached conversations page and wouldn't otherwise be watched —
@@ -163,6 +195,9 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       invalidateTimer = setTimeout(() => {
         invalidateTimer = null;
         void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+        // Converge each project folder's own list too (new/archived/relabeled
+        // members the local field-patch can't place).
+        void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       }, DEBOUNCE_MS);
     };
 
@@ -232,7 +267,12 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     const cache = queryClient.getQueryCache();
     const unsubscribeCache = cache.subscribe((event) => {
       const key = event.query.queryKey;
-      if (Array.isArray(key) && key[0] === "conversations") scheduleWatch();
+      // Recompute the watch-set when either the global list or a project
+      // folder's list changes (fetch, pagination, splice) so newly loaded
+      // folder members join the stream's watch-set.
+      if (Array.isArray(key) && (key[0] === "conversations" || key[0] === "project-sessions")) {
+        scheduleWatch();
+      }
     });
 
     return () => {

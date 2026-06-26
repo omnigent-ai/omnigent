@@ -37,6 +37,11 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
+  useProjects: () => ({ data: [] }),
+  useMoveToProject: () => ({ mutate: vi.fn() }),
+  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  fetchProjectSessionIds: () => Promise.resolve([]),
+  PROJECT_LABEL_KEY: "omni_project",
 }));
 
 // Heavy sibling widgets in the sidebar pull their own hooks/providers;
