@@ -615,18 +615,38 @@ function SubagentRow({
             <Icon className="size-3.5 shrink-0 text-muted-foreground" />
             <span className="shrink-0 truncate text-xs font-medium">{primary}</span>
             <span className="flex-1" />
-            
             {isActive ? (
-              <span className="flex items-center gap-1 rounded bg-accent-foreground/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground transition-colors group-hover:bg-accent-foreground/20 group-hover:text-foreground group-focus-visible:bg-accent-foreground/20 group-focus-visible:text-foreground">
-                Return <CornerLeftUpIcon className="size-3" />
+              // The active (current) row doubles as an explicit "go back up
+              // the tree" control: its Link targets the parent, and this
+              // always-visible pill names the action so a child/grandchild
+              // has a discoverable path to its parent from inside the tree —
+              // not only from the header. ``aria-hidden`` keeps it from
+              // double-announcing the Link's own ``aria-label``; the visual
+              // ``title`` tooltip and brand-token styling stay theme-aware.
+              <span
+                aria-hidden="true"
+                title="Return to parent"
+                data-testid="subagent-return-affordance"
+                className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground transition-colors group-hover:bg-accent-foreground/10 group-hover:text-foreground group-focus-visible:bg-accent-foreground/10 group-focus-visible:text-foreground"
+              >
+                Return
+                <CornerLeftUpIcon className="size-3" />
               </span>
             ) : (
               <>
-                <div className="group-hover:hidden group-focus-visible:hidden">
-                  <StatusIndicator {...status} />
-                </div>
-                <span className="hidden items-center gap-1 rounded bg-accent-foreground/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground transition-colors group-hover:flex group-hover:bg-accent-foreground/20 group-hover:text-foreground group-focus-visible:flex group-focus-visible:bg-accent-foreground/20 group-focus-visible:text-foreground">
-                  Open <ArrowRightIcon className="size-3" />
+                <StatusIndicator {...status} />
+                {/* Always-visible "take over" cue: the action is explicit and
+                    discoverable, never inferred from hover alone. The row's
+                    Link carries the accessible "Take over …" name, so this
+                    icon is decorative (``aria-hidden``) with a ``title``
+                    tooltip, and brightens on row hover / keyboard focus. */}
+                <span
+                  aria-hidden="true"
+                  title="Take over"
+                  data-testid="subagent-takeover-affordance"
+                  className="flex shrink-0 items-center text-muted-foreground/70 transition-colors group-hover:text-foreground group-focus-visible:text-foreground"
+                >
+                  <ArrowRightIcon className="size-3.5" />
                 </span>
               </>
             )}

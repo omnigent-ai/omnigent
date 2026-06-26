@@ -1181,4 +1181,53 @@ describe("SubagentsPanel", () => {
     expect(childRow(container, "conv_grandchild").className.split(/\s+/)).toContain("bg-accent");
     expect(childRow(container, "conv_child").className.split(/\s+/)).not.toContain("bg-accent");
   });
+
+  it("exposes an explicit, always-visible 'take over' affordance with an accessible name", () => {
+    // The action must be discoverable, not inferred from hover: the cue is
+    // rendered up-front, the Link carries the accessible action name, and the
+    // row still navigates into the sub-agent.
+    mockChildTree({
+      conv_root: [childInfo({ id: "conv_child", tool: "researcher", session_name: "auth" })],
+    });
+
+    const { container } = renderPanel({ conversationId: "conv_root", rootSessionId: "conv_root" });
+
+    const row = childRow(container, "conv_child");
+    expect(within(row).getByTestId("subagent-takeover-affordance")).toBeInTheDocument();
+    // Status stays visible alongside the affordance (no hover-swap that hides it).
+    expect(within(row).getByTestId("subagent-status-dot")).toBeInTheDocument();
+    expect(row).toHaveAttribute("aria-label", expect.stringMatching(/take over/i));
+    expect(row).toHaveAttribute("href", "/c/conv_child");
+    // A non-active row offers "take over", not "return".
+    expect(within(row).queryByTestId("subagent-return-affordance")).toBeNull();
+  });
+
+  it("turns the active row into a search-clean 'return to parent' control", () => {
+    // From a grandchild, the active row links *up* to its immediate parent —
+    // an in-tree path back, not just the header — while railLinkSearch drops
+    // session-scoped params (?file) and preserves global ones (?debug).
+    mockChildTree({
+      conv_root: [childInfo({ id: "conv_child", tool: "researcher" })],
+      conv_child: [childInfo({ id: "conv_grandchild", tool: "Explore" })],
+    });
+
+    const { container } = renderPanel({
+      conversationId: "conv_grandchild",
+      rootSessionId: "conv_root",
+      initialEntries: ["/c/conv_grandchild?file=foo.txt&debug=1"],
+    });
+
+    const active = childRow(container, "conv_grandchild");
+    expect(active.getAttribute("href")).toBe("/c/conv_child?debug=1");
+    expect(active).toHaveAttribute("aria-label", expect.stringMatching(/return to parent/i));
+    expect(within(active).getByTestId("subagent-return-affordance")).toBeInTheDocument();
+    expect(within(active).queryByTestId("subagent-takeover-affordance")).toBeNull();
+
+    // The (non-active) parent row still navigates *into* its own session and
+    // keeps its take-over affordance.
+    const parentRow = childRow(container, "conv_child");
+    expect(parentRow.getAttribute("href")).toBe("/c/conv_child?debug=1");
+    expect(within(parentRow).getByTestId("subagent-takeover-affordance")).toBeInTheDocument();
+    expect(within(parentRow).queryByTestId("subagent-return-affordance")).toBeNull();
+  });
 });
