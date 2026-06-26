@@ -149,8 +149,6 @@ export interface HostStatus {
   process: "online" | "offline";
   /** The server-reported host tunnel state, e.g. "online", or null. */
   hostStatus: string | null;
-  /** Number of sessions this host is currently running. */
-  sessions: number;
   /** Whether this desktop app started (and owns) the host connection. */
   ownedByDesktop: boolean;
   /** A status error from the CLI, or null. */
@@ -162,7 +160,6 @@ export interface LocalServerStatus {
   running: boolean;
   url: string | null;
   pid: number | null;
-  liveSessions: number;
   /** Whether this desktop app started (and would stop) the local server. */
   ownedByDesktop: boolean;
 }

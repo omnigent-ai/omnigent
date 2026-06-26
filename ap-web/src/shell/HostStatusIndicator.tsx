@@ -52,12 +52,8 @@ function hostDisplay(status: HostStatus, pending: HostControlAction | null): Dis
   if (!status.cliInstalled) statusText = "Omnigent CLI not found";
   else if (stopping) statusText = "Stopping…";
   else if (connecting) statusText = "Connecting…";
-  else if (status.connected) {
-    statusText =
-      status.sessions > 0
-        ? `Connected · ${status.sessions} session${status.sessions === 1 ? "" : "s"}`
-        : "Connected";
-  } else if (status.error) statusText = status.error;
+  else if (status.connected) statusText = "Connected";
+  else if (status.error) statusText = status.error;
   else statusText = "Not hosting";
 
   return {
@@ -80,9 +76,8 @@ function serverDisplay(server: LocalServerStatus, pending: HostControlAction | n
   if (stopping) statusText = "Stopping…";
   else if (pending === "restart") statusText = "Restarting…";
   else if (pending === "start") statusText = "Starting…";
-  else if (server.running) {
-    statusText = server.liveSessions > 0 ? `Running · ${server.liveSessions} active` : "Running";
-  } else statusText = "Stopped";
+  else if (server.running) statusText = "Running";
+  else statusText = "Stopped";
 
   let hint: string | null = null;
   if (stopping) hint = "stopping…";

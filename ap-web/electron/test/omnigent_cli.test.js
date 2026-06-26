@@ -145,7 +145,6 @@ describe("connectionFromStatus", () => {
     assert.equal(conn.connected, true);
     assert.equal(conn.process, "online");
     assert.equal(conn.hostStatus, "online");
-    assert.equal(conn.sessions, 2);
     assert.equal(conn.pid, 1234);
   });
 
@@ -165,7 +164,6 @@ describe("connectionFromStatus", () => {
       connected: false,
       process: "offline",
       hostStatus: null,
-      sessions: 0,
       pid: null,
       error: null,
     });

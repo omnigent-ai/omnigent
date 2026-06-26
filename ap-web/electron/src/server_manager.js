@@ -33,37 +33,6 @@ const hostChildren = new Map();
 /** serverUrl(normalized) -> in-flight ensureHostConnected promise (dedup). */
 const connectingHosts = new Map();
 
-/** serverUrl(normalized) -> last-known session count for an owned host. */
-const ownedSessions = new Map();
-
-/** serverUrl(normalized) currently having their session count refreshed. */
-const sessionRefreshing = new Set();
-
-/**
- * Refresh the session count for an owned host in the background (one query per
- * key at a time), updating the cache and pinging the UI only if it changed. Lets
- * statusFor return an owned host's connected state instantly without blocking on
- * the CLI, while the count catches up shortly after.
- *
- * @param {string} cliPath
- * @param {string} serverUrl
- * @param {string} key Normalized server URL.
- */
-function refreshOwnedSessions(cliPath, serverUrl, key) {
-  if (sessionRefreshing.has(key)) return;
-  sessionRefreshing.add(key);
-  cli
-    .getHostStatus(cliPath, serverUrl)
-    .then((status) => {
-      const { sessions } = cli.connectionFromStatus(status, serverUrl);
-      const changed = ownedSessions.get(key) !== sessions;
-      ownedSessions.set(key, sessions);
-      if (changed) emitChange();
-    })
-    .catch(() => {})
-    .finally(() => sessionRefreshing.delete(key));
-}
-
 /** { url, port, pid } when this app started the local server; null otherwise. */
 let ownedLocalServer = null;
 
@@ -233,7 +202,6 @@ async function connectHost(cliPath, serverUrl, key) {
   spawned.child.on("exit", () => {
     if (hostChildren.get(key)?.child === spawned.child) {
       hostChildren.delete(key);
-      ownedSessions.delete(key);
       emitChange();
     }
   });
@@ -254,7 +222,6 @@ async function disconnectHost(cliPath, serverUrl) {
   const entry = hostChildren.get(key);
   if (entry) {
     hostChildren.delete(key);
-    ownedSessions.delete(key);
     // Await the exit so a follow-up restart spawns fresh rather than adopting
     // the daemon we're tearing down.
     await stopChild(entry.child);
@@ -377,7 +344,6 @@ async function statusFor(cliPath, serverUrl) {
       connected: false,
       process: "offline",
       hostStatus: null,
-      sessions: 0,
       ownedByDesktop: false,
       error: null,
     };
@@ -393,23 +359,19 @@ async function statusFor(cliPath, serverUrl) {
       connected: false,
       process: "online",
       hostStatus: null,
-      sessions: 0,
       ownedByDesktop: true,
       error: null,
     };
   }
   // We own a live host child (saw its "✓ Connected") — report connected
   // instantly without shelling out to the CLI. This is the common case after a
-  // page refresh, where the daemon is already up. The session count is filled
-  // in by a non-blocking background query.
+  // page refresh, where the daemon is already up.
   if (ownsLiveHost(key)) {
-    refreshOwnedSessions(cliPath, serverUrl, key);
     return {
       cliInstalled: true,
       connected: true,
       process: "online",
       hostStatus: "online",
-      sessions: ownedSessions.get(key) ?? 0,
       ownedByDesktop: true,
       error: null,
     };
@@ -444,7 +406,6 @@ async function serverStatusFor(cliPath, serverUrl) {
     running: Boolean(status.running),
     url,
     pid: typeof status.pid === "number" ? status.pid : null,
-    liveSessions: typeof status.live_sessions === "number" ? status.live_sessions : 0,
     ownedByDesktop: Boolean(ownedLocalServer),
   };
 }

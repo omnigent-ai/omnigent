@@ -366,7 +366,6 @@ function matchesServer(daemon, serverUrl) {
  *   connected: boolean,
  *   process: "online" | "offline",
  *   hostStatus: string | null,
- *   sessions: number,
  *   pid: number | null,
  *   error: string | null,
  * }}
@@ -379,7 +378,6 @@ function connectionFromStatus(statusJson, serverUrl) {
       connected: false,
       process: "offline",
       hostStatus: null,
-      sessions: 0,
       pid: null,
       error: null,
     };
@@ -390,7 +388,6 @@ function connectionFromStatus(statusJson, serverUrl) {
     connected: proc === "online" && hostStatus === "online",
     process: proc,
     hostStatus,
-    sessions: Array.isArray(daemon.sessions) ? daemon.sessions.length : 0,
     pid: typeof daemon.pid === "number" ? daemon.pid : null,
     error: typeof daemon.error === "string" ? daemon.error : null,
   };
