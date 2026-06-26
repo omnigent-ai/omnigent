@@ -1000,3 +1000,58 @@ def test_failed_status_event_without_error_falls_back() -> None:
 
     assert "turn failed" in host.text
     assert items
+
+
+def test_waiting_status_notice_renders_alive_line() -> None:
+    """A terminal ``session.status: waiting`` renders an alive notice.
+
+    Regression: idle / waiting / failed shared one branch and only
+    ``failed`` rendered anything, so a ``waiting`` turn tore down exactly
+    like ``idle`` — the spinner vanished with no output and a live
+    session that had merely parked on background work (a sub-agent or
+    async tool still running) looked dead. ``_render_waiting_status_notice``
+    must surface a line that BOTH says the session is still alive and
+    names what it is waiting on, so it can never be confused with a
+    finished ``idle`` turn.
+    """
+    from omnigent_ui_sdk import RichBlockFormatter
+
+    from omnigent.repl._repl import _render_waiting_status_notice
+    from tests.repl.helpers import CapturingHost
+
+    host = CapturingHost()
+
+    items = _render_waiting_status_notice(RichBlockFormatter(), host)  # type: ignore[arg-type]
+
+    # Collapse wrap-induced newlines so the substring checks are
+    # width-independent.
+    text = " ".join(host.text.lower().split())
+    # Reads as the live "waiting" state, not a dead/finished session.
+    assert "waiting" in text
+    assert "alive" in text
+    # Names WHAT it is waiting on (background work).
+    assert "background" in text
+    # Non-empty render -> a ``waiting`` turn is never silent (the point).
+    assert items
+
+
+def test_waiting_status_notice_is_not_an_error() -> None:
+    """The waiting notice reads as alive-and-working, not as a failure.
+
+    ``waiting`` is a healthy, transient state — the parent turn parked on
+    the async-work drain and resumes on its own — so its line must not
+    reuse the ``failed`` error wording, or a normal background wait would
+    read to the user as a turn failure.
+    """
+    from omnigent_ui_sdk import RichBlockFormatter
+
+    from omnigent.repl._repl import _render_waiting_status_notice
+    from tests.repl.helpers import CapturingHost
+
+    host = CapturingHost()
+
+    _render_waiting_status_notice(RichBlockFormatter(), host)  # type: ignore[arg-type]
+
+    text = " ".join(host.text.lower().split())
+    assert "failed" not in text
+    assert "error" not in text

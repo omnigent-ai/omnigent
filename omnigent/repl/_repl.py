@@ -2841,6 +2841,51 @@ def _render_failed_status_error(
     return err_items
 
 
+def _render_waiting_status_notice(
+    fmt: RichBlockFormatter,
+    host: TerminalHost,
+) -> list[FormattedItem]:
+    """
+    Render the "alive, waiting on background work" line for a terminal
+    ``session.status: waiting`` event.
+
+    The runtime emits ``waiting`` when a parent turn ends while
+    dispatched background work is still in flight: the parent loop parks
+    on the async-work drain (``_drain_async_completions(
+    block_for_one=True)`` in ``omnigent/runtime/workflow.py``) until a
+    sub-agent or background tool completes, then a follow-up ``running``
+    resumes the turn. The REPL tears the turn down on the same path as
+    ``idle`` (flush trailing text, stop the spinner, signal turn-done),
+    so without this line the spinner just vanishes and a live, waiting
+    session is indistinguishable from a finished ``idle`` one — it looks
+    dead even though it will resume on its own.
+
+    This writes a themed notice that both states the session is still
+    alive and names what it is waiting on. The wire event carries no
+    finer-grained reason (only ``status`` / ``response_id`` / ``error``,
+    and ``error`` is ``None`` for ``waiting``), so the message describes
+    the documented cause — background work — rather than guessing; a more
+    specific reason should be surfaced here if the schema ever carries
+    one.
+
+    :param fmt: The active block formatter; supplies the theme styles
+        (``fmt.warning`` for the label, ``fmt.muted`` for the detail) so
+        the notice honors the active light/dark theme.
+    :param host: The terminal host the notice is written to.
+    :returns: The single-item list written to the host (for debug-tape
+        recording by the caller); never empty, so a ``waiting`` turn is
+        never silent.
+    """
+    notice = Text.from_markup(
+        f"  [{fmt.warning}]⏳ waiting[/{fmt.warning}] "
+        f"[{fmt.muted}]— a sub-agent or background task is still running; "
+        f"the session is alive and resumes automatically when it "
+        f"finishes.[/{fmt.muted}]"
+    )
+    host.output(notice)
+    return [notice]
+
+
 async def run_repl(
     client: OmnigentClient,
     agent_name: str,
@@ -3226,18 +3271,37 @@ async def run_repl(
             elif event.status in ("idle", "waiting", "failed"):
                 from omnigent_client import TextDone
 
-                # A SETUP-phase failure (spec resolution, spawn-env
-                # build) ends the turn before the LLM stream starts, so
-                # no response.failed / ErrorEvent ever arrives — the only
-                # signal is this terminal ``failed`` status. Render its
-                # error message as an error line; without this the turn
-                # ends silently and the user sees the spinner vanish with
-                # no output. The helper falls back to a generic message
-                # when the event carries no error detail.
+                # idle / waiting / failed all reach the same turn-teardown
+                # tail below (flush trailing text, stop the spinner, signal
+                # turn-done, refresh the context ring), but they must NOT
+                # read the same to the user, so each gets its own leading
+                # line first:
+                #
+                # * ``failed`` -> a red error line. A SETUP-phase failure
+                #   (spec resolution, spawn-env build) ends the turn before
+                #   the LLM stream starts, so no response.failed / ErrorEvent
+                #   ever arrives — this terminal status is the only signal;
+                #   without the line the spinner vanishes silently. The helper
+                #   falls back to a generic message when no error is carried.
+                # * ``waiting`` -> a muted "still alive, working in the
+                #   background" notice. The parent turn parked on the
+                #   async-work drain (a sub-agent or background tool is still
+                #   running) and resumes on its own; without a line it is
+                #   indistinguishable from a dead ``idle`` session.
+                # * ``idle`` -> nothing extra: the turn is done and the input
+                #   prompt returns, which is the conventional "ready" signal;
+                #   a per-turn idle banner would be noise on every response.
+                #
+                # Only the representation differs here — the underlying status
+                # semantics and the teardown tail are unchanged.
                 if event.status == "failed":
                     err_items = _render_failed_status_error(fmt, host, event)
                     if tape_entry is not None and err_items:
                         _event_tape.mark_rendered(tape_entry, len(err_items))  # type: ignore[union-attr]
+                elif event.status == "waiting":
+                    wait_items = _render_waiting_status_notice(fmt, host)
+                    if tape_entry is not None and wait_items:
+                        _event_tape.mark_rendered(tape_entry, len(wait_items))  # type: ignore[union-attr]
 
                 items_out = list(
                     fmt.format_text_done(TextDone(full_text="", has_code_blocks=False))
