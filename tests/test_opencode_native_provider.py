@@ -15,10 +15,29 @@ from omnigent.opencode_native_provider import (
     OpenCodeGatewayResolution,
     _gateway_endpoint_for_model,
     build_opencode_model_default_config,
+    build_opencode_omnigent_mcp_server,
     build_opencode_provider_config,
     resolve_databricks_gateway,
     write_opencode_provider_config,
 )
+
+
+def test_build_omnigent_mcp_server_points_serve_mcp_at_bridge_dir() -> None:
+    block = build_opencode_omnigent_mcp_server(Path("/tmp/bridge-xyz"))
+    assert set(block) == {"omnigent"}
+    entry = block["omnigent"]
+    assert entry["type"] == "local"
+    assert entry["enabled"] is True
+    cmd = entry["command"]
+    # Launches the SHARED serve-mcp relay, pointed at THIS bridge dir.
+    assert cmd[-3:] == ["serve-mcp", "--bridge-dir", "/tmp/bridge-xyz"]
+    assert "omnigent.claude_native_bridge" in cmd
+    assert entry.get("environment", {}).get("PYTHONUNBUFFERED") == "1"
+
+
+def test_build_omnigent_mcp_server_honors_python_executable() -> None:
+    block = build_opencode_omnigent_mcp_server(Path("/tmp/b"), python_executable="/custom/python")
+    assert block["omnigent"]["command"][0] == "/custom/python"
 
 
 def test_build_model_default_config_pins_model_without_provider_block() -> None:
@@ -138,3 +157,70 @@ def test_resolve_gateway_defaults_non_gateway_model(monkeypatch: pytest.MonkeyPa
 def test_resolve_gateway_none_when_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token=None)
     assert resolve_databricks_gateway("oss") is None
+
+
+def test_build_mcp_block_stdio_and_http() -> None:
+    from types import SimpleNamespace as N
+
+    from omnigent.opencode_native_provider import build_opencode_mcp_block
+
+    servers = [
+        N(
+            name="gh",
+            transport="stdio",
+            command="npx",
+            args=["-y", "server-github"],
+            env={"GITHUB_TOKEN": "x"},
+            url=None,
+            headers={},
+            databricks_profile=None,
+        ),
+        N(
+            name="remote",
+            transport="http",
+            url="https://mcp.example/sse",
+            headers={"X-Key": "k"},
+            databricks_profile=None,
+            command=None,
+            args=[],
+            env={},
+        ),
+        # Unrepresentable (stdio without a command) → skipped.
+        N(name="bad", transport="stdio", command=None, args=[], env={}, url=None, headers={}),
+    ]
+    block = build_opencode_mcp_block(servers)
+    assert set(block) == {"gh", "remote"}
+    assert block["gh"] == {
+        "type": "local",
+        "command": ["npx", "-y", "server-github"],
+        "enabled": True,
+        "environment": {"GITHUB_TOKEN": "x"},
+    }
+    assert block["remote"] == {
+        "type": "remote",
+        "url": "https://mcp.example/sse",
+        "enabled": True,
+        "headers": {"X-Key": "k"},
+    }
+
+
+def test_build_mcp_block_http_databricks_injects_bearer(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace as N
+
+    import omnigent.opencode_native_provider as prov
+
+    monkeypatch.setattr(prov, "_databricks_bearer_token", lambda _p: "tok123")
+    servers = [
+        N(
+            name="dbx",
+            transport="http",
+            url="https://ws/mcp",
+            headers={},
+            databricks_profile="oss",
+            command=None,
+            args=[],
+            env={},
+        )
+    ]
+    block = prov.build_opencode_mcp_block(servers)
+    assert block["dbx"]["headers"] == {"Authorization": "Bearer tok123"}

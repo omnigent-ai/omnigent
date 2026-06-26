@@ -3919,6 +3919,45 @@ def _spawn_native_approval_popup_forward(
     task.add_done_callback(_native_popup_forward_tasks.discard)
 
 
+def _spawn_native_blocked_notice_forward(
+    session_id: str, message: str, policy_name: str | None = None
+) -> None:
+    """
+    Ask the bound runner to pop an INFORMATIONAL hard-block notice on the pane.
+
+    The request-phase HARD-DENY counterpart of
+    :func:`_spawn_native_approval_popup_forward`: no approve/decline (the prompt
+    is blocked). opencode can only hard-block a prompt by its policy plugin
+    throwing, which opencode renders as a generic "Unexpected server error";
+    this forwards the policy reason so the runner can surface it as a dismissable
+    tmux popup on the opencode pane. Fire-and-forget; the runner dispatch is
+    harness-gated (only ``opencode-native`` pops — claude/codex already show a
+    clean ``UserPromptSubmit`` block, so they no-op).
+
+    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
+    :param message: The block reason shown in the popup.
+    :param policy_name: Deciding policy, rendered as the popup header. ``None``
+        falls back to a generic header on the runner.
+    :returns: None. Forwarding failures (runner offline / none bound) are
+        swallowed and never affect the verdict.
+    """
+
+    async def _forward() -> None:
+        await _forward_session_change_to_runner(
+            session_id,
+            _server_runner_router,
+            {
+                "type": "policy_blocked_notice",
+                "message": message,
+                "policy_name": policy_name,
+            },
+        )
+
+    task = asyncio.create_task(_forward())
+    _native_popup_forward_tasks.add(task)
+    task.add_done_callback(_native_popup_forward_tasks.discard)
+
+
 async def _hold_native_ask_gate(
     request: Request,
     *,
@@ -9739,10 +9778,15 @@ _FORK_HISTORY_NATIVE_HARNESSES: frozenset[str] = frozenset(
 
 # Native harnesses that carry FORK history as a text preamble (text-prefix
 # replay) instead of a rebuilt transcript. Fork-only — switch-agent does not
-# use this set, so switching into cursor still launches fresh. The runner
-# branches on the harness to choose preamble vs transcript rebuild (see
-# _auto_create_cursor_terminal / cursor_native_executor).
-_CURSOR_FORK_HISTORY_HARNESSES: frozenset[str] = frozenset({"cursor-native", "native-cursor"})
+# use this set, so switching into one still launches fresh. The runner branches
+# on the harness to choose preamble vs transcript rebuild (see
+# _auto_create_cursor_terminal / cursor_native_executor and the opencode
+# resume/fork rehydration in _auto_create_opencode_terminal). opencode-native
+# joins cursor here: opencode has no history-import API, so a fork seeds prior
+# context as a noReply preamble rather than a rebuilt session.
+_CURSOR_FORK_HISTORY_HARNESSES: frozenset[str] = frozenset(
+    {"cursor-native", "native-cursor", "opencode-native", "native-opencode"}
+)
 
 
 def _agent_carries_native_fork_history(agent: Agent) -> bool:
@@ -9775,16 +9819,17 @@ def _agent_carries_native_fork_history(agent: Agent) -> bool:
 
 
 def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
-    """Return whether *agent* is cursor-native (carries FORK history via preamble).
+    """Return whether *agent*'s native harness carries FORK history via preamble.
 
-    Cursor's conversation is server-backed, so a fork can't seed a local store
-    for ``--resume``; instead the runner replays the prior turns as a text
-    preamble on the fork's first message. Fork-only — switch-agent does not call
-    this, so switching into cursor still launches fresh. Returns ``False`` when
-    the bundle can't be loaded.
+    Cursor's conversation is server-backed and opencode has no history-import
+    API, so neither can seed a local store for a rebuilt resume; instead the
+    runner replays prior turns as a text preamble on the fork (cursor: the
+    first message; opencode: a ``noReply`` context message). Fork-only —
+    switch-agent does not call this, so switching into one still launches fresh.
+    Returns ``False`` when the bundle can't be loaded.
 
     :param agent: The agent whose harness to classify.
-    :returns: ``True`` only for the cursor-native harness (either spelling).
+    :returns: ``True`` for the cursor-native / opencode-native harnesses.
     """
     from omnigent.harness_aliases import canonicalize_harness
 
@@ -10013,7 +10058,7 @@ def _build_actor(user_id: str | None) -> dict[str, str] | None:
 
 def _build_evaluation_context(
     phase: Phase,
-    data: dict[str, Any],
+    data: dict[str, Any] | str,
     event: dict[str, Any],
     *,
     actor: dict[str, str] | None = None,
@@ -10091,8 +10136,18 @@ def _build_evaluation_context(
             model=hook_model,
             harness=hook_harness,
         )
-    # REQUEST / RESPONSE — content is the user/assistant text.
-    text = data.get("text") or data.get("content") or str(data)
+    # REQUEST / RESPONSE — content is the user/assistant text. The wire ``data``
+    # is a dict for the native command hooks (``{"text"|"content": ...}``), but
+    # may be a bare string — opencode's policy plugin sends the prompt text
+    # directly for ``PHASE_REQUEST``. Accept both, and NEVER raise here: a crash
+    # 500s the evaluate endpoint, which silently fails the request/result gate
+    # OPEN (the exact symptom that let cost-over-budget terminal prompts through).
+    if isinstance(data, str):
+        text = data
+    elif isinstance(data, dict):
+        text = data.get("text") or data.get("content") or str(data)
+    else:
+        text = str(data)
     return EvaluationContext(
         phase=phase,
         content=text if isinstance(text, str) else json.dumps(text),
@@ -15414,6 +15469,15 @@ def create_sessions_router(
             resp_body["reason"] = result.reason
         if result.data is not None:
             resp_body["data"] = result.data
+        # A request-phase HARD DENY (no approve option) — surface the reason as a
+        # dismissable tmux popup on the native pane. opencode hard-blocks the
+        # prompt by its plugin throwing (rendered as a generic error), so this is
+        # the clean explanation; the runner dispatch only pops for opencode
+        # (claude/codex already show a clean UserPromptSubmit block). Best-effort.
+        if result.action == PolicyAction.DENY and phase == Phase.REQUEST and not is_read_only:
+            _spawn_native_blocked_notice_forward(
+                session_id, result.reason or "Blocked by policy.", result.deciding_policy
+            )
         return Response(
             content=json.dumps(resp_body),
             media_type="application/json",

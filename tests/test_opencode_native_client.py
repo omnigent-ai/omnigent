@@ -247,3 +247,98 @@ async def test_request_json_http_error_raises() -> None:
     with pytest.raises(OpenCodeClientError):
         await client.list_messages("ses_1")
     await client.aclose()
+
+
+async def test_summarize_posts_v1_endpoint_with_model() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=True)
+
+    client = _client(handler)
+    assert await client.summarize("ses_1", provider_id="anthropic", model_id="claude-sonnet-4-5")
+    assert seen["method"] == "POST"
+    assert seen["path"] == "/session/ses_1/summarize"
+    assert seen["body"] == {"providerID": "anthropic", "modelID": "claude-sonnet-4-5"}
+    await client.aclose()
+
+
+async def test_summarize_raises_on_error() -> None:
+    client = _client(lambda _r: httpx.Response(503, json={"error": "compact not available"}))
+    with pytest.raises(OpenCodeClientError):
+        await client.summarize("ses_1", provider_id="opencode", model_id="big-pickle")
+    await client.aclose()
+
+
+async def test_seed_context_posts_noreply_message() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"info": {"id": "msg_1"}})
+
+    client = _client(handler)
+    assert await client.seed_context("ses_1", "prior context", provider_id="p", model_id="m")
+    assert seen["path"] == "/session/ses_1/message"
+    body = seen["body"]
+    assert body["noReply"] is True
+    assert body["parts"] == [{"type": "text", "text": "prior context"}]
+    assert body["model"] == {"providerID": "p", "modelID": "m"}
+    await client.aclose()
+
+
+async def test_seed_context_omits_model_when_absent() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    client = _client(handler)
+    assert await client.seed_context("ses_1", "ctx")
+    assert "model" not in seen["body"]
+    await client.aclose()
+
+
+async def test_reply_question_posts_global_endpoint() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=True)
+
+    client = _client(handler)
+    assert await client.reply_question("que_1", [["Tabs"]])
+    assert seen["method"] == "POST"
+    # GLOBAL /question path (NOT session-scoped) — live-verified.
+    assert seen["path"] == "/question/que_1/reply"
+    assert seen["body"] == {"answers": [["Tabs"]]}
+    await client.aclose()
+
+
+async def test_reply_question_raises_on_error() -> None:
+    client = _client(lambda _r: httpx.Response(404, json={"error": "unknown question"}))
+    with pytest.raises(OpenCodeClientError):
+        await client.reply_question("que_x", [["A"]])
+    await client.aclose()
+
+
+async def test_reject_question_posts_global_endpoint() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        return httpx.Response(200, json=True)
+
+    client = _client(handler)
+    assert await client.reject_question("que_1")
+    assert seen["method"] == "POST"
+    assert seen["path"] == "/question/que_1/reject"
+    await client.aclose()

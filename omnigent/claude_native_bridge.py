@@ -186,9 +186,10 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     Return the trusted parent for an allowed bridge directory.
 
     Claude-native files live below the uid-scoped temp bridge root.
-    Codex-, Cursor-, and Qwen-native reuse the relay/MCP implementation but keep
-    bridge files below their own bridge roots. All roots use the same
-    owner-only ancestor validation; only the trusted anchor differs.
+    Codex-, Cursor-, Qwen-, Hermes-, Antigravity-, and OpenCode-native reuse the
+    relay/MCP implementation but keep bridge files below their own bridge roots.
+    All roots use the same owner-only ancestor validation; only the trusted
+    anchor differs.
 
     :param target: Normalized bridge directory path being created or validated,
         e.g. ``Path("/tmp/omnigent-501/claude-native/abc")``.
@@ -253,10 +254,25 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
         # bridge-owned directories below it.
         return _absolute_syntactic_path(hermes_root.parent.parent)
 
+    from omnigent.opencode_native_bridge import bridge_root as opencode_bridge_root
+
+    # opencode-native keeps its bridge files below ``~/.omnigent/opencode-native``
+    # (the same ``$HOME/.omnigent/<harness>-native`` shape codex/antigravity use),
+    # so apply the identical anchor logic: in production trust ``$HOME`` and
+    # validate/chmod the two bridge-owned dirs below it (``.omnigent`` and
+    # ``opencode-native``); in tests the monkeypatched root may differ, so trust
+    # the direct parent.
+    opencode_root = _absolute_syntactic_path(opencode_bridge_root())
+    if target.is_relative_to(opencode_root):
+        trusted_parent = opencode_root.parent
+        if opencode_root.name == "opencode-native" and opencode_root.parent.name == ".omnigent":
+            trusted_parent = opencode_root.parent.parent
+        return _absolute_syntactic_path(trusted_parent)
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, "
-        f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s})"
+        f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s})"
     )
 
 

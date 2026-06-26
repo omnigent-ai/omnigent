@@ -298,6 +298,96 @@ class OpenCodeClient:
         data = await self._request_json("POST", f"/session/{session_id}/abort")
         return bool(data)
 
+    async def summarize(self, session_id: str, *, provider_id: str, model_id: str) -> bool:
+        """
+        Compact a session in place (``POST /session/{id}/summarize``).
+
+        opencode summarizes the session with the given model and emits a
+        ``session.compacted`` event when done. (The v2
+        ``POST /api/session/{id}/compact`` endpoint returns ``503 "Session
+        compact is not available yet"`` in 1.17.x — verified against a live
+        ``opencode serve`` — so this uses the v1 ``/summarize`` path, which
+        requires the model explicitly.)
+
+        :param session_id: OpenCode session id.
+        :param provider_id: Provider id for the compaction model, e.g.
+            ``"anthropic"``.
+        :param model_id: Model id for the compaction model, e.g.
+            ``"claude-sonnet-4-5"``.
+        :returns: ``True`` once opencode has accepted the compaction request.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        await self._request_json(
+            "POST",
+            f"/session/{session_id}/summarize",
+            json={"providerID": provider_id, "modelID": model_id},
+        )
+        return True
+
+    async def seed_context(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+    ) -> bool:
+        """
+        Inject a context message without triggering a reply (``noReply``).
+
+        Used to rehydrate a fresh session with prior conversation context on a
+        cross-host resume (opencode has no history-import API). ``noReply``
+        admits the message as history without running a model turn.
+
+        :param session_id: OpenCode session id.
+        :param text: The context text to seed (e.g. the prior transcript).
+        :param provider_id: Optional model provider (opencode requires only
+            ``parts``, but a model keeps the seeded message attributed).
+        :param model_id: Optional model id.
+        :returns: ``True`` once opencode has accepted the message.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        body: dict[str, Any] = {"parts": [{"type": "text", "text": text}], "noReply": True}
+        if provider_id and model_id:
+            body["model"] = {"providerID": provider_id, "modelID": model_id}
+        await self._request_json("POST", f"/session/{session_id}/message", json=body)
+        return True
+
+    async def reply_question(self, request_id: str, answers: list[list[str]]) -> bool:
+        """
+        Answer a ``question`` tool request (``POST /question/{id}/reply``).
+
+        The opencode ``question`` tool blocks until answered. ``answers`` is one
+        entry per question, each a list of the selected option labels (single
+        choice → a one-element list). Verified live against ``opencode serve``
+        1.17.7: ``{"answers": [["Tabs"]]}`` resolves the question (emits
+        ``question.replied`` → ``session.idle``). The GLOBAL ``/question`` path
+        is used (the session-scoped one is not an API route).
+
+        :param request_id: OpenCode question request id (``que_…``).
+        :param answers: Selected labels per question, in question order.
+        :returns: ``True`` on a 2xx response.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        await self._request_json(
+            "POST", f"/question/{request_id}/reply", json={"answers": answers}
+        )
+        return True
+
+    async def reject_question(self, request_id: str) -> bool:
+        """
+        Reject a ``question`` tool request (``POST /question/{id}/reject``).
+
+        Unblocks the opencode ``question`` tool without an answer (the tool
+        reports the question was declined).
+
+        :param request_id: OpenCode question request id (``que_…``).
+        :returns: ``True`` on a 2xx response.
+        :raises OpenCodeClientError: On a non-2xx status.
+        """
+        await self._request_json("POST", f"/question/{request_id}/reject")
+        return True
+
     async def fork(
         self, session_id: str, payload: Mapping[str, Any] | None = None
     ) -> OpenCodeSession:

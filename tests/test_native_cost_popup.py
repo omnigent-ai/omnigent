@@ -348,3 +348,58 @@ def test_wait_for_tmux_client_times_out_when_no_client(
     # timeout_s=0.0 → the deadline has already passed, so it returns without
     # sleeping (keeps the test fast and free of time.sleep).
     assert native_cost_popup.wait_for_tmux_client("/tmp/x.sock", "main", timeout_s=0.0) is False
+
+
+def test_main_notice_mode_needs_no_config_and_no_resolve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--notice`` shows a hard-block reason and exits 0 without any server call.
+
+    The hard-DENY path (e.g. an opencode cost cap) has nothing to resolve — it
+    must not require the AP-routing config and must not POST a verdict.
+    """
+    posted: list[Any] = []
+    monkeypatch.setattr(request, "urlopen", lambda *a, **k: posted.append(a))  # type: ignore[arg-type]
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "")
+    rc = native_cost_popup.main(
+        ["--notice", "--message", "You've hit the $0.0001 budget.", "--policy-name", "cost-budget"]
+    )
+    assert rc == 0
+    assert posted == [], "notice mode must not POST a resolution"
+
+
+def test_launch_blocked_notice_spawns_notice_popup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``launch_blocked_notice`` pops a ``--notice`` popup (no config/elicitation)."""
+    monkeypatch.setattr(native_cost_popup, "_list_tmux_clients", lambda _s, _t: ["/dev/pts/9"])
+    spawned: list[list[str]] = []
+
+    class _FakePopen:
+        def __init__(self, cmd: list[str], **_kw: Any) -> None:
+            spawned.append(cmd)
+
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    native_cost_popup.launch_blocked_notice(
+        "/tmp/x.sock", "main", message="over budget", policy_name="cost-budget"
+    )
+    assert len(spawned) == 1
+    inner = spawned[0][-1]  # the shell-string passed to display-popup
+    assert "--notice" in inner and "over budget" in inner
+    assert "--config-file" not in inner and "--elicitation-id" not in inner
+
+
+def test_launch_blocked_notice_skips_without_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No attached client → nothing to render on → no popup spawned."""
+    monkeypatch.setattr(native_cost_popup, "_list_tmux_clients", lambda _s, _t: [])
+    import subprocess
+
+    def _boom(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("must not spawn a popup with no client")
+
+    monkeypatch.setattr(subprocess, "Popen", _boom)
+    native_cost_popup.launch_blocked_notice("/tmp/x.sock", "main", message="x")
