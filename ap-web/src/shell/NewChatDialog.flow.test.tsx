@@ -527,6 +527,76 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.terminal_launch_args).toEqual(["--permission-mode", "bypassPermissions"]);
   });
 
+  it("seeds the permission mode from the last pick for claude-native on a new session", async () => {
+    // A returning user's last pick for this harness is on record; the new
+    // session must auto-fill it (the "Mode:" pill reflects it) and post it
+    // WITHOUT the user re-opening the pill.
+    localStorage.setItem(
+      "omnigent:last-mode-by-harness",
+      JSON.stringify({ "claude-native": "plan" }),
+    );
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_native" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // Seeded without touching the pill — the label proves the state was
+    // pre-filled from storage.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-permission-pill").textContent).toContain("Plan"),
+    );
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.terminal_launch_args).toEqual(["--permission-mode", "plan"]);
+  });
+
+  it("persists the picked permission mode for claude-native so the next session seeds it", async () => {
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_native" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-pill"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-permission-acceptEdits"));
+
+    // The pick is snapshotted under the harness key immediately, so the next
+    // visit can seed from it.
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem("omnigent:last-mode-by-harness") ?? "{}")).toEqual({
+        "claude-native": "acceptEdits",
+      }),
+    );
+  });
+
+  it("does not leak one harness's mode onto another harness's pill", async () => {
+    // Codex has a pick on record; selecting Claude Code (no pick) must stay on
+    // its default — modes are keyed per harness, not shared.
+    localStorage.setItem(
+      "omnigent:last-mode-by-harness",
+      JSON.stringify({ "codex-native": "full-access" }),
+    );
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // Claude Code has no stored pick → default; Codex's "Full access" must not
+    // bleed into the permission pill.
+    expect(screen.getByTestId("new-chat-landing-permission-pill").textContent).toContain("Default");
+    expect(screen.getByTestId("new-chat-landing-permission-pill").textContent).not.toContain(
+      "Full access",
+    );
+  });
+
   it("omits terminal_launch_args when permission mode is left at default for claude-native", async () => {
     setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
