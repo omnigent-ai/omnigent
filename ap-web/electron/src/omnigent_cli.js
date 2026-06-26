@@ -137,24 +137,62 @@ function isPidAlive(pid) {
 }
 
 /**
- * Local-server status read straight from the pidfile + a pid-liveness check —
- * no `omnigent server status` subprocess, so it's instant. Returns null when no
- * live local server is recorded. The CLI additionally probes `/health`; pid
- * liveness is enough to drive the sidebar quickly (and you can only be viewing
- * the page if the server is actually up).
+ * Read + parse the local-server pidfile. Returns { pid, port } or null.
  *
- * @returns {{ running: true, url: string, pid: number, port: number } | null}
+ * @returns {{ pid: number, port: number } | null}
  */
-function localServerStatus() {
+function readLocalServerPidfile() {
   let text;
   try {
     text = fs.readFileSync(path.join(localDataDir(), "local_server.pid"), "utf8");
   } catch {
     return null;
   }
-  const rec = parseLocalServerPidfile(text);
+  return parseLocalServerPidfile(text);
+}
+
+/**
+ * Local-server status from the pidfile + a pid-liveness check — no `omnigent
+ * server status` subprocess, so it's instant. Returns null when no live local
+ * server is recorded.
+ *
+ * Liveness only (no `/health`): a dead/cleared pidfile correctly reports null,
+ * but a stale pidfile whose pid happens to be alive (reused/hung) would report
+ * running. That's acceptable for the sidebar row, which is only shown when this
+ * port matches the server the window is already connected to — so a server is
+ * provably up there. Decisions made WITHOUT that guarantee (e.g. reusing a
+ * server before navigating) must use {@link localServerHealthy} instead.
+ *
+ * @returns {{ running: true, url: string, pid: number, port: number } | null}
+ */
+function localServerStatus() {
+  const rec = readLocalServerPidfile();
   if (!rec || !isPidAlive(rec.pid)) return null;
   return { running: true, url: `http://127.0.0.1:${rec.port}`, pid: rec.pid, port: rec.port };
+}
+
+/**
+ * Health-verified local-server lookup: pidfile + pid liveness + a `/health`
+ * probe (short timeout), mirroring `local_server_url_if_healthy()` in
+ * omnigent/host/local_server.py. Returns null for a stale pidfile (dead pid, a
+ * reused pid with nothing listening → connection refused fast, or a hung server
+ * → times out). Use this before reusing a server you're about to navigate to,
+ * so a stale pidfile doesn't send the window to a dead URL.
+ *
+ * @param {number} [timeoutMs]
+ * @returns {Promise<{ url: string, pid: number, port: number } | null>}
+ */
+async function localServerHealthy(timeoutMs = 1500) {
+  const rec = readLocalServerPidfile();
+  if (!rec || !isPidAlive(rec.pid)) return null;
+  const url = `http://127.0.0.1:${rec.port}`;
+  try {
+    const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (resp.ok) return { url, pid: rec.pid, port: rec.port };
+  } catch {
+    // Refused / unreachable / timed out → not a healthy server we can reuse.
+  }
+  return null;
 }
 
 /**
@@ -474,7 +512,9 @@ module.exports = {
   sameLoopbackServer,
   parseLocalServerPidfile,
   isPidAlive,
+  readLocalServerPidfile,
   localServerStatus,
+  localServerHealthy,
   candidatePaths,
   isExecutableFile,
   whichOmnigent,

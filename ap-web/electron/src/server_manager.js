@@ -288,11 +288,13 @@ function stopChild(child) {
  * @returns {Promise<{ ok: boolean, url?: string, alreadyRunning?: boolean, error?: string }>}
  */
 async function startLocalServer(cliPath) {
-  // Reuse a server that's already running via the instant pidfile read (no
-  // `omnigent server status` subprocess), so "Run locally" returns immediately
-  // when there's already a local server — instead of paying a Python cold start
-  // on every click. We didn't start it, so don't claim ownership.
-  const existing = cli.localServerStatus();
+  // Reuse a server that's already running — but health-verify it (pidfile +
+  // pid + /health), not just pid-liveness, since we're about to navigate the
+  // window to this URL: a stale pidfile (dead/reused pid, hung server) must NOT
+  // be reused or we'd send the window to a dead URL. Still far faster than
+  // `omnigent server status` (a Python cold start). We didn't start it, so no
+  // ownership claim.
+  const existing = await cli.localServerHealthy();
   if (existing) {
     return { ok: true, url: existing.url, alreadyRunning: true };
   }
