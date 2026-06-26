@@ -21,12 +21,7 @@ def _cwd_escapes_workspace(spec_cwd: str) -> bool:
     ``copytree`` source, exposing the host filesystem.
     """
     posix, win = PurePosixPath(spec_cwd), PureWindowsPath(spec_cwd)
-    return (
-        posix.is_absolute()
-        or win.is_absolute()
-        or ".." in posix.parts
-        or ".." in win.parts
-    )
+    return posix.is_absolute() or win.is_absolute() or ".." in posix.parts or ".." in win.parts
 
 
 def validate_agent_bundle(
@@ -101,8 +96,10 @@ def validate_agent_bundle(
     if enforce_handler_allowlist:
         os_env = getattr(spec, "os_env", None)
         spec_cwd = getattr(os_env, "cwd", None) if os_env is not None else None
-        if spec_cwd is not None and spec_cwd not in (".", "./") and _cwd_escapes_workspace(
-            spec_cwd
+        if (
+            spec_cwd is not None
+            and spec_cwd not in (".", "./")
+            and _cwd_escapes_workspace(spec_cwd)
         ):
             raise OmnigentError(
                 "agent os_env.cwd must be a relative path within the workspace "

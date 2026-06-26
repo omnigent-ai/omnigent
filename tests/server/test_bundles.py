@@ -315,9 +315,7 @@ def _bundle_with_cwd(cwd: str) -> bytes:
     )
 
 
-@pytest.mark.parametrize(
-    "bad_cwd", ["/", "/etc", "/etc/passwd", "../../etc", "a/../../b"]
-)
+@pytest.mark.parametrize("bad_cwd", ["/", "/etc", "/etc/passwd", "../../etc", "a/../../b"])
 def test_validate_agent_bundle_rejects_escaping_os_env_cwd(bad_cwd: str) -> None:
     """An uploaded bundle may not pin an absolute or ``..``-escaping cwd.
 
