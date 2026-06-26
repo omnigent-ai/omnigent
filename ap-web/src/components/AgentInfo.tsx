@@ -1094,15 +1094,17 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
                 <PopoverContent
                   side="top"
                   align="start"
-                  className="w-64"
+                  className="max-w-72"
                   onClick={(e) => e.stopPropagation()}
                 >
                   <div className="flex flex-col gap-2">
                     <div className="flex items-center gap-1.5">
                       <ShieldCheckIcon className="size-3.5 text-muted-foreground" />
-                      <span className="font-medium text-sm">{p.name}</span>
+                      <span className="min-w-0 break-all font-medium text-sm">{p.name}</span>
                     </div>
-                    {description && <p className="text-xs text-muted-foreground">{description}</p>}
+                    {description && (
+                      <p className="break-words text-xs text-muted-foreground">{description}</p>
+                    )}
                     <button
                       type="button"
                       onClick={() => p.id && deletePolicy.mutate(p.id)}
