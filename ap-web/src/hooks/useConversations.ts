@@ -422,6 +422,11 @@ export function useStopAndDeleteConversation() {
       }
       queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
       queryClient.removeQueries({ queryKey: ["session", id] });
+      // Deleting the last member of a project empties it, so refresh the
+      // project list to drop the now-empty folder. Unlike the conversations
+      // list, /v1/sessions/projects reads the DB directly (no search-index
+      // lag), so this can't resurrect the deleted row.
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
   });
 }
@@ -533,6 +538,9 @@ export function useBulkDeleteConversations() {
         queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
         queryClient.removeQueries({ queryKey: ["session", id] });
       }
+      // Refresh the project list so a project emptied by these deletes drops
+      // its now-empty folder (DB-direct read, no search-index lag).
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
     onError: (err: any) => {
       if (err?.succeeded) {
@@ -549,6 +557,7 @@ export function useBulkDeleteConversations() {
           queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
           queryClient.removeQueries({ queryKey: ["session", id] });
         }
+        void queryClient.invalidateQueries({ queryKey: ["projects"] });
       }
     },
   });

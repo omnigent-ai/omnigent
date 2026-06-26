@@ -364,19 +364,21 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     expect(queryClient.getQueryData(["session", "conv_x"])).toBeUndefined();
   });
 
-  it("does not refetch the list (no invalidation)", async () => {
+  it("does not refetch the conversations list, but does refresh the project list", async () => {
     const { queryClient, rendered } = seedAndDelete();
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
 
     rendered.result.current.mutate({ id: "conv_x" });
     await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
 
-    // An immediate refetch races the server's async search-index reindex
-    // of the delete and can resurrect the just-deleted row (the bug this
-    // hook shape fixes) — the only network calls allowed are the stop
-    // and the DELETE themselves.
-    expect(invalidateSpy).not.toHaveBeenCalled();
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // An immediate conversations refetch races the server's async search-index
+    // reindex of the delete and can resurrect the just-deleted row (the bug
+    // this hook shape fixes) — so the list is patched in place, never
+    // invalidated.
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    // The project list IS refreshed (DB-direct, no reindex race) so a project
+    // emptied by the delete drops its now-empty folder without a reload.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
   });
 });
 
