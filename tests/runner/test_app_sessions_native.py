@@ -3425,11 +3425,12 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     * the relay starter (``ensure_comment_relay``) is invoked for THIS session's
       bridge dir before launch, so its ``tool_relay.json`` is on disk when agy
       first scans the MCP server;
-    * the relay ``mcp_config.json`` is written into the per-session ISOLATED agy
-      HOME (``<bridge_dir>/agy-home/.gemini/config``), NOT the user's real
+    * the relay ``mcp_config.json`` is written into the per-session isolated agy
+      Gemini dir (``<bridge_dir>/agy-home/.gemini/config``), NOT the user's real
       ``~/.gemini`` — the config-scoping footgun the design avoids;
-    * the launch env carries ``HOME`` = that isolated home, so agy actually loads
-      the bridge-scoped config (and never the user's interactive agy config).
+    * the launch args carry ``--gemini_dir=<isolated .gemini>`` while the launch
+      env does not override ``HOME``, so agy keeps platform auth such as macOS
+      Keychain but loads the bridge-scoped config.
     """
     import omnigent.antigravity_native_bridge as bridge_mod
     import omnigent.antigravity_native_launch as launch_mod
@@ -3448,8 +3449,8 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: (None, None))
     monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", list)
 
-    # Capture the env build_agy_launch starts from so we can assert HOME is layered
-    # on top of it (the launch env is the captured spec's ``env`` below).
+    # Capture the env build_agy_launch starts from so we can assert it is preserved
+    # without a HOME override (the launch env is the captured spec's ``env`` below).
     monkeypatch.setattr(
         launch_mod, "build_agy_launch", lambda **_kwargs: (("agy",), {"AGY_ENV": "1"})
     )
@@ -3493,6 +3494,7 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
             resource_role: str | None = None,
             **_kwargs: Any,
         ) -> SessionResourceView:
+            captured_spec["args"] = list(spec.args)
             captured_spec["env"] = dict(spec.env)
             return SessionResourceView(
                 id="terminal_antigravity_main",
@@ -3515,6 +3517,7 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
 
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id(session_id)
     iso_home = bridge_mod.agy_home_dir(bridge_dir)
+    iso_gemini = bridge_mod.agy_gemini_dir(bridge_dir)
 
     # 1) The relay starter was invoked for this session's bridge dir.
     assert len(relay_calls) == 1
@@ -3533,9 +3536,10 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     # The bridge token the shared relay needs was written into the bridge dir.
     assert (bridge_dir / "bridge.json").is_file()
 
-    # 3) The launch env carries HOME = the isolated home, layered over the
-    #    build_agy_launch base env.
-    assert captured_spec["env"]["HOME"] == str(iso_home)
+    # 3) The launch args point agy at the isolated Gemini dir, while HOME stays
+    #    real so platform auth such as macOS Keychain keeps working.
+    assert captured_spec["args"] == [f"--gemini_dir={iso_gemini}"]
+    assert "HOME" not in captured_spec["env"]
     assert captured_spec["env"]["AGY_ENV"] == "1"
 
 
