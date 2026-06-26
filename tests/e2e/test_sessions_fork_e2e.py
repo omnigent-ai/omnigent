@@ -29,6 +29,7 @@ import uuid
 from typing import Any
 
 import httpx
+import pytest
 
 from tests.e2e.conftest import (
     configure_mock_llm,
@@ -262,6 +263,11 @@ def test_full_fork_replays_whole_history(
     )
 
 
+# Truncating a fork at a mid-conversation cutoff (dropping the post-cutoff turn)
+# is server-side behavior that shipped after v0.2.0 — a v0.2.0 server keeps the
+# post-cutoff turn, so main's test (unchanged) fails against it (server-behavior
+# co-evolution, not a regression). Skip against servers < 0.3.0.
+@pytest.mark.min_server_version("0.3.0")
 def test_fork_from_middle_truncates_context(
     http_client: httpx.Client,
     live_runner_id: str,
@@ -362,6 +368,11 @@ def _builtin_agent_id(client: httpx.Client, name: str) -> str:
     raise AssertionError(f"built-in agent {name!r} not registered on the server")
 
 
+# Carrying forked history across an agent switch (the recall turn is served
+# directly, with no separate replay request) is server-side behavior that
+# shipped after v0.2.0 — a v0.2.0 server doesn't carry it, so main's test fails
+# against it (co-evolution, not a regression). Skip against servers < 0.3.0.
+@pytest.mark.min_server_version("0.3.0")
 def test_fork_with_agent_switch_carries_history(
     http_client: httpx.Client,
     claude_coder_agent: str,
@@ -411,14 +422,12 @@ def test_fork_with_agent_switch_carries_history(
             [{"text": "OK"}],
             key=source_model,
         )
-        # The claude-sdk harness replays the forked transcript as context
-        # when binding the switched fork, which sends an initial
-        # /v1/messages request before the user's recall turn. Queue two
-        # responses: a throwaway for the replay and the codeword for the
-        # actual recall.
+        # The fork+switch passes the copied transcript as context to the
+        # first real LLM call (the recall turn itself) — no separate
+        # replay request is made. Queue only the codeword for the recall.
         configure_mock_llm(
             mock_llm_server_url,
-            [{"text": "OK"}, {"text": _CODEWORD_1}],
+            [{"text": _CODEWORD_1}],
             key=target_model,
         )
     else:

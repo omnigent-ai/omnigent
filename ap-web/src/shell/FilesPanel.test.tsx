@@ -203,6 +203,62 @@ describe("FilesPanel working folder directory", () => {
   });
 });
 
+describe("FilesPanel working folder header role", () => {
+  // The inline right-rail panel passes `frameless` to fill the rail height
+  // without the card chrome. That must NOT downgrade the "Working folder"
+  // header to a plain label: it stays a collapsible button (accessible name
+  // + aria-expanded) so the rail header is focusable and toggleable, and so
+  // the e2e suite can target it by role. Only the drawer (onClose), which
+  // has its own X close button, uses the static label header.
+  it("renders the header as a collapsible button in the standalone card", () => {
+    renderPanel({ conversationId: "conv_header_card", files: [] });
+    const header = screen.getByRole("button", { name: /working folder/i });
+    expect(header).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("renders the header as a collapsible button in frameless (inline rail) mode", () => {
+    useAllFilesMock.mockReturnValue(allFilesResult([]));
+    useChangedFilesMock.mockReturnValue(changedFilesResult([]));
+    useDirectoryMock.mockReturnValue(directoryResult());
+    useEnvironmentMock.mockReturnValue(environmentResult("/home/user/workspace"));
+    useSearchMock.mockReturnValue(searchResult());
+
+    render(
+      <MemoryRouter initialEntries={["/c/conv_header_frameless"]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanel
+                sort="recent"
+                onSortChange={vi.fn()}
+                frameless
+                flatView={false}
+                onFileSelect={vi.fn()}
+                onFlatViewChange={vi.fn()}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const header = screen.getByRole("button", { name: /working folder/i });
+    expect(header).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("renders a static label header (no toggle button) in the drawer", () => {
+    renderPanel({ conversationId: "conv_header_drawer", files: [], onClose: vi.fn() });
+    // The drawer has its own X close button, so the title is a plain label,
+    // not a collapse toggle.
+    expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
+    expect(screen.getByText("Working folder")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close files" })).toBeInTheDocument();
+  });
+});
+
 describe("FilesPanel scope switch (Changed | All) visibility", () => {
   it("does not enable the root filesystem listing while showing Changed files", () => {
     renderPanel({
@@ -777,6 +833,7 @@ describe("FilesPanel tree (Explore) search", () => {
           conversationId="conv_tree_search_loading"
           showHidden={false}
           changedFiles={[]}
+          sort="alpha"
           searchQuery="test"
           searchResults={undefined}
           isSearching={true}
@@ -805,6 +862,7 @@ describe("FilesPanel tree (Explore) search", () => {
           conversationId="conv_tree_align"
           showHidden={false}
           changedFiles={[]}
+          sort="alpha"
         />
       </TooltipProvider>,
     );
@@ -952,6 +1010,7 @@ describe("FilesPanel tree (Explore) search", () => {
           conversationId="conv_tree_search_error"
           showHidden={false}
           changedFiles={[]}
+          sort="alpha"
           searchQuery="test"
           searchResults={undefined}
           isSearching={false}
@@ -1140,5 +1199,18 @@ describe("FilesPanel tree (Explore) search", () => {
 
     expect(screen.getByRole("textbox", { name: "files to include" })).toHaveValue("");
     expect(screen.getByRole("textbox", { name: "files to exclude" })).toHaveValue("");
+  });
+});
+
+describe("FilesPanel sort control", () => {
+  it("renders the sort selector in the All (tree) view", () => {
+    // Sort applies to the All tree too, not just the Changed list (trigger is
+    // labeled "Sort: <active>").
+    renderPanel({
+      conversationId: "conv_all_sort",
+      files: [file("a.txt")],
+      flatView: false,
+    });
+    expect(screen.getByRole("button", { name: /^Sort:/ })).toBeInTheDocument();
   });
 });

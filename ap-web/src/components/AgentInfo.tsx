@@ -1,10 +1,36 @@
-// Agent info surface: the MCP-server and policy badges plus the
-// header info-icon popover that displays them.
+// Agent info surface: the MCP-server and policy badges, the
+// intelligent-routing readout, and the header info-icon popover that
+// displays them.
 
-import { useState } from "react";
-import { InfoIcon, PlusIcon, ServerIcon, ShieldCheckIcon, TrashIcon } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  CheckIcon,
+  CopyIcon,
+  AlertTriangleIcon,
+  PencilIcon,
+  InfoIcon,
+  PlusIcon,
+  SaveIcon,
+  ServerIcon,
+  ShieldCheckIcon,
+  TrashIcon,
+  XIcon,
+} from "lucide-react";
+import {
+  useCreateMcpServer,
+  useDeleteMcpServer,
+  useUpdateMcpServer,
+  type UpsertMcpServerInput,
+} from "@/hooks/useAgents";
 import type { Agent, McpServerSummary } from "@/hooks/useAgents";
+import { useSession } from "@/hooks/useSession";
+import {
+  isCostRoutingSession,
+  parseCostRoutingVerdict,
+  verdictRelativeTime,
+} from "@/components/CostRoutingControl";
 import type { ModelUsage } from "@/lib/types";
+import { showToast } from "@/components/ui/toast";
 import {
   usePolicies,
   usePolicyRegistry,
@@ -12,7 +38,11 @@ import {
   useDeletePolicy,
   type PolicyRegistryEntry,
 } from "@/hooks/usePolicies";
+import { useSessionOwner } from "@/hooks/usePermissions";
+import { getCurrentUserId } from "@/lib/identity";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Dialog,
   DialogContent,
@@ -26,7 +56,10 @@ import { capitalizeAgentName } from "@/lib/agentLabels";
 import { coercePolicyParams } from "@/lib/policyParams";
 import { agentRootName } from "@/lib/forkHarness";
 import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
+import { copyText } from "@/lib/clipboard";
 import { useChatStore } from "@/store/chatStore";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useSessionHostVersion } from "@/hooks/RunnerHealthProvider";
 
 /**
  * Display label for an agent name: the wrapper alias when mapped, else
@@ -50,19 +83,64 @@ export function agentDisplayLabel(name: string): string {
 }
 
 /** Compact pill row listing MCP servers attached to an agent. */
-export function McpServerList({ servers }: { servers: McpServerSummary[] }) {
+export function McpServerList({
+  servers,
+  onDelete,
+}: {
+  servers: McpServerSummary[];
+  onDelete?: (name: string) => void;
+}) {
   return (
     <div className="flex flex-wrap gap-1">
-      {servers.map((srv) => (
-        <span
-          key={srv.name}
-          title={srv.description ?? srv.name}
-          className="flex items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
-        >
-          <ServerIcon className="size-2.5 shrink-0" />
-          {srv.name}
-        </span>
-      ))}
+      {servers.map((srv) =>
+        onDelete ? (
+          <Popover key={srv.name}>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                className="flex cursor-pointer items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:bg-muted/80"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <ServerIcon className="size-2.5 shrink-0" />
+                {srv.name}
+              </button>
+            </PopoverTrigger>
+            <PopoverContent
+              side="top"
+              align="start"
+              className="w-64"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center gap-1.5">
+                  <ServerIcon className="size-3.5 text-muted-foreground" />
+                  <span className="font-medium text-sm">{srv.name}</span>
+                </div>
+                {srv.description && (
+                  <p className="text-xs text-muted-foreground">{srv.description}</p>
+                )}
+                <button
+                  type="button"
+                  onClick={() => onDelete(srv.name)}
+                  className="flex items-center gap-1 self-end rounded px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
+                >
+                  <TrashIcon className="size-3" />
+                  Remove
+                </button>
+              </div>
+            </PopoverContent>
+          </Popover>
+        ) : (
+          <span
+            key={srv.name}
+            title={srv.description ?? srv.name}
+            className="flex items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
+          >
+            <ServerIcon className="size-2.5 shrink-0" />
+            {srv.name}
+          </span>
+        ),
+      )}
     </div>
   );
 }
@@ -83,6 +161,73 @@ function formatSessionCostUsd(costUsd: number): string {
     return "<$0.01";
   }
   return `$${costUsd.toFixed(2)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Intelligent routing section
+// ---------------------------------------------------------------------------
+
+/**
+ * Read-only "Intelligent model router" section: the per-session routing
+ * state plus the judge's latest model decision. Mode mutation stays
+ * with the composer toggle — this surface only reports.
+ *
+ * Gated on routing capability (`isCostRoutingSession`, the predicate
+ * the composer's toggle uses) or a recorded decision — NOT on the
+ * toggle's visibility, so deployments that force routing on (toggle
+ * hidden) still surface the decisions here.
+ *
+ * @param sessionId Active session id, e.g. `"conv_abc123"` — keys the
+ *   shared snapshot cache the verdict is parsed from.
+ */
+function IntelligentRoutingSection({ sessionId }: { sessionId: string }) {
+  const mode = useChatStore((s) => s.costControlModeOverride);
+  // Shared ["session", id] cache — bindStream keeps it fresh; no new polling.
+  const { session } = useSession(sessionId);
+  const labels = session?.labels;
+  const verdict = useMemo(() => parseCostRoutingVerdict(labels), [labels]);
+
+  // Children never render — even a recorded verdict can't unhide them.
+  if (session?.parentSessionId) return null;
+  if (!isCostRoutingSession(session) && verdict === null) return null;
+  // Only an explicit "off" disables routing; unset defers to the spec (active).
+  const stateLabel = mode === "off" ? "Off" : "On";
+  const verdictTime = verdict === null ? null : verdictRelativeTime(verdict.turnAnchor);
+
+  return (
+    <div className="flex flex-col gap-1.5" data-testid="intelligent-routing-section">
+      <div className="flex items-baseline justify-between">
+        <SectionLabel>Intelligent model router</SectionLabel>
+        <span
+          className="text-[10px] font-medium text-muted-foreground"
+          data-testid="intelligent-routing-state"
+        >
+          {stateLabel}
+        </span>
+      </div>
+      {verdict !== null ? (
+        <div data-testid="intelligent-routing-verdict">
+          <div className="truncate text-xs">
+            <span className="font-mono" data-testid="intelligent-routing-model">
+              {verdict.model}
+            </span>
+            <span className="text-muted-foreground/70"> · {verdict.tier}</span>
+          </div>
+          <div className="mt-0.5 text-xs text-muted-foreground">
+            {verdict.applied ? "Applied" : "Would have picked"}
+            {verdictTime !== null && (
+              <span className="text-muted-foreground/70"> · {verdictTime}</span>
+            )}
+          </div>
+          {verdict.rationale !== null && verdict.rationale.length > 0 && (
+            <p className="mt-1 text-xs leading-snug text-muted-foreground">{verdict.rationale}</p>
+          )}
+        </div>
+      ) : (
+        <p className="text-xs text-muted-foreground">No decision yet this session.</p>
+      )}
+    </div>
+  );
 }
 
 /**
@@ -119,18 +264,22 @@ const MODEL_TOKEN_ROWS: ReadonlyArray<{ key: keyof ModelUsage; label: string }> 
  * @param usageByModel - Map of raw harness model id to its cumulative usage.
  */
 function ModelUsageBreakdown({ usageByModel }: { usageByModel: Record<string, ModelUsage> }) {
+  const [isOpen, setIsOpen] = useState(false);
   // Stable display order: most total tokens first, so the dominant model
   // leads. Falls back to 0 for models that haven't recorded a total yet.
   const models = Object.entries(usageByModel).sort(
     ([, a], [, b]) => (b.totalTokens ?? 0) - (a.totalTokens ?? 0),
   );
   return (
-    <details data-testid="agent-info-usage-by-model">
+    <details
+      data-testid="agent-info-usage-by-model"
+      onToggle={(e) => setIsOpen(e.currentTarget.open)}
+    >
       <summary className="cursor-pointer select-none list-none">
         <SectionLabel>
           <span className="inline-flex items-center gap-1">
             Token usage
-            <span className="text-[9px]">▶</span>
+            <span className="text-[9px]">{isOpen ? "▼" : "▶"}</span>
           </span>
         </SectionLabel>
       </summary>
@@ -496,6 +645,406 @@ function AddPolicyDialog({
 }
 
 // ---------------------------------------------------------------------------
+// MCP server management
+// ---------------------------------------------------------------------------
+
+interface McpFormState {
+  originalName: string | null;
+  name: string;
+  transport: "http" | "stdio";
+  description: string;
+  url: string;
+  command: string;
+  argsText: string;
+}
+
+const EMPTY_MCP_FORM: McpFormState = {
+  originalName: null,
+  name: "",
+  transport: "http",
+  description: "",
+  url: "",
+  command: "",
+  argsText: "",
+};
+
+function mcpFormFromServer(server: McpServerSummary): McpFormState {
+  return {
+    originalName: server.name,
+    name: server.name,
+    transport: server.transport === "stdio" ? "stdio" : "http",
+    description: server.description ?? "",
+    url: server.url ?? "",
+    command: server.command ?? "",
+    argsText: (server.args ?? []).join("\n"),
+  };
+}
+
+function payloadFromMcpForm(form: McpFormState): UpsertMcpServerInput {
+  const base = {
+    name: form.name.trim(),
+    transport: form.transport,
+    description: form.description.trim() || null,
+  };
+  if (form.transport === "http") {
+    return {
+      ...base,
+      transport: "http",
+      url: form.url.trim(),
+      command: null,
+      args: [],
+    };
+  }
+  return {
+    ...base,
+    transport: "stdio",
+    url: null,
+    command: form.command.trim(),
+    args: form.argsText
+      .split("\n")
+      .map((arg) => arg.trim())
+      .filter(Boolean),
+  };
+}
+
+function validateMcpForm(form: McpFormState): string | null {
+  const name = form.name.trim();
+  if (!name) return "Name is required.";
+  if (!/^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}$/.test(name)) {
+    return "Name can use letters, numbers, dots, dashes, and underscores.";
+  }
+  if (form.transport === "http") {
+    const url = form.url.trim();
+    if (!url) return "URL is required.";
+    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+      return "URL must start with http:// or https://.";
+    }
+  }
+  if (form.transport === "stdio" && !form.command.trim()) {
+    return "Command is required.";
+  }
+  return null;
+}
+
+function McpServerManagerDialog({
+  sessionId,
+  servers,
+  open,
+  onOpenChange,
+  dirty,
+  onDirty,
+}: {
+  sessionId: string;
+  servers: McpServerSummary[];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  dirty: boolean;
+  onDirty: () => void;
+}) {
+  const [form, setForm] = useState<McpFormState>(EMPTY_MCP_FORM);
+  const [formError, setFormError] = useState<string | null>(null);
+  const createServer = useCreateMcpServer(sessionId);
+  const updateServer = useUpdateMcpServer(sessionId);
+  const deleteServer = useDeleteMcpServer(sessionId);
+  const mutationError =
+    createServer.error?.message ?? updateServer.error?.message ?? deleteServer.error?.message;
+  const saving = createServer.isPending || updateServer.isPending;
+
+  function resetForm() {
+    setForm(EMPTY_MCP_FORM);
+    setFormError(null);
+  }
+
+  function notifyRestart() {
+    onDirty();
+    showToast(
+      <span className="text-sm">MCP servers updated. Restart the session to apply changes.</span>,
+    );
+  }
+
+  function handleSave() {
+    const error = validateMcpForm(form);
+    if (error) {
+      setFormError(error);
+      return;
+    }
+    const payload = payloadFromMcpForm(form);
+    setFormError(null);
+    if (form.originalName) {
+      updateServer.mutate(
+        { serverName: form.originalName, payload },
+        {
+          onSuccess: () => {
+            resetForm();
+            notifyRestart();
+          },
+        },
+      );
+      return;
+    }
+    createServer.mutate(payload, {
+      onSuccess: () => {
+        resetForm();
+        notifyRestart();
+      },
+    });
+  }
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        onOpenChange(next);
+        if (!next) resetForm();
+      }}
+    >
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Manage MCP Servers</DialogTitle>
+          <DialogDescription>Add, edit, or remove MCP servers for this session.</DialogDescription>
+        </DialogHeader>
+        {dirty && (
+          <div className="flex items-center gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-700 dark:text-yellow-400">
+            <AlertTriangleIcon className="size-4 shrink-0" />
+            Restart the session to apply your changes.
+          </div>
+        )}
+        <div className="grid gap-4 pt-1 md:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+          <div className="flex min-w-0 flex-col gap-1.5">
+            <SectionLabel>Servers</SectionLabel>
+            {servers.length > 0 ? (
+              <div className="flex max-h-56 flex-col divide-y divide-border overflow-y-auto rounded border border-border">
+                {servers.map((server) => (
+                  <div key={server.name} className="flex min-w-0 items-center gap-1.5 px-2 py-2">
+                    <ServerIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setForm(mcpFormFromServer(server));
+                        setFormError(null);
+                      }}
+                      className="min-w-0 flex-1 text-left"
+                    >
+                      <span className="block truncate font-mono text-xs">{server.name}</span>
+                      <span className="block truncate text-[11px] text-muted-foreground">
+                        {server.transport}
+                      </span>
+                    </button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label={`Edit ${server.name}`}
+                      onClick={() => {
+                        setForm(mcpFormFromServer(server));
+                        setFormError(null);
+                      }}
+                    >
+                      <PencilIcon className="size-3" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label={`Delete ${server.name}`}
+                      onClick={() => deleteServer.mutate(server.name, { onSuccess: notifyRestart })}
+                      disabled={deleteServer.isPending}
+                    >
+                      <TrashIcon className="size-3 text-destructive" />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="py-3 text-xs text-muted-foreground">No MCP servers</p>
+            )}
+            {form.originalName && (
+              <Button type="button" variant="ghost" size="sm" onClick={resetForm}>
+                <PlusIcon className="size-3.5" />
+                New server
+              </Button>
+            )}
+          </div>
+
+          <div className="flex min-w-0 flex-col gap-2">
+            <SectionLabel>{form.originalName ? "Edit Server" : "New Server"}</SectionLabel>
+            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+              Name
+              <Input
+                value={form.name}
+                onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))}
+                className="font-mono"
+                placeholder="github"
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+              Transport
+              <select
+                value={form.transport}
+                onChange={(e) =>
+                  setForm((prev) => ({
+                    ...prev,
+                    transport: e.target.value === "stdio" ? "stdio" : "http",
+                  }))
+                }
+                className="h-8 rounded-lg border border-input bg-background px-2 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+              >
+                <option value="http">HTTP</option>
+                <option value="stdio">stdio</option>
+              </select>
+            </label>
+            {form.transport === "http" ? (
+              <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                URL
+                <Input
+                  value={form.url}
+                  onChange={(e) => setForm((prev) => ({ ...prev, url: e.target.value }))}
+                  placeholder="https://example.com/sse"
+                />
+              </label>
+            ) : (
+              <>
+                <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                  Command
+                  <Input
+                    value={form.command}
+                    onChange={(e) => setForm((prev) => ({ ...prev, command: e.target.value }))}
+                    placeholder="npx"
+                  />
+                </label>
+                <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                  Args
+                  <Textarea
+                    value={form.argsText}
+                    onChange={(e) => setForm((prev) => ({ ...prev, argsText: e.target.value }))}
+                    className="min-h-20 font-mono text-xs"
+                    placeholder={"-y\n@modelcontextprotocol/server-github"}
+                  />
+                </label>
+              </>
+            )}
+            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+              Description
+              <Input
+                value={form.description}
+                onChange={(e) => setForm((prev) => ({ ...prev, description: e.target.value }))}
+                placeholder="Optional"
+              />
+            </label>
+            {(formError || mutationError) && (
+              <div
+                role="alert"
+                className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              >
+                {formError ?? mutationError}
+              </div>
+            )}
+            <div className="flex justify-end gap-2 pt-1">
+              <Button type="button" variant="ghost" size="sm" onClick={resetForm}>
+                <XIcon className="size-3.5" />
+                Clear
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                onClick={handleSave}
+                disabled={saving || validateMcpForm(form) !== null}
+              >
+                <SaveIcon className="size-3.5" />
+                {saving ? "Saving..." : "Save"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function McpServersSection({
+  sessionId,
+  servers,
+  editable,
+}: {
+  sessionId?: string | null;
+  servers: McpServerSummary[];
+  editable: boolean;
+}) {
+  const [managerOpen, setManagerOpen] = useState(false);
+  const [mcpDirty, setMcpDirty] = useState(false);
+  const sessionStatus = useChatStore((s) => s.sessionStatus);
+  // Clear the dirty flag when the session restarts (launching picks up
+  // the updated MCP config) or when the user navigates to another session.
+  useEffect(() => {
+    if (sessionStatus === "launching") setMcpDirty(false);
+  }, [sessionStatus]);
+  useEffect(() => {
+    setMcpDirty(false);
+  }, [sessionId]);
+  const canEdit = !!(sessionId && editable);
+  const deleteServer = useDeleteMcpServer(canEdit ? sessionId : "");
+  const showSection = servers.length > 0 || canEdit;
+  if (!showSection) return null;
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center justify-between">
+        <SectionLabel>Tools</SectionLabel>
+        {canEdit && (
+          <button
+            type="button"
+            onClick={() => setManagerOpen(true)}
+            className="rounded p-0.5 hover:bg-muted"
+            title="Manage MCP servers"
+            aria-label="Manage MCP servers"
+          >
+            <PlusIcon className="size-3 text-muted-foreground" />
+          </button>
+        )}
+      </div>
+      {mcpDirty && (
+        <p className="flex items-center gap-1 text-xs text-yellow-700 dark:text-yellow-400">
+          <AlertTriangleIcon className="size-3 shrink-0" />
+          Restart to apply changes
+        </p>
+      )}
+      {servers.length > 0 ? (
+        <McpServerList
+          servers={servers}
+          onDelete={
+            canEdit
+              ? (name) =>
+                  deleteServer.mutate(name, {
+                    onSuccess: () => {
+                      setMcpDirty(true);
+                      showToast(
+                        <span className="text-sm">
+                          MCP servers updated. Restart the session to apply changes.
+                        </span>,
+                      );
+                    },
+                  })
+              : undefined
+          }
+        />
+      ) : (
+        <p className="text-xs text-muted-foreground">No MCP servers</p>
+      )}
+      {canEdit && (
+        <McpServerManagerDialog
+          sessionId={sessionId!}
+          servers={servers}
+          open={managerOpen}
+          onOpenChange={setManagerOpen}
+          dirty={mcpDirty}
+          onDirty={() => setMcpDirty(true)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Session policies section (user-editable only)
 // ---------------------------------------------------------------------------
 
@@ -591,6 +1140,8 @@ interface AgentInfoProps {
   agent: Agent | undefined;
   /** Session ID — needed to manage user policies. */
   sessionId?: string | null;
+  /** Dark until the routing-UI go-ahead (mirrors #3021's composer gates). */
+  showIntelligentRouting?: boolean;
 }
 
 /**
@@ -607,9 +1158,16 @@ export function agentHasInfo(agent: Agent | undefined, sessionId?: string | null
  * Shared by the desktop header popover ({@link AgentInfoButton}) and the
  * mobile header menu's agent-info dialog.
  */
-export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
+export function AgentInfoContent({
+  agent,
+  sessionId,
+  showIntelligentRouting = false,
+}: AgentInfoProps) {
   const servers = agent?.mcp_servers ?? [];
+  const mcpEditable = agent?.mcp_servers_editable === true;
   const displayName = agent ? agentDisplayLabel(agent.name) : null;
+  const [sessionIdCopied, setSessionIdCopied] = useState(false);
+  const copyResetTimeoutRef = useRef<number | null>(null);
   // Cumulative session spend, live from the store (seeded on bind, updated
   // by SSE ``session_usage``). ``null`` when the session is unpriced (no
   // turn priced yet) — omit the row rather than show "$0.00" / "—".
@@ -619,6 +1177,44 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
   // popover renders it directly — the frontend derives any aggregate view
   // from this map rather than receiving flat token fields.
   const usageByModel = useChatStore((s) => s.sessionUsageByModel);
+  // Version footer: the server version (global, from the boot capabilities
+  // probe) and the bound host's version (per-session, from the health poll).
+  // Either may be absent — the footer renders whatever is known and hides
+  // entirely when neither is.
+  const serverInfo = useServerInfo();
+  const serverVersion = serverInfo !== "loading" ? serverInfo.server_version : null;
+  const hostVersion = useSessionHostVersion(sessionId ?? undefined);
+  const versionFooter = [
+    serverVersion ? `server ${serverVersion}` : null,
+    hostVersion ? `host ${hostVersion}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  // Session owner (the user_id granted LEVEL_OWNER), so a viewer can see whose
+  // session this is — e.g. a chat shared into a workspace group. ``null`` /
+  // undefined when permissions are off (single-user) or still loading, in
+  // which case the row is omitted rather than showing a placeholder.
+  const { data: owner } = useSessionOwner(sessionId ?? null);
+  const viewerId = getCurrentUserId();
+
+  useEffect(() => {
+    return () => {
+      if (copyResetTimeoutRef.current !== null) window.clearTimeout(copyResetTimeoutRef.current);
+    };
+  }, []);
+
+  async function copySessionId() {
+    if (!sessionId) return;
+    try {
+      await copyText(sessionId);
+    } catch (err) {
+      console.warn("Failed to copy session ID", err);
+      return;
+    }
+    setSessionIdCopied(true);
+    if (copyResetTimeoutRef.current !== null) window.clearTimeout(copyResetTimeoutRef.current);
+    copyResetTimeoutRef.current = window.setTimeout(() => setSessionIdCopied(false), 2000);
+  }
 
   return (
     <div className="flex flex-col gap-3">
@@ -630,11 +1226,53 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
           )}
         </div>
       )}
+      {sessionId && owner && (
+        <div className="flex flex-col gap-1.5">
+          <SectionLabel>Owner</SectionLabel>
+          <span
+            className="truncate font-mono text-xs text-muted-foreground"
+            data-testid="agent-info-session-owner"
+            title={owner}
+          >
+            {owner}
+            {owner === viewerId && <span className="ml-1 text-muted-foreground/60">(you)</span>}
+          </span>
+        </div>
+      )}
+      {sessionId && (
+        <div className="flex flex-col gap-1.5">
+          <SectionLabel>Session ID</SectionLabel>
+          <div className="flex items-center gap-2">
+            <code
+              className="min-w-0 flex-1 truncate py-1 font-mono text-xs text-muted-foreground"
+              data-testid="agent-info-session-id"
+              title={sessionId}
+            >
+              {sessionId}
+            </code>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label={sessionIdCopied ? "Copied session ID" : "Copy session ID"}
+              data-testid="agent-info-copy-session-id"
+              onClick={copySessionId}
+              className="shrink-0"
+            >
+              {sessionIdCopied ? (
+                <CheckIcon className="size-3.5" />
+              ) : (
+                <CopyIcon className="size-3.5" />
+              )}
+            </Button>
+          </div>
+        </div>
+      )}
       {sessionId && sessionCostUsd != null && (
         <div className="flex flex-col gap-1.5">
           <SectionLabel>Session cost</SectionLabel>
           <span
-            className="text-sm tabular-nums text-muted-foreground"
+            className="font-mono text-xs tabular-nums text-muted-foreground"
             data-testid="agent-info-session-cost"
           >
             {formatSessionCostUsd(sessionCostUsd)}
@@ -644,13 +1282,19 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
       {sessionId && usageByModel != null && Object.keys(usageByModel).length > 0 && (
         <ModelUsageBreakdown usageByModel={usageByModel} />
       )}
-      {servers.length > 0 && (
-        <div className="flex flex-col gap-1.5">
-          <SectionLabel>Tools</SectionLabel>
-          <McpServerList servers={servers} />
+      {showIntelligentRouting && sessionId && <IntelligentRoutingSection sessionId={sessionId} />}
+      <McpServersSection sessionId={sessionId} servers={servers} editable={mcpEditable} />
+      {sessionId && <SessionPoliciesSection sessionId={sessionId} />}
+      {versionFooter && (
+        <div className="border-t border-border pt-2">
+          <span
+            className="font-mono text-[10px] text-muted-foreground/70"
+            data-testid="agent-info-versions"
+          >
+            {versionFooter}
+          </span>
         </div>
       )}
-      {sessionId && <SessionPoliciesSection sessionId={sessionId} />}
     </div>
   );
 }
@@ -662,7 +1306,11 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
  * header's three-dot menu, which opens {@link AgentInfoContent} in a
  * dialog. Self-hides when the agent has neither tools nor policies.
  */
-export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
+export function AgentInfoButton({
+  agent,
+  sessionId,
+  showIntelligentRouting = false,
+}: AgentInfoProps) {
   if (!agentHasInfo(agent, sessionId)) return null;
 
   return (
@@ -685,7 +1333,11 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
         <TooltipContent>Agent tools &amp; policies</TooltipContent>
       </Tooltip>
       <PopoverContent align="end" className="w-80">
-        <AgentInfoContent agent={agent} sessionId={sessionId} />
+        <AgentInfoContent
+          agent={agent}
+          sessionId={sessionId}
+          showIntelligentRouting={showIntelligentRouting}
+        />
       </PopoverContent>
     </Popover>
   );

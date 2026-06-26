@@ -12,6 +12,51 @@ function readConfig() {
   }
 }
 
+/**
+ * Evaluate a TOOL_CALL policy for a native Pi tool via the Omnigent server's
+ * session-level HTTP endpoint (POST /v1/sessions/{sessionId}/policies/evaluate).
+ *
+ * This is the same endpoint used by the Claude Code and Codex native hooks.
+ * It does NOT require an active Omnigent turn context on the harness side —
+ * the endpoint evaluates against the session's full policy set directly.
+ * Fail-open (null) on any transport or parse error so a transient server
+ * outage never wedges Pi mid-turn.
+ */
+async function evalNativePolicyHttp(config, toolName, args) {
+  if (
+    !config ||
+    !config.serverUrl ||
+    !config.sessionId ||
+    typeof fetch !== "function"
+  )
+    return null;
+  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
+  const body = JSON.stringify({
+    event: {
+      type: "PHASE_TOOL_CALL",
+      target: "",
+      data: { name: toolName, arguments: args },
+      context: {},
+    },
+  });
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(config.authHeaders || {}) },
+      body,
+    });
+    if (!resp.ok) return null;
+    const json = await resp.json();
+    if (json.result === "POLICY_ACTION_DENY") {
+      return { block: true, reason: json.reason || "blocked by Omnigent policy" };
+    }
+    return { block: false, reason: "" };
+  } catch (_err) {
+    // Keep Pi responsive if Omnigent is temporarily unavailable.
+    return null;
+  }
+}
+
 function textFromContent(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -278,6 +323,38 @@ module.exports = function (pi) {
   const postedReasoning = new Set();
   const toolCallsById = new Map();
   const pendingInterruptMs = 30_000;
+  // Live streaming state for assistant text deltas. Pi emits
+  // message_update events carrying an assistantMessageEvent of type
+  // "text_delta" (token chunk) / "text_end" (block complete) during a
+  // turn — see @earendil-works/pi-ai AssistantMessageEvent. We forward
+  // each token as a transient external_output_text_delta so the web UI
+  // paints a live preview before the final message lands.
+  //
+  // The preview is keyed by ASSISTANT MESSAGE, not per text block: the
+  // web UI (chatStore.pumpStreamEvents) finalizes the OLDEST in-flight
+  // "live:<message_id>" preview when the authoritative text_done arrives,
+  // FIFO, and message_end posts ONE combined external_conversation_item
+  // per assistant message (textFromMessage joins all text blocks). So a
+  // 1:1 message-scoped id keeps exactly one preview per item; a per-block
+  // id would orphan extra previews when a message has multiple text
+  // blocks (e.g. text → tool call → more text). All text blocks of a
+  // message share its id with a single monotonic chunk index, so the
+  // preview reads as one growing message — matching claude-native.
+  //
+  // Deltas are best-effort live preview: postEvent fails open, and the
+  // authoritative text still arrives via message_end regardless.
+  //
+  // streamingMessageOrdinal: bumped at each assistant message_end so the
+  // NEXT message of the turn gets a fresh, stable id distinct from earlier
+  // ones — see the message_end handler for why it advances there (not on
+  // message_start) so deltas and the finalize agree on the id.
+  let streamingMessageOrdinal = 0;
+  // streamedTextIndex: message_id -> next 0-based chunk index.
+  const streamedTextIndex = new Map();
+  // finalizedTextBlocks: message_ids whose final delta was already posted,
+  // so a duplicate text_end (or a stray text_delta after end) can't reopen
+  // or double-finalize the preview.
+  const finalizedTextBlocks = new Set();
 
   function rememberContext(ctx) {
     if (ctx) latestContext = ctx;
@@ -408,6 +485,63 @@ module.exports = function (pi) {
     });
   }
 
+  function streamingMessageId(responseId) {
+    // Stable per-assistant-message id across all of the message's text
+    // chunks. The web UI keys an in-flight "live:<message_id>" preview off
+    // this, appends each chunk in `index` order, and reconciles it against
+    // the authoritative assistant item by FIFO retirement. responseId
+    // scopes it to this turn and the ordinal distinguishes successive
+    // assistant messages within the turn, so a finalized message's id is
+    // never reused by a later one.
+    return `${responseId}:msg:${streamingMessageOrdinal}`;
+  }
+
+  async function postOutputTextDelta(messageId, delta, options) {
+    // Transient assistant-text chunk for live preview (Responses-style
+    // response.output_text.delta on the wire). Not persisted; the
+    // authoritative final text arrives separately via
+    // external_conversation_item. A blank, non-final delta carries no
+    // signal — skip it so an empty token can't churn the UI buffer.
+    const final = !!(options && options.final);
+    if (typeof delta !== "string") return;
+    if (!delta && !final) return;
+    const index = streamedTextIndex.get(messageId) || 0;
+    streamedTextIndex.set(messageId, index + 1);
+    await postEvent(config, {
+      type: "external_output_text_delta",
+      data: {
+        delta,
+        message_id: messageId,
+        index,
+        final,
+      },
+    });
+  }
+
+  async function postTextDelta(update, responseId) {
+    // assistantMessageEvent of type "text_delta": one streamed token of
+    // the current assistant message. All text blocks of the message share
+    // its id, so the preview reads as one growing message.
+    if (!update || typeof update.delta !== "string" || !update.delta) return;
+    const messageId = streamingMessageId(responseId);
+    if (finalizedTextBlocks.has(messageId)) return;
+    await postOutputTextDelta(messageId, update.delta);
+  }
+
+  async function finalizeStreamingMessage(responseId) {
+    // Emit a final-marker delta so the web UI knows no further chunks will
+    // arrive for this message_id and can stop the live buffer. The marker
+    // carries no new text (the running preview already holds the full
+    // message); message_end posts the authoritative item that replaces the
+    // preview in place. Only finalize a message we actually streamed (a
+    // message with no text_delta has no live preview to close).
+    const messageId = streamingMessageId(responseId);
+    if (finalizedTextBlocks.has(messageId)) return;
+    if (!streamedTextIndex.has(messageId)) return;
+    finalizedTextBlocks.add(messageId);
+    await postOutputTextDelta(messageId, "", { final: true });
+  }
+
   async function mirrorAssistantMessage(message, responseId) {
     const blocks = contentBlocks(message);
     for (let index = 0; index < blocks.length; index += 1) {
@@ -463,6 +597,9 @@ module.exports = function (pi) {
     postedToolResults.clear();
     postedReasoning.clear();
     toolCallsById.clear();
+    streamedTextIndex.clear();
+    finalizedTextBlocks.clear();
+    streamingMessageOrdinal = 0;
     await postEvent(config, {
       type: "external_session_status",
       data: {
@@ -501,6 +638,10 @@ module.exports = function (pi) {
     const responseId = currentResponseId();
     const update = event ? event.assistantMessageEvent : undefined;
     if (!update || typeof update !== "object") return;
+    if (update.type === "text_delta") {
+      await postTextDelta(update, responseId);
+      return;
+    }
     if (update.type === "toolcall_end") {
       await postToolCall(update.toolCall, responseId);
       return;
@@ -530,6 +671,19 @@ module.exports = function (pi) {
     );
     if (blocked) {
       return { block: true, reason: "Interrupted by user" };
+    }
+    // Evaluate TOOL_CALL policy via the Omnigent server's session-level HTTP
+    // endpoint. This works even after the harness turn has completed (which
+    // happens immediately for pi-native — just enqueue + TurnComplete), so
+    // the verdict is always evaluated against live session policies regardless
+    // of whether an Omnigent turn is currently in flight.
+    const verdict = await evalNativePolicyHttp(
+      config,
+      (event && event.toolName) || "",
+      (event && event.input) || {},
+    );
+    if (verdict && verdict.block) {
+      return { block: true, reason: verdict.reason || "blocked by Omnigent policy" };
     }
   });
 
@@ -571,9 +725,20 @@ module.exports = function (pi) {
     const role = messageRole(message);
     if (role !== "assistant") return;
     const responseId = currentResponseId();
+    // Close the live preview for this message (no-op if nothing streamed),
+    // then bump the ordinal so the NEXT assistant message of this turn
+    // streams under a fresh, distinct id and never reuses this one's. The
+    // ordinal advances here (not on message_start) so the deltas just
+    // posted and this finalize agree on the id regardless of whether Pi
+    // fires message_start.
+    await finalizeStreamingMessage(responseId);
+    streamingMessageOrdinal += 1;
     await mirrorAssistantMessage(message, responseId);
     const text = textFromMessage(message);
     if (!text) return;
+    // The authoritative assistant item. The web UI retires + replaces the
+    // oldest in-flight live preview in place with this (FIFO; one preview
+    // per message), so the streamed partials never duplicate the final.
     await postEvent(config, {
       type: "external_conversation_item",
       data: {

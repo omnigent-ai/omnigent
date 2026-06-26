@@ -345,6 +345,25 @@ async def test_tool_name_collision_first_server_wins_dispatch(
 
 
 @pytest.mark.asyncio
+async def test_call_tool_rejects_wrong_namespaced_server(
+    patch_connection: dict[str, Any],
+) -> None:
+    """A stale or wrong server prefix must not dispatch by bare tool name."""
+    patch_connection["__tools_for__"]["jira-a"] = [_make_tool_def("get_issue")]
+
+    spec = _make_spec(_make_config("jira-a"))
+    manager = RunnerMcpManager()
+    try:
+        await manager.schemas_for(spec)
+        with pytest.raises(RuntimeError, match="no live MCP serving tool"):
+            await manager.call_tool(spec, "jira-old__get_issue", {"key": "K-1"})
+    finally:
+        await manager.shutdown()
+
+    assert patch_connection["jira-a"].call_tool_calls == []
+
+
+@pytest.mark.asyncio
 async def test_call_tool_against_failed_server_raises(
     patch_connection: dict[str, Any],
 ) -> None:

@@ -57,8 +57,6 @@ from tests.e2e.conftest import (
     send_user_message_to_session,
 )
 
-pytestmark = pytest.mark.mock_only
-
 _COMPUTE_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {

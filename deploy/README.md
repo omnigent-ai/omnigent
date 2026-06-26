@@ -73,6 +73,9 @@ deploy/
 ├── trycloudflare/     ← Cloudflare quick tunnel (public URL for a LOCAL server)
 │   └── README.md
 │
+├── tailscale/         ← Tailscale (private access from phone/tablet/laptop
+│   └── README.md         via tailnet; Funnel for cloud sandbox dial-back)
+│
 ├── daytona/           ← Daytona sandbox-provider guide + the Cloudflare
 │   ├── wrangler.toml     Worker egress relay for its free tier; NOT a
 │   ├── src/index.js      server deploy target. See its README.md.
@@ -86,6 +89,12 @@ deploy/
 │
 ├── openshell/         ← NVIDIA OpenShell sandbox-provider guide (self-hosted
 │   └── README.md         gRPC gateway, on-prem/air-gapped); NOT a server target.
+│
+├── databricks/        ← Databricks Apps (Lakebase + UC Volumes)
+│   ├── databricks.yml     bundle declarative config
+│   ├── deploy.py          build + `bundle deploy`/`run` orchestrator
+│   ├── src/app.py         app entrypoint (Lakebase + UC Volumes)
+│   └── README.md
 │
 └── docker/            ← common Docker image + compose stack
     ├── Dockerfile         multi-stage slim image (node web build → python builder → runtime)
@@ -108,11 +117,15 @@ deploy/
 | Deploy serverless (scale-to-zero, no VM/Postgres to manage) | Cloudflare Containers + D1 + R2 | [`cloudflare/README.md`](cloudflare/README.md): `wrangler deploy` |
 | Stand up a quick demo (no DB to provision) | HF Spaces | [`hf-spaces/README.md`](hf-spaces/README.md): Docker Space, SQLite |
 | Share a server running on your **laptop**: demo it to teammates, or let remote runners & cloud sandboxes connect back to it (nothing to deploy) | Cloudflare quick tunnel | `cloudflared tunnel --url http://localhost:6767` |
+| Access your server privately from **your phone, tablet, or other personal devices** without exposing it to the internet | Tailscale | [`tailscale/README.md`](tailscale/README.md): `tailscale serve https / http://localhost:8000` |
 | Cloud Run / Kubernetes / other | Docker image | [`docker/README.md`](docker/README.md), then point your platform at the image |
+| Deploy on a Databricks workspace (Lakebase + UC Volumes) | Databricks Apps | [`databricks/README.md`](databricks/README.md): uses Asset Bundles |
 
-All deploy paths share the same image (`docker/Dockerfile`): a slim Python
-container running the FastAPI / WebSocket coordinator, with Postgres or
-SQLite as the datastore.
+All non-Databricks deploy paths share the same image (`docker/Dockerfile`): a
+slim Python container running the FastAPI / WebSocket coordinator, with Postgres
+or SQLite as the datastore. The Databricks Apps path uses a separate entrypoint
+(`databricks/src/app.py`) that swaps Postgres for Lakebase (managed PostgreSQL)
+and the artifact store for UC Volumes.
 
 ## Database: Postgres or SQLite
 
@@ -252,7 +265,7 @@ no user credentials ever enter the sandbox.
 (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host`
 target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in
 seconds instead of installing Omnigent at boot. The image ships the
-coding-harness CLIs (`claude`, `codex`, `pi`), so agents on any harness run
+coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`), so agents on any harness run
 in the sandbox with nothing extra to install. To run sandboxes from your own
 image instead (a fork, or extra tooling baked in), build the same `host`
 target and point the config at it:
@@ -348,7 +361,14 @@ overrides this auto-selection.
 |---|---|---|
 | `accounts` (deploy default) | Standalone deploy, no external IdP: built-in username/password with first-user-is-admin bootstrap and UI-based invites. Opt in with `OMNIGENT_AUTH_ENABLED=1` (and no OIDC vars). | Set `OMNIGENT_ACCOUNTS_COOKIE_SECRET` (or let `bootstrap.sh` mint it) and `OMNIGENT_ACCOUNTS_BASE_URL` (public URL). On first boot, set the admin password via the web Create-admin form, the terminal prompt, or `--admin-password` / `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`. |
 | `oidc` | Standalone deploy with your own IdP: server handles the full login flow | Set `OMNIGENT_AUTH_ENABLED=1` and the `OMNIGENT_OIDC_*` env vars; the presence of `OMNIGENT_OIDC_ISSUER` selects OIDC (or pin `OMNIGENT_AUTH_PROVIDER=oidc`). Requires HTTPS (the session cookie uses the `__Host-` prefix). |
-| `header` | Behind an existing SSO proxy (oauth2-proxy, AWS ALB OIDC, Tailscale Funnel, …) that injects `X-Forwarded-Email` | The default when `OMNIGENT_AUTH_ENABLED` is off; or pin `OMNIGENT_AUTH_PROVIDER=header`. Proxy MUST strip any inbound copy of the header from clients. Missing headers are always rejected. |
+| `header` | Behind an existing SSO proxy (oauth2-proxy, AWS ALB OIDC, Cloudflare Access, Tailscale Funnel, …) that injects an identity header | The default when `OMNIGENT_AUTH_ENABLED` is off; or pin `OMNIGENT_AUTH_PROVIDER=header`. Reads `X-Forwarded-Email` by default; set `OMNIGENT_AUTH_HEADER` for proxies that use another name (e.g. `Cf-Access-Authenticated-User-Email`), and `OMNIGENT_AUTH_HEADER_STRIP_PREFIX=accounts.google.com:` for Google IAP. Proxy MUST strip any inbound copy of the header from clients. Missing headers are always rejected. |
+
+> [!NOTE]
+> **Managed sandboxes need `header`/`oidc` or single-user auth.** Each session's
+> runner dials back with the *user's* identity, which the built-in `accounts` mode
+> (the deploy default above) can't supply over the runner WebSocket — it returns
+> `403` even though the host connects. Framework-level; applies to every sandbox
+> provider (Modal / Daytona / Islo / Kubernetes / …).
 
 ### Single sign-on (OIDC)
 
@@ -408,18 +428,40 @@ generic OIDC), see
 > reverse proxy.
 
 `header` mode (`OMNIGENT_AUTH_PROVIDER=header`) takes the caller's identity
-from the `X-Forwarded-Email` request header. It exists for deployments that
-sit behind an SSO proxy (oauth2-proxy, Cloudflare Access, an ALB/OIDC
-listener, Databricks Apps) that authenticates the user and injects that
-header on every request.
+from a trusted request header — `X-Forwarded-Email` by default. It exists for
+deployments that sit behind an SSO proxy (oauth2-proxy, Cloudflare Access, an
+ALB/OIDC listener, Databricks Apps) that authenticates the user and injects
+that header on every request.
+
+Proxies that authenticate with a different header name set
+`OMNIGENT_AUTH_HEADER` to that name instead of standing up an extra hop to
+rename it. For example, behind **Cloudflare Access** (which provides the
+authenticated email in `Cf-Access-Authenticated-User-Email`):
+
+```dotenv
+OMNIGENT_AUTH_PROVIDER=header
+OMNIGENT_AUTH_HEADER=Cf-Access-Authenticated-User-Email
+```
+
+Some proxies namespace the identity they inject. **Google IAP** forwards the
+email in `X-Goog-Authenticated-User-Email` prefixed with `accounts.google.com:`
+(e.g. `accounts.google.com:user@example.com`). Set
+`OMNIGENT_AUTH_HEADER_STRIP_PREFIX` to drop that prefix and recover the bare
+email:
+
+```dotenv
+OMNIGENT_AUTH_PROVIDER=header
+OMNIGENT_AUTH_HEADER=X-Goog-Authenticated-User-Email
+OMNIGENT_AUTH_HEADER_STRIP_PREFIX=accounts.google.com:
+```
 
 In header mode **the server trusts whatever that header says**. If no proxy
 sets it, requests are rejected (`401`) rather than silently sharing one
 identity. But a *misconfigured* proxy is still dangerous: if the proxy
-doesn't **strip** any client-supplied `X-Forwarded-Email` before forwarding,
-anyone can impersonate anyone by sending the header themselves. Getting this
-wrong exposes every user's sessions, conversation history, tool output, and
-files to every other caller.
+doesn't **strip** any client-supplied copy of the identity header before
+forwarding, anyone can impersonate anyone by sending the header themselves.
+Getting this wrong exposes every user's sessions, conversation history, tool
+output, and files to every other caller.
 
 **For almost everyone, use built-in `accounts` (the default in these
 deploys) or `oidc`**; both authenticate users at the server with no proxy to

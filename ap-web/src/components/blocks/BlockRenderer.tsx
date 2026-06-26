@@ -19,6 +19,7 @@ import type React from "react";
 import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
 import { MessageResponse } from "@/components/ai-elements/message";
+import { ZoomableImage } from "@/components/ImageLightbox";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import type { RenderItem } from "@/lib/renderItems";
 import type { SessionStatus } from "@/lib/types";
@@ -30,7 +31,7 @@ import {
   useWorkspacePaths,
 } from "@/shell/FileViewerContext";
 import { toWorkspaceRelativePath, useWorkspaceFileExists } from "@/hooks/useWorkspaceChangedFiles";
-import { ApprovalCard } from "./ApprovalCard";
+import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
 import { TerminalCommandCard } from "./TerminalCommandCard";
@@ -133,9 +134,20 @@ function WorkspacePathInlineCode({
   );
 }
 
+// Markdown images open in the shared lightbox on click, matching uploaded and
+// generated images. (Remote `src`s are still gated by Streamdown's image
+// security; this only adds the zoom affordance to whatever does render.)
+function ZoomableMarkdownImage({ src, alt, ...props }: React.ComponentProps<"img">) {
+  const resolvedSrc = typeof src === "string" ? src : undefined;
+  return <ZoomableImage {...props} src={resolvedSrc} alt={alt ?? ""} />;
+}
+
 // Stable module-level override map so MessageResponse's memo (which ignores
 // `components` changes) never sees a new identity.
-const FILE_PATH_AWARE_COMPONENTS = { inlineCode: WorkspacePathInlineCode };
+const FILE_PATH_AWARE_COMPONENTS = {
+  inlineCode: WorkspacePathInlineCode,
+  img: ZoomableMarkdownImage,
+};
 
 // How often the live (growing) assistant bubble re-parses its markdown. The
 // store pump commits a new, longer text up to once per animation frame (~60/s);
@@ -467,24 +479,7 @@ function renderItem(item: RenderItem, index: number, isReasoningStreaming: boole
         />
       );
     case "elicitation":
-      return (
-        <ApprovalCard
-          key={key}
-          elicitationId={item.elicitationId}
-          message={item.message}
-          phase={item.phase}
-          policyName={item.policyName}
-          contentPreview={item.contentPreview}
-          requestedSchema={item.requestedSchema}
-          url={item.url}
-          status={item.status}
-          response={item.response}
-          askUserQuestion={item.askUserQuestion}
-          exitPlanMode={item.exitPlanMode}
-          codexCommand={item.codexCommand}
-          allowAllEdits={item.allowAllEdits}
-        />
-      );
+      return <ElicitationCard key={key} item={item} />;
   }
 }
 

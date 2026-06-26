@@ -38,6 +38,11 @@ import { useSession } from "@/hooks/useSession";
 
 const RunnerHealthContext = createContext<Map<string, boolean>>(new Map());
 const HostHealthContext = createContext<Map<string, boolean | null>>(new Map());
+// Bound-host version per session, for the info popover's version footer.
+// Sourced from the `/health` poll only — that poll always covers the open
+// session (the only place the popover is shown), so the stream/sidebar
+// path the online maps merge isn't needed here.
+const HostVersionContext = createContext<Map<string, string | null>>(new Map());
 
 // Lets a transient view register extra sessions into the single fallback
 // poll while it's mounted (keyed per-consumer so registrants don't clobber
@@ -148,11 +153,21 @@ export function RunnerHealthProvider({ children }: { children: ReactNode }) {
     for (const [id, liveness] of polledHealth) merged.set(id, liveness.host_online);
     return merged;
   }, [polledHealth, streamHost]);
+  // Host version is poll-only: the version doesn't ride the sidebar stream,
+  // and the popover that reads it only ever shows the open session, which is
+  // always in the fallback poll set above.
+  const hostVersion = useMemo(() => {
+    const map = new Map<string, string | null>();
+    for (const [id, liveness] of polledHealth) map.set(id, liveness.host_version);
+    return map;
+  }, [polledHealth]);
 
   return (
     <RunnerHealthRegistryContext.Provider value={register}>
       <RunnerHealthContext.Provider value={runnerHealth}>
-        <HostHealthContext.Provider value={hostHealth}>{children}</HostHealthContext.Provider>
+        <HostHealthContext.Provider value={hostHealth}>
+          <HostVersionContext.Provider value={hostVersion}>{children}</HostVersionContext.Provider>
+        </HostHealthContext.Provider>
       </RunnerHealthContext.Provider>
     </RunnerHealthRegistryContext.Provider>
   );
@@ -181,6 +196,22 @@ export function useSessionRunnerOnline(sessionId: string | undefined): boolean |
  */
 export function useSessionHostOnline(sessionId: string | undefined): boolean | null | undefined {
   const map = useContext(HostHealthContext);
+  if (!sessionId) return undefined;
+  return map.get(sessionId);
+}
+
+/**
+ * Read the bound host's version for a session, for the info popover's
+ * version footer.
+ *
+ * Returns the version string (e.g. `"0.1.0"`) when the session is bound to
+ * a host whose version resolved server-side, `null` when there's no host
+ * binding or the version isn't resolvable (offline, or on another replica),
+ * and `undefined` when liveness for this session hasn't been polled yet —
+ * callers treat both `null` and `undefined` as "nothing to show".
+ */
+export function useSessionHostVersion(sessionId: string | undefined): string | null | undefined {
+  const map = useContext(HostVersionContext);
   if (!sessionId) return undefined;
   return map.get(sessionId);
 }

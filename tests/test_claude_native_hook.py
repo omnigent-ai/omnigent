@@ -11,7 +11,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import claude_native_hook
+from omnigent import claude_native_hook, native_policy_hook
 from omnigent.claude_native_bridge import (
     build_hook_settings,
     prepare_bridge_dir,
@@ -1179,7 +1179,7 @@ def test_evaluate_policy_pre_tool_use_converts_and_returns_deny(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_abc",
         bridge_id="bridge_shared",
@@ -1786,3 +1786,85 @@ def test_evaluate_policy_non_tool_call_phases_fail_open_on_error(
     captured = capsys.readouterr()
     assert exit_code == 0
     assert captured.out == ""
+
+
+def test_build_hook_settings_omits_apikeyhelper_when_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``None`` api_key_helper writes no ``apiKeyHelper`` (the Bedrock path).
+
+    ``ClaudeNativeUcodeConfig.api_key_helper`` is now Optional and the Bedrock
+    config returns ``None`` (Bedrock authenticates from AWS_BEARER_TOKEN_BEDROCK,
+    not an apiKeyHelper). The settings writer must omit the key for ``None`` and
+    never write the string ``"None"`` — a regression to an unconditional
+    assignment would also corrupt the existing key/gateway/local flows.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_test", workspace=tmp_path)
+
+    assert "apiKeyHelper" not in build_hook_settings(bridge_dir, api_key_helper=None)
+    with_helper = build_hook_settings(bridge_dir, api_key_helper="printf tok")
+    assert with_helper["apiKeyHelper"] == "printf tok"
+
+
+def test_evaluate_policy_retries_5xx_and_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A transient 5xx from the policy server is retried and the eventual 200 is used.
+
+    Regression guard for DB-hosted deployments where brief server hiccups
+    previously caused a spurious fail-closed deny on every affected tool call.
+    """
+    call_count = 0
+
+    class _FlakyThenOkClient:
+        def __init__(self, *, headers: object, timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _FlakyThenOkClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: object = None) -> httpx.Response:
+            del json
+            nonlocal call_count
+            call_count += 1
+            req = httpx.Request("POST", url)
+            if call_count < 3:
+                return httpx.Response(503, text="upstream down", request=req)
+            return httpx.Response(
+                200,
+                text='{"result":"POLICY_ACTION_ALLOW"}',
+                request=req,
+            )
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    # Sleep is a no-op so retries are instant.
+    monkeypatch.setattr(native_policy_hook.time, "sleep", lambda _: None)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FlakyThenOkClient)
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    # ALLOW verdict → no hook output (hook defers to Claude's own permission system).
+    assert captured.out == ""
+    # Two 503s then one 200 = 3 total attempts.
+    assert call_count == 3

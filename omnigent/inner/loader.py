@@ -252,6 +252,7 @@ def _parse_agent_def(
     agent.runtime = data.get("runtime", False)
     agent.timers = data.get("timers", False)
     agent.spawn = data.get("spawn", False)
+    agent.agent_session_sharing = data.get("agent_session_sharing", "none")
     agent.os_env = _parse_os_env_spec(data.get("os_env"))
 
     # Executor

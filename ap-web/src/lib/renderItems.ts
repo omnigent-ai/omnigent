@@ -19,6 +19,7 @@
 // Pure function. No React, no DOM. Tested in `renderItems.test.ts`.
 
 import type { AnyBlock, MessageContentBlock, ToolExecution, ToolResultBlock } from "./blocks";
+import type { RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
 /**
@@ -112,6 +113,7 @@ export type RenderItem =
         execPolicyAmendment: string[] | null;
       } | null;
       allowAllEdits?: boolean;
+      rememberScope?: RememberScope | null;
     };
 
 /** A bubble cluster. The page maps over these. */
@@ -141,7 +143,15 @@ export type Bubble =
       items: RenderItem[];
     }
   | { kind: "compaction_loading"; itemId: string }
-  | { kind: "compaction"; itemId: string };
+  | { kind: "compaction"; itemId: string }
+  | {
+      kind: "routing_decision";
+      itemId: string;
+      model: string;
+      tier: "cheap" | "medium" | "expensive";
+      applied: boolean;
+      rationale: string;
+    };
 
 const TEXT_BLOCK_TYPES = new Set(["text_chunk", "text_done"]);
 const REASONING_BLOCK_TYPES = new Set(["reasoning_start", "reasoning_chunk", "reasoning_block"]);
@@ -425,6 +435,22 @@ function walkBubbles(
       continue;
     }
 
+    if (b.type === "routing_decision") {
+      // Standalone muted chip at its transcript position (turn start),
+      // never folded into an adjacent assistant bubble.
+      lastBubbleStart = i;
+      bubbles.push({
+        kind: "routing_decision",
+        itemId: b.ctx.itemId ?? `routing_${i}`,
+        model: b.model,
+        tier: b.tier,
+        applied: b.applied,
+        rationale: b.rationale,
+      });
+      i += 1;
+      continue;
+    }
+
     // Open an assistant bubble. Collect all subsequent blocks that
     // share this `responseId` and are not themselves user/compaction
     // boundaries. Out-of-band blocks with a different responseId
@@ -442,7 +468,8 @@ function walkBubbles(
       if (
         cur.type === "user_message" ||
         cur.type === "compaction" ||
-        cur.type === "compaction_loading"
+        cur.type === "compaction_loading" ||
+        cur.type === "routing_decision"
       )
         break;
       if (cur.type === "response_start" || cur.type === "response_end") {
@@ -499,6 +526,8 @@ function isAssistantSideBlock(b: AnyBlock): boolean {
     // compaction_loading has its own top-level bubble slot and must not
     // end up in an assistant bubble's item list.
     b.type !== "compaction_loading" &&
+    // routing_decision is a standalone top-level chip, not an assistant item.
+    b.type !== "routing_decision" &&
     b.type !== "response_start" &&
     b.type !== "response_end" &&
     // FileBlock is currently deferred from rendering; skip silently.
@@ -696,6 +725,7 @@ function buildAssistantItems(
         exitPlanMode: b.exitPlanMode,
         codexCommand: b.codexCommand,
         allowAllEdits: b.allowAllEdits,
+        rememberScope: b.rememberScope,
       });
       i += 1;
       continue;
@@ -870,6 +900,10 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
     (a.kind === "compaction" && b.kind === "compaction") ||
     (a.kind === "compaction_loading" && b.kind === "compaction_loading")
   ) {
+    return a.itemId === b.itemId;
+  }
+  if (a.kind === "routing_decision" && b.kind === "routing_decision") {
+    // Verdict fields are immutable per item, so the id alone identifies it.
     return a.itemId === b.itemId;
   }
   return false;

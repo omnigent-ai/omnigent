@@ -534,24 +534,45 @@ class QueuedResponse:
 
 
 class _ResponseQueue:
-    """Per-key FIFO queue of pre-configured responses."""
+    """Per-key FIFO queue of pre-configured responses.
+
+    An optional *fallback* response is returned when the queue is
+    exhausted.  Unlike regular entries, the fallback is NOT cleared by
+    :meth:`reset` — it persists for the lifetime of the queue instance
+    so session-level callers (e.g. a policy-classifier LLM configured
+    by ``live_server``) always receive a valid response even when
+    per-test ``reset_mock_llm`` calls clear the regular queue.
+    """
 
     def __init__(self) -> None:
         self.responses: list[QueuedResponse] = []
         self.index: int = 0
+        self.fallback: QueuedResponse | None = None
+        # Optional content-routing token. When set, a request is served
+        # from this queue if the token appears in the request's
+        # role="user" input text — regardless of the request's ``model``.
+        # Lets each test claim its own queue by the (unique) message it
+        # sends, so a stray/late request from another test (which carries
+        # a different user message) can't draw from this test's queue —
+        # the #523 cross-test contamination, fixed without per-test
+        # servers. ``None`` preserves the default model/"default" routing.
+        self.match: str | None = None
 
     def next(self) -> QueuedResponse:
-        """Consume the next response, or return a default."""
+        """Consume the next response, or return the fallback / default."""
         if self.index < len(self.responses):
             resp = self.responses[self.index]
             self.index += 1
             return resp
+        if self.fallback is not None:
+            return self.fallback
         return QueuedResponse()
 
     def reset(self) -> None:
-        """Clear the queue."""
+        """Clear the regular queue + content-routing token; fallback is preserved."""
         self.responses.clear()
         self.index = 0
+        self.match = None
 
 
 class MockState:
@@ -593,8 +614,88 @@ class MockState:
         self.queues[_DEFAULT_KEY] = _ResponseQueue()
         return self.queues[_DEFAULT_KEY]
 
+    @staticmethod
+    def _user_input_text(parsed: object) -> str:
+        """Concatenate the text of all ``role="user"`` items in the request.
+
+        Endpoint-agnostic: reads BOTH the Responses-API ``input`` array
+        (``/v1/responses``) AND the ``messages`` array used by the
+        Anthropic Messages (``/v1/messages``) and OpenAI Chat
+        (``/v1/chat/completions``) endpoints — so content routing behaves
+        identically no matter which endpoint ``resolve_queue_for_request``
+        is called from, rather than silently degrading to model routing
+        for ``messages``-shaped requests.
+
+        Scoped to user-role content deliberately — NOT the system prompt
+        (``instructions`` / ``system``) or tool outputs — so a
+        content-routing token only ever matches what the test itself
+        typed, never incidental words in a shared system prompt. Content
+        may be a plain string or a list of ``{"type","text"}`` blocks
+        (both the Responses and Messages shapes), so both are walked.
+
+        :param parsed: The parsed request body.
+        :returns: Space-joined user message text (``""`` if none).
+        """
+        if not isinstance(parsed, dict):
+            return ""
+        parts: list[str] = []
+        # ``input`` (Responses API) and ``messages`` (Anthropic / Chat)
+        # are mutually exclusive in practice, but walk both so the helper
+        # is correct for every endpoint that routes through it.
+        for key in ("input", "messages"):
+            for item in parsed.get(key) or []:
+                if not isinstance(item, dict) or item.get("role") != "user":
+                    continue
+                content = item.get("content")
+                if isinstance(content, str):
+                    parts.append(content)
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict):
+                            parts.append(str(block.get("text", "")))
+        return " ".join(parts)
+
+    def resolve_queue_for_request(self, parsed: object) -> _ResponseQueue:
+        """Pick the queue for a request: content-routed queues first, then model/default.
+
+        A queue with a ``match`` token wins if that token appears in the
+        request's user input — this is how a test claims its own queue by
+        the unique message it sends. Otherwise falls back to the existing
+        ``model`` / ``"default"`` routing, so tests that don't opt in are
+        unaffected.
+
+        When several match-queues are live at once (e.g. a sub-agent test
+        with distinct parent/worker queues), the LONGEST matching token
+        wins — deterministic regardless of dict order, and robust if one
+        token is a substring of another. Tests should still pick mutually
+        non-substring tokens; longest-match is a safety net, not a
+        license to overlap.
+
+        :param parsed: The parsed request body.
+        :returns: The selected response queue.
+        """
+        user_text = self._user_input_text(parsed)
+        if user_text:
+            best: _ResponseQueue | None = None
+            for queue in self.queues.values():
+                if (
+                    queue.match
+                    and queue.match in user_text
+                    and (best is None or len(queue.match) > len(best.match or ""))
+                ):
+                    best = queue
+            if best is not None:
+                return best
+        model = parsed.get("model") if isinstance(parsed, dict) else None
+        return self.resolve_queue(model)
+
     def reset(self) -> None:
         """Clear all state (queues, captured requests, gates).
+
+        Queues that have a fallback response set (via ``POST /mock/set_fallback``)
+        are not deleted — their regular responses are cleared but the fallback
+        is preserved so session-level callers (e.g. the policy-classifier LLM)
+        continue to receive a valid response after per-test resets.
 
         Atomically swaps the pending-gates list before releasing
         so a handler that appends between the loop and the clear
@@ -604,7 +705,13 @@ class MockState:
         self.pending_gates = []
         for qr in old_gates:
             qr._gate.set()
-        self.queues.clear()
+        # Preserve queues that have a non-resettable fallback; delete others.
+        for key in list(self.queues):
+            queue = self.queues[key]
+            if queue.fallback is not None:
+                queue.reset()  # clear responses/index, keep fallback
+            else:
+                del self.queues[key]
         self.captured_requests.clear()
         self.request_count = 0
 
@@ -634,8 +741,7 @@ async def create_response(
     async with _state._lock:
         _state.request_count += 1
         _state.captured_requests.append(parsed)
-        model = parsed.get("model") if isinstance(parsed, dict) else None
-        queue = _state.resolve_queue(model)
+        queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
 
     # Error response
@@ -702,8 +808,7 @@ async def create_message(
     async with _state._lock:
         _state.request_count += 1
         _state.captured_requests.append(parsed)
-        model = parsed.get("model") if isinstance(parsed, dict) else None
-        queue = _state.resolve_queue(model)
+        queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
 
     if qr.error is not None:
@@ -753,7 +858,7 @@ async def create_chat_completion(
         _state.request_count += 1
         _state.captured_requests.append(parsed)
         model = parsed.get("model") if isinstance(parsed, dict) else None
-        queue = _state.resolve_queue(model)
+        queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
 
     if qr.error is not None:
@@ -768,6 +873,29 @@ async def create_chat_completion(
         await qr._gate.wait()
 
     text = qr.text if not qr.tool_calls else ""
+    # Render queued tool_calls in Chat Completions format (harnesses on the
+    # openai-completions wire — e.g. pi's gateway models.json — POST here, not
+    # /v1/responses). Without this, a tool_call response collapsed to empty
+    # content and the tool round-trip silently produced nothing.
+    cc_tool_calls = (
+        [
+            {
+                "id": tc.get("call_id", "call-mock"),
+                "type": "function",
+                "function": {
+                    "name": tc.get("name", ""),
+                    "arguments": tc.get("arguments", "{}"),
+                },
+            }
+            for tc in qr.tool_calls
+        ]
+        if qr.tool_calls
+        else None
+    )
+    finish_reason = "tool_calls" if cc_tool_calls else "stop"
+    cc_message: dict[str, object] = {"role": "assistant", "content": text or None}
+    if cc_tool_calls:
+        cc_message["tool_calls"] = cc_tool_calls
     resp_id = _response_id()
     body_json = {
         "id": f"chatcmpl-{resp_id}",
@@ -776,8 +904,8 @@ async def create_chat_completion(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
+                "message": cc_message,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
@@ -787,6 +915,9 @@ async def create_chat_completion(
         },
     }
     if parsed.get("stream"):
+        delta: dict[str, object] = {"role": "assistant", "content": text or None}
+        if cc_tool_calls:
+            delta["tool_calls"] = [{"index": i, **tc} for i, tc in enumerate(cc_tool_calls)]
         chunk = {
             "id": f"chatcmpl-{resp_id}",
             "object": "chat.completion.chunk",
@@ -794,8 +925,8 @@ async def create_chat_completion(
             "choices": [
                 {
                     "index": 0,
-                    "delta": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
+                    "delta": delta,
+                    "finish_reason": finish_reason,
                 }
             ],
         }
@@ -822,17 +953,27 @@ async def configure(request: Request) -> dict[str, object]:
 
         {
             "key": "mock-model",          // optional, default "default"
+            "match": "mangosteen-tr",     // optional content-routing token
             "responses": [{"text": "..."}, ...]
         }
+
+    When ``match`` is set, a request is served from this queue if the
+    token appears in the request's ``role="user"`` input text, regardless
+    of the request's ``model`` — so a test can claim its own queue by the
+    unique message it sends (per-test isolation against cross-test
+    contamination). Omitting ``match`` keeps the default model/"default"
+    routing.
 
     Multiple calls with different keys accumulate queues; use
     ``POST /mock/reset`` to clear all keys.
     """
     body = await request.json()
     key = body.get("key", _DEFAULT_KEY)
+    match = body.get("match")
     async with _state._lock:
         queue = _state.get_queue(key)
         queue.reset()
+        queue.match = match
         for entry in body.get("responses", []):
             queue.responses.append(
                 QueuedResponse(
@@ -849,9 +990,35 @@ async def configure(request: Request) -> dict[str, object]:
     return {"configured": True, "key": key, "count": count}
 
 
+@app.post("/mock/set_fallback")
+async def set_fallback(request: Request) -> dict[str, object]:
+    """Set a non-resettable fallback response for a queue key.
+
+    The fallback is returned when the regular queue for *key* is
+    exhausted.  Unlike regular entries (configured via
+    ``POST /mock/configure``), the fallback survives
+    ``POST /mock/reset`` — it persists for the lifetime of the server
+    process.  Use this for session-level queues that must return a
+    valid response even when per-test resets clear the regular queue
+    (e.g. the server-level policy-classifier LLM queue).
+
+    Body: ``{"key": "<key>", "text": "<response-text>"}``
+    """
+    body = await request.json()
+    key = body.get("key", _DEFAULT_KEY)
+    text = body.get("text", "Mock LLM response")
+    async with _state._lock:
+        queue = _state.get_queue(key)
+        queue.fallback = QueuedResponse(text=text)
+    return {"fallback_set": True, "key": key}
+
+
 @app.post("/mock/reset")
 async def reset() -> dict[str, bool]:
-    """Clear all state (all keyed queues, captured requests, gates)."""
+    """Clear all regular queues, captured requests, and gates.
+
+    Fallbacks set via ``POST /mock/set_fallback`` are preserved.
+    """
     async with _state._lock:
         _state.reset()
     return {"reset": True}

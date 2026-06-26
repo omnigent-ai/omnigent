@@ -12,10 +12,8 @@
 # does not vouch for the contents of this one) and first-timers
 # (FIRST_TIME_CONTRIBUTOR / NONE).
 #
-# This gate is independent of fork-e2e/should-mirror.sh: that one gates secret-
-# bearing e2e on a maintainer's approving PR review, whereas this gate
-# decides whether to inspect for attacks and so errs toward scanning more (it
-# scans returning CONTRIBUTORs that the label gate would not by itself run).
+# This gate decides whether to inspect a PR for attacks and errs toward scanning
+# more (it scans returning CONTRIBUTORs, not just first-timers).
 #
 # author_association is computed by GitHub from the actor's relationship to the
 # repo at event time; it is not attacker-settable from PR contents.
@@ -70,9 +68,8 @@ has_skip_label() {
 }
 
 # Only PRs carry untrusted contributor code through the gate. Every other
-# trigger -- push to main / fork-e2e/** (the mirror branch only exists after a
-# returning-contributor / maintainer-approval gate), schedule, dispatch -- is a
-# trusted context, so proceed without scanning. pull_request_review is still
+# trigger -- push to main, schedule, dispatch -- is a trusted context, so
+# proceed without scanning. pull_request_review is still
 # accepted (it carries the same pull_request + author_association fields, so the
 # gate evaluates identically) in case a workflow_call caller is wired to it, but
 # no workflow triggers a scan on review any more: the skip-security-scan waiver

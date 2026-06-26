@@ -1,6 +1,7 @@
 // Tests for the sidebar conversation-row quick actions:
-//   1. A pin/unpin button (the sole pin affordance — no longer in the kebab
-//      menu) that toggles the pin (ConversationRow's `quick-pin-conversation`).
+//   1. A desktop quick pin/unpin button (`quick-pin-conversation`) and a
+//      mobile-only kebab Pin item (`pin-conversation`) — two affordances for
+//      the same pin toggle, split by viewport (responsive Tailwind classes).
 //   2. Double-clicking a row to enter inline rename (ConversationRow's
 //      `onDoubleClick`), gated on edit permission.
 // See ConversationRow / ConversationEditRow in Sidebar.tsx.
@@ -42,7 +43,6 @@ vi.mock("@/hooks/useConversations", () => ({
 vi.mock("./AgentTypeFilter", () => ({ AgentTypeFilter: () => null }));
 vi.mock("./ReportIssueButton", () => ({ ReportIssueButton: () => null }));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
-vi.mock("@/components/theme/ThemeModeMenu", () => ({ ThemeModeMenu: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Sidebar } from "./Sidebar";
@@ -136,16 +136,44 @@ describe("quick pin/unpin hover button", () => {
     expect(screen.queryByText("Pinned")).toBeNull();
   });
 
-  it("no longer offers Pin in the kebab menu (the quick button replaced it)", () => {
+  it("also offers Pin in the kebab menu (mobile affordance) and toggles the same pin state", () => {
     renderSidebar();
+
+    expect(screen.queryByText("Pinned")).toBeNull();
 
     // Radix DropdownMenu opens on pointerdown, not click.
     fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
 
-    // The menu opened (a sibling item is present) but the old Pin item is gone
-    // — pinning now lives only on the hover/quick button.
-    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
-    expect(screen.queryByTestId("pin-conversation")).toBeNull();
+    // The kebab carries a Pin item (mobile-only via `md:hidden`, but always in
+    // the DOM since jsdom doesn't evaluate media queries). Clicking it drives
+    // the same pin state as the quick button — the row moves under "Pinned".
+    const pinItem = screen.getByTestId("pin-conversation");
+    expect(pinItem).toHaveTextContent("Pin");
+    fireEvent.click(pinItem);
+
+    const pinnedHeader = screen.getByText("Pinned");
+    const pinnedSection = pinnedHeader.closest("section")!;
+    expect(within(pinnedSection).getByText("My Session")).toBeInTheDocument();
+    expect(localStorage.getItem("omnigent:pinned-conversation-ids")).toContain("conv_1");
+  });
+
+  it("splits the two pin affordances by viewport via Tailwind responsive classes", () => {
+    // jsdom doesn't evaluate CSS media queries, so both affordances live in the
+    // DOM regardless of viewport — the mobile/desktop split is purely the
+    // responsive classes. Assert those classes directly: the kebab Pin item is
+    // hidden from `md` up (desktop), and the quick button is hidden below `md`
+    // (mobile) but shown from `md` up. Together they guarantee exactly one pin
+    // affordance is visible at any breakpoint.
+    renderSidebar();
+
+    // Desktop quick button: hidden on mobile, shown on desktop.
+    const quickButton = screen.getByTestId("quick-pin-conversation");
+    expect(quickButton).toHaveClass("hidden", "md:block");
+
+    // Kebab Pin item: present in the menu but hidden from `md` up, so it only
+    // surfaces on mobile.
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    expect(screen.getByTestId("pin-conversation")).toHaveClass("md:hidden");
   });
 });
 

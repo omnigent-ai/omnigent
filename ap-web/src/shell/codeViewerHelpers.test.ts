@@ -5,6 +5,7 @@ import {
   getSelectionOffsets,
   indexToLine,
   isBinaryPath,
+  isImageFile,
   lineOverlapsSelection,
   openHtmlArtifactInNewTab,
   prepareHtmlPreviewDoc,
@@ -108,6 +109,55 @@ describe("isBinaryPath", () => {
 
   it("treats extension-less paths as non-binary", () => {
     expect(isBinaryPath("Dockerfile")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isImageFile — image-preview detection (MIME-first, extension fallback)
+// ---------------------------------------------------------------------------
+
+describe("isImageFile", () => {
+  it.each([
+    "logo.png",
+    "photo.jpg",
+    "scan.jpeg",
+    "anim.gif",
+    "icon.ico",
+    "hero.webp",
+    "next.avif",
+    "diagram.svg",
+  ])("classifies %s as an image by extension", (path) => {
+    expect(isImageFile(path)).toBe(true);
+  });
+
+  it.each(["app.py", "archive.zip", "clip.mp4", "font.woff2", "notes.txt"])(
+    "classifies %s as non-image by extension",
+    (path) => {
+      expect(isImageFile(path)).toBe(false);
+    },
+  );
+
+  it("is case-insensitive on the extension", () => {
+    expect(isImageFile("LOGO.PNG")).toBe(true);
+  });
+
+  it("treats a content type as authoritative over the extension", () => {
+    // A misleading/extension-less name still previews when the server says image.
+    expect(isImageFile("blob", "image/png")).toBe(true);
+    expect(isImageFile("data.txt", "image/jpeg")).toBe(true);
+    // ...and an image extension is overridden by a non-image content type.
+    expect(isImageFile("logo.png", "text/plain")).toBe(false);
+    expect(isImageFile("photo.jpg", "application/octet-stream")).toBe(false);
+  });
+
+  it("falls back to the extension when content type is null/undefined", () => {
+    expect(isImageFile("logo.png", null)).toBe(true);
+    expect(isImageFile("logo.png", undefined)).toBe(true);
+    expect(isImageFile("notes.txt", null)).toBe(false);
+  });
+
+  it("treats extension-less paths with no content type as non-image", () => {
+    expect(isImageFile("Dockerfile")).toBe(false);
   });
 });
 

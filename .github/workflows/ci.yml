@@ -112,6 +112,14 @@ jobs:
               --ignore=tests/spec
               --ignore=tests/llms
               --ignore=tests/codex_parity
+          # Databricks-coupled tests (Lakebase token engine, psycopg). This is
+          # the only lane that installs the `databricks` extra; the
+          # @pytest.mark.databricks marker keeps these tests off the lean lanes
+          # (which run -m "not databricks") and selects them here.
+          - group: databricks
+            paths: tests/db tests/deploy
+            extra: databricks
+            markexpr: databricks
 
     steps:
       - name: Check out repo
@@ -144,13 +152,13 @@ jobs:
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install dependencies
-        run: uv sync --extra all --extra dev
+        # matrix.extra (e.g. "databricks") adds an extra for lanes that need it;
+        # empty for the default lanes.
+        run: uv sync --locked --extra all --extra dev ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
 
       - name: Run pytest
         shell: bash
         env:
-          # force-all-tests label bypasses tests/known_failures.yaml.
-          FORCE_ALL_TESTS: ${{ contains(github.event.pull_request.labels.*.name, 'force-all-tests') }}
           PYTHONFAULTHANDLER: "1"
           PYTEST_PROGRESS_LOG_DIR: artifacts/progress
           OMNIGENT_TOKEN_USAGE_JSON: artifacts/tokens-${{ matrix.group }}.json
@@ -163,22 +171,17 @@ jobs:
           COVERAGE_CORE: sysmon
         run: |
           mkdir -p artifacts artifacts/progress "$(dirname "$COVERAGE_FILE")"
-          EXTRA_ARGS=()
-          if [[ "$FORCE_ALL_TESTS" == "true" ]]; then
-            EXTRA_ARGS=(--no-skip-known)
-            echo "::notice::force-all-tests label present; bypassing tests/known_failures.yaml"
-          fi
           # matrix.paths is unquoted on purpose: it word-splits into pytest args.
           # shellcheck disable=SC2086
           env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \
             uv run pytest ${{ matrix.paths }} \
+              -m "${{ matrix.markexpr || 'not databricks' }}" \
               -n ${{ matrix.workers || '8' }} \
               --dist=${{ matrix.dist || 'loadfile' }} \
               --timeout=${{ matrix.timeout || '300' }} \
               --junitxml=artifacts/pytest-${{ matrix.group }}.xml \
               --cov=omnigent --cov-report= \
               -v --tb=long --showlocals --log-level=INFO -r a \
-              "${EXTRA_ARGS[@]}" \
               || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
 
       - name: Stage coverage data for upload
@@ -249,7 +252,7 @@ jobs:
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install dependencies
-        run: uv sync --extra all --extra dev
+        run: uv sync --locked --extra all --extra dev
 
       - name: Build parity sidecar
         run: |

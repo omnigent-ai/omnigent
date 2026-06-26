@@ -4,12 +4,14 @@ Covers the pure pieces a live cursor-agent isn't needed for: reading the
 content-addressed SQLite chat store (including the live-WAL layout that the
 ``immutable=1`` open mode silently missed), unwrapping cursor's
 ``<user_query>`` framing, building conversation items, rowid-based dedup,
-store discovery by ``md5(cwd)`` + launch recency, and the POST shapes. The live
-tmux + cursor-agent path is exercised by the e2e gate, not here.
+store discovery by ``md5(cwd)`` + launch recency, the POST shapes, and the
+``external_session_id`` patch that enables cold resume. The live tmux +
+cursor-agent path is exercised by the e2e gate, not here.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -19,6 +21,14 @@ import httpx
 import pytest
 
 from omnigent import cursor_native_forwarder as fwd
+
+# Real cursor chat ids are UUIDs. Use UUID-shaped ids in fixtures so the
+# persist side (forwarder) and the resume side (runner's strict
+# ``is_valid_cursor_chat_id`` guard) agree on the same id shape — exercising the
+# persist→resume path with values the resume side would actually accept.
+_CHAT_ID = "0ef42bbf-3b80-4bec-ac39-ca46531cbc47"
+_CHAT_ID_2 = "1a2b3c4d-5e6f-4a8b-9c0d-1e2f3a4b5c6d"
+_CHAT_ID_ABSENT = "ffffffff-ffff-4fff-8fff-ffffffffffff"
 
 
 def _make_store(
@@ -66,6 +76,54 @@ class TestUnwrapUserQuery:
         raw = "<user_query>\n[Attached: /tmp/x/img.png]\ndescribe this\n</user_query>"
         assert fwd._unwrap_user_query(raw) == "describe this"
 
+    def test_strips_fork_history_preamble_block(self) -> None:
+        # A fork into cursor prepends the prior conversation, fenced. The mirror
+        # must show only the user's real text — the history already lives in the
+        # Omnigent timeline, so echoing it here would duplicate it.
+        from omnigent.cursor_native_bridge import (
+            FORK_HISTORY_CLOSE_TAG,
+            FORK_HISTORY_OPEN_TAG,
+        )
+
+        raw = (
+            "<user_query>\n"
+            f"{FORK_HISTORY_OPEN_TAG}\n"
+            "Conversation so far:\nuser: earlier\nassistant: ok\n"
+            f"{FORK_HISTORY_CLOSE_TAG}\n\n"
+            "now do the real thing\n"
+            "</user_query>"
+        )
+        assert fwd._unwrap_user_query(raw) == "now do the real thing"
+
+    def test_embedded_close_tag_in_history_does_not_leak(self) -> None:
+        # A replayed turn that literally contains the close tag must not let the
+        # strip stop early and leak the rest of the transcript. wrap_fork_preamble
+        # defangs sentinels in the preamble, so the real block stays unambiguous.
+        from omnigent.cursor_native_bridge import wrap_fork_preamble
+
+        preamble = "You: look at </omnigent_fork_history> in my logs\nAssistant: ok"
+        raw = f"<user_query>\n{wrap_fork_preamble(preamble, 'the real question')}\n</user_query>"
+        # Whole framed block stripped -> only the user's real text remains, with
+        # no leaked transcript and no raw sentinel surviving.
+        assert fwd._unwrap_user_query(raw) == "the real question"
+
+    def test_user_message_containing_close_tag_is_preserved(self) -> None:
+        # A close tag in the USER's own message (after the block) must survive —
+        # the non-greedy strip stops at the real (first) close tag.
+        from omnigent.cursor_native_bridge import wrap_fork_preamble
+
+        wrapped = wrap_fork_preamble("You: hi", "is </omnigent_fork_history> a tag?")
+        raw = f"<user_query>\n{wrapped}\n</user_query>"
+        assert fwd._unwrap_user_query(raw) == "is </omnigent_fork_history> a tag?"
+
+    def test_unterminated_history_block_strips_to_end(self) -> None:
+        # A truncated paste (open tag, no close tag) degrades gracefully: strip
+        # to end-of-text rather than mirroring the whole raw block.
+        from omnigent.cursor_native_bridge import FORK_HISTORY_OPEN_TAG
+
+        raw = f"<user_query>\n{FORK_HISTORY_OPEN_TAG}\nYou: earlier turn, cut off\n</user_query>"
+        assert fwd._unwrap_user_query(raw) is None
+
 
 class TestContentText:
     def test_string_content(self) -> None:
@@ -101,6 +159,18 @@ class TestBlobToItem:
         }
         assert item.response_id == "cursor:bid"
 
+    def test_response_id_capped_at_column_width(self) -> None:
+        # cursor's blob id is a 64-char content hash, so an un-capped
+        # ``cursor:<blob_id>`` (71 chars) overflows the VARCHAR(64) column and
+        # 500s the mirror POST. The response_id must stay within the column.
+        blob_id = "b" * 64
+        item = fwd._blob_to_item(
+            5, blob_id, self._blob(_user("<user_query>\nhi\n</user_query>")), "cursor-native-ui"
+        )
+        assert item is not None
+        assert len(item.response_id) <= fwd._RESPONSE_ID_MAX_LEN
+        assert item.response_id == f"cursor:{blob_id}"[: fwd._RESPONSE_ID_MAX_LEN]
+
     def test_assistant_text_becomes_output_text_item(self) -> None:
         item = fwd._blob_to_item(
             9,
@@ -135,6 +205,27 @@ class TestBlobToItem:
 
     def test_binary_merkle_node_is_skipped(self) -> None:
         assert fwd._blob_to_item(3, "bid", b"\n \x92\xc0\xa6w\xef&", "a") is None
+
+    def test_summary_rollup_becomes_compaction_completed(self) -> None:
+        # After /summarize finishes, cursor collapses the prior history into a
+        # user blob whose content is a plain STRING (not a [{type:text}] list)
+        # starting with the marker. It must surface as a compaction-completed
+        # signal — the only durable cue that the in-pane compaction finished —
+        # not as a chat bubble.
+        blob = self._blob(
+            {"role": "user", "content": f"{fwd._COMPACTION_SUMMARY_PREFIX} Summary:\n1. ..."}
+        )
+        item = fwd._blob_to_item(12, "bid", blob, "cursor-native-ui")
+        assert item is not None
+        assert item.item_type == "compaction_completed"
+        assert item.item_data == {}
+
+    def test_plain_string_user_without_marker_is_skipped(self) -> None:
+        # A bare-string user content that ISN'T the summary rollup has no
+        # <user_query> wrapper, so it is neither a chat bubble nor a compaction
+        # signal — skipped, exactly as before.
+        blob = self._blob({"role": "user", "content": "just some unwrapped context"})
+        assert fwd._blob_to_item(2, "bid", blob, "a") is None
 
 
 class TestReadNewItems:
@@ -252,6 +343,70 @@ class TestStateRoundTrip:
         fwd.clear_cursor_bridge_state(tmp_path)
 
 
+class TestChatClaim:
+    """``_chat_claimed_by_other`` keeps one cursor chat → one mirroring session.
+
+    cursor keeps one chat per working dir, so two cursor-native sessions in the
+    same cwd discover the same store; this guard stops both from mirroring it
+    into two conversations (the duplicate-session bug).
+    """
+
+    def test_yields_to_earlier_live_session(self, tmp_path: Path) -> None:
+        root = tmp_path / "cursor-native"
+        earlier = root / "sessA"
+        later = root / "sessB"
+        earlier.mkdir(parents=True)
+        later.mkdir(parents=True)
+        store = "/cursor/chats/h/c/store.db"
+        # The earlier-launched session claims the chat (fresh heartbeat on write).
+        fwd._write_state(
+            earlier, fwd._ForwardState(store_path=store, last_rowid=3, launch_epoch_ms=1_000)
+        )
+        # The later session must yield to the established one.
+        assert fwd._chat_claimed_by_other(later, Path(store), my_launch_ms=2_000) is True
+        # The earlier session does NOT yield, even once the later one has also
+        # recorded a claim on the same chat.
+        fwd._write_state(
+            later, fwd._ForwardState(store_path=store, last_rowid=0, launch_epoch_ms=2_000)
+        )
+        assert fwd._chat_claimed_by_other(earlier, Path(store), my_launch_ms=1_000) is False
+
+    def test_unrelated_store_is_not_claimed(self, tmp_path: Path) -> None:
+        root = tmp_path / "cursor-native"
+        (root / "sessA").mkdir(parents=True)
+        (root / "sessB").mkdir(parents=True)
+        fwd._write_state(
+            root / "sessA",
+            fwd._ForwardState(
+                store_path="/cursor/chats/h/c1/store.db", last_rowid=1, launch_epoch_ms=1_000
+            ),
+        )
+        # A session mirroring a DIFFERENT chat is not blocked.
+        assert (
+            fwd._chat_claimed_by_other(
+                root / "sessB", Path("/cursor/chats/h/c2/store.db"), my_launch_ms=2_000
+            )
+            is False
+        )
+
+    def test_stale_sibling_claim_is_ignored(self, tmp_path: Path) -> None:
+        root = tmp_path / "cursor-native"
+        dead = root / "sessDead"
+        live = root / "sessLive"
+        dead.mkdir(parents=True)
+        live.mkdir(parents=True)
+        store = "/cursor/chats/h/c/store.db"
+        # An ancient heartbeat marks a dead session; write the file directly so
+        # _write_state does not refresh the heartbeat to "now".
+        (dead / fwd._STATE_FILE).write_text(
+            json.dumps(
+                {"store_path": store, "last_rowid": 9, "launch_epoch_ms": 1_000, "heartbeat_ms": 1}
+            ),
+            encoding="utf-8",
+        )
+        assert fwd._chat_claimed_by_other(live, Path(store), my_launch_ms=2_000) is False
+
+
 class _RecordingClient:
     """Async httpx-client stub that records POSTs and returns HTTP 200."""
 
@@ -261,6 +416,157 @@ class _RecordingClient:
     async def post(self, url: str, *, json: dict) -> httpx.Response:
         self.posts.append((url, json))
         return httpx.Response(200, request=httpx.Request("POST", url))
+
+
+def _write_meta_model(con: sqlite3.Connection, model: str | None, *, key: str = "0") -> None:
+    """Add cursor's ``meta`` table to *con* and store a hex-encoded model blob.
+
+    Mirrors cursor's on-disk layout: ``meta(key TEXT, value TEXT)`` where value
+    is hex-encoded JSON. When *model* is ``None`` the JSON omits ``lastUsedModel``.
+    """
+    con.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+    payload: dict = {"mode": "default"}
+    if model is not None:
+        payload["lastUsedModel"] = model
+    hexed = json.dumps(payload).encode("utf-8").hex()
+    con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (key, hexed))
+    con.commit()
+
+
+class TestLastUsedModelFromMetaValue:
+    def test_decodes_hex_json(self) -> None:
+        hexed = json.dumps({"lastUsedModel": "gpt-5.2"}).encode().hex()
+        assert fwd._last_used_model_from_meta_value(hexed) == "gpt-5.2"
+
+    def test_strips_whitespace(self) -> None:
+        hexed = json.dumps({"lastUsedModel": "  composer-2.5  "}).encode().hex()
+        assert fwd._last_used_model_from_meta_value(hexed) == "composer-2.5"
+
+    def test_missing_field_is_none(self) -> None:
+        hexed = json.dumps({"mode": "default"}).encode().hex()
+        assert fwd._last_used_model_from_meta_value(hexed) is None
+
+    def test_empty_model_is_none(self) -> None:
+        hexed = json.dumps({"lastUsedModel": "   "}).encode().hex()
+        assert fwd._last_used_model_from_meta_value(hexed) is None
+
+    def test_non_hex_text_is_none(self) -> None:
+        assert fwd._last_used_model_from_meta_value("not-hex-zzz") is None
+
+    def test_bytes_value_is_decoded(self) -> None:
+        raw = json.dumps({"lastUsedModel": "auto"}).encode()
+        assert fwd._last_used_model_from_meta_value(raw) == "auto"
+
+
+class TestReadLastUsedModel:
+    def test_reads_model_from_live_wal_store(self, tmp_path: Path) -> None:
+        store = tmp_path / "store.db"
+        writer = _make_store(store, [("u", _user("<user_query>hi</user_query>"))], wal=True)
+        try:
+            _write_meta_model(writer, "claude-opus-4-7")
+            assert fwd._read_last_used_model(store) == "claude-opus-4-7"
+        finally:
+            writer.close()
+
+    def test_no_meta_table_is_none(self, tmp_path: Path) -> None:
+        store = tmp_path / "store.db"
+        writer = _make_store(store, [("u", _user("<user_query>hi</user_query>"))])
+        try:
+            assert fwd._read_last_used_model(store) is None
+        finally:
+            writer.close()
+
+
+class TestPostModelChangeIfNew:
+    @pytest.mark.asyncio
+    async def test_first_observation_is_posted(self) -> None:
+        # Unlike claude-native, cursor posts the FIRST observed model so an
+        # un-pinned session shows the real cursor model instead of omnigent's
+        # default ("fable") in the Web UI pill.
+        client = _RecordingClient()
+        state = fwd._ModelMirrorState()
+        await fwd._post_model_change_if_new(
+            client,  # type: ignore[arg-type]
+            session_id="conv_1",
+            state=state,
+            model="claude-sonnet-4-5",
+        )
+        url, body = client.posts[0]
+        assert url == "/v1/sessions/conv_1/events"
+        assert body == {"type": "external_model_change", "data": {"model": "claude-sonnet-4-5"}}
+        assert state.posted == "claude-sonnet-4-5"
+
+    @pytest.mark.asyncio
+    async def test_switch_after_seed_posts_external_model_change(self) -> None:
+        client = _RecordingClient()
+        state = fwd._ModelMirrorState(observed="composer-2.5", posted="composer-2.5")
+        await fwd._post_model_change_if_new(
+            client,  # type: ignore[arg-type]
+            session_id="conv_1",
+            state=state,
+            model="gpt-5.2",
+        )
+        url, body = client.posts[0]
+        assert url == "/v1/sessions/conv_1/events"
+        assert body == {"type": "external_model_change", "data": {"model": "gpt-5.2"}}
+        assert state.posted == "gpt-5.2"
+
+    @pytest.mark.asyncio
+    async def test_unchanged_model_does_not_repost(self) -> None:
+        client = _RecordingClient()
+        state = fwd._ModelMirrorState(observed="gpt-5.2", posted="gpt-5.2")
+        await fwd._post_model_change_if_new(
+            client,  # type: ignore[arg-type]
+            session_id="conv_1",
+            state=state,
+            model="gpt-5.2",
+        )
+        assert client.posts == []
+
+    @pytest.mark.asyncio
+    async def test_none_observation_does_not_clear_or_post(self) -> None:
+        client = _RecordingClient()
+        state = fwd._ModelMirrorState(observed="gpt-5.2", posted="gpt-5.2")
+        await fwd._post_model_change_if_new(
+            client,  # type: ignore[arg-type]
+            session_id="conv_1",
+            state=state,
+            model=None,
+        )
+        assert client.posts == []
+        assert state.observed == "gpt-5.2"
+
+    @pytest.mark.asyncio
+    async def test_failed_post_retries_next_poll(self) -> None:
+        class _FailingThenOkClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def post(self, url: str, *, json: dict) -> httpx.Response:
+                self.calls += 1
+                if self.calls == 1:
+                    raise httpx.ConnectError("boom")
+                return httpx.Response(200, request=httpx.Request("POST", url))
+
+        client = _FailingThenOkClient()
+        state = fwd._ModelMirrorState(observed="composer-2.5", posted="composer-2.5")
+        # First poll: switch observed, POST fails → posted stays behind observed.
+        await fwd._post_model_change_if_new(
+            client,  # type: ignore[arg-type]
+            session_id="conv_1",
+            state=state,
+            model="gpt-5.2",
+        )
+        assert state.posted == "composer-2.5" and state.observed == "gpt-5.2"
+        # Next poll retries (model=None means "no fresh read") and succeeds.
+        await fwd._post_model_change_if_new(
+            client,  # type: ignore[arg-type]
+            session_id="conv_1",
+            state=state,
+            model=None,
+        )
+        assert state.posted == "gpt-5.2"
+        assert client.calls == 2
 
 
 @pytest.mark.asyncio
@@ -281,3 +587,603 @@ async def test_post_conversation_item_shape() -> None:
         "item_data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
         "response_id": "cursor:bid",
     }
+
+
+def _http_status_error(status: int) -> httpx.HTTPStatusError:
+    """An ``HTTPStatusError`` carrying *status*, as ``raise_for_status`` would raise."""
+    req = httpx.Request("POST", "http://test/v1/sessions/conv_1/events")
+    return httpx.HTTPStatusError(
+        f"HTTP {status}", request=req, response=httpx.Response(status, request=req)
+    )
+
+
+class _FakePoster:
+    """Async ``_post_conversation_item`` stub for driving the poll loop.
+
+    ``fail(item)`` returns an exception to raise for that item (simulating a
+    rejected or failed POST) or ``None`` to accept it. Every attempt lands in
+    ``calls``; accepted items also land in ``delivered``.
+    """
+
+    def __init__(self, fail) -> None:
+        self.calls: list[fwd._MirrorItem] = []
+        self.delivered: list[fwd._MirrorItem] = []
+        self._fail = fail
+
+    async def __call__(self, client: object, *, session_id: str, item: fwd._MirrorItem) -> None:
+        self.calls.append(item)
+        exc = self._fail(item)
+        if exc is not None:
+            raise exc
+        self.delivered.append(item)
+
+
+async def _drive_forwarder(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    store: Path,
+    poster: _FakePoster,
+    *,
+    until,
+    max_ticks: int = 2000,
+) -> Path:
+    """Run the real poll loop against *store* + *poster* until *until* holds.
+
+    Stubs discovery/claim so the loop binds *store* at once and routes every
+    POST through *poster*, then polls ``until(bridge_dir)`` (which inspects the
+    persisted cursor and/or *poster*) and cancels the loop. Raises if the
+    condition is never reached within *max_ticks* — i.e. the loop wedged.
+    """
+    bridge_dir = tmp_path / "cursor-native" / "sess"
+    bridge_dir.mkdir(parents=True)
+    monkeypatch.setattr(fwd, "_discover_store", lambda workspace, launch_ms: store)
+    monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
+    monkeypatch.setattr(fwd, "_post_conversation_item", poster)
+    task = asyncio.create_task(
+        fwd.forward_cursor_store_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv_1",
+            bridge_dir=bridge_dir,
+            agent_name="cursor-native-ui",
+            workspace="/ws",
+            launch_epoch_ms=1_000,
+            poll_interval_s=0.001,
+        )
+    )
+    try:
+        for _ in range(max_ticks):
+            if until(bridge_dir):
+                break
+            await asyncio.sleep(0.001)
+        else:
+            raise AssertionError("forwarder never reached the expected state (wedged?)")
+    finally:
+        task.cancel()
+        # Drain the cancelled task (return_exceptions swallows its CancelledError).
+        await asyncio.gather(task, return_exceptions=True)
+    return bridge_dir
+
+
+class TestForwardLoopPostFailures:
+    """Drive the real poll loop to pin its POST-failure handling.
+
+    The unit tests above cover the pure transforms; these exercise
+    ``forward_cursor_store_to_session`` end to end against a fake poster, so the
+    bounded-retry-then-skip guard — and the original truncation wedge it hardens
+    against — are verified at the loop level, not just per item.
+    """
+
+    @staticmethod
+    def _seed(store: Path, blobs: list[tuple[str, str]]) -> None:
+        # Each (blob_id, prompt) becomes a user blob; rowids are 1, 2, … in order.
+        writer = _make_store(
+            store,
+            [(bid, _user(f"<user_query>\n{text}\n</user_query>")) for bid, text in blobs],
+        )
+        writer.close()
+
+    @pytest.mark.asyncio
+    async def test_long_blob_id_is_mirrored_not_wedged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Incident repro: cursor's blob id is a 64-char content hash, so the
+        # pre-fix ``cursor:<id>`` was 71 chars and overflowed the VARCHAR(64)
+        # column — every mirror POST 500'd and the loop wedged on message #1. A
+        # poster mimicking that column limit must now ACCEPT the capped id.
+        store = tmp_path / "store.db"
+        self._seed(store, [("a" * 64, "hello")])
+
+        def fail(item: fwd._MirrorItem):
+            if len(item.response_id) > fwd._RESPONSE_ID_MAX_LEN:
+                return _http_status_error(500)
+            return None
+
+        poster = _FakePoster(fail)
+        bridge = await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            poster,
+            until=lambda b: fwd._read_state(b).last_rowid >= 1,
+        )
+        assert [it.rowid for it in poster.delivered] == [1]
+        assert all(len(it.response_id) <= fwd._RESPONSE_ID_MAX_LEN for it in poster.delivered)
+        assert fwd._read_state(bridge).last_rowid == 1
+
+    @pytest.mark.asyncio
+    async def test_rejected_item_is_skipped_after_bounded_retries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A persistently rejected item (rowid 2) must be retried only a BOUNDED
+        # number of times and then skipped, so the messages after it still
+        # mirror — no infinite re-post flood, no permanent wedge.
+        store = tmp_path / "store.db"
+        self._seed(store, [("b1", "one"), ("b2", "two"), ("b3", "three")])
+
+        def fail(item: fwd._MirrorItem):
+            return _http_status_error(500) if item.rowid == 2 else None
+
+        poster = _FakePoster(fail)
+        bridge = await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            poster,
+            until=lambda b: fwd._read_state(b).last_rowid >= 3,
+        )
+        assert sum(it.rowid == 2 for it in poster.calls) == fwd._MAX_ITEM_POST_ATTEMPTS
+        assert [it.rowid for it in poster.delivered] == [1, 3]
+        assert fwd._read_state(bridge).last_rowid == 3
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_failure_is_skipped_without_retry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A ReadTimeout means the request was sent but the response was lost:
+        # the server may have committed the item, and external items aren't
+        # deduped, so a retry could duplicate the bubble. The loop must skip the
+        # item after a SINGLE attempt — not the bounded-retry burst.
+        store = tmp_path / "store.db"
+        self._seed(store, [("b1", "one"), ("b2", "two")])
+        req = httpx.Request("POST", "http://test")
+
+        def fail(item: fwd._MirrorItem):
+            return httpx.ReadTimeout("response lost", request=req) if item.rowid == 1 else None
+
+        poster = _FakePoster(fail)
+        bridge = await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            poster,
+            until=lambda b: fwd._read_state(b).last_rowid >= 2,
+        )
+        assert sum(it.rowid == 1 for it in poster.calls) == 1
+        assert [it.rowid for it in poster.delivered] == [2]
+        assert fwd._read_state(bridge).last_rowid == 2
+
+    @pytest.mark.asyncio
+    async def test_connection_failure_retries_indefinitely(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A ConnectError means the server was unreachable — no bytes delivered,
+        # not the item's fault. The loop must retry it indefinitely (NOT count it
+        # toward the skip bound) so a server outage never drops a message.
+        store = tmp_path / "store.db"
+        self._seed(store, [("b1", "one")])
+        req = httpx.Request("POST", "http://test")
+
+        def fail(item: fwd._MirrorItem):
+            return httpx.ConnectError("connection refused", request=req)
+
+        poster = _FakePoster(fail)
+        bridge = await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            poster,
+            until=lambda b: len(poster.calls) >= fwd._MAX_ITEM_POST_ATTEMPTS + 3,
+        )
+        # Retried well past the skip bound, yet never advanced — not quarantined.
+        assert fwd._read_state(bridge).last_rowid == 0
+        assert not poster.delivered
+
+
+# ---------------------------------------------------------------------------
+# external_session_id patching (cold-resume support)
+# ---------------------------------------------------------------------------
+
+
+class _PatchRecordingClient:
+    """Async stub that records PATCH calls and allows injecting a failure response."""
+
+    def __init__(self, status: int = 200) -> None:
+        self.patches: list[tuple[str, dict]] = []
+        self._status = status
+
+    async def patch(self, url: str, *, json: dict) -> httpx.Response:
+        self.patches.append((url, json))
+        return httpx.Response(self._status, request=httpx.Request("PATCH", url))
+
+
+@pytest.mark.asyncio
+async def test_patch_external_session_id_request_shape() -> None:
+    """PATCH carries the correct URL and JSON body."""
+    client = _PatchRecordingClient()
+    await fwd._patch_external_session_id(client, session_id="conv_abc", chat_id=_CHAT_ID)  # type: ignore[arg-type]
+    assert len(client.patches) == 1
+    url, body = client.patches[0]
+    assert url == "/v1/sessions/conv_abc"
+    assert body == {"external_session_id": _CHAT_ID}
+
+
+@pytest.mark.asyncio
+async def test_patch_external_session_id_4xx_logs_but_does_not_raise(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 4xx rejection from the server is logged but must not propagate."""
+    client = _PatchRecordingClient(status=400)
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        await fwd._patch_external_session_id(client, session_id="conv_x", chat_id="cid")  # type: ignore[arg-type]
+    assert any("400" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_patch_external_session_id_http_error_logs_but_does_not_raise(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A transport error is logged and swallowed so the forwarder loop continues."""
+
+    class _ErrorClient:
+        async def patch(self, url: str, *, json: dict) -> httpx.Response:
+            raise httpx.ConnectError("refused", request=httpx.Request("PATCH", url))
+
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        await fwd._patch_external_session_id(_ErrorClient(), session_id="conv_x", chat_id="cid")  # type: ignore[arg-type]
+    assert caplog.records
+
+
+class TestPreseedResumeState:
+    """``preseed_resume_state`` pre-seeds bridge state for cold resume."""
+
+    def _seed_chat(self, chats_root: Path, workspace: str, chat_id: str, rows: int = 3) -> Path:
+        import hashlib
+
+        ws_hash = hashlib.md5(workspace.encode()).hexdigest()
+        chat_dir = chats_root / ws_hash / chat_id
+        chat_dir.mkdir(parents=True)
+        store = chat_dir / "store.db"
+        writer = _make_store(
+            store,
+            [(f"b{i}", _user(f"<user_query>\nmsg{i}\n</user_query>")) for i in range(rows)],
+        )
+        writer.close()
+        return store
+
+    def test_returns_false_when_store_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path / "chats")
+        bridge_dir = tmp_path / "bridge"
+        bridge_dir.mkdir()
+        result = fwd.preseed_resume_state(bridge_dir, "/ws", _CHAT_ID_ABSENT, 1_000)
+        assert result is False
+        assert fwd._read_state(bridge_dir).store_path is None
+
+    def test_writes_store_path_and_current_rowid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path / "chats")
+        store = self._seed_chat(tmp_path / "chats", "/ws", _CHAT_ID, rows=5)
+        bridge_dir = tmp_path / "bridge"
+        bridge_dir.mkdir()
+
+        result = fwd.preseed_resume_state(bridge_dir, "/ws", _CHAT_ID, launch_epoch_ms=99_000)
+
+        assert result is True
+        state = fwd._read_state(bridge_dir)
+        assert state.store_path == str(store)
+        assert state.last_rowid == 5  # all 5 rows already in store
+        assert state.launch_epoch_ms == 99_000
+
+    def test_empty_store_seeds_rowid_zero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path / "chats")
+        self._seed_chat(tmp_path / "chats", "/ws", _CHAT_ID_2, rows=0)
+        bridge_dir = tmp_path / "bridge"
+        bridge_dir.mkdir()
+
+        fwd.preseed_resume_state(bridge_dir, "/ws", _CHAT_ID_2, launch_epoch_ms=1_000)
+
+        assert fwd._read_state(bridge_dir).last_rowid == 0
+
+
+class TestForwardLoopPreseedResume:
+    """Forwarder uses pre-seeded bridge state on cold resume, skipping discovery."""
+
+    @pytest.mark.asyncio
+    async def test_uses_preseed_store_without_discover(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When bridge state is pre-seeded, forwarder skips _discover_store."""
+        chat_id = _CHAT_ID
+        store = tmp_path / chat_id / "store.db"
+        store.parent.mkdir(parents=True)
+        writer = _make_store(
+            store,
+            [
+                ("old", _user("<user_query>\nold message\n</user_query>")),  # rowid 1 (pre-resume)
+                ("new", _user("<user_query>\nnew message\n</user_query>")),  # rowid 2 (new)
+            ],
+        )
+        writer.close()
+
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        bridge_dir.mkdir(parents=True)
+        # Pre-seed: rowid 1 already mirrored (old history), start from there.
+        fwd._write_state(
+            bridge_dir,
+            fwd._ForwardState(store_path=str(store), last_rowid=1, launch_epoch_ms=999_000),
+        )
+
+        discover_calls: list = []
+
+        def _no_discover(workspace: str, launch_ms: int) -> None:
+            discover_calls.append((workspace, launch_ms))
+            return  # should never be reached
+
+        monkeypatch.setattr(fwd, "_discover_store", _no_discover)
+        monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
+
+        delivered: list[fwd._MirrorItem] = []
+
+        async def _collect(client: object, *, session_id: str, item: fwd._MirrorItem) -> None:
+            delivered.append(item)
+
+        monkeypatch.setattr(fwd, "_post_conversation_item", _collect)
+        monkeypatch.setattr(fwd, "_patch_external_session_id", lambda *a, **k: None)
+
+        task = asyncio.create_task(
+            fwd.forward_cursor_store_to_session(
+                base_url="http://test",
+                headers={},
+                session_id="conv_1",
+                bridge_dir=bridge_dir,
+                agent_name="cursor-native-ui",
+                workspace="/ws",
+                launch_epoch_ms=1_000_000,  # far future — discovery would find nothing
+                poll_interval_s=0.001,
+            )
+        )
+        try:
+            for _ in range(2000):
+                if delivered:
+                    break
+                await asyncio.sleep(0.001)
+            else:
+                raise AssertionError("forwarder never mirrored the new message")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        # Only the NEW message (rowid 2) was mirrored; old history was skipped.
+        assert len(delivered) == 1
+        assert delivered[0].item_data["content"][0]["text"] == "new message"
+        # _discover_store was never called (pre-seed took the fast path).
+        assert not discover_calls
+
+
+class TestForwardLoopExternalSessionId:
+    """The poll loop patches external_session_id once when the store is found."""
+
+    @staticmethod
+    def _seed(store: Path, text: str = "hello") -> None:
+        writer = _make_store(store, [("u", _user(f"<user_query>\n{text}\n</user_query>"))])
+        writer.close()
+
+    @pytest.mark.asyncio
+    async def test_patches_chat_id_on_first_store_discovery(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The forwarder PATCHes external_session_id with the cursor chat_id."""
+        store = tmp_path / _CHAT_ID / "store.db"
+        store.parent.mkdir(parents=True)
+        self._seed(store)
+
+        patches: list[tuple[str, dict]] = []
+
+        async def _fake_patch(client: object, *, session_id: str, chat_id: str) -> None:
+            patches.append((session_id, chat_id))
+
+        monkeypatch.setattr(fwd, "_patch_external_session_id", _fake_patch)
+        monkeypatch.setattr(fwd, "_post_conversation_item", _FakePoster(lambda _: None))
+
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        bridge_dir.mkdir(parents=True)
+        monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: store)
+        monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
+
+        task = asyncio.create_task(
+            fwd.forward_cursor_store_to_session(
+                base_url="http://test",
+                headers={},
+                session_id="conv_1",
+                bridge_dir=bridge_dir,
+                agent_name="cursor-native-ui",
+                workspace="/ws",
+                launch_epoch_ms=1_000,
+                poll_interval_s=0.001,
+            )
+        )
+        try:
+            for _ in range(2000):
+                if patches:
+                    break
+                await asyncio.sleep(0.001)
+            else:
+                raise AssertionError("external_session_id patch was never called")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert len(patches) == 1
+        session_id, chat_id = patches[0]
+        assert session_id == "conv_1"
+        assert chat_id == _CHAT_ID
+
+    @pytest.mark.asyncio
+    async def test_patches_only_once_across_multiple_polls(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """external_session_id is patched exactly once, not on every poll tick."""
+        store = tmp_path / _CHAT_ID_2 / "store.db"
+        store.parent.mkdir(parents=True)
+        self._seed(store)
+
+        patch_count = 0
+
+        async def _count_patches(client: object, *, session_id: str, chat_id: str) -> None:
+            nonlocal patch_count
+            patch_count += 1
+
+        monkeypatch.setattr(fwd, "_patch_external_session_id", _count_patches)
+        monkeypatch.setattr(fwd, "_post_conversation_item", _FakePoster(lambda _: None))
+
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        bridge_dir.mkdir(parents=True)
+        monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: store)
+        monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
+
+        task = asyncio.create_task(
+            fwd.forward_cursor_store_to_session(
+                base_url="http://test",
+                headers={},
+                session_id="conv_2",
+                bridge_dir=bridge_dir,
+                agent_name="cursor-native-ui",
+                workspace="/ws",
+                launch_epoch_ms=1_000,
+                poll_interval_s=0.001,
+            )
+        )
+        try:
+            # Let the loop run for several ticks after the patch fires.
+            for _ in range(2000):
+                if patch_count >= 1:
+                    break
+                await asyncio.sleep(0.001)
+            # Extra ticks to confirm it doesn't re-patch.
+            for _ in range(50):
+                await asyncio.sleep(0.001)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert patch_count == 1
+
+
+class TestCompactionCompletedForwarding:
+    """The forwarder maps cursor's post-/summarize rollup blob to a
+    ``external_compaction_status`` 'completed' edge.
+
+    The runner raises the web UI's "Compacting…" spinner when it submits
+    ``/summarize`` but cannot tell when cursor actually finishes (cursor-agent
+    has no compaction hook). The forwarder closes that gap: when it tails the
+    summary rollup blob out of the store it posts the completion, so the
+    permanent "Conversation compacted" marker tracks cursor's real progress
+    instead of flashing the instant the command was submitted.
+    """
+
+    @pytest.mark.asyncio
+    async def test_summary_blob_posts_compaction_completed_not_a_bubble(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Store: a normal user turn (rowid 1) then the post-/summarize rollup
+        # (rowid 2, a plain-string user blob with the marker prefix).
+        store = tmp_path / "store.db"
+        writer = _make_store(
+            store,
+            [
+                ("b1", _user("<user_query>\nhi\n</user_query>")),
+                (
+                    "b2",
+                    {
+                        "role": "user",
+                        "content": f"{fwd._COMPACTION_SUMMARY_PREFIX} Summary:\n1. ...",
+                    },
+                ),
+            ],
+        )
+        writer.close()
+
+        completions: list[str] = []
+
+        async def _fake_compaction(client: object, *, session_id: str, status: str) -> None:
+            completions.append(status)
+
+        monkeypatch.setattr(fwd, "_post_external_compaction_status", _fake_compaction)
+
+        poster = _FakePoster(lambda item: None)
+        bridge = await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            poster,
+            until=lambda b: bool(completions) and fwd._read_state(b).last_rowid >= 2,
+        )
+
+        # The rollup fired exactly one 'completed' edge — the web UI marker.
+        assert completions == ["completed"]
+        # It was NOT mirrored as a chat bubble (only the real user turn was).
+        assert [it.rowid for it in poster.delivered] == [1]
+        assert all(it.item_type == "message" for it in poster.delivered)
+        # The cursor advanced past the rollup so it never re-fires completion.
+        assert fwd._read_state(bridge).last_rowid == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_completion_post_does_not_wedge_the_mirror(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A failed completion POST must not wedge the loop: unlike a chat item it
+        # carries no content to lose, so the cursor advances past it regardless
+        # (the spinner just lingers). A later message must still mirror.
+        store = tmp_path / "store.db"
+        writer = _make_store(
+            store,
+            [
+                (
+                    "b1",
+                    {
+                        "role": "user",
+                        "content": f"{fwd._COMPACTION_SUMMARY_PREFIX} Summary:\n1. ...",
+                    },
+                ),
+                ("b2", _user("<user_query>\nnext\n</user_query>")),
+            ],
+        )
+        writer.close()
+
+        async def _failing_compaction(client: object, *, session_id: str, status: str) -> None:
+            raise _http_status_error(500)
+
+        monkeypatch.setattr(fwd, "_post_external_compaction_status", _failing_compaction)
+
+        poster = _FakePoster(lambda item: None)
+        bridge = await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            poster,
+            until=lambda b: fwd._read_state(b).last_rowid >= 2,
+        )
+
+        # The message after the (failed) completion still mirrored, and the
+        # cursor advanced past both — no wedge, no infinite re-post.
+        assert [it.rowid for it in poster.delivered] == [2]
+        assert fwd._read_state(bridge).last_rowid == 2

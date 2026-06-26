@@ -1056,6 +1056,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "AWS_SECRET_ACCESS_KEY": "aws-secret",
         "SOME_RANDOM_VAR": "x",
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
+        "KUBECONFIG": "/home/alice/.kube/config",
     }
 
     env = _build_runner_env(
@@ -1089,6 +1090,9 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # must reach the runner without also forcing
     # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``.
     assert env["OMNIGENT_CLAUDE_SDK_NO_SANDBOX"] == "1"
+    # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
+    # need it to resolve the user's cluster contexts and namespaces.
+    assert env["KUBECONFIG"] == "/home/alice/.kube/config"
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env
@@ -1121,6 +1125,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "OPENAI_API_KEY": "sk-o",
         "OPENAI_BASE_URL": "https://gateway.example.com/openai",
         "GEMINI_API_KEY": "g-key",
+        "AWS_BEARER_TOKEN_BEDROCK": "absk-fwd",
+        "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-runtime.us-east-1.amazonaws.com",
     }
 
     env = _build_runner_env(
@@ -1140,6 +1146,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "GEMINI_API_KEY",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "ANTHROPIC_BEDROCK_BASE_URL",
     ):
         # Pins each conventional name into the default set — dropping
         # one breaks that harness's credentials on managed sandboxes.

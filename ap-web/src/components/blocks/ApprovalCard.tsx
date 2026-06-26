@@ -49,6 +49,8 @@ import {
   parseAskUserQuestionPreview,
 } from "@/lib/askUserQuestion";
 import { formatPreview } from "@/lib/previewFormat";
+import type { RenderItem } from "@/lib/renderItems";
+import type { RememberScope } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
@@ -137,6 +139,17 @@ interface ApprovalCardProps {
    */
   allowAllEdits?: boolean;
   /**
+   * Claude-native non-edit tool prompts only: when set, the binary
+   * approve/reject card grows a third "Approve & don't ask again for
+   * <host|tool>" button. Accepting through it asks the server to
+   * install a session-scoped allow rule for the tool (scoped to
+   * ``host`` for WebFetch, tool-wide otherwise) — the web equivalent
+   * of Claude Code's native "don't ask again" permission option, so
+   * same-scope calls stop re-prompting. Absent/null for every other
+   * elicitation (edit tools take the ``allowAllEdits`` path instead).
+   */
+  rememberScope?: RememberScope | null;
+  /**
    * Verdict submitter override. Defaults to `chatStore.submitApproval`
    * (the in-chat path: optimistic block flip + resolve POST + rollback).
    * The Inbox page passes its own handler because its cards belong to
@@ -159,6 +172,7 @@ export function ApprovalCard({
   exitPlanMode,
   codexCommand,
   allowAllEdits,
+  rememberScope,
   onSubmit,
 }: ApprovalCardProps) {
   const submit: SubmitApprovalFn =
@@ -192,6 +206,15 @@ export function ApprovalCard({
     // mode" action — same flag, server picks the mode).
     submit(elicitationId, "accept", { allow_all_edits: true });
   };
+  const submitRemember = () => {
+    // Accept AND ask the server to install a session-scoped allow rule
+    // so the same scope stops prompting. The server reads
+    // ``content.remember`` and re-derives the rule scope (WebFetch
+    // domain or tool-wide) from the gated tool itself — the client only
+    // signals intent, never the rule — then echoes an ``addRules``
+    // permission update back to the PermissionRequest hook.
+    submit(elicitationId, "accept", { remember: true });
+  };
   const submitPlanRejection = (feedback: string) => {
     // The typed feedback rides on `content.feedback`; the server
     // forwards it to Claude as the deny `message`, so Claude stays in
@@ -223,9 +246,13 @@ export function ApprovalCard({
   // paths are handled inline with approve/reject buttons.
   const isExternalUrl = typeof url === "string" && url.length > 0 && !url.startsWith("/approve/");
   const askUserQuestionTitle =
-    policyName.startsWith("codex_") || phase.startsWith("codex_")
-      ? "Codex needs input"
-      : "Claude has questions";
+    policyName.startsWith("agy_") || phase.startsWith("agy_")
+      ? "Antigravity needs your input"
+      : policyName.startsWith("codex_") || phase.startsWith("codex_")
+        ? "Codex needs input"
+        : policyName.startsWith("cursor_") || phase.startsWith("cursor_")
+          ? "Cursor has questions"
+          : "Claude has questions";
 
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-
@@ -244,6 +271,19 @@ export function ApprovalCard({
     Array.isArray(response?.content?.execpolicy_amendment) &&
     response.content.execpolicy_amendment.every((entry) => typeof entry === "string");
   const acceptedAllEdits = response?.content?.allow_all_edits === true;
+  const acceptedRemember = response?.content?.remember === true;
+  // Persistent "don't ask again" affordance: label by the WebFetch
+  // domain when present, else the tool name. Drives the third binary
+  // button and the responded-state pill.
+  const rememberTarget = rememberScope ? (rememberScope.host ?? rememberScope.tool) : null;
+  // Tooltip spelling out the scope — the tool-wide case (no host) is a
+  // broad grant (every call to the tool), so make that explicit rather
+  // than letting the short button label imply a narrower scope.
+  const rememberTitle = rememberScope
+    ? rememberScope.host
+      ? `Won't ask again for ${rememberScope.host} for the rest of this session`
+      : `Won't ask again for any ${rememberScope.tool} call for the rest of this session`
+    : undefined;
   const binaryButtons = (
     <div className="flex flex-wrap gap-2 pt-1">
       <Button size="sm" onClick={() => submitBinary("accept")}>
@@ -254,6 +294,18 @@ export function ApprovalCard({
         <Button size="sm" variant="outline" onClick={submitAllowAllEdits}>
           <CheckIcon className="mr-1 size-3.5" />
           Accept & allow all edits
+        </Button>
+      )}
+      {rememberTarget && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={submitRemember}
+          title={rememberTitle}
+          data-testid="approval-card-remember"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Approve &amp; don't ask again for {rememberTarget}
         </Button>
       )}
       <Button size="sm" variant="outline" onClick={() => submitBinary("decline")}>
@@ -339,6 +391,11 @@ export function ApprovalCard({
     } else if (acceptedAllEdits) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = isExitPlanMode ? "Plan approved · auto mode" : "Approved · auto-accepting edits";
+    } else if (acceptedRemember) {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = rememberTarget
+        ? `Approved · won't ask again for ${rememberTarget}`
+        : "Approved · won't ask again";
     } else if (accepted) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = isExitPlanMode ? "Plan approved" : "Approved";
@@ -494,5 +551,40 @@ export function ApprovalCard({
         )}
       </AlertDescription>
     </Alert>
+  );
+}
+
+/**
+ * Render an elicitation ``RenderItem`` as an ``ApprovalCard``. The prop
+ * mapping lives here, in one place, so the two callers stay in sync:
+ * ``BlockRenderer`` (inline in the message stream) and ``ChatPage``'s
+ * pinned tray (pending cards lifted above the composer). Pass ``onSubmit``
+ * to route the verdict somewhere other than the active chat store.
+ */
+export function ElicitationCard({
+  item,
+  onSubmit,
+}: {
+  item: Extract<RenderItem, { kind: "elicitation" }>;
+  onSubmit?: SubmitApprovalFn;
+}) {
+  return (
+    <ApprovalCard
+      elicitationId={item.elicitationId}
+      message={item.message}
+      phase={item.phase}
+      policyName={item.policyName}
+      contentPreview={item.contentPreview}
+      requestedSchema={item.requestedSchema}
+      url={item.url}
+      status={item.status}
+      response={item.response}
+      askUserQuestion={item.askUserQuestion}
+      exitPlanMode={item.exitPlanMode}
+      codexCommand={item.codexCommand}
+      allowAllEdits={item.allowAllEdits}
+      rememberScope={item.rememberScope}
+      onSubmit={onSubmit}
+    />
   );
 }

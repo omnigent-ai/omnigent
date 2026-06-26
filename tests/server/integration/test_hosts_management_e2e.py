@@ -208,13 +208,17 @@ async def test_list_hosts_stale_host_reported_offline(
     # Register the host so it has status="online" in the DB.
     host_store.upsert_on_connect("host_stale", "stale-laptop", "local")
 
-    # Verify it initially shows as online.
+    # Verify it initially shows as online. Other tests sharing this
+    # xdist worker's host store leave rows behind (host rows are not
+    # isolated per-test within a worker), so scope the assertion to the
+    # host this test registered rather than the global host count.
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get("/v1/hosts")
     assert resp.status_code == 200, resp.text
     hosts = resp.json()["hosts"]
-    assert len(hosts) == 1
-    assert hosts[0]["status"] == "online"
+    stale = next((h for h in hosts if h["host_id"] == "host_stale"), None)
+    assert stale is not None, f"host_stale missing from {[h['host_id'] for h in hosts]}"
+    assert stale["status"] == "online"
 
     # Manually backdate updated_at to simulate a crashed host.
     # The liveness window is typically 60-120s; setting it 10 minutes
@@ -235,9 +239,9 @@ async def test_list_hosts_stale_host_reported_offline(
         resp = await client.get("/v1/hosts")
     assert resp.status_code == 200, resp.text
     hosts = resp.json()["hosts"]
-    assert len(hosts) == 1
-    assert hosts[0]["host_id"] == "host_stale"
-    assert hosts[0]["status"] == "offline", (
+    stale = next((h for h in hosts if h["host_id"] == "host_stale"), None)
+    assert stale is not None, f"host_stale missing from {[h['host_id'] for h in hosts]}"
+    assert stale["status"] == "offline", (
         "A host with a stale last_seen_at should be reported as offline. "
         "The liveness check (host_is_live) is missing from the list route."
     )

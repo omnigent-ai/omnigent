@@ -142,13 +142,13 @@ def test_hello_frame_configured_harnesses_round_trip() -> None:
         version="0.1.0",
         frame_protocol_version=1,
         name="corey-laptop",
-        configured_harnesses={"claude-sdk": True, "codex": False},
+        configured_harnesses={"claude-sdk": True, "codex": "needs-auth"},
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
     # Exact map equality: both the True and the False must survive —
     # False is the actionable "warn the user" value.
-    assert decoded.configured_harnesses == {"claude-sdk": True, "codex": False}
+    assert decoded.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
 
 
 def test_hello_frame_legacy_payload_decodes_unknown_harnesses() -> None:

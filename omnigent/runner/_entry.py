@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, cast
 import httpx
 from fastapi import FastAPI
 
+from omnigent._platform import IS_WINDOWS
+from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
 
 if TYPE_CHECKING:
@@ -424,29 +426,33 @@ def _parent_process_is_alive(parent_pid: int) -> bool:
     :returns: ``True`` when the process exists or is not visible due
         to permissions, otherwise ``False``.
     """
-    try:
-        os.kill(parent_pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    # Not ``os.kill(parent_pid, 0)``: on Windows that maps to TerminateProcess
+    # and would kill the parent rather than probe it.
+    return _proc.process_alive(parent_pid)
 
 
 def _parent_is_orphaned(parent_pid: int) -> bool:
     """Return whether this process has been orphaned by *parent_pid*.
 
-    The runner is launched as a direct child of ``parent_pid``, so
+    The runner is launched as a direct child of ``parent_pid``, so on POSIX
     ``getppid()`` equals it until the parent dies — at which point the OS
     reparents us to init / a subreaper and ``getppid()`` changes. That
     reparent signal is immune to PID reuse, which can otherwise make the
-    ``os.kill(pid, 0)`` liveness probe succeed against an unrelated process
-    that recycled the dead parent's pid (seen on busy CI hosts).
+    liveness probe succeed against an unrelated process that recycled the
+    dead parent's pid (seen on busy CI hosts).
+
+    Windows has no reparenting, AND ``os.getppid()`` is unreliable there: the
+    interpreter launcher in a venv breaks the parent link, so ``getppid()``
+    does not match the spawning process. Using it would report the runner
+    orphaned the instant it starts, tearing it down immediately. So on Windows
+    rely solely on an explicit liveness probe of the passed-in ``parent_pid``.
 
     :param parent_pid: The launcher's process id, e.g. ``12345``.
     :returns: ``True`` once the parent is gone, otherwise ``False``.
     """
-    return os.getppid() != parent_pid or not _parent_process_is_alive(parent_pid)
+    if not IS_WINDOWS and os.getppid() != parent_pid:
+        return True
+    return not _parent_process_is_alive(parent_pid)
 
 
 def _run_parent_death_killer(
@@ -621,10 +627,17 @@ async def _resolve_agent_spec_from_server(
     # PUT-induced bundle bumps invalidate naturally.
     version = resp.headers.get("X-Agent-Version", "0")
     dest = _agent_cache_dest(spec_cache_root, agent_id, version)
+    # prune_invalid_sub_agents: the server already validated this bundle
+    # before serving it, so a sub-agent that fails validation *here* means
+    # this runner is older than that server and can't run that sub-agent
+    # (e.g. it names a harness this version doesn't know). Drop the
+    # unsupported sub-agent and launch the parent with what this runner
+    # *does* support, rather than failing every dispatch of the agent.
+    # See omnigent.spec.load.
     if not dest.exists():
         dest.mkdir(parents=True)
-        load(resp.content, dest=dest, expand_env=expand_env)
-    spec = load(dest, expand_env=expand_env)
+        load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
     return ResolvedSpec(spec=spec, workdir=dest)
 
 
@@ -644,6 +657,8 @@ def create_app(
     from omnigent.runner.app import create_runner_app
     from omnigent.runner.identity import (
         OMNIGENT_INTERNAL_WS_ORIGIN,
+        OMNIGENT_SESSION_ENV_VALUE,
+        OMNIGENT_SESSION_ENV_VAR,
         RUNNER_ID_ENV_VAR,
         get_stable_runner_id,
     )
@@ -656,6 +671,14 @@ def create_app(
     # restarts (§5 "Persistence" in RUNNER.md).
     _runner_id = get_stable_runner_id()
     os.environ[RUNNER_ID_ENV_VAR] = _runner_id
+    # Stamp the Omnigent session marker into the runner's environment so
+    # every process this runner spawns can detect it is running inside an
+    # Omnigent agent session, the way Claude Code sets CLAUDE_CODE and
+    # Codex sets CODEX. Harness workers inherit it (the process manager
+    # merges os.environ), native CLI terminals copy os.environ, and the
+    # claude-sdk SDK merges os.environ. The deny-by-default env scrubbers
+    # (os_env, codex, pi) allowlist it so it survives their scrub.
+    os.environ[OMNIGENT_SESSION_ENV_VAR] = OMNIGENT_SESSION_ENV_VALUE
 
     # Keep the harness manager on its default /tmp/omnigent root.
     # Nesting harness UDS paths under caller-provided temp dirs can

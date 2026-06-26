@@ -58,6 +58,7 @@ _LAUNCHERS: dict[str, str] = {
     "lakebox": "omnigent.onboarding.sandboxes.lakebox:LakeboxLauncher",
     "modal": "omnigent.onboarding.sandboxes.modal:ModalSandboxLauncher",
     "daytona": "omnigent.onboarding.sandboxes.daytona:DaytonaSandboxLauncher",
+    "boxlite": "omnigent.onboarding.sandboxes.boxlite:BoxliteSandboxLauncher",
     # CoreWeave Sandbox via the official cwsandbox SDK (the
     # `omnigent[cwsandbox]` extra), imported lazily like modal/daytona.
     "cwsandbox": "omnigent.onboarding.sandboxes.cwsandbox:CWSandboxLauncher",
@@ -66,6 +67,9 @@ _LAUNCHERS: dict[str, str] = {
     # `omnigent[e2b]` extra), imported lazily like modal/daytona.
     "e2b": "omnigent.onboarding.sandboxes.e2b:E2BSandboxLauncher",
     "openshell": "omnigent.onboarding.sandboxes.openshell:OpenShellSandboxLauncher",
+    # On-demand Kubernetes runner Pod via the official kubernetes client (the
+    # `omnigent[kubernetes]` extra), imported lazily like modal/daytona.
+    "kubernetes": "omnigent.onboarding.sandboxes.kubernetes:KubernetesSandboxLauncher",
 }
 
 

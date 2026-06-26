@@ -31,6 +31,7 @@ import {
   Columns2Icon,
   DownloadIcon,
   EyeIcon,
+  EyeOffIcon,
   FileDiffIcon,
   Link2Icon,
   Loader2Icon,
@@ -81,6 +82,7 @@ import {
   MONACO_SPLIT_BREAKPOINT,
   type SaveStatus,
   detectLang,
+  isImageFile,
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
@@ -574,8 +576,13 @@ function FileViewerBody({
   // View mode toggle — preview is the default for md/html, source for everything else.
   const lang = detectLang(path);
   const isPreviewable = lang === "markdown" || lang === "html";
+  // Images render through CodeViewer's <ImageViewer> regardless of view mode;
+  // they have no source/diff representation, so diff is suppressed for them
+  // (Monaco would otherwise render the base64 payload as garbage text).
+  const isImage = isImageFile(path, fileQuery.data?.content_type);
   // Show Δ button only when the file appears in the session's changed-files list.
-  const isDiffAvailable = changedFiles.data?.data.some((f) => f.path === path) ?? false;
+  const isDiffAvailable =
+    !isImage && (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
 
@@ -596,6 +603,9 @@ function FileViewerBody({
   const [diffLayout, setDiffLayout] = useState<"unified" | "split">(
     () => persistedPrefsRef.current.diffLayout,
   );
+  const [hideWhitespace, setHideWhitespace] = useState(
+    () => persistedPrefsRef.current.hideWhitespace,
+  );
   const [previewableViewMode, setPreviewableViewMode] = useState<"editor" | "preview" | "source">(
     () => persistedPrefsRef.current.previewableViewMode,
   );
@@ -604,8 +614,8 @@ function FileViewerBody({
   // is intentionally excluded — it's contextual (per-open), not a sticky
   // preference. Idempotent on mount (writes back the seeded values).
   useEffect(() => {
-    writeFileViewPreferences({ diffActive, diffLayout, previewableViewMode });
-  }, [diffActive, diffLayout, previewableViewMode]);
+    writeFileViewPreferences({ diffActive, diffLayout, previewableViewMode, hideWhitespace });
+  }, [diffActive, diffLayout, previewableViewMode, hideWhitespace]);
   // Non-markdown previewable (HTML): "editor" falls back to "preview" — no rich-text mode.
   // Markdown: "preview" is removed; treat as "source" if somehow set (e.g. shared state from an HTML file).
   const fileViewMode: "editor" | "preview" | "source" = isPreviewable
@@ -760,6 +770,15 @@ function FileViewerBody({
           <RowsIcon className="size-4" />
         ),
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
+    });
+  }
+  if (viewMode === "diff") {
+    toolbarActions.push({
+      key: "hide-whitespace",
+      label: hideWhitespace ? "Show whitespace changes" : "Hide whitespace changes",
+      icon: hideWhitespace ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />,
+      active: hideWhitespace,
+      onSelect: () => setHideWhitespace((prev) => !prev),
     });
   }
   toolbarActions.push({
@@ -1043,6 +1062,7 @@ function FileViewerBody({
                   after={diffQuery.data.after}
                   path={path}
                   layout={diffLayout}
+                  hideWhitespace={hideWhitespace}
                   conversationId={conversationId}
                   comments={openComments}
                   activeSelection={activeSelection}
