@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
+import { HostBadge } from "@/components/HostBadge";
 import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
@@ -204,6 +205,7 @@ export function ChatHeader({
             <TooltipContent side="bottom">Open sidebar</TooltipContent>
           </Tooltip>
         )}
+        {!isChildSession && conversationId && <HostBadge sessionId={conversationId} />}
         {isChildSession && parentSessionId && (
           <>
             {/* Back affordance. Ghost (not a filled pill) so it sits on the
