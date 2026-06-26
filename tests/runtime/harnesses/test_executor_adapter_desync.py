@@ -34,7 +34,7 @@ from omnigent.runtime.harnesses._executor_adapter import (
     _ORPHAN_RESYNC_THRESHOLD,
     ExecutorAdapter,
 )
-from omnigent.runtime.harnesses._scaffold import TurnContext
+from omnigent.runtime.harnesses._scaffold import ToolResultEvent, TurnContext
 from omnigent.server.schemas import CreateResponseRequest
 
 
@@ -320,3 +320,97 @@ async def test_abnormal_exit_detaches_executor_synchronously() -> None:
     # executor was never interrupted (no cross-turn kill).
     assert executor1.interrupt_calls == [adapter._session_key]
     assert executor2.interrupt_calls == []
+
+
+async def test_tier1_reset_preserves_scaffold_registry() -> None:
+    """Review FIX-5: Tier-1 reset clears executor binding but NOT the registry.
+
+    ``_in_flight`` and ``_active_turn_ctx`` are owned by the scaffold's
+    ``_start_or_inject_turn``/``_teardown_turn`` and back the tool-result
+    resolver. The orphan self-heal must drop only the executor + current-turn
+    binding; clearing the scaffold registry would strand parked tool futures.
+    """
+    executor = _FakeExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    adapter._ensure_executor()
+
+    ctx = _ctx("resp_live")
+    adapter._in_flight["resp_live"] = ctx
+    adapter._active_turn_ctx = ctx
+    adapter._current_ctx = ctx
+    adapter._current_agent = "agent_live"
+
+    # Trip the threshold and run the Tier-1 self-heal.
+    adapter._orphan_callback_count = _ORPHAN_RESYNC_THRESHOLD
+    await adapter._maybe_resync_on_orphan()
+
+    # Executor + current binding dropped (the actual self-heal)...
+    assert adapter._executor is None
+    assert adapter._current_ctx is None
+    assert adapter._current_agent is None
+    assert adapter._orphan_callback_count == 0
+    # ...but the scaffold-owned registry is left intact.
+    assert adapter._in_flight == {"resp_live": ctx}
+    assert adapter._active_turn_ctx is ctx
+
+
+async def test_slow_tool_result_after_reset_still_resolves() -> None:
+    """Review FIX-5 (Mode A): a slow legit tool result delivered AFTER a Tier-1
+    reset still resolves its parked Future — it does not hang.
+
+    The result arrives via ``_handle_tool_result_event``, which resolves
+    whichever ``_in_flight`` turn holds the matching ``call_id``. Were the
+    Tier-1 reset to clear ``_in_flight``, the resolver would find no entry and
+    the awaiting Future would hang forever.
+    """
+    executor = _FakeExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    adapter._ensure_executor()
+
+    ctx = _ctx("resp_slow")
+    adapter._in_flight["resp_slow"] = ctx
+    fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    ctx._pending_tool_calls["call_slow"] = fut
+
+    # Orphan watchdog trips and resets the executor mid-flight.
+    adapter._orphan_callback_count = _ORPHAN_RESYNC_THRESHOLD
+    await adapter._maybe_resync_on_orphan()
+
+    # The slow tool result lands AFTER the reset and must still resolve.
+    await adapter._handle_tool_result_event(
+        ToolResultEvent(type="tool_result", call_id="call_slow", output="late-result")
+    )
+    assert fut.done()
+    assert await asyncio.wait_for(fut, timeout=1.0) == "late-result"
+
+
+async def test_new_turn_registered_during_reset_survives() -> None:
+    """Review FIX-5 (Mode B): a new turn registered in ``_in_flight`` while
+    ``_current_ctx is None`` survives an orphan-triggered Tier-1 reset.
+
+    Models the race where a fresh turn has registered its ctx and parked a
+    tool future, but ``_current_ctx`` is not yet bound, when the watchdog
+    fires. The reset must leave the new entry discoverable so its tool
+    dispatches still resolve.
+    """
+    executor = _FakeExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    adapter._ensure_executor()
+
+    # New turn registered in the scaffold registry, but _current_ctx is still
+    # None (the racing window the second reset add would have wiped).
+    new_ctx = _ctx("resp_new")
+    adapter._in_flight["resp_new"] = new_ctx
+    adapter._current_ctx = None
+    fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    new_ctx._pending_tool_calls["call_new"] = fut
+
+    adapter._orphan_callback_count = _ORPHAN_RESYNC_THRESHOLD
+    await adapter._maybe_resync_on_orphan()
+
+    # The newly registered turn survived the reset and is still discoverable.
+    assert adapter._in_flight.get("resp_new") is new_ctx
+    await adapter._handle_tool_result_event(
+        ToolResultEvent(type="tool_result", call_id="call_new", output="ok")
+    )
+    assert await asyncio.wait_for(fut, timeout=1.0) == "ok"

@@ -7679,6 +7679,10 @@ def create_runner_app(
     # Exposed on app.state for test inspection (mirrors interrupted/desynced).
     app.state.active_turns = _active_turns
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
+    # Exposed on app.state for test inspection (mirrors active_turns): lets a
+    # test assert a message actually landed in the buffer-into-active-turn
+    # branch of ``post_session_events`` rather than only its log/status.
+    app.state.session_message_buffers = _session_message_buffers
     # Per-conversation message-ingest ordering (RUNNER_MESSAGE_INGEST.md
     # Part A). Each inbound ``message`` event takes a monotonic arrival
     # sequence from ``_ingest_next_seq`` (read-incremented synchronously,
@@ -7747,6 +7751,10 @@ def create_runner_app(
     # Events accumulate while no subscriber is reading, so tunnel
     # drops don't lose events — the relay drains on reconnect.
     _session_event_queues = _session_event_queues_ref
+    # Exposed on app.state for test inspection (mirrors active_turns /
+    # session_message_buffers): lets a test reach the per-session SSE queues
+    # via a public accessor instead of importing the module-private ref.
+    app.state.session_event_queues = _session_event_queues
     # Per-session async inbox queues for sys_call_async /
     # sys_read_inbox (SESSION_REARCHITECTURE Step 7 partial).
     _session_inboxes = _session_inboxes_ref
@@ -12486,6 +12494,9 @@ def create_runner_app(
         # the competitor consumes it whenever it runs (before OR after our
         # publish), and a stale token is cleared at the next ``_run_turn_bg``.
         if not _session_message_buffers.get(conv_id):
+            # Claim the terminal token exactly once, here. The buffer-empty
+            # publish branch below runs under the same guard and reuses this
+            # claim — it does not re-add (the set is idempotent anyway).
             _desync_terminalized.add(conv_id)
         # Stream-mode floor (SYNCHRONOUS — no await before the pop). A
         # ``stream=true`` turn parks the ``None`` sentinel in ``_active_turns``
@@ -12525,7 +12536,6 @@ def create_runner_app(
         if not _session_message_buffers.get(conv_id):
             # We own the terminal status (token claimed above). Publish exactly
             # one desync ``failed``; competing publish sites no-op via the token.
-            _desync_terminalized.add(conv_id)
             _publish_turn_status(
                 conv_id,
                 "failed",

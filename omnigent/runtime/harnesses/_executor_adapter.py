@@ -603,7 +603,7 @@ class ExecutorAdapter(HarnessApp):
             if not clean_exit:
                 abandoned_executor = self._executor
                 self._executor = None
-                interrupt_task = asyncio.ensure_future(
+                interrupt_task = asyncio.create_task(
                     self._safe_interrupt(abandoned_executor, self._session_key)
                 )
                 self._bg_tasks.add(interrupt_task)
@@ -665,7 +665,7 @@ class ExecutorAdapter(HarnessApp):
                 executor.interrupt_session(session_key),
                 timeout=INTERRUPT_TIMEOUT_S,
             )
-        except (Exception, asyncio.TimeoutError):  # best-effort: log, never raise
+        except Exception:  # best-effort: log, never raise (TimeoutError ⊂ Exception on 3.12+)
             _logger.error(
                 "abnormal-exit interrupt of inner session %s failed",
                 session_key,
@@ -719,8 +719,17 @@ class ExecutorAdapter(HarnessApp):
                 self._executor = None
                 self._current_ctx = None
                 self._current_agent = None
-                self._in_flight.clear()
-                self._active_turn_ctx = None
+                # Deliberately do NOT touch ``self._in_flight`` or
+                # ``self._active_turn_ctx``: those are owned by the scaffold's
+                # ``_start_or_inject_turn``/``_teardown_turn`` and back the
+                # registry ``_handle_tool_result_event`` uses to resolve pending
+                # tool futures. Clearing them here strands tool results — a slow
+                # but legit result arriving after this reset would find no entry
+                # and its awaiting Future would hang forever (Mode A); and a NEW
+                # turn registered while ``_current_ctx is None`` would have its
+                # fresh entry wiped, hanging all its dispatches (Mode B). The
+                # adapter's stable callbacks already guard on ``_current_ctx``,
+                # so dropping the executor + current binding is sufficient.
                 self._orphan_callback_count = 0
             # Close the dropped executor outside the lock — close_session can
             # block on subprocess teardown and must not stall route handlers

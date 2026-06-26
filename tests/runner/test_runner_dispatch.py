@@ -171,6 +171,7 @@ async def _await_bg_turn_task(conv: str, *, timeout: float = 10.0) -> None:
 
 
 async def _drain_published_statuses(
+    queues: dict[str, Any],
     conv: str,
     *,
     until: str,
@@ -178,15 +179,16 @@ async def _drain_published_statuses(
 ) -> list[str]:
     """Collect ``session.status`` values a runner published for a session.
 
-    Reads the runner's module-level per-session event queue
-    (``omnigent.runner.app._session_event_queues_ref``) — the same queue
-    the SSE ``/stream`` endpoint drains — and returns the ordered list of
-    ``session.status`` values seen, stopping once *until* is published. This
-    polls the in-process queue rather than a concurrent SSE ``GET`` because
-    ``httpx.ASGITransport`` does not interleave a streaming response with a
-    concurrent ``POST`` on the same client, so a live SSE subscriber would
-    never observe the background turn's events.
+    Reads the runner's per-session event queue (``app.state.session_event_queues``)
+    — the same queue the SSE ``/stream`` endpoint drains — and returns the
+    ordered list of ``session.status`` values seen, stopping once *until* is
+    published. This polls the in-process queue rather than a concurrent SSE
+    ``GET`` because ``httpx.ASGITransport`` does not interleave a streaming
+    response with a concurrent ``POST`` on the same client, so a live SSE
+    subscriber would never observe the background turn's events.
 
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
     :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param until: Stop once this ``session.status`` value is observed,
         e.g. ``"failed"``.
@@ -195,12 +197,10 @@ async def _drain_published_statuses(
         assertion instead of spinning forever.
     :returns: Ordered ``session.status`` values published for *conv*.
     """
-    from omnigent.runner.app import _session_event_queues_ref
-
     statuses: list[str] = []
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        queue = _session_event_queues_ref.get(conv)
+        queue = queues.get(conv)
         drained = False
         while queue is not None and not queue.empty():
             event = queue.get_nowait()
@@ -218,6 +218,7 @@ async def _drain_published_statuses(
 
 
 async def _drain_failed_status_event(
+    queues: dict[str, Any],
     conv: str,
     *,
     timeout: float,
@@ -229,17 +230,17 @@ async def _drain_failed_status_event(
     ``error`` payload. Used to prove a SETUP-phase failure forwards its
     error message on the terminal ``failed`` event instead of dropping it.
 
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
     :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param timeout: Hard cap in seconds; returns ``None`` if no failed
         event arrives so a regression fails the assertion rather than
         hanging.
     :returns: The ``session.status: failed`` event dict, or ``None``.
     """
-    from omnigent.runner.app import _session_event_queues_ref
-
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        queue = _session_event_queues_ref.get(conv)
+        queue = queues.get(conv)
         drained = False
         while queue is not None and not queue.empty():
             event = queue.get_nowait()
@@ -1533,8 +1534,12 @@ async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
             },
         )
         assert response.status_code == 202
+        # Await the background turn task (main's helper) before draining, then
+        # read the runner's per-session queue via the ``app.state`` test seam.
         await _await_bg_turn_task(conv)
-        statuses = await _drain_published_statuses(conv, until="failed", timeout=2.0)
+        statuses = await _drain_published_statuses(
+            app.state.session_event_queues, conv, until="failed", timeout=2.0
+        )
 
     # The turn published "running" then "failed" — it reached a terminal
     # state and cleared. Without the fix, the setup-phase OmnigentError is
@@ -1619,8 +1624,12 @@ async def test_runner_failed_status_carries_setup_error_message(
             },
         )
         assert response.status_code == 202
+        # Await the background turn task (main's helper) before draining, then
+        # read the runner's per-session queue via the ``app.state`` test seam.
         await _await_bg_turn_task(conv)
-        failed_event = await _drain_failed_status_event(conv, timeout=2.0)
+        failed_event = await _drain_failed_status_event(
+            app.state.session_event_queues, conv, timeout=2.0
+        )
 
     # The failed event must carry the real setup error message — not a
     # bare status. Without the fix ``error`` is absent and the REPL
@@ -1639,6 +1648,7 @@ async def test_runner_failed_status_carries_setup_error_message(
 
 
 async def _drain_status_events(
+    queues: dict[str, Any],
     conv: str,
     *,
     until: str,
@@ -1650,6 +1660,8 @@ async def _drain_status_events(
     so one drain can assert both the status order and the carried ``error``
     payload — the queue is consumed by reading, so a test cannot drain twice.
 
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
     :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param until: Stop once this ``session.status`` value is observed,
         e.g. ``"failed"``.
@@ -1658,12 +1670,10 @@ async def _drain_status_events(
         assertion instead of spinning forever.
     :returns: Ordered ``session.status`` event dicts published for *conv*.
     """
-    from omnigent.runner.app import _session_event_queues_ref
-
     events: list[dict[str, Any]] = []
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        queue = _session_event_queues_ref.get(conv)
+        queue = queues.get(conv)
         drained = False
         while queue is not None and not queue.empty():
             event = queue.get_nowait()
@@ -1800,11 +1810,13 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
             },
         )
         assert response.status_code == 202
-        # Await the background turn task directly so we know it has completed
-        # (and published its terminal status) before draining — the same race
-        # guard the sibling failed-status tests use.
+        # Await the background turn task (main's helper) before draining — the
+        # same race guard the sibling failed-status tests use — then read the
+        # runner's per-session queue via the ``app.state`` test seam.
         await _await_bg_turn_task(conv)
-        events = await _drain_status_events(conv, until=until, timeout=2.0)
+        events = await _drain_status_events(
+            app.state.session_event_queues, conv, until=until, timeout=2.0
+        )
 
     statuses = [event.get("status") for event in events]
     # The turn must reach the parametrized terminal state. Without the fix,
@@ -7122,7 +7134,9 @@ async def test_desync_emits_user_visible_error() -> None:
     async with _runner_test_client(app):
         # Drive the recovery entry directly (no live turn, no buffer).
         await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
-        failed_event = await _drain_failed_status_event(conv, timeout=5.0)
+        failed_event = await _drain_failed_status_event(
+            app.state.session_event_queues, conv, timeout=5.0
+        )
 
     assert conv in app.state.desynced_sessions
     assert failed_event is not None
