@@ -73,7 +73,7 @@ from omnigent.runner.resource_registry import (
     TerminalExitEvent,
     TerminalLifecycle,
 )
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.ws_bridge import (
@@ -12295,6 +12295,8 @@ def create_runner_app(
                 # Bounded under the Omnigent server's 5s stop deadline.
                 timeout=3.0,
             )
+        except NoLiveHarnessError:
+            _logger.debug("Interrupt forward skipped for %s: no live harness", conv_id)
         except Exception:  # noqa: BLE001 — best-effort: harness may have exited
             _logger.warning(
                 "Interrupt forward to harness failed for %s",
@@ -14801,6 +14803,14 @@ def create_runner_app(
         # only spawning a fresh one does.
         try:
             harness_client = await process_manager.get_client(conversation_id, "any")
+        except NoLiveHarnessError:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "no_live_harness",
+                    "detail": "no harness subprocess is running for this conversation",
+                },
+            )
         except RuntimeError as exc:
             return JSONResponse(
                 status_code=503,
@@ -17729,6 +17739,15 @@ def create_runner_app(
             )
         try:
             client = await process_manager.get_client(conv_id, "any")
+        except NoLiveHarnessError:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "no_live_harness",
+                    "detail": "no harness subprocess is running for this conversation",
+                },
+            )
+        try:
             # Translate the MCP-shape ElicitationResult body
             # ({"action": ..., "content": ...}) onto the harness's
             # discriminated ``approval`` event per
