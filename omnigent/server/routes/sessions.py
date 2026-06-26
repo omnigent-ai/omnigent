@@ -87,7 +87,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
-from omnigent.model_override import validate_model_override
+from omnigent.model_override import model_family_mismatch, validate_model_override
 from omnigent.native_coding_agents import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
@@ -9731,6 +9731,34 @@ def _same_provider_family(a: Agent, b: Agent) -> bool:
     return family_a is not None and family_a == _agent_provider_family(b)
 
 
+def _agent_harness_id(agent: Agent) -> str | None:
+    """Return an agent's canonical harness id, or ``None`` when unloadable.
+
+    Used to family-check a fork's explicit ``model_override`` against the
+    harness the fork will actually run (e.g. reject a Claude model on a
+    codex-native fork). ``None`` when the bundle can't be loaded — the
+    caller then skips the family guard (the runner's fail-loud launch
+    remains the safety net) rather than blocking the fork.
+
+    :param agent: The agent whose harness to resolve, e.g. the fork's
+        base agent.
+    :returns: The canonical harness id, e.g. ``"codex-native"``, or
+        ``None`` when the bundle can't be loaded.
+    """
+    try:
+        spec = (
+            get_agent_cache()
+            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .spec
+        )
+    except Exception:  # noqa: BLE001 — unloadable bundle → skip the family guard
+        return None
+    from omnigent.harness_aliases import canonicalize_harness
+
+    harness_kind = spec.executor.harness_kind
+    return canonicalize_harness(harness_kind) or harness_kind
+
+
 def _agent_is_native(agent: Agent) -> bool:
     """Return whether an agent runs a native CLI harness.
 
@@ -9773,7 +9801,15 @@ def _agent_is_native(agent: Agent) -> bool:
 # text preamble (see _CURSOR_FORK_HISTORY_HARNESSES below) — switch-agent keeps
 # the current fresh-launch behavior.
 _FORK_HISTORY_NATIVE_HARNESSES: frozenset[str] = frozenset(
-    {"claude-native", "native-claude", "codex-native", "native-codex", "pi-native"}
+    {
+        "claude-native",
+        "native-claude",
+        "codex-native",
+        "native-codex",
+        "hermes-native",
+        "native-hermes",
+        "pi-native",
+    }
 )
 
 # Native harnesses that carry FORK history as a text preamble (text-prefix
@@ -14594,6 +14630,37 @@ def create_sessions_router(
         cloned_agent_id = generate_agent_id()
         cloned_agent_name = base_agent.name
 
+        # An explicit "restart with model" override for the fork. Validated
+        # (charset/length) and family-checked against the harness the fork
+        # will actually run, so a bad or cross-family id (e.g. a Claude model
+        # on a codex-native fork) fails loud here rather than after launch.
+        # Wins over the source's copied model in the store.
+        fork_model_override: str | None = None
+        if body.model_override is not None:
+            try:
+                fork_model_override = validate_model_override(body.model_override)
+            except ValueError as exc:
+                raise OmnigentError(
+                    f"invalid model_override: {exc}",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
+            base_harness = await asyncio.to_thread(_agent_harness_id, base_agent)
+            # Fail CLOSED: if the fork harness can't be resolved we can't
+            # family-check the override, so reject rather than launch an
+            # unvalidated cross-family model. (Only when an override was
+            # actually supplied — a normal fork with no override is
+            # unaffected by an unloadable bundle here.)
+            if base_harness is None:
+                raise OmnigentError(
+                    "cannot validate model_override: the fork's harness could not "
+                    "be resolved. Retry without a model override to keep the "
+                    "source's model.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            mismatch = model_family_mismatch(base_harness, fork_model_override)
+            if mismatch is not None:
+                raise OmnigentError(mismatch, code=ErrorCode.INVALID_INPUT)
+
         # A model id is provider-bound, so the source's model_override /
         # reasoning_effort only carry over when the switch stays in the same
         # provider family. A cross-family switch (or an undeterminable
@@ -14656,6 +14723,7 @@ def create_sessions_router(
                 cloned_agent_bundle_location=base_agent.bundle_location,
                 cloned_agent_description=base_agent.description,
                 copy_model_settings=copy_model_settings,
+                model_override=fork_model_override,
                 carry_history_into_native=carry_history_into_native,
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,

@@ -11,11 +11,11 @@ name: CI
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
-    paths-ignore: ['ap-web/**']
+    paths-ignore: ['ap-web/**', 'tests/e2e_ui/**']
   push:
     branches:
       - main
-    paths-ignore: ['ap-web/**']
+    paths-ignore: ['ap-web/**', 'tests/e2e_ui/**']
 
 permissions:
   contents: read
