@@ -13594,6 +13594,7 @@ def create_sessions_router(
         search_query: str | None = Query(default=None),
         include_archived: bool = Query(default=False),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
+        label: str | None = Query(default=None),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -13637,6 +13638,10 @@ def create_sessions_router(
             this lets the new-session agent picker discover agents
             that are only bound to sub-agent sessions (e.g. ones
             uploaded via ``sys_session_create``).
+        :param label: When set, only return sessions whose
+            ``user.label`` label matches this value exactly.
+            ``None`` disables the filter. Powers the sidebar's
+            label filter chips.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -13670,6 +13675,7 @@ def create_sessions_router(
             sort_by=sort_by,
             search_query=normalized_query,
             include_archived=include_archived,
+            label=label if label else None,
         )
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.

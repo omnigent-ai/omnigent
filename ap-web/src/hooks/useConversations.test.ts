@@ -106,7 +106,7 @@ describe("useConversations refetch interval", () => {
 
     renderHook(() => useConversations("", false, options), { wrapper });
     const query = queryClient.getQueryCache().find({
-      queryKey: ["conversations", "", false],
+      queryKey: ["conversations", "", false, ""],
     });
     return (query?.options as { refetchInterval?: unknown } | undefined)?.refetchInterval;
   }

@@ -92,7 +92,7 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
  * @throws Error if the key is not the canonical conversations list key.
  */
 export function filtersFromConversationQueryKey(key: readonly unknown[]): ConversationListFilters {
-  if (key.length !== 3 || key[0] !== "conversations") {
+  if ((key.length !== 3 && key.length !== 4) || key[0] !== "conversations") {
     throw new Error("Invalid conversations query key");
   }
   const [, searchQuery, includeArchived] = key;

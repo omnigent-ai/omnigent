@@ -31,6 +31,7 @@ vi.mock("@/hooks/useConversations", () => ({
   }),
   usePinnedConversationBackfill: () => [],
   useRenameConversation: () => mocks.rename,
+  useSetSessionLabel: () => ({ mutate: vi.fn() }),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),

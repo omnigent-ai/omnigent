@@ -6868,6 +6868,23 @@
               "title": "Kind",
               "type": "string"
             }
+          },
+          {
+            "description": "When set, only return sessions whose `user.label` label matches this value exactly. `None` disables the filter. Powers the sidebar's label filter chips.",
+            "in": "query",
+            "name": "label",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Label"
+            }
           }
         ],
         "responses": {

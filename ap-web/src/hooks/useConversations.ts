@@ -160,10 +160,12 @@ async function fetchConversationsPage({
   after,
   searchQuery,
   includeArchived,
+  label,
 }: {
   after?: string;
   searchQuery: string;
   includeArchived: boolean;
+  label?: string;
 }): Promise<ConversationsPage> {
   // `updated_at` matches the sidebar's sort, which keeps server
   // pagination consistent with the visible order as the user scrolls.
@@ -179,6 +181,7 @@ async function fetchConversationsPage({
   // sidebar never pays to fetch them. The server excludes archived
   // sessions unless include_archived=true.
   if (includeArchived) params.set("include_archived", "true");
+  if (label) params.set("label", label);
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as ConversationsPage;
@@ -198,6 +201,7 @@ export function useConversations(
   searchQuery: string = "",
   includeArchived: boolean = false,
   options: UseConversationsOptions = {},
+  label?: string,
 ) {
   // Live updates arrive over the `WS /v1/sessions/updates` push stream
   // (SessionUpdatesProvider), which patches this cache in place as watched
@@ -208,12 +212,13 @@ export function useConversations(
   // If the socket is down, all consumers use a safety poll.
   const streamConnected = useSessionUpdatesConnected();
   return useInfiniteQuery({
-    queryKey: ["conversations", searchQuery, includeArchived],
+    queryKey: ["conversations", searchQuery, includeArchived, label ?? ""],
     queryFn: ({ pageParam }) =>
       fetchConversationsPage({
         after: pageParam as string | undefined,
         searchQuery,
         includeArchived,
+        label,
       }),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
@@ -325,6 +330,33 @@ export function useRenameConversation() {
       queryClient.setQueryData<Session>(["session", updated.id], (old) =>
         old ? { ...old, title: updated.title } : old,
       );
+    },
+  });
+}
+
+export async function setSessionLabel(id: string, label: string | null): Promise<Conversation> {
+  const labels: Record<string, string> = {};
+  if (label) {
+    labels["user.label"] = label;
+  } else {
+    labels["user.label"] = "";
+  }
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ labels }),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()) as Conversation;
+}
+
+export function useSetSessionLabel() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, label }: { id: string; label: string | null }) => setSessionLabel(id, label),
+    onSuccess: (updated) => {
+      markConversationSeen(updated.id, updated.updated_at);
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
     },
   });
 }
