@@ -3152,6 +3152,7 @@ export function composerHarnessLabel(
   if (modelPickerKind === "claude") return "Claude";
   if (modelPickerKind === "codex") return "Codex";
   if (modelPickerKind === "cursor") return "Cursor";
+  if (modelPickerKind === "opencode") return "OpenCode";
   const display = agentName ? agentDisplayLabel(agentName) : null;
   const harness = sessionHarness ? (BRAIN_HARNESS_LABELS[sessionHarness] ?? null) : null;
   if (display && harness) return `${display} (${harness})`;
@@ -3771,13 +3772,20 @@ export function Composer({
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0].toLowerCase();
       const arg = parts[1] ?? "";
-      // Bare "/model" when the picker has a Models section (claude-native):
-      // sent as plaintext it would open Claude's interactive selector inside
-      // the vendor TUI, which the web UI can't render — the session just
-      // blocks. Open the composer's model picker instead and let the user
-      // choose there. "/model <name>" takes the builtin route below to
+      // Bare "/model" when the picker has a switchable Models section
+      // (claude-native): sent as plaintext it would open Claude's interactive
+      // selector inside the vendor TUI, which the web UI can't render — the
+      // session just blocks. Open the composer's model picker instead and let
+      // the user choose there. "/model <name>" takes the builtin route below to
       // setModel — the same write the picker makes.
-      if (cmd === "/model" && !arg && showModels) {
+      //
+      // opencode is excluded: it surfaces showModels (the pill mirrors its live
+      // TUI model) but ships no web model options, so intercepting bare "/model"
+      // would pop an empty dropdown and swallow the command. Fall through to the
+      // builtin "/model" handler below, which surfaces the current model as a
+      // read-only hint. ("/model <name>" still routes to setModel there —
+      // opencode reads model_override on the next web-injected turn.)
+      if (cmd === "/model" && !arg && showModels && modelPickerKind !== "opencode") {
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -4445,7 +4453,7 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor";
+type NativeModelPickerKind = "claude" | "codex" | "cursor" | "opencode";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4509,6 +4517,11 @@ export function modelPickerKindForConv(
       return "codex";
     case "cursor-native-ui":
       return "cursor";
+    case "opencode-native-ui":
+      // Like cursor: a vendor-owns-model wrapper that mirrors its live TUI
+      // model into the session ``model_override`` (the forwarder's terminal→web
+      // mirror), so the picker surfaces that as the live model.
+      return "opencode";
     default:
       return null;
   }
@@ -4656,7 +4669,10 @@ function AgentPicker({
   // carried over from some other session) nor the meaningless `llmModel`
   // default. The other vendor-owns wrappers have no Omnigent-visible model and
   // stay null.
-  const pickerSelectedModel = modelPickerKind === "cursor" ? sessionModelOverride : selectedModel;
+  const pickerSelectedModel =
+    modelPickerKind === "cursor" || modelPickerKind === "opencode"
+      ? sessionModelOverride
+      : selectedModel;
   // SDK/bundle agents (no native picker) never have the cross-session sticky
   // applied to them, so their live model is the session's own — the applied
   // override or the bound default — never `selectedModel` (a pick carried over
@@ -4668,7 +4684,12 @@ function AgentPicker({
   const effectiveModel = nativeVendorOwnsModel
     ? modelPickerKind === "cursor"
       ? sessionModelOverride
-      : null
+      : modelPickerKind === "opencode"
+        ? // opencode mirrors its live TUI model into ``model_override`` (set at
+          // launch and updated by the forwarder on a TUI switch); show that,
+          // falling back to the launch-resolved model before any switch.
+          (sessionModelOverride ?? llmModel)
+        : null
     : nonNativeModel;
   const modelLabel = formatStatusModelLabel(effectiveModel, codexModelOptions);
   const effortTriggerLabel =
