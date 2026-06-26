@@ -222,7 +222,15 @@ def test_cursor_install_command_uv_tool(monkeypatch: pytest.MonkeyPatch) -> None
     """Inside a ``uv tool`` venv, the install uses ``uv tool install --with``."""
     monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: True)
     cmd = cursor_install_command()
-    assert cmd == ["uv", "tool", "install", "--with", "omnigent[cursor]", "omnigent", "--force"]
+    assert cmd == [
+        "uv",
+        "tool",
+        "install",
+        "--with",
+        "omnigent[cursor]",
+        "omnigent",
+        "--force",
+    ]
 
 
 def test_install_cursor_sdk_runs_command_then_rechecks(
