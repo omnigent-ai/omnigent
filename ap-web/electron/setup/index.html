@@ -98,8 +98,8 @@
         opacity: 0.5;
         cursor: default;
       }
-      /* Connect (to a remote server) is the secondary path; "Run locally" below
-         is the prominent primary action. */
+      /* Connect (to a remote server) is the secondary path, below the prominent
+         "Run locally" action that leads the card. */
       #connect {
         margin-top: 16px;
         padding: 9px 12px;
@@ -141,12 +141,13 @@
         line-height: 1.4;
         min-height: 18px;
       }
-      /* "or — start a server on this machine" alternative + CLI detection. */
+      /* Separator between the prominent "Run locally" action and the
+         connect-to-a-server form below it. */
       .divider {
         display: flex;
         align-items: center;
         gap: 10px;
-        margin: 20px 0 0;
+        margin: 20px 0;
         color: var(--muted-foreground);
         font-size: 12px;
       }
@@ -157,9 +158,10 @@
         height: 1px;
         background: var(--border);
       }
-      /* "Run locally" — the prominent primary action (filled). */
+      /* "Run locally" — the prominent primary action (filled), leading the
+         card above the connect form. */
       #start-local {
-        margin-top: 12px;
+        margin-top: 0;
         padding: 10px 12px;
         font-weight: 600;
         border: none;
@@ -298,27 +300,8 @@
         />
         <img class="logo" src="../../platform-assets/logos/omnigents-logo.svg" alt="Omnigents" />
       </picture>
-      <p class="sub">
-        Enter the URL of the Omnigents server. The desktop app loads its web UI directly.
-      </p>
-      <label for="url">Server URL</label>
-      <input
-        id="url"
-        type="text"
-        placeholder="http://localhost:6767"
-        autocomplete="off"
-        spellcheck="false"
-      />
-      <label class="host-row disabled" id="host-row" hidden>
-        <input type="checkbox" id="host-toggle" disabled />
-        <span class="switch" aria-hidden="true"></span>
-        <span>Connect this machine as a runner to this server</span>
-      </label>
-      <button id="connect">Connect</button>
-      <div class="err" id="err"></div>
-
+      <p class="sub">Run an Omnigents server on this machine, or connect to an existing one.</p>
       <div id="local-section">
-        <div class="divider">or</div>
         <button id="start-local" disabled>Run locally</button>
 
         <div class="cli-panel" id="cli-panel" hidden>
@@ -343,7 +326,25 @@
             <p class="cli-note" id="cli-path-note"></p>
           </div>
         </div>
+
+        <div class="divider">or connect to a server</div>
       </div>
+
+      <label for="url">Server URL</label>
+      <input
+        id="url"
+        type="text"
+        placeholder="http://localhost:6767"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <label class="host-row disabled" id="host-row" hidden>
+        <input type="checkbox" id="host-toggle" disabled />
+        <span class="switch" aria-hidden="true"></span>
+        <span>Connect this machine as a runner to this server</span>
+      </label>
+      <button id="connect">Connect</button>
+      <div class="err" id="err"></div>
 
       <div class="recents" id="recents" hidden>
         <p class="recents-title">Recent servers</p>
