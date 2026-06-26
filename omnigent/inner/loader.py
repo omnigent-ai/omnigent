@@ -786,6 +786,7 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
     # hardened backend / no egress rules) is rejected on both paths.
     from omnigent.spec.parser import (
         _credential_proxy_macos_unsupported_reason,
+        _parse_credential_broker,
         _parse_credential_proxy,
     )
 
@@ -806,6 +807,28 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
     macos_reason = _credential_proxy_macos_unsupported_reason(credential_proxy, sandbox_type)
     if macos_reason is not None:
         raise ValueError(macos_reason)
+    # Non-HTTP credential broker. Same reuse-the-canonical-parser rationale as
+    # credential_proxy above; the cross-field guards mirror the spec parser
+    # (raising ValueError to match this path's error contract).
+    credential_broker = _parse_credential_broker(data.get("credential_broker"))
+    if credential_broker is not None:
+        if egress_rules:
+            raise ValueError(
+                "os_env.sandbox.credential_broker is not compatible with egress_rules: "
+                "brokered tools (e.g. psql) need raw TCP, but egress isolates the network "
+                "to an HTTP-only proxy."
+            )
+        if sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
+            raise ValueError(
+                "os_env.sandbox.credential_broker requires sandbox.type=linux_bwrap "
+                f"or darwin_seatbelt. Got sandbox.type={sandbox_type!r}."
+            )
+        if not bool(data.get("allow_network", True)):
+            raise ValueError(
+                "os_env.sandbox.credential_broker requires allow_network: true: brokered "
+                "tools connect to a network service, and the broker socket needs network "
+                "access on darwin_seatbelt."
+            )
     # Defer the absent-field defaults to the dataclass so there is a single
     # source of truth: re-stating literals here (e.g. ``"warn"``, ``50000``)
     # silently drifts the moment the OSEnvSandboxSpec defaults change. An
@@ -842,6 +865,7 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,
         credential_proxy=credential_proxy,
+        credential_broker=credential_broker,
     )
 
 

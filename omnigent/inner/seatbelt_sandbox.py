@@ -439,6 +439,7 @@ class SeatbeltSandboxBackend(SandboxBackend):
                 else None
             ),
             credential_proxy=sandbox_spec.credential_proxy,
+            credential_broker=sandbox_spec.credential_broker,
         )
 
     def wrap_launcher_argv(

@@ -23,11 +23,16 @@ from typing import Any, TypeAlias
 
 from omnigent.runner.identity import strip_runner_auth_secrets
 
+from .credential_broker import (
+    CredentialBrokerRuntime,
+    prepare_credential_broker_runtime,
+)
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from .egress import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .os_env import (
     OSEnvironment,
     _copy_tree,
+    build_helper_env,
     create_os_environment,
 )
 from .sandbox import (
@@ -780,6 +785,8 @@ class TerminalInstance:
     # Unix socket don't outlive the terminal.
     _egress_handle: EgressProxyHandle | None = field(default=None, repr=False)
     _egress_tmpdir: Path | None = field(default=None, repr=False)
+    _broker_runtime: CredentialBrokerRuntime | None = field(default=None, repr=False)
+    _broker_tmpdir: Path | None = field(default=None, repr=False)
     _idle_task: asyncio.Task[None] | None = field(default=None, repr=False)
     # Threaded idle-watcher state. Mirrors :attr:`_idle_task` but for
     # callers that don't have a long-lived event loop (the Omnigent path:
@@ -928,6 +935,8 @@ class TerminalInstance:
         if sandbox_for_launcher is not None and sandbox_for_launcher.active:
             if self.egress_rules:
                 sandbox_for_launcher = self._bootstrap_egress_proxy(sandbox_for_launcher, env)
+            if sandbox_for_launcher.credential_broker is not None:
+                sandbox_for_launcher = self._bootstrap_credential_broker(sandbox_for_launcher, env)
             cli_path = shutil.which(self.command) or self.command
             launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
             inner_cmd = [launcher_path, *self.args]
@@ -1141,6 +1150,51 @@ class TerminalInstance:
             egress_socket_path=str(self._egress_handle.socket_path),
         )
 
+    def _bootstrap_credential_broker(
+        self,
+        sandbox: SandboxPolicy,
+        env: dict[str, str],
+    ) -> SandboxPolicy:
+        """Start the parent-side non-HTTP credential broker for this terminal.
+
+        Mirrors :meth:`_bootstrap_egress_proxy`: creates a scratch tmpdir, adds
+        it to ``write_roots`` (so bwrap/seatbelt bind the broker socket + shim
+        dir into the namespace), starts the broker, and prepends the shim dir to
+        ``PATH``. ``close()`` is the only sanctioned teardown.
+
+        H1 caveat: unlike the os_env helper, the terminal harness is a foreign
+        binary and tmux closes inherited FDs before exec, so there is no
+        out-of-band channel for the per-handle token — the same constraint that
+        makes the terminal egress proxy ``require_auth=False`` (see
+        :meth:`_bootstrap_egress_proxy`). The token is delivered via the
+        terminal env, which a same-UID ``ps -E`` reader can lift; on the
+        terminal path the broker socket's cross-agent protection therefore
+        reduces to uid-gating. Prefer the os_env shell surface, or one agent per
+        UID, where strict cross-agent isolation is required.
+
+        :param sandbox: Active sandbox policy with ``credential_broker`` set.
+        :param env: Mutable env dict passed to the tmux subprocess.
+        :returns: Updated policy with the broker scratch dir in ``write_roots``.
+        """
+        assert sandbox.credential_broker is not None, "caller checked credential_broker"
+        self._broker_tmpdir = create_private_tmpdir()
+        # Add to write_roots BEFORE encoding the policy into the launcher so
+        # bwrap/seatbelt bind the broker socket + shim dir into the namespace.
+        sandbox = with_additional_write_roots(sandbox, [self._broker_tmpdir])
+        # ``command_env`` is the filtered helper env (deny-by-default) so a
+        # fallback command can't enumerate the parent's secret-bearing env.
+        command_env = build_helper_env(os.environ, sandbox)
+        self._broker_runtime = prepare_credential_broker_runtime(
+            sandbox.credential_broker,
+            parent_env=dict(os.environ),
+            command_env=command_env,
+            scratch_dir=self._broker_tmpdir,
+        )
+        if self._broker_runtime is not None:
+            env["PATH"] = f"{self._broker_runtime.shim_dir}{os.pathsep}{env['PATH']}"
+            env["OMNIGENT_CRED_BROKER_TOKEN"] = self._broker_runtime.auth_token
+        return sandbox
+
     async def close(self) -> None:
         """Kill the tmux session and clean up."""
         # Cancel both idle-watcher variants first so they don't race
@@ -1174,6 +1228,22 @@ class TerminalInstance:
         if self._egress_tmpdir is not None:
             cleanup_private_tmpdir(self._egress_tmpdir)
             self._egress_tmpdir = None
+
+        # Stop the credential broker + clean up its scratch tmpdir (same
+        # order rationale as the egress proxy: stop before deleting the dir).
+        if self._broker_runtime is not None:
+            try:
+                self._broker_runtime.stop()
+            except Exception:
+                logger.exception(
+                    "credential broker stop failed for terminal %s:%s",
+                    self.name,
+                    self.session_key,
+                )
+            self._broker_runtime = None
+        if self._broker_tmpdir is not None:
+            cleanup_private_tmpdir(self._broker_tmpdir)
+            self._broker_tmpdir = None
 
         # Clean up the private dir (contains socket + fork).
         if self.private_dir.exists():
