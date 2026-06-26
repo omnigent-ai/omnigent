@@ -374,6 +374,23 @@ function mockConversations(
   } as ReturnType<typeof useConversations>);
 }
 
+function withWindowOrigin(origin: string, run: () => void) {
+  const originalLocation = window.location;
+  Object.defineProperty(window, "location", {
+    configurable: true,
+    value: {
+      ...originalLocation,
+      origin,
+      href: `${origin}/`,
+    },
+  });
+  try {
+    run();
+  } finally {
+    Object.defineProperty(window, "location", { configurable: true, value: originalLocation });
+  }
+}
+
 beforeEach(() => {
   useConvMock.mockReset();
   useTerminalsMock.mockReset();
@@ -2641,11 +2658,32 @@ describe("AppShell clone/fork action", () => {
 describe("AppShell share action", () => {
   it("shows the Share button to an owner of a top-level session", () => {
     // permission_level null = owner. A top-level session can be shared.
-    mockConversations([{ id: "conv_top", permission_level: null }]);
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: null }]);
 
-    renderShell("/c/conv_top");
+      renderShell("/c/conv_top");
 
-    expect(screen.getByRole("button", { name: /share session/i })).toBeInTheDocument();
+      const shareButton = screen.getByRole("button", { name: /share session/i });
+      expect(shareButton).toBeInTheDocument();
+      expect(shareButton).toBeEnabled();
+    });
+  });
+
+  it("disables the Share button when the server is local", () => {
+    withWindowOrigin("http://localhost:6767", () => {
+      mockConversations([{ id: "conv_top", permission_level: null }]);
+
+      renderShell("/c/conv_top");
+
+      const shareButton = screen.getByRole("button", { name: /share session/i });
+      expect(shareButton).toBeDisabled();
+      expect(
+        screen.getByLabelText(
+          "Share session disabled: Sharing is unavailable from a local server.",
+        ),
+      ).toBeInTheDocument();
+      expect(shareButton).toHaveAttribute("title", "Sharing is unavailable from a local server.");
+    });
   });
 
   it("hides the Share button on a sub-agent (child) session", () => {
@@ -2721,29 +2759,44 @@ describe("Mobile header actions menu", () => {
   }
 
   it("offers Share and Clone for an owner of a top-level session", () => {
-    mockConversations([
-      {
-        id: "conv_host",
-        permission_level: null,
-        labels: {},
-        host_id: "host_a1b2",
-        runner_id: "runner_token_abc",
-      },
-    ]);
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([
+        {
+          id: "conv_host",
+          permission_level: null,
+          labels: {},
+          host_id: "host_a1b2",
+          runner_id: "runner_token_abc",
+        },
+      ]);
 
-    renderShell("/c/conv_host");
-    openActionsMenu();
+      renderShell("/c/conv_host");
+      openActionsMenu();
 
-    // Menu labels drop the redundant "session" suffix (most entries relate to
-    // the session), so match the bare verbs.
-    expect(screen.getByRole("menuitem", { name: /^share$/i })).toBeInTheDocument();
-    // Clone is not a menu entry — forking lives on each assistant
-    // message's "Fork from here" action (ChatPage).
-    expect(screen.queryByRole("menuitem", { name: /^clone$/i })).toBeNull();
-    // Agent info is always available (policies section is shown for any session).
-    expect(screen.getByRole("menuitem", { name: /agent info/i })).toBeInTheDocument();
-    // Stop session is not a header action — it lives in the sidebar row's kebab.
-    expect(screen.queryByRole("menuitem", { name: /^stop$/i })).toBeNull();
+      // Menu labels drop the redundant "session" suffix (most entries relate to
+      // the session), so match the bare verbs.
+      const shareItem = screen.getByRole("menuitem", { name: /^share$/i });
+      expect(shareItem).toBeInTheDocument();
+      expect(shareItem).not.toHaveAttribute("data-disabled");
+      // Clone is not a menu entry — forking lives on each assistant
+      // message's "Fork from here" action (ChatPage).
+      expect(screen.queryByRole("menuitem", { name: /^clone$/i })).toBeNull();
+      // Agent info is always available (policies section is shown for any session).
+      expect(screen.getByRole("menuitem", { name: /agent info/i })).toBeInTheDocument();
+      // Stop session is not a header action — it lives in the sidebar row's kebab.
+      expect(screen.queryByRole("menuitem", { name: /^stop$/i })).toBeNull();
+    });
+  });
+
+  it("disables the mobile Share item when the server is local", () => {
+    withWindowOrigin("http://127.0.0.1:6767", () => {
+      mockConversations([{ id: "conv_host", permission_level: null, labels: {} }]);
+
+      renderShell("/c/conv_host");
+      openActionsMenu();
+
+      expect(screen.getByRole("menuitem", { name: /^share$/i })).toHaveAttribute("data-disabled");
+    });
   });
 
   it("offers no Share to a read-only collaborator", () => {

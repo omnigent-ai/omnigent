@@ -274,7 +274,15 @@ async def test_permission_asked_allows_only_on_explicit_policy_allow() -> None:
     assert opencode.replies[0][1]["reply"] == "once"
 
 
-async def test_permission_asked_allow_always_maps_to_always() -> None:
+async def test_permission_asked_allow_always_still_replies_once() -> None:
+    """An allow_always verdict must reply "once", never "always".
+
+    Replying "always" makes opencode persist the grant and stop emitting
+    permission.asked, which bypasses the server policy engine and breaks live
+    policy toggles (e.g. enabling "Require Approval" mid-session). The forwarder
+    always replies "once" so opencode re-asks every call; "always allow"
+    persistence is the server engine's job.
+    """
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
 
     async def allow_always(_normalized: Any) -> dict[str, Any]:
@@ -282,7 +290,7 @@ async def test_permission_asked_allow_always_maps_to_always() -> None:
 
     fwd = _forwarder(server, opencode, policy_evaluator=allow_always)
     await fwd.handle_event(_event("permission.v2.asked", id="per_aa", action="bash"))
-    assert opencode.replies[0][1]["reply"] == "always"
+    assert opencode.replies[0][1]["reply"] == "once"
 
 
 async def test_permission_asked_rejects_when_policy_returns_ask() -> None:
@@ -421,3 +429,223 @@ async def test_seed_dedupe_from_history_swallows_errors() -> None:
     fwd = _forwarder(server, opencode)
     await fwd.seed_dedupe_from_history()  # best-effort → no raise
     assert fwd._msg_role == {}
+
+
+async def test_compaction_started_posts_in_progress() -> None:
+    """`session.next.compaction.started` → external_compaction_status in_progress."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event("session.next.compaction.started", messageID="msg_1", reason="auto")
+    )
+    body = next(b for _u, b in server.posts if b["type"] == "external_compaction_status")
+    assert body["data"]["status"] == "in_progress"
+
+
+async def test_compaction_ended_posts_completed() -> None:
+    """`session.next.compaction.ended` → external_compaction_status completed."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "session.next.compaction.ended",
+            messageID="msg_1",
+            reason="manual",
+            text="summary",
+            recent="tail",
+        )
+    )
+    body = next(b for _u, b in server.posts if b["type"] == "external_compaction_status")
+    assert body["data"]["status"] == "completed"
+
+
+async def test_session_compacted_posts_completed() -> None:
+    """Explicit /summarize emits `session.compacted` → external_compaction_status completed."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.compacted"))
+    body = next(b for _u, b in server.posts if b["type"] == "external_compaction_status")
+    assert body["data"]["status"] == "completed"
+
+
+async def test_assistant_usage_posts_external_session_usage() -> None:
+    """message.updated assistant cost/tokens → external_session_usage (cumulative)."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "message.updated",
+            info={
+                "id": "msg_a",
+                "role": "assistant",
+                "modelID": "claude-sonnet-4-5",
+                "providerID": "anthropic",
+                "cost": 0.012,
+                "tokens": {"input": 1000, "output": 50, "cache": {"read": 200, "write": 0}},
+            },
+        )
+    )
+    usage = next(b for _u, b in server.posts if b["type"] == "external_session_usage")["data"]
+    assert usage["cumulative_cost_usd"] == 0.012
+    assert usage["cumulative_input_tokens"] == 1000
+    assert usage["cumulative_output_tokens"] == 50
+    assert usage["cumulative_cache_read_input_tokens"] == 200
+    assert usage["context_tokens"] == 1200  # input + cache.read + cache.write
+    assert usage["model"] == "anthropic/claude-sonnet-4-5"
+    assert usage["context_window"] > 0
+
+
+async def test_usage_sums_across_messages_and_dedupes() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+
+    def msg(mid: str, cost: float, inp: int) -> dict[str, object]:
+        return {
+            "id": mid,
+            "role": "assistant",
+            "modelID": "m",
+            "providerID": "p",
+            "cost": cost,
+            "tokens": {"input": inp, "output": 1},
+        }
+
+    await fwd.handle_event(_event("message.updated", info=msg("m1", 0.01, 100)))
+    await fwd.handle_event(_event("message.updated", info=msg("m2", 0.02, 200)))
+    usages = [b["data"] for _u, b in server.posts if b["type"] == "external_session_usage"]
+    assert usages[-1]["cumulative_cost_usd"] == 0.03  # 0.01 + 0.02
+    assert usages[-1]["cumulative_input_tokens"] == 300
+    # Re-posting the same final message must dedupe (no new identical post).
+    before = len(usages)
+    await fwd.handle_event(_event("message.updated", info=msg("m2", 0.02, 200)))
+    after = len([b for _u, b in server.posts if b["type"] == "external_session_usage"])
+    assert after == before
+
+
+async def test_model_switched_mirrors_to_omnigent_and_dedupes() -> None:
+    """TUI model switch → external_model_change (deduped)."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "session.next.model.switched", model={"providerID": "anthropic", "id": "claude-opus-4"}
+        )
+    )
+    changes = [b["data"] for _u, b in server.posts if b["type"] == "external_model_change"]
+    assert changes[-1]["model"] == "anthropic/claude-opus-4"
+    # Same model again → no duplicate post.
+    before = len(changes)
+    await fwd.handle_event(
+        _event(
+            "session.next.model.switched", model={"providerID": "anthropic", "id": "claude-opus-4"}
+        )
+    )
+    after = len([b for _u, b in server.posts if b["type"] == "external_model_change"])
+    assert after == before
+
+
+async def test_reasoning_part_streams_suffix_deltas() -> None:
+    """opencode reasoning parts → transient reasoning deltas (suffix-only)."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(
+        _event(
+            "message.part.updated",
+            part={"id": "prt_r", "messageID": "msg_1", "type": "reasoning", "text": "Let me"},
+        )
+    )
+    await fwd.handle_event(
+        _event(
+            "message.part.updated",
+            part={
+                "id": "prt_r",
+                "messageID": "msg_1",
+                "type": "reasoning",
+                "text": "Let me think",
+            },
+        )
+    )
+    deltas = [
+        b["data"] for _u, b in server.posts if b["type"] == "external_output_reasoning_delta"
+    ]
+    # First snapshot opens the block (started); second posts only the new suffix.
+    assert deltas[0] == {"delta": "Let me", "started": True}
+    assert deltas[1] == {"delta": " think", "started": False}
+
+
+async def test_reasoning_part_no_repost_when_unchanged() -> None:
+    """A repeated identical reasoning snapshot posts no new delta."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    part = {"id": "prt_r", "messageID": "msg_1", "type": "reasoning", "text": "stable"}
+    await fwd.handle_event(_event("message.part.updated", part=part))
+    await fwd.handle_event(_event("message.part.updated", part=dict(part)))
+    deltas = [b for _u, b in server.posts if b["type"] == "external_output_reasoning_delta"]
+    assert len(deltas) == 1
+
+
+async def test_image_file_part_posts_image_block() -> None:
+    """An image ``file`` part → an input/output_image content block."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_u", "role": "user"}))
+    await fwd.handle_event(
+        _event(
+            "message.part.updated",
+            part={
+                "id": "prt_f",
+                "messageID": "msg_u",
+                "type": "file",
+                "mime": "image/png",
+                "url": "data:image/png;base64,AAAA",
+            },
+        )
+    )
+    items = [b for _u, b in server.posts if b["type"] == "external_conversation_item"]
+    content = items[-1]["data"]["item_data"]["content"][0]
+    assert content == {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+    assert items[-1]["data"]["item_data"]["role"] == "user"
+
+
+async def test_non_image_file_part_text_flattened() -> None:
+    """A non-image ``file`` part → a short text reference (text-flattened)."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_a", "role": "assistant"}))
+    await fwd.handle_event(
+        _event(
+            "message.part.updated",
+            part={
+                "id": "prt_f2",
+                "messageID": "msg_a",
+                "type": "file",
+                "mime": "application/pdf",
+                "url": "file:///tmp/report.pdf",
+                "filename": "report.pdf",
+            },
+        )
+    )
+    items = [b for _u, b in server.posts if b["type"] == "external_conversation_item"]
+    block = items[-1]["data"]["item_data"]["content"][0]
+    assert block["type"] == "output_text"
+    assert "report.pdf" in block["text"]
+    assert items[-1]["data"]["item_data"]["agent"] == "opencode"
+
+
+async def test_file_part_dedupes_across_snapshots() -> None:
+    """A file part posts once even when the part updates repeatedly."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_u", "role": "user"}))
+    part = {
+        "id": "prt_f",
+        "messageID": "msg_u",
+        "type": "file",
+        "mime": "image/jpeg",
+        "url": "data:image/jpeg;base64,ZZZZ",
+    }
+    await fwd.handle_event(_event("message.part.updated", part=part))
+    await fwd.handle_event(_event("message.part.updated", part=dict(part)))
+    items = [b for _u, b in server.posts if b["type"] == "external_conversation_item"]
+    assert len(items) == 1
