@@ -3252,6 +3252,18 @@
             "description": "Built-in agent to bind the fork to, switching it away from the source's agent/harness (e.g. fork a Claude session into a Codex one, or a Claude-SDK session into Claude Code). When `None`, the fork keeps the source's agent. Must be a built-in agent (one listed by `GET /v1/agents`).",
             "title": "Agent Id"
           },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model id to launch the fork on, e.g. `\"databricks-gpt-5-4-mini\"` \u2014 the \"restart with model\" path. Overrides the model the fork would otherwise inherit from the source; the value is validated and family-checked against the fork's harness. When `None` (default), the fork keeps the source's model (within the same provider family).",
+            "title": "Model Override"
+          },
           "title": {
             "anyOf": [
               {

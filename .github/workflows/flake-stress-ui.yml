@@ -1,0 +1,396 @@
+name: Flake stress (E2E UI)
+
+# Manually-dispatched flake-reproducer for the Playwright `tests/e2e_ui/`
+# suite (workflow_dispatch only). Runs a pytest target N times in parallel,
+# each attempt a full run of the target on its own runner, then renders a
+# pass/fail summary on the run page. failures/N is the observed flake
+# probability for the target.
+#
+# Why a SEPARATE workflow from flake-stress.yml / flake-stress-e2e.yml:
+#   * flake-stress.yml sets OMNIGENT_SKIP_WEB_UI=true and has no npm registry,
+#     so it can't build the ap-web SPA the UI tests serve.
+#   * flake-stress-e2e.yml targets the LLM-backed tests/e2e/ and injects
+#     Databricks gateway credentials.
+# The e2e_ui suite runs entirely against the in-process mock LLM (no secrets),
+# but needs the full UI toolchain: a built SPA, Playwright Chromium, and — for
+# the native render-parity / Codex goal-mode tests — the Claude Code / Codex
+# CLIs and the Rust parity sidecar. This workflow mirrors e2e-ui.yml's setup
+# exactly, then runs ONE target N times instead of the sharded full suite.
+#
+# Examples:
+#   gh workflow run flake-stress-ui.yml --ref main \
+#     -f test_target='tests/e2e_ui/chat/test_codex_goal_mode.py::test_codex_goal_mode_with_mocked_responses'
+#   gh workflow run flake-stress-ui.yml --ref main \
+#     -f test_target=tests/e2e_ui/chat/test_codex_goal_mode.py \
+#     -f attempts=20 -f extra_pytest_args=-x
+#
+# NOTE: workflow_dispatch workflows must exist on the DEFAULT branch to be
+# dispatchable, so this must land on main before `gh workflow run` finds it;
+# `--ref <branch>` then selects which ref's tests to stress.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_target:
+        description: "Pytest target under tests/e2e_ui/: path or node-id (e.g. tests/e2e_ui/chat/test_codex_goal_mode.py::test_codex_goal_mode_with_mocked_responses)"
+        required: true
+        default: "tests/e2e_ui/chat/test_codex_goal_mode.py::test_codex_goal_mode_with_mocked_responses"
+      target_branch:
+        description: "Branch or SHA to check out for the test (default: main)"
+        required: false
+        default: "main"
+      attempts:
+        description: "Number of parallel attempts (1-30, default: 12). UI attempts are heavy (SPA build + spawned server + browser), so keep N modest."
+        required: false
+        default: "12"
+      extra_pytest_args:
+        description: "Extra pytest args appended to the command, e.g. '-x' (default: empty)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  # No SPA build during `uv sync`: the build is a dedicated step below
+  # (mirrors e2e-ui.yml; the setup.py build would be a redundant npm hit).
+  OMNIGENT_SKIP_WEB_UI: "true"
+  # Scrub harness credentials the test server must not pick up. The whole
+  # e2e_ui suite runs against the in-process mock LLM, so no real key is ever
+  # needed (the conftest's live_server fixture points the spawned server's
+  # OPENAI_BASE_URL/OPENAI_API_KEY at the mock).
+  ANTHROPIC_API_KEY: ""
+  DATABRICKS_TOKEN: ""
+  CODEX: ""
+  CLAUDE_CODE: ""
+  UV_INDEX_URL: https://pypi.org/simple
+  # Runners default to TERM=dumb, which breaks the PTY shell's "clear".
+  TERM: xterm-256color
+
+jobs:
+  prep:
+    # Validate inputs and turn ``attempts`` into a JSON array the matrix fans
+    # out across (arrays must exist at job-graph construction time; the
+    # downstream job picks it up via ``fromJSON``).
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    outputs:
+      attempts_json: ${{ steps.gen.outputs.attempts_json }}
+    steps:
+      - name: Generate attempts array
+        id: gen
+        env:
+          ATTEMPTS: ${{ github.event.inputs.attempts }}
+          TEST_TARGET: ${{ github.event.inputs.test_target }}
+          EXTRA_ARGS: ${{ github.event.inputs.extra_pytest_args }}
+        run: |
+          set -euo pipefail
+          # attempts ∈ [1, 30]; each attempt is a full UI runner (SPA build +
+          # spawned server + browser), so cap lower than the e2e variant.
+          if ! [[ "$ATTEMPTS" =~ ^[1-9][0-9]?$ ]] || (( ATTEMPTS > 30 )); then
+            echo "::error::attempts must be an integer in [1, 30], got '$ATTEMPTS'"
+            exit 1
+          fi
+          # test_target / extra_pytest_args reach a shell; restrict to
+          # legitimate pytest node-id chars so hostile input can't smuggle
+          # command substitution (belt-and-suspenders atop authz dispatch).
+          # POSIX char-class rules: ``]`` first (literal), ``-`` last (not a
+          # range).
+          allowed_chars='^[]a-zA-Z0-9./_:[ =-]+$'
+          if ! [[ "$TEST_TARGET" =~ $allowed_chars ]]; then
+            echo "::error::test_target contains disallowed characters; allowed: a-zA-Z0-9 . / _ : [ ] - = space"
+            exit 1
+          fi
+          if [[ -n "$EXTRA_ARGS" ]] && ! [[ "$EXTRA_ARGS" =~ $allowed_chars ]]; then
+            echo "::error::extra_pytest_args contains disallowed characters; allowed: a-zA-Z0-9 . / _ : [ ] - = space"
+            exit 1
+          fi
+          # Uploaded ARTIFACTS are NOT secret-masked by GitHub. Even though the
+          # e2e_ui suite uses no real credentials, forbid the tokens that would
+          # dump locals / re-enable junit log capture into the uploaded junit,
+          # matching flake-stress-e2e.yml so the harness stays safe if a future
+          # target ever touches a secret. ``set -f`` so bracketed node-ids
+          # (``test_x[chromium]``) are examined literally, not glob-expanded.
+          set -f
+          for tok in $TEST_TARGET $EXTRA_ARGS; do
+            case "$tok" in
+              -l|--showlocals|--show-locals)
+                echo "::error::--showlocals/-l is forbidden: it dumps locals into the uploaded junit artifact, which GitHub does not secret-mask."
+                set +f; exit 1
+                ;;
+              -o|--override-ini|--override-ini=*)
+                echo "::error::pytest ini overrides (-o/--override-ini) are forbidden: they could re-enable junit log capture into the uploaded artifact."
+                set +f; exit 1
+                ;;
+              *junit_logging*)
+                echo "::error::junit_logging override is forbidden: it captures logs into the uploaded junit artifact."
+                set +f; exit 1
+                ;;
+              --*)
+                : # other long options are already constrained by the allowlist
+                ;;
+              -*l*)
+                echo "::error::bundled short flag '$tok' contains -l (showlocals); pass flags individually without -l."
+                set +f; exit 1
+                ;;
+            esac
+          done
+          set +f
+          ARR=$(python3 -c "import json,os; print(json.dumps(list(range(1, int(os.environ['ATTEMPTS'])+1))))")
+          echo "attempts_json=$ARR" >> "$GITHUB_OUTPUT"
+          echo "Will run $ATTEMPTS attempts of: $TEST_TARGET  extra='$EXTRA_ARGS'"
+
+  repro:
+    name: Attempt ${{ matrix.attempt }}
+    needs: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # Keep going after a failure to observe the full distribution.
+      fail-fast: false
+      matrix:
+        attempt: ${{ fromJSON(needs.prep.outputs.attempts_json) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.inputs.target_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up Node 20
+        uses: ./.github/actions/setup-node
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        with:
+          enable-cache: true
+
+      - name: Cache virtualenv
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install project + dev extras
+        run: uv sync --locked --extra all --extra dev
+
+      - name: Install bubblewrap + tmux
+        # bubblewrap: the UI tests open terminals under os_env, whose
+        # linux_bwrap backend fails loud if `bwrap` is missing. The apparmor
+        # sysctl mirrors ci.yml (Ubuntu 24.04 blocks unprivileged user
+        # namespaces, which bwrap's unshare(CLONE_NEWUSER) needs). tmux: the
+        # native render-parity tests drive the CLIs through a tmux pane.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap tmux
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Set up Rust toolchain
+        # The mocked_native_codex_goal_session fixture builds the Codex parity
+        # sidecar via `cargo build`; pin the toolchain for a stable cache key
+        # (mirrors e2e-ui.yml / ci.yml's codex-parity job).
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+        with:
+          path: .tmp-codex-parity-target
+          # Identical key to e2e-ui.yml / ci.yml so a populated cache restores.
+          key: codex-parity-sidecar-${{ runner.os }}-${{ hashFiles('tests/codex_parity/sidecar/Cargo.lock') }}
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright Chromium
+        run: uv run playwright install --with-deps chromium
+
+      - name: Build ap-web SPA
+        # Build BEFORE pytest: Vite's emptyOutDir clobbers the static dir, so
+        # never run it under xdist or alongside the live server.
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          cd ap-web
+          npm ci --legacy-peer-deps --no-audit --no-fund
+          npm run build
+
+      - name: Install Claude Code CLI
+        # Pinned to match e2e-ui.yml (2.1.170 recognises the native bridge
+        # hook events). --ignore-scripts then run the audited install.cjs.
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/.cc-cli" && cd "${GITHUB_WORKSPACE}/.cc-cli"
+          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.170
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "${GITHUB_WORKSPACE}/.cc-cli/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Install Codex CLI
+        # @openai/codex pinned to match e2e-ui.yml; goal-mode app-server APIs
+        # require >= 0.139.0.
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/.codex-cli" && cd "${GITHUB_WORKSPACE}/.codex-cli"
+          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
+          echo "${GITHUB_WORKSPACE}/.codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Run pytest target
+        # Inputs validated by prep. Word-splitting on $TEST_TARGET / $EXTRA_ARGS
+        # is intentional (multi-token); bound via env (not ``${{ }}``) to avoid
+        # expression injection at the shell. --ui-skip-build: the SPA was built
+        # above. NO --showlocals (the prep step also forbids it): keeps the
+        # uploaded junit artifact free of dumped locals.
+        shell: bash
+        timeout-minutes: 25
+        env:
+          TEST_TARGET: ${{ github.event.inputs.test_target }}
+          EXTRA_ARGS: ${{ github.event.inputs.extra_pytest_args }}
+        run: |
+          mkdir -p artifacts "artifacts/basetemp-${{ matrix.attempt }}"
+          # shellcheck disable=SC2086
+          uv run pytest $TEST_TARGET \
+            --ui-skip-build \
+            --tracing=retain-on-failure \
+            --screenshot=only-on-failure \
+            --video=retain-on-failure \
+            --timeout=300 \
+            --timeout-method=thread \
+            --basetemp="artifacts/basetemp-${{ matrix.attempt }}" \
+            --junitxml=artifacts/pytest-attempt-${{ matrix.attempt }}.xml \
+            -v --tb=long --log-level=INFO -r a \
+            $EXTRA_ARGS \
+            || { rc=$?; if [ "$rc" -eq 5 ]; then echo "::error::No tests collected — check your test_target ('$TEST_TARGET'). A flake-stress run with a single user-specified target that collects nothing is almost always a typo'd selector, not a clean pass."; fi; exit "$rc"; }
+
+      - name: Upload pytest junit
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: pytest-attempt-${{ matrix.attempt }}-${{ github.run_id }}
+          path: artifacts/pytest-attempt-${{ matrix.attempt }}.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload Playwright artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: playwright-attempt-${{ matrix.attempt }}-${{ github.run_id }}
+          path: test-results/
+          retention-days: 3
+          if-no-files-found: ignore
+
+  summarize:
+    # Render a pass/fail summary table on the run page for an at-a-glance flake
+    # rate. ``if: always()`` so failed attempts still summarize. Parsing logic
+    # copied from flake-stress-e2e.yml.
+    name: Summarize results
+    needs: repro
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all attempt artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          pattern: pytest-attempt-*-${{ github.run_id }}
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Render summary
+        run: |
+          python3 - <<'PY'
+          import glob
+          import os
+          import xml.etree.ElementTree as ET
+
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+          rows = []
+          test_failure_counts: dict[str, int] = {}
+          for path in sorted(glob.glob("artifacts/pytest-attempt-*.xml")):
+              attempt = path.rsplit("-", 1)[-1].removesuffix(".xml")
+              root = ET.parse(path).getroot()
+              tests = passed = failed = errored = skipped = 0
+              failures: list[str] = []
+              for case in root.iter("testcase"):
+                  tests += 1
+                  fail = case.find("failure")
+                  err = case.find("error")
+                  skip = case.find("skipped")
+                  if fail is not None:
+                      failed += 1
+                      tid = f"{case.attrib.get('classname','')}::{case.attrib.get('name','')}"
+                      failures.append(tid)
+                      test_failure_counts[tid] = test_failure_counts.get(tid, 0) + 1
+                  elif err is not None:
+                      errored += 1
+                      tid = f"{case.attrib.get('classname','')}::{case.attrib.get('name','')}"
+                      failures.append(tid)
+                      test_failure_counts[tid] = test_failure_counts.get(tid, 0) + 1
+                  elif skip is not None:
+                      skipped += 1
+                  else:
+                      passed += 1
+              status = ":white_check_mark:" if (failed + errored) == 0 else ":x:"
+              rows.append(
+                  {
+                      "attempt": int(attempt),
+                      "status": status,
+                      "tests": tests,
+                      "passed": passed,
+                      "failed": failed,
+                      "errored": errored,
+                      "skipped": skipped,
+                      "failures": failures,
+                  }
+              )
+
+          rows.sort(key=lambda r: r["attempt"])
+          n = len(rows)
+          n_red = sum(1 for r in rows if r["failed"] + r["errored"] > 0)
+          rate = (n_red / n * 100.0) if n else 0.0
+
+          lines = [
+              "## Flake stress results (E2E UI)",
+              "",
+              f"**Failure rate: {n_red}/{n} ({rate:.0f}%)**",
+              "",
+              "| Attempt | Status | Tests | Pass | Fail | Error | Skip | Failing test(s) |",
+              "|---:|:---:|---:|---:|---:|---:|---:|---|",
+          ]
+          for r in rows:
+              fails = ", ".join(f"`{t}`" for t in r["failures"]) or "—"
+              lines.append(
+                  f"| {r['attempt']} | {r['status']} | {r['tests']} | "
+                  f"{r['passed']} | {r['failed']} | {r['errored']} | "
+                  f"{r['skipped']} | {fails} |"
+              )
+
+          if test_failure_counts:
+              lines += [
+                  "",
+                  "### Per-test failure counts",
+                  "",
+                  "| Test | Failed in N attempts |",
+                  "|---|---:|",
+              ]
+              for tid, c in sorted(
+                  test_failure_counts.items(),
+                  key=lambda kv: (-kv[1], kv[0]),
+              ):
+                  lines.append(f"| `{tid}` | {c} |")
+
+          with open(summary_path, "a") as f:
+              f.write("\n".join(lines) + "\n")
+          PY

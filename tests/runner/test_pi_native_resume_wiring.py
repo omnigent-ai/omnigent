@@ -147,6 +147,32 @@ async def test_resolve_cold_resume_builds_and_returns_captured_id(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_resolve_cold_resume_no_resumable_history_launches_fresh(tmp_path: Path) -> None:
+    """Cold resume with a captured id but no resumable history launches fresh.
+
+    Regression: ``_resolve_pi_resume_session`` used to return the captured
+    ``external_session_id`` unconditionally, even when
+    ``ensure_local_pi_resume_session`` produced no file (empty/cleared bridge
+    dir, empty history, or a transient fetch/write failure). That id is then
+    emitted as ``pi --session <id>``, which Pi treats as "open an existing
+    session file" and exits when the file is absent — failing the launch
+    instead of falling back to a fresh session. With no resumable items, the
+    cold-resume path must return ``None`` (no ``--session``) and write no file.
+    """
+    config = _config(workspace=tmp_path, external_session_id=_EXTERNAL_ID)
+    async with _items_only_client([]) as client:
+        out = await _resolve_pi_resume_session(
+            session_id="conv_1",
+            launch_config=config,
+            session_dir=tmp_path,
+            workspace=tmp_path,
+            server_client=client,
+        )
+    assert out is None
+    assert not list(tmp_path.glob("*.jsonl"))
+
+
+@pytest.mark.asyncio
 async def test_resolve_fork_rebuild_mints_id_and_patches(tmp_path: Path) -> None:
     config = _config(workspace=tmp_path, fork_carry_history=True)
     patched: dict[str, Any] = {}

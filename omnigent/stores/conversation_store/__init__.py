@@ -61,21 +61,46 @@ FORK_CARRY_HISTORY_LABEL_KEY = "omnigent.fork.carry_history"
 # so it survives across turns and is overwritten by each subsequent switch.
 SWITCH_PREVIOUS_BUILTIN_LABEL_KEY = "omnigent.switch.previous_builtin_id"
 
-# Labels scoped to one running session instance — deliberately NOT copied
-# when forking. A fork is an independent session that re-binds its own
-# runtime, so inheriting these would point the clone at the SOURCE's
-# state: the native bridge-id labels would route the clone's terminal +
-# web injection to the source's claude/codex bridge (whose active-session
-# marker isn't the clone → "session no longer active"); the context-size
-# metrics would display the source's last usage. The literals mirror the
-# harness modules' ``*_BRIDGE_ID_LABEL_KEY`` constants; a store test
-# cross-checks them so a rename in those modules fails loudly here.
+# Opt-in DANGEROUS launch directive for a codex-native session: when set to
+# ``"1"`` the runner launches Codex with
+# ``--dangerously-bypass-approvals-and-sandbox`` and puts the app-server
+# threads into the matching no-approval / no-sandbox stance (see
+# ``omnigent.runner.app._codex_native_launch_config`` and
+# ``codex_native_app_server.build_codex_remote_args``). Stored as a plain
+# conversation label (cheap thread metadata, like the fork directives above)
+# so it survives reload without a schema migration. The web UI gates turning
+# this on behind a typed confirmation + a persistent red warning banner; any
+# value other than ``"1"`` (incl. absent) leaves the session in Codex's
+# normal approval/sandbox stance. See issue #657.
+CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
+
+# Labels that must NOT cross into a new session context — deliberately
+# dropped both when forking (not copied to the clone) and on an in-place
+# agent switch (deleted from the switched session). Two distinct reasons
+# put a key here:
+#
+#   * Runtime state bound to ONE running instance — the native bridge-id
+#     labels would route the new context's terminal + web injection to the
+#     SOURCE's claude/codex bridge (whose active-session marker isn't the
+#     clone → "session no longer active"); the context-size metrics would
+#     display the source's last usage. The bridge-id literals mirror the
+#     harness modules' ``*_BRIDGE_ID_LABEL_KEY`` constants; a store test
+#     cross-checks them so a rename in those modules fails loudly here.
+#
+#   * Per-context safety opt-in — the DANGEROUS codex full-bypass directive
+#     (:data:`CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY`). Letting it ride into a
+#     fork (a new session + workspace) or survive an agent switch would
+#     silently re-arm ``--dangerously-bypass-approvals-and-sandbox`` with no
+#     typed re-confirmation and no banner, violating the "impossible to
+#     enable accidentally" contract (#657). Dropping it forces each session
+#     that runs bypass to make its own explicit opt-in.
 _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     {
         "omnigent.claude_native.bridge_id",
         "omnigent.codex_native.bridge_id",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
+        CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )
 
@@ -1055,6 +1080,7 @@ class ConversationStore(ABC):
         cloned_agent_bundle_location: str | None = None,
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
+        model_override: str | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -1098,6 +1124,10 @@ class ConversationStore(ABC):
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
+        :param model_override: When set, the fork's ``model_override`` is
+            this value instead of the source's copied one — the "restart
+            with model" path. Wins over the ``copy_model_settings`` copy;
+            ``None`` (default) leaves the copy behavior unchanged.
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript (clone the source's
