@@ -6,6 +6,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckIcon,
   CopyIcon,
+  AlertTriangleIcon,
   PencilIcon,
   InfoIcon,
   PlusIcon,
@@ -37,7 +38,8 @@ import {
   useDeletePolicy,
   type PolicyRegistryEntry,
 } from "@/hooks/usePolicies";
-import { useSessionOwner } from "@/hooks/usePermissions";
+import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
+import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import { getCurrentUserId } from "@/lib/identity";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -57,8 +59,20 @@ import { agentRootName } from "@/lib/forkHarness";
 import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { copyText } from "@/lib/clipboard";
 import { useChatStore } from "@/store/chatStore";
+import { RestartWithModelDialog } from "@/shell/RestartWithModelDialog";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useSessionHostVersion } from "@/hooks/RunnerHealthProvider";
+
+/**
+ * Whether a harness id is in the codex (GPT) family — the only harness the
+ * "Restart with model…" affordance is offered for. Both the canonical and
+ * reversed native spellings count, mirroring the server's
+ * ``_CODEX_FAMILY_HARNESSES``. ``null`` / undefined (harness not loaded) is
+ * not codex, so the affordance stays hidden until the harness is known.
+ */
+function isCodexHarness(harness: string | null | undefined): boolean {
+  return harness === "codex" || harness === "codex-native" || harness === "native-codex";
+}
 
 /**
  * Display label for an agent name: the wrapper alias when mapped, else
@@ -730,11 +744,15 @@ function McpServerManagerDialog({
   servers,
   open,
   onOpenChange,
+  dirty,
+  onDirty,
 }: {
   sessionId: string;
   servers: McpServerSummary[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  dirty: boolean;
+  onDirty: () => void;
 }) {
   const [form, setForm] = useState<McpFormState>(EMPTY_MCP_FORM);
   const [formError, setFormError] = useState<string | null>(null);
@@ -751,6 +769,7 @@ function McpServerManagerDialog({
   }
 
   function notifyRestart() {
+    onDirty();
     showToast(
       <span className="text-sm">MCP servers updated. Restart the session to apply changes.</span>,
     );
@@ -797,6 +816,12 @@ function McpServerManagerDialog({
           <DialogTitle>Manage MCP Servers</DialogTitle>
           <DialogDescription>Add, edit, or remove MCP servers for this session.</DialogDescription>
         </DialogHeader>
+        {dirty && (
+          <div className="flex items-center gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-700 dark:text-yellow-400">
+            <AlertTriangleIcon className="size-4 shrink-0" />
+            Restart the session to apply your changes.
+          </div>
+        )}
         <div className="grid gap-4 pt-1 md:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
           <div className="flex min-w-0 flex-col gap-1.5">
             <SectionLabel>Servers</SectionLabel>
@@ -959,6 +984,16 @@ function McpServersSection({
   editable: boolean;
 }) {
   const [managerOpen, setManagerOpen] = useState(false);
+  const [mcpDirty, setMcpDirty] = useState(false);
+  const sessionStatus = useChatStore((s) => s.sessionStatus);
+  // Clear the dirty flag when the session restarts (launching picks up
+  // the updated MCP config) or when the user navigates to another session.
+  useEffect(() => {
+    if (sessionStatus === "launching") setMcpDirty(false);
+  }, [sessionStatus]);
+  useEffect(() => {
+    setMcpDirty(false);
+  }, [sessionId]);
   const canEdit = !!(sessionId && editable);
   const deleteServer = useDeleteMcpServer(canEdit ? sessionId : "");
   const showSection = servers.length > 0 || canEdit;
@@ -980,6 +1015,12 @@ function McpServersSection({
           </button>
         )}
       </div>
+      {mcpDirty && (
+        <p className="flex items-center gap-1 text-xs text-yellow-700 dark:text-yellow-400">
+          <AlertTriangleIcon className="size-3 shrink-0" />
+          Restart to apply changes
+        </p>
+      )}
       {servers.length > 0 ? (
         <McpServerList
           servers={servers}
@@ -987,12 +1028,14 @@ function McpServersSection({
             canEdit
               ? (name) =>
                   deleteServer.mutate(name, {
-                    onSuccess: () =>
+                    onSuccess: () => {
+                      setMcpDirty(true);
                       showToast(
                         <span className="text-sm">
                           MCP servers updated. Restart the session to apply changes.
                         </span>,
-                      ),
+                      );
+                    },
                   })
               : undefined
           }
@@ -1006,6 +1049,8 @@ function McpServersSection({
           servers={servers}
           open={managerOpen}
           onOpenChange={setManagerOpen}
+          dirty={mcpDirty}
+          onDirty={() => setMcpDirty(true)}
         />
       )}
     </div>
@@ -1062,15 +1107,17 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
                 <PopoverContent
                   side="top"
                   align="start"
-                  className="w-64"
+                  className="max-w-72"
                   onClick={(e) => e.stopPropagation()}
                 >
                   <div className="flex flex-col gap-2">
                     <div className="flex items-center gap-1.5">
                       <ShieldCheckIcon className="size-3.5 text-muted-foreground" />
-                      <span className="font-medium text-sm">{p.name}</span>
+                      <span className="min-w-0 break-all font-medium text-sm">{p.name}</span>
                     </div>
-                    {description && <p className="text-xs text-muted-foreground">{description}</p>}
+                    {description && (
+                      <p className="break-words text-xs text-muted-foreground">{description}</p>
+                    )}
                     <button
                       type="button"
                       onClick={() => p.id && deletePolicy.mutate(p.id)}
@@ -1164,6 +1211,20 @@ export function AgentInfoContent({
   // which case the row is omitted rather than showing a placeholder.
   const { data: owner } = useSessionOwner(sessionId ?? null);
   const viewerId = getCurrentUserId();
+  // The session's current model override, prefilled into the restart dialog.
+  const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
+  // "Restart with model…" is codex-only: codex applies its model at launch
+  // (no mid-turn switch), so a model change is a fork that carries history.
+  const showRestartWithModel = isCodexHarness(agent?.harness) && !!sessionId;
+  const [restartOpen, setRestartOpen] = useState(false);
+  // Only surface the owner once the session is actually shared — a private
+  // solo session has no "owner" worth showing. A non-owner viewer already
+  // implies a share; the owner needs the grant list (manage-only, readable by
+  // the owner) to know they've granted access to anyone else or made it
+  // public. Mirrors the author-label gate in ChatPage.
+  const viewerOwnsSession = owner != null && owner === viewerId;
+  const { data: ownerGrants } = usePermissions(viewerOwnsSession ? (sessionId ?? null) : null);
+  const isSessionShared = isSessionSharedWithOthers(owner ?? null, viewerId, ownerGrants);
 
   useEffect(() => {
     return () => {
@@ -1194,7 +1255,7 @@ export function AgentInfoContent({
           )}
         </div>
       )}
-      {sessionId && owner && (
+      {sessionId && owner && isSessionShared && (
         <div className="flex flex-col gap-1.5">
           <SectionLabel>Owner</SectionLabel>
           <span
@@ -1249,6 +1310,27 @@ export function AgentInfoContent({
       )}
       {sessionId && usageByModel != null && Object.keys(usageByModel).length > 0 && (
         <ModelUsageBreakdown usageByModel={usageByModel} />
+      )}
+      {showRestartWithModel && sessionId && (
+        <div className="flex flex-col gap-1.5">
+          <SectionLabel>Model</SectionLabel>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            data-testid="restart-with-model-trigger"
+            onClick={() => setRestartOpen(true)}
+            className="justify-start text-xs"
+          >
+            Restart with model…
+          </Button>
+          <RestartWithModelDialog
+            sessionId={sessionId}
+            currentModel={sessionModelOverride}
+            open={restartOpen}
+            onOpenChange={setRestartOpen}
+          />
+        </div>
       )}
       {showIntelligentRouting && sessionId && <IntelligentRoutingSection sessionId={sessionId} />}
       <McpServersSection sessionId={sessionId} servers={servers} editable={mcpEditable} />

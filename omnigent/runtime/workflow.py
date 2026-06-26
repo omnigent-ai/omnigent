@@ -595,6 +595,16 @@ def configure_agent_harness_with_provider(
         return
 
     if entry.kind == CLI_CONFIG_KIND:
+        # The pi harness consumes both families and can route a cli-config
+        # Databricks AI Gateway (the gateway's Anthropic Messages surface is one
+        # Pi speaks natively) — the same provider pi-native routes via
+        # ``_cli_config_pi_provider``. Translate it into the pi gateway
+        # transport rather than failing loud; a non-Databricks cli-config is
+        # never selected for pi (see ``default_provider_for_harness``), so it
+        # won't reach here.
+        if harness_type == "pi":
+            _apply_cli_config_databricks_to_pi(env, entry)
+            return
         # A custom model provider defined (and authenticated) by the codex
         # CLI's own config.toml: pin it by name; the executor's bridged
         # config.toml carries the provider table + credential. Only the
@@ -883,6 +893,59 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
             "~/.omnigent/config.yaml.",
             code=ErrorCode.INVALID_INPUT,
         )
+
+
+def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
+    """Apply a cli-config Databricks AI Gateway to the pi (gateway-harness) path.
+
+    The gateway-harness pi launch (``omnigent run`` / agents) and pi-native
+    (the terminal) both resolve the same default provider
+    (:func:`default_provider_for_harness`), so when that default is a
+    ``cli-config`` Databricks AI Gateway, this path must route it rather than
+    fail loud. We reuse the pi-native translation
+    (:func:`omnigent.pi_native_credentials._cli_config_pi_provider`) — which
+    reads the codex ``[model_providers.X]`` transport, rewrites the base URL to
+    the gateway's Anthropic Messages surface (``/anthropic``) Pi speaks
+    natively, and builds the per-request bearer-token ``!command`` apiKey — then
+    maps its fields onto the ``HARNESS_PI_GATEWAY_*`` env vars the pi harness
+    wrap reads (the same vars :func:`_apply_provider_to_pi` emits).
+
+    :param env: Mutable spawn-env dict, modified in place.
+    :param entry: The resolved ``cli-config`` provider entry (a Databricks
+        gateway — selection guarantees a non-Databricks cli-config never
+        reaches here).
+    :raises OmnigentError: If the cli-config entry cannot be translated into a
+        Pi gateway provider (its codex table can't be resolved or it is not a
+        recognized Databricks AI Gateway) — selection should prevent this, so a
+        failure here is a real misconfiguration worth surfacing.
+    """
+    # Imported lazily: pi_native_credentials is on the runner's session-create
+    # hot path and pulls onboarding-only deps; keep this off workflow import.
+    from omnigent.pi_native_credentials import _cli_config_pi_provider
+
+    # The spec model (if any) is already in HARNESS_PI_MODEL; thread it so the
+    # gateway translation honors an explicit override, else its default.
+    model_override = env.get("HARNESS_PI_MODEL")
+    provider = _cli_config_pi_provider(entry, model=model_override)
+    if provider is None:
+        raise OmnigentError(
+            f"provider {entry.name!r} (kind 'cli-config') was selected for the 'pi' "
+            "harness but its codex [model_providers] table could not be resolved as a "
+            "Databricks AI Gateway. Check the [model_providers] base_url + auth in "
+            "~/.codex/config.toml, or configure a key/gateway provider for pi in "
+            "~/.omnigent/config.yaml.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # Pi speaks the gateway's Anthropic Messages surface — register it under
+    # pi's "claude" family key (mirrors _apply_provider_to_pi's anthropic path).
+    base_urls = {_PI_FAMILY_KEY[ANTHROPIC_FAMILY]: provider.base_url}
+    env[_HARNESS_GATEWAY_FLAG["pi"]] = "true"
+    env["HARNESS_PI_GATEWAY_BASE_URLS"] = json.dumps(base_urls, sort_keys=True)
+    env["HARNESS_PI_GATEWAY_HOST"] = _origin_of(provider.base_url)
+    # provider.api_key is a "!command" form (Pi's models.json convention); the
+    # gateway transport env var wants the bare shell command, so strip the "!".
+    env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] = provider.api_key.lstrip("!")
+    env["HARNESS_PI_MODEL"] = provider.model
 
 
 def _synthesize_databricks_provider(profile: str | None) -> ProviderEntry:
@@ -2485,21 +2548,76 @@ def _find_spec_by_name(
     name: str,
 ) -> AgentSpec | None:
     """
-    Recursively search the spec tree for a sub-agent by name.
+    Resolve a sub-agent spec by name within the parent spec tree.
 
-    Sub-agent names are validated to be unique across the entire
-    spec tree, so this always finds at most one match.
+    Recursively searches ``spec.sub_agents`` (names are validated unique
+    across the tree, so at most one matches).
+
+    The one exception is the built-in ``__web_researcher`` sub-agent that
+    backs the ``web_fetch`` tool: ``WebFetchTool`` synthesizes its spec in
+    memory and appends it to the parent's live ``sub_agents`` list, but
+    that spec is never serialized into the parent's persisted bundle. A
+    child ``__web_researcher`` session boots by re-parsing the bundle
+    fresh (``runner/_entry.py`` spec resolver), so the researcher is
+    absent from the re-parsed tree and a plain search returns ``None``.
+    Every caller swaps to the resolved sub-spec only ``if ... is not
+    None`` and otherwise keeps the parent spec, which boots the child as
+    a full clone of the parent (runaway recursion via ``sys_session_send``
+    when the parent is a coordinator). To keep that fallback safe, the
+    researcher is reconstructed deterministically from the parent (the
+    same pure builder ``WebFetchTool`` uses) instead of returning ``None``,
+    but only when the parent actually declares the ``web_fetch`` builtin.
+    That builtin is the sole reason the researcher ever exists, so a parent
+    without it has no such child and the name falls through to normal
+    resolution (``None``). Reconstructing unconditionally would let a
+    caller-controlled ``sub_agent_name`` coerce any parent into a
+    shell-capable researcher (``build_researcher_spec`` synthesizes an
+    ``OSEnvSpec``), widening the parent's tool boundary.
 
     :param spec: The root agent spec to search.
     :param name: The sub-agent name to find,
         e.g. ``"researcher"``.
-    :returns: The matching sub-agent spec, or ``None`` if not
-        found.
+    :returns: The matching sub-agent spec, the reconstructed
+        ``__web_researcher`` spec when the parent declares ``web_fetch``
+        and the name matches, or ``None`` otherwise.
+    """
+    found = _search_sub_agent_tree(spec, name)
+    if found is not None:
+        return found
+    # Built-in web_fetch researcher: derived from the parent, never
+    # persisted in the bundle, so reconstruct it on a resolve-miss rather
+    # than letting callers fall back to the parent spec. Gated on the parent
+    # declaring the ``web_fetch`` builtin, the only reason the researcher
+    # exists (``WebFetchTool.__init__`` appends it). Imported lazily to keep
+    # the tools layer off this module's import path.
+    from omnigent.tools.builtins.web_fetch import RESEARCHER_NAME
+
+    if name == RESEARCHER_NAME and any(entry.name == "web_fetch" for entry in spec.tools.builtins):
+        from omnigent.tools.builtins.web_fetch import build_researcher_spec
+
+        return build_researcher_spec(spec)
+    return None
+
+
+def _search_sub_agent_tree(
+    spec: AgentSpec,
+    name: str,
+) -> AgentSpec | None:
+    """
+    Recursively search ``spec.sub_agents`` for a sub-agent named ``name``.
+
+    The pure tree search backing :func:`_find_spec_by_name`; kept separate
+    so the ``__web_researcher`` reconstruction in that function fires once
+    at the root rather than on every recursive frame.
+
+    :param spec: The agent spec whose sub-tree to search.
+    :param name: The sub-agent name to find.
+    :returns: The matching sub-agent spec, or ``None`` if not found.
     """
     for sa in spec.sub_agents:
         if sa.name == name:
             return sa
-        found = _find_spec_by_name(sa, name)
+        found = _search_sub_agent_tree(sa, name)
         if found is not None:
             return found
     return None
