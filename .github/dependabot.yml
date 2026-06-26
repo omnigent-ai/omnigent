@@ -1,16 +1,19 @@
-# Dependabot configuration.
+# Dependabot configuration — security-only.
 #
-# Two jobs per ecosystem are driven from this one file:
-#   * SECURITY updates  — opened automatically whenever a dependency has an
-#     open advisory, regardless of the weekly schedule below. These are gated
-#     by the repo-level "Dependabot security updates" toggle (enabled out of
-#     band). Grouping them (see `groups: ... applies-to: security-updates`)
-#     keeps a burst of advisories from becoming a burst of PRs.
-#   * VERSION updates   — the scheduled weekly bump of out-of-date deps.
+# Fix PRs come from the repo-level "Dependabot security updates" toggle
+# (enabled out of band): Dependabot opens a PR whenever a dependency has an
+# open advisory. The `updates` blocks below exist to (a) GROUP those security
+# PRs per ecosystem so a burst of advisories becomes one PR, and (b) declare
+# every manifest directory.
 #
-# Supply-chain stance mirrors the rest of the repo (uv.toml `exclude-newer`,
-# ap-web/.npmrc `min-release-age`): a 7-day cooldown so a freshly published —
-# possibly compromised — release is never pulled the moment it lands.
+# Scheduled VERSION updates are DISABLED (`open-pull-requests-limit: 0`): the
+# proactive bump PRs — especially majors (react 19, react-router 8, …) — were
+# pure churn for this repo. Security updates are NOT subject to that limit, so
+# they keep flowing. To re-enable hygiene bumps later, raise the limit and add
+# a `version-updates` group (e.g. `update-types: [minor, patch]`) per ecosystem.
+#
+# No cooldown: security fixes should land promptly. The supply-chain delay a
+# cooldown provided only mattered for version updates, which are now off.
 version: 2
 
 updates:
@@ -20,17 +23,11 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 0
     groups:
-      python-security:
+      pip-security:
         applies-to: security-updates
         patterns: ["*"]
-      python-version:
-        applies-to: version-updates
-        patterns: ["*"]
-        update-types: [minor, patch]
 
   # ── ap-web (React frontend) ──────────────────────────────────────────────
   - package-ecosystem: npm
@@ -38,17 +35,11 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 0
     groups:
       ap-web-security:
         applies-to: security-updates
         patterns: ["*"]
-      ap-web-version:
-        applies-to: version-updates
-        patterns: ["*"]
-        update-types: [minor, patch]
 
   # ── ap-web Electron shell ────────────────────────────────────────────────
   - package-ecosystem: npm
@@ -56,17 +47,11 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 0
     groups:
       electron-security:
         applies-to: security-updates
         patterns: ["*"]
-      electron-version:
-        applies-to: version-updates
-        patterns: ["*"]
-        update-types: [minor, patch]
 
   # ── CI helper deps (.github/ci-deps) ─────────────────────────────────────
   - package-ecosystem: npm
@@ -74,15 +59,10 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     groups:
       ci-deps-security:
         applies-to: security-updates
-        patterns: ["*"]
-      ci-deps-version:
-        applies-to: version-updates
         patterns: ["*"]
 
   # ── Rust sidecar used by the codex-parity test fixture ───────────────────
@@ -91,15 +71,10 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     groups:
       sidecar-security:
         applies-to: security-updates
-        patterns: ["*"]
-      sidecar-version:
-        applies-to: version-updates
         patterns: ["*"]
 
   # ── iOS app (CocoaPods/Bundler Gemfile) ──────────────────────────────────
@@ -108,32 +83,20 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     groups:
       ios-security:
         applies-to: security-updates
         patterns: ["*"]
-      ios-version:
-        applies-to: version-updates
-        patterns: ["*"]
 
   # ── GitHub Actions (workflow `uses:` pins) ───────────────────────────────
-  # The repo pins actions by commit SHA; Dependabot keeps the SHAs current
-  # and surfaces advisories against the underlying action.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
       day: monday
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     groups:
       actions-security:
         applies-to: security-updates
-        patterns: ["*"]
-      actions-version:
-        applies-to: version-updates
         patterns: ["*"]
