@@ -1191,3 +1191,90 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
     );
   });
 });
+
+describe("ApprovalCard — MCP elicitation form", () => {
+  it("renders the generic schema form and submits typed content via the store", () => {
+    // A third-party MCP server's elicitation arrives marked with
+    // policy_name "claude_native_mcp_elicitation" and a renderable
+    // requestedSchema. The card must render the typed form (not the
+    // binary buttons) and route the submitted values through
+    // submitApproval as MCP ElicitResult.content.
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
+
+    render(
+      <ApprovalCard
+        elicitationId="elic_mcp"
+        message="Approve the following?"
+        phase="mcp_elicitation"
+        policyName="claude_native_mcp_elicitation"
+        contentPreview=""
+        requestedSchema={{
+          type: "object",
+          properties: { name: { type: "string", title: "Name" } },
+          required: ["name"],
+        }}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    expect(screen.getByText("Input requested")).toBeDefined();
+    expect(screen.getByTestId("mcp-elicitation-form")).toBeDefined();
+
+    fireEvent.change(screen.getByTestId("mcp-elicit-field-name"), { target: { value: "blue" } });
+    fireEvent.click(screen.getByTestId("mcp-elicitation-submit"));
+    expect(submitSpy).toHaveBeenCalledWith("elic_mcp", "accept", { name: "blue" });
+  });
+
+  it("routes Cancel to the MCP cancel action (distinct from decline)", () => {
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
+
+    render(
+      <ApprovalCard
+        elicitationId="elic_mcp_cancel"
+        message="Approve the following?"
+        phase="mcp_elicitation"
+        policyName="claude_native_mcp_elicitation"
+        contentPreview=""
+        requestedSchema={{
+          type: "object",
+          properties: { name: { type: "string" } },
+          required: ["name"],
+        }}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("mcp-elicitation-cancel"));
+    expect(submitSpy).toHaveBeenCalledWith("elic_mcp_cancel", "cancel", undefined);
+  });
+
+  it("falls back to the binary card for an unrenderable schema", () => {
+    // A schema with a nested object can't be rendered as a flat form;
+    // the card must degrade to binary approve/reject so the prompt is
+    // still answerable.
+    render(
+      <ApprovalCard
+        elicitationId="elic_mcp_nested"
+        message="Approve the following?"
+        phase="mcp_elicitation"
+        policyName="claude_native_mcp_elicitation"
+        contentPreview=""
+        requestedSchema={{ type: "object", properties: { nested: { type: "object" } } }}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    expect(screen.queryByTestId("mcp-elicitation-form")).toBeNull();
+    expect(screen.getByRole("button", { name: /approve/i })).toBeDefined();
+    expect(screen.getByRole("button", { name: /reject/i })).toBeDefined();
+  });
+});

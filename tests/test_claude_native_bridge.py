@@ -2118,6 +2118,62 @@ def test_augment_claude_args_registers_permission_command_hook(
     assert "omnigent.claude_native_status" in settings["statusLine"]["command"]
 
 
+def test_augment_claude_args_registers_elicitation_command_hook(
+    tmp_path: Path,
+) -> None:
+    """
+    Passing ``ap_server_url`` registers Claude's ``Elicitation`` hook as
+    a long-timeout command hook so third-party MCP-server elicitations
+    surface in the web UI instead of only the TUI.
+
+    In claude-native Claude Code is the MCP client, so this hook is the
+    only window onto an MCP ``elicitation/create``. A regression here
+    means an MCP server's form renders only in the terminal and a
+    web-driven user can never answer it.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        ap_server_url="http://127.0.0.1:8787/",
+        ap_auth_headers={"Authorization": "Bearer xyz"},
+    )
+    settings = json.loads(args[args.index("--settings") + 1])
+    entries = settings["hooks"]["Elicitation"]
+    assert len(entries) == 1
+    # No matcher → fires for every MCP server (the form is generic over
+    # the elicitation's requested_schema).
+    assert "matcher" not in entries[0]
+    hooks = entries[0]["hooks"]
+    assert len(hooks) == 1
+    hook = hooks[0]
+    assert hook["type"] == "command"
+    # Same day-long budget as PermissionRequest: a web-UI form may take
+    # minutes to answer and the default command-hook timeout would sever
+    # the long-poll and drop the prompt back into the TUI.
+    assert hook["timeout"] == 86400
+    assert "omnigent.claude_native_hook elicitation" in hook["command"]
+    assert "--bridge-dir" in hook["command"]
+
+
+def test_augment_claude_args_omits_elicitation_hook_without_omnigent_server(
+    tmp_path: Path,
+) -> None:
+    """
+    No ``Elicitation`` hook is registered without an Omnigent server URL.
+
+    Without a server to POST the elicitation to, the hook would have
+    nowhere to forward — Claude must fall back to its built-in TUI form.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+    settings = json.loads(args[args.index("--settings") + 1])
+    assert "Elicitation" not in settings["hooks"]
+
+
 def test_augment_claude_args_registers_user_prompt_submit_policy_hook(
     tmp_path: Path,
 ) -> None:

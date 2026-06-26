@@ -61,7 +61,7 @@ import { conversationDisplayLabel, getConversationAgentType } from "@/shell/side
 /** Optimistic verdicts keyed by elicitation id, mirroring the chat store's flip. */
 type RespondedMap = Record<
   string,
-  { action: "accept" | "decline"; content?: Record<string, unknown> }
+  { action: "accept" | "decline" | "cancel"; content?: Record<string, unknown> }
 >;
 
 export function InboxPage() {

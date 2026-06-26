@@ -1173,6 +1173,40 @@ def build_hook_settings(
         }
         hooks["PermissionRequest"] = [{"hooks": [permission_hook]}]
 
+        # ``Elicitation`` fires when a third-party MCP server requests
+        # input mid-tool-call (the MCP ``elicitation/create`` flow). In
+        # claude-native Claude Code is the MCP client, so this hook is
+        # Omnigent's only window onto such prompts — without it an MCP
+        # server's form renders only in the TUI and a web-UI-driven user
+        # never sees it. Route it like ``PermissionRequest``: forward to
+        # the web UI and long-poll for the verdict. It is a deciding hook
+        # (stdout ``hookSpecificOutput.action`` accept/decline/cancel plus
+        # ``content`` on accept) and fires in every permission mode, so
+        # unlike ``AskUserQuestion`` it needs no bypassPermissions twin.
+        elicitation_command_parts = [
+            python,
+            "-I",
+            "-m",
+            "omnigent.claude_native_hook",
+            "elicitation",
+            "--bridge-dir",
+            str(bridge_dir),
+        ]
+        elicitation_hook: dict[str, Any] = {
+            "type": "command",
+            "command": shlex.join(elicitation_command_parts),
+            # Same day-long budget as PermissionRequest: an interactive
+            # web-UI form may take minutes to answer, and Claude Code's
+            # default command-hook timeout would sever the long-poll and
+            # drop the prompt back into the TUI. Kept in lockstep with the
+            # subprocess/AP-side elicitation budgets so none caps first.
+            "timeout": 86400,
+        }
+        # No matcher → fires for every MCP server. The web form is generic
+        # over the elicitation's ``requested_schema``, so it is not scoped
+        # per-server.
+        hooks["Elicitation"] = [{"hooks": [elicitation_hook]}]
+
         # Policy-gate native Claude Code tools, not just relay/MCP tools.
         evaluate_policy_command_parts = [
             python,

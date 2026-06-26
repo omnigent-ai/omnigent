@@ -82,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
         return _main_permission_request(raw_argv[1:])
     if raw_argv and raw_argv[0] == "ask-user-question":
         return _main_ask_user_question(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "elicitation":
+        return _main_elicitation(raw_argv[1:])
     if raw_argv and raw_argv[0] == "evaluate-policy":
         return _main_evaluate_policy(raw_argv[1:])
     # Backwards compat: older bridge dirs may still reference the
@@ -613,6 +615,67 @@ def _main_permission_request(argv: list[str]) -> int:
         f"{url_component(session_id)}/hooks/permission-request"
     )
     resp = _post_hook_with_reattach(url, headers, payload, "claude permission")
+    if resp is None:
+        return 0
+    if resp.content:
+        sys.stdout.write(resp.text)
+    return 0
+
+
+def _main_elicitation(argv: list[str]) -> int:
+    """
+    Forward one Claude ``Elicitation`` hook to the active Omnigent session.
+
+    Claude Code fires the ``Elicitation`` hook when a third-party MCP
+    server requests input mid-tool-call (the MCP ``elicitation/create``
+    flow). In claude-native Claude Code is the MCP client, so this hook
+    is the only point at which Omnigent can route the prompt to the web
+    UI. The observed payload carries ``message``, ``requested_schema``
+    (a flat JSON Schema), ``mcp_server_name``, and ``mode`` (``"form"``;
+    URL-mode elicitations are left to Claude's own TUI).
+
+    Mirrors :func:`_main_permission_request`: POSTs to the active
+    session's ``/hooks/elicitation`` endpoint, long-polls for the web
+    verdict via :func:`_post_hook_with_reattach`, and writes the server's
+    fully-formed ``hookSpecificOutput`` JSON straight to stdout. On any
+    transport failure it returns ``0`` with no output so Claude falls
+    back to its built-in TUI elicitation form (fail-ask).
+
+    :param argv: CLI argv after the ``elicitation`` subcommand, e.g.
+        ``["--bridge-dir", "/tmp/x"]``.
+    :returns: Process exit code. Returns ``0`` on transport failures so
+        Claude Code falls back to its terminal form.
+    """
+    args = _parse_permission_args(argv)
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw or "{}")
+    except json.JSONDecodeError as exc:
+        print(f"omnigent claude elicitation hook: malformed JSON: {exc}", file=sys.stderr)
+        return 0
+    if not isinstance(payload, dict):
+        print("omnigent claude elicitation hook: expected JSON object", file=sys.stderr)
+        return 0
+    bridge_dir = Path(args.bridge_dir)
+    session_id = read_active_session_id(bridge_dir)
+    if not session_id:
+        print("omnigent claude elicitation hook: active session missing", file=sys.stderr)
+        return 0
+    config = read_permission_hook_config(bridge_dir)
+    ap_server_url = args.omnigent_server_url or config.get("ap_server_url")
+    if not isinstance(ap_server_url, str) or not ap_server_url:
+        print("omnigent claude elicitation hook: Omnigent server URL missing", file=sys.stderr)
+        return 0
+    headers = _parse_headers(args.omnigent_auth_headers_json)
+    if not headers:
+        raw_headers = config.get("ap_auth_headers")
+        if isinstance(raw_headers, dict):
+            headers = {str(key): str(value) for key, value in raw_headers.items()}
+    url = (
+        f"{ap_server_url.rstrip('/')}/v1/sessions/"
+        f"{url_component(session_id)}/hooks/elicitation"
+    )
+    resp = _post_hook_with_reattach(url, headers, payload, "claude elicitation")
     if resp is None:
         return 0
     if resp.content:

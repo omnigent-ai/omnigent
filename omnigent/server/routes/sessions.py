@@ -15225,6 +15225,149 @@ def create_sessions_router(
             media_type="application/json",
         )
 
+    # ── POST /sessions/{session_id}/hooks/elicitation ────────────
+
+    @router.post(
+        "/sessions/{session_id}/hooks/elicitation",
+        response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def claude_elicitation_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Claude Code ``Elicitation`` HTTP hook endpoint.
+
+        Receives Claude Code's ``Elicitation`` hook payload — emitted
+        when a third-party MCP server requests input mid-tool-call (the
+        MCP ``elicitation/create`` flow) — publishes a
+        ``response.elicitation_request`` SSE event so the web UI renders
+        the server's ``requested_schema`` as an interactive form, and
+        long-polls until the verdict arrives via the session ``approval``
+        path.
+
+        In claude-native, Claude Code (not Omnigent) is the MCP client,
+        so this hook is the only point at which an MCP elicitation can be
+        surfaced to the web UI. Unlike ``PermissionRequest`` it fires in
+        every permission mode (it is not a permission gate), so no
+        bypassPermissions twin is needed.
+
+        Response follows Claude Code's ``Elicitation`` hook contract:
+        ``hookSpecificOutput.action`` is ``"accept"`` / ``"decline"`` /
+        ``"cancel"``, with ``content`` (the filled form values) on
+        accept. On timeout / disconnect the endpoint returns ``200`` with
+        an empty body — Claude Code treats that as "defer to the TUI
+        form" (fail-ask), matching the wrapper's contract.
+
+        :param request: FastAPI request — body is Claude Code's
+            ``Elicitation`` hook payload as JSON.
+        :param session_id: Omnigent conversation id from the URL path.
+        :returns: Claude ``Elicitation`` hookSpecificOutput JSON, or
+            ``200`` with empty body on timeout / url-mode (fail-ask).
+        :raises OmnigentError: 404 if the session doesn't exist, 400 if
+            the body fails JSON parse or is not an object.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in Elicitation hook body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "Elicitation hook body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        # Claude Code's Elicitation hook payload uses snake_case
+        # ``requested_schema`` (empirically captured), whereas the MCP
+        # spec / our SSE params use camelCase ``requestedSchema`` — map
+        # across the boundary here.
+        message = payload.get("message")
+        if not isinstance(message, str):
+            message = ""
+        requested_schema = payload.get("requested_schema")
+        if requested_schema is not None and not isinstance(requested_schema, dict):
+            requested_schema = None
+        server_name = payload.get("mcp_server_name")
+        if not isinstance(server_name, str) or not server_name:
+            server_name = None
+        # Only form-mode elicitations carry a schema we can render. A
+        # url-mode elicitation (OAuth / out-of-band) has no form, so
+        # fail-ask and let Claude handle it in the TUI (browser flow).
+        if payload.get("mode") == "url":
+            return Response(status_code=status.HTTP_200_OK)
+        # Client-minted stable id so a retry re-parks the same elicitation
+        # (same ``elicit_claude_`` namespace as the permission hook).
+        elicitation_id = _client_supplied_hook_elicitation_id(payload, session_id)
+
+        try:
+            preview_str = json.dumps(requested_schema or {}, ensure_ascii=False)
+        except (TypeError, ValueError):
+            preview_str = repr(requested_schema)
+        preview_str = preview_str[:1024]
+
+        # ``policy_name`` is the marker the web UI keys on to pick the
+        # generic schema-form renderer; ``requestedSchema`` (camelCase) is
+        # the form definition; ``mcp_server_name`` rides as an MCP extra
+        # (params allow extras) so the card can name the requesting server.
+        extras: dict[str, Any] = {}
+        if server_name is not None:
+            extras["mcp_server_name"] = server_name
+        params = ElicitationRequestParams(
+            mode="form",
+            message=(
+                message
+                or (f"**{server_name}** needs input" if server_name else "An MCP server needs input")
+            ),
+            requestedSchema=requested_schema,
+            url=None,
+            phase="mcp_elicitation",
+            policy_name="claude_native_mcp_elicitation",
+            content_preview=preview_str,
+            **extras,
+        )
+        result = await _publish_and_wait_for_harness_elicitation(
+            request,
+            session_id=session_id,
+            params=params,
+            timeout_s=_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
+            conversation_store=conversation_store,
+            elicitation_id=elicitation_id,
+            # No gated tool to correlate: an MCP elicitation happens mid
+            # ``tools/call`` and has no tool result of its own, so the
+            # terminal-resolved fast path does not apply. The wait ends on
+            # the web verdict, disconnect, or timeout.
+            tool_name=None,
+            tool_input=None,
+        )
+        if result is None:
+            # Disconnect or timeout — Claude is no longer waiting; empty
+            # 2xx → Claude defers to its built-in TUI form (fail-ask).
+            return Response(status_code=status.HTTP_200_OK)
+
+        # The MCP ``ElicitationResult`` (action + flat content map) maps
+        # 1:1 onto Claude's Elicitation hook output: ``content`` rides
+        # through verbatim on accept; decline / cancel carry no content.
+        hook_specific: dict[str, Any] = {
+            "hookEventName": "Elicitation",
+            "action": result.action,
+        }
+        if result.action == "accept" and isinstance(result.content, dict):
+            hook_specific["content"] = result.content
+        body = {"hookSpecificOutput": hook_specific}
+        return Response(
+            content=json.dumps(body),
+            media_type="application/json",
+        )
+
     # ── Proto event-type → internal Phase mapping ────────────────────
     _PROTO_EVENT_TYPE_TO_PHASE: dict[str, Phase] = {
         "PHASE_TOOL_CALL": Phase.TOOL_CALL,

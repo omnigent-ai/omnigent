@@ -1868,3 +1868,112 @@ def test_evaluate_policy_retries_5xx_and_succeeds(
     assert captured.out == ""
     # Two 503s then one 200 = 3 total attempts.
     assert call_count == 3
+
+
+def test_elicitation_hook_forwards_payload_and_returns_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    The ``elicitation`` subcommand POSTs the hook payload to the active
+    session's ``/hooks/elicitation`` endpoint and writes the server's
+    ``hookSpecificOutput`` verdict straight to stdout.
+
+    This is the claude-native path that surfaces a third-party MCP
+    server's ``elicitation/create`` form to the web UI. A regression
+    means MCP elicitations never reach the web UI (the form shows only
+    in the TUI).
+    """
+    captured_posts: list[tuple[str, dict[str, object]]] = []
+    server_verdict = {
+        "hookSpecificOutput": {
+            "hookEventName": "Elicitation",
+            "action": "accept",
+            "content": {"approve": True, "note": "ship it"},
+        }
+    }
+
+    class _FakeHttpxClient:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _FakeHttpxClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            captured_posts.append((url, json))
+            return httpx.Response(200, json=server_verdict, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    bridge_dir = prepare_bridge_dir("conv_x", workspace=tmp_path)
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer xyz"},
+    )
+    payload = {
+        "hook_event_name": "Elicitation",
+        "mcp_server_name": "elicit-demo",
+        "message": "Approve the following?",
+        "mode": "form",
+        "requested_schema": {
+            "type": "object",
+            "properties": {"approve": {"type": "boolean"}},
+            "required": ["approve"],
+        },
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["elicitation", "--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    # Server returns the fully-formed hookSpecificOutput; the hook just
+    # relays it verbatim so Claude applies the accept + content.
+    assert json.loads(captured.out) == server_verdict
+    assert len(captured_posts) == 1
+    url, body = captured_posts[0]
+    assert url == "http://127.0.0.1:8787/v1/sessions/conv_x/hooks/elicitation"
+    # The full hook payload is forwarded, plus a client-minted re-attach
+    # id in the ``elicit_claude_`` namespace the server validates.
+    assert body["mcp_server_name"] == "elicit-demo"
+    assert body["requested_schema"] == payload["requested_schema"]
+    assert re.fullmatch(r"elicit_claude_[0-9a-f]{32}", str(body["_omnigent_elicitation_id"]))
+
+
+def test_elicitation_hook_fail_asks_on_empty_server_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    An empty 200 from the server (its timeout / disconnect / url-mode
+    fail-ask) makes the hook exit 0 with no stdout, so Claude falls back
+    to its built-in TUI elicitation form rather than blocking the tool.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client("empty_body"))
+    bridge_dir = prepare_bridge_dir("conv_x", workspace=tmp_path)
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer xyz"},
+    )
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(json.dumps({"hook_event_name": "Elicitation", "mode": "form"})),
+    )
+
+    exit_code = claude_native_hook.main(["elicitation", "--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == ""

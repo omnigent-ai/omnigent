@@ -54,6 +54,7 @@ import type { RememberScope } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
+import { McpElicitationForm, schemaIsRenderable } from "./McpElicitationForm";
 
 /**
  * Extract the answer-option labels from an AskUserQuestion-shaped
@@ -81,7 +82,7 @@ function extractOptionLabels(schema: Record<string, unknown>): string[] {
  */
 export type SubmitApprovalFn = (
   elicitationId: string,
-  action: "accept" | "decline",
+  action: "accept" | "decline" | "cancel",
   content?: Record<string, unknown>,
 ) => void;
 
@@ -222,6 +223,18 @@ export function ApprovalCard({
     const trimmed = feedback.trim();
     submit(elicitationId, "decline", trimmed ? { feedback: trimmed } : undefined);
   };
+  const submitMcpForm = (content: Record<string, unknown>) => {
+    // The typed form values ARE MCP's ``ElicitResult.content`` (a flat
+    // ``{[field]: scalar}`` map); the server passes them straight to
+    // Claude's Elicitation hook ``content`` on accept.
+    submit(elicitationId, "accept", content);
+  };
+  const submitMcpCancel = () => {
+    // ``cancel`` (dismissed) is distinct from ``decline`` (explicit
+    // refusal) in MCP semantics; the server forwards the literal action
+    // so the MCP server can branch on it.
+    submit(elicitationId, "cancel");
+  };
 
   // Mode detection. Prefer the server-stamped structured payload
   // (full, non-truncated); fall back to parsing the content_preview
@@ -241,6 +254,12 @@ export function ApprovalCard({
   const isAskUserQuestion = askPayload !== null;
   const isMultiChoice = optionLabels.length > 0;
   const isCodexCommandApproval = codexCommand !== null && codexCommand !== undefined;
+  // Generic MCP-server elicitation (claude-native ``Elicitation`` hook):
+  // render ``requestedSchema`` as a typed form. Falls back to the binary
+  // card when the schema carries a property type the form can't render,
+  // so the prompt is always answerable.
+  const isMcpElicitation =
+    policyName === "claude_native_mcp_elicitation" && schemaIsRenderable(requestedSchema);
   // External URL: the elicitation points to a third-party page (OAuth,
   // external MCP server, etc.) — show a link. Our own /approve/...
   // paths are handled inline with approve/reject buttons.
@@ -260,7 +279,7 @@ export function ApprovalCard({
   // approvals get a dedicated command render below, so showing the
   // transport JSON would expose unrelated ids and duplicate details.
   const formattedPreview =
-    isAskUserQuestion || isExitPlanMode || isMultiChoice || isCodexCommandApproval
+    isAskUserQuestion || isExitPlanMode || isMultiChoice || isCodexCommandApproval || isMcpElicitation
       ? ""
       : formatPreview(contentPreview);
   const execPolicyAmendment =
@@ -350,7 +369,9 @@ export function ApprovalCard({
     // (flat ``{[question]: answer}``) — matches MCP's
     // ElicitResult.content shape.
     const submittedAnswers =
-      isAskUserQuestion && response.content && Object.keys(response.content).length > 0
+      (isAskUserQuestion || isMcpElicitation) &&
+      response.content &&
+      Object.keys(response.content).length > 0
         ? response.content
         : null;
     const selectedAnswer =
@@ -368,8 +389,13 @@ export function ApprovalCard({
         ? response.content.feedback
         : null;
 
-    let icon = <XIcon className="size-4 text-destructive" />;
-    let label = isExitPlanMode ? "Plan rejected" : "Rejected";
+    const cancelled = response.action === "cancel";
+    let icon = cancelled ? (
+      <InfoIcon className="size-4 text-muted-foreground" />
+    ) : (
+      <XIcon className="size-4 text-destructive" />
+    );
+    let label = cancelled ? "Cancelled" : isExitPlanMode ? "Plan rejected" : "Rejected";
     if (autoResolved) {
       // Card was cleared by the chat store when the gated tool's
       // function_call_output arrived without a UI verdict —
@@ -474,11 +500,13 @@ export function ApprovalCard({
               ? askUserQuestionTitle
               : isMultiChoice
                 ? "Choose an option"
-                : "Approval required"}
-        {policyName && !isAskUserQuestion && !isExitPlanMode && (
+                : isMcpElicitation
+                  ? "Input requested"
+                  : "Approval required"}
+        {policyName && !isAskUserQuestion && !isExitPlanMode && !isMcpElicitation && (
           <span className="text-muted-foreground text-xs">· {policyName}</span>
         )}
-        {phase && !isMultiChoice && !isAskUserQuestion && !isExitPlanMode && (
+        {phase && !isMultiChoice && !isAskUserQuestion && !isExitPlanMode && !isMcpElicitation && (
           <span className="text-muted-foreground text-xs">({phase})</span>
         )}
       </AlertTitle>
@@ -499,6 +527,16 @@ export function ApprovalCard({
             onSubmit={submitAnswers}
             onReject={() => submitBinary("decline")}
           />
+        ) : isMcpElicitation ? (
+          <>
+            <span>{message}</span>
+            <McpElicitationForm
+              requestedSchema={requestedSchema}
+              onSubmit={submitMcpForm}
+              onDecline={() => submitBinary("decline")}
+              onCancel={submitMcpCancel}
+            />
+          </>
         ) : isCodexCommandApproval ? (
           <>
             <span>Codex wants to run this command.</span>
