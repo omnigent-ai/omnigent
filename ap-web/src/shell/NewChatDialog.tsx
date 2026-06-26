@@ -1264,8 +1264,7 @@ export function NewChatLandingScreen() {
   // The selected native harness, used to persist/seed its mode pick (the
   // mode knob is harness-specific). null for non-native agents, which have
   // no mode knob to remember.
-  const selectedNativeHarness =
-    nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
+  const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
   // Seed the harness's mode knob from the user's last pick when the selected
   // harness changes (including the first mount), so a returning user starts a
   // new session on the mode they used last for that harness instead of the
