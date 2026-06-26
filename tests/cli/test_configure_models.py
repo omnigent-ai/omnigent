@@ -2140,15 +2140,14 @@ def test_cursor_overview_surfaces_install_command_when_sdk_missing(
 ) -> None:
     """L1 overview: the Cursor row names the extra install command when absent.
 
-    The exact ``pip install "omnigent[cursor]"`` is shown (escaped so the
-    literal brackets render).
+    The install command (dynamically computed) is shown so the literal brackets
+    render.
     """
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
     assert result.exit_code == 0, result.output
     out = result.output
     assert "not installed — open to install" in out
-    # The literal command (brackets included) reaches the rendered output.
-    assert 'pip install "omnigent[cursor]"' in out
+    assert "omnigent[cursor]" in out
 
 
 def test_cursor_drillin_offers_install_when_sdk_missing(
@@ -2165,7 +2164,7 @@ def test_cursor_drillin_offers_install_when_sdk_missing(
     assert result.exit_code == 0, result.output
     out = result.output
     assert "isn't installed" in out
-    assert 'pip install "omnigent[cursor]"' in out
+    assert "omnigent[cursor]" in out
 
 
 def test_cursor_key_settable_when_sdk_missing(isolated_config, _cursor_sdk_absent) -> None:
@@ -2202,7 +2201,8 @@ def test_cursor_install_now_invokes_runner_without_index(
         calls.append(argv)
         return subprocess.CompletedProcess(args=argv, returncode=0)
 
-    monkeypatch.setattr("omnigent.onboarding.cursor_auth.shutil.which", lambda name: None)
+    monkeypatch.setattr("omnigent.onboarding.extra_install._is_uv_tool_install", lambda: False)
+    monkeypatch.setattr("omnigent.onboarding.extra_install.shutil.which", lambda name: None)
     monkeypatch.setattr("omnigent.onboarding.cursor_auth.subprocess.run", _run)
 
     # L1 4=Cursor → install offer 1=install now → key menu q=back → L1 q.
@@ -2379,15 +2379,14 @@ def test_antigravity_overview_surfaces_install_command_when_sdk_missing(
 ) -> None:
     """L1 overview: the Antigravity row names the extra install command when absent.
 
-    The exact ``pip install "omnigent[antigravity]"`` is shown (escaped so the literal
-    brackets render). Without the SDK-detection branch this line never appears.
+    The install command (dynamically computed) is shown so the literal brackets
+    render. Without the SDK-detection branch this line never appears.
     """
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
     assert result.exit_code == 0, result.output
     out = result.output
     assert "not installed — open to install" in out
-    # The literal command (brackets included) reaches the rendered output.
-    assert 'pip install "omnigent[antigravity]"' in out
+    assert "omnigent[antigravity]" in out
 
 
 def test_antigravity_drillin_offers_install_when_sdk_missing(
@@ -2404,7 +2403,7 @@ def test_antigravity_drillin_offers_install_when_sdk_missing(
     assert result.exit_code == 0, result.output
     out = result.output
     assert "isn't installed" in out
-    assert 'pip install "omnigent[antigravity]"' in out
+    assert "omnigent[antigravity]" in out
 
 
 def test_antigravity_key_settable_when_sdk_missing(
@@ -2443,7 +2442,8 @@ def test_antigravity_install_now_invokes_runner_without_index(
         calls.append(argv)
         return subprocess.CompletedProcess(args=argv, returncode=0)
 
-    monkeypatch.setattr("omnigent.onboarding.antigravity_auth.shutil.which", lambda name: None)
+    monkeypatch.setattr("omnigent.onboarding.extra_install._is_uv_tool_install", lambda: False)
+    monkeypatch.setattr("omnigent.onboarding.extra_install.shutil.which", lambda name: None)
     monkeypatch.setattr("omnigent.onboarding.antigravity_auth.subprocess.run", _run)
 
     # L1 5=Antigravity → install offer 1=install now → key menu q=back → L1 q.

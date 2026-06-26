@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from omnigent.onboarding import antigravity_auth
+from omnigent.onboarding import antigravity_auth, extra_install
 from omnigent.onboarding import secrets as secret_store
 from omnigent.onboarding.antigravity_auth import (
     ANTIGRAVITY_SECRET_NAME,
@@ -149,25 +149,33 @@ def test_antigravity_sdk_installed_false_when_namespace_absent(
 
 def test_antigravity_install_command_prefers_uv(monkeypatch: pytest.MonkeyPatch) -> None:
     """With ``uv`` on PATH, the install runs ``uv pip install`` — no index URL."""
-    monkeypatch.setattr(antigravity_auth.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
+    monkeypatch.setattr(extra_install.shutil, "which", lambda name: "/usr/bin/uv")
     cmd = antigravity_install_command()
     assert cmd == ["uv", "pip", "install", "omnigent[antigravity]"]
-    # No hardcoded index / proxy leaks into committed code.
     assert not any("index" in part or "://" in part for part in cmd)
 
 
 def test_antigravity_install_command_falls_back_to_pip(monkeypatch: pytest.MonkeyPatch) -> None:
     """Without ``uv``, it falls back to this interpreter's pip — still no index."""
-    monkeypatch.setattr(antigravity_auth.shutil, "which", lambda name: None)
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
+    monkeypatch.setattr(extra_install.shutil, "which", lambda name: None)
     cmd = antigravity_install_command()
     assert cmd == [
-        antigravity_auth.sys.executable,
+        extra_install.sys.executable,
         "-m",
         "pip",
         "install",
         "omnigent[antigravity]",
     ]
     assert not any("index" in part or "://" in part for part in cmd)
+
+
+def test_antigravity_install_command_uv_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inside a ``uv tool`` venv, the install uses ``uv tool install --with``."""
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: True)
+    cmd = antigravity_install_command()
+    assert cmd == ["uv", "tool", "install", "--with", "omnigent[antigravity]", "omnigent", "--force"]
 
 
 def test_install_antigravity_sdk_runs_command_then_rechecks(
@@ -188,13 +196,14 @@ def test_install_antigravity_sdk_runs_command_then_rechecks(
         state["installed"] = True
         return subprocess.CompletedProcess(args=argv, returncode=0)
 
-    monkeypatch.setattr(antigravity_auth.shutil, "which", lambda name: None)
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
+    monkeypatch.setattr(extra_install.shutil, "which", lambda name: None)
     monkeypatch.setattr(antigravity_auth.subprocess, "run", _run)
     monkeypatch.setattr(antigravity_auth, "antigravity_sdk_installed", lambda: state["installed"])
 
     assert install_antigravity_sdk() is True
     assert calls == [
-        [antigravity_auth.sys.executable, "-m", "pip", "install", "omnigent[antigravity]"]
+        [extra_install.sys.executable, "-m", "pip", "install", "omnigent[antigravity]"]
     ]
 
 
@@ -204,6 +213,7 @@ def test_install_antigravity_sdk_false_on_spawn_failure(monkeypatch: pytest.Monk
     def _boom(*args: object, **kwargs: object) -> object:
         raise OSError("no pip")
 
-    monkeypatch.setattr(antigravity_auth.shutil, "which", lambda name: None)
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
+    monkeypatch.setattr(extra_install.shutil, "which", lambda name: None)
     monkeypatch.setattr(antigravity_auth.subprocess, "run", _boom)
     assert install_antigravity_sdk() is False
