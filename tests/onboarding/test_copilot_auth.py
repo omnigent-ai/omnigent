@@ -19,8 +19,8 @@ import yaml
 
 from omnigent.onboarding import copilot_auth
 from omnigent.onboarding import secrets as secret_store
+from omnigent.onboarding import extra_install
 from omnigent.onboarding.copilot_auth import (
-    COPILOT_EXTRA_INSTALL_COMMAND,
     COPILOT_SECRET_NAME,
     copilot_github_token_configured,
     copilot_github_token_ref,
@@ -143,9 +143,11 @@ def test_settings_shape() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_copilot_extra_install_command_shape() -> None:
-    """The surfaced install command targets the optional ``copilot`` extra."""
-    assert COPILOT_EXTRA_INSTALL_COMMAND == 'pip install "omnigent[copilot]"'
+def test_copilot_extra_install_command_targets_extra() -> None:
+    """The install command targets the optional ``copilot`` extra."""
+    cmd = copilot_install_command()
+    assert "omnigent[copilot]" in cmd
+    assert "install" in cmd
 
 
 def test_copilot_sdk_installed_true_when_spec_found(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -178,25 +180,33 @@ def test_copilot_sdk_installed_false_when_module_not_found(
 
 def test_copilot_install_command_prefers_uv(monkeypatch: pytest.MonkeyPatch) -> None:
     """With ``uv`` on PATH, the install runs ``uv pip install`` — no index URL."""
-    monkeypatch.setattr(copilot_auth.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
+    monkeypatch.setattr(extra_install.shutil, "which", lambda name: "/usr/bin/uv")
     cmd = copilot_install_command()
     assert cmd == ["uv", "pip", "install", "omnigent[copilot]"]
-    # No hardcoded index / proxy leaks into committed code.
     assert not any("index" in part or "://" in part for part in cmd)
 
 
 def test_copilot_install_command_falls_back_to_pip(monkeypatch: pytest.MonkeyPatch) -> None:
     """Without ``uv``, it falls back to this interpreter's pip — still no index."""
-    monkeypatch.setattr(copilot_auth.shutil, "which", lambda name: None)
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
+    monkeypatch.setattr(extra_install.shutil, "which", lambda name: None)
     cmd = copilot_install_command()
     assert cmd == [
-        copilot_auth.sys.executable,
+        extra_install.sys.executable,
         "-m",
         "pip",
         "install",
         "omnigent[copilot]",
     ]
     assert not any("index" in part or "://" in part for part in cmd)
+
+
+def test_copilot_install_command_uv_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inside a ``uv tool`` venv, the install uses ``uv tool install --with``."""
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: True)
+    cmd = copilot_install_command()
+    assert cmd == ["uv", "tool", "install", "--with", "omnigent[copilot]", "omnigent", "--force"]
 
 
 def test_install_copilot_sdk_runs_command_then_rechecks(
@@ -217,12 +227,13 @@ def test_install_copilot_sdk_runs_command_then_rechecks(
         state["installed"] = True
         return subprocess.CompletedProcess(args=argv, returncode=0)
 
-    monkeypatch.setattr(copilot_auth.shutil, "which", lambda name: None)
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
+    monkeypatch.setattr(extra_install.shutil, "which", lambda name: None)
     monkeypatch.setattr(copilot_auth.subprocess, "run", _run)
     monkeypatch.setattr(copilot_auth, "copilot_sdk_installed", lambda: state["installed"])
 
     assert install_copilot_sdk() is True
-    assert calls == [[copilot_auth.sys.executable, "-m", "pip", "install", "omnigent[copilot]"]]
+    assert calls == [[extra_install.sys.executable, "-m", "pip", "install", "omnigent[copilot]"]]
 
 
 def test_install_copilot_sdk_false_on_spawn_failure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -231,6 +242,7 @@ def test_install_copilot_sdk_false_on_spawn_failure(monkeypatch: pytest.MonkeyPa
     def _boom(*args: object, **kwargs: object) -> object:
         raise OSError("no pip")
 
-    monkeypatch.setattr(copilot_auth.shutil, "which", lambda name: None)
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
+    monkeypatch.setattr(extra_install.shutil, "which", lambda name: None)
     monkeypatch.setattr(copilot_auth.subprocess, "run", _boom)
     assert install_copilot_sdk() is False
