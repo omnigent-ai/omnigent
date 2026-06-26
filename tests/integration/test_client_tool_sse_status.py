@@ -41,17 +41,9 @@ from collections.abc import Iterator
 from typing import Any
 
 import httpx
-import pytest
 
 from tests.e2e.conftest import configure_mock_llm, send_user_message_to_session
 from tests.integration.conftest import JourneySession
-
-# The mock LLM is scripted with a fixed tool-call sequence, so these
-# tests cannot run against a real LLM (it would 401 on the mock base
-# URL and could never reproduce the scripted call_ids/markers). The
-# central gate in ``tests/integration/conftest.py`` skips ``mock_only``
-# tests when a real ``--llm-api-key`` is supplied.
-pytestmark = pytest.mark.mock_only
 
 _LOOKUP_SECRET_TOOL: dict[str, Any] = {
     "type": "function",

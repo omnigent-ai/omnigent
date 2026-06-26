@@ -100,7 +100,7 @@ class TestConstructor(unittest.TestCase):
         self.assertIsNone(executor._os_env_spec)
         self.assertIsNone(executor._cwd)
         self.assertIsNone(executor._model_override)
-        self.assertEqual(executor._permission_mode, "bypassPermissions")
+        self.assertEqual(executor._permission_mode, "auto")
         self.assertIsNone(executor._tool_executor)
         self.assertEqual(executor._clients, {})
         self.assertEqual(executor._crashed_sessions, {})
@@ -1175,6 +1175,96 @@ class TestSystemMessages(unittest.TestCase):
             self.assertIsInstance(events[0], ExecutorError)
             self.assertIn("authentication failed", events[0].message)
             self.assertIn("401", events[0].message)
+            # Non-gateway executor should suggest checking CLI login, not databrickscfg
+            self.assertIn("claude /status", events[0].message)
+            self.assertNotIn("databrickscfg", events[0].message)
+
+        _run(_t())
+
+    def test_auth_retry_databricks_gateway_mentions_databrickscfg(self):
+        """Databricks-profile gateway auth errors should mention ~/.databrickscfg."""
+        from claude_agent_sdk.types import (
+            ClaudeAgentOptions as SDKClaudeAgentOptions,
+        )
+        from claude_agent_sdk.types import (
+            StreamEvent as SDKStreamEvent,
+        )
+        from claude_agent_sdk.types import (
+            SystemMessage as SDKSystemMessage,
+        )
+
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        class _Sentinel:
+            pass
+
+        class _FakeSDK:
+            AssistantMessage = _Sentinel
+            ResultMessage = _Sentinel
+            UserMessage = _Sentinel
+            SystemMessage = SDKSystemMessage
+            StreamEvent = SDKStreamEvent
+            ClaudeAgentOptions = SDKClaudeAgentOptions
+            messages = [
+                SDKSystemMessage(
+                    subtype="api_retry",
+                    data={
+                        "type": "system",
+                        "subtype": "api_retry",
+                        "attempt": 1,
+                        "max_retries": 10,
+                        "retry_delay_ms": 500,
+                        "error_status": 401,
+                        "error": "authentication_failed",
+                    },
+                )
+            ]
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    return None
+
+                async def receive_response(self):
+                    for message in _FakeSDK.messages:
+                        yield message
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            # Create a gateway executor that uses a Databricks profile path.
+            # gateway=True + no host/base_url overrides → _gateway_uses_databricks_profile is True.
+            # Patch _resolve_gateway_env to avoid needing a real ~/.databrickscfg.
+            with patch(
+                "omnigent.inner.claude_sdk_executor._resolve_gateway_env",
+                return_value={
+                    "ANTHROPIC_BASE_URL": "https://host/ai-gateway/anthropic",
+                    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "900000",
+                    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+                    "OMNIGENT_CLAUDE_API_KEY_HELPER": "databricks auth token ...",
+                },
+            ):
+                executor = ClaudeSDKExecutor(gateway=True)
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "hello"}],
+                        [],
+                        "",
+                    )
+                ]
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], ExecutorError)
+            self.assertIn("authentication failed", events[0].message)
+            # Databricks gateway should mention databrickscfg
+            self.assertIn("databrickscfg", events[0].message)
 
         _run(_t())
 
@@ -3376,3 +3466,191 @@ class TestToolCallPolicyGate(unittest.TestCase):
             self.assertIsNone(captured["can_use_tool"])
 
         _run(_t())
+
+
+# ---------------------------------------------------------------------------
+# Tests: Compaction detection via PreCompact hook
+# ---------------------------------------------------------------------------
+
+
+def test_precompact_hook_emits_compaction_complete_with_session_messages() -> None:
+    """When PreCompact fires and a ResultMessage carries a session_id,
+    CompactionComplete is emitted with compacted_messages read from
+    the CLI's session transcript."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete
+
+    class _ResultMessage:
+        def __init__(self, session_id, result):
+            self.session_id = session_id
+            self.result = result
+            self.content = []
+            self.model = "claude-test"
+            self.usage = type(
+                "U",
+                (),
+                {
+                    "input_tokens": 500,
+                    "output_tokens": 100,
+                },
+            )()
+
+    class _SystemMessage:
+        def __init__(self, subtype, data, hook_event_name=None):
+            self.subtype = subtype
+            self.data = data
+            self.hook_event_name = hook_event_name
+
+    class _HookEventMessage(_SystemMessage):
+        pass
+
+    class _FakeSessionMessage:
+        def __init__(self, type, message):
+            self.type = type
+            self.message = message
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = _SystemMessage
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+        messages: list = []
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                _FakeSDK.messages = [
+                    _HookEventMessage(
+                        subtype="hook_started",
+                        data={"hook_event": "PreCompact"},
+                        hook_event_name="PreCompact",
+                    ),
+                    _ResultMessage("claude-uuid-123", "compacted result"),
+                ]
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    fake_session_msgs = [
+        _FakeSessionMessage("user", {"content": [{"type": "text", "text": "hi"}]}),
+        _FakeSessionMessage("assistant", {"content": [{"type": "text", "text": "compacted"}]}),
+    ]
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                return_value=_FakeSDK,
+            ),
+            patch(
+                "claude_agent_sdk.get_session_messages",
+                return_value=fake_session_msgs,
+            ) as mock_get_msgs,
+        ):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        compaction_events = [e for e in events if isinstance(e, CompactionComplete)]
+        assert len(compaction_events) == 1
+        ce = compaction_events[0]
+        assert ce.compacted_messages is not None
+        assert len(ce.compacted_messages) == 2
+        assert ce.compacted_messages[0]["role"] == "user"
+        assert ce.compacted_messages[1]["role"] == "assistant"
+        mock_get_msgs.assert_called_once_with("claude-uuid-123", directory=None)
+        # CompactionComplete before TurnComplete
+        turn_completes = [e for e in events if isinstance(e, TurnComplete)]
+        assert len(turn_completes) == 1
+        assert events.index(compaction_events[0]) < events.index(turn_completes[0])
+
+    _run(_t())
+
+
+def test_no_precompact_no_compaction_event() -> None:
+    """When no PreCompact hook fires, no CompactionComplete is yielded."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete
+
+    class _ResultMessage:
+        def __init__(self, session_id, result):
+            self.session_id = session_id
+            self.result = result
+            self.content = []
+            self.model = "claude-test"
+            self.usage = type(
+                "U",
+                (),
+                {
+                    "input_tokens": 500,
+                    "output_tokens": 100,
+                },
+            )()
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = type("SystemMessage", (), {})
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+        messages: list = []
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                _FakeSDK.messages = [_ResultMessage(session_id, "normal result")]
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        compaction_events = [e for e in events if isinstance(e, CompactionComplete)]
+        assert len(compaction_events) == 0
+
+    _run(_t())

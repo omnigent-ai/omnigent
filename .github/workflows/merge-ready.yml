@@ -4,26 +4,24 @@ name: Merge Ready
 # required branch-protection check, backed by the REQUIRED list inside
 # this workflow. Triggers: `/merge` comment (write-access commenter only),
 # `pull_request_target` labeled (acts only with `automerge`),
-# `workflow_run` on same-repo CI completion, `check_suite` completion on a
-# `fork-e2e/**` branch (the mirrored fork PR e2e -- a delivery that actually
-# fires, unlike the brittle fork-PR `workflow_run` hop it replaces), and
-# `workflow_dispatch` (programmatic/manual re-evaluation of one PR). Posted
-# via the REST API (not the job's implicit check run) so the status lands on
-# the PR head SHA, since these jobs run on the default branch.
+# `workflow_run` on CI completion (same-repo and fork PRs -- ctx resolves the
+# PR from the head SHA), and `workflow_dispatch` (programmatic/manual
+# re-evaluation of one PR). Posted via the REST API (not the job's implicit
+# check run) so the status lands on the PR head SHA, since these jobs run on
+# the default branch.
 #
 # Labels:
 #   automerge    enable GitHub auto-merge (one-shot on label add) + opt
 #                into continuous gate updates (green AND red).
 #
 # There is no CI bypass label. To land a PR despite red required checks,
-# either quarantine the offending flaky test (tests/known_failures.yaml) or,
-# for a genuine emergency, a repo admin uses GitHub's native "merge without
-# waiting for requirements" affordance (branch protection has
-# enforce_admins=false).
+# fix or delete the offending test; for a genuine emergency, a repo admin
+# uses GitHub's native "merge without waiting for requirements" affordance
+# (branch protection has enforce_admins=false).
 
 on:
-  # `labeled` only; `workflow_run` re-evaluates on CI completion (same-repo PRs
-  # and the fork-e2e/** mirror push -- see the job `if`).
+  # `labeled` only; `workflow_run` re-evaluates on CI completion for all PRs
+  # (same-repo and fork -- ctx resolves the PR from the head SHA).
   # pull_request_target (not pull_request) so this workflow always runs from
   # main -- a PR cannot modify the gate logic by editing this file.
   pull_request_target:
@@ -31,14 +29,9 @@ on:
   workflow_run:
     workflows: [PR Template, CI, Lint, E2E UI Tests, E2E Tests, Integration Tests]
     types: [completed]
-  # check_suite is a fork-PR fallback (workflow_run on the fork-e2e/** push is
-  # primary); ctx maps the head SHA back to the open PR.
-  check_suite:
-    types: [completed]
   issue_comment:
     types: [created]
-  # Programmatic / manual re-evaluation of a single PR -- a reliable entry
-  # point that does not depend on the fork-e2e mirror at all.
+  # Programmatic / manual re-evaluation of a single PR.
   workflow_dispatch:
     inputs:
       pr:
@@ -55,7 +48,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: merge-ready-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr || github.event.check_suite.head_sha || github.event.workflow_run.head_sha }}
+  group: merge-ready-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr || github.event.workflow_run.head_sha }}
   cancel-in-progress: true
 
 jobs:
@@ -67,9 +60,8 @@ jobs:
       checks: read
       actions: read         # evaluate-checks.sh reads GET /actions/runs to classify missing checks
       statuses: write
-    # Fire on automerge label adds, PR CI workflow_run completions
-    # (same-repo and the fork-e2e/** mirror push), `/merge` comments, or a
-    # workflow_dispatch re-eval; check_suite is a fork-PR fallback. Runs with no
+    # Fire on automerge label adds, PR CI workflow_run completions (same-repo
+    # and fork), `/merge` comments, or a workflow_dispatch re-eval. Runs with no
     # open PR (push to main, etc.) are dropped by the ctx step.
     if: >-
       (
@@ -78,17 +70,7 @@ jobs:
       ) ||
       (
         github.event_name == 'workflow_run' &&
-        (
-          github.event.workflow_run.event == 'pull_request' ||
-          (
-            github.event.workflow_run.event == 'push' &&
-            startsWith(github.event.workflow_run.head_branch, 'fork-e2e/')
-          )
-        )
-      ) ||
-      (
-        github.event_name == 'check_suite' &&
-        startsWith(github.event.check_suite.head_branch, 'fork-e2e/')
+        github.event.workflow_run.event == 'pull_request'
       ) ||
       github.event_name == 'workflow_dispatch' ||
       (
@@ -120,7 +102,6 @@ jobs:
           # Via env, not interpolated: author-controlled, so direct
           # interpolation would be a shell-injection vector.
           WF_PRS: ${{ toJSON(github.event.workflow_run.pull_requests) }}
-          CS_PRS: ${{ toJSON(github.event.check_suite.pull_requests) }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           PR_INPUT: ${{ inputs.pr }}
           SHA_INPUT: ${{ inputs.sha }}
@@ -157,17 +138,6 @@ jobs:
             fi
             PR="${{ github.event.issue.number }}"
             SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
-          elif [[ "${{ github.event_name }}" == "check_suite" ]]; then
-            # Mirrored fork e2e completed on fork-e2e/pr-N; its head SHA is
-            # the PR head (the mirror pushes the exact fork head SHA).
-            SHA="${{ github.event.check_suite.head_sha }}"
-            PR=$(echo "$CS_PRS" | jq -r '.[0].number // empty')
-            [[ -z "$PR" ]] && PR=$(resolve_pr_from_sha "$SHA")
-            if [[ -z "$PR" ]]; then
-              echo "::notice::Skipped: check_suite has no associated open PR"
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
           else
             PR=$(echo "$WF_PRS" | jq -r '.[0].number // empty')
             SHA="${{ github.event.workflow_run.head_sha }}"
@@ -181,60 +151,19 @@ jobs:
           echo "pr=$PR"   >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Load maintainers
-        id: maintainers
-        if: steps.ctx.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: bash .github/scripts/merge-ready/load-maintainers.sh
-
-      - name: Read PR labels and fork approval state
+      - name: Read PR labels
         id: labels
         if: steps.ctx.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ steps.ctx.outputs.pr }}
-          MAINTAINERS: ${{ steps.maintainers.outputs.list }}
         run: |
-          INFO=$(gh pr view "$PR" --repo "$REPO" --json labels,isCrossRepository)
-          NAMES=$(echo "$INFO" | jq -r '.labels[].name')
+          NAMES=$(gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name')
           if echo "$NAMES" | grep -qx "automerge"; then
             echo "automerge=true" >> "$GITHUB_OUTPUT"
           else
             echo "automerge=false" >> "$GITHUB_OUTPUT"
-          fi
-          # A fork PR without a maintainer's approving review or the
-          # `e2e-approved` label never runs e2e (the fork pull_request run is
-          # an empty matrix), so the gate blocks until one of these is present.
-          # Same-repo PRs run e2e with secrets directly and need no gate.
-          if [[ "$(echo "$INFO" | jq -r '.isCrossRepository')" == "true" ]]; then
-            # Check path 1: maintainer approval via PR review.
-            MAINTAINERS_LC=$(echo "${MAINTAINERS:-}" | tr '[:upper:]' '[:lower:]')
-            APPROVERS=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
-              --jq '[.[] | select(.state != "COMMENTED")] | group_by(.user.login) | map(max_by(.submitted_at)) | .[] | select(.state == "APPROVED") | .user.login')
-            HAS_GATE=false
-            for u in $APPROVERS; do
-              u_lc=$(echo "$u" | tr '[:upper:]' '[:lower:]')
-              for m in $MAINTAINERS_LC; do
-                if [[ "$m" == "$u_lc" ]]; then
-                  HAS_GATE=true
-                  break 2
-                fi
-              done
-            done
-            # Check path 2: e2e-approved label.
-            if [[ "$HAS_GATE" == "false" ]] && echo "$NAMES" | grep -qx "e2e-approved"; then
-              HAS_GATE=true
-            fi
-            if [[ "$HAS_GATE" == "false" ]]; then
-              echo "fork_needs_e2e_approval=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "fork_needs_e2e_approval=false" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "fork_needs_e2e_approval=false" >> "$GITHUB_OUTPUT"
           fi
 
       # post_red gates posting a red status: /merge needs it, automerge opts
@@ -274,7 +203,6 @@ jobs:
         env:
           EVAL: ${{ steps.eval.outcome }}
           FAILED: ${{ steps.eval.outputs.failed }}
-          FORK_NEEDS_E2E_APPROVAL: ${{ steps.labels.outputs.fork_needs_e2e_approval }}
         run: bash .github/scripts/merge-ready/compute-gate.sh
 
       # Skipped when post_red is false AND gate is red: leaves prior
@@ -342,12 +270,11 @@ jobs:
 
       # Not on pull_request_target-labeled: auto-merge was enabled in an earlier
       # step there, so failing here would make the label look broken even
-      # though it worked. Safe on workflow_run/check_suite/workflow_dispatch.
+      # though it worked. Safe on workflow_run/workflow_dispatch.
       - name: Fail job when gate is red
         if: >-
           (
             github.event_name == 'workflow_run' ||
-            github.event_name == 'check_suite' ||
             github.event_name == 'workflow_dispatch'
           ) &&
           steps.ctx.outputs.skip != 'true' &&

@@ -352,7 +352,7 @@ class LocalPythonTool(Tool):
         :returns: The command list for ``subprocess.Popen``.
         """
         if self._sandbox_config.container_image is not None:
-            return self._build_docker_command()
+            return self._build_container_command()
 
         base = [sys.executable, _RUNNER_PATH]
         # When both uv and srt are active, uv must run OUTSIDE
@@ -433,7 +433,7 @@ class LocalPythonTool(Tool):
             settings_file=settings_file,
         )
 
-    def _build_docker_command(self) -> list[str]:
+    def _build_container_command(self) -> list[str]:
         """
         Build a container ``run`` command (Docker or Podman).
 
@@ -453,7 +453,7 @@ class LocalPythonTool(Tool):
         """
         image = self._sandbox_config.container_image
         assert image is not None, (
-            "_build_docker_command called without a container_image — "
+            "_build_container_command called without a container_image — "
             "caller (_build_command) must gate on "
             "``self._sandbox_config.container_image is not None``"
         )
@@ -470,6 +470,8 @@ class LocalPythonTool(Tool):
             image,
             "python",
             "-c",
+            # Inline the runner as a one-liner because the full
+            # _runner.py is not available inside the container.
             (
                 "import sys,json,importlib.util,asyncio,os;"
                 "os.environ['_AP_RESPONSE_MODE']='stdout';"
@@ -492,6 +494,10 @@ class LocalPythonTool(Tool):
         for proc in procs:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
+
+    def shutdown(self) -> None:
+        """Kill any remaining in-flight subprocesses on teardown."""
+        self.cancel()
 
 
 def _write_srt_settings_file(state_root: str) -> str:

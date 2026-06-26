@@ -31,6 +31,7 @@ import {
   Columns2Icon,
   DownloadIcon,
   EyeIcon,
+  EyeOffIcon,
   FileDiffIcon,
   Link2Icon,
   Loader2Icon,
@@ -39,6 +40,7 @@ import {
   PencilLineIcon,
   RowsIcon,
   SearchIcon,
+  SquareArrowOutUpRightIcon,
   Trash2Icon,
 } from "lucide-react";
 import { useSearchParams } from "@/lib/routing";
@@ -76,7 +78,13 @@ import { cn } from "@/lib/utils";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { type ChangedSort, compareChangedFiles } from "./FlatFileList";
 import { CodeViewer } from "./CodeViewer";
-import { detectLang, MONACO_SPLIT_BREAKPOINT, type SaveStatus } from "./codeViewerHelpers";
+import {
+  MONACO_SPLIT_BREAKPOINT,
+  type SaveStatus,
+  detectLang,
+  isImageFile,
+  openHtmlArtifactInNewTab,
+} from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
 
 // Monaco diff is heavy (~MBs + worker); load it only when the diff view is
@@ -463,6 +471,20 @@ function FileViewerBody({
     triggerBrowserDownload(fileContentToBlob(data), path.split("/").pop() ?? path);
   }, [fileQuery.data, path]);
 
+  // Pop the HTML artifact into its own browser tab. The artifact is rendered in
+  // a sandboxed, opaque-origin iframe (see `openHtmlArtifactInNewTab`), so it
+  // stays isolated from the host app — full-window rendering, no origin sharing.
+  const openHtmlInNewTab = useCallback(() => {
+    const data = fileQuery.data;
+    if (!data) return;
+    const opened = openHtmlArtifactInNewTab(data.content, path.split("/").pop() ?? path);
+    if (!opened) {
+      // window.open returned null — almost always a popup blocker. There's no
+      // toast surface here, so log it rather than failing silently.
+      console.warn("Open in new tab: the browser blocked the popup window.");
+    }
+  }, [fileQuery.data, path]);
+
   const copyFileLink = useCallback(() => {
     if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
     const url = new URL(window.location.href);
@@ -554,8 +576,13 @@ function FileViewerBody({
   // View mode toggle — preview is the default for md/html, source for everything else.
   const lang = detectLang(path);
   const isPreviewable = lang === "markdown" || lang === "html";
+  // Images render through CodeViewer's <ImageViewer> regardless of view mode;
+  // they have no source/diff representation, so diff is suppressed for them
+  // (Monaco would otherwise render the base64 payload as garbage text).
+  const isImage = isImageFile(path, fileQuery.data?.content_type);
   // Show Δ button only when the file appears in the session's changed-files list.
-  const isDiffAvailable = changedFiles.data?.data.some((f) => f.path === path) ?? false;
+  const isDiffAvailable =
+    !isImage && (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
 
@@ -576,6 +603,9 @@ function FileViewerBody({
   const [diffLayout, setDiffLayout] = useState<"unified" | "split">(
     () => persistedPrefsRef.current.diffLayout,
   );
+  const [hideWhitespace, setHideWhitespace] = useState(
+    () => persistedPrefsRef.current.hideWhitespace,
+  );
   const [previewableViewMode, setPreviewableViewMode] = useState<"editor" | "preview" | "source">(
     () => persistedPrefsRef.current.previewableViewMode,
   );
@@ -584,8 +614,8 @@ function FileViewerBody({
   // is intentionally excluded — it's contextual (per-open), not a sticky
   // preference. Idempotent on mount (writes back the seeded values).
   useEffect(() => {
-    writeFileViewPreferences({ diffActive, diffLayout, previewableViewMode });
-  }, [diffActive, diffLayout, previewableViewMode]);
+    writeFileViewPreferences({ diffActive, diffLayout, previewableViewMode, hideWhitespace });
+  }, [diffActive, diffLayout, previewableViewMode, hideWhitespace]);
   // Non-markdown previewable (HTML): "editor" falls back to "preview" — no rich-text mode.
   // Markdown: "preview" is removed; treat as "source" if somehow set (e.g. shared state from an HTML file).
   const fileViewMode: "editor" | "preview" | "source" = isPreviewable
@@ -699,6 +729,17 @@ function FileViewerBody({
       },
     });
   }
+  // HTML artifacts can be popped out into their own browser tab for full-window
+  // viewing. The artifact still runs in the same sandboxed, opaque-origin iframe
+  // as the in-app preview (isolated from the host app) — just full-screen.
+  if (lang === "html" && fileQuery.data && viewMode !== "diff") {
+    toolbarActions.push({
+      key: "open-new-tab",
+      label: "Open in new tab",
+      icon: <SquareArrowOutUpRightIcon className="size-4" />,
+      onSelect: openHtmlInNewTab,
+    });
+  }
   toolbarActions.push({
     key: "comments",
     label: commentsOpen ? "Hide comments" : "Show comments",
@@ -729,6 +770,15 @@ function FileViewerBody({
           <RowsIcon className="size-4" />
         ),
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
+    });
+  }
+  if (viewMode === "diff") {
+    toolbarActions.push({
+      key: "hide-whitespace",
+      label: hideWhitespace ? "Show whitespace changes" : "Hide whitespace changes",
+      icon: hideWhitespace ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />,
+      active: hideWhitespace,
+      onSelect: () => setHideWhitespace((prev) => !prev),
     });
   }
   toolbarActions.push({
@@ -1012,6 +1062,7 @@ function FileViewerBody({
                   after={diffQuery.data.after}
                   path={path}
                   layout={diffLayout}
+                  hideWhitespace={hideWhitespace}
                   conversationId={conversationId}
                   comments={openComments}
                   activeSelection={activeSelection}

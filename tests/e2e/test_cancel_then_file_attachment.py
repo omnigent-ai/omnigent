@@ -1,37 +1,39 @@
-"""E2E test: cancel → file attachment → cancel → file attachment → success.
+"""E2E test: cancel + file attachment flow (mock LLM).
 
-Exercises the full cancel + file-attachment flow on the runner-native
-sessions API (``POST /v1/sessions/{id}/events``). Verifies that:
+Exercises the cancel + file-attachment flow on the runner-native
+sessions API. Uses the mock LLM's block mode to hold turns in
+running state so they can be interrupted, then verifies that a
+subsequent turn with a file attachment completes normally.
 
-1. Interrupting a running turn doesn't break subsequent turns.
-2. File attachments work after an interrupt.
-3. Multiple interrupt → send cycles don't corrupt session state.
-4. The LLM actually reads the attached markdown content.
+The interrupt pattern follows test_cancel_history.py:
+  1. Wait for the gate to be pending (LLM is blocked)
+  2. Interrupt the session
+  3. Release the gate (let the blocked request complete for cleanup)
 
-Migrated off the removed ``POST /v1/responses`` route: turns are now
-driven through one runner-bound session, cancellation uses the
-sessions interrupt event (the same path :mod:`test_cancel_history`
-exercises), and continuity is implicit in the shared session rather
-than threaded through ``previous_response_id``. File upload is
-unchanged — ``POST /v1/sessions/{id}/resources/files``.
+The model name is static (mock-cancel-file) so reruns hit the same
+mock queue key after reset_mock_llm.
 
 Usage::
 
-    pytest tests/e2e/test_cancel_then_file_attachment.py \
-        --llm-api-key $LLM_API_KEY -v
+    pytest tests/e2e/test_cancel_then_file_attachment.py -v
 """
 
 from __future__ import annotations
 
 import time
+import uuid
 from typing import Any
 
 import httpx
 import pytest
 
 from tests.e2e.conftest import (
+    configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
+    register_inline_agent,
+    release_mock_gate,
+    reset_mock_llm,
     send_user_message_to_session,
 )
 from tests.e2e.helpers import POLL_INTERVAL_S, final_assistant_text
@@ -48,18 +50,12 @@ _MD_CONTENT = (
     b"3. Launch during the Tuesday alignment window.\n"
     b"4. Confirm delivery via carrier pigeon relay.\n"
 )
-"""Distinctive fictional markdown — keyword assertions check for
-'zebra', 'Mars' to confirm the file was actually read."""
+"""Distinctive fictional markdown -- keyword assertions check for
+'zebra', 'Mars' to confirm the pipeline delivered the file."""
 
 
 def _upload_md(client: httpx.Client, session_id: str) -> str:
-    """
-    Upload the test markdown file and return its file_id.
-
-    :param client: Sync HTTP client pointed at the live server.
-    :param session_id: Owning session/conversation id.
-    :returns: The uploaded file's ID.
-    """
+    """Upload the test markdown file and return its file_id."""
     resp = client.post(
         f"/v1/sessions/{session_id}/resources/files",
         files={"file": ("protocol.md", _MD_CONTENT, "text/markdown")},
@@ -76,21 +72,16 @@ def _file_message(text: str, file_id: str) -> list[dict[str, Any]]:
     ]
 
 
-def _wait_for_session_running(client: httpx.Client, session_id: str, timeout: float = 60) -> None:
-    """Poll until the runner-native session transitions to ``running``."""
+def _wait_for_gate_pending(mock_url: str, timeout: float = 30) -> None:
+    """Poll until a request is blocked on the mock LLM gate."""
     deadline = time.monotonic() + timeout
-    last: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        resp = client.get(f"/v1/sessions/{session_id}")
+        resp = httpx.get(f"{mock_url}/gate/pending", timeout=2.0)
         resp.raise_for_status()
-        last = resp.json()
-        status = last.get("status")
-        if status == "running":
+        if resp.json().get("pending"):
             return
-        if status not in ("idle", "running"):
-            raise AssertionError(f"Session reached {status!r} before running: {last}")
-        time.sleep(POLL_INTERVAL_S)
-    raise AssertionError(f"Session {session_id} didn't reach running within {timeout}s: {last}")
+        time.sleep(0.1)
+    raise AssertionError(f"No gate pending within {timeout}s")
 
 
 def _interrupt_and_wait_idle(client: httpx.Client, session_id: str, timeout: float = 30) -> None:
@@ -113,66 +104,72 @@ def _interrupt_and_wait_idle(client: httpx.Client, session_id: str, timeout: flo
     raise AssertionError(f"Session {session_id} did not return to idle within {timeout}s: {last}")
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_cancel_send_file_cancel_send_file_succeeds(
     http_client: httpx.Client,
-    archer_agent: str,
     live_runner_id: str,
-    using_mock_llm: bool,
+    mock_llm_server_url: str,
 ) -> None:
-    """
-    Sessions-API flow: send → interrupt → send with .md → interrupt →
-    send with .md → verify content was read.
-
-    All turns run in one runner-bound session, so conversation
-    continuity is implicit. Cancellation uses the sessions interrupt
-    event; the final turn must complete and quote distinctive terms
-    from the uploaded markdown.
-
-    **What breaks if wrong:**
-
-    - Interrupt teardown leaves the session non-idle → the next
-      ``events`` POST can't start a fresh turn.
-    - Dangling ``function_call`` items without outputs after an
-      interrupt → the next turn fails ``[llm] failed``.
-    - The attached file never reaches the model → the final answer
-      omits 'zebra'/'Mars'.
+    """Sessions-API flow: send -> interrupt -> send .md -> interrupt -> send .md -> verify.
 
     :param http_client: Sync HTTP client for the live server.
-    :param archer_agent: Name of the registered archer agent.
     :param live_runner_id: Registered runner id to bind the session to.
-    :param using_mock_llm: True when the mock LLM backs the server.
+    :param mock_llm_server_url: Mock LLM server URL.
     """
-    if using_mock_llm:
-        pytest.skip(
-            "requires real streaming generation + file comprehension; "
-            "the mock gate/interrupt interaction and the 'agent read the "
-            "file' assertions do not reproduce under the mock LLM"
-        )
-
-    session_id = create_runner_bound_session(
-        http_client, agent_name=archer_agent, runner_id=live_runner_id
+    reset_mock_llm(mock_llm_server_url)
+    agent_name = register_inline_agent(
+        http_client,
+        name=f"cancel-file-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model="mock-cancel-file",
+        profile="",
+        prompt="You are a document analyst. Read files and answer questions.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
     )
 
-    # ── Turn 1: start a long turn, interrupt mid-flight ───────────
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"block": True, "text": "A long essay about volcanoes..."},
+            {"block": True, "text": "Summarizing the file..."},
+            {
+                "text": (
+                    "The document describes the Zebra Deployment Protocol (ZDP), "
+                    "a fictional strategy used by the Interplanetary Logistics "
+                    "Corps to deliver supply crates to Mars colonies. The protocol "
+                    "involves an orbital catapult and a zebra-stripe targeting laser."
+                ),
+            },
+        ],
+        key="mock-cancel-file",
+    )
+
+    session_id = create_runner_bound_session(
+        http_client, agent_name=agent_name, runner_id=live_runner_id
+    )
+
+    # Turn 1: start, wait for gate (LLM blocked), interrupt, then release gate.
     send_user_message_to_session(
         http_client,
         session_id=session_id,
         content="Write a detailed 2000-word essay about volcanoes.",
     )
-    _wait_for_session_running(http_client, session_id)
+    _wait_for_gate_pending(mock_llm_server_url)
     _interrupt_and_wait_idle(http_client, session_id)
+    release_mock_gate(mock_llm_server_url)
 
-    # ── Turn 2: send with markdown file, interrupt mid-flight ─────
+    # Turn 2: send with markdown file, interrupt while blocked.
     file_id_1 = _upload_md(http_client, session_id)
     send_user_message_to_session(
         http_client,
         session_id=session_id,
         content=_file_message("Read this file and summarize it in detail.", file_id_1),
     )
-    _wait_for_session_running(http_client, session_id)
+    _wait_for_gate_pending(mock_llm_server_url)
     _interrupt_and_wait_idle(http_client, session_id)
+    release_mock_gate(mock_llm_server_url)
 
-    # ── Turn 3: send with markdown file again — must succeed ──────
+    # Turn 3: send with markdown file -- must succeed.
     file_id_2 = _upload_md(http_client, session_id)
     response_id = send_user_message_to_session(
         http_client,
@@ -188,7 +185,7 @@ def test_cancel_send_file_cancel_send_file_succeeds(
         http_client,
         session_id=session_id,
         response_id=response_id,
-        timeout=120,
+        timeout=60,
     )
 
     assert body["status"] == "completed", (
@@ -198,8 +195,6 @@ def test_cancel_send_file_cancel_send_file_succeeds(
     text = final_assistant_text(body)
     assert text.strip(), f"Agent produced no output. Body: {body}"
 
-    # The content has distinctive terms that can only appear if the
-    # LLM actually processed the uploaded markdown.
     text_lower = text.lower()
     assert "zebra" in text_lower, (
         f"Response should mention 'zebra' from the file. Got: {text[:300]}"

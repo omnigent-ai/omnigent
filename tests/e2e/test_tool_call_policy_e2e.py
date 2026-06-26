@@ -21,6 +21,7 @@ tool registers, and the policy DENY surfaces as the tool output.
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -29,13 +30,21 @@ from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
-    register_inline_agent,
+    register_dir_agent_with_mock_llm,
     reset_mock_llm,
     send_user_message_to_session,
 )
 
-# Unique reason string — chosen so its presence proves OUR policy
-# fired, not an incidental denial from another path.
+# Fixture agent: the calculate tool ships as Python source under tools/python/
+# (auto-discovered) and the tool_call DENY policy lives in its config.yaml, so
+# both resolve from the uploaded bundle on any server version (no tests/ dep).
+_TOOL_CALL_POLICY_DIR = (
+    Path(__file__).resolve().parents[1] / "resources" / "agents" / "tool-call-policy"
+)
+
+# Unique reason string — chosen so its presence proves OUR policy fired, not an
+# incidental denial from another path. Must match the `reason:` in
+# tests/resources/agents/tool-call-policy/config.yaml.
 _DENY_REASON = "TOOL_BAN_TEST_SENTINEL_XYZQ"
 
 
@@ -79,42 +88,12 @@ def test_tool_call_deny_blocks_callable_tool(
     """
     model = f"mock-toolpolicy-{uuid.uuid4().hex[:6]}"
     reset_mock_llm(mock_llm_server_url)
-    agent_name = register_inline_agent(
+    agent_name = register_dir_agent_with_mock_llm(
         http_client,
+        agent_dir=_TOOL_CALL_POLICY_DIR,
         name=f"toolpolicy-{uuid.uuid4().hex[:6]}",
-        harness="openai-agents",
         model=model,
-        profile="",
-        prompt=(
-            "Use calculate to answer. If the tool output starts with "
-            "'[Denied by policy' or mentions a denial, reply that the "
-            "calculation was denied. Do not retry."
-        ),
-        mock_llm_base_url=(f"{mock_llm_server_url}/v1" if mock_llm_server_url else None),
-        extra_config={
-            "tools": {
-                "calculate": {
-                    "type": "function",
-                    "description": "Evaluate a math expression.",
-                    "callable": ("tests.resources.examples._shared.tool_functions.calculate"),
-                },
-            },
-            "policies": {
-                "deny_calculate_tool": {
-                    "type": "function",
-                    "on": ["tool_call:calculate"],
-                    "function": {
-                        "path": "omnigent.policies.function.make_fixed_action_callable",
-                        "arguments": {
-                            "action": "deny",
-                            "reason": _DENY_REASON,
-                            "on_phases": ["tool_call"],
-                            "on_tools": ["calculate"],
-                        },
-                    },
-                },
-            },
-        },
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
     )
     configure_mock_llm(
         mock_llm_server_url,

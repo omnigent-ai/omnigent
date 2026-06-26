@@ -14,11 +14,11 @@ export interface Host {
   sandbox_provider?: string | null;
   /**
    * Per-harness readiness reported by the host's last connect, e.g.
-   * `{"claude-sdk": true, "codex": false}`. `null`/absent means the
+   * `{"claude-sdk": true, "codex": "needs-auth"}`. `null`/absent means the
    * host has never reported it (older host build) — unknown, never
    * "nothing configured".
    */
-  configured_harnesses?: Record<string, boolean> | null;
+  configured_harnesses?: Record<string, boolean | string> | null;
 }
 
 interface HostsResponse {

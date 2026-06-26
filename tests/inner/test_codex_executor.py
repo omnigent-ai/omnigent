@@ -26,6 +26,7 @@ from omnigent.inner.codex_executor import (
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.inner.executor import (
     ExecutorError,
+    ReasoningChunk,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -308,6 +309,7 @@ class TestCodexExecutor(unittest.TestCase):
             patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
             patch.dict("os.environ", {}, clear=True),
             patch("omnigent.inner.codex_executor._read_databrickscfg", return_value=None),
+            patch("omnigent.inner.codex_executor._read_databrickscfg_host", return_value=None),
         ):
             with self.assertRaises(EnvironmentError):
                 CodexExecutor(gateway=True)
@@ -1350,6 +1352,79 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_app_server_run_turn_reasoning_deltas_yield_reasoning_chunks(self):
+        """item/reasoning/textDelta and item/reasoning/summaryTextDelta events
+        yield ReasoningChunk events so the idle watchdog resets during long
+        think phases (regression guard for omnigent-ai/omnigent#738)."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+            async def _inject() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {
+                        "method": "item/reasoning/textDelta",
+                        "params": {"turnId": "turn-1", "delta": "thinking hard..."},
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "item/reasoning/summaryTextDelta",
+                        "params": {"turnId": "turn-1", "delta": "summary of thoughts"},
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "msg-1",
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": "Here is my answer.",
+                            },
+                        },
+                    }
+                )
+
+            inject_task = asyncio.create_task(_inject())
+            events = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "complex question"}],
+                    tools=[],
+                    system_prompt="",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+            await inject_task
+
+            reasoning_events = [e for e in events if isinstance(e, ReasoningChunk)]
+            self.assertEqual(len(reasoning_events), 2)
+            self.assertEqual(reasoning_events[0].delta, "thinking hard...")
+            self.assertEqual(reasoning_events[0].event_type, "reasoning_text")
+            self.assertEqual(reasoning_events[1].delta, "summary of thoughts")
+            self.assertEqual(reasoning_events[1].event_type, "reasoning_text")
+
+            turn_complete = events[-1]
+            self.assertIsInstance(turn_complete, TurnComplete)
+            self.assertEqual(turn_complete.response, "Here is my answer.")
+
+        _run(_t())
+
     def test_stderr_loop_handles_oversized_lines(self):
         async def _t():
             session = _CodexAppServerSession(
@@ -2265,6 +2340,28 @@ def test_clean_codex_env_includes_databricks_bearer(monkeypatch) -> None:
     assert "DATABRICKS_TOKEN" not in env
 
 
+def test_clean_codex_env_includes_omnigent_session_marker(monkeypatch) -> None:
+    """The ``OMNIGENT`` session marker survives the codex env scrub.
+
+    The marker (set once on the runner) must reach the codex CLI so the
+    shell commands codex runs can detect they are inside an Omnigent
+    session, like ``CLAUDE_CODE`` / ``CODEX``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.codex_executor import _clean_codex_env
+    from omnigent.runner.identity import (
+        OMNIGENT_SESSION_ENV_VALUE,
+        OMNIGENT_SESSION_ENV_VAR,
+    )
+
+    monkeypatch.setenv(OMNIGENT_SESSION_ENV_VAR, OMNIGENT_SESSION_ENV_VALUE)
+
+    env = _clean_codex_env()
+
+    assert env.get(OMNIGENT_SESSION_ENV_VAR) == OMNIGENT_SESSION_ENV_VALUE
+
+
 # ---------------------------------------------------------------------------
 # Tests for _to_codex_input_items — input_file → inline text conversion
 # ---------------------------------------------------------------------------
@@ -2525,3 +2622,56 @@ def test_model_provider_override_with_gateway_raises() -> None:
             model="some-model",
             model_provider_override="Databricks",
         )
+
+
+def _mk_codex_skill(skills_dir: Path, name: str) -> None:
+    """Create a ``<skills_dir>/<name>/SKILL.md`` skill directory."""
+    d = skills_dir / name
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: d\n---\nbody\n")
+
+
+def test_select_codex_skill_dirs_all_first_source_wins(tmp_path: Path) -> None:
+    from omnigent.inner.codex_executor import select_codex_skill_dirs
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    _mk_codex_skill(a, "shared")
+    _mk_codex_skill(b, "shared")
+    _mk_codex_skill(b, "only-b")
+    out = select_codex_skill_dirs("all", [a, b])
+    assert out["shared"] == a / "shared"
+    assert out["only-b"] == b / "only-b"
+
+
+def test_select_codex_skill_dirs_none_and_list(tmp_path: Path) -> None:
+    from omnigent.inner.codex_executor import select_codex_skill_dirs
+
+    a = tmp_path / "a"
+    _mk_codex_skill(a, "x")
+    _mk_codex_skill(a, "y")
+    assert select_codex_skill_dirs("none", [a]) == {}
+    assert set(select_codex_skill_dirs(["x"], [a])) == {"x"}
+
+
+def test_codex_skill_sources_order_bundle_then_host(tmp_path: Path) -> None:
+    """codex_skill_sources lists <bundle>/skills before <home>/.codex/skills."""
+    from omnigent.inner.codex_executor import codex_skill_sources
+
+    bundle = tmp_path / "bundle"
+    (bundle / "skills").mkdir(parents=True)
+    home = tmp_path / "home"
+    (home / ".codex" / "skills").mkdir(parents=True)
+    assert codex_skill_sources(bundle, home) == [
+        bundle / "skills",
+        home / ".codex" / "skills",
+    ]
+
+
+def test_codex_skill_sources_omits_absent_dirs(tmp_path: Path) -> None:
+    """Only existing dirs are returned (bundle absent → host only)."""
+    from omnigent.inner.codex_executor import codex_skill_sources
+
+    home = tmp_path / "home"
+    (home / ".codex" / "skills").mkdir(parents=True)
+    assert codex_skill_sources(None, home) == [home / ".codex" / "skills"]
+    assert codex_skill_sources(tmp_path / "no-bundle", home) == [home / ".codex" / "skills"]

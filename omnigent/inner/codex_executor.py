@@ -14,7 +14,6 @@ import logging
 import os
 import re
 import shutil
-import signal
 import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -25,8 +24,10 @@ from typing import Any, Protocol, TypeAlias
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
+from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
+from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
 from .databricks_executor import (
     _read_databrickscfg,
@@ -39,6 +40,7 @@ from .executor import (
     ExecutorError,
     ExecutorEvent,
     Message,
+    ReasoningChunk,
     TextChunk,
     ToolArgs,
     ToolCallComplete,
@@ -272,27 +274,11 @@ class _Process(Protocol):
 
 
 def _terminate_process_tree(process: _Process | None) -> None:
-    if process is None or process.returncode is not None:
-        return
-    pid = process.pid
-    if pid is not None:
-        with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGTERM)
-            return
-    with suppress(ProcessLookupError, Exception):
-        process.terminate()
+    _proc.terminate_tree(process)
 
 
 def _kill_process_tree(process: _Process | None) -> None:
-    if process is None or process.returncode is not None:
-        return
-    pid = process.pid
-    if pid is not None:
-        with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGKILL)
-            return
-    with suppress(ProcessLookupError, Exception):
-        process.kill()
+    _proc.kill_tree(process)
 
 
 def _find_codex_cli() -> str | None:
@@ -399,6 +385,7 @@ def _clean_codex_env() -> dict[str, str]:
         "PYTHONUTF8",
         "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
         "DATABRICKS_CODEX_TOKEN",  # env_key referenced by ~/.codex/config.toml's DB provider
+        OMNIGENT_SESSION_ENV_VAR,  # "inside Omnigent" marker (CLAUDE_CODE/CODEX analog)
     }
     for key, value in os.environ.items():
         if key in _CODEX_ENV_DENY_EXACT:
@@ -406,6 +393,83 @@ def _clean_codex_env() -> dict[str, str]:
         if key in allow_exact or key.startswith(allow_prefixes):
             env[key] = value
     return env
+
+
+def codex_skill_sources(bundle_dir: Path | None, home: Path) -> list[Path]:
+    """
+    Build the ordered Codex skill-source list: bundle skills, then host skills.
+
+    The single source of truth for *where* Codex skills come from, shared
+    by :func:`populate_codex_skills_from_bundle` (which symlinks them into
+    ``$CODEX_HOME/skills/``) and the slash-command menu's ``codex_host_skills``
+    provider — so the linked set and the menu cannot drift on which roots
+    are scanned. Priority order: the agent's own ``<bundle>/skills/`` before
+    host-installed ``<home>/.codex/skills/`` (a bundled skill shadows a host
+    skill of the same name). Only existing directories are returned.
+
+    :param bundle_dir: Materialized agent-bundle root, or ``None``.
+    :param home: The user home directory (``Path.home()``); injected so
+        tests and the menu provider can pin it.
+    :returns: Existing skill-dir roots in priority order.
+    """
+    sources: list[Path] = []
+    if bundle_dir is not None and (bundle_dir / "skills").is_dir():
+        sources.append(bundle_dir / "skills")
+    host = home / ".codex" / "skills"
+    if host.is_dir():
+        sources.append(host)
+    return sources
+
+
+def select_codex_skill_dirs(
+    skills_filter: str | list[str],
+    sources: list[Path],
+) -> dict[str, Path]:
+    """
+    Resolve skill name → directory for a Codex skill source list.
+
+    The single source of truth for "which skills does this Codex session
+    expose", shared by :func:`_populate_codex_skills` (which symlinks the
+    result into ``$CODEX_HOME/skills/``) and the slash-command menu's
+    Codex skill source — so the menu and the actually-linked set cannot
+    diverge.
+
+    :param skills_filter: ``"all"`` selects every skill found in
+        *sources*; ``"none"`` selects nothing; a ``list[str]`` selects
+        only the named skills present in some source. Names not present
+        are silently skipped.
+    :param sources: Ordered skill-dir roots (each containing
+        ``<name>/SKILL.md`` subdirs). The first source that contains a
+        given skill name wins.
+    :returns: Ordered mapping of selected skill name → absolute dir.
+    """
+    if skills_filter == "none":
+        return {}
+    available: dict[str, Path] = {}
+    for source in sources:
+        if not source.is_dir():
+            continue
+        try:
+            children = sorted(source.iterdir())
+        except OSError as exc:
+            # An unreadable source (permission denied, races) must not abort
+            # skill discovery / session startup — skip it and continue.
+            logger.warning("could not list codex skill source %s (%s); skipping", source, exc)
+            continue
+        for child in children:
+            if not child.is_dir():
+                continue
+            if not (child / "SKILL.md").is_file():
+                continue
+            available.setdefault(child.name, child)
+
+    if skills_filter == "all":
+        names = list(available.keys())
+    elif isinstance(skills_filter, list):
+        names = [n for n in skills_filter if n in available]
+    else:
+        return {}
+    return {n: available[n] for n in names}
 
 
 def _populate_codex_skills(
@@ -422,7 +486,8 @@ def _populate_codex_skills(
     which means by default Codex sees zero skills. This helper populates
     the temp ``skills/`` subdir based on the agent spec's ``skills:``
     field, sourcing skill directories from ``sources`` (typically the
-    user's ``~/.codex/skills/`` plus any ``<bundle>/skills/``).
+    user's ``~/.codex/skills/`` plus any ``<bundle>/skills/``). Skill
+    selection is delegated to :func:`select_codex_skill_dirs`.
 
     :param target_dir: ``<temp_codex_home>/skills/`` — the directory
         Codex will scan. Created if it doesn't exist (unless
@@ -442,25 +507,9 @@ def _populate_codex_skills(
         return
 
     target_dir.mkdir(parents=True, exist_ok=True)
-    available: dict[str, Path] = {}
-    for source in sources:
-        if not source.is_dir():
-            continue
-        for child in sorted(source.iterdir()):
-            if not child.is_dir():
-                continue
-            if not (child / "SKILL.md").is_file():
-                continue
-            available.setdefault(child.name, child)
+    selected = select_codex_skill_dirs(skills_filter, sources)
 
-    if skills_filter == "all":
-        names = list(available.keys())
-    elif isinstance(skills_filter, list):
-        names = [n for n in skills_filter if n in available]
-    else:
-        return
-
-    for name in names:
+    for name, skill_dir in selected.items():
         link_path = target_dir / name
         if link_path.exists() or link_path.is_symlink():
             continue
@@ -468,7 +517,7 @@ def _populate_codex_skills(
             # Resolve to absolute so the symlink doesn't break when
             # the source was a relative path (relative symlinks resolve
             # against the link's parent, not the original cwd).
-            link_path.symlink_to(available[name].resolve())
+            link_path.symlink_to(skill_dir.resolve())
         except OSError as exc:
             # Filesystems without symlink support (e.g. some Windows
             # configs) — fall back to a copy. Don't crash the harness
@@ -479,7 +528,17 @@ def _populate_codex_skills(
                 target_dir,
                 exc,
             )
-            shutil.copytree(available[name], link_path)
+            try:
+                shutil.copytree(skill_dir, link_path)
+            except OSError as copy_exc:
+                # Copy fallback can also fail (unreadable source, race) — skip
+                # this one skill rather than abort the whole session boot.
+                logger.warning(
+                    "could not copy skill %r into %s (%s); skipping",
+                    name,
+                    target_dir,
+                    copy_exc,
+                )
 
 
 def populate_codex_skills_from_bundle(
@@ -509,14 +568,7 @@ def populate_codex_skills_from_bundle(
         ``"none"`` / a list of skill names.
     :returns: None.
     """
-    skill_sources: list[Path] = []
-    if bundle_dir is not None:
-        bundle_skills = bundle_dir / "skills"
-        if bundle_skills.is_dir():
-            skill_sources.append(bundle_skills)
-    host_skills = Path.home() / ".codex" / "skills"
-    if host_skills.is_dir():
-        skill_sources.append(host_skills)
+    skill_sources = codex_skill_sources(bundle_dir, Path.home())
     _populate_codex_skills(codex_home / "skills", skills_filter, skill_sources)
 
 
@@ -1180,7 +1232,7 @@ class _CodexAppServerSession:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=proc_env,
-                start_new_session=(os.name == "posix"),
+                **_proc.spawn_kwargs(),
                 cwd=self._cwd or os.getcwd(),
             )
             self._reader_task = asyncio.create_task(self._reader_loop())
@@ -1581,6 +1633,15 @@ class _CodexAppServerSession:
                     prior = message_buffers.get(item_id)
                     message_buffers[item_id] = (prior if prior is not None else "") + delta
                     yield TextChunk(text=delta)
+                    continue
+
+                if method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
+                    if not _event_turn_matches(params):
+                        continue
+                    raw_reasoning_delta = params.get("delta")
+                    if not isinstance(raw_reasoning_delta, str) or not raw_reasoning_delta:
+                        continue
+                    yield ReasoningChunk(delta=raw_reasoning_delta, event_type="reasoning_text")
                     continue
 
                 if method == "item/completed":

@@ -22,6 +22,16 @@ backend-native SDK harness): because a Gemini key is not provisioned on CI, the
 test **skips** (rather than fails) when no key is present, so the e2e shards stay
 green; it runs for real wherever a key is configured.
 
+**Why this test cannot use the mock LLM server:** The ``google-antigravity``
+SDK has no OpenAI-compatible ``base_url`` and no Databricks-gateway path.
+Setting ``OPENAI_BASE_URL`` to the mock server has no effect on this harness —
+the SDK always connects directly to Google's Gemini backend using the Gemini
+API key. There is no intercept point equivalent to ``OPENAI_BASE_URL`` in the
+Gemini SDK, so the mock-LLM approach used by other harness tests (e.g.
+``test_per_harness_openai_agents.py``) cannot be applied here. The
+``pytest.skip`` in :func:`_antigravity_skip_reason` gates each test cleanly
+when the SDK or key is absent.
+
 **Prerequisites (skipped cleanly when absent):**
 - ``google.antigravity`` importable in the Omnigent venv (the ``antigravity``
   extra — ``pip install 'omnigent[antigravity]'``).
@@ -347,7 +357,7 @@ def _assert_clean_assistant_reply(
 def test_per_harness_antigravity_smoke(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
     antigravity_spec: Path,
     tmp_path: Path,
 ) -> None:
@@ -360,7 +370,7 @@ def test_per_harness_antigravity_smoke(
 
     :param omnigent_python: Interpreter with omnigent + the antigravity SDK.
     :param omnigent_repo_root: Cwd for the subprocess.
-    :param omnigent_credentials_env: Base env (PATH / onboarding-suppression /
+    : param mock_credentials_env: Base env (PATH / onboarding-suppression /
         worktree PYTHONPATH); the Gemini key resolves independently of the
         Databricks gateway keys it also carries.
     :param antigravity_spec: Materialized antigravity agent YAML.
@@ -372,7 +382,7 @@ def test_per_harness_antigravity_smoke(
 
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    env = _antigravity_env(omnigent_credentials_env, fake_home)
+    env = _antigravity_env(mock_credentials_env, fake_home)
 
     result = _run_one_shot(
         omnigent_python=omnigent_python,
@@ -394,7 +404,7 @@ def test_per_harness_antigravity_model_selection(
     model: str,
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
     antigravity_spec: Path,
     tmp_path: Path,
 ) -> None:
@@ -409,7 +419,7 @@ def test_per_harness_antigravity_model_selection(
     :param model: The Gemini id under test (parametrized).
     :param omnigent_python: Interpreter with omnigent + the antigravity SDK.
     :param omnigent_repo_root: Cwd for the subprocess.
-    :param omnigent_credentials_env: Base subprocess env.
+    :param mock_credentials_env: Base subprocess env.
     :param antigravity_spec: Materialized antigravity agent YAML.
     :param tmp_path: Per-test temp dir (also the fake ``$HOME``).
     """
@@ -419,7 +429,7 @@ def test_per_harness_antigravity_model_selection(
 
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    env = _antigravity_env(omnigent_credentials_env, fake_home)
+    env = _antigravity_env(mock_credentials_env, fake_home)
 
     result = _run_one_shot(
         omnigent_python=omnigent_python,
@@ -437,7 +447,7 @@ def test_per_harness_antigravity_model_selection(
 def test_per_harness_antigravity_multi_turn_history_retention(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
     antigravity_spec: Path,
     tmp_path: Path,
 ) -> None:
@@ -458,7 +468,7 @@ def test_per_harness_antigravity_multi_turn_history_retention(
 
     :param omnigent_python: Interpreter with omnigent + the antigravity SDK.
     :param omnigent_repo_root: Cwd for the subprocess.
-    :param omnigent_credentials_env: Base subprocess env.
+    :param mock_credentials_env: Base subprocess env.
     :param antigravity_spec: Materialized antigravity agent YAML.
     :param tmp_path: Per-test temp dir (also the fake ``$HOME``).
     """
@@ -468,7 +478,7 @@ def test_per_harness_antigravity_multi_turn_history_retention(
 
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    env = _antigravity_env(omnigent_credentials_env, fake_home)
+    env = _antigravity_env(mock_credentials_env, fake_home)
     db_path = fake_home / ".omnigent" / "chat.db"
     # Fresh per-run nonce so a parallel run can't leak it, and so the model can't
     # "recover" a popular fixture word from its training data instead of history.
@@ -549,7 +559,7 @@ def test_per_harness_antigravity_multi_turn_history_retention(
 def test_per_harness_antigravity_graceful_completion(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
     antigravity_spec: Path,
     tmp_path: Path,
 ) -> None:
@@ -564,7 +574,7 @@ def test_per_harness_antigravity_graceful_completion(
 
     :param omnigent_python: Interpreter with omnigent + the antigravity SDK.
     :param omnigent_repo_root: Cwd for the subprocess.
-    :param omnigent_credentials_env: Base subprocess env.
+    :param mock_credentials_env: Base subprocess env.
     :param antigravity_spec: Materialized antigravity agent YAML.
     :param tmp_path: Per-test temp dir (also the fake ``$HOME``).
     """
@@ -574,7 +584,7 @@ def test_per_harness_antigravity_graceful_completion(
 
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    env = _antigravity_env(omnigent_credentials_env, fake_home)
+    env = _antigravity_env(mock_credentials_env, fake_home)
     db_path = fake_home / ".omnigent" / "chat.db"
 
     result = _run_one_shot(

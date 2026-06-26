@@ -8,6 +8,7 @@ import {
   getConversationIconKind,
   getConversationAgentType,
   normalizePinnedConversationIds,
+  orderByPinnedSequence,
   togglePinnedConversationId,
 } from "./sidebarNav";
 
@@ -116,6 +117,46 @@ describe("pin helpers", () => {
   });
 });
 
+describe("orderByPinnedSequence", () => {
+  it("puts the newest pin last, ignoring updated_at", () => {
+    // conv_a leads the ids list (the most recent pin) AND has the newest
+    // updated_at, yet it must render LAST: pinned order is oldest-pin-first
+    // (newest pin at the bottom) and never follows updated_at.
+    const convA = conversation("conv_a", "A", new Date(2026, 4, 14, 9), {
+      updatedAt: new Date(2026, 4, 14, 23),
+    });
+    const convB = conversation("conv_b", "B", new Date(2026, 4, 14, 8), {
+      updatedAt: new Date(2026, 4, 14, 9),
+    });
+
+    // ids are most-recently-pinned-first: conv_a pinned last, conv_b earlier.
+    expect(orderByPinnedSequence([convA, convB], ["conv_a", "conv_b"]).map((c) => c.id)).toEqual([
+      "conv_b",
+      "conv_a",
+    ]);
+  });
+
+  it("holds a pinned row's slot when its updated_at is bumped", () => {
+    const convA = conversation("conv_a", "A", new Date(2026, 4, 14, 9));
+    const convB = conversation("conv_b", "B", new Date(2026, 4, 14, 8));
+    const ids = ["conv_a", "conv_b"];
+
+    const before = orderByPinnedSequence([convA, convB], ids).map((c) => c.id);
+    // conv_b gets a new message (latest updated_at) — its slot must not move.
+    const bumped = { ...convB, updated_at: Math.floor(new Date(2026, 4, 14, 23).getTime() / 1000) };
+    const after = orderByPinnedSequence([convA, bumped], ids).map((c) => c.id);
+    expect(after).toEqual(before);
+  });
+
+  it("does not mutate the input array", () => {
+    const convA = conversation("conv_a", "A", new Date(2026, 4, 14, 9));
+    const convB = conversation("conv_b", "B", new Date(2026, 4, 14, 8));
+    const input = [convB, convA];
+    orderByPinnedSequence(input, ["conv_a", "conv_b"]);
+    expect(input.map((c) => c.id)).toEqual(["conv_b", "conv_a"]);
+  });
+});
+
 describe("getConversationAgentType", () => {
   it("returns 'Claude Code' for claude-native-ui sessions", () => {
     const conv = conversation("conv_native", null, new Date(2026, 4, 14, 9), {
@@ -140,6 +181,23 @@ describe("getConversationAgentType", () => {
       labels: { "omnigent.wrapper": "pi-native-ui" },
     });
     expect(getConversationAgentType(conv)).toBe("Pi");
+  });
+
+  it("returns 'Kiro' for kiro-native-ui sessions", () => {
+    const conv = conversation("conv_kiro", null, new Date(2026, 4, 14, 9), {
+      labels: { "omnigent.wrapper": "kiro-native-ui" },
+    });
+    expect(getConversationAgentType(conv)).toBe("Kiro");
+  });
+
+  it("returns 'Antigravity' for antigravity-native-ui sessions", () => {
+    const conv = conversation("conv_agy", null, new Date(2026, 4, 14, 9), {
+      labels: { "omnigent.wrapper": "antigravity-native-ui" },
+    });
+    // antigravity-native-ui is the wrapper label assigned to sessions started
+    // via `omnigent antigravity` or the web-UI Antigravity picker. It gets its
+    // own filter bucket and friendly sidebar name.
+    expect(getConversationAgentType(conv)).toBe("Antigravity");
   });
 
   it("returns agent_name for YAML-based sessions", () => {
@@ -213,11 +271,32 @@ describe("getConversationIconKind", () => {
     ).toBe("codex");
     expect(
       getConversationIconKind(
+        conversation("conv_opencode", null, new Date(2026, 4, 14, 9), {
+          labels: { "omnigent.wrapper": "opencode-native-ui" },
+        }),
+      ),
+    ).toBe("opencode");
+    expect(
+      getConversationIconKind(
         conversation("conv_pi", null, new Date(2026, 4, 14, 9), {
           labels: { "omnigent.wrapper": "pi-native-ui" },
         }),
       ),
     ).toBe("pi");
+    expect(
+      getConversationIconKind(
+        conversation("conv_kiro", null, new Date(2026, 4, 14, 9), {
+          labels: { "omnigent.wrapper": "kiro-native-ui" },
+        }),
+      ),
+    ).toBe("kiro");
+    expect(
+      getConversationIconKind(
+        conversation("conv_agy", null, new Date(2026, 4, 14, 9), {
+          labels: { "omnigent.wrapper": "antigravity-native-ui" },
+        }),
+      ),
+    ).toBe("antigravity");
     expect(
       getConversationIconKind({
         ...conversation("conv_nessie", null, new Date(2026, 4, 14, 9)),

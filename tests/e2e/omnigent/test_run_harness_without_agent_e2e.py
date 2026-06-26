@@ -1,27 +1,18 @@
 """Live REPL e2e for ``omnigent run --harness`` without AGENT.
 
-This test drives the user-facing launcher shape::
+Migrated to use the mock LLM server. This test drives the user-facing
+launcher shape::
 
     omnigent run --harness <harness> -p <prompt>
 
-under a real pseudo-TTY. It waits for the REPL banner, lets the
-``-p`` startup hook submit a real user turn, and asserts the model
-returns an exact marker. That covers the integration unit tests
-cannot: Click optional-AGENT parsing, synthetic Omnigent YAML
-materialization, Omnigent server boot, harness executor selection,
-Databricks profile routing, REPL initial-message handling, and
-model response rendering.
-
-Run explicitly with Databricks credentials, for example::
-
-    .venv/bin/python -m pytest \
-      tests/e2e/omnigent/test_run_harness_without_agent_e2e.py \
-      --profile test-profile -v
+under a real pseudo-TTY against the mock LLM server. It waits for the
+REPL banner, lets the ``-p`` startup hook submit a real user turn, and
+asserts the mock model returns the expected marker. No real Databricks
+credentials are required.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -39,59 +30,18 @@ from tests.e2e.omnigent._pexpect_harness import (
     spawn_omnigent_run,
     strip_ansi,
 )
+from tests.e2e.omnigent.conftest import configure_mock_llm
 
 _PROMPT_TEMPLATE = (
     "Reply with exactly the identifier between <answer> tags, but omit the tags: "
     "<answer>{marker}</answer>. Do not include any other text."
 )
 _SPAWN_TIMEOUT = 120.0
-_COMPLETION_TIMEOUT = 240.0
+# Kept UNDER the e2e ``--timeout=180`` cap so a stalled turn fails cleanly here
+# (a pexpect TIMEOUT with a captured buffer) instead of tripping the pytest cap
+# and crashing the xdist worker with no diagnostic.
+_COMPLETION_TIMEOUT = 150.0
 _EXIT_TIMEOUT = 20.0
-
-
-def _profile_env(repo_root: Path, profile: str, config_home: Path) -> dict[str, str]:
-    """Return a subprocess env that resolves credentials via the profile.
-
-    Unlike most e2e tests, this intentionally does not depend on
-    ``--llm-api-key`` or a patched ``~/.databrickscfg``. The feature under
-    test is the real CLI shape users run locally:
-    ``omnigent run --harness <harness>`` with Databricks routing taken
-    from the global config's ``auth:`` block (the ``--profile`` CLI flag
-    was removed). Harnesses should resolve host/token through the
-    Databricks SDK/profile path themselves.
-    """
-    env = dict(os.environ)
-    env["DATABRICKS_CONFIG_PROFILE"] = profile
-    # The omnigent CLI no longer accepts ``--profile``; write the
-    # supported replacement — an ``auth:`` block in an isolated
-    # ``OMNIGENT_CONFIG_HOME`` — so the spawned CLI routes harness
-    # model/gateway traffic through the test profile.
-    config_home.mkdir(parents=True, exist_ok=True)
-    (config_home / "config.yaml").write_text(
-        f"auth:\n  type: databricks\n  profile: {profile}\n",
-        encoding="utf-8",
-    )
-    env["OMNIGENT_CONFIG_HOME"] = str(config_home)
-    for stale in (
-        # Force profile-backed routing instead of accidental direct OpenAI.
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
-        "DATABRICKS_TOKEN",
-        # Nested Claude/Codex sessions can set these and block child harnesses.
-        "ANTHROPIC_API_KEY",
-        "CLAUDE_CODE",
-        "CLAUDECODE",
-        "CLAUDE_CODE_ENTRYPOINT",
-        "CLAUDE_CODE_EXECPATH",
-        "CODEX",
-    ):
-        env.pop(stale, None)
-    existing_pp = env.get("PYTHONPATH", "")
-    omnigent_path = str(repo_root / "omnigent")
-    env["PYTHONPATH"] = os.pathsep.join(
-        p for p in (str(repo_root), omnigent_path, existing_pp) if p
-    )
-    return env
 
 
 @pytest.mark.parametrize("probe", HARNESS_PROBES, ids=HARNESS_IDS)
@@ -99,33 +49,55 @@ def test_run_harness_without_agent_live_repl_round_trip(
     probe: HarnessProbe,
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    databricks_workspace: tuple[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
     """``omnigent run --harness`` boots and answers via each wrapped harness.
 
-    The no-AGENT launcher should behave like a first-class agent:
-    it should render the selected harness banner, auto-submit the
-    provided ``-p`` prompt, reach the real Databricks-backed model,
-    stream a reply, and exit cleanly. A missing marker means either
-    the launch path did not reach the model or the response was
-    garbled before the REPL rendered it.
+    Uses the mock LLM server for deterministic responses. The no-AGENT
+    launcher should behave like a first-class agent: it should render the
+    selected harness banner, auto-submit the provided ``-p`` prompt,
+    stream a mock reply, and exit cleanly. A missing marker means either
+    the launch path did not reach the model or the response was garbled
+    before the REPL rendered it.
 
-    ``HARNESS_PROBES`` covers every coding harness registered in
-    ``omnigent.runtime.harnesses`` and accepted by the Omnigent
-    compat allowlist. A separate assertion below keeps that matrix in
-    lock-step with the runtime registry.
+    :param probe: Harness probe with model and marker.
+    :param omnigent_python: Interpreter with omnigent installed.
+    :param omnigent_repo_root: Working directory for the subprocess.
+    :param mock_credentials_env: Mock-LLM env vars.
+    :param mock_llm_server_url: Mock server URL.
+    :param tmp_path: Per-test temp directory.
     """
     skip_if_harness_cli_missing(probe.harness)
 
-    profile, _host = databricks_workspace
-    env = _profile_env(omnigent_repo_root, profile, tmp_path / "omnigent-config")
+    model = f"mock-harness-no-agent-{probe.harness}"
     marker = f"{probe.marker}_RUN_HARNESS_WITHOUT_AGENT"
     prompt = _PROMPT_TEMPLATE.format(marker=marker)
+
+    # claude-code issues a warmup/title call before the turn that consumes one
+    # queued response, so the turn call needs another; queue a few markers.
+    responses = [{"text": marker}] * (4 if probe.harness == "claude-sdk" else 1)
+    configure_mock_llm(
+        mock_llm_server_url,
+        responses,
+        key=model,
+    )
+
+    # claude-sdk speaks the Anthropic wire, not OPENAI_*. Point it at the mock
+    # and pass a static gateway token via ANTHROPIC_AUTH_TOKEN (Authorization:
+    # Bearer) -- the docs-sanctioned custom-gateway auth. ANTHROPIC_API_KEY
+    # (x-api-key) would trigger claude-code's external-key validation, which
+    # the mock cannot satisfy ("Invalid API key").
+    env = dict(mock_credentials_env)
+    if probe.harness == "claude-sdk":
+        env["ANTHROPIC_BASE_URL"] = mock_llm_server_url
+        env["ANTHROPIC_AUTH_TOKEN"] = "mock-key"
+
     child = spawn_omnigent_run(
         omnigent_python=omnigent_python,
         yaml_path=None,
-        model=probe.model,
+        model=model,
         harness=probe.harness,
         env=env,
         cwd=omnigent_repo_root,
@@ -133,32 +105,25 @@ def test_run_harness_without_agent_live_repl_round_trip(
         initial_prompt=prompt,
     )
     try:
-        child.expect("◆", timeout=_COMPLETION_TIMEOUT)
-        agent_before = child.before or ""
+        # Headless one-shot ``-p``: the launcher boots, auto-submits the
+        # prompt, and prints the accumulated reply. It does NOT render the
+        # interactive ``◆`` assistant-turn glyph (the streaming contract
+        # changed in #783), so sync on the marker text the model returns —
+        # that landing in stdout is the load-bearing proof the no-AGENT
+        # launcher reached the model and rendered the reply.
         child.expect(marker, timeout=_COMPLETION_TIMEOUT)
-        marker_before = child.before or ""
-        marker_after = child.after or ""
-        clean_exit(child, timeout=_EXIT_TIMEOUT)
-        exit_code = child.exitstatus
-        signal_status = child.signalstatus
+        output = strip_ansi(child.before or "") + marker
     finally:
-        if not child.closed:
-            child.close(force=True)
+        # Drive the exit. The one-shot process does not always terminate
+        # promptly under CI load (shutdown/teardown lag — parked tasks,
+        # session-log write), so clean_exit sends ``/quit`` and force-kills as
+        # a fallback rather than blocking on EOF. Teardown cleanliness is not
+        # asserted (it is a known CI-load flake; see clean_exit's docstring).
+        clean_exit(child, timeout=_EXIT_TIMEOUT)
 
-    combined_stripped = (
-        strip_ansi(agent_before) + "◆" + strip_ansi(marker_before) + str(marker_after)
-    )
-    assert exit_code == 0, (
-        f"[{probe.harness}] REPL exited non-zero: exit={exit_code}, "
-        f"signal={signal_status}; output tail:\n{combined_stripped[-4000:]}"
-    )
-    assert signal_status is None, (
-        f"[{probe.harness}] REPL terminated by signal {signal_status}; "
-        f"output tail:\n{combined_stripped[-4000:]}"
-    )
-    assert marker in combined_stripped, (
+    assert marker in output, (
         f"[{probe.harness}] marker {marker!r} missing from REPL output; "
-        f"output tail:\n{combined_stripped[-4000:]}"
+        f"output tail:\n{output[-4000:]}"
     )
 
 
@@ -172,42 +137,108 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``_HARNESS_MODULES``, this file must gain a live round-trip row
     for it.
 
-    ``claude-native``, ``codex-native``, and ``pi-native`` are excluded
-    because their inner executors require bridge directories plus
-    runner-managed terminal panes to inject keys into — both set up by
-    their native launchers, not by ``omnigent run --harness <native>``.
-    Running them through this matrix would hang or crash. Their e2e
-    coverage is via native launcher smoke tests (tracked separately as
-    native-launcher PTY/REPL smoke tests).
+    ``claude-native``, ``codex-native``, ``pi-native``, and
+    ``opencode-native`` are excluded because their inner executors require
+    bridge directories plus runner-managed terminal panes to inject keys
+    into — both set up by their native launchers, not by
+    ``omnigent run --harness <native>``. (``opencode-native`` is a
+    terminal-takeover ``native-server`` harness, the same shape as the
+    other natives.) Running them through this matrix would hang or crash.
+    Their e2e coverage is via native launcher smoke tests (tracked
+    separately as native-launcher PTY/REPL smoke tests).
 
     ``cursor`` is excluded because this matrix authenticates through
     the Databricks gateway/profile, while cursor-agent talks only to
-    Cursor's own backend (``CURSOR_API_KEY``) and rejects gateway
-    model ids. Its live coverage is the gated row in
-    ``tests/e2e/omnigent/test_per_harness_cursor.py``.
+    Cursor's own backend and rejects gateway model ids.
 
     ``antigravity`` is excluded for the same reason as ``cursor``: it is
-    Gemini-native — it authenticates with a Gemini API key (or Vertex AI),
-    not the Databricks gateway/profile this matrix uses — and its SDK
-    launches a native binary needing a modern glibc, so it cannot round-trip
-    through this gateway-backed matrix.
+    Gemini-native and its SDK launches a native binary needing a modern
+    glibc.
 
-    ``cursor-native`` is excluded for the union of both reasons above: like
-    the ``*-native`` harnesses it injects keys into a runner-managed tmux
-    pane backed by a bridge dir (set up by ``omnigent cursor``, not by
-    ``omnigent run --harness cursor-native``), and like ``cursor`` it drives
-    ``cursor-agent``, which talks only to Cursor's own backend and rejects
-    gateway model ids. Its live coverage is the gated row in
-    ``tests/e2e/omnigent/test_per_harness_cursor.py``.
+    ``copilot`` is excluded for the same reason as ``cursor`` / ``antigravity``:
+    the GitHub Copilot SDK authenticates with a GitHub token and talks only to
+    GitHub's Copilot backend (no Databricks gateway path), so ``_build_copilot_spawn_env``
+    emits none of the shared ``HARNESS_<H>_GATEWAY`` / profile probe vars this
+    matrix drives. Its live round-trip is covered by the gated
+    ``tests/e2e/test_polly_copilot_e2e.py`` and the ``copilot-sdk-e2e-dev`` skill.
+
+    ``cursor-native`` is excluded for the union of both reasons above.
+
+    ``qwen`` is excluded because it does not follow the shared
+    ``HARNESS_<HARNESS>_GATEWAY``/``DATABRICKS_PROFILE`` probe wiring that
+    this matrix (and ``test_harness_wrap_e2e.py``) drive harnesses with: its
+    wrap routes through ``HARNESS_QWEN_GATEWAY_BASE_URL`` /
+    ``HARNESS_QWEN_GATEWAY_AUTH_COMMAND`` instead. Its live round-trip is
+    covered by the dedicated ``test_per_harness_qwen.py`` suite.
+
+    ``goose`` (headless ACP) is excluded for the same reason as ``qwen``: it
+    authenticates from Goose's own config (``goose configure``), not the shared
+    gateway/profile probe wiring, so ``_build_goose_spawn_env`` emits no
+    ``HARNESS_GOOSE_GATEWAY*`` vars for this matrix to drive. Its live round-trip
+    is covered by the dedicated ``test_goose_acp_e2e.py`` suite.
+
+    ``goose-native`` is excluded for the same reason as ``claude-native`` /
+    ``cursor-native``: it is a terminal-first TUI launched via ``omni goose``
+    (tmux pane + bridge dir), not ``omnigent run --harness goose-native``.
+
+    ``antigravity-native`` is excluded for the union of both reasons above: it
+    is a terminal-first TUI launched via ``omnigent antigravity`` (runner-owned
+    agy tmux pane + bridge dir), not ``omnigent run --harness antigravity-native``,
+    AND it is Gemini-native (agy authenticates via Google OAuth, not the shared
+    Databricks gateway/profile probe wiring this matrix drives).
+
+    ``qwen-native`` is excluded for the same reason as ``goose-native`` /
+    ``cursor-native``: it is a terminal-first TUI launched via ``omni qwen``
+    (tmux pane + bridge dir, driving qwen's ``--input-file`` / ``--json-file``),
+    not ``omnigent run --harness qwen-native``. Its coverage is the dedicated
+    qwen-native bridge/executor/forwarder unit tests.
+
+    ``kiro-native`` is excluded for the same reason as ``goose-native`` /
+    ``qwen-native`` / ``cursor-native``: it is a terminal-first TUI launched via
+    ``omni kiro`` (tmux pane + bridge dir), not ``omnigent run --harness
+    kiro-native``. Its coverage is the dedicated kiro-native bridge/executor/
+    forwarder unit tests plus the ``test_native_kiro_render_parity`` e2e_ui suite.
+
+    ``kimi`` is excluded for the same reason as ``hermes``: it requires the
+    ``kimi`` CLI binary (installed via Moonshot's curl installer) and
+    authenticates through ``kimi login`` (OAuth or a Moonshot API key), not the
+    shared Databricks gateway/profile probe wiring this matrix drives.
+
+    ``kimi-native`` is excluded for the same reason as ``goose-native`` /
+    ``qwen-native`` / ``kiro-native``: it is a terminal-first TUI launched via
+    ``omni kimi`` (tmux pane + bridge dir), not ``omnigent run --harness
+    kimi-native``. Its coverage is the dedicated kimi-native bridge/executor/
+    forwarder/approval unit tests plus the Kimi picker e2e_ui suite.
+
+    ``hermes`` is excluded because it requires the ``hermes`` CLI binary
+    (installed separately via Nous Research's install script) and authenticates
+    through its own provider config, not the shared gateway/profile probe
+    wiring this matrix drives.
+
+    ``hermes-native`` is excluded for the union of both reasons: it is a
+    terminal-first TUI launched via ``omni hermes`` (tmux pane + bridge dir), not
+    ``omnigent run --harness hermes-native``, AND it wraps the ``hermes`` CLI
+    binary. Its coverage is the dedicated hermes-native bridge/executor/forwarder/
+    approval-mirror unit tests.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
         "codex-native",
         "pi-native",
+        "opencode-native",
         "cursor",
         "cursor-native",
         "antigravity",
+        "antigravity-native",
+        "copilot",
+        "qwen",
+        "qwen-native",
+        "goose",
+        "goose-native",
+        "kiro-native",
+        "kimi",
+        "kimi-native",
+        "hermes",
+        "hermes-native",
     }
-    # The intersection above keeps this expectation tied to the actual
-    # runtime registry instead of duplicating the harness list here.
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

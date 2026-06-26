@@ -54,6 +54,7 @@ import type {
   SessionTerminalPendingEvent,
   SessionUsageEvent,
   SlashCommand,
+  RoutingDecision,
   TerminalCommandEvent,
   StreamEvent,
   TextDelta,
@@ -61,7 +62,7 @@ import type {
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
-import type { ErrorInfo, ModelUsage, Response } from "./types";
+import type { ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
 
 /**
  * Out-param for `parseSseStream`: `sawDone` is set when the server's `[DONE]`
@@ -766,6 +767,25 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // offers the "Accept & allow all edits" button (switches the
     // session to acceptEdits mode on accept).
     const allowAllEdits = p.allow_all_edits === true;
+    // claude-native non-edit tool prompts stamp this so the ApprovalCard
+    // offers the persistent "don't ask again" button (installs a
+    // session-scoped allow rule on accept). `tool` is the gated tool;
+    // `host` is the WebFetch request domain when present (drives the
+    // button label and the rule scope).
+    const rememberScopeRaw = p.remember_scope;
+    const rememberScope: RememberScope | null =
+      rememberScopeRaw &&
+      typeof rememberScopeRaw === "object" &&
+      !Array.isArray(rememberScopeRaw) &&
+      typeof (rememberScopeRaw as Record<string, unknown>).tool === "string"
+        ? {
+            tool: (rememberScopeRaw as Record<string, unknown>).tool as string,
+            host:
+              typeof (rememberScopeRaw as Record<string, unknown>).host === "string"
+                ? ((rememberScopeRaw as Record<string, unknown>).host as string)
+                : undefined,
+          }
+        : null;
     return {
       type: "elicitation_request",
       elicitationId,
@@ -805,6 +825,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
             }
           : null,
       allowAllEdits,
+      rememberScope,
     } satisfies ElicitationRequest;
   }
 
@@ -903,6 +924,20 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
     } satisfies MessageDone;
   }
 
+  if (itemType === "error") {
+    return {
+      type: "error",
+      source: String(rec.source ?? ""),
+      toolName: null,
+      error: {
+        code: String(rec.code ?? ""),
+        message: String(rec.message ?? ""),
+      },
+      itemId,
+      responseId,
+    } satisfies ErrorEvent;
+  }
+
   if (itemType === "slash_command") {
     // Coerce a missing ``output`` (server-side exclude_none) to null
     // so downstream code branches on a single shape.
@@ -923,6 +958,25 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       itemId,
       responseId,
     } satisfies SlashCommand;
+  }
+
+  if (itemType === "routing_decision") {
+    // Drop a malformed frame (empty model / unknown tier) rather than
+    // rendering a broken chip — the relay also persists nothing for it.
+    const model = typeof rec.model === "string" ? rec.model : "";
+    const tier = rec.tier;
+    if (!model || (tier !== "cheap" && tier !== "medium" && tier !== "expensive")) {
+      return null;
+    }
+    return {
+      type: "routing_decision",
+      model,
+      tier,
+      applied: rec.applied === true,
+      rationale: typeof rec.rationale === "string" ? rec.rationale : "",
+      itemId,
+      responseId,
+    } satisfies RoutingDecision;
   }
 
   if (itemType === "terminal_command") {

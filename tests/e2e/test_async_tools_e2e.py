@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -38,10 +39,16 @@ from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
-    register_inline_agent,
+    register_dir_agent_with_mock_llm,
     reset_mock_llm,
     send_user_message_to_session,
 )
+
+# Fixture agent whose @tool functions ship as Python source under tools/python/
+# (auto-discovered, like the archer fixture), so the server loads them by file
+# path from the uploaded bundle on any version — no dependency on the repo's
+# tests/ tree being importable by the server.
+_ASYNC_TOOLS_DIR = Path(__file__).resolve().parents[1] / "resources" / "agents" / "async-tools"
 
 
 def _final_text(response_body: dict[str, Any]) -> str:
@@ -89,42 +96,12 @@ def test_async_tool_real_llm_e2e(
     model = f"mock-async-single-{uuid.uuid4().hex[:6]}"
     reset_mock_llm(mock_llm_server_url)
 
-    agent_name = register_inline_agent(
+    agent_name = register_dir_agent_with_mock_llm(
         http_client,
+        agent_dir=_ASYNC_TOOLS_DIR,
         name=f"async-tools-{uuid.uuid4().hex[:6]}",
-        harness="openai-agents",
         model=model,
-        profile="",
-        prompt=(
-            "You are the async-tools test fixture agent. Your only job is to call "
-            "the tools the user names, then report the literal result strings.\n\n"
-            "Tool routing: delayed_echo and boom_async are ASYNC — invoke them "
-            'via sys_call_async(tool="<name>", args="<json>"). count_chars is '
-            "SYNC — call it directly.\n\n"
-            "After an async dispatch, the real result auto-delivers as a system "
-            "message starting with [System: task ...]. Quote the BODY of that "
-            "message (the tool's return value) in your final reply."
-        ),
         mock_llm_base_url=f"{mock_llm_server_url}/v1",
-        extra_config={
-            "tools": {
-                "delayed_echo": {
-                    "type": "function",
-                    "description": "Sleep 2 seconds then echo the label.",
-                    "callable": "tests._fixtures.agents._async_tools.delayed_echo",
-                },
-                "boom_async": {
-                    "type": "function",
-                    "description": "Always raises.",
-                    "callable": "tests._fixtures.agents._async_tools.boom_async",
-                },
-                "count_chars": {
-                    "type": "function",
-                    "description": "Return the character count.",
-                    "callable": "tests._fixtures.agents._async_tools.count_chars",
-                },
-            }
-        },
     )
 
     # Mock queue: first response dispatches sys_call_async, second
@@ -205,31 +182,12 @@ def test_mixed_sync_and_async_tools_e2e(
     model = f"mock-async-mixed-{uuid.uuid4().hex[:6]}"
     reset_mock_llm(mock_llm_server_url)
 
-    agent_name = register_inline_agent(
+    agent_name = register_dir_agent_with_mock_llm(
         http_client,
+        agent_dir=_ASYNC_TOOLS_DIR,
         name=f"async-mixed-{uuid.uuid4().hex[:6]}",
-        harness="openai-agents",
         model=model,
-        profile="",
-        prompt=(
-            "You call tools as instructed and report results verbatim.\n"
-            "ASYNC tools: use sys_call_async. SYNC tools: call directly."
-        ),
         mock_llm_base_url=f"{mock_llm_server_url}/v1",
-        extra_config={
-            "tools": {
-                "delayed_echo": {
-                    "type": "function",
-                    "description": "Sleep 2 seconds then echo the label.",
-                    "callable": "tests._fixtures.agents._async_tools.delayed_echo",
-                },
-                "count_chars": {
-                    "type": "function",
-                    "description": "Return the character count.",
-                    "callable": "tests._fixtures.agents._async_tools.count_chars",
-                },
-            }
-        },
     )
 
     # Turn 1: LLM calls count_chars sync AND sys_call_async for delayed_echo.
@@ -308,26 +266,12 @@ def test_async_tool_failure_surfaces_e2e(
     model = f"mock-async-fail-{uuid.uuid4().hex[:6]}"
     reset_mock_llm(mock_llm_server_url)
 
-    agent_name = register_inline_agent(
+    agent_name = register_dir_agent_with_mock_llm(
         http_client,
+        agent_dir=_ASYNC_TOOLS_DIR,
         name=f"async-fail-{uuid.uuid4().hex[:6]}",
-        harness="openai-agents",
         model=model,
-        profile="",
-        prompt=(
-            "You call tools as instructed and report results verbatim.\n"
-            "ASYNC tools: use sys_call_async."
-        ),
         mock_llm_base_url=f"{mock_llm_server_url}/v1",
-        extra_config={
-            "tools": {
-                "boom_async": {
-                    "type": "function",
-                    "description": "Always raises.",
-                    "callable": "tests._fixtures.agents._async_tools.boom_async",
-                },
-            }
-        },
     )
 
     # Turn 1: dispatch boom_async via sys_call_async.

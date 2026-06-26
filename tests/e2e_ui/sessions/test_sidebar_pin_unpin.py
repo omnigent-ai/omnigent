@@ -21,6 +21,7 @@ the pinned peel would surface end-to-end.
 
 from __future__ import annotations
 
+import time
 import uuid
 
 import httpx
@@ -158,3 +159,118 @@ def test_unpin_moves_session_back_to_recent(
     # Back under "Recent", and no longer in "Pinned".
     expect(_section(page, "Recent").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
     expect(_section(page, "Pinned").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
+
+
+def _pinned_session_order(page: Page) -> list[str]:
+    """Return the ``/c/{id}`` hrefs under "Pinned" in top-to-bottom DOM order.
+
+    ``evaluate_all`` reads the rows in render order, so the index of a
+    session's href is its visible rank in the Pinned section — exactly what
+    the ordering assertions compare.
+
+    :param page: Playwright page with the sidebar open.
+    :returns: Conversation hrefs (e.g. ``["/c/conv_b", "/c/conv_a"]``).
+    """
+    links = _section(page, "Pinned").locator('a[href^="/c/"]')
+    return links.evaluate_all("els => els.map((e) => e.getAttribute('href'))")
+
+
+def _updated_at(base_url: str, session_id: str) -> int:
+    """Read a session's server-side ``updated_at`` from ``GET /v1/sessions``."""
+    resp = httpx.get(f"{base_url}/v1/sessions", timeout=10.0)
+    resp.raise_for_status()
+    for item in resp.json()["data"]:
+        if item["id"] == session_id:
+            return int(item["updated_at"])
+    raise AssertionError(f"session {session_id} not present in /v1/sessions")
+
+
+def _bump_updated_at_past(base_url: str, session_id: str, reference_id: str) -> None:
+    """Make *session_id* the most-recently-updated session, strictly past *reference_id*.
+
+    ``PATCH /v1/sessions`` stamps ``updated_at = now_epoch()`` at
+    whole-second granularity, so a single title bump issued in the same
+    wall-clock second as *reference_id*'s last update can tie. Re-bump across
+    a second boundary until the target is unambiguously newest — that is the
+    update-time ordering the pinned-order assertion must refuse to follow.
+
+    :param base_url: Spawned server base URL.
+    :param session_id: The session to bump.
+    :param reference_id: The session it must end up strictly newer than.
+    :raises AssertionError: If it cannot get strictly ahead within the budget.
+    """
+    deadline = time.monotonic() + 15.0
+    attempt = 0
+    while time.monotonic() < deadline:
+        _set_title(base_url, session_id, f"e2e-bump-{attempt}-{uuid.uuid4().hex[:8]}")
+        if _updated_at(base_url, session_id) > _updated_at(base_url, reference_id):
+            return
+        attempt += 1
+        time.sleep(1.1)
+    raise AssertionError(f"could not bump {session_id} past {reference_id}'s updated_at")
+
+
+def test_pinned_section_orders_by_pin_time_not_update_time(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """Pinned rows hold their pin order even when a newer message arrives.
+
+    The Pinned section orders strictly by when each session was pinned
+    (oldest pin on top, newest pin at the bottom), not by ``updated_at`` like
+    the Recent / Shared / Archived sections. The regression this guards: the
+    Pinned group reused the ``updated_at``-desc comparator, so a pinned
+    session jumped the moment it got a new message.
+
+    The test pins ``a`` then ``b`` (so ``b`` is the newer pin and belongs at
+    the bottom), then bumps ``b``'s ``updated_at`` to be the freshest of the
+    two. ``a`` is the active chat so its sort key is frozen, leaving ``b`` as
+    the unambiguously most-recently-updated row — under the old comparator
+    that would lift ``b`` to the top. Asserting ``b`` stays at the bottom
+    proves the pinned order follows pin time, not update time.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session_pair: ``(base_url, session_a, session_b)`` — two
+        runner-bound sessions in the same server.
+    """
+    base_url, session_a, session_b = seeded_session_pair
+    _set_title(base_url, session_a, f"e2e-order-A-{uuid.uuid4().hex[:8]}")
+    _set_title(base_url, session_b, f"e2e-order-B-{uuid.uuid4().hex[:8]}")
+
+    # View a: it becomes the active chat, so its sidebar sort key is frozen
+    # and only b's updated_at moves when we bump it below.
+    page.goto(f"{base_url}/c/{session_a}")
+
+    # Pin a first, then b. The newer pin (b) belongs at the bottom of the
+    # Pinned group, below the older pin (a).
+    row_a = _row(page, session_a)
+    expect(row_a).to_be_visible()
+    row_a.hover()
+    row_a.get_by_test_id("quick-pin-conversation").click()
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_be_visible()
+
+    row_b = _row(page, session_b)
+    row_b.hover()
+    row_b.get_by_test_id("quick-pin-conversation").click()
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_b}"]')).to_be_visible()
+
+    # Oldest pin (a) sits above the newer pin (b).
+    order = _pinned_session_order(page)
+    assert order.index(f"/c/{session_a}") < order.index(f"/c/{session_b}"), (
+        f"newest pin should sort last, got {order}"
+    )
+
+    # Bump b so it is the most-recently-updated session, then reload to
+    # refetch the list (pins live in localStorage and survive the reload).
+    _bump_updated_at_past(base_url, session_b, session_a)
+    page.reload()
+
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_be_visible()
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_b}"]')).to_be_visible()
+
+    # b is now the freshest session, but it must stay below a: pinned order is
+    # by pin time. Under the old updated_at-desc comparator b would jump up.
+    order_after = _pinned_session_order(page)
+    assert order_after.index(f"/c/{session_a}") < order_after.index(f"/c/{session_b}"), (
+        f"pinned order must follow pin time, not the bumped updated_at, got {order_after}"
+    )

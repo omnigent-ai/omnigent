@@ -81,6 +81,9 @@ def _render_menu(
     width: int,
     selectable: list[bool],
     status: str | None = None,
+    max_visible: int | None = None,
+    window_start: int = 0,
+    compact: bool = False,
 ) -> str:
     """Render the menu frame to an ANSI string for the termios redraw.
 
@@ -118,10 +121,28 @@ def _render_menu(
         render_console.print(Text.from_markup(f"  [bold green]{status}[/]"))
         render_console.print()
     render_console.print(Text.from_markup(f"  [bold {ACCENT}]{title}[/]"))
-    render_console.print()
+    if not compact:
+        # The compact overview hugs the title to the list (Hermes-style); other
+        # menus keep a blank line below the title for breathing room.
+        render_console.print()
+
+    # Optional scrolling viewport: when *max_visible* is set and the list is
+    # longer, render only ``options[window_start : window_start + max_visible]``
+    # (the caller keeps the selected row inside this window) plus dim "N more"
+    # markers, so a long flat list fits one screen instead of overflowing and
+    # flickering. ``None`` (the default) renders every row, unchanged.
+    n_options = len(options)
+    if max_visible is not None and n_options > max_visible:
+        win_start = max(0, min(window_start, n_options - max_visible))
+        win_end = win_start + max_visible
+    else:
+        win_start, win_end = 0, n_options
+    if win_start > 0:
+        render_console.print(Text.from_markup(f"       [{MUTED}]↑ {win_start} more[/]"))
 
     last_choice = -1  # index of the most recent selectable (group-owning) row
-    for i, label in enumerate(options):
+    for i in range(win_start, win_end):
+        label = options[i]
         if not selectable[i]:
             # Sub-line(s) under the preceding choice (a harness's default +
             # "+N more" summary): indented, no pointer. ↑/↓ skip them. Their
@@ -149,12 +170,23 @@ def _render_menu(
             last_choice = i
             render_console.print(Text.from_markup(f"       {label}"))
 
+    if win_end < n_options:
+        render_console.print(Text.from_markup(f"       [{MUTED}]↓ {n_options - win_end} more[/]"))
+
     if descriptions is not None and descriptions[selected]:
         render_console.print()
         render_console.print(Text.from_markup(f"    [dim italic]{descriptions[selected]}[/]"))
 
     render_console.print()
-    render_console.print(Text.from_markup(f"  [{MUTED}]↑/↓ move  ·  Enter select  ·  Esc back[/]"))
+    # The compact overview is a top-level menu (Esc exits setup), so it shows a
+    # navigate/select/exit hint in the spirit of other modern CLIs; nested menus
+    # keep the "Esc back" wording, where Esc returns rather than exits.
+    hint = (
+        "↑/↓ navigate  ·  Enter select  ·  Esc to exit"
+        if compact
+        else "↑/↓ move  ·  Enter select  ·  Esc back"
+    )
+    render_console.print(Text.from_markup(f"  [{MUTED}]{hint}[/]"))
 
     return buf.getvalue()
 
@@ -280,6 +312,8 @@ def select(
     selectable: list[bool] | None = None,
     clear_on_exit: bool = False,
     status: str | None = None,
+    max_visible: int | None = None,
+    compact: bool = False,
 ) -> int:
     """Show a theme-picker-styled arrow-key menu and return the choice.
 
@@ -320,6 +354,16 @@ def select(
         title (part of the frame, so it clears with ``clear_on_exit``).
         Pass the prior action's result so a re-rendering loop shows only
         the latest, never an accumulating stack. No-op on the fallback.
+    :param max_visible: Optional cap on visible rows. When set and the list
+        is longer, the menu shows a scrolling viewport that follows the
+        cursor (with "N more" markers) so a long flat list fits one screen
+        instead of overflowing and flickering. ``None`` renders every row.
+        No-op on the numbered fallback.
+    :param compact: When ``True`` (TTY only), render the dense top-level
+        overview layout: the title hugs the list (no blank line below it) and
+        the footer reads ``navigate · select · Esc to exit`` (Esc exits rather
+        than goes back). Intended for the setup harness overview. No-op on the
+        numbered fallback.
     :returns: The chosen zero-based index into *options* (always a
         selectable row), or ``-1`` when the user aborts — Esc / Ctrl-C /
         Ctrl-D on the TTY, or ``q`` on the numbered fallback.
@@ -347,9 +391,20 @@ def select(
     # occupied so the next redraw can move up and overwrite it
     # (the ``_theme_picker`` redraw idiom).
     prev_lines = [0]
+    # Scrolling-viewport start index (mutable for the redraw closure); only
+    # used when ``max_visible`` bounds a long list.
+    window_start = [0]
 
     def _redraw() -> None:
         """Clear the prior frame region and reprint the menu in place."""
+        if max_visible is not None and len(options) > max_visible:
+            # Keep the selected row inside the [start, start+max_visible) window,
+            # scrolling the window just enough to follow the cursor.
+            if selected < window_start[0]:
+                window_start[0] = selected
+            elif selected >= window_start[0] + max_visible:
+                window_start[0] = selected - max_visible + 1
+            window_start[0] = max(0, min(window_start[0], len(options) - max_visible))
         rendered = _render_menu(
             title,
             options,
@@ -358,6 +413,9 @@ def select(
             width=width,
             selectable=mask,
             status=status,
+            max_visible=max_visible,
+            window_start=window_start[0],
+            compact=compact,
         )
         if prev_lines[0] > 0:
             sys.stdout.write(f"\033[{prev_lines[0]}A")

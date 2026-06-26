@@ -33,13 +33,15 @@ vi.mock("@/hooks/useConversations", () => ({
   // stubs keep the row from crashing on mount.
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
+  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
 }));
 
 // Heavy sibling widgets in the sidebar pull their own hooks/providers;
 // stub them so this test stays scoped to the conversation row.
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
-vi.mock("@/components/theme/ThemeModeMenu", () => ({ ThemeModeMenu: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Sidebar } from "./Sidebar";

@@ -1,10 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  HTML_PREVIEW_SANDBOX,
   detectLang,
   getSelectionOffsets,
   indexToLine,
   isBinaryPath,
+  isImageFile,
   lineOverlapsSelection,
+  openHtmlArtifactInNewTab,
+  prepareHtmlPreviewDoc,
 } from "./codeViewerHelpers";
 
 // ---------------------------------------------------------------------------
@@ -109,6 +113,55 @@ describe("isBinaryPath", () => {
 });
 
 // ---------------------------------------------------------------------------
+// isImageFile — image-preview detection (MIME-first, extension fallback)
+// ---------------------------------------------------------------------------
+
+describe("isImageFile", () => {
+  it.each([
+    "logo.png",
+    "photo.jpg",
+    "scan.jpeg",
+    "anim.gif",
+    "icon.ico",
+    "hero.webp",
+    "next.avif",
+    "diagram.svg",
+  ])("classifies %s as an image by extension", (path) => {
+    expect(isImageFile(path)).toBe(true);
+  });
+
+  it.each(["app.py", "archive.zip", "clip.mp4", "font.woff2", "notes.txt"])(
+    "classifies %s as non-image by extension",
+    (path) => {
+      expect(isImageFile(path)).toBe(false);
+    },
+  );
+
+  it("is case-insensitive on the extension", () => {
+    expect(isImageFile("LOGO.PNG")).toBe(true);
+  });
+
+  it("treats a content type as authoritative over the extension", () => {
+    // A misleading/extension-less name still previews when the server says image.
+    expect(isImageFile("blob", "image/png")).toBe(true);
+    expect(isImageFile("data.txt", "image/jpeg")).toBe(true);
+    // ...and an image extension is overridden by a non-image content type.
+    expect(isImageFile("logo.png", "text/plain")).toBe(false);
+    expect(isImageFile("photo.jpg", "application/octet-stream")).toBe(false);
+  });
+
+  it("falls back to the extension when content type is null/undefined", () => {
+    expect(isImageFile("logo.png", null)).toBe(true);
+    expect(isImageFile("logo.png", undefined)).toBe(true);
+    expect(isImageFile("notes.txt", null)).toBe(false);
+  });
+
+  it("treats extension-less paths with no content type as non-image", () => {
+    expect(isImageFile("Dockerfile")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // indexToLine
 // ---------------------------------------------------------------------------
 
@@ -161,6 +214,115 @@ describe("indexToLine", () => {
     // ["", "x"] → line 1 is empty (length 0), line 2 starts at offset 1.
     expect(indexToLine(0, ["", "x"])).toBe(1); // on the empty first line
     expect(indexToLine(1, ["", "x"])).toBe(2); // on "x"
+  });
+});
+
+// ---------------------------------------------------------------------------
+// prepareHtmlPreviewDoc — force links to open in a new tab (issue #777)
+// ---------------------------------------------------------------------------
+
+describe("prepareHtmlPreviewDoc", () => {
+  const BASE = '<base target="_blank">';
+
+  it("injects the base tag inside an existing <head>", () => {
+    const html = "<!DOCTYPE html><html><head><title>x</title></head><body>hi</body></html>";
+    const out = prepareHtmlPreviewDoc(html);
+    expect(out).toContain(`<head>${BASE}<title>x</title>`);
+    // Doctype stays first so the document keeps standards mode.
+    expect(out.indexOf("<!DOCTYPE html>")).toBe(0);
+  });
+
+  it("matches <head> with attributes", () => {
+    const out = prepareHtmlPreviewDoc('<head lang="en"><meta></head>');
+    expect(out).toContain(`<head lang="en">${BASE}<meta>`);
+  });
+
+  it("creates a <head> after <html> when none exists", () => {
+    const out = prepareHtmlPreviewDoc("<!DOCTYPE html><html><body>hi</body></html>");
+    expect(out).toContain(`<html><head>${BASE}</head><body>`);
+    expect(out.indexOf("<!DOCTYPE html>")).toBe(0);
+  });
+
+  it("prepends the base tag for a bare fragment (no doctype to displace)", () => {
+    const out = prepareHtmlPreviewDoc('<a href="https://example.com">link</a>');
+    expect(out).toBe(`${BASE}<a href="https://example.com">link</a>`);
+  });
+
+  it("is case-insensitive on the HEAD tag", () => {
+    const out = prepareHtmlPreviewDoc("<HEAD></HEAD>");
+    expect(out).toContain(`<HEAD>${BASE}`);
+  });
+
+  it("preserves an existing <base href>; the injected target tag wins by order", () => {
+    // Browsers use the first <base> for each attribute, so injecting our
+    // `target` tag ahead of the artifact's keeps its `href` intact while still
+    // forcing links to a new tab.
+    const html = '<head><base href="https://cdn.example.com/"></head>';
+    const out = prepareHtmlPreviewDoc(html);
+    expect(out).toBe(`<head>${BASE}<base href="https://cdn.example.com/"></head>`);
+    expect(out.indexOf(BASE)).toBeLessThan(out.indexOf("<base href"));
+  });
+
+  it("injects exactly one base tag per call (no duplicates)", () => {
+    const out = prepareHtmlPreviewDoc("<head></head>");
+    expect(out.match(/<base target="_blank">/g)).toHaveLength(1);
+  });
+
+  it("is idempotent: re-preparing already-prepared content adds no second base tag", () => {
+    const once = prepareHtmlPreviewDoc("<head></head>");
+    const twice = prepareHtmlPreviewDoc(once);
+    expect(twice).toBe(once);
+    expect(twice.match(/<base target="_blank">/g)).toHaveLength(1);
+  });
+
+  it("still injects a real base when the literal base string only appears in content", () => {
+    // Regression: a loose `html.includes(baseTag)` idempotency check wrongly
+    // skipped injection for content that merely *mentions* the string (e.g. a
+    // comment or code sample), leaving links to navigate the preview in place
+    // instead of opening a new tab. The base must still land in <head>.
+    const html = '<html><head></head><body><!-- <base target="_blank"> --></body></html>';
+    const out = prepareHtmlPreviewDoc(html);
+    expect(out).toContain(`<head>${BASE}</head>`);
+  });
+
+  it("documents the matcher limitation: a <head> literal in earlier markup is matched textually", () => {
+    // A simple regex (not a full parser) matches the first <head> string, even
+    // inside a comment. This only mis-places the harmless base tag inside the
+    // sandboxed preview — never a security issue — so we lock in the behavior.
+    const out = prepareHtmlPreviewDoc("<!-- <head> --><html><head></head></html>");
+    expect(out).toBe(`<!-- <head>${BASE} --><html><head></head></html>`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// openHtmlArtifactInNewTab — pop-out renders in an isolated sandboxed iframe
+// ---------------------------------------------------------------------------
+
+describe("openHtmlArtifactInNewTab", () => {
+  it("renders the artifact in a sandboxed, opaque-origin iframe (never the app origin)", () => {
+    // A real (detached) document stands in for the popped tab's document.
+    const shellDoc = document.implementation.createHTMLDocument("");
+    const open = vi.fn(() => ({ document: shellDoc }) as unknown as Window);
+
+    const ok = openHtmlArtifactInNewTab("<h1>hi</h1>", "art.html", { open });
+
+    expect(ok).toBe(true);
+    // Critically: the artifact is NOT navigated to as a top-level blob:/data:
+    // page (which would inherit the app origin) — it's hosted in about:blank.
+    expect(open).toHaveBeenCalledWith("about:blank", "_blank");
+    const frame = shellDoc.querySelector("iframe");
+    expect(frame).not.toBeNull();
+    const sandbox = frame!.getAttribute("sandbox") ?? "";
+    expect(sandbox).toBe(HTML_PREVIEW_SANDBOX);
+    // Security invariant: the artifact must never share the app's origin.
+    expect(sandbox).not.toContain("allow-same-origin");
+    // Links still open in a new tab inside the pop-out (#777).
+    expect(frame!.getAttribute("srcdoc")).toContain('<base target="_blank">');
+  });
+
+  it("returns false when the popup is blocked (window.open → null)", () => {
+    const open = vi.fn(() => null);
+    expect(openHtmlArtifactInNewTab("<h1>hi</h1>", "art.html", { open })).toBe(false);
   });
 });
 
