@@ -459,6 +459,7 @@ class ConversationStore(ABC):
         search_query: str | None = None,
         accessible_by: str | None = None,
         include_archived: bool = False,
+        project: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -542,6 +543,12 @@ class ConversationStore(ABC):
             conversations are excluded. When ``True``, archived and
             non-archived conversations are both returned (the caller
             groups them). Powers the sidebar's "Show archived" toggle.
+        :param project: When set to a non-empty string, only return
+            sessions that have a ``conversation_labels`` row with
+            ``key="omni_project"`` and ``value=project`` (the sidebar's
+            per-project folder fetch). When set to an empty string
+            ``""``, only return sessions with NO project label (unfiled
+            sessions). ``None`` disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -674,6 +681,50 @@ class ConversationStore(ABC):
             audit trails aligned with the enforcement site
             rather than wall-clock drift between evaluate()
             and the actual DB write.
+        """
+        ...
+
+    @abstractmethod
+    def delete_label(
+        self,
+        conversation_id: str,
+        key: str,
+    ) -> None:
+        """
+        Delete a single label key from a conversation.
+
+        No-op if the label does not exist. Counterpart to
+        :meth:`set_labels` for clearing one key — e.g. removing a
+        session from its sidebar project (deleting the
+        ``omni_project`` label).
+
+        :param conversation_id: The conversation to update,
+            e.g. ``"conv_abc123"``.
+        :param key: The label key to remove, e.g. ``"omni_project"``.
+        """
+        ...
+
+    @abstractmethod
+    def list_projects(
+        self,
+        accessible_by: str | None = None,
+    ) -> list[str]:
+        """
+        Return all distinct sidebar "project" names, ordered ascending.
+
+        Projects are implicit: a project exists while at least one
+        *non-archived* conversation carries a
+        ``conversation_labels`` row with ``key="omni_project"``
+        naming it. Archived sessions keep their project label, but a
+        project whose every member is archived drops out of this list
+        (so "Delete project" — which archives all members — removes the
+        folder, while unarchiving a member restores it).
+
+        :param accessible_by: When set, restrict to projects on
+            sessions the user has a permission row for (mirrors the
+            ``list_conversations`` ACL filter). ``None`` returns
+            projects across all sessions.
+        :returns: List of project names ordered alphabetically.
         """
         ...
 
