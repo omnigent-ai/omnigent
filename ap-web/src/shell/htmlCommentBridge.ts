@@ -170,8 +170,10 @@ export function findAnchorInSource(
   // whitespace that the source spells out (newlines, indentation between tags).
   const pattern = trimmed.split(/\s+/).map(escapeRegExp).join("\\s+");
   try {
-    const match = new RegExp(pattern).exec(source);
-    if (match) return { start_index: match.index, end_index: match.index + match[0].length };
+    const match = source.match(new RegExp(pattern));
+    if (match?.index !== undefined) {
+      return { start_index: match.index, end_index: match.index + match[0].length };
+    }
   } catch {
     // Pathological anchor produced an invalid pattern — fall through to null.
   }
