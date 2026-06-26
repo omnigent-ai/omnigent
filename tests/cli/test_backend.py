@@ -233,6 +233,25 @@ def test_build_host_daemon_env_local_preserves_server_credentials(
     assert empty_string_env["OPENAI_API_KEY"] == "test-key"
 
 
+def test_build_host_daemon_env_local_forwards_bedrock_skip_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLAUDE_CODE_SKIP_BEDROCK_AUTH reaches the local daemon env.
+
+    LiteLLM proxies fronting Bedrock need this flag to disable AWS SigV4
+    auth. Without it in the daemon allowlist, ``omni claude`` drops the
+    flag and Claude Code falls back to native AWS auth (which fails).
+    """
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SKIP_BEDROCK_AUTH", "1")
+
+    env = _build_host_daemon_env(server_url=None)
+
+    assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+    assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
+
+
 def test_build_host_daemon_env_remote_strips_provider_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1391,11 +1410,11 @@ def _patch_auth_preflight(
     monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: tty)
     login_calls: list[str] = []
-    monkeypatch.setattr(
-        cli,
-        "_databricks_login",
-        lambda server, workspace_host: login_calls.append(f"{server} {workspace_host}"),
-    )
+
+    def _capture_login(server: str, workspace_host: str, org_id: str | None = None) -> None:
+        login_calls.append(f"{server} {workspace_host}")
+
+    monkeypatch.setattr(cli, "_databricks_login", _capture_login)
     return login_calls
 
 

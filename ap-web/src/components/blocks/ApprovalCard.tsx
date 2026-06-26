@@ -246,9 +246,13 @@ export function ApprovalCard({
   // paths are handled inline with approve/reject buttons.
   const isExternalUrl = typeof url === "string" && url.length > 0 && !url.startsWith("/approve/");
   const askUserQuestionTitle =
-    policyName.startsWith("codex_") || phase.startsWith("codex_")
-      ? "Codex needs input"
-      : "Claude has questions";
+    policyName.startsWith("agy_") || phase.startsWith("agy_")
+      ? "Antigravity needs your input"
+      : policyName.startsWith("codex_") || phase.startsWith("codex_")
+        ? "Codex needs input"
+        : policyName.startsWith("cursor_") || phase.startsWith("cursor_")
+          ? "Cursor has questions"
+          : "Claude has questions";
 
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-

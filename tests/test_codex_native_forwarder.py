@@ -16,12 +16,19 @@ only an already-mirrored value is not re-posted.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 
 from omnigent import codex_native_forwarder as fwd
-from omnigent.codex_native_bridge import codex_home_for_bridge_dir
+from omnigent.codex_native_bridge import (
+    CodexNativeBridgeState,
+    codex_home_for_bridge_dir,
+    read_bridge_state,
+    write_bridge_state,
+)
+from omnigent.codex_native_forwarder import _persist_codex_compaction_item
 
 
 class _RecordingClient:
@@ -667,3 +674,684 @@ async def test_elicitation_post_returns_none_when_budget_exhausted(
     # 1 = the deadline check stopped the loop before a second attempt
     # (backoff 1.0s > 0.5s budget); more means the budget is ignored.
     assert len(client.posts) == 1
+
+
+class _StatusClient:
+    """httpx client stub whose ``post`` returns a fixed status code."""
+
+    def __init__(self, status_code: int) -> None:
+        """:param status_code: Status to return from every post, e.g. ``400``."""
+        self.status_code = status_code
+        self.posts = 0
+
+    async def post(self, url: str, *, json: dict) -> httpx.Response:
+        """Return the configured status; never raises."""
+        del json
+        self.posts += 1
+        return httpx.Response(self.status_code, request=httpx.Request("POST", url))
+
+
+def test_forward_failures_escalate_to_degraded_once() -> None:
+    """
+    Sustained forward failures flip the degraded latch exactly once (#1120).
+
+    Network drops previously surfaced only as scattered per-item warnings;
+    the latch turns a real outage into a single loud signal and does not
+    re-fire per dropped item.
+    """
+    fwd._reset_forward_health()
+
+    for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD - 1):
+        fwd._note_forward_failure("external_output_text_delta")
+    # Below threshold: not yet degraded.
+    assert fwd._forward_health.degraded_logged is False
+
+    fwd._note_forward_failure("external_output_text_delta")  # crosses threshold
+    assert fwd._forward_health.degraded_logged is True
+    assert fwd._forward_health.consecutive_failures == fwd._FORWARD_DEGRADED_THRESHOLD
+
+    # The latch holds — further failures keep counting but don't re-escalate.
+    fwd._note_forward_failure("external_output_text_delta")
+    assert fwd._forward_health.degraded_logged is True
+    assert fwd._forward_health.consecutive_failures == fwd._FORWARD_DEGRADED_THRESHOLD + 1
+
+
+def test_forward_success_resets_degraded_state() -> None:
+    """
+    A successful forward clears the failure count and degraded latch.
+
+    Recovery must re-arm the indicator so a later outage escalates again.
+    """
+    fwd._reset_forward_health()
+    for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD):
+        fwd._note_forward_failure("external_session_usage")
+    assert fwd._forward_health.degraded_logged is True
+
+    fwd._note_forward_success()
+
+    assert fwd._forward_health.consecutive_failures == 0
+    assert fwd._forward_health.degraded_logged is False
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_tracks_success_and_failure() -> None:
+    """
+    _post_session_event classifies each outcome into forward health (#1120).
+
+    A 2xx clears the failure run; a permanent 4xx counts as a failure so a
+    sustained outage can escalate.
+    """
+    fwd._reset_forward_health()
+
+    # A permanent 4xx is a failure.
+    await fwd._post_session_event(
+        _StatusClient(400), "conv_x", event_type="external_session_status", data={"status": "idle"}
+    )
+    assert fwd._forward_health.consecutive_failures == 1
+
+    # A 2xx resets the run.
+    await fwd._post_session_event(
+        _RecordingClient(), "conv_x", event_type="external_session_status", data={"status": "idle"}
+    )
+    assert fwd._forward_health.consecutive_failures == 0
+
+
+# ── #1108: turn-error "silent success" → surfaced failed ──────────────
+#
+# A failed Codex turn arrives as ``turn/completed`` (a clean success boundary)
+# with ``turn.status == "failed"`` and a ``turn.error`` object. These tests pin
+# the surface-only fix: such turns are forced to ``failed``, the reason is
+# surfaced as the status output, auth errors (codexErrorInfo / 401-403) carry a
+# re-auth hint, the resume path reaches the same verdict, an empty turn is idle
+# (+ WARN), and a genuinely clean turn still reports success.
+
+
+def _seed_active_turn(bridge_dir: Path, turn_id: str) -> None:
+    """
+    Seed bridge state so a terminal turn edge clears the active turn.
+
+    ``_terminal_turn_status_edge`` only produces an edge when the terminal
+    event clears the recorded active turn id; without this seed it returns
+    ``None`` as "stale".
+
+    :param bridge_dir: Native Codex bridge directory (the test ``tmp_path``).
+    :param turn_id: Active Codex turn id to record, e.g. ``"turn_123"``.
+    :returns: None.
+    """
+    write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(bridge_dir / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(bridge_dir / "codex-home"),
+            active_turn_id=turn_id,
+        ),
+    )
+
+
+def test_classify_codex_error_auth_vs_generic() -> None:
+    """The shared classifier flags auth errors and leaves the rest generic.
+
+    This is the single classifier reused by both the live and resume paths;
+    if it regresses, an expired-login failure would surface without the
+    re-auth hint (or a disk-full error would wrongly demand re-auth). It
+    prefers ``codexErrorInfo`` (variant / httpStatusCode) and falls back to
+    the message text.
+    """
+    auth = fwd._CODEX_ERROR_KIND_AUTH
+    generic = fwd._CODEX_ERROR_KIND_GENERIC
+    # Structured codexErrorInfo: string variant, tagged object, http status.
+    assert fwd._classify_codex_error({"codexErrorInfo": "Unauthorized"}, "nope") == auth
+    assert fwd._classify_codex_error({"codexErrorInfo": {"type": "Unauthorized"}}, "nope") == auth
+    assert fwd._classify_codex_error({"codexErrorInfo": {"httpStatusCode": 401}}, "nope") == auth
+    # The real app-server enum serializes lowercase snake_case; it must match
+    # via the structured path (message "nope" has no auth substring to fall
+    # back on), case-insensitively.
+    assert fwd._classify_codex_error({"codexErrorInfo": "unauthorized"}, "nope") == auth
+    assert fwd._classify_codex_error({"codexErrorInfo": {"type": "unauthorized"}}, "nope") == auth
+    # Message-text fallback when codexErrorInfo is absent.
+    assert fwd._classify_codex_error({}, "Please run codex login") == auth
+    assert fwd._classify_codex_error({}, "ChatGPT session expired") == auth
+    assert fwd._classify_codex_error({"codexErrorInfo": "Other"}, "disk full") == generic
+
+
+def test_terminal_error_from_turn_reads_and_classifies_turn_error() -> None:
+    """``_terminal_error_from_turn`` returns the classified ``turn.error``.
+
+    The helper is the single source of truth for "did this turn fail"; both
+    edge builders depend on it, so it must read ``turn.error`` and classify it.
+    """
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {
+                "message": "401 Unauthorized: login expired",
+                "codexErrorInfo": "Unauthorized",
+            },
+        }
+    }
+
+    error = fwd._terminal_error_from_turn(params)
+
+    assert error is not None
+    assert error.message == "401 Unauthorized: login expired"
+    assert error.kind == fwd._CODEX_ERROR_KIND_AUTH
+    assert error.is_auth is True
+
+
+def test_terminal_error_from_turn_falls_back_to_error_item() -> None:
+    """With no ``turn.error``, an ``error`` ThreadItem in ``turn.items`` is used.
+
+    Both shapes exist in the app-server type system; the fallback keeps the fix
+    correct on the version/path that emits the error as an item rather than as a
+    ``turn.error`` object.
+    """
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "completed",
+            "items": [
+                {"type": "agentMessage", "id": "a", "text": "working"},
+                {"type": "error", "message": "please run codex login"},
+            ],
+        }
+    }
+
+    error = fwd._terminal_error_from_turn(params)
+
+    assert error is not None
+    assert error.message == "please run codex login"
+    assert error.is_auth is True
+
+
+def test_terminal_error_from_turn_prefers_turn_error_over_item() -> None:
+    """``turn.error`` wins when both it and an ``error`` item are present."""
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {"message": "from turn.error"},
+            "items": [{"type": "error", "message": "from item"}],
+        }
+    }
+
+    error = fwd._terminal_error_from_turn(params)
+
+    assert error is not None
+    assert error.message == "from turn.error"
+
+
+def test_terminal_error_from_turn_none_for_clean_turn() -> None:
+    """A turn with no ``error`` object or item yields ``None`` (no false positives)."""
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "completed",
+            "items": [{"type": "agentMessage", "id": "a", "text": "done"}],
+        }
+    }
+
+    assert fwd._terminal_error_from_turn(params) is None
+
+
+def test_terminal_turn_status_edge_error_item_forces_failed(tmp_path: Path) -> None:
+    """A ``turn/completed`` carrying an ``error`` item (no ``turn.error``) fails.
+
+    The item-fallback path must flip the live edge to ``failed`` just like the
+    ``turn.error`` path does.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "completed",
+            "items": [{"type": "error", "message": "model stream broke"}],
+        }
+    }
+
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.status == "failed"
+    assert edge.error is not None
+    assert edge.error.message == "model stream broke"
+    assert edge.source == "turn/completed:turn-error"
+
+
+def test_terminal_turn_status_edge_turn_error_forces_failed(tmp_path: Path) -> None:
+    """A ``turn/completed`` carrying ``turn.error`` is forced to ``failed``.
+
+    This is the core of #1108: Codex reported a *completed* boundary, but the
+    turn actually failed. The edge must be ``failed`` (not the silent ``idle``
+    the method alone implies) and carry the classified error.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {"message": "model stream broke"},
+        }
+    }
+
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.status == "failed"
+    assert edge.turn_id == "turn_123"
+    assert edge.error is not None
+    assert edge.error.message == "model stream broke"
+    assert edge.error.kind == fwd._CODEX_ERROR_KIND_GENERIC
+    assert edge.source == "turn/completed:turn-error"
+
+
+def test_terminal_turn_status_edge_auth_turn_error_classified(tmp_path: Path) -> None:
+    """An auth-classified ``turn.error`` rides the failed edge as ``auth``."""
+    _seed_active_turn(tmp_path, "turn_123")
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {
+                "message": "Forbidden",
+                "codexErrorInfo": {"type": "Unauthorized", "httpStatusCode": 403},
+            },
+        }
+    }
+
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.status == "failed"
+    assert edge.error is not None
+    assert edge.error.is_auth is True
+
+
+def test_terminal_turn_status_edge_failed_status_without_error(tmp_path: Path) -> None:
+    """A ``turn.status == "failed"`` with no ``error`` object still fails.
+
+    Defends against an app-server version that records the failed status but
+    omits the populated ``turn.error`` — the edge must not fall back to ``idle``.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    params = {"turn": {"id": "turn_123", "status": "failed"}}
+
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.status == "failed"
+    assert edge.error is None
+    assert edge.source == "turn/completed:turn-failed"
+
+
+def test_terminal_turn_status_edge_clean_turn_still_idle(tmp_path: Path) -> None:
+    """A genuinely clean ``turn/completed`` still maps to ``idle`` (regression).
+
+    The turn-error check must not break the happy path: no error → the edge
+    stays ``idle`` with no attached error.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "completed",
+            "items": [{"type": "agentMessage", "id": "a", "text": "all good"}],
+        }
+    }
+
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.status == "idle"
+    assert edge.error is None
+    assert edge.source == "turn/completed"
+
+
+def test_terminal_turn_status_edge_empty_turn_idle_and_warns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A zero-item ``turn/completed`` maps to ``idle`` and emits a WARN.
+
+    An empty turn is not an error, but it is unusual enough to log: it maps to
+    ``idle`` (so the session closes) while a WARN records the anomaly.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    params = {"turn": {"id": "turn_123", "status": "completed", "items": []}}
+
+    with caplog.at_level("WARNING", logger="omnigent.codex_native_forwarder"):
+        edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.status == "idle"
+    assert edge.error is None
+    assert any(
+        "empty turn" in record.getMessage() and record.levelname == "WARNING"
+        for record in caplog.records
+    ), "expected a WARN log for the empty (zero-item) turn"
+
+
+def test_omnigent_status_from_resume_turn_error_parity() -> None:
+    """Resume parity: a completed resume turn carrying ``turn.error`` → ``failed``.
+
+    Without this, a reconnect that backfills from ``thread/resume`` would close
+    the session as ``idle`` even though the turn had errored — the resume-path
+    half of the silent-success bug.
+    """
+    turn_with_error = {
+        "id": "turn_123",
+        "status": "completed",
+        "error": {"message": "rate limited"},
+    }
+    turn_clean = {
+        "id": "turn_123",
+        "status": "completed",
+        "items": [{"type": "agentMessage", "id": "a", "text": "hi"}],
+    }
+
+    assert fwd._omnigent_status_from_resume_turn(turn_with_error) == "failed"
+    # Parity check: the clean turn still resolves to idle.
+    assert fwd._omnigent_status_from_resume_turn(turn_clean) == "idle"
+
+
+def test_resume_terminal_status_edge_attaches_error(tmp_path: Path) -> None:
+    """The resume edge carries the classified error like the live edge does."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    turns = [
+        {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {"message": "please sign in again"},
+        }
+    ]
+
+    edge = fwd._resume_terminal_status_edge_for_latest_turn(tmp_path, "thread_123", turns)
+
+    assert edge is not None
+    assert edge.status == "failed"
+    assert edge.error is not None
+    assert edge.error.is_auth is True
+    assert edge.source == "thread/resume:turn-error"
+    # The active turn id is cleared once the terminal edge is derived.
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
+
+
+@pytest.mark.asyncio
+async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
+    """A failed edge with a generic error surfaces the message as output.
+
+    The reason must reach the server (as ``output``) rather than being dropped;
+    a generic error carries no re-auth flag.
+    """
+    client = _RecordingClient()
+    edge = fwd._CodexTurnStatusEdge(
+        status="failed",
+        turn_id="turn_123",
+        source="turn/completed:turn-error",
+        error=fwd._CodexTerminalError(
+            message="model stream broke",
+            kind=fwd._CODEX_ERROR_KIND_GENERIC,
+        ),
+    )
+
+    await fwd._post_turn_status_edge(client, "conv_x", edge)
+
+    assert len(client.posts) == 1
+    _url, body = client.posts[0]
+    assert body["type"] == "external_session_status"
+    data = body["data"]
+    assert data["status"] == "failed"
+    assert data["output"] == "model stream broke"
+    # Generic errors do not demand re-auth.
+    assert "reauth_required" not in data
+
+
+@pytest.mark.asyncio
+async def test_post_turn_status_edge_auth_error_includes_reauth_hint() -> None:
+    """A failed edge with an auth error flags re-auth and appends the hint."""
+    client = _RecordingClient()
+    edge = fwd._CodexTurnStatusEdge(
+        status="failed",
+        turn_id="turn_123",
+        source="turn/completed:turn-error",
+        error=fwd._CodexTerminalError(
+            message="401 Unauthorized",
+            kind=fwd._CODEX_ERROR_KIND_AUTH,
+        ),
+    )
+
+    await fwd._post_turn_status_edge(client, "conv_x", edge)
+
+    assert len(client.posts) == 1
+    _url, body = client.posts[0]
+    data = body["data"]
+    assert data["status"] == "failed"
+    assert data["reauth_required"] is True
+    assert "401 Unauthorized" in data["output"]
+    assert fwd._CODEX_REAUTH_HINT in data["output"]
+
+
+@pytest.mark.asyncio
+async def test_post_turn_status_edge_clean_idle_has_no_output() -> None:
+    """A normal idle edge (no error) posts status only — the success path."""
+    client = _RecordingClient()
+    edge = fwd._CodexTurnStatusEdge(status="idle", turn_id="turn_123", source="turn/completed")
+
+    await fwd._post_turn_status_edge(client, "conv_x", edge)
+
+    assert len(client.posts) == 1
+    _url, body = client.posts[0]
+    data = body["data"]
+    assert data["status"] == "idle"
+    assert "output" not in data
+    assert "reauth_required" not in data
+
+
+@pytest.mark.asyncio
+async def test_compaction_status_posts_and_dedupes_consecutive() -> None:
+    """
+    Compaction status mirrors as external_compaction_status, deduped (#1255).
+
+    Codex may signal completion via both a ``contextCompaction`` item and a
+    ``thread/compacted`` notification; consecutive identical statuses must
+    not double-post (the spinner would flicker).
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await fwd._post_compaction_status(client, "conv_x", "in_progress", forwarder_state=state)
+    await fwd._post_compaction_status(client, "conv_x", "completed", forwarder_state=state)
+    # Duplicate completion (e.g. item then notification) is suppressed.
+    await fwd._post_compaction_status(client, "conv_x", "completed", forwarder_state=state)
+
+    assert [post[1] for post in client.posts] == [
+        {"type": "external_compaction_status", "data": {"status": "in_progress"}},
+        {"type": "external_compaction_status", "data": {"status": "completed"}},
+    ]
+    assert state.compaction_status_posted == "completed"
+
+
+@pytest.mark.asyncio
+async def test_completed_context_compaction_item_clears_spinner() -> None:
+    """
+    A completed ``contextCompaction`` item posts compaction-completed.
+
+    It is a status edge, not transcript history, so it must clear the
+    spinner without being appended as a conversation item.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    state.compaction_status_posted = "in_progress"
+
+    await fwd._handle_completed_item(
+        client,
+        "conv_x",
+        {
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "item": {"type": "contextCompaction", "id": "item_c"},
+        },
+        forwarder_state=state,
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {"type": "external_compaction_status", "data": {"status": "completed"}},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_delta_opens_block_then_continues() -> None:
+    """
+    Codex reasoning deltas mirror as external_output_reasoning_delta (#1254).
+
+    The first delta of a reasoning item opens the block (``started=True``
+    → ``response.reasoning.started``); subsequent deltas for the same item
+    continue it (``started=False``). Reasoning was previously dropped — only
+    the effort *level* synced, never the thinking text.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await fwd._handle_reasoning_delta(
+        client,
+        "conv_x",
+        {"turnId": "turn_1", "itemId": "item_r", "delta": "Let me "},
+        state,
+    )
+    await fwd._handle_reasoning_delta(
+        client,
+        "conv_x",
+        {"turnId": "turn_1", "itemId": "item_r", "delta": "think."},
+        state,
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_output_reasoning_delta",
+                "data": {"delta": "Let me ", "started": True},
+            },
+        ),
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_output_reasoning_delta",
+                "data": {"delta": "think.", "started": False},
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_delta_new_item_reopens_block() -> None:
+    """
+    A reasoning delta for a new item id opens a fresh block.
+
+    Multi-step turns (reason → tool → reason) emit a second reasoning item;
+    its first delta must re-open the block so the web UI starts a new
+    "thinking" section rather than appending to the prior one.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await fwd._handle_reasoning_delta(
+        client, "conv_x", {"itemId": "item_a", "delta": "first"}, state
+    )
+    await fwd._handle_reasoning_delta(
+        client, "conv_x", {"itemId": "item_b", "delta": "second"}, state
+    )
+
+    started_flags = [post[1]["data"]["started"] for post in client.posts]
+    assert started_flags == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_delta_skips_empty_non_opening_delta() -> None:
+    """
+    An empty delta that does not open a block is dropped (no noise post).
+
+    The block-opening delta is always posted (even empty, to emit
+    ``response.reasoning.started``); a later empty continuation carries
+    nothing to render and must not POST.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    # Opening delta (empty) still posts to open the block.
+    await fwd._handle_reasoning_delta(client, "conv_x", {"itemId": "item_r", "delta": ""}, state)
+    # Empty continuation for the same item is dropped.
+    await fwd._handle_reasoning_delta(client, "conv_x", {"itemId": "item_r", "delta": ""}, state)
+
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["data"] == {"delta": "", "started": True}
+
+
+# ---------------------------------------------------------------------------
+# _persist_codex_compaction_item
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_persist_codex_compaction_item_posts_event() -> None:
+    """Compaction event is posted with last_item_id and Codex summary."""
+    get_resp = MagicMock()
+    get_resp.json.return_value = {"data": [{"id": "item_codex"}]}
+    get_resp.raise_for_status = MagicMock()
+
+    client = MagicMock()
+    client.get = AsyncMock(return_value=get_resp)
+
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+    client.post = AsyncMock(return_value=post_resp)
+
+    await _persist_codex_compaction_item(client, session_id="conv_codex")
+
+    client.post.assert_called_once()
+    _url, kwargs = client.post.call_args
+    body = kwargs["json"]
+    assert body["type"] == "compaction"
+    assert body["data"]["last_item_id"] == "item_codex"
+    assert "Codex" in body["data"]["summary"]
+    # Codex can't read post-compaction state, so no compacted_messages
+    assert "compacted_messages" not in body["data"]
+
+
+@pytest.mark.asyncio
+async def test_persist_codex_compaction_item_empty_items_fallback() -> None:
+    """When no items exist, last_item_id falls back to compact_boundary_ prefix."""
+    empty_resp = MagicMock()
+    empty_resp.json.return_value = {"data": []}
+    empty_resp.raise_for_status = MagicMock()
+
+    client = MagicMock()
+    client.get = AsyncMock(return_value=empty_resp)
+
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+    client.post = AsyncMock(return_value=post_resp)
+
+    await _persist_codex_compaction_item(client, session_id="conv_codex")
+
+    client.post.assert_called_once()
+    _url, kwargs = client.post.call_args
+    body = kwargs["json"]
+    assert body["data"]["last_item_id"].startswith("compact_boundary_")
+    assert "compacted_messages" not in body["data"]

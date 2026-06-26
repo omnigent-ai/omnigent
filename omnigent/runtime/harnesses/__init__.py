@@ -49,6 +49,10 @@ _HARNESS_MODULES: dict[str, str] = {
     "pi": "omnigent.inner.pi_harness",
     # Native Pi TUI bridge used by ``omnigent pi``.
     "pi-native": "omnigent.inner.pi_native_harness",
+    # Native Antigravity (agy) TUI terminal bridge used by
+    # ``omnigent antigravity``. The in-process SDK counterpart is the
+    # canonical ``antigravity`` harness registered below.
+    "antigravity-native": "omnigent.inner.antigravity_native_harness",
     # Step 4e: openai-agents harness wrap. See
     # omnigent/inner/openai_agents_sdk_harness.py. Registry
     # key is the Omnigent-side spelling (``openai-agents``,
@@ -62,11 +66,20 @@ _HARNESS_MODULES: dict[str, str] = {
     # cursor harness wrap (Cursor's ``cursor-agent`` CLI, headless). See
     # omnigent/inner/cursor_harness.py.
     "cursor": "omnigent.inner.cursor_harness",
+    # Kimi Code CLI harness wrap (Moonshot AI's ``kimi`` CLI, headless). See
+    # omnigent/inner/kimi_harness.py. Drives ``kimi --print --output-format
+    # stream-json`` per turn; resumes via ``--session <uuid>`` captured from
+    # the prior turn's stderr.
+    "kimi": "omnigent.inner.kimi_harness",
+    # User-facing alias matching the upstream product name ("Kimi Code").
+    "kimi-code": "omnigent.inner.kimi_harness",
     # cursor-native harness wrap. Drives the resident ``cursor-agent`` TUI by
     # injecting each web-UI turn into its tmux pane and mirroring the transcript
     # back — a native-CLI harness like claude/codex/pi-native, so it IS in
     # ``NATIVE_HARNESSES``. See omnigent/inner/cursor_native_harness.py.
     "cursor-native": "omnigent.inner.cursor_native_harness",
+    # Native Kiro TUI bridge used by ``omnigent kiro``.
+    "kiro-native": "omnigent.inner.kiro_native_harness",
     # goose-native harness wrap. Drives the resident ``goose session`` TUI by
     # injecting each web-UI turn into its tmux pane and mirroring the transcript
     # back from Goose's SQLite session store — a native-CLI harness like
@@ -80,6 +93,12 @@ _HARNESS_MODULES: dict[str, str] = {
     # ``qwen`` name stays the ACP-piped harness. See
     # omnigent/inner/qwen_native_harness.py.
     "qwen-native": "omnigent.inner.qwen_native_harness",
+    # Native Kimi Code TUI bridge used by ``omnigent kimi``. Drives the resident
+    # ``kimi`` TUI by injecting each web-UI turn into its tmux pane (tmux paste)
+    # — a native-CLI harness like claude/codex/cursor-native, so it IS in
+    # ``NATIVE_HARNESSES``. Distinct from the headless ``kimi`` SDK harness
+    # above. See omnigent/inner/kimi_native_harness.py.
+    "kimi-native": "omnigent.inner.kimi_native_harness",
     # Google Antigravity SDK harness wrap. See
     # omnigent/inner/antigravity_harness.py. In-process SDK harness
     # (``google-antigravity``), like openai-agents — Omnigent spawns no CLI
@@ -111,6 +130,19 @@ _HARNESS_MODULES: dict[str, str] = {
     # Omnigent spawns no separately-installed CLI. Authenticates against GitHub's
     # Copilot backend with a GitHub token (no Databricks gateway).
     "copilot": "omnigent.inner.copilot_harness",
+    # Hermes Agent harness wrap. Runs the ``hermes`` CLI as a subprocess
+    # for each turn, managing its own session state via Hermes' SQLite
+    # session store. See omnigent/inner/hermes_harness.py and
+    # omnigent/inner/hermes_executor.py. The ``hermes`` binary must be
+    # on PATH (or set by HARNESS_HERMES_PATH).
+    "hermes": "omnigent.inner.hermes_harness",
+    # hermes-native harness wrap. Drives the resident ``hermes`` TUI by
+    # injecting each web-UI turn into its tmux pane and mirroring the transcript
+    # back from Hermes' SQLite ``state.db`` session store — a native-CLI harness
+    # like goose-native, so it IS in ``NATIVE_HARNESSES``. The bare ``hermes``
+    # name stays the headless subprocess harness. See
+    # omnigent/inner/hermes_native_harness.py.
+    "hermes-native": "omnigent.inner.hermes_native_harness",
 }
 
 __all__ = ["_HARNESS_MODULES"]

@@ -14,7 +14,6 @@ import logging
 import os
 import secrets
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -56,6 +55,7 @@ from omnigent._wrapper_labels import (
 from omnigent.conversation_browser import open_conversation_link_if_enabled
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
 from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.spec import load as load_spec
@@ -620,23 +620,38 @@ def _remote_headers(
         stored OIDC tokens, e.g. ``"http://localhost:6767"``.
     :returns: Headers to pass to httpx / OmnigentClient.
     """
+    # Resolve the bearer in the documented precedence order (one credential
+    # source per branch), then merge the workspace-routing header.
+    headers: dict[str, str] = {}
     token = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
     if token and (token := token.strip()):
-        return {"Authorization": f"Bearer {token}"}
-    # Check stored OIDC token from `omnigent login`.
-    if server_url:
+        # 1. Explicit env-var token.
+        headers["Authorization"] = f"Bearer {token}"
+    elif server_url:
         from omnigent.cli_auth import load_token
 
+        # 2. Stored OIDC session token from `omnigent login`.
         oidc_token = load_token(server_url)
         if oidc_token:
-            return {"Authorization": f"Bearer {oidc_token}"}
-        record_token = _stored_databricks_record_token(server_url)
-        if record_token:
-            return {"Authorization": f"Bearer {record_token}"}
-    creds = _read_databrickscfg(None)
-    if creds is None or not creds.token:
-        return {}
-    return {"Authorization": f"Bearer {creds.token}"}
+            headers["Authorization"] = f"Bearer {oidc_token}"
+        else:
+            # 3. Databricks Apps pointer record → mint a fresh workspace token.
+            record_token = _stored_databricks_record_token(server_url)
+            if record_token:
+                headers["Authorization"] = f"Bearer {record_token}"
+    if "Authorization" not in headers:
+        # 4. Ambient ~/.databrickscfg credentials.
+        creds = _read_databrickscfg(None)
+        if creds is not None and creds.token:
+            headers["Authorization"] = f"Bearer {creds.token}"
+    # Workspace routing: when a ?o= selector was recorded at login, name the
+    # workspace or the request routes to the account. Merged onto the result
+    # because these ad-hoc requests carry no httpx Auth.
+    if server_url:
+        from omnigent.cli_auth import databricks_org_id_headers
+
+        headers.update(databricks_org_id_headers(server_url))
+    return headers
 
 
 def _stored_databricks_record_token(server_url: str) -> str | None:
@@ -746,11 +761,19 @@ class _DatabricksTokenAuth(httpx.Auth):
 
         Static env-var token takes precedence, then stored OIDC token,
         then the reused Databricks SDK auth (which refreshes expired
-        OAuth tokens transparently).
+        OAuth tokens transparently). The stored ``X-Databricks-Org-Id``
+        selector (if any) is set first so the request routes to the
+        workspace, regardless of which credential branch sets the bearer.
 
         :param request: The outgoing httpx request.
         :yields: The request with auth header set.
         """
+        # Workspace routing (empty when none recorded); independent of the
+        # credential branch below.
+        if self._server_url:
+            from omnigent.cli_auth import databricks_org_id_headers
+
+            request.headers.update(databricks_org_id_headers(self._server_url))
         if self._static_token:
             request.headers["Authorization"] = f"Bearer {self._static_token}"
             yield request
@@ -1049,8 +1072,24 @@ def _redirect_native_resume_if_needed(
             progress=progress,
         )
         return True
+    if native_agent.key == "kiro":
+        _run_kiro_native_resume_redirect(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            auto_open_conversation=auto_open_conversation,
+            progress=progress,
+        )
+        return True
     if native_agent.key == "cursor":
         _run_cursor_native_resume_redirect(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            auto_open_conversation=auto_open_conversation,
+            progress=progress,
+        )
+        return True
+    if native_agent.key == "kimi":
+        _run_kimi_native_resume_redirect(
             base_url=base_url,
             conversation_id=conversation_id,
             auto_open_conversation=auto_open_conversation,
@@ -1188,6 +1227,30 @@ def _run_pi_native_resume_redirect(
     )
 
 
+def _run_kiro_native_resume_redirect(
+    *,
+    base_url: str,
+    conversation_id: str,
+    auto_open_conversation: bool,
+    progress: RunnerStartupProgress | None,
+) -> None:
+    """Hand a kiro-native conversation back to ``omnigent kiro``."""
+    _finish_native_redirect_progress(
+        progress=progress,
+        conversation_id=conversation_id,
+        wrapper_name="kiro-native",
+        native_command="kiro",
+    )
+    from omnigent.kiro_native import run_kiro_native
+
+    run_kiro_native(
+        server=base_url,
+        session_id=conversation_id,
+        kiro_args=(),
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
 def _run_cursor_native_resume_redirect(
     *,
     base_url: str,
@@ -1224,6 +1287,44 @@ def _run_cursor_native_resume_redirect(
         server=base_url,
         session_id=conversation_id,
         cursor_args=(),
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+def _run_kimi_native_resume_redirect(
+    *,
+    base_url: str,
+    conversation_id: str,
+    auto_open_conversation: bool,
+    progress: RunnerStartupProgress | None,
+) -> None:
+    """
+    Hand a kimi-native conversation back to ``omnigent kimi``.
+
+    The kimi-native session is driven by the ``kimi`` TUI in a runner-owned
+    tmux pane. Resuming through the Omnigent REPL would run an Omnigent turn
+    per message instead of attaching to the live TUI; redirecting to
+    ``omnigent kimi``'s direct tmux attach keeps the TUI the single source of
+    turns. Mirrors :func:`_run_cursor_native_resume_redirect`.
+
+    :param base_url: Omnigent server base URL.
+    :param conversation_id: Omnigent conversation id.
+    :param auto_open_conversation: Browser-open preference for the wrapper.
+    :param progress: Optional Omnigent startup spinner to finish before redirect.
+    :returns: None.
+    """
+    _finish_native_redirect_progress(
+        progress=progress,
+        conversation_id=conversation_id,
+        wrapper_name="kimi-native",
+        native_command="kimi",
+    )
+    from omnigent.kimi_native import run_kimi_native
+
+    run_kimi_native(
+        server=base_url,
+        session_id=conversation_id,
+        kimi_args=(),
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -3485,7 +3586,7 @@ def _start_local_server(
             env=child_env,
             stdout=log_fh,
             stderr=log_fh,
-            start_new_session=True,
+            **_proc.spawn_kwargs(),
         )
     finally:
         log_fh.close()
@@ -3607,14 +3708,11 @@ def _stop_server(proc: subprocess.Popen[bytes]) -> None:
     :param proc: The server subprocess.
     """
     if proc.poll() is None:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            proc.wait(timeout=5)
+        _proc.terminate_tree(proc, grace=5)
+        if proc.poll() is None:
+            _proc.kill_tree(proc)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
 
 
 def _stop_local_server(server: LocalServer) -> None:

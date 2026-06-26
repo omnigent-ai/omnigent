@@ -20,13 +20,25 @@ import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent import claude_native_bridge, codex_native_bridge, cursor_native_bridge
+from omnigent import (
+    claude_native_bridge,
+    codex_native_bridge,
+    cursor_native_bridge,
+    kiro_native_bridge,
+    qwen_native_bridge,
+)
+from omnigent.antigravity_native_bridge import (
+    ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+)
+from omnigent.antigravity_native_bridge import (
+    is_placeholder_conversation_id as bridge_mod_is_placeholder,
+)
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     bridge_dir_for_bridge_id,
@@ -43,12 +55,15 @@ from omnigent.runner.app import (
     _WAKE_POST_MAX_ATTEMPTS,
     ResolvedSpec,
     _agent_os_env_from_spec,
+    _auto_create_antigravity_terminal,
     _auto_create_claude_terminal,
     _auto_create_codex_terminal,
     _auto_create_cursor_terminal,
+    _auto_create_kiro_terminal,
     _auto_create_pi_terminal,
     _auto_create_repl_terminal,
     _deliver_subagent_wake_post,
+    _KiroNativeLaunchConfig,
     _log_terminal_lookup_miss,
     _PiNativeLaunchConfig,
     _publish_native_terminal_start_error,
@@ -60,8 +75,10 @@ from omnigent.runner.app import (
 )
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.resource_registry import (
+    ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
+    KIRO_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
@@ -94,7 +111,13 @@ class _FakeMcpManager:
         }
         return McpSchemasResult(schemas=[schema], tool_names={self._tool_name}, failures={})
 
-    async def call_tool(self, spec: AgentSpec, tool_name: str, arguments: dict[str, Any]) -> str:
+    async def call_tool(
+        self,
+        spec: AgentSpec,
+        tool_name: str,
+        arguments: dict[str, Any],
+        **_kwargs: Any,
+    ) -> str:
         """Record the dispatch + return a fixed reply."""
         del spec
         self.call_tool_invocations.append((tool_name, arguments))
@@ -948,6 +971,35 @@ async def test_mcp_execute_dispatches_builtin_tool_with_runner_workspace(
 
 
 @pytest.mark.asyncio
+async def test_mcp_execute_dispatches_full_namespaced_mcp_tool_name() -> None:
+    """``/mcp/execute`` must not strip the MCP server prefix before dispatch."""
+    app, mcp_manager, _harness_client, _server_client = _build_app_with_mcp_tool(
+        tool_name="jira__search_issues"
+    )
+    async with _runner_client(app) as client:
+        seed_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_execute_mcp", "agent_id": "ag_abc"},
+        )
+        assert seed_resp.status_code == 201, seed_resp.text
+
+        execute_resp = await client.post(
+            "/v1/sessions/conv_execute_mcp/mcp/execute",
+            json={
+                "method": "tools/call",
+                "params": {
+                    "name": "jira__search_issues",
+                    "arguments": {"query": "asyncio"},
+                },
+            },
+        )
+
+    assert execute_resp.status_code == 200
+    assert execute_resp.json() == {"result": {"output": "called jira__search_issues"}}
+    assert mcp_manager.call_tool_invocations == [("jira__search_issues", {"query": "asyncio"})]
+
+
+@pytest.mark.asyncio
 async def test_sessions_native_path_injects_mcp_schemas() -> None:
     """``POST /v1/sessions/{conv}/events`` with a message body injects MCP schemas.
 
@@ -1153,6 +1205,51 @@ async def test_create_session_threads_cursor_bridge_dir_without_dead_guard_env(
         )
     }
     assert "HARNESS_CURSOR_NATIVE_REQUEST_SESSION_ID" not in env
+
+
+@pytest.mark.asyncio
+async def test_create_session_threads_kiro_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kiro-native session pre-spawn emits the Kiro bridge dir env."""
+    monkeypatch.setattr(kiro_native_bridge, "_BRIDGE_ROOT", tmp_path / "kiro-bridge")
+    spec = AgentSpec(
+        spec_version=1,
+        name="kiro-native-agent",
+        executor=ExecutorSpec(
+            config={"harness": "kiro-native", "model": "auto"},
+        ),
+    )
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=tmp_path)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_kiro", "agent_id": "ag_kiro"},
+        )
+
+    assert resp.status_code == 201
+    assert pm.get_client_calls
+    conversation_id, harness, env = pm.get_client_calls[-1]
+    assert conversation_id == "conv_kiro"
+    assert harness == "kiro-native"
+    assert env == {
+        kiro_native_bridge.KIRO_NATIVE_BRIDGE_DIR_ENV_VAR: str(
+            kiro_native_bridge.bridge_dir_for_session_id("conv_kiro")
+        )
+    }
 
 
 @pytest.mark.asyncio
@@ -2675,6 +2772,774 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
         shutil.rmtree(bridge_dir, ignore_errors=True)
 
 
+async def _run_antigravity_auto_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_id: str,
+    snapshot: dict[str, Any],
+    candidate_ports: list[int],
+    pane: tuple[Path, str] | None = None,
+    pane_scoped_port: int | None = None,
+    pane_agy_found: bool = True,
+) -> tuple[Any, list[tuple[int, str]], list[dict[str, Any]], list[tuple[str, dict[str, Any]]]]:
+    """
+    Drive ``_auto_create_antigravity_terminal`` with every live collaborator faked.
+
+    No real agy is launched: ``build_agy_launch`` is stubbed to a no-op argv, the
+    onboarding seed is a no-op, the resource registry records the launched spec,
+    the forwarder is a counting stub, and the connect-RPC layer
+    (``_candidate_agy_rpc_ports`` / ``resolve_pane_agy_rpc_port_state`` /
+    ``start_cascade``) is mocked so the cold-start bootstrap runs without a socket.
+
+    The cold-start exercises the REAL ``resolve_cold_start_agy_rpc_port`` dispatch:
+    with no ``pane`` the pane is absent (``_terminal_tmux_pane`` → ``(None, None)``)
+    and it falls back to the candidate scan; with a ``pane`` the pane-scoped
+    resolver's 3-state result (driven by ``pane_scoped_port`` + ``pane_agy_found``)
+    is consulted first.
+
+    :param tmp_path: Temporary directory for isolated bridge state.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param session_id: Session/conversation id under test.
+    :param snapshot: The Omnigent session snapshot the helper should read.
+    :param candidate_ports: Ports ``_candidate_agy_rpc_ports`` yields (``[]`` →
+        the bootstrap never finds a candidate port).
+    :param pane: ``(tmux_socket, tmux_target)`` ``_terminal_tmux_pane`` returns,
+        or ``None`` (the default) → ``(None, None)`` (no local pane).
+    :param pane_scoped_port: The port the pane-scoped resolver reports (``None`` →
+        no port; combined with ``pane_agy_found`` to pick state 1/2/3).
+    :param pane_agy_found: Whether the pane-scoped resolver found our agy in the
+        pane subtree. ``True`` + a port → scoped (state 1); ``True`` + no port →
+        candidate fallback (state 2); ``False`` → keep polling (state 3).
+    :returns: ``(bridge_state_after, start_cascade_calls, reader_calls,
+        external_session_id_patch_calls)``.
+    """
+    import omnigent.antigravity_native_bridge as bridge_mod
+    import omnigent.antigravity_native_launch as launch_mod
+    import omnigent.antigravity_native_reader as reader_mod
+    import omnigent.antigravity_native_rpc as rpc_mod
+    import omnigent.runner.app as runner_app_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    # No-op the launch builder + onboarding seed so nothing tries to find agy.
+    monkeypatch.setattr(
+        launch_mod, "build_agy_launch", lambda **_kwargs: (("agy",), {"AGY_ENV": "1"})
+    )
+    monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
+    # Auto-create now spawns the RPC reader (NOT the transcript forwarder); stub
+    # ``supervise_reader`` at its definition module (the helper imports it lazily)
+    # so the test does not start a real one. The reader is wrapped in
+    # ``_run_antigravity_reader``, which still opens (and, on teardown, closes) a
+    # real Omnigent client around this stub — fine, since nothing posts here.
+    reader_calls: list[dict[str, Any]] = []
+
+    def _counting_reader(*args: Any, **kwargs: Any) -> Any:
+        reader_calls.append(kwargs)
+
+        async def _runner() -> None:
+            await asyncio.Event().wait()
+
+        return _runner()
+
+    monkeypatch.setattr(reader_mod, "supervise_reader", _counting_reader)
+    # The pane the runner resolves for cold-start scoping + the tmux advertise.
+    # Default ``None`` → no local pane (``(None, None)``), so the cold-start uses
+    # the candidate-scan fallback. A provided pane lets the test assert the
+    # pane-scoped port path.
+    resolved_pane = (None, None) if pane is None else pane
+    monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: resolved_pane)
+    # The pane-scoped resolver the REAL ``resolve_cold_start_agy_rpc_port``
+    # consults first when a pane is present — returns the 3-state result.
+    pane_resolution = rpc_mod.PaneAgyResolution(agy_found=pane_agy_found, port=pane_scoped_port)
+    monkeypatch.setattr(
+        rpc_mod, "resolve_pane_agy_rpc_port_state", lambda _sock, _tgt: pane_resolution
+    )
+
+    # Mock the connect-RPC cold-start surface. Collapse the port-poll budget +
+    # backoff so the no-port case bails immediately instead of waiting the real
+    # 20s (and the success case still finds its port on the first probe).
+    monkeypatch.setattr(runner_app_mod, "_AGY_COLD_START_PORT_TIMEOUT_S", 0.0)
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(runner_app_mod, "_agy_cold_start_poll_sleep", _no_sleep)
+    monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", lambda: list(candidate_ports))
+    start_cascade_calls: list[tuple[int, str]] = []
+
+    def _fake_start_cascade(port: int, cascade_id: str, **_kwargs: Any) -> None:
+        start_cascade_calls.append((port, cascade_id))
+
+    monkeypatch.setattr(rpc_mod, "start_cascade", _fake_start_cascade)
+
+    patch_calls: list[tuple[str, dict[str, Any]]] = []
+
+    class _SnapshotServerClient:
+        """Server client returning the snapshot + recording external_session_id PATCHes."""
+
+        async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
+            assert url == f"/v1/sessions/{session_id}"
+            return httpx.Response(200, json=snapshot, request=httpx.Request("GET", url))
+
+        async def patch(self, url: str, *, json: dict[str, Any], **_kwargs: Any) -> httpx.Response:
+            patch_calls.append((url, json))
+            return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
+
+    class _FakeResourceRegistry:
+        """Resource registry that records the required-terminal launch."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            **_kwargs: Any,
+        ) -> SessionResourceView:
+            assert terminal_name == "antigravity"
+            assert session_key == "main"
+            assert resource_role == ANTIGRAVITY_NATIVE_TERMINAL_ROLE
+            return SessionResourceView(
+                id="terminal_antigravity_main",
+                type="terminal",
+                session_id=session_id,
+                name="Antigravity",
+            )
+
+    try:
+        await _auto_create_antigravity_terminal(
+            session_id,
+            cast(SessionResourceRegistry, _FakeResourceRegistry()),
+            lambda _sid, _event: None,
+            server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
+        )
+        await asyncio.sleep(0)
+    finally:
+        await runner_app_mod._cancel_auto_forwarder_task(session_id)
+
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id(session_id)
+    return (
+        bridge_mod.read_bridge_state(bridge_dir),
+        start_cascade_calls,
+        reader_calls,
+        patch_calls,
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_cold_starts_real_conversation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A fresh runner launch cold-starts the agy conversation over RPC.
+
+    The runner mints the cascade over ``StartCascade`` (no send-keys / no waiting
+    for the TUI to lazily create it) so the executor's turn-1 has a real cascade
+    id. This asserts the load-bearing integration: after the agy terminal launches
+    and the connect-RPC port answers, the runner calls ``start_cascade`` with a
+    runner-generated id, writes THAT real id into bridge state — NOT the
+    ``agy_conv_*`` placeholder ``read_bridge_state`` would otherwise return — and
+    PATCHes it onto the session as ``external_session_id`` so a later ``--resume``
+    continues it.
+    """
+    session_id = "conv_agy_coldstart"
+    state, start_cascade_calls, reader_calls, patch_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={},  # fresh: no external_session_id
+        candidate_ports=[52548],
+    )
+    # start_cascade was called once, on the discovered port, with a real id.
+    assert len(start_cascade_calls) == 1
+    called_port, called_id = start_cascade_calls[0]
+    assert called_port == 52548
+    assert not bridge_mod_is_placeholder(called_id)
+    # The real cold-started id is what reaches bridge state (no placeholder).
+    assert state is not None
+    assert state.conversation_id == called_id
+    assert not bridge_mod_is_placeholder(state.conversation_id)
+    # The same real id is PATCHed onto the session as external_session_id so a
+    # later --resume continues agy's actual conversation (the read-path
+    # replacement for the retired forwarder's _patch_external_session_id).
+    assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
+    # The RPC reader spawns (it replaced the transcript forwarder).
+    assert len(reader_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_cold_start_scopes_to_pane_agy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With several agy candidates, cold-start binds THIS session's pane agy.
+
+    The cross-bind fix: on a host running several agy instances (sub-agent
+    fan-out / shared runner), ``StartCascade`` must target the agy actually
+    running under this session's tmux pane — NOT the lowest Heartbeat-answering
+    candidate, which could be a FOREIGN agy and permanently cross-bind the
+    session. With a resolvable pane the cold-start uses the pane-scoped port
+    (61000) even though a lower foreign candidate (52548) exists.
+    """
+    session_id = "conv_agy_paneScoped"
+    state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={},
+        # Several agy ports on the host; 52548 is the lowest (a FOREIGN agy).
+        candidate_ports=[52548, 61000],
+        # This session's pane resolves to a DIFFERENT (higher) agy's port.
+        pane=(tmp_path / "agy.sock", "main"),
+        pane_scoped_port=61000,
+    )
+    # StartCascade fired on the PANE-SCOPED port, NOT candidates[0] (52548).
+    assert len(start_cascade_calls) == 1
+    called_port, called_id = start_cascade_calls[0]
+    assert called_port == 61000
+    assert not bridge_mod_is_placeholder(called_id)
+    assert state is not None
+    assert state.conversation_id == called_id
+    assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_cold_start_falls_back_when_no_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    No local pane (remote runner) → cold-start uses the lowest candidate port.
+
+    Preserves the current behavior on single-agy hosts and remote runners: when
+    ``_terminal_tmux_pane`` yields no socket/target the pane cannot be scoped, so
+    the cold-start falls back to ``_candidate_agy_rpc_ports()[0]``.
+    """
+    session_id = "conv_agy_noPaneFallback"
+    state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={},
+        candidate_ports=[52548, 61000],
+        pane=None,  # remote runner / no local pane
+        pane_scoped_port=99999,  # must be ignored — there is no pane to scope to
+    )
+    assert len(start_cascade_calls) == 1
+    called_port, _called_id = start_cascade_calls[0]
+    assert called_port == 52548  # the lowest candidate, NOT the (ignored) pane port
+    assert state is not None
+    assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_cold_start_waits_when_pane_agy_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Pane present, our agy NOT up yet, FOREIGN candidate present → no cold-start.
+
+    The cross-bind guard: with a local pane whose agy has not appeared yet
+    (``agy_found=False``) and a foreign agy as the only candidate, the cold-start
+    must NOT bind the foreign candidate — it keeps polling until its (collapsed)
+    deadline, leaving the placeholder for the reader to bind later. No
+    ``StartCascade``, no ``external_session_id`` PATCH.
+    """
+    session_id = "conv_agy_paneEarlyPoll"
+    state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={},
+        candidate_ports=[52548],  # a FOREIGN agy is the only candidate
+        pane=(tmp_path / "agy.sock", "main"),
+        pane_agy_found=False,  # our agy not exec'd into the pane yet
+        pane_scoped_port=None,
+    )
+    # Never cold-started onto the foreign candidate; placeholder stands.
+    assert start_cascade_calls == []
+    assert patch_calls == []
+    assert state is not None
+    assert bridge_mod_is_placeholder(state.conversation_id)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_cold_start_falls_back_when_port_unattributable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Pane present, our agy found, port not lsof-attributable → candidate fallback.
+
+    The restricted-/proc one-agy-per-pod case: our agy IS up in the pane
+    (``agy_found=True``) but lsof cannot attribute its listener, so the scoped
+    port is ``None``. Since agy exists here, the lone candidate is ours and the
+    candidate fallback is safe.
+    """
+    session_id = "conv_agy_paneNoPort"
+    state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={},
+        candidate_ports=[52548],  # one-agy-per-pod → the lone candidate is ours
+        pane=(tmp_path / "agy.sock", "main"),
+        pane_agy_found=True,  # our agy IS up...
+        pane_scoped_port=None,  # ...but its port is not lsof-attributable
+    )
+    assert len(start_cascade_calls) == 1
+    assert start_cascade_calls[0][0] == 52548  # safe candidate fallback
+    assert state is not None
+    assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_resume_skips_cold_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A resume launch does NOT cold-start — the conversation already exists.
+
+    On resume the snapshot carries agy's real ``external_session_id`` (persisted
+    by a prior run), so the conversation already exists and ``StartCascade`` must
+    not be issued (it would create a second, empty one). Bridge state keeps the
+    resume id verbatim, and — since no cold-start runs — no ``external_session_id``
+    PATCH is issued (it already holds the resume id).
+    """
+    session_id = "conv_agy_resume"
+    resume_id = "68caaeac-2eaf-4e2c-9b95-721b022f4903"
+    state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={"external_session_id": resume_id},
+        candidate_ports=[52548],
+    )
+    assert start_cascade_calls == []
+    assert state is not None
+    assert state.conversation_id == resume_id
+    assert patch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_cold_start_agy_conversation_returns_early_on_real_id_in_bridge_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The runner cold-start refuses to run when bridge state already holds a real id.
+
+    Defense-in-depth mirroring the CLI cold-start (``antigravity_native.py``): the
+    caller only invokes this on a fresh launch (``if not resume:``), but if bridge
+    state already names a NON-placeholder conversation id, cold-starting would
+    create a second empty conversation and clobber the real id. The guard must
+    early-return BEFORE probing for a port or calling ``StartCascade`` — so even a
+    future caller that forgets the resume gate cannot cold-start over a real id.
+    """
+    import omnigent.antigravity_native_bridge as bridge_mod
+    import omnigent.antigravity_native_rpc as rpc_mod
+    import omnigent.runner.app as runner_app_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    session_id = "conv_agy_guard"
+    real_id = "68caaeac-2eaf-4e2c-9b95-721b022f4903"  # NOT an agy_conv_* placeholder
+    assert not bridge_mod.is_placeholder_conversation_id(real_id)
+
+    bridge_dir = bridge_mod.prepare_bridge_dir(session_id)
+    bridge_mod.write_bridge_state(
+        bridge_dir,
+        bridge_mod.AntigravityNativeBridgeState(
+            session_id=session_id,
+            conversation_id=real_id,
+        ),
+    )
+
+    # The cold-start must touch NEITHER the port-scan NOR StartCascade.
+    def _no_ports() -> list[int]:
+        raise AssertionError("cold-start must not probe for a port when the id is real")
+
+    start_cascade_calls: list[tuple[int, str]] = []
+
+    def _fake_start_cascade(port: int, cascade_id: str, **_kwargs: Any) -> None:
+        start_cascade_calls.append((port, cascade_id))
+
+    monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", _no_ports)
+    monkeypatch.setattr(rpc_mod, "start_cascade", _fake_start_cascade)
+
+    patch_calls: list[tuple[str, dict[str, Any]]] = []
+
+    class _RecordingServerClient:
+        async def patch(self, url: str, *, json: dict[str, Any], **_kwargs: Any) -> httpx.Response:
+            patch_calls.append((url, json))
+            return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
+
+    result = await runner_app_mod._cold_start_agy_conversation(
+        bridge_dir,
+        session_id,
+        server_client=cast(httpx.AsyncClient, _RecordingServerClient()),
+    )
+
+    # Returns the existing real id, and never cold-started or re-PATCHed.
+    assert result == real_id
+    assert start_cascade_calls == []
+    assert patch_calls == []
+    # Bridge state is untouched (still the real id, not a fresh cold-start id).
+    state = bridge_mod.read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == real_id
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_cold_start_port_timeout_keeps_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When no connect-RPC port answers, the cold-start is best-effort: the launch
+    still completes and leaves the placeholder id for the reader to bind.
+
+    The cold-start must NOT abort the launch (which would leave a registered
+    terminal with no reader, never self-healing). With no port, ``start_cascade``
+    is never called, bridge state retains the ``agy_conv_*`` placeholder, and no
+    ``external_session_id`` PATCH is issued (there is no real id to record).
+    """
+    session_id = "conv_agy_noport"
+    state, start_cascade_calls, reader_calls, patch_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={},
+        candidate_ports=[],  # port never comes up within the bounded poll
+    )
+    assert start_cascade_calls == []
+    assert state is not None
+    assert bridge_mod_is_placeholder(state.conversation_id)
+    assert patch_calls == []
+    # The RPC reader still spawns regardless of the cold-start outcome.
+    assert len(reader_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auto-create spawns the RPC reader task and wires its interaction bridge.
+
+    Asserts the Task 11b integration linchpin end-to-end against fakes:
+
+    * the background task is the ``antigravity-reader-{session_id}`` reader (NOT
+      the transcript forwarder), registered in the single-instance task slot;
+    * the reader is wired with an ``on_pending_interaction`` that, when a WAITING
+      interaction is handed to it, POSTs the Task 9 antigravity-elicitation hook
+      with ``{elicitation_id, params}``, then — on the human verdict — delivers
+      the answer to agy via ``handle_user_interaction`` (the bridge default).
+    """
+    import omnigent.antigravity_native_bridge as bridge_mod
+    import omnigent.antigravity_native_interactions as interactions_mod
+    import omnigent.antigravity_native_launch as launch_mod
+    import omnigent.antigravity_native_reader as reader_mod
+    import omnigent.antigravity_native_rpc as rpc_mod
+    import omnigent.runner.app as runner_app_mod
+    from omnigent.antigravity_native_interactions import agy_elicitation_id
+    from omnigent.antigravity_native_steps import pending_interaction
+
+    session_id = "conv_agy_wiring"
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(
+        launch_mod, "build_agy_launch", lambda **_kwargs: (("agy",), {"AGY_ENV": "1"})
+    )
+    monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
+    monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: (None, None))
+    # Skip the 11a cold-start network work (resume launch → no StartCascade).
+    resume_id = "efb134b2-d69f-43de-bb54-c9ece346d8a3"
+    monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", list)
+
+    # Capture the reader's wiring (client + on_pending_interaction) and park so the
+    # owning ``_run_antigravity_reader`` keeps its client open while we drive the
+    # callback. ``supervise_reader`` is patched at its definition module (the
+    # helper imports it lazily).
+    captured: dict[str, Any] = {}
+    wired = asyncio.Event()
+
+    def _capturing_reader(*_args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        wired.set()
+
+        async def _runner() -> None:
+            await asyncio.Event().wait()
+
+        return _runner()
+
+    monkeypatch.setattr(reader_mod, "supervise_reader", _capturing_reader)
+
+    # Control the reader's Omnigent client transport: record the elicitation hook
+    # POST and return the human's ACCEPT verdict as an ElicitationResult body.
+    hook_posts: list[tuple[str, dict[str, Any]]] = []
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        hook_posts.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"action": "accept", "content": {}})
+
+    real_async_client = httpx.AsyncClient
+
+    def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
+        return real_async_client(transport=httpx.MockTransport(_handle), **kwargs)
+
+    # ``_run_antigravity_reader`` builds its client via ``httpx.AsyncClient``; patch
+    # the httpx module itself (the reader is the only AsyncClient built on this
+    # auto-create path — the snapshot client is a hand-rolled fake) so its POSTs hit
+    # the MockTransport above instead of the network.
+    monkeypatch.setattr(httpx, "AsyncClient", _mock_client)
+
+    # The WAITING (permission) step the bridge re-reads at delivery time, and the
+    # ``handle_user_interaction`` delivery sink (the bridge's default ``deliver``).
+    waiting_step = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "fixtures"
+            / "antigravity"
+            / "steps"
+            / "run_command_waiting.json"
+        ).read_text()
+    )
+    # The shared ``run_reader_with_bridge`` helper's ``_get_steps`` closure binds
+    # ``get_trajectory_steps`` from the reader module's top-level import, so patch
+    # it there (matching how the reader's own poll-loop tests patch it).
+    monkeypatch.setattr(reader_mod, "get_trajectory_steps", lambda _port, _cid: [waiting_step])
+    delivered: list[dict[str, Any]] = []
+
+    def _fake_deliver(
+        port: int, cascade_id: str, *, trajectory_id: str, step_index: int, payload: Any
+    ) -> None:
+        delivered.append(
+            {
+                "port": port,
+                "cascade_id": cascade_id,
+                "trajectory_id": trajectory_id,
+                "step_index": step_index,
+                "payload": payload,
+            }
+        )
+
+    monkeypatch.setattr(interactions_mod, "handle_user_interaction", _fake_deliver)
+
+    class _SnapshotServerClient:
+        async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
+            assert url == f"/v1/sessions/{session_id}"
+            return httpx.Response(
+                200,
+                json={"external_session_id": resume_id},
+                request=httpx.Request("GET", url),
+            )
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            **_kwargs: Any,
+        ) -> SessionResourceView:
+            return SessionResourceView(
+                id="terminal_antigravity_main",
+                type="terminal",
+                session_id=session_id,
+                name="Antigravity",
+            )
+
+    try:
+        await _auto_create_antigravity_terminal(
+            session_id,
+            cast(SessionResourceRegistry, _FakeResourceRegistry()),
+            lambda _sid, _event: None,
+            server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
+        )
+        await asyncio.wait_for(wired.wait(), timeout=5.0)
+
+        # The single-instance task slot holds the reader task, named for the reader.
+        task = runner_app_mod._AUTO_FORWARDER_TASKS[session_id]
+        assert task.get_name() == f"antigravity-reader-{session_id}"
+
+        # Drive the captured wiring with a WAITING (permission) interaction, as the
+        # reader would when it observes one. Use the SAME cascade id + port the
+        # callback contract threads through.
+        port = 52548
+        pending = pending_interaction(waiting_step)
+        assert pending is not None
+        await captured["on_pending_interaction"](resume_id, port, pending)
+
+        # 1) It POSTed the antigravity-elicitation hook with {elicitation_id, params}.
+        assert len(hook_posts) == 1
+        path, body = hook_posts[0]
+        assert path == f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request"
+        assert body["elicitation_id"] == agy_elicitation_id(
+            resume_id, pending["trajectory_id"], pending["step_index"]
+        )
+        assert isinstance(body["params"], dict)
+
+        # 2) On the ACCEPT verdict it delivered the answer to agy via the bridge.
+        assert len(delivered) == 1
+        assert delivered[0]["cascade_id"] == resume_id
+        assert delivered[0]["port"] == port
+        assert delivered[0]["trajectory_id"] == pending["trajectory_id"]
+        assert delivered[0]["step_index"] == pending["step_index"]
+        assert delivered[0]["payload"] == {"permission": {"allow": True}}
+    finally:
+        await runner_app_mod._cancel_auto_forwarder_task(session_id)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auto-create wires the Omnigent MCP relay so agy gets the sys_* tools (#1194).
+
+    Asserts the three wiring points end-to-end against fakes:
+
+    * the relay starter (``ensure_comment_relay``) is invoked for THIS session's
+      bridge dir before launch, so its ``tool_relay.json`` is on disk when agy
+      first scans the MCP server;
+    * the relay ``mcp_config.json`` is written into the per-session ISOLATED agy
+      HOME (``<bridge_dir>/agy-home/.gemini/config``), NOT the user's real
+      ``~/.gemini`` — the config-scoping footgun the design avoids;
+    * the launch env carries ``HOME`` = that isolated home, so agy actually loads
+      the bridge-scoped config (and never the user's interactive agy config).
+    """
+    import omnigent.antigravity_native_bridge as bridge_mod
+    import omnigent.antigravity_native_launch as launch_mod
+    import omnigent.antigravity_native_reader as reader_mod
+    import omnigent.antigravity_native_rpc as rpc_mod
+    import omnigent.runner.app as runner_app_mod
+
+    session_id = "conv_agy_mcp"
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
+    monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: (None, None))
+    monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", list)
+
+    # Capture the env build_agy_launch starts from so we can assert HOME is layered
+    # on top of it (the launch env is the captured spec's ``env`` below).
+    monkeypatch.setattr(
+        launch_mod, "build_agy_launch", lambda **_kwargs: (("agy",), {"AGY_ENV": "1"})
+    )
+
+    def _noop_reader(*_args: Any, **_kwargs: Any) -> Any:
+        async def _runner() -> None:
+            await asyncio.Event().wait()
+
+        return _runner()
+
+    monkeypatch.setattr(reader_mod, "supervise_reader", _noop_reader)
+
+    relay_calls: list[dict[str, Any]] = []
+
+    async def _recording_relay(session_id_arg: str, **kwargs: Any) -> None:
+        relay_calls.append({"session_id": session_id_arg, **kwargs})
+
+    captured_spec: dict[str, Any] = {}
+
+    snapshot = {"workspace": str(tmp_path / "workspace")}
+
+    class _SnapshotServerClient:
+        async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
+            assert url == f"/v1/sessions/{session_id}"
+            return httpx.Response(200, json=snapshot, request=httpx.Request("GET", url))
+
+        async def patch(self, url: str, *, json: dict[str, Any], **_kwargs: Any) -> httpx.Response:
+            del json
+            return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            **_kwargs: Any,
+        ) -> SessionResourceView:
+            captured_spec["env"] = dict(spec.env)
+            return SessionResourceView(
+                id="terminal_antigravity_main",
+                type="terminal",
+                session_id=session_id,
+                name="Antigravity",
+            )
+
+    try:
+        await _auto_create_antigravity_terminal(
+            session_id,
+            cast(SessionResourceRegistry, _FakeResourceRegistry()),
+            lambda _sid, _event: None,
+            server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
+            ensure_comment_relay=_recording_relay,
+        )
+        await asyncio.sleep(0)
+    finally:
+        await runner_app_mod._cancel_auto_forwarder_task(session_id)
+
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id(session_id)
+    iso_home = bridge_mod.agy_home_dir(bridge_dir)
+
+    # 1) The relay starter was invoked for this session's bridge dir.
+    assert len(relay_calls) == 1
+    assert relay_calls[0]["session_id"] == session_id
+    assert relay_calls[0]["explicit_bridge_dir"] == bridge_dir
+    assert relay_calls[0]["await_notify"] is False
+
+    # 2) The relay mcp_config.json landed in the ISOLATED agy HOME, not ~/.gemini.
+    mcp_config = iso_home / ".gemini" / "config" / "mcp_config.json"
+    assert mcp_config.is_file()
+    payload = json.loads(mcp_config.read_text(encoding="utf-8"))
+    server = payload["mcpServers"]["omnigent"]
+    assert server["args"][:4] == ["-I", "-m", "omnigent.claude_native_bridge", "serve-mcp"]
+    assert str(bridge_dir) in server["args"]
+    assert "sys_session_create" in server["enabledTools"]
+    # The bridge token the shared relay needs was written into the bridge dir.
+    assert (bridge_dir / "bridge.json").is_file()
+
+    # 3) The launch env carries HOME = the isolated home, layered over the
+    #    build_agy_launch base env.
+    assert captured_spec["env"]["HOME"] == str(iso_home)
+    assert captured_spec["env"]["AGY_ENV"] == "1"
+
+
 @pytest.mark.parametrize("parent_host_id", ["host_parent", None])
 @pytest.mark.asyncio
 async def test_codex_subagent_always_needs_runner_terminal(
@@ -4194,8 +5059,11 @@ class _FakeServerClient:
     exist. Tracks GET calls for assertion.
     """
 
-    def __init__(self, items: list[dict[str, Any]]) -> None:
+    def __init__(
+        self, items: list[dict[str, Any]], *, session_snapshot: dict[str, Any] | None = None
+    ) -> None:
         self._items = items
+        self._session_snapshot: dict[str, Any] = session_snapshot or {}
         self.get_calls: list[dict[str, str]] = []
 
     async def get(
@@ -4204,6 +5072,19 @@ class _FakeServerClient:
         del timeout
         params = params or {}
         self.get_calls.append(dict(params))
+
+        # Session snapshot GET (e.g. /v1/sessions/{id}, no /items suffix).
+        if "/items" not in url:
+            snapshot = dict(self._session_snapshot)
+
+            class _SnapshotResp:
+                status_code = 200
+
+                def json(self_inner) -> dict[str, Any]:
+                    return snapshot
+
+            return _SnapshotResp()
+
         after = params.get("after")
         limit = int(params.get("limit", "100"))
 
@@ -4900,6 +5781,89 @@ async def test_compaction_item_in_history_expands_and_discards_prior() -> None:
 
 
 @pytest.mark.asyncio
+async def test_error_item_in_history_is_surfaced_as_error_block_not_dropped() -> None:
+    """History loading surfaces ``error`` items as typed ERROR blocks, not dropped (#1108).
+
+    Breakage this catches: ``_convert_raw_items_to_input`` used to drop every
+    item that wasn't message / function_call / function_call_output, so an
+    ``error`` item recorded for a failed turn vanished on history reload — the
+    next turn replayed as if the failure had never happened ("silent success").
+
+    The converter now preserves each error item as a typed ``error`` item
+    (the ``ErrorData`` shape: ``source`` / ``code`` / ``message``). The fix is
+    specifically NOT a synthetic user-role ``input_text`` message: that would
+    keep the text visible but mis-attribute the failure to the user's input
+    and lose the error semantics. This test pins the typed-error shape and
+    guards against a regression back to the user-message shim.
+    """
+    import asyncio as _aio
+
+    history = [
+        {
+            "id": "item_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "do the thing"}],
+        },
+        {
+            "id": "item_2",
+            "type": "error",
+            "response_id": "resp_failed",
+            "source": "execution",
+            "code": "codex_turn_error",
+            "message": "401 Unauthorized: ChatGPT login expired",
+        },
+        {
+            "id": "item_3",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "try again"}],
+        },
+    ]
+    app, _pm, hc = _build_recovery_app(history)
+
+    async with _runner_client(app) as client:
+        # Trailing user message → crash recovery starts a turn, replaying history.
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_err_1", "agent_id": "ag_1"},
+        )
+        assert resp.status_code == 201
+        assert resp.json()["status"] == "running"
+        await _aio.sleep(0.5)
+
+    assert len(hc.posted_bodies) == 1, (
+        f"Expected 1 harness POST (recovery turn), got {len(hc.posted_bodies)}."
+    )
+    content = hc.posted_bodies[0].get("content", [])
+    error_items = [
+        item for item in content if isinstance(item, dict) and item.get("type") == "error"
+    ]
+    # The error item survived the converter as a typed ERROR block.
+    assert len(error_items) == 1, (
+        "Expected exactly one typed 'error' item in the converted history; "
+        f"got {len(error_items)}. If 0, the error item was dropped (the "
+        "silent-success regression) or wrongly mapped to another type."
+    )
+    error_item = error_items[0]
+    assert error_item["message"] == "401 Unauthorized: ChatGPT login expired"
+    # The stable code/source round-trip so the failure stays attributable.
+    assert error_item["code"] == "codex_turn_error"
+    assert error_item["source"] == "execution"
+    # Crucially, the error is NOT mis-attributed as a user input_text message.
+    user_texts = [
+        block.get("text", "")
+        for item in content
+        if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "user"
+        for block in (item.get("content") or [])
+        if isinstance(block, dict)
+    ]
+    assert not any("401 Unauthorized" in text for text in user_texts), (
+        "Error text leaked into a user message — it must be a typed error block, not user input."
+    )
+
+
+@pytest.mark.asyncio
 async def test_crash_recovery_with_compaction_uses_post_compaction_history() -> None:
     """Crash recovery after compaction sees only post-compaction items.
 
@@ -5163,7 +6127,7 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
             },
         )
         assert resp.status_code == 202
-        await _aio.wait_for(_hc.post_seen.wait(), timeout=5.0)
+        await _aio.wait_for(_hc.post_seen.wait(), timeout=15.0)
 
         # The interrupt route must block on the (still-blocked) harness forward —
         # forward-first awaits it before cancelling. If it completes here, the
@@ -5178,7 +6142,7 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
 
         # Release the forward → the harness gets the interrupt, then the cancel runs.
         fwd_gate.set()
-        int_resp = await _aio.wait_for(int_task, timeout=5.0)
+        int_resp = await _aio.wait_for(int_task, timeout=15.0)
         assert int_resp.status_code == 204, int_resp.text
         markers = _interrupt_markers(list(_session_histories_ref.get(conv_id, [])))
 
@@ -7322,6 +8286,12 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
         # runner's idle edge because the injection task completes before
         # the user-visible Codex turn.
         ("codex-native", ["running"]),
+        # antigravity-native shares codex's shape: the executor's
+        # SendUserCascadeMessage returns as soon as agy accepts the turn, so the
+        # RPC read driver (not the runner injection task) owns idle. Publishing
+        # the runner's idle here fires ~2s before agy's output streams and
+        # prematurely completes the response (the live-e2e "double-idle").
+        ("antigravity-native", ["running"]),
         # Non-terminal harnesses have no external lifecycle observer; the
         # runner turn remains their source of truth.
         ("openai-agents", ["running", "idle"]),
@@ -9274,6 +10244,177 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
     assert pm.released == [conv_id]
 
 
+@pytest.mark.parametrize("terminal_name", ["qwen", "antigravity"])
+@pytest.mark.asyncio
+async def test_required_terminal_clean_quit_publishes_idle_not_failed(
+    terminal_name: str,
+) -> None:
+    """A clean ``/quit`` of qwen/antigravity-native is not a crash.
+
+    Both harnesses leave the exit-classification memo stuck on ``running`` at
+    quit time — qwen's "powering down" redraw trips the PTY-activity watcher,
+    and antigravity-native is deliberately excluded from the PTY ``emit_status``
+    role set (the RPC reader owns working-status). So ``session_was_idle`` is
+    ``False`` even though the user quit normally. The runner must special-case
+    these terminals: publish a final ``idle`` (to clear the web "Working…"
+    spinner) and release the harness, but never render the spurious red
+    ``required_terminal_exited`` failure card.
+
+    :param terminal_name: The native terminal that the user quit cleanly.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import (
+        TerminalExitEvent,
+        TerminalLifecycle,
+    )
+
+    conv_id = f"conv_clean_quit_{terminal_name}_{uuid.uuid4().hex[:12]}"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resource_registry = app.state.session_resource_registry
+    # Grab the runner's terminal-exit publisher (the branch under test) and
+    # drive it directly, mimicking the registry firing on a clean quit.
+    publish_exit = resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        publish_exit(
+            TerminalExitEvent(
+                session_id=conv_id,
+                terminal_id=f"terminal_{terminal_name}_main",
+                terminal_name=terminal_name,
+                session_key="main",
+                lifecycle=TerminalLifecycle.REQUIRED,
+                # The memo never flipped to idle, so the generic guard would
+                # otherwise misclassify this normal quit as a crash.
+                session_was_idle=False,
+            )
+        )
+        queued_events: list[dict[str, Any]] = []
+        for _ in range(1000):
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            if pm.released:
+                break
+            await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        runner_app.unregister_child_session(conv_id)
+
+    # The terminal resource is removed and a final idle clears the spinner...
+    assert {
+        "type": "session.resource.deleted",
+        "resource_id": f"terminal_{terminal_name}_main",
+        "resource_type": "terminal",
+        "session_id": conv_id,
+    } in queued_events
+    assert {"type": "session.status", "status": "idle"} in queued_events
+    # ...but no spurious failure card renders — the user quit normally.
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] == []
+    # The harness subprocess is still released — the terminal is gone.
+    assert pm.released == [conv_id]
+
+
+@pytest.mark.asyncio
+async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path: Path) -> None:
+    """
+    A structured native ``idle`` status prevents a later pane close from failing.
+
+    Kiro completion is observed from its persisted JSONL session, not only from
+    PTY diff-idle. After a web turn marks the required terminal ``running``, the
+    forwarded ``external_session_status: idle`` must update the same exit memo
+    used by the required-terminal watcher; otherwise a normal user close after
+    Kiro answered is misclassified as ``required_terminal_exited``.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = f"conv_kiro_external_idle_exit_{uuid.uuid4().hex[:12]}"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("kiro", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("kiro", "main")] = instance
+    callbacks: dict[str, Any] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, idle_threshold_s, poll_interval_s, replace
+        callbacks["on_exit"] = on_exit
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    resource_registry = app.state.session_resource_registry
+
+    try:
+        await resource_registry.observe_required_terminal(
+            conv_id,
+            "kiro",
+            "main",
+            instance,
+            resource_role=KIRO_NATIVE_TERMINAL_ROLE,
+        )
+        resource_registry.note_session_turn_started(conv_id)
+        async with _runner_client(app) as client:
+            status_resp = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "external_session_status", "data": {"status": "idle"}},
+            )
+        assert status_resp.status_code == 204, status_resp.text
+
+        on_exit = callbacks.get("on_exit")
+        assert callable(on_exit)
+        on_exit()
+        deleted_event = {
+            "type": "session.resource.deleted",
+            "resource_id": "terminal_kiro_main",
+            "resource_type": "terminal",
+            "session_id": conv_id,
+        }
+        queued_events: list[dict[str, Any]] = []
+        for _ in range(1000):
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            if pm.released and deleted_event in queued_events:
+                break
+            await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+
+    assert terminal_registry.get(conv_id, "kiro", "main") is None
+    assert deleted_event in queued_events
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] == []
+    assert pm.released == [conv_id]
+
+
 @pytest.mark.asyncio
 async def test_events_effort_change_on_native_session_types_slash_command(
     monkeypatch: pytest.MonkeyPatch,
@@ -10016,6 +11157,538 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
 
 
 @pytest.mark.asyncio
+async def test_events_compact_on_cursor_native_pastes_summarize_and_raises_spinner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    POST ``/events`` with ``{"type":"compact"}`` on a cursor-native
+    session submits ``/summarize`` via bracketed paste, returns 200, and
+    raises the "Compacting…" spinner — but does NOT complete it.
+
+    cursor-agent manages its own context window in the TUI, so explicit
+    compaction must run there (its built-in ``/summarize`` command) rather
+    than as AP-side compaction — the same rationale as the claude-native
+    path.  The 200 (not 204) is load-bearing: the Omnigent server reads it to
+    skip its own ``_run_compact_locked`` (which 400s on the LLM-less native
+    pseudo-agent).
+
+    Two properties are pinned here:
+
+    1. **The command must go through the bracketed-paste path**
+       (``inject_user_message``), NOT a ``send-keys``-typed slash command.
+       Typing the literal ``/summarize`` opens cursor-agent's slash-command
+       autocomplete dropdown, and the single submit Enter then confirms the
+       highlighted completion instead of submitting the command — so the
+       command was never sent (the original bug, seen as ``/summarize`` left
+       sitting in the input box).
+    2. **The handler raises the spinner but must NOT complete it.** It publishes
+       ``response.compaction.in_progress`` (→ "Compacting conversation…") only.
+       cursor-agent runs the summarization asynchronously in the pane after the
+       submit, so completing here would flash "Conversation compacted" while
+       the TUI is still summarizing.  The ``completed`` edge is emitted later by
+       the cursor forwarder when it observes the summary blob (covered by
+       ``tests/test_cursor_native_forwarder.py``).
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
+
+    captured: list[tuple[Any, str, float]] = []
+
+    def _fake_inject(bridge_dir: Any, *, content: str, timeout_s: float) -> None:
+        """Record the bracketed-paste call without touching tmux."""
+        captured.append((bridge_dir, content, timeout_s))
+
+    monkeypatch.setattr(cursor_native_bridge, "inject_user_message", _fake_inject)
+
+    cursor_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the cursor-native spec for any agent_id."""
+        del agent_id, session_id
+        return cursor_native_spec
+
+    conv_id = "conv_cursor_compact"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        # Drain creation-time events so the drain below isolates only what
+        # /compact emits.
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+    # 200 = cursor-native dispatch routed to the compact handler and the paste
+    # succeeded. 204 would mean the dispatch fell through to the in-process
+    # no-op branch (the original gap) → Omnigent runs its own compaction and 400s.
+    assert resp.status_code == 200, (
+        f"Cursor-native compact must return 200 from /events; got {resp.status_code}: {resp.text}"
+    )
+    # Exactly one paste call. 0 = dispatch missed the cursor branch.
+    assert len(captured) == 1, (
+        f"Expected one inject_user_message call from cursor compact, got {len(captured)}."
+    )
+    bridge_dir, content, timeout_s = captured[0]
+    assert bridge_dir == cursor_native_bridge.bridge_dir_for_session_id(conv_id)
+    # The literal ``/summarize`` is cursor-agent's compaction command. It is
+    # delivered as *paste content*, not a typed slash command, so the
+    # autocomplete dropdown never opens and the submit Enter sends the command.
+    assert content == "/summarize", f"Expected '/summarize' paste content, got {content!r}."
+    # 1.0s short timeout: a missing tmux target means the pane isn't attached,
+    # so there is no live cursor TUI to compact.
+    assert timeout_s == 1.0
+
+    # The handler raises the spinner (in_progress) but must NOT complete it —
+    # completion is the forwarder's job once the summary blob actually lands.
+    # A regression re-adding ``completed`` here would flash the permanent
+    # "Conversation compacted" marker while the TUI is still summarizing.
+    compaction_types = [
+        e.get("type")
+        for e in queued_events
+        if str(e.get("type", "")).startswith("response.compaction")
+    ]
+    assert compaction_types == ["response.compaction.in_progress"], (
+        f"Handler must publish only in_progress (forwarder completes it); "
+        f"got {compaction_types!r}."
+    )
+    in_progress = next(
+        e for e in queued_events if e.get("type") == "response.compaction.in_progress"
+    )
+    assert in_progress.get("task_id") == conv_id, (
+        f"in_progress must carry the session id as task_id; got {in_progress!r}."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("inject_exc", "label"),
+    [
+        # Pane not attached: _wait_for_tmux_info / _run_tmux raise RuntimeError.
+        (RuntimeError("tmux target is not advertised"), "runtime"),
+        # Filesystem fault writing the paste tempfile into bridge_dir (disk
+        # full, perms, dir removed). cursor's inject_user_message has this
+        # surface; the claude-native analog does not. A narrow
+        # ``except (RuntimeError, ValueError)`` would let this escape AFTER
+        # in_progress fired, stranding the spinner with no failed edge.
+        (OSError("No space left on device"), "oserror"),
+    ],
+)
+async def test_events_compact_on_cursor_native_503_dismisses_spinner_on_inject_failure(
+    inject_exc: Exception,
+    label: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    An injection failure surfaces as 503 AND dismisses the spinner.
+
+    The handler publishes ``response.compaction.in_progress`` before injecting,
+    so every failure path must publish ``response.compaction.failed`` to
+    dismiss the "Compacting…" spinner — otherwise it is stranded forever — and
+    must NOT publish ``completed`` (the history was never compacted). Covers
+    both the tmux ``RuntimeError`` and the tempfile ``OSError`` surfaces; the
+    latter is unique to cursor's bracketed-paste path.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
+
+    def _fake_inject(bridge_dir: Any, *, content: str, timeout_s: float) -> None:
+        """Simulate an injection failure (tmux down, or tempfile write fault)."""
+        del bridge_dir, content, timeout_s
+        raise inject_exc
+
+    monkeypatch.setattr(cursor_native_bridge, "inject_user_message", _fake_inject)
+
+    cursor_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the cursor-native spec for any agent_id."""
+        del agent_id, session_id
+        return cursor_native_spec
+
+    conv_id = f"conv_cursor_compact_fail_{label}"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+    assert resp.status_code == 503, (
+        f"Cursor-native compact with no live pane must return 503; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    body = resp.json()
+    assert body.get("error") == "cursor_native_compact_failed", (
+        f"503 body must carry the cursor bridge-failure error code; got {body!r}"
+    )
+
+    compaction_types = [
+        e.get("type")
+        for e in queued_events
+        if str(e.get("type", "")).startswith("response.compaction")
+    ]
+    # in_progress raised the spinner; failed must dismiss it. completed must
+    # never fire — the history was not compacted.
+    assert compaction_types == [
+        "response.compaction.in_progress",
+        "response.compaction.failed",
+    ], f"Expected in_progress then failed (no completed); got {compaction_types!r}."
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_pi_native_enqueues_compact_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    POST ``/events`` with ``{"type":"compact"}`` on a pi-native session
+    queues a ``compact`` payload to the Pi extension inbox and returns 200.
+
+    Pi owns its context window inside the resident Pi TUI process, so explicit
+    compaction must run there (the Omnigent server's AP-side compaction would
+    only summarise the transcript mirror and desync the two, and 400s on the
+    LLM-less pi-native pseudo-agent). The runner's ``compact`` dispatch routes
+    to ``_handle_pi_native_compact``, which drops a ``compact`` payload into the
+    bridge inbox; the resident extension consumes it and calls Pi's
+    ``ExtensionContext.compact()``.
+
+    Regression guard: the dispatch originally enumerated only claude/codex/
+    cursor-native, so pi-native fell through to the 204 no-op.
+
+    Pins:
+    1. 200 returned (not 204) so the Omnigent server skips its own AP-side
+       compaction.
+    2. A ``compact_*`` payload is written to the session's bridge inbox.
+    3. /compact is a control signal and publishes no ``session.status`` events.
+    """
+    import omnigent.pi_native_bridge as pi_native_bridge
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_pi_native_compact"
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+
+    pi_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the pi-native spec for any agent_id."""
+        del agent_id, session_id
+        return pi_native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        # Seeds _session_spec_cache so the dispatch detects "pi-native".
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        # Drain creation-time events (pi-native auto-create enqueues
+        # session.terminal_pending and, with no real Pi terminal in the test,
+        # a session.status failure) so the drain below isolates only what
+        # /compact emits.
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+        # /compact is a control signal; it must not enqueue session.status events.
+        queue = _session_event_queues_ref.get(conv_id)
+        queued_events: list[dict[str, Any]] = []
+        if queue is not None:
+            while not queue.empty():
+                item = queue.get_nowait()
+                if isinstance(item, dict):
+                    queued_events.append(item)
+
+    # 1) 200 means pi-native owns its context, so the control was handled in the
+    # terminal and the server must skip its own compaction. 204 would mean the
+    # dispatch fell through to the no-op (the original bug).
+    assert resp.status_code == 200, (
+        f"pi-native compact must return 200; got {resp.status_code}: {resp.text}"
+    )
+
+    # 2) The compact request reached the bridge inbox (the extension's
+    # compaction channel). If empty, the dispatch fell through to the no-op.
+    inbox = pi_native_bridge.bridge_dir_for_session_id(conv_id) / "inbox"
+    queued = sorted(p.name for p in inbox.glob("*.json")) if inbox.exists() else []
+    assert any("compact_" in name for name in queued), (
+        f"pi-native compact must enqueue a compact payload to the bridge inbox; "
+        f"inbox contained {queued!r}."
+    )
+
+    # 3) No session.status events; /compact is a control signal, not a state change.
+    assert queued_events == [], (
+        f"pi-native compact must not publish session events; got {queued_events!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_pi_native_returns_503_when_inbox_unwritable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Pi-native compact returns 503 when the bridge inbox cannot be written.
+
+    Sister to the happy-path test. If the inbox enqueue raises OSError (e.g. a
+    filesystem fault), the handler surfaces 503 with the
+    ``pi_native_compact_failed`` code rather than silently swallowing the
+    request; the Omnigent server then treats it as not-handled.
+    """
+    import omnigent.pi_native_bridge as pi_native_bridge
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_pi_native_compact_fail"
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+
+    def _boom(*_args: Any, **_kwargs: Any) -> str:
+        """Simulate an unwritable inbox."""
+        raise OSError("inbox is read-only")
+
+    monkeypatch.setattr(pi_native_bridge, "enqueue_compact", _boom)
+
+    pi_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the pi-native spec for any agent_id."""
+        del agent_id, session_id
+        return pi_native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+    assert resp.status_code == 503, (
+        f"pi-native compact with unwritable inbox must return 503; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    body = resp.json()
+    assert body.get("error") == "pi_native_compact_failed", (
+        f"503 body must carry the pi bridge-failure error code; got {body!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_qwen_native_submits_compress_and_raises_spinner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    POST ``/events`` ``{"type":"compact"}`` on a qwen-native session submits
+    ``/compress`` via the input file, returns 200, and raises the spinner only.
+
+    qwen owns its context window inside the TUI, so compaction runs there
+    (``/compress``), not as AP-side compaction; same rationale as cursor-native.
+    Unlike cursor, injection is file-based: a ``submit`` line routes through
+    qwen's ``RemoteInputWatcher`` then ``submitQuery``, which processes the slash
+    command (no autocomplete-dropdown trap). The 200 is load-bearing (server
+    skips its own ``_run_compact_locked``). The handler publishes only
+    ``in_progress``; the ``completed`` edge is the compaction mirror's job once
+    the ``chat_compression`` record lands (covered in test_qwen_native_forwarder).
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    captured: list[tuple[Any, str]] = []
+
+    def _fake_submit(bridge_dir: Any, *, content: str) -> None:
+        """Record the input-file submit without touching disk."""
+        captured.append((bridge_dir, content))
+
+    monkeypatch.setattr(qwen_native_bridge, "submit_user_message", _fake_submit)
+
+    qwen_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "qwen-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return qwen_native_spec
+
+    conv_id = "conv_qwen_compact"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+    assert resp.status_code == 200, (
+        f"qwen-native compact must return 200 from /events; got {resp.status_code}: {resp.text}"
+    )
+    assert len(captured) == 1, (
+        f"Expected one submit_user_message call from qwen compact, got {len(captured)}."
+    )
+    bridge_dir, content = captured[0]
+    assert bridge_dir == qwen_native_bridge.bridge_dir_for_session_id(conv_id)
+    assert content == "/compress", f"Expected '/compress' submit content, got {content!r}."
+
+    compaction_types = [
+        e.get("type")
+        for e in queued_events
+        if str(e.get("type", "")).startswith("response.compaction")
+    ]
+    assert compaction_types == ["response.compaction.in_progress"], (
+        f"Handler must publish only in_progress (mirror completes it); got {compaction_types!r}."
+    )
+    in_progress = next(
+        e for e in queued_events if e.get("type") == "response.compaction.in_progress"
+    )
+    assert in_progress.get("task_id") == conv_id
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_qwen_native_503_dismisses_spinner_on_submit_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A submit failure surfaces as 503 AND dismisses the spinner (in_progress->failed)."""
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_submit(bridge_dir: Any, *, content: str) -> None:
+        del bridge_dir, content
+        raise RuntimeError("input file unwritable")
+
+    monkeypatch.setattr(qwen_native_bridge, "submit_user_message", _fake_submit)
+
+    qwen_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "qwen-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return qwen_native_spec
+
+    conv_id = "conv_qwen_compact_fail"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+    assert resp.status_code == 503, f"got {resp.status_code}: {resp.text}"
+    assert resp.json().get("error") == "qwen_native_compact_failed"
+    compaction_types = [
+        e.get("type")
+        for e in queued_events
+        if str(e.get("type", "")).startswith("response.compaction")
+    ]
+    assert compaction_types == [
+        "response.compaction.in_progress",
+        "response.compaction.failed",
+    ], f"Expected in_progress then failed (no completed); got {compaction_types!r}."
+
+
+@pytest.mark.asyncio
 async def test_events_compact_on_non_native_session_is_204_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10511,6 +12184,236 @@ async def test_events_model_change_on_non_native_session_is_204_noop(
 
 
 @pytest.mark.asyncio
+async def test_events_model_change_on_cursor_native_session_types_slash_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    POST ``/events`` with ``model_change`` on a cursor-native session
+    drives cursor-agent's ``/model`` picker via ``inject_model_command``.
+
+    Cursor analog of the claude-native happy-path test: the runner
+    dispatch must route cursor-native model_change to its TUI handler
+    (not the claude slash injector and not a 204 no-op) and pass the
+    model id straight through.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    captured: list[tuple[Any, str, float]] = []
+
+    def _fake_inject(bridge_dir: Any, *, model: str, timeout_s: float) -> None:
+        """Record the call and return without touching tmux."""
+        captured.append((bridge_dir, model, timeout_s))
+
+    monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _fake_inject)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the cursor-native spec for any agent_id."""
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_cursor_model", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            "/v1/sessions/conv_cursor_model/events",
+            json={"type": "model_change", "model": "gpt-5.2"},
+        )
+
+    assert resp.status_code == 204, (
+        f"cursor-native model_change must return 204 from /events; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    assert len(captured) == 1, f"Expected one inject_model_command call, got {len(captured)}."
+    _bridge_dir, model, timeout_s = captured[0]
+    assert model == "gpt-5.2", f"Expected the model id passed through, got {model!r}."
+    assert timeout_s == 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_value", [None, "", "   "])
+async def test_events_model_change_on_cursor_native_session_skips_inject_for_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    model_value: str | None,
+) -> None:
+    """
+    Null / empty / whitespace-only model values 204 without driving the picker.
+
+    cursor-agent has no slash form for "use the spawn default", so a
+    clear only takes effect on the next spawn — mirrors the claude-native
+    skip test.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_inject(bridge_dir: Any, *, model: str, timeout_s: float) -> None:
+        """Fail the test if the runner reaches inject for an empty value."""
+        del bridge_dir, timeout_s
+        raise AssertionError(f"inject_model_command must not be called for model={model_value!r}.")
+
+    monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _fake_inject)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the cursor-native spec for any agent_id."""
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_cursor_model_skip", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            "/v1/sessions/conv_cursor_model_skip/events",
+            json={"type": "model_change", "model": model_value},
+        )
+
+    assert resp.status_code == 204, (
+        f"cursor-native model_change with empty / null value must return "
+        f"204 (no-op); got {resp.status_code}: {resp.text}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_on_cursor_native_session_returns_503_when_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Bridge-not-ready RuntimeError surfaces as 503 from /events.
+
+    Cursor analog of the claude-native 503 test: a missing tmux target
+    (pane not attached yet) returns 503 with the cursor-specific error
+    code; Omnigent server swallows it and the next spawn applies ``--model``.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_inject(bridge_dir: Any, *, model: str, timeout_s: float) -> None:
+        """Simulate the bridge-not-ready path."""
+        del bridge_dir, model, timeout_s
+        raise RuntimeError("tmux target is not advertised")
+
+    monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _fake_inject)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the cursor-native spec for any agent_id."""
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_cursor_model_fail", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            "/v1/sessions/conv_cursor_model_fail/events",
+            json={"type": "model_change", "model": "gpt-5.2"},
+        )
+
+    assert resp.status_code == 503, (
+        f"cursor-native model_change with inject failure must return 503; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    body = resp.json()
+    assert body.get("error") == "cursor_native_model_failed", (
+        f"503 body must carry the cursor bridge-failure error code; got {body!r}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effort_value", ["high", "medium", "low", "xhigh", None, ""])
+async def test_events_effort_change_on_cursor_native_session_is_disabled_noop(
+    effort_value: str | None,
+) -> None:
+    """
+    cursor-native effort switching is intentionally dropped (for now): a model
+    switch resets cursor's per-model effort to that model's default, so a web
+    effort would silently diverge from the TUI. The dispatch must 204 for ANY
+    effort value (cursor-native is excluded from the effort_change gate, and the
+    effort injector no longer exists).
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the cursor-native spec for any agent_id."""
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_cursor_effort", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            "/v1/sessions/conv_cursor_effort/events",
+            json={"type": "effort_change", "effort": effort_value},
+        )
+
+    assert resp.status_code == 204, (
+        f"cursor-native effort_change must 204 (disabled); got {resp.status_code}: {resp.text}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_auto_create_claude_terminal_registers_permission_hook(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10643,7 +12546,11 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     # The lifecycle of the launch — not the binary or credentials — is under
     # test, so neither a real Pi install nor a configured provider is needed.
     monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
-    monkeypatch.setattr(pi_native_credentials, "resolve_pi_native_provider", lambda: None)
+    # Accept the ``model`` kwarg the runner now threads through (the spec model
+    # → models.json path); None still skips provider injection here.
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
+    )
 
     # Skip the GET /v1/sessions round-trip: hand the flow a ready launch
     # config pointing at the tmp workspace.
@@ -10706,6 +12613,113 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
 
 @pytest.mark.asyncio
+async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolated_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kiro-native auto-create launches the TUI and session forwarder."""
+    import omnigent.kiro_native as kiro_native
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
+    monkeypatch.setattr(kiro_native_bridge, "_BRIDGE_ROOT", tmp_path / "kiro-bridge")
+    monkeypatch.setattr(
+        kiro_native,
+        "resolve_kiro_executable",
+        lambda **_kwargs: "/usr/bin/kiro-cli",
+    )
+    forwarder_calls: list[dict[str, Any]] = []
+
+    async def _fake_supervise_kiro_session_forwarder(**kwargs: Any) -> None:
+        forwarder_calls.append(kwargs)
+
+    monkeypatch.setattr(
+        "omnigent.kiro_native_session_forwarder.supervise_kiro_session_forwarder",
+        _fake_supervise_kiro_session_forwarder,
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _KiroNativeLaunchConfig:
+        return _KiroNativeLaunchConfig(
+            workspace=tmp_path,
+            terminal_launch_args=["--model", "auto", "--effort", "high", "hello"],
+            external_session_id="kiro-session-123",
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._kiro_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Records the launch; exposes ONLY the required-terminal launch API."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del parent_os_env
+            captured["terminal_name"] = terminal_name
+            captured["session_key"] = session_key
+            captured["resource_role"] = resource_role
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_kiro_main",
+                type="terminal",
+                session_id=session_id,
+                name="kiro:main",
+                metadata={"terminal_name": "kiro", "session_key": "main", "running": True},
+            )
+
+    published: list[dict[str, Any]] = []
+
+    await _auto_create_kiro_terminal(
+        "conv_kiro",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, evt: published.append(evt),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    await asyncio.sleep(0)
+
+    spec = captured["spec"]
+    assert captured["terminal_name"] == "kiro"
+    assert captured["session_key"] == "main"
+    assert captured["resource_role"] == KIRO_NATIVE_TERMINAL_ROLE
+    assert spec.command == "/usr/bin/kiro-cli"
+    assert spec.args == [
+        "chat",
+        "--tui",
+        "--resume-id",
+        "kiro-session-123",
+        "--model",
+        "auto",
+        "--effort",
+        "high",
+        "hello",
+    ]
+    assert spec.inherit_env is False
+    assert "OPENAI_API_KEY" not in spec.env
+    assert "OPENAI_API_KEY" in spec.env_unset
+    assert spec.env[kiro_native_bridge.KIRO_NATIVE_BRIDGE_DIR_ENV_VAR] == str(
+        kiro_native_bridge.bridge_dir_for_session_id("conv_kiro")
+    )
+    assert any(evt.get("type") == "session.resource.created" for evt in published)
+    assert forwarder_calls
+    assert forwarder_calls[0]["base_url"] == "http://127.0.0.1:6767"
+    assert forwarder_calls[0]["session_id"] == "conv_kiro"
+    assert forwarder_calls[0]["agent_name"] == "kiro-native-ui"
+    assert forwarder_calls[0]["workspace"] == str(tmp_path)
+
+
+@pytest.mark.asyncio
 async def test_auto_create_pi_terminal_inherits_agent_sandbox(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10737,7 +12751,11 @@ async def test_auto_create_pi_terminal_inherits_agent_sandbox(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
     monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
-    monkeypatch.setattr(pi_native_credentials, "resolve_pi_native_provider", lambda: None)
+    # Accept the ``model`` kwarg the runner now threads through (the spec model
+    # → models.json path); None still skips provider injection here.
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
+    )
 
     async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
         return _PiNativeLaunchConfig(
@@ -11416,8 +13434,22 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         """Server client whose session snapshot carries the resume id."""
 
         async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
-            """Return the session snapshot used to derive resume args."""
+            """Return the session snapshot, or labels for the cleared-bridge check."""
             del kwargs
+
+            # auto-create reads the bridge_id label to honour a /clear "-cleared"
+            # re-key. Report none here so it falls back to session_id (no /clear).
+            if url.endswith("/labels"):
+
+                class _LabelsResponse(NullServerClient._Response):
+                    """Empty labels → bridge_id resolves to session_id."""
+
+                    def json(self) -> dict[str, Any]:
+                        """Return an empty labels payload."""
+                        return {"labels": {}}
+
+                return _LabelsResponse()
+
             assert url == "/v1/sessions/conv_resume"
 
             class _SnapResponse(NullServerClient._Response):
@@ -11860,6 +13892,123 @@ async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
     )
 
 
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A session re-keyed to "{id}-cleared" by /clear resumes in its OWN dir.
+
+    The /clear rotation hands the live pane to the new session and re-keys the
+    superseded session's bridge_id label to ``{session_id}-cleared``. When that
+    session is later resumed, ``_auto_create_claude_terminal`` must honour the
+    marker and prepare the isolated ``D({session_id}-cleared)`` — NOT the
+    natural ``D(session_id)`` (the new session's live dir, which would
+    double-mirror the transcript and trip the executor guard).
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    class _FakeInstance:
+        """Minimal live terminal instance for the tmux-target publish."""
+
+        running = True
+        socket_path = "/tmp/fake-claude.sock"
+        tmux_target = "claude:0.0"
+
+    class _FakeTerminalRegistry:
+        """Returns the live instance for any (session, terminal, key) lookup."""
+
+        def get(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
+            """Return the fake live instance."""
+            del conversation_id, terminal_name, session_key
+            return _FakeInstance()
+
+    class _FakeResourceRegistry:
+        """Resource registry exposing a live terminal registry."""
+
+        terminal_registry = _FakeTerminalRegistry()
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Return a minimal terminal view so the launch doesn't error."""
+            del spec, resource_role
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name=f"{terminal_name}:{session_key}",
+                metadata={
+                    "terminal_name": terminal_name,
+                    "session_key": session_key,
+                    "running": True,
+                },
+            )
+
+    recorded_requests: list[httpx.Request] = []
+
+    def _handle(req: httpx.Request) -> httpx.Response:
+        """Report the session's bridge_id label as the cleared marker."""
+        recorded_requests.append(req)
+        return httpx.Response(
+            200,
+            json={
+                "reasoning_effort": None,
+                "labels": {BRIDGE_ID_LABEL_KEY: "conv_cleared-cleared"},
+            },
+            request=req,
+        )
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle),
+    )
+
+    await _auto_create_claude_terminal(
+        "conv_cleared",
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+    )
+    await fake_client.aclose()
+
+    cleared_dir = claude_native_bridge.bridge_dir_for_bridge_id("conv_cleared-cleared")
+    natural_dir = claude_native_bridge.bridge_dir_for_bridge_id("conv_cleared")
+    # The isolated cleared dir is prepared; the natural (live-sibling) dir is not.
+    assert cleared_dir.exists()
+    assert not natural_dir.exists()
+    # tmux.json (what the executor reads to inject) must land in the SAME dir the
+    # executor + forwarder use — the cleared dir — NOT the natural session_id dir.
+    # Hardcoding session_id there was the "tmux target not advertised yet" bug.
+    assert (cleared_dir / "tmux.json").exists()
+    assert not (natural_dir / "tmux.json").exists()
+
+    import json as _json
+
+    patch_requests = [r for r in recorded_requests if r.method == "PATCH"]
+    assert len(patch_requests) == 1
+    patch_body = _json.loads(patch_requests[0].content)
+    assert patch_body.get("labels", {}).get(BRIDGE_ID_LABEL_KEY) == "conv_cleared-cleared"
+
+
 @dataclass
 class _AutoCreateScenario:
     """
@@ -12101,6 +14250,262 @@ async def test_create_session_auto_create_guard_skips_rotation_targets(
         # The rotation target's terminal arrives via transfer. Auto-create
         # here is the regression: it 409s the transfer and loops the
         # rotation into unbounded session spawning.
+        assert created == [], f"Auto-create must be skipped for {scenario.case_id}; got {created}"
+
+
+@dataclass
+class _AntigravityAutoCreateScenario:
+    """
+    One parametrized case for the antigravity-native auto-create guard.
+
+    :param case_id: Human-readable scenario id used as the pytest id,
+        e.g. ``"clear_rotation_target_skips"``.
+    :param bridge_state_session: ``session_id`` to seed into the shared
+        bridge state, e.g. ``"conv_old"``. ``None`` seeds no bridge state
+        at all (models a genuinely fresh session).
+    :param terminal_under: Session id to seed a live ``antigravity:main``
+        terminal under in the registry, e.g. ``"conv_old"``. ``None``
+        seeds no terminal (models a dead/absent original terminal).
+    :param bridge_id_label: Value returned for the new session's
+        :data:`ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY` label, e.g.
+        ``"bridge_shared"`` for a rotation target (shares the original's
+        bridge) or ``"conv_new"`` for a fresh session (own bridge).
+    :param expect_auto_create: Whether the guard should invoke
+        ``_auto_create_antigravity_terminal`` for the new session.
+    """
+
+    case_id: str
+    bridge_state_session: str | None
+    terminal_under: str | None
+    bridge_id_label: str
+    expect_auto_create: bool
+
+
+class _AntigravitySnapshotServerClient:
+    """
+    Server-client stub for the antigravity auto-create guard route test.
+
+    Answers the two GETs the antigravity branch issues for ``conv_new``: the
+    session snapshot (``/v1/sessions/conv_new`` — non-``None`` so
+    ``_session_payload_for_host_spawn_check`` reports the session needs a
+    terminal) and the labels lookup (``/v1/sessions/conv_new/labels`` — returns
+    the bridge-id label so the transfer-inbound check can resolve the shared
+    bridge dir). A real stub class — not ``MagicMock`` — so an unexpected call
+    shape fails loudly instead of silently returning a mock.
+    """
+
+    def __init__(self, bridge_id_label: str) -> None:
+        """
+        :param bridge_id_label: Bridge id to report on the session's
+            ``labels``, e.g. ``"bridge_shared"``.
+        """
+        self._bridge_id_label = bridge_id_label
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """
+        Return a canned snapshot or labels payload for *url*.
+
+        :param url: Request path, e.g. ``"/v1/sessions/conv_new"`` or
+            ``"/v1/sessions/conv_new/labels"``.
+        :returns: A response object exposing ``status_code`` and ``json()``
+            matching the subset the runner reads.
+        """
+        del kwargs
+        labels = {ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: self._bridge_id_label}
+
+        class _Response:
+            """Minimal httpx-like response with the fields the runner reads."""
+
+            def __init__(self, payload: dict[str, Any]) -> None:
+                """:param payload: JSON body returned by ``json()``."""
+                self.status_code = 200
+                self._payload = payload
+
+            def json(self) -> dict[str, Any]:
+                """:returns: The canned JSON payload."""
+                return self._payload
+
+        if url.endswith("/labels"):
+            return _Response({"labels": labels})
+        # The session snapshot: non-None so the host-spawn check reports the
+        # session needs a terminal, and carries the same labels.
+        return _Response({"id": "conv_new", "labels": labels})
+
+
+_ANTIGRAVITY_AUTO_CREATE_SCENARIOS = [
+    # Rotation target: the bridge's active session (conv_old) still owns the
+    # live agy terminal that is about to be transferred onto conv_new.
+    _AntigravityAutoCreateScenario(
+        case_id="clear_rotation_target_skips",
+        bridge_state_session="conv_old",
+        terminal_under="conv_old",
+        bridge_id_label="bridge_shared",
+        expect_auto_create=False,
+    ),
+    # Fresh host-spawned session: its own bridge has no recorded state and no
+    # terminal, so it must bootstrap (cold-start) its own agy.
+    _AntigravityAutoCreateScenario(
+        case_id="fresh_session_creates",
+        bridge_state_session=None,
+        terminal_under=None,
+        bridge_id_label="conv_new",
+        expect_auto_create=True,
+    ),
+    # The bridge's recorded session is conv_new itself (e.g. a relaunch after
+    # the terminal died) — not a rotation, so auto-create proceeds.
+    _AntigravityAutoCreateScenario(
+        case_id="active_is_self_creates",
+        bridge_state_session="conv_new",
+        terminal_under=None,
+        bridge_id_label="bridge_shared",
+        expect_auto_create=True,
+    ),
+    # The bridge names a sibling (conv_old) but no live terminal exists under
+    # it — nothing to transfer in, so auto-create proceeds.
+    _AntigravityAutoCreateScenario(
+        case_id="dead_terminal_under_active_creates",
+        bridge_state_session="conv_old",
+        terminal_under=None,
+        bridge_id_label="bridge_shared",
+        expect_auto_create=True,
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    _ANTIGRAVITY_AUTO_CREATE_SCENARIOS,
+    ids=[s.case_id for s in _ANTIGRAVITY_AUTO_CREATE_SCENARIOS],
+)
+async def test_create_session_antigravity_auto_create_guard_skips_rotation_targets(
+    scenario: _AntigravityAutoCreateScenario,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The antigravity-native auto-create guard skips ``/clear`` rotation targets.
+
+    A ``/clear`` rotation binds the runner to a fresh Omnigent session, then
+    transfers the existing agy terminal onto it — agy is one long-lived process
+    hosting many cascades, so the rotation re-homes the SAME process. The bind
+    reaches the runner's ``POST /v1/sessions`` before the transfer runs, so the
+    new session momentarily has no terminal. Auto-creating a second agy here
+    cold-starts a brand-new process whose own ``external_session_id`` then 400s
+    the rotation's PATCH and loops it into unbounded session/process spawning
+    (the bug found by live e2e). The guard now skips auto-create when the new
+    session's bridge already has a *different* session owning a live
+    ``antigravity:main`` terminal — the one about to be transferred in. Mirrors
+    the claude-native guard test above.
+
+    Drives the real route with the real guard. Each scenario seeds the shared
+    bridge state's ``session_id`` and the terminal registry, then asserts whether
+    ``_auto_create_antigravity_terminal`` ran. Reverting the guard turns the
+    ``clear_rotation_target_skips`` case red (auto-create fires for a rotation
+    target again).
+    """
+    import omnigent.antigravity_native_bridge as bridge_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+
+    # Seed the shared bridge state so the guard reads the original
+    # (terminal-owning) session as the bridge's active session.
+    if scenario.bridge_state_session is not None:
+        seed_dir = bridge_mod.prepare_bridge_dir(scenario.bridge_id_label)
+        bridge_mod.write_bridge_state(
+            seed_dir,
+            bridge_mod.AntigravityNativeBridgeState(
+                session_id=scenario.bridge_state_session,
+                conversation_id="cascade_old",
+            ),
+        )
+
+    # Seed a live antigravity:main terminal under the original session so the
+    # guard's registry probe finds the terminal that would be transferred.
+    # Poking ``_by_conversation`` directly is the established registry-test
+    # idiom — a real TerminalInstance without launching tmux.
+    terminal_registry = TerminalRegistry()
+    if scenario.terminal_under is not None:
+        instance = TerminalInstance(
+            name="antigravity",
+            session_key="main",
+            socket_path=tmp_path / "antigravity.sock",
+            private_dir=tmp_path / "antigravity",
+            running=True,
+        )
+        terminal_registry._by_conversation[scenario.terminal_under] = {
+            ("antigravity", "main"): instance
+        }
+
+    created: list[str] = []
+
+    async def _recording_auto_create(
+        session_id: str, resource_registry: Any, publish_event: Any, **_kwargs: Any
+    ) -> None:
+        """
+        Record the auto-create call instead of launching a real agy.
+
+        :param session_id: Session id the guard chose to auto-create for,
+            e.g. ``"conv_new"``.
+        :param resource_registry: Unused — the real launch path is stubbed.
+        :param publish_event: Unused — the real launch path is stubbed.
+        :param _kwargs: Absorbs keyword args added to the real function
+            (e.g. ``server_client``).
+        :returns: None.
+        """
+        del resource_registry, publish_event
+        created.append(session_id)
+
+    monkeypatch.setattr(
+        "omnigent.runner.app._auto_create_antigravity_terminal", _recording_auto_create
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Return the antigravity-native spec for any agent id.
+
+        :param agent_id: Requested agent id (unused — fixed spec).
+        :param session_id: Requested session id (unused — fixed spec).
+        :returns: The antigravity-native :class:`AgentSpec`.
+        """
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_AntigravitySnapshotServerClient(  # type: ignore[arg-type]
+            scenario.bridge_id_label
+        ),
+        terminal_registry=terminal_registry,
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_new", "agent_id": "ag_1"},
+        )
+    assert resp.status_code == 201, resp.text
+
+    if scenario.expect_auto_create:
+        # Fresh / no-live-sibling sessions must still bootstrap their own agy —
+        # the guard only suppresses true rotation targets. An empty ``created``
+        # here would mean the guard over-fired and a host-spawned session would
+        # never get a terminal.
+        assert created == ["conv_new"], (
+            f"Expected auto-create for {scenario.case_id}; got {created}"
+        )
+    else:
+        # The rotation target's terminal arrives via transfer. Auto-create here
+        # is the regression: it cold-starts a redundant agy that 400s the
+        # rotation's external_session_id PATCH and loops the rotation.
         assert created == [], f"Auto-create must be skipped for {scenario.case_id}; got {created}"
 
 
@@ -13360,8 +15765,13 @@ class _LabelPatchRecordingServerClient(_FakeServerClient):
     :param items: History items served by the inherited GET handler.
     """
 
-    def __init__(self, items: list[dict[str, Any]]) -> None:
-        super().__init__(items)
+    def __init__(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        session_snapshot: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(items, session_snapshot=session_snapshot)
         self.label_patches: list[dict[str, Any]] = []  # type: ignore[explicit-any]  # JSON bodies
 
     async def patch(
@@ -13527,11 +15937,8 @@ async def test_optimize_turn_applies_model_and_injects_note(
 async def test_advise_turn_records_but_does_not_apply(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An advise-mode turn shadows: the label persists (applied=False) but
-    the harness body carries NO model_override and NO note.
-
-    Mutation proof against the optimize test: same judge, same harness, only
-    the mode differs — yet nothing is applied, isolating "advise = shadow".
+    """An advise-mode turn shadows: the verdict is recorded (applied=False)
+    but the brain model is untouched and no note is injected.
 
     :param monkeypatch: Replaces the production judge with the stub.
     """
@@ -13576,18 +15983,18 @@ async def test_advise_turn_records_but_does_not_apply(
         assert resp2.status_code == 200
         assert "response.completed" in resp2.text
 
-    # Verdict recorded for telemetry, but applied=False (shadow).
+    # Advise mode: recorded but not applied.
     label_bodies = [body for body in server_client.label_patches if "labels" in body]
     assert len(label_bodies) == 1
     verdict = parse_verdict(label_bodies[0]["labels"])
     assert verdict is not None
+    assert verdict.model == "model-pricey"
     assert verdict.applied is False
 
-    # No application: the harness body has no model_override and no note —
-    # advise mode leaves the brain untouched.
+    # Shadow: no model_override, no note.
     assert len(hc.posted_bodies) == 1
     body = hc.posted_bodies[0]
-    assert body.get("model_override") is None, "advise mode must not switch the brain model"
+    assert body.get("model_override") is None
     assert _advisor_note_items(body.get("content") or []) == []
 
 

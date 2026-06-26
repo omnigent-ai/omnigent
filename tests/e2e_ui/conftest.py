@@ -35,6 +35,8 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -52,10 +54,18 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
+from tests.codex_parity.sidecar_harness import (
+    CodexResponsesSidecar,
+    build_sidecar_bin,
+    start_codex_responses_sidecar,
+)
 from tests.e2e_ui.url_safety import DEV_PORTS, unsafe_ui_base_url_reason
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ALLOW_DEV_BASE_URL_ENV = "OMNIGENT_E2E_ALLOW_DEV_BASE_URL"
+_CODEX_GOAL_MIN_VERSION = (0, 139, 0)
+_PUBLIC_LOOPBACK_HOST = "omnigent-e2e-public.test"
 
 
 def open_right_rail(page: Page) -> None:
@@ -260,6 +270,10 @@ def browser_type_launch_args(
         launch_args["headless"] = True
     elif not pytestconfig.getoption("--headed", default=False):
         launch_args.setdefault("headless", True)
+    launch_args["args"] = [
+        *launch_args.get("args", []),
+        f"--host-resolver-rules=MAP {_PUBLIC_LOOPBACK_HOST} 127.0.0.1",
+    ]
     # The pinned Playwright Docker image (the visual-snapshot renderer, both in
     # ui-snapshot.yml and the local regen script) runs as root, where Chromium
     # refuses to start without --no-sandbox; --disable-dev-shm-usage avoids the
@@ -547,6 +561,22 @@ def set_fallback_mock_llm(
         timeout=5.0,
     )
     resp.raise_for_status()
+
+
+def _codex_cli_supports_goal_mode(codex_path: str) -> bool:
+    """Return whether the installed Codex CLI has app-server goal APIs."""
+    version = subprocess.run(
+        [codex_path, "--version"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if version.returncode != 0:
+        return False
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", f"{version.stdout}\n{version.stderr}")
+    if not match:
+        return False
+    return tuple(int(part) for part in match.groups()) >= _CODEX_GOAL_MIN_VERSION
 
 
 @pytest.fixture(scope="session")
@@ -2273,6 +2303,220 @@ def native_codex_mock_session(
                 respawned.wait(timeout=5)
 
 
+@dataclass(frozen=True)
+class MockedCodexNativeSession:
+    """Session handle for native Codex e2e tests with mocked Responses API."""
+
+    base_url: str
+    session_id: str
+    sidecar: CodexResponsesSidecar
+
+
+def _write_mock_codex_provider_config(config_home: Path, base_url: str) -> None:
+    """Write provider config that routes native Codex to the sidecar."""
+    config_home.mkdir(parents=True, exist_ok=True)
+    (config_home / "config.yaml").write_text(
+        f"""\
+providers:
+  codex-e2e-mock:
+    kind: key
+    default: openai
+    openai:
+      base_url: "{base_url}"
+      api_key: "sk-e2e-mock"
+      wire_api: responses
+      models:
+        default: mock-model
+""",
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def mocked_native_codex_goal_session(
+    built_spa: None,
+    tmp_path_factory: pytest.TempPathFactory,
+    request: pytest.FixtureRequest,
+) -> Iterator[MockedCodexNativeSession]:
+    """Spawn native Codex against Codex's mock Responses sidecar.
+
+    This intentionally does not reuse the session-scoped ``live_server``:
+    native Codex reads provider config and bridge roots in subprocesses, so
+    the mock ``OMNIGENT_CONFIG_HOME`` / ``HOME`` / source ``CODEX_HOME`` must
+    be present before the AP server and runner start. Keeping a dedicated
+    server prevents those mock-only env vars from affecting unrelated UI tests
+    in the same shard.
+    """
+    if request.config.getoption("--ui-base-url"):
+        pytest.skip("mocked native Codex goal e2e requires an isolated spawned server")
+
+    codex_path = shutil.which("codex")
+    if codex_path is None:
+        pytest.skip("codex CLI is required for mocked native Codex goal e2e")
+    if not _codex_cli_supports_goal_mode(codex_path):
+        pytest.skip("codex CLI >= 0.139.0 is required for app-server goal APIs")
+
+    try:
+        sidecar_bin = build_sidecar_bin()
+    except RuntimeError:
+        pytest.skip("cargo is required for Codex parity sidecar")
+
+    server_tmp = tmp_path_factory.mktemp("e2e_ui_codex_goal_server")
+    sidecar = start_codex_responses_sidecar(
+        sidecar_bin,
+        server_tmp / "responses.json",
+        [
+            [
+                ev_response_created("resp-goal-ui-bootstrap"),
+                ev_assistant_message("msg-goal-ui-bootstrap", "E2E_GOAL_BOOTSTRAP"),
+                ev_completed("resp-goal-ui-bootstrap"),
+            ]
+        ],
+    )
+
+    config_home = server_tmp / "config-home"
+    source_codex_home = server_tmp / "source-codex-home"
+    home_dir = server_tmp / "home"
+    state_dir = server_tmp / "codex-native-state"
+    artifact_dir = server_tmp / "artifacts"
+    for path in (source_codex_home, home_dir, state_dir, artifact_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    _write_mock_codex_provider_config(config_home, sidecar.base_url)
+
+    port = _find_free_port()
+    log_path = server_tmp / "server.log"
+    runner_log_path = server_tmp / "runner.log"
+    db_path = server_tmp / "test.db"
+    agent_yaml_path = server_tmp / "hello_world.yaml"
+    agent_yaml_path.write_text(_TEST_AGENT_YAML, encoding="utf-8")
+
+    import secrets as _secrets
+
+    from omnigent.runner.identity import token_bound_runner_id
+
+    binding_token = _secrets.token_urlsafe(32)
+    runner_id = token_bound_runner_id(binding_token)
+    base_url = f"http://127.0.0.1:{port}"
+    shared_env = {
+        **os.environ,
+        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+        "OMNIGENT_CONFIG_HOME": str(config_home),
+        "OMNIGENT_CODEX_NATIVE_STATE_DIR": str(state_dir),
+        "CODEX_HOME": str(source_codex_home),
+        "HOME": str(home_dir),
+    }
+    server_env = {
+        **shared_env,
+        "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
+    }
+    runner_env = {
+        **shared_env,
+        "OMNIGENT_RUNNER_ID": runner_id,
+        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
+        "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+        "RUNNER_SERVER_URL": base_url,
+    }
+
+    log_handle = open(log_path, "w")  # noqa: SIM115
+    runner_log_handle = open(runner_log_path, "w")  # noqa: SIM115
+    proc: subprocess.Popen[bytes] | None = None
+    runner_proc: subprocess.Popen[bytes] | None = None
+    session_id: str | None = None
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
+                + "from omnigent.cli import main; main()",
+                "server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--database-uri",
+                f"sqlite:///{db_path}",
+                "--artifact-location",
+                str(artifact_dir),
+                "--agent",
+                str(agent_yaml_path),
+            ],
+            env=server_env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        runner_proc = subprocess.Popen(
+            [sys.executable, "-m", "omnigent.runner._entry"],
+            env=runner_env,
+            stdout=runner_log_handle,
+            stderr=subprocess.STDOUT,
+        )
+
+        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
+        ready = False
+        last_error = "not polled yet"
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                last_error = f"process exited early with code {proc.returncode}"
+                break
+            if runner_proc.poll() is not None:
+                last_error = f"runner exited early with code {runner_proc.returncode}"
+                break
+            try:
+                resp = httpx.get(f"{base_url}/health", timeout=2)
+                if resp.status_code == 200:
+                    status_resp = httpx.get(
+                        f"{base_url}/v1/runners/{runner_id}/status",
+                        timeout=2,
+                    )
+                    if status_resp.status_code == 200 and status_resp.json()["online"] is True:
+                        ready = True
+                        break
+                    last_error = (
+                        f"runner status HTTP {status_resp.status_code}: {status_resp.text[:200]}"
+                    )
+                else:
+                    last_error = f"health HTTP {resp.status_code}: {resp.text[:200]}"
+            except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            time.sleep(_HEALTH_POLL_INTERVAL_S)
+
+        if not ready:
+            raise RuntimeError(
+                f"mocked Codex e2e server did not become healthy within "
+                f"{_HEALTH_TIMEOUT_S:.0f}s on {base_url} "
+                f"(last_error={last_error}).\n"
+                f"Server log at {log_path}:\n"
+                f"{log_path.read_text()[-3000:] if log_path.exists() else ''}\n"
+                f"Runner log at {runner_log_path}:\n"
+                f"{runner_log_path.read_text()[-3000:] if runner_log_path.exists() else ''}"
+            )
+
+        session_id = _create_native_codex_session(base_url, runner_id)
+        yield MockedCodexNativeSession(base_url=base_url, session_id=session_id, sidecar=sidecar)
+    finally:
+        if session_id is not None:
+            with contextlib.suppress(httpx.HTTPError):
+                httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+        if runner_proc is not None and runner_proc.poll() is None:
+            runner_proc.send_signal(signal.SIGTERM)
+            try:
+                runner_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                runner_proc.kill()
+                runner_proc.wait(timeout=5)
+        if proc is not None and proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        runner_log_handle.close()
+        log_handle.close()
+        sidecar.close()
+
+
 # ---------------------------------------------------------------------------
 # ``native_cursor_session`` is the sibling native-CLI fixture for the
 # ``cursor-native`` ("Cursor") wrapper: it spins up a real Cursor wrapper
@@ -2458,6 +2702,184 @@ def native_goose_session(
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     session_id = _create_native_goose_session(live_server, runner_id)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+def _create_native_kiro_session(base_url: str, runner_id: str) -> str:
+    """Register the ``kiro-native`` wrapper agent and bind its session.
+
+    Mirrors :func:`_create_native_goose_session`: reuses the terminal-first spec
+    ``omnigent kiro`` ships
+    (:func:`omnigent.kiro_native._materialize_kiro_agent_spec`) and stamps the
+    same wrapper / terminal-first labels. Binding triggers the runner's
+    kiro-native auto-bootstrap
+    (:func:`omnigent.runner.app._auto_create_kiro_terminal`), which launches the
+    ``kiro-cli`` TUI in the session terminal and starts the forwarder that mirrors
+    the TUI transcript back as conversation items.
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :returns: The new session/conversation id.
+    """
+    import json as _json
+    import tempfile
+
+    from omnigent._wrapper_labels import (
+        KIRO_NATIVE_WRAPPER_VALUE,
+        UI_MODE_LABEL_KEY,
+        UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY,
+    )
+    from omnigent.kiro_native import _materialize_kiro_agent_spec
+
+    with tempfile.TemporaryDirectory() as _tmp:
+        spec_path = _materialize_kiro_agent_spec(Path(_tmp), model=None)
+        yaml_text = spec_path.read_text()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = yaml_text.encode()
+        info = tarfile.TarInfo("kiro-native-ui.yaml")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    labels = {
+        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY: KIRO_NATIVE_WRAPPER_VALUE,
+    }
+    metadata = {
+        "labels": labels,
+        "workspace": str(_REPO_ROOT),
+    }
+    create = httpx.post(
+        f"{base_url}/v1/sessions",
+        data={"metadata": _json.dumps(metadata)},
+        files={"bundle": ("kiro-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
+        timeout=30.0,
+    )
+    create.raise_for_status()
+    session_id = str(create.json()["session_id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+@pytest.fixture
+def native_kiro_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the real ``kiro-native`` ("Kiro") wrapper.
+
+    The runner auto-launches the ``kiro-cli`` TUI in the session terminal on bind,
+    so the SPA's Terminal view attaches to a live Kiro TUI and its Chat view
+    renders the same canonical transcript. Drives the kiro render-parity suite.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_kiro_session(live_server, runner_id)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+def _create_native_hermes_session(base_url: str, runner_id: str) -> str:
+    """Register the ``hermes-native`` wrapper agent and bind its session.
+
+    Mirrors :func:`_create_native_goose_session`: reuses the exact terminal-first
+    spec ``omnigent hermes`` ships
+    (:func:`omnigent.hermes_native._materialize_hermes_agent_spec`) and stamps the
+    same wrapper / terminal-first labels. Binding triggers the runner's
+    hermes-native auto-bootstrap
+    (:func:`omnigent.runner.app._auto_create_hermes_terminal`), which launches the
+    ``hermes`` TUI in the session terminal and starts the forwarder that mirrors
+    the TUI transcript back as conversation items.
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :returns: The new session/conversation id.
+    """
+    import json as _json
+    import tempfile
+
+    from omnigent._wrapper_labels import (
+        HERMES_NATIVE_WRAPPER_VALUE,
+        UI_MODE_LABEL_KEY,
+        UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY,
+    )
+    from omnigent.hermes_native import _materialize_hermes_agent_spec
+
+    with tempfile.TemporaryDirectory() as _tmp:
+        spec_path = _materialize_hermes_agent_spec(Path(_tmp))
+        yaml_text = spec_path.read_text()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = yaml_text.encode()
+        info = tarfile.TarInfo("hermes-native-ui.yaml")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    labels = {
+        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY: HERMES_NATIVE_WRAPPER_VALUE,
+    }
+    metadata = {
+        "labels": labels,
+        "workspace": str(_REPO_ROOT),
+    }
+    create = httpx.post(
+        f"{base_url}/v1/sessions",
+        data={"metadata": _json.dumps(metadata)},
+        files={"bundle": ("hermes-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
+        timeout=30.0,
+    )
+    create.raise_for_status()
+    session_id = str(create.json()["session_id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+@pytest.fixture
+def native_hermes_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the real ``hermes-native`` ("Hermes") wrapper.
+
+    The runner auto-launches the ``hermes`` TUI in the session terminal on bind,
+    so the SPA's Terminal view attaches to a live Hermes TUI and its Chat view
+    renders the same canonical transcript. Drives the hermes render-parity suite.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_hermes_session(live_server, runner_id)
     try:
         yield (live_server, session_id)
     finally:

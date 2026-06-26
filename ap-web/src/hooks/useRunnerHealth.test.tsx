@@ -17,7 +17,10 @@ function input(id: string, runner_id: string | null = null): RunnerHealthInput {
 }
 
 function mockHealth(
-  body: Record<string, { runner_online: boolean; host_online?: boolean | null }>,
+  body: Record<
+    string,
+    { runner_online: boolean; host_online?: boolean | null; host_version?: string | null }
+  >,
 ) {
   return {
     ok: true,
@@ -44,22 +47,26 @@ describe("useRunnerHealth", () => {
     // on the next message.
     fetchMock.mockResolvedValueOnce(
       mockHealth({
-        conv_a: { runner_online: true, host_online: true },
+        conv_a: { runner_online: true, host_online: true, host_version: "1.2.3" },
         conv_b: { runner_online: false, host_online: true },
       }),
     );
     const { result } = renderHook(() => useRunnerHealth([input("conv_a"), input("conv_b")]));
 
     await waitFor(() => expect(result.current.size).toBe(2));
-    // Assert both fields, not just structure: this proves the host-aware
-    // server payload made it through the poll into the exposed map.
+    // Assert all fields, not just structure: this proves the host-aware
+    // server payload — including the bound host's version — made it through
+    // the poll into the exposed map. conv_b omits host_version, which the
+    // poll normalizes to null (same as host_online).
     expect(result.current.get("conv_a")).toEqual({
       runner_online: true,
       host_online: true,
+      host_version: "1.2.3",
     });
     expect(result.current.get("conv_b")).toEqual({
       runner_online: false,
       host_online: true,
+      host_version: null,
     });
     const [url] = fetchMock.mock.calls[0];
     expect(url).toBe(`/health?session_ids=${encodeURIComponent("conv_a,conv_b")}`);
@@ -86,6 +93,7 @@ describe("useRunnerHealth", () => {
     expect(result.current.get("conv_a")).toEqual({
       runner_online: false,
       host_online: true,
+      host_version: null,
     });
   });
 
@@ -99,6 +107,7 @@ describe("useRunnerHealth", () => {
     expect(result.current.get("conv_a")).toEqual({
       runner_online: true,
       host_online: null,
+      host_version: null,
     });
   });
 

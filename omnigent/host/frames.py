@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+HarnessAvailability = bool | str
+
 # Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
 # when the host refuses a launch because the session's harness is not
 # configured on that machine (CLI missing or no default credential). Shared
@@ -81,7 +83,7 @@ class HostHelloFrame:
     frame_protocol_version: int
     name: str
     runners: list[str] = field(default_factory=list)
-    configured_harnesses: dict[str, bool] | None = None
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
 
 
 @dataclass
@@ -774,7 +776,7 @@ def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:
         frame_protocol_version=_required_int(msg, "frame_protocol_version"),
         name=_required_str(msg, "name"),
         runners=_optional_str_list(msg, "runners"),
-        configured_harnesses=_optional_str_bool_map(msg, "configured_harnesses"),
+        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
     )
 
 
@@ -1091,23 +1093,25 @@ def _optional_str_list(msg: dict[str, Any], key: str) -> list[str]:
     return list(val)
 
 
-def _optional_str_bool_map(msg: dict[str, Any], key: str) -> dict[str, bool] | None:
-    """Return an optional string→bool mapping field.
+def _optional_str_availability_map(
+    msg: dict[str, Any], key: str
+) -> dict[str, HarnessAvailability] | None:
+    """Return an optional string→availability mapping field.
 
     Tolerant by design: absent, null, or non-mapping values all decode
     to ``None`` ("unknown") rather than raising, so an older or newer
     peer's hello never breaks the tunnel handshake. Entries with a
-    non-string key or non-bool value are dropped for the same reason.
+    non-string key or non-bool/string value are dropped for the same reason.
 
     :param msg: Decoded frame object.
     :param key: Field name, e.g. ``"configured_harnesses"``.
-    :returns: The mapping, e.g. ``{"claude-sdk": True}``, or ``None``
+    :returns: The mapping, e.g. ``{"claude-sdk": True, "codex": "needs-auth"}``, or ``None``
         when absent / null / not a JSON object.
     """
     val = msg.get(key)
     if not isinstance(val, dict):
         return None
-    return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, bool)}
+    return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, (bool, str))}
 
 
 def _optional_nullable_str(msg: dict[str, Any], key: str) -> str | None:

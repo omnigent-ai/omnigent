@@ -688,6 +688,22 @@ async def forward_claude_transcript_to_session(
                     state=hook_state,
                 )
                 if rotation is not None:
+                    # Tell the superseded (old) conversation it was cleared:
+                    # persist a notice linking to the rotated-to session and
+                    # emit a live redirect event. Use the loop's ``session_id``
+                    # (the session being forwarded BEFORE this poll), NOT
+                    # ``current_session_id``: when the hook rotated the bridge's
+                    # active session synchronously, ``current_session_id`` already
+                    # reads the NEW id, whereas ``session_id`` is not reassigned
+                    # to ``rotation`` until below. The call is fully best-effort
+                    # (swallows its own errors) so the state reset below always
+                    # runs.
+                    await _post_clear_supersession(
+                        client,
+                        old_session_id=session_id,
+                        new_session_id=rotation,
+                        agent_name=agent_name,
+                    )
                     session_id = rotation
                     state = None
                     hook_state = None
@@ -1818,10 +1834,9 @@ async def _maybe_rotate_session_on_clear(
         ``"conv_old"``.
     :param bridge_dir: Native Claude bridge directory.
     :param state: Current hook cursor state.
-    :returns: New active session id when rotation occurred, otherwise
-        ``None``.
-    :raises httpx.HTTPError: If Omnigent rejects the create, bind, transfer,
-        or old-session clear calls.
+    :returns: New active session id when rotation succeeded, otherwise
+        ``None`` (no clear pending, or the rotation failed and was consumed
+        to avoid a re-rotation loop).
     """
     result = await asyncio.to_thread(_read_hook_events_for_state, bridge_dir, state)
     clear_record = next(
@@ -1835,14 +1850,13 @@ async def _maybe_rotate_session_on_clear(
     if clear_record is None:
         return None
 
-    if clear_record.clear_rotated_to:
-        new_session_id = clear_record.clear_rotated_to
-    else:
-        new_session_id = await _create_clear_replacement_session(
-            client=client,
-            old_session_id=session_id,
-            bridge_dir=bridge_dir,
-        )
+    # Consume this clear hook EXACTLY ONCE. If the rotation raises partway
+    # (e.g. the terminal transfer returns 400 because the target already owns a
+    # terminal), we must still advance the cursor: otherwise the forwarder's
+    # next poll re-reads the same clear record and re-rotates — creating a fresh
+    # replacement session every poll, unbounded. A single /clear rotates at most
+    # once; a failed rotation is logged and skipped (the old session simply
+    # keeps running) rather than retried forever.
     durable = HookForwardState(
         event_cursor=clear_record.event_cursor,
         byte_offset=clear_record.byte_offset,
@@ -1851,6 +1865,24 @@ async def _maybe_rotate_session_on_clear(
             clear_record.byte_offset,
         ),
     )
+    new_session_id: str | None = None
+    try:
+        if clear_record.clear_rotated_to:
+            new_session_id = clear_record.clear_rotated_to
+        else:
+            new_session_id = await _create_clear_replacement_session(
+                client=client,
+                old_session_id=session_id,
+                bridge_dir=bridge_dir,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _logger.exception(
+            "Claude /clear rotation failed; consuming the clear hook to avoid a "
+            "re-rotation loop. old_session=%s",
+            session_id,
+        )
     await _write_hook_state_async(bridge_dir, durable)
     reset_transcript_forward_state(bridge_dir, reset_hooks=False)
     return new_session_id
@@ -1950,7 +1982,20 @@ async def _create_clear_replacement_session(
     write_active_session_id(bridge_dir, new_session_id)
     clear_resp = await client.patch(
         f"/v1/sessions/{url_component(old_session_id)}",
-        json={"runner_id": ""},
+        json={
+            "runner_id": "",
+            # Re-key the superseded session onto a DISTINCT "-cleared" bridge id.
+            # The new session keeps the original bridge id (set above) and owns
+            # the live terminal/pane in D(original); the old session must NOT
+            # share that dir, or resuming it (host wake-on-message /
+            # ``omnigent claude --resume``) would put a second forwarder on the
+            # live transcript (duplicate items) and trip the executor's
+            # "no longer active after /clear" guard. ``_auto_create_claude_terminal``
+            # recognises this exact marker and cold-resumes the old session in
+            # its own isolated D("{id}-cleared"); the executor spawn_env resolves
+            # the same label, so both agree.
+            "labels": {BRIDGE_ID_LABEL_KEY: f"{old_session_id}-cleared"},
+        },
     )
     if clear_resp.status_code >= 400:
         _logger.warning(
@@ -1984,24 +2029,20 @@ async def _maybe_rotate_session_on_fork(
         ``"conv_old"``.
     :param bridge_dir: Native Claude bridge directory.
     :param state: Current hook cursor state.
-    :returns: New active session id when fork rotation occurred,
-        otherwise ``None``.
-    :raises httpx.HTTPError: If Omnigent rejects the fork, bind, transfer,
-        or old-session clear calls.
+    :returns: New active session id when fork rotation succeeded, otherwise
+        ``None`` (no fork pending, or the rotation failed and was consumed to
+        avoid a re-rotation loop).
     """
     result = await asyncio.to_thread(_read_hook_events_for_state, bridge_dir, state)
     fork_record = next((record for record in result.records if _is_fork_hook_record(record)), None)
     if fork_record is None:
         return None
 
-    if fork_record.fork_rotated_to:
-        new_session_id = fork_record.fork_rotated_to
-    else:
-        new_session_id = await _create_fork_replacement_session(
-            client=client,
-            old_session_id=session_id,
-            bridge_dir=bridge_dir,
-        )
+    # Consume this fork hook EXACTLY ONCE — see the matching guard in
+    # _maybe_rotate_session_on_clear. A rotation that raises partway (e.g. a
+    # terminal-transfer 400) must still advance the cursor so the next poll does
+    # not re-read the same fork record and create another replacement session
+    # without bound.
     durable = HookForwardState(
         event_cursor=fork_record.event_cursor,
         byte_offset=fork_record.byte_offset,
@@ -2010,6 +2051,24 @@ async def _maybe_rotate_session_on_fork(
             fork_record.byte_offset,
         ),
     )
+    new_session_id: str | None = None
+    try:
+        if fork_record.fork_rotated_to:
+            new_session_id = fork_record.fork_rotated_to
+        else:
+            new_session_id = await _create_fork_replacement_session(
+                client=client,
+                old_session_id=session_id,
+                bridge_dir=bridge_dir,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _logger.exception(
+            "Claude /fork rotation failed; consuming the fork hook to avoid a "
+            "re-rotation loop. old_session=%s",
+            session_id,
+        )
     await _write_hook_state_async(bridge_dir, durable)
     await _seed_fork_transcript_forward_state(
         bridge_dir=bridge_dir,
@@ -2428,6 +2487,23 @@ async def _forward_available_status_events(
                         compaction_status,
                         exc_info=True,
                     )
+                # Persist a compaction item so session resume knows
+                # the compaction boundary. Without this, rebuilding
+                # the transcript from the conversation DB loads the
+                # full pre-compaction history.
+                if compaction_status == "completed":
+                    try:
+                        await _persist_native_compaction_item(
+                            client,
+                            session_id=session_id,
+                            bridge_dir=bridge_dir,
+                        )
+                    except Exception:  # noqa: BLE001
+                        _logger.warning(
+                            "Failed to persist compaction item for %s",
+                            session_id,
+                            exc_info=True,
+                        )
                 durable = next_durable
                 await _write_hook_state_async(bridge_dir, durable)
                 continue
@@ -3020,6 +3096,109 @@ def _validated_transcript_state(
     )
 
 
+async def _post_clear_supersession(
+    client: httpx.AsyncClient,
+    *,
+    old_session_id: str,
+    new_session_id: str,
+    agent_name: str,
+) -> None:
+    """
+    Notify the superseded session that a ``/clear`` rotated it away.
+
+    Posts three best-effort events to the OLD conversation, in order:
+
+    1. An ``external_session_status: idle`` so the old conversation's
+       "Working…" spinner stops — its terminal moved to the new session,
+       so it will never receive the turn-end edge that would normally
+       clear it.
+    2. A persisted assistant ``message`` item linking to the new
+       conversation, so a later reload of the cleared conversation
+       explains what happened and offers the continuation link. This is
+       the durable record — it survives reconnects.
+    3. A transient ``external_session_superseded`` event the server
+       republishes as ``session.superseded``, so a client *actively*
+       viewing the old conversation auto-redirects to the new one.
+
+    Each failure is logged and swallowed: the rotation has already
+    completed and reset forwarder state, and a notification error must
+    not disrupt the poll loop or stop the new session from forwarding.
+
+    :param client: Omnigent HTTP client (``base_url`` = AP server).
+    :param old_session_id: Superseded conversation id, e.g. ``"conv_old"``.
+    :param new_session_id: Rotated-to conversation id, e.g. ``"conv_new"``.
+    :param agent_name: Agent name to stamp on the notice message — an
+        assistant ``message`` item requires one.
+    :returns: None.
+    """
+    if old_session_id == new_session_id:
+        # Defensive: never address the notice/redirect at the live session.
+        # The caller resolves the old id from the pre-rotation forwarder
+        # state, but if that ever collapses to the new id, posting here
+        # would dump the "you were cleared" banner onto the active chat.
+        return
+    try:
+        status_resp = await client.post(
+            f"/v1/sessions/{url_component(old_session_id)}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle"},
+            },
+        )
+        status_resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to post /clear supersession idle status; old_session=%s new_session=%s",
+            old_session_id,
+            new_session_id,
+            exc_info=True,
+        )
+    notice = (
+        "This conversation was ended by `/clear`. "
+        f"Continue in [the new chat](/c/{new_session_id}). "
+        "You can also send a message here to resume this conversation."
+    )
+    try:
+        item_resp = await client.post(
+            f"/v1/sessions/{url_component(old_session_id)}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "assistant",
+                        "agent": agent_name,
+                        "content": [{"type": "output_text", "text": notice}],
+                    },
+                },
+            },
+        )
+        item_resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to post /clear supersession notice; old_session=%s new_session=%s",
+            old_session_id,
+            new_session_id,
+            exc_info=True,
+        )
+    try:
+        event_resp = await client.post(
+            f"/v1/sessions/{url_component(old_session_id)}/events",
+            json={
+                "type": "external_session_superseded",
+                "data": {"target_conversation_id": new_session_id},
+            },
+        )
+        event_resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to post /clear supersession redirect event; old_session=%s new_session=%s",
+            old_session_id,
+            new_session_id,
+            exc_info=True,
+        )
+
+
 async def _post_external_conversation_item(
     client: httpx.AsyncClient,
     *,
@@ -3408,6 +3587,80 @@ async def _post_external_compaction_status(
         json={
             "type": "external_compaction_status",
             "data": {"status": status},
+        },
+    )
+    resp.raise_for_status()
+
+
+async def _persist_native_compaction_item(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+) -> None:
+    """
+    Persist a compaction boundary item to the conversation store.
+
+    Called when the forwarder observes a compaction-completed signal
+    (``SessionStart source=compact``). Queries the latest conversation
+    item to use as ``last_item_id`` so session resume knows the
+    compaction boundary — items before this marker are summarized
+    and don't need to be loaded.
+
+    After writing the boundary, it also reads the post-compaction
+    transcript from Claude's own session state via
+    ``get_session_messages`` and includes them as ``compacted_messages``
+    so session resume in ephemeral environments can reconstruct context
+    without the CLI's local transcript files.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Bridge directory path used to look up the
+        Claude-native session id.
+    """
+    # Find the last persisted item to use as the compaction boundary.
+    resp = await client.get(
+        f"/v1/sessions/{session_id}/items",
+        params={"limit": 1, "order": "desc"},
+    )
+    resp.raise_for_status()
+    items = resp.json().get("data", [])
+    last_item_id = items[0]["id"] if items else f"compact_boundary_{session_id}"
+
+    # Read the post-compaction session messages so session resume can
+    # reconstruct context in ephemeral environments.
+    compacted_messages: list[dict[str, Any]] | None = None
+    try:
+        from claude_agent_sdk import get_session_messages
+
+        claude_sid = read_claude_session_id(bridge_dir)
+        if claude_sid:
+            msgs = get_session_messages(claude_sid)
+            compacted_messages = [
+                {"type": "message", "role": m.type, "content": m.message.get("content", [])}
+                for m in msgs
+                if isinstance(m.message, dict)
+            ]
+    except Exception:  # noqa: BLE001
+        _logger.debug(
+            "Failed to read Claude session messages for compaction persist",
+            exc_info=True,
+        )
+
+    event_data: dict[str, Any] = {
+        "summary": "[Claude Code compaction — context was compacted in the terminal]",
+        "last_item_id": last_item_id,
+        "model": "unknown",
+        "token_count": 0,
+    }
+    if compacted_messages is not None:
+        event_data["compacted_messages"] = compacted_messages
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "compaction",
+            "data": event_data,
         },
     )
     resp.raise_for_status()

@@ -7,6 +7,12 @@ export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation
 // Keyed by display title — stable identifiers for these fixed groups.
 export const COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY = "omnigent:collapsed-sidebar-sections";
 
+// Names of project folders the user has expanded. Project folders default to
+// COLLAPSED (so the sidebar stays short as project count grows), so this is
+// the inverse of the fixed-section collapse set: a project shows its rows only
+// when its name is present here.
+export const EXPANDED_PROJECT_SECTIONS_STORAGE_KEY = "omnigent:expanded-project-sections";
+
 // Snapshot of the active chat's updated_at at the moment the user
 // entered it. Used as the sort key for the active row so subsequent
 // updated_at bumps (the user sending a message) don't move it.
@@ -27,8 +33,12 @@ export type ConversationIconKind =
   | "opencode"
   | "pi"
   | "cursor"
+  | "kiro"
   | "goose"
+  | "antigravity"
   | "qwen"
+  | "kimi"
+  | "hermes"
   | "nessie"
   | null;
 

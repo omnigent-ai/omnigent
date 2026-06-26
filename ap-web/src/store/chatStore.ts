@@ -175,6 +175,16 @@ export interface ChatState {
   // Reactive — subscribed to by UI components.
   conversationId: string | null;
   /**
+   * Set when a live `session.superseded` event asks the client to follow
+   * the active conversation to another one (e.g. after a Claude `/clear`).
+   * `ChatPage` observes this, navigates to `/c/<id>` (replacing history so
+   * Back doesn't return to the cleared session), then clears it. Null when
+   * no redirect is pending. The store can't call react-router directly, so
+   * it hands the target to the page via this field. Live-only — a reload of
+   * the old conversation renders the persisted notice instead.
+   */
+  redirectToConversationId: string | null;
+  /**
    * Flat block list (history + streaming). Renderer walks this.
    *
    * Terminal-observed (claude-native) live streaming inserts a
@@ -341,6 +351,12 @@ export interface ChatState {
    * snapshot on bind; drives the composer pill's harness suffix.
    */
   sessionHarness: string | null;
+  /**
+   * The active session's sub-agent head name (e.g. `"gpt"`), or null for a
+   * top-level session. Set from the snapshot on bind; lets a head sub-agent's
+   * composer identity name the head rather than the bundle orchestrator.
+   */
+  subAgentName: string | null;
   /**
    * Context window size in tokens for the active session's model,
    * as looked up server-side. ``null`` before bind or when the
@@ -680,6 +696,7 @@ export function consumePendingInitialPrompt(conversationId: string): PendingInit
 
 export const useChatStore = create<ChatState>((set, get) => ({
   conversationId: null,
+  redirectToConversationId: null,
   blocks: [],
   pendingUserMessages: [],
   pendingByConversation: {},
@@ -704,6 +721,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   flashItemId: null,
   llmModel: null,
   sessionHarness: null,
+  subAgentName: null,
   contextWindow: null,
   tokensUsed: null,
   sessionCostUsd: null,
@@ -1153,6 +1171,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return {
         pendingByConversation,
         conversationId,
+        // Clear any pending supersession redirect: we've now switched
+        // sessions, so a leftover target (e.g. already consumed by the
+        // navigate that brought us here) must not fire again.
+        redirectToConversationId: null,
         // Cleared here, so a different session's in-flight preview blocks
         // (``live:*``) never bleed across.
         blocks: [],
@@ -1614,6 +1636,7 @@ function sessionBindingPatch(
   | "llmModel"
   | "sessionModelOverride"
   | "sessionHarness"
+  | "subAgentName"
   | "costControlModeOverride"
   | "codexPlanMode"
   | "contextWindow"
@@ -1636,6 +1659,7 @@ function sessionBindingPatch(
     llmModel: session.llmModel ?? null,
     sessionModelOverride: session.modelOverride ?? null,
     sessionHarness: session.harness ?? null,
+    subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
     codexPlanMode: codexPlanModeFromSession(session),
     contextWindow: session.contextWindow ?? null,
@@ -3379,8 +3403,9 @@ export function handleSessionEvent(event: StreamEvent): void {
       return;
     }
     case "session_model":
-      // A `/model` switch made inside the Claude Code terminal. Reflect
-      // it in the picker for the open session. The server already
+      // A `/model` switch made inside a native terminal (Claude Code,
+      // codex, or cursor-agent). Reflect it in the picker for the open
+      // session. The server already
       // persisted `model_override`, so a reload restores it; the
       // cross-session sticky pref is intentionally left untouched (a
       // terminal switch is a per-session choice, not a new default).
@@ -3727,6 +3752,31 @@ export function handleSessionEvent(event: StreamEvent): void {
           queryKey: childSessionsQueryKey(event.conversationId),
         });
       }
+      return;
+    case "session_superseded":
+      // The conversation we're viewing was rotated away (e.g. Claude
+      // `/clear`): follow it to the new one. Guard on the active
+      // conversation id so a late event from a stream we've already
+      // switched away from can't yank the user, and ignore a self-target
+      // no-op. `ChatPage` observes `redirectToConversationId` and performs
+      // the actual react-router navigation.
+      useChatStore.setState((s) => {
+        if (s.conversationId !== event.conversationId) return {};
+        if (event.targetConversationId === s.conversationId) return {};
+        // The rotation happened mid-input: the `/clear` (or whatever the
+        // user just sent) never gets a `session.input.consumed` on THIS
+        // conversation — the runner moved to the new one — so its optimistic
+        // user bubble would otherwise spin forever. Drop the superseded
+        // conversation's pending bubbles (live view + the navigate-back
+        // stash) since the turn is over; resuming starts a fresh one.
+        const pendingByConversation = { ...s.pendingByConversation };
+        delete pendingByConversation[event.conversationId];
+        return {
+          redirectToConversationId: event.targetConversationId,
+          pendingUserMessages: [],
+          pendingByConversation,
+        };
+      });
       return;
     case "session_resource_created":
       if (event.resource.type === "terminal") {

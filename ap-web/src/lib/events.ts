@@ -314,6 +314,26 @@ export interface SlashCommand {
 }
 
 /**
+ * Intelligent-model-router decision from `output_item.done`
+ * (type `routing_decision`). Emitted by the runner's cost advisor at
+ * turn start; the reducer produces a `RoutingDecisionBlock` rendered as
+ * a muted chip. Display-only — never enters the model's history.
+ */
+export interface RoutingDecision {
+  type: "routing_decision";
+  /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */
+  model: string;
+  /** Difficulty tier the router assigned. */
+  tier: "cheap" | "medium" | "expensive";
+  /** `true` when the brain ran on `model`; `false` = "would have picked". */
+  applied: boolean;
+  /** The router's one-line rationale. */
+  rationale: string;
+  itemId: string;
+  responseId: string;
+}
+
+/**
  * Terminal command item from `output_item.done` (type `terminal_command`).
  * Produced by the claude-native transcript forwarder when the user types `!cmd`.
  */
@@ -359,6 +379,10 @@ export interface ErrorEvent {
   source: string;
   toolName: string | null;
   error: ErrorInfo;
+  /** Server-assigned item id when parsed from `response.output_item.done`. */
+  itemId?: string;
+  /** Server-assigned response id when parsed from `response.output_item.done`. */
+  responseId?: string;
 }
 
 // ── Compaction ───────────────────────────────────────────
@@ -758,6 +782,27 @@ export interface SessionPresenceEvent {
   viewers: SessionViewer[];
 }
 
+/**
+ * `session.superseded` — this conversation was superseded and the client
+ * should follow to `targetConversationId`.
+ *
+ * Emitted when a Claude `/clear` rotates a session away: the old
+ * conversation keeps its history but the live terminal moves to a fresh
+ * conversation. A client actively viewing the old conversation
+ * auto-redirects. Live-only (no SSE replay): a client connecting after
+ * the rotation instead renders the persisted notice message appended to
+ * the old conversation.
+ */
+export interface SessionSupersededEvent {
+  type: "session_superseded";
+  /** The superseded (old) conversation id this event rides the stream of. */
+  conversationId: string;
+  /** The conversation id to redirect to. */
+  targetConversationId: string;
+  /** Why the session was superseded. Currently always `"clear"`. */
+  reason: "clear";
+}
+
 // ── Union type for all events ────────────────────────────
 
 export type StreamEvent =
@@ -776,6 +821,7 @@ export type StreamEvent =
   | ToolResult
   | NativeToolCall
   | SlashCommand
+  | RoutingDecision
   | TerminalCommandEvent
   | MessageDone
   | OutputFileDone
@@ -800,6 +846,7 @@ export type StreamEvent =
   | SessionInputConsumedEvent
   | SessionInterruptedEvent
   | SessionCreatedEvent
+  | SessionSupersededEvent
   | SessionResourceCreatedEvent
   | SessionResourceDeletedEvent
   | SessionChildSessionUpdatedEvent

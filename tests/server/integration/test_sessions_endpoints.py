@@ -502,6 +502,102 @@ async def test_external_session_status_event_lands_in_status_cache(
         sessions_module._session_status_cache.pop(session["id"], None)
 
 
+# ── POST /v1/sessions/{id}/events external_session_superseded ─────
+
+
+async def test_external_session_superseded_publishes_redirect_event(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Posting ``external_session_superseded`` republishes a
+    ``session.superseded`` SSE event carrying the redirect target.
+
+    This is the claude-native forwarder's live-only redirect signal after
+    a Claude ``/clear``: a client viewing the old conversation follows to
+    the new one. The event is transient (not persisted) — the handler only
+    publishes to the session stream.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_superseded",
+            "data": {"target_conversation_id": "conv_new"},
+        },
+    )
+    assert resp.status_code in (200, 202)
+
+    superseded = [ev for _sid, ev in published if ev.get("type") == "session.superseded"]
+    assert len(superseded) == 1
+    event = superseded[0]
+    assert event["conversation_id"] == session["id"]
+    assert event["target_conversation_id"] == "conv_new"
+    assert event["reason"] == "clear"
+
+
+async def test_external_session_superseded_requires_target(
+    client: httpx.AsyncClient,
+) -> None:
+    """A superseded event without a target conversation id is rejected."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_superseded", "data": {}},
+    )
+    assert resp.status_code == 400
+
+
+async def test_external_session_superseded_drains_pending_inputs(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Superseding a session discards its unconsumed pending inputs.
+
+    The ``/clear`` the user typed in the web UI is recorded as a pending input
+    but never mirrored back (the session rotated away), so it would otherwise
+    re-hydrate as a stuck optimistic bubble on every reload of the old chat.
+    The superseded handler drains it (without committing it as a user message).
+    """
+    from omnigent.runtime import pending_inputs
+
+    pending_inputs.reset_for_tests()
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    try:
+        # The optimistic pending entry the web composer recorded when the user
+        # sent ``/clear`` from the UI.
+        pending_inputs.record(session["id"], [{"type": "input_text", "text": "/clear"}])
+        assert pending_inputs.snapshot_for(session["id"]) != []
+
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_session_superseded",
+                "data": {"target_conversation_id": "conv_new"},
+            },
+        )
+        assert resp.status_code in (200, 202)
+
+        # Drained — so it won't reappear from the snapshot on reload, and it was
+        # NOT committed as a message item (the fresh session stays empty: no
+        # /clear bubble was promoted into history).
+        assert pending_inputs.snapshot_for(session["id"]) == []
+        items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+        assert not any(item["type"] == "message" for item in items)
+    finally:
+        pending_inputs.reset_for_tests()
+
+
 # ── POST /v1/sessions/{id}/events external_subagent_start ─────────
 
 
@@ -2621,6 +2717,48 @@ async def test_post_external_session_status_publishes_session_status(
     assert "response_id" not in published[0][1]
 
 
+async def test_post_external_session_status_failed_surfaces_output_and_reauth(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``failed`` edge with ``output`` surfaces a typed error on the stream (#1108).
+
+    A native forwarder (e.g. codex-native on an expired login) posts the
+    terminal failure reason as ``data.output`` and flags ``reauth_required``.
+    The handler must surface it as the ``session.status`` edge's ``error`` so a
+    *top-level* session sees the reason — not only the sub-agent parent path.
+    ``reauth_required`` selects the ``codex_reauth_required`` code.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "failed",
+                "output": "401 Unauthorized\n\nRun `codex login` and retry.",
+                "reauth_required": True,
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    assert published[0][1]["status"] == "failed"
+    error = published[0][1]["error"]
+    assert error is not None
+    assert error["code"] == "codex_reauth_required"
+    assert "401 Unauthorized" in error["message"]
+
+
 async def test_post_external_session_status_carries_response_id(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -3128,6 +3266,147 @@ async def test_post_external_output_text_delta_rejects_malformed_delta(
     )
     assert resp.status_code == 400, resp.text
     assert "external_output_text_delta requires string data.delta" in resp.text
+    assert published == []
+
+
+async def test_post_external_output_reasoning_delta_started_publishes_started_then_delta(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``external_output_reasoning_delta`` with ``started`` emits started + delta.
+
+    The antigravity-native reader uses this for a Gemini Thinking-model
+    ``plannerResponse.thinking`` stream. The first delta of a block sets
+    ``started`` so the route precedes the ``response.reasoning_text.delta`` with
+    one ``response.reasoning.started`` (the SPA new-block marker). Both events
+    must be visible on the SSE stream and nothing persisted to history (reasoning
+    has no completed item).
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def capture_publish(session_id: str, event: dict[str, Any]) -> None:
+        """
+        Capture session-stream events emitted by the route.
+
+        :param session_id: Session id passed to ``session_stream``.
+        :param event: Event payload published to the stream.
+        :returns: None.
+        """
+        published.append((session_id, event))
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        capture_publish,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_output_reasoning_delta",
+            "data": {"delta": "Let me think", "started": True},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+
+    assert published == [
+        (session["id"], {"type": "response.reasoning.started"}),
+        (
+            session["id"],
+            {"type": "response.reasoning_text.delta", "delta": "Let me think"},
+        ),
+    ]
+
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.status_code == 200, snap.text
+    assert snap.json()["items"] == []
+
+
+async def test_post_external_output_reasoning_delta_continuation_publishes_delta_only(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A continuation reasoning delta (``started`` false/omitted) emits delta only.
+
+    Only the first delta of a reasoning block opens it with
+    ``response.reasoning.started``; later deltas publish a bare
+    ``response.reasoning_text.delta``.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def capture_publish(session_id: str, event: dict[str, Any]) -> None:
+        """
+        Capture session-stream events emitted by the route.
+
+        :param session_id: Session id passed to ``session_stream``.
+        :param event: Event payload published to the stream.
+        :returns: None.
+        """
+        published.append((session_id, event))
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        capture_publish,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_output_reasoning_delta",
+            "data": {"delta": " more thought", "started": False},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    assert published == [
+        (
+            session["id"],
+            {"type": "response.reasoning_text.delta", "delta": " more thought"},
+        )
+    ]
+
+
+async def test_post_external_output_reasoning_delta_rejects_malformed_delta(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``external_output_reasoning_delta`` fails loud on a non-string delta.
+
+    Mirrors the text-delta validation: a malformed payload must not publish a
+    non-conforming ``response.reasoning_text.delta`` that strict SDK clients drop.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def capture_publish(session_id: str, event: dict[str, Any]) -> None:
+        """
+        Capture any accidental stream publish before validation fails.
+
+        :param session_id: Session id passed to ``session_stream``.
+        :param event: Event payload published to the stream.
+        :returns: None.
+        """
+        published.append((session_id, event))
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        capture_publish,
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_output_reasoning_delta", "data": {"delta": 123}},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "external_output_reasoning_delta requires string data.delta" in resp.text
     assert published == []
 
 
@@ -3706,6 +3985,48 @@ async def test_external_session_usage_cumulative_cost_is_set_not_added(
         assert resp.status_code == 202, resp.text
     usage = _read_session_usage(db_uri, session["id"])
     assert usage.get("total_cost_usd") == 0.90
+
+
+async def test_external_session_usage_cost_is_monotonic(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A cumulative-usage post may only RAISE the persisted costs, never lower them.
+
+    The ``external_session_usage`` event carries the session owner's own bearer
+    token (the forwarder uses no privileged identity), so an owner could replay
+    it with a falsified low cost. Both the display cost (``total_cost_usd``) and
+    the enforcement cost (``policy_cost_usd``, which the cost-budget gate reads)
+    are clamped monotonic so such a post is a no-op — it can't reset the gate to
+    ~0 and re-enable spending past the budget. A regression (the low value
+    landing) would re-open the budget-bypass.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    high = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_usage",
+            "data": {"cumulative_cost_usd": 0.90, "policy_cost_usd": 0.95},
+        },
+    )
+    assert high.status_code == 202, high.text
+
+    # Falsified low report — must be ignored, not stored.
+    low = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_usage",
+            "data": {"cumulative_cost_usd": 0.0, "policy_cost_usd": 0.0},
+        },
+    )
+    assert low.status_code == 202, low.text
+
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage.get("total_cost_usd") == 0.90
+    assert usage.get("policy_cost_usd") == 0.95
 
 
 async def test_external_session_usage_codex_tokens_priced(

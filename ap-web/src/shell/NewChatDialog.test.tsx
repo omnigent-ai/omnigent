@@ -8,7 +8,10 @@ import {
   deriveHomeDir,
   deriveRepoName,
   describeCreateError,
+  harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
+  harnessWarningBadgeText,
+  harnessWarningMessageText,
   isValidSandboxRepoUrl,
   isValidWorkspace,
   matchSkillInvocation,
@@ -47,6 +50,13 @@ vi.mock("@/hooks/useDirectorySessions", () => ({
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: vi.fn(),
+}));
+// The composer's project chip lists projects via useProjects; stub it to an
+// empty list so it doesn't fire its own authenticatedFetch (which would skew
+// the create-POST call-count / call-order assertions below).
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
+  useProjects: () => ({ data: [] }),
 }));
 
 const authenticatedFetchMock = vi.mocked(authenticatedFetch);
@@ -375,7 +385,7 @@ describe("describeCreateError", () => {
 });
 
 describe("harnessUnconfiguredOnHost", () => {
-  const hostWith = (configured: Record<string, boolean> | null | undefined): Host =>
+  const hostWith = (configured: Record<string, boolean | string> | null | undefined): Host =>
     ({
       host_id: "host_1",
       name: "laptop",
@@ -385,10 +395,41 @@ describe("harnessUnconfiguredOnHost", () => {
     }) as Host;
 
   it("warns only on an explicit false from the host", () => {
-    const host = hostWith({ "claude-sdk": true, codex: false });
+    const testHost = hostWith({ "claude-sdk": true, codex: false });
     // Explicit false → warn; explicit true → no warning.
-    expect(harnessUnconfiguredOnHost("codex", host)).toBe(true);
-    expect(harnessUnconfiguredOnHost("claude-sdk", host)).toBe(false);
+    expect(harnessUnconfiguredOnHost("codex", testHost)).toBe(true);
+    expect(harnessUnconfiguredOnHost("claude-sdk", testHost)).toBe(false);
+  });
+
+  it("keeps legacy non-codex false availability generic", () => {
+    const testHost = hostWith({ "claude-native": false });
+    const reason = harnessUnavailableReasonOnHost("claude-native", testHost);
+    expect(reason).toBe("unconfigured");
+    expect(harnessWarningBadgeText(reason)).toBe("needs setup");
+    expect(harnessWarningMessageText("Claude Code", "laptop", reason)).toBe(
+      "Claude Code isn't configured on laptop — run omnigent setup on that machine.",
+    );
+  });
+
+  it("surfaces structured codex unavailable reasons", () => {
+    const testHost = hostWith({ codex: "needs-auth", "codex-native": "binary-missing" });
+    expect(harnessUnconfiguredOnHost("codex", testHost)).toBe(true);
+    expect(harnessUnavailableReasonOnHost("codex", testHost)).toBe("needs-auth");
+    expect(harnessUnavailableReasonOnHost("codex-native", testHost)).toBe("binary-missing");
+    expect(harnessWarningBadgeText("needs-auth")).toBe("needs auth");
+    expect(harnessWarningMessageText("Codex", "laptop", "needs-auth")).toBe(
+      "Codex needs Codex authentication on laptop — run codex login on that machine.",
+    );
+    expect(harnessWarningBadgeText("binary-missing")).toBe("binary missing");
+    expect(harnessWarningMessageText("Codex", "laptop", "binary-missing")).toBe(
+      "Codex is missing the Codex binary on laptop — run omnigent setup on that machine.",
+    );
+  });
+
+  it("ignores unknown future reason strings", () => {
+    expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "future-reason" }))).toBe(
+      null,
+    );
   });
 
   it("never warns when readiness is unknown", () => {
@@ -533,7 +574,7 @@ function setupLandingMocks() {
   ]);
 }
 
-function renderLanding(infoOverrides: Partial<ServerInfo> = {}) {
+function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -544,13 +585,15 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}) {
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    server_version: null,
+    smart_routing_enabled: false,
     ...infoOverrides,
   };
   return render(
     <QueryClientProvider client={client}>
       <CapabilitiesProvider info={info}>
         <TooltipProvider>
-          <MemoryRouter>
+          <MemoryRouter initialEntries={[route]}>
             <NewChatLandingScreen />
           </MemoryRouter>
         </TooltipProvider>
@@ -611,7 +654,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByText("No agents")).toBeTruthy();
   });
 
-  it("orders Cursor above Pi in the built-in agent picker", () => {
+  it("orders native built-ins together in the agent picker", () => {
     mockAgents([
       {
         id: "a_pi",
@@ -619,6 +662,14 @@ describe("NewChatLandingScreen", () => {
         display_name: "Pi",
         description: null,
         harness: "pi-native",
+        skills: [],
+      },
+      {
+        id: "a_kiro",
+        name: "kiro-native-ui",
+        display_name: "Kiro",
+        description: null,
+        harness: "kiro-native",
         skills: [],
       },
       {
@@ -645,12 +696,24 @@ describe("NewChatLandingScreen", () => {
         harness: "claude-native",
         skills: [],
       },
+      {
+        id: "a_polly",
+        name: "polly",
+        display_name: "Polly",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      },
     ]);
     renderLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     const cursor = screen.getByTestId("new-chat-landing-agent-a_cursor");
     const pi = screen.getByTestId("new-chat-landing-agent-a_pi");
+    const kiro = screen.getByTestId("new-chat-landing-agent-a_kiro");
+    const polly = screen.getByTestId("new-chat-landing-agent-a_polly");
     expect(cursor.compareDocumentPosition(pi) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(pi.compareDocumentPosition(kiro) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(kiro.compareDocumentPosition(polly) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("seeds the working directory from the host's most-recent path", async () => {
@@ -700,14 +763,14 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
   });
 
-  it("shows permission-mode options in the Advanced menu only for the claude-native agent", () => {
+  it("shows permission-mode options behind the run-mode pill for the claude-native agent", () => {
     renderLanding();
-    // The radios live behind the footer tray's Advanced chip — absent
+    // The radios live behind the composer's left-side run-mode pill — absent
     // until the menu opens.
     expect(screen.queryByTestId("new-chat-landing-permission-plan")).toBeNull();
-    // a1 (Claude Code, claude-native) is the default agent → the footer
-    // tray surfaces the Advanced chip with the permission-mode radios.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    // a1 (Claude Code, claude-native) is the default agent → the composer
+    // surfaces the permission-mode pill with the permission-mode radios.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-pill"), { button: 0 });
     const planOption = screen.getByTestId("new-chat-landing-permission-plan");
     expect(planOption.textContent).toContain("Plan");
     // The footer line explains the SELECTED mode until a row is hovered —
@@ -717,21 +780,21 @@ describe("NewChatLandingScreen", () => {
     expect(detail.textContent).toContain("Prompts before edits and commands");
     fireEvent.pointerEnter(planOption);
     expect(detail.textContent).toContain("Plans only; makes no edits");
-    // Switch to Codex (a2: codex-native) — the Advanced chip stays visible
+    // Switch to Codex (a2: codex-native) — the run-mode pill stays visible
     // but now shows approval-mode radios instead of permission-mode radios.
-    // Close the Advanced menu first (Escape), then switch agents.
+    // Close the menu first (Escape), then switch agents.
     fireEvent.keyDown(document.activeElement!, { key: "Escape" });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    expect(screen.queryByTestId("new-chat-landing-advanced-chip")).not.toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-approval-pill")).not.toBeNull();
   });
 
-  it("shows approval-mode options in the Advanced menu for the codex-native agent", () => {
+  it("shows approval-mode options behind the run-mode pill for the codex-native agent", () => {
     renderLanding();
     // Switch to Codex first.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
     const fullAccessOption = screen.getByTestId("new-chat-landing-approval-full-access");
     expect(fullAccessOption.textContent).toContain("Full access");
     // The footer line explains the SELECTED mode until a row is hovered.
@@ -740,6 +803,115 @@ describe("NewChatLandingScreen", () => {
     expect(detail.textContent).toContain("Read/edit/run in workspace");
     fireEvent.pointerEnter(fullAccessOption);
     expect(detail.textContent).toContain("Edit any file and access the internet");
+  });
+
+  it("arms codex full bypass only after the confirmation phrase is typed", async () => {
+    renderLanding();
+    // Switch to Codex, open the Advanced menu.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    const toggle = screen.getByTestId(
+      "new-chat-landing-bypass-sandbox-switch",
+    ) as HTMLButtonElement;
+    // OFF by default and not flippable until the phrase is typed: a click
+    // while disabled must not arm it (no in-menu banner appears).
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(toggle.disabled).toBe(true);
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-banner")).toBeNull();
+    // Confirmation is VERBATIM — none of these near-misses unlock the toggle:
+    // a prefix, a different case, or leading/trailing whitespace.
+    for (const nearMiss of ["bypass", "Bypass Sandbox", " bypass sandbox", "bypass sandbox "]) {
+      fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
+        target: { value: nearMiss },
+      });
+      expect(
+        (screen.getByTestId("new-chat-landing-bypass-sandbox-switch") as HTMLButtonElement)
+          .disabled,
+      ).toBe(true);
+    }
+    // Only the exact phrase unlocks it; flipping on renders the red banner.
+    fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
+      target: { value: "bypass sandbox" },
+    });
+    const armed = screen.getByTestId("new-chat-landing-bypass-sandbox-switch") as HTMLButtonElement;
+    expect(armed.disabled).toBe(false);
+    fireEvent.click(armed);
+    expect(
+      (
+        screen.getByTestId("new-chat-landing-bypass-sandbox-switch") as HTMLButtonElement
+      ).getAttribute("aria-checked"),
+    ).toBe("true");
+    const banner = screen.getByTestId("new-chat-landing-bypass-sandbox-banner");
+    expect(banner.textContent).toContain("approvals and the sandbox disabled");
+  });
+
+  it("disarms the dangerous bypass when the agent changes (re-confirm per context)", () => {
+    renderLanding();
+    // Arm bypass on Codex (a2): type the phrase, flip the switch, close tray.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
+      target: { value: "bypass sandbox" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-bypass-sandbox-switch"));
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    // Armed → the persistent banner is up under the composer.
+    expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeTruthy();
+
+    // Switch away to Claude (a1): the armed bypass must clear immediately, so
+    // the persistent banner disappears (Claude has no bypass toggle at all).
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a1"));
+    expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeNull();
+
+    // Switch back to Codex and reopen Advanced: the toggle is OFF and disabled
+    // again — the confirmation phrase must be re-typed for this fresh context.
+    // Without the reset effect it would re-render armed from stale state.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    const toggle = screen.getByTestId(
+      "new-chat-landing-bypass-sandbox-switch",
+    ) as HTMLButtonElement;
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(toggle.disabled).toBe(true);
+    expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-banner")).toBeNull();
+  });
+
+  it("seeds the bypass-sandbox label in the create body when armed", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
+      target: { value: "bypass sandbox" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-bypass-sandbox-switch"));
+    // Close the menu and submit a real task.
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    // The persistent banner remains visible under the composer after the
+    // Advanced tray closes.
+    expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeTruthy();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    const labels = body.labels as Record<string, string>;
+    // The label is what the runner reads to launch with the bypass flag.
+    expect(labels["omnigent.codex_native.bypass_sandbox"]).toBe("1");
+    // The native wrapper labels still ride alongside it.
+    expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
   });
 
   it("shows a conflict banner in the file browser for an occupied directory", async () => {
@@ -760,6 +932,25 @@ describe("NewChatLandingScreen", () => {
     // Singular copy proves the count (1) flowed through, not just that *some*
     // banner rendered.
     expect(banner.textContent).toContain("1 other agent is");
+  });
+
+  it("caps each footer chip label with truncate so a long label can't wrap the row", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    // The host / working-directory / project / worktree chips each clamp their
+    // label to a fixed max width and `truncate` it, so a long value (a deep
+    // working-directory path, a long project or branch name) is ellipsized
+    // rather than growing the chip and pushing the tray onto a second row.
+    // Dropping `truncate` or the `max-w-*` cap would regress the single-row
+    // layout this guards.
+    const label = (testid: string) => screen.getByTestId(testid).querySelector("span.truncate");
+
+    expect(label("new-chat-landing-workspace-chip")?.className).toContain("max-w-20");
+    expect(label("new-chat-landing-host-chip")?.className).toContain("max-w-24");
+    expect(label("new-chat-landing-project-chip")?.className).toContain("max-w-16");
+    expect(label("new-chat-landing-branch-chip")?.className).toContain("max-w-16");
   });
 
   it("suppresses the conflict banner once a git branch is named", async () => {
@@ -980,6 +1171,83 @@ describe("NewChatLandingScreen", () => {
     } as unknown as Response);
     // The resolved create navigates without surfacing an error.
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-error")).toBeNull());
+  });
+
+  it("files the new session under a project picked in the composer chip", async () => {
+    // Both the create POST and the follow-up label PATCH read .ok / .json.
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const invalidateSpy = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+    renderLanding();
+
+    // Open the project chip → "New project…" → type a name → commit.
+    fireEvent.click(screen.getByTestId("new-chat-landing-project-chip"));
+    fireEvent.click(screen.getByText("New project…"));
+    const nameInput = screen.getByPlaceholderText("Project name…");
+    fireEvent.change(nameInput, { target: { value: "docs" } });
+    fireEvent.keyDown(nameInput, { key: "Enter" });
+    // The chip reflects the pick.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain("docs"),
+    );
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "write the docs" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    // Create POST first, then a PATCH that sets the omni_project label on the
+    // freshly-created session id.
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
+    const [createUrl] = authenticatedFetchMock.mock.calls[0];
+    expect(createUrl).toBe("/v1/sessions");
+    const [patchUrl, patchInit] = authenticatedFetchMock.mock.calls[1];
+    expect(patchUrl).toBe("/v1/sessions/conv_new");
+    expect((patchInit as RequestInit).method).toBe("PATCH");
+    const patchBody = JSON.parse((patchInit as RequestInit).body as string) as {
+      labels: Record<string, string>;
+    };
+    expect(patchBody.labels).toEqual({ omni_project: "docs" });
+
+    // The target folder fetches its own paginated list (useProjectSessions),
+    // so filing the new session must invalidate it — otherwise the row only
+    // appears after a manual refresh.
+    await waitFor(() =>
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] }),
+    );
+    invalidateSpy.mockRestore();
+  });
+
+  it("pre-fills the project chip from the ?project= query param", async () => {
+    // The sidebar's per-project "new session" pencil lands here with the
+    // project pre-selected — the chip reflects it with no interaction.
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding({}, "/?project=Sprint%2042");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain(
+        "Sprint 42",
+      ),
+    );
+
+    // Creating a session files it under that pre-filled project.
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "kick off the sprint" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
+    const [patchUrl, patchInit] = authenticatedFetchMock.mock.calls[1];
+    expect(patchUrl).toBe("/v1/sessions/conv_new");
+    const patchBody = JSON.parse((patchInit as RequestInit).body as string) as {
+      labels: Record<string, string>;
+    };
+    expect(patchBody.labels).toEqual({ omni_project: "Sprint 42" });
   });
 
   it.each([

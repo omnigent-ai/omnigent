@@ -41,6 +41,7 @@ import type {
   SessionResource,
   SessionResourceCreatedEvent,
   SessionResourceDeletedEvent,
+  SessionSupersededEvent,
   SessionSkillsEvent,
   SessionViewer,
   SessionTerminalActivityEvent,
@@ -54,6 +55,7 @@ import type {
   SessionTerminalPendingEvent,
   SessionUsageEvent,
   SlashCommand,
+  RoutingDecision,
   TerminalCommandEvent,
   StreamEvent,
   TextDelta,
@@ -641,6 +643,18 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       parentSessionId: typeof data.parent_session_id === "string" ? data.parent_session_id : null,
     } satisfies SessionCreatedEvent;
   }
+  if (eventType === "session.superseded") {
+    const conversationId = data.conversation_id;
+    const targetConversationId = data.target_conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    if (typeof targetConversationId !== "string" || !targetConversationId) return null;
+    return {
+      type: "session_superseded",
+      conversationId,
+      targetConversationId,
+      reason: "clear",
+    } satisfies SessionSupersededEvent;
+  }
   if (eventType === "session.resource.created") {
     const resource = parseSessionResource(data.resource);
     if (resource === null) return null;
@@ -923,6 +937,20 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
     } satisfies MessageDone;
   }
 
+  if (itemType === "error") {
+    return {
+      type: "error",
+      source: String(rec.source ?? ""),
+      toolName: null,
+      error: {
+        code: String(rec.code ?? ""),
+        message: String(rec.message ?? ""),
+      },
+      itemId,
+      responseId,
+    } satisfies ErrorEvent;
+  }
+
   if (itemType === "slash_command") {
     // Coerce a missing ``output`` (server-side exclude_none) to null
     // so downstream code branches on a single shape.
@@ -943,6 +971,25 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       itemId,
       responseId,
     } satisfies SlashCommand;
+  }
+
+  if (itemType === "routing_decision") {
+    // Drop a malformed frame (empty model / unknown tier) rather than
+    // rendering a broken chip — the relay also persists nothing for it.
+    const model = typeof rec.model === "string" ? rec.model : "";
+    const tier = rec.tier;
+    if (!model || (tier !== "cheap" && tier !== "medium" && tier !== "expensive")) {
+      return null;
+    }
+    return {
+      type: "routing_decision",
+      model,
+      tier,
+      applied: rec.applied === true,
+      rationale: typeof rec.rationale === "string" ? rec.rationale : "",
+      itemId,
+      responseId,
+    } satisfies RoutingDecision;
   }
 
   if (itemType === "terminal_command") {
