@@ -250,6 +250,16 @@ export interface ChatState {
    */
   isNativeTerminalSession: boolean;
   /**
+   * Whether this is a native-terminal wrapper whose model is chosen inside the
+   * vendor TUI (qwen/goose/cursor/pi/opencode) rather than through an Omnigent
+   * model picker. The composer status line hides its model/effort label for
+   * these — Omnigent's bound `llmModel` is just an unused default (it would
+   * otherwise read e.g. "claude-sonnet-4-6" on a Qwen session). claude-/codex-
+   * native DO expose an Omnigent picker, so they keep the label. `false` on
+   * `/`, before the snapshot resolves, and for non-native sessions.
+   */
+  nativeVendorOwnsModel: boolean;
+  /**
    * Server-bound agent id for the active conversation, read from
    * `GET /v1/sessions/{id}.agent_id` during bind. `null` while the
    * snapshot is in flight, on `/`, or for legacy conversations that
@@ -331,6 +341,12 @@ export interface ChatState {
    * snapshot on bind; drives the composer pill's harness suffix.
    */
   sessionHarness: string | null;
+  /**
+   * The active session's sub-agent head name (e.g. `"gpt"`), or null for a
+   * top-level session. Set from the snapshot on bind; lets a head sub-agent's
+   * composer identity name the head rather than the bundle orchestrator.
+   */
+  subAgentName: string | null;
   /**
    * Context window size in tokens for the active session's model,
    * as looked up server-side. ``null`` before bind or when the
@@ -678,6 +694,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   status: "idle",
   sessionStatus: "idle",
   isNativeTerminalSession: false,
+  nativeVendorOwnsModel: false,
   boundAgentId: null,
   boundAgentName: null,
   loadingConversation: false,
@@ -693,6 +710,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   flashItemId: null,
   llmModel: null,
   sessionHarness: null,
+  subAgentName: null,
   contextWindow: null,
   tokensUsed: null,
   sessionCostUsd: null,
@@ -1152,6 +1170,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         status: "idle",
         sessionStatus: "idle",
         isNativeTerminalSession: false,
+        nativeVendorOwnsModel: false,
         boundAgentId: null,
         boundAgentName: null,
         loadingConversation: conversationId !== null,
@@ -1596,11 +1615,13 @@ function sessionBindingPatch(
 ): Pick<
   ChatState,
   | "isNativeTerminalSession"
+  | "nativeVendorOwnsModel"
   | "boundAgentId"
   | "boundAgentName"
   | "llmModel"
   | "sessionModelOverride"
   | "sessionHarness"
+  | "subAgentName"
   | "costControlModeOverride"
   | "codexPlanMode"
   | "contextWindow"
@@ -1613,11 +1634,17 @@ function sessionBindingPatch(
   const wrapper = session.labels?.["omnigent.wrapper"];
   return {
     isNativeTerminalSession: isNativeWrapper(wrapper),
+    // Native wrapper whose model lives in the vendor TUI (no Omnigent picker):
+    // qwen/goose/cursor/pi/opencode. nativeModelFamilyForSession is non-null
+    // only for claude-/codex-native, which keep the composer model label.
+    nativeVendorOwnsModel:
+      isNativeWrapper(wrapper) && nativeModelFamilyForSession(session) === null,
     boundAgentId: session.agentId,
     boundAgentName: session.agentName,
     llmModel: session.llmModel ?? null,
     sessionModelOverride: session.modelOverride ?? null,
     sessionHarness: session.harness ?? null,
+    subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
     codexPlanMode: codexPlanModeFromSession(session),
     contextWindow: session.contextWindow ?? null,
@@ -3361,8 +3388,9 @@ export function handleSessionEvent(event: StreamEvent): void {
       return;
     }
     case "session_model":
-      // A `/model` switch made inside the Claude Code terminal. Reflect
-      // it in the picker for the open session. The server already
+      // A `/model` switch made inside a native terminal (Claude Code,
+      // codex, or cursor-agent). Reflect it in the picker for the open
+      // session. The server already
       // persisted `model_override`, so a reload restores it; the
       // cross-session sticky pref is intentionally left untouched (a
       // terminal switch is a per-session choice, not a new default).

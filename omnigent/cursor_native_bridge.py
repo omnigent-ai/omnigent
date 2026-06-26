@@ -23,13 +23,16 @@ import time
 from pathlib import Path
 from typing import Any
 
+from omnigent._platform import stable_user_id
+
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_CURSOR_NATIVE_BRIDGE_DIR"
 
-_BRIDGE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{os.getuid()}" / "cursor-native"
+_BRIDGE_ROOT = Path(tempfile.gettempdir()) / f"omnigent-{stable_user_id()}" / "cursor-native"
 _TMUX_FILE = "tmux.json"
 _BRIDGE_CONFIG_FILE = "bridge.json"
 _MCP_CONFIG_FILE = "mcp.json"
+_HOOKS_CONFIG_FILE = "hooks.json"
 _MCP_SERVER_NAME = "omnigent"
 _CURSOR_AUTO_APPROVE_TOOLS = [
     "list_comments",
@@ -68,10 +71,33 @@ _PASTE_BUFFER = "omnigent-cursor-paste"
 # sending Enter — submitting before the TUI commits the paste folds the Enter
 # into the paste as a newline and the message sits unsent.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
+# Pause between the ``/model`` filter landing and Enter. cursor-agent's
+# composer debounces input (~1.5s); an Enter fired too soon selects a stale
+# picker highlight. See the cursor-native e2e_ui TUI-driving notes.
+_MODEL_PICKER_SETTLE_S = 1.5
+# ``/model`` picker filter-result markers. cursor prints ``Models matching
+# "<query>"`` above the matched rows, or ``No matches`` when the id resolves to
+# nothing. These distinguish a landed filter from the echoed ``/model <id>``
+# composer text (which always contains the id), so the readiness gate verifies
+# the picker actually matched rather than passing instantly off the echo.
+_PICKER_MATCH_MARKER = "Models matching"
+_PICKER_NO_MATCH_MARKER = "No matches"
 # cursor-agent TUI markers (Phase 0): idle input placeholder / running footer /
 # first-run trust modal.
 _IDLE_MARKERS = ("Plan, search, build", "Add a follow-up")
 _TRUST_MARKER = "Trust this workspace"
+# Composer-clear (see _clear_composer): cursor-agent's input widget ignores the
+# readline Home/kill-line keys, so we delete with a Backspace flood instead.
+# Backspaces per round (one ``send-keys -N`` call) and a round cap; the loop
+# stops early once the pane stops changing (the draft is gone). The cap bounds a
+# pathological never-settles pane; ``_COMPOSER_CLEAR_CHUNK * _COMPOSER_CLEAR_MAX_ROUNDS``
+# deletions comfortably exceed any real draft.
+_COMPOSER_CLEAR_CHUNK = 200
+_COMPOSER_CLEAR_MAX_ROUNDS = 50
+# After a cancel, cursor-agent restores the interrupted prompt into the composer
+# slightly after the turn stops. Wait for the pane to stop changing (generation
+# ended and the draft settled) before clearing it, bounded by this timeout.
+_INTERRUPT_SETTLE_TIMEOUT_S = 2.0
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -90,6 +116,122 @@ def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         os.chmod(path, 0o700)
+
+
+#: File the runner drops into a fork's bridge dir holding the prior-conversation
+#: text preamble, consumed once by the executor on the first injected message.
+#: cursor's conversation is server-backed (a synthesized local store.db is NOT
+#: loaded by ``cursor-agent --resume``), so a fork carries history by replaying
+#: the prior turns as a text prefix on the first message (text-prefix replay).
+_FORK_PREAMBLE_FILE = "fork_preamble.txt"
+#: Sentinel framing the replayed history inside the first injected message. The
+#: cursor agent reads the wrapped context, but the forwarder strips this block
+#: when mirroring the user turn back to Omnigent so the copied history isn't
+#: duplicated in the timeline (see cursor_native_forwarder._unwrap_user_query).
+FORK_HISTORY_OPEN_TAG = "<omnigent_fork_history>"
+FORK_HISTORY_CLOSE_TAG = "</omnigent_fork_history>"
+
+
+def write_fork_preamble(bridge_dir: Path, preamble: str) -> None:
+    """Persist a fork's prior-conversation preamble for the executor to consume.
+
+    :param bridge_dir: The session's cursor-native bridge dir.
+    :param preamble: Rendered prior-conversation text (``""`` is not written).
+    """
+    if not preamble:
+        return
+    _ensure_dir(bridge_dir)
+    (bridge_dir / _FORK_PREAMBLE_FILE).write_text(preamble, encoding="utf-8")
+
+
+def read_fork_preamble(bridge_dir: Path) -> str | None:
+    """Read the fork preamble WITHOUT consuming it (else ``None``).
+
+    Read and clear are deliberately split: the executor reads the preamble,
+    injects it, and only calls :func:`clear_fork_preamble` on a SUCCESSFUL
+    injection. Consuming on read would lose the forked history permanently if
+    the first injection fails (e.g. the TUI exited) and the turn is retried.
+
+    :param bridge_dir: The session's cursor-native bridge dir.
+    :returns: The preamble text, or ``None`` when absent/empty.
+    """
+    try:
+        text = (bridge_dir / _FORK_PREAMBLE_FILE).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    return text or None
+
+
+def clear_fork_preamble(bridge_dir: Path) -> None:
+    """Remove the fork preamble so it rides only the FIRST injected message.
+
+    Called by the executor only after a turn's injection succeeds; subsequent
+    turns then inject the plain user text. A no-op when the file is absent.
+
+    :param bridge_dir: The session's cursor-native bridge dir.
+    """
+    with contextlib.suppress(OSError):
+        (bridge_dir / _FORK_PREAMBLE_FILE).unlink()
+
+
+#: Human-readable lead-in / sign-off framing the replayed transcript inside the
+#: sentinel, so the block reads as a contained "here's the prior conversation"
+#: note rather than a raw dump. The cursor agent sees this context; the forwarder
+#: strips the whole sentinel block from the mirrored web bubble.
+_FORK_HISTORY_HEADER = "This session was forked. Here is the conversation so far:"
+_FORK_HISTORY_FOOTER = "(End of prior conversation. Please continue from here.)"
+
+
+def _neutralize_fork_sentinels(text: str) -> str:
+    """Defang any literal fork sentinel tags inside replayed transcript text.
+
+    The preamble is rendered from prior user/assistant turns verbatim, so a turn
+    could literally contain ``<omnigent_fork_history>`` /
+    ``</omnigent_fork_history>`` (a user typed it, pasted logs, etc.). If left
+    intact, an embedded close tag would let the forwarder's strip stop early and
+    leak the rest of the transcript into the mirrored web bubble. Replacing the
+    angle brackets guarantees the framed block contains exactly ONE real
+    open/close pair, so the (non-greedy) strip is unambiguous. The bracketed form
+    stays readable for the cursor agent.
+
+    :param text: Rendered transcript text.
+    :returns: The text with any literal sentinel tags defanged.
+    """
+    return text.replace(FORK_HISTORY_OPEN_TAG, "[omnigent_fork_history]").replace(
+        FORK_HISTORY_CLOSE_TAG, "[/omnigent_fork_history]"
+    )
+
+
+def wrap_fork_preamble(preamble: str, user_text: str) -> str:
+    """Combine a fork preamble with the latest user text for one injection.
+
+    The transcript is framed by a human lead-in / sign-off and fenced in
+    :data:`FORK_HISTORY_OPEN_TAG` / :data:`FORK_HISTORY_CLOSE_TAG`. cursor can't
+    reconstruct native chat bubbles from a fork (its conversation is
+    server-backed), so this is the closest single-message analog: the agent
+    reads the framed transcript as context, and the forwarder strips the whole
+    sentinel block from the mirrored user turn so the copied history isn't
+    duplicated in the Omnigent timeline.
+
+    Any literal sentinel tags inside *preamble* are defanged
+    (:func:`_neutralize_fork_sentinels`) so the framed block holds exactly one
+    real open/close pair — this keeps the forwarder's non-greedy strip
+    unambiguous and prevents embedded tags from leaking history. *user_text* is
+    left untouched (it sits after the close tag; the non-greedy strip stops at
+    the real close, so a tag in the user's own message is preserved).
+
+    :param preamble: Rendered prior-conversation transcript.
+    :param user_text: The user's first message in the fork.
+    :returns: The framed, fenced transcript followed by the user text.
+    """
+    return (
+        f"{FORK_HISTORY_OPEN_TAG}\n"
+        f"{_FORK_HISTORY_HEADER}\n\n"
+        f"{_neutralize_fork_sentinels(preamble)}\n\n"
+        f"{_FORK_HISTORY_FOOTER}\n"
+        f"{FORK_HISTORY_CLOSE_TAG}\n\n"
+        f"{user_text}"
+    )
 
 
 def build_cursor_native_spawn_env(session_id: str) -> dict[str, str]:
@@ -166,6 +308,59 @@ def write_mcp_config(
     os.replace(tmp, path)
     enable_mcp_for_workspace(workspace)
     allow_mcp_tools_in_cli_config()
+    return path
+
+
+def build_hooks_config(
+    bridge_dir: Path, *, python_executable: str | None = None
+) -> dict[str, Any]:
+    """Build Cursor's ``.cursor/hooks.json`` registering the usage ``stop`` hook.
+
+    cursor-agent fires the ``stop`` hook once per completed turn with a JSON
+    payload (on stdin) carrying that turn's token usage — the only surface where
+    the interactive TUI exposes usage. The hook command runs
+    ``omnigent.cursor_native_usage record-usage``, which appends the usage to
+    ``<bridge_dir>/cursor_usage.jsonl`` for the runner's usage forwarder to tail
+    and post as ``external_session_usage`` (lighting up the web Session-cost
+    badge). Bakes the absolute ``--bridge-dir`` so the recorder writes where the
+    forwarder reads, regardless of the hook's working directory.
+    """
+    import shlex
+
+    python = python_executable or sys.executable
+    command = " ".join(
+        shlex.quote(part)
+        for part in (
+            python,
+            "-I",
+            "-m",
+            "omnigent.cursor_native_usage",
+            "record-usage",
+            "--bridge-dir",
+            str(bridge_dir),
+        )
+    )
+    return {"version": 1, "hooks": {"stop": [{"command": command}]}}
+
+
+def write_hooks_config(
+    workspace: Path,
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> Path:
+    """Write the workspace-scoped Cursor ``hooks.json`` capturing per-turn usage.
+
+    Sibling of :func:`write_mcp_config`: project-scoped Cursor config the TUI
+    loads on launch in a trusted workspace. Returns the written path.
+    """
+    cursor_dir = workspace / ".cursor"
+    cursor_dir.mkdir(parents=True, exist_ok=True)
+    path = cursor_dir / _HOOKS_CONFIG_FILE
+    payload = build_hooks_config(bridge_dir, python_executable=python_executable)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
     return path
 
 
@@ -363,6 +558,48 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
     return proc.returncode == 0
 
 
+def capture_cursor_pane(bridge_dir: Path) -> str | None:
+    """
+    Return the visible Cursor pane text, or ``None`` if the TUI is not running.
+
+    Reused by the runner-side approval mirror
+    (:mod:`omnigent.cursor_native_permissions`) to detect cursor-agent's native
+    tool-approval prompts. ``None`` (no advertised tmux target, or a dead pane)
+    is distinct from ``""`` (a live but empty capture) so the caller can skip
+    polling a TUI that has not started yet or has exited.
+
+    :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
+    :returns: The captured pane text, or ``None`` when no live pane exists.
+    """
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        return None
+    socket_path, tmux_target = info["socket_path"], info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        return None
+    return _capture_pane(socket_path, tmux_target)
+
+
+def send_cursor_pane_keys(bridge_dir: Path, *keys: str) -> None:
+    """
+    Send one or more keys to the Cursor pane (tmux ``send-keys``).
+
+    Used by the approval mirror to answer cursor-agent's native prompt from a
+    web verdict, e.g. ``"y"`` to approve or ``"Escape"`` to reject. Each key is
+    a tmux key name/argument (not bracketed-paste data), so multi-byte keys like
+    ``"Escape"`` are interpreted, not typed literally.
+
+    :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
+    :param keys: tmux key arguments, e.g. ``"y"`` or ``"Escape"``.
+    :raises RuntimeError: If the tmux target is not advertised or the
+        ``send-keys`` invocation fails.
+    """
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        raise RuntimeError("cursor-native tmux target not advertised")
+    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], *keys)
+
+
 def _submit_needle(content: str) -> str:
     """A stable single-line substring used to confirm the paste rendered in the pane."""
     for line in content.splitlines():
@@ -396,6 +633,38 @@ def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> Non
         time.sleep(_POLL_INTERVAL_S)
 
 
+def _clear_composer(socket_path: str, tmux_target: str) -> None:
+    """Empty the cursor-agent composer of any leftover draft before a paste.
+
+    cursor-agent restores the interrupted prompt back into the composer when a
+    turn is cancelled (Stop button -> :func:`inject_interrupt`), and its input
+    widget ignores the readline ``C-a``/``C-k``/``C-u`` keys we'd otherwise use
+    to clear a line — only ``Backspace`` deletes. So jump to the end (``End``)
+    and flood ``Backspace`` in ``send-keys -N`` bursts until the pane stops
+    changing (the draft is gone) or a generous round cap is hit. A burst against
+    an already-empty composer is a harmless no-op (unlike ``C-c``, which would
+    arm cursor-agent's exit), so this is safe to run before every injection.
+    """
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "End")
+    previous = _capture_pane(socket_path, tmux_target)
+    for _ in range(_COMPOSER_CLEAR_MAX_ROUNDS):
+        _run_tmux(
+            socket_path,
+            "send-keys",
+            "-t",
+            tmux_target,
+            "-N",
+            str(_COMPOSER_CLEAR_CHUNK),
+            "BSpace",
+        )
+        current = _capture_pane(socket_path, tmux_target)
+        # Once a burst no longer changes the pane, the composer is empty —
+        # further Backspaces are no-ops, so stop.
+        if current == previous:
+            return
+        previous = current
+
+
 def inject_user_message(
     bridge_dir: Path,
     *,
@@ -427,9 +696,9 @@ def inject_user_message(
             "cursor terminal is no longer running (the TUI exited); restart the session"
         )
     _settle_pane(socket_path, tmux_target, timeout_s=timeout_s)
-    # Clear any leftover draft: Home (C-a) + kill-to-end (C-k).
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    # Clear any leftover draft (e.g. the prompt cursor-agent restores into the
+    # composer after a cancelled turn) so it can't prepend the new message.
+    _clear_composer(socket_path, tmux_target)
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
     ) as paste_file:
@@ -466,10 +735,102 @@ def inject_user_message(
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
 
 
-def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
-    """Cancel the in-flight Cursor turn by sending ``Escape`` to the pane.
+def inject_model_command(
+    bridge_dir: Path,
+    *,
+    model: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> None:
+    """Switch the live Cursor model by driving the TUI ``/model`` picker.
 
-    cursor-agent stops a running turn on a single ``Escape`` (verified live).
+    cursor-agent's ``--model`` flag is baked in at spawn, so a web-UI / REPL
+    model switch on a *running* pane can't be applied by re-reading the
+    persisted ``model_override`` — it has to be typed into the TUI. Typing
+    ``/model <id>`` opens cursor-agent's model picker filtered to *model* and
+    Enter selects the (now top) match; verified live that an exact model id
+    selects exactly that model (e.g. ``gpt-5.2`` → "GPT-5.2 Medium"). This is
+    the cursor analog of claude-native's ``inject_slash_command('/model …')``.
+
+    :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
+    :param model: cursor-agent model id, e.g. ``"gpt-5.2"`` (the same ids
+        ``cursor-agent --list-models`` reports).
+    :param timeout_s: Per-readiness-gate timeout.
+    :raises RuntimeError: If the tmux target is never advertised, the TUI has
+        exited, a tmux command fails, or the picker reports no match for *model*
+        (an unavailable/typo'd id) — in which case the picker is dismissed and
+        the model is left unchanged rather than mis-selected.
+    """
+    model = model.strip()
+    if not model:
+        raise RuntimeError("cursor-native model switch requires a non-empty model id")
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "cursor terminal is no longer running (the TUI exited); restart the session"
+        )
+    _settle_pane(socket_path, tmux_target, timeout_s=timeout_s)
+    # Clear any leftover draft so the slash command isn't appended to it.
+    # cursor-agent's composer ignores the readline C-a/C-k keys, so this floods
+    # Backspace (see _clear_composer); a bare "/model <id>" is what opens the
+    # picker, whereas "<draft>/model <id>" would not.
+    _clear_composer(socket_path, tmux_target)
+    # ``-l`` sends the command as literal characters so ``/`` opens the slash
+    # menu and the id filters the picker rather than being parsed as key names.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "-l", f"/model {model}")
+    # Gate on the picker's *filter result*, not the echoed command: the composer
+    # line itself contains ``model``, so a naive ``model in pane`` check passes
+    # instantly off the echo and never confirms a match landed. Poll for cursor's
+    # "Models matching" header (≥1 match) or "No matches", then settle so the
+    # highlight stabilizes before Enter. The composer debounces input (~1.5s), so
+    # both the filter and the highlight need time to resolve.
+    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        if _PICKER_NO_MATCH_MARKER in pane or _PICKER_MATCH_MARKER in pane:
+            break
+        time.sleep(_POLL_INTERVAL_S)
+    time.sleep(_MODEL_PICKER_SETTLE_S)
+    # Re-read after the settle: a transient "No matches" can flash mid-filter,
+    # and a real match may only resolve once the debounce fires.
+    if _PICKER_NO_MATCH_MARKER in _capture_pane(socket_path, tmux_target):
+        # Dismiss the picker and clear the composer so the literal "/model <id>"
+        # can't be submitted as a chat message, then fail loudly so the web
+        # surfaces an honest error instead of silently selecting nothing.
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+        _clear_composer(socket_path, tmux_target)
+        raise RuntimeError(
+            f"cursor model {model!r} is not available in the picker (no match); "
+            "the model was not switched"
+        )
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+
+
+def _wait_for_pane_settle(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
+    """Best-effort wait until the pane stops changing across two captures.
+
+    Used after a cancel so the restored draft (and any final generation output)
+    has landed before we clear the composer. Falls through after *timeout_s*
+    rather than raising — the clear that follows is a no-op on an empty composer.
+    """
+    deadline = time.monotonic() + timeout_s
+    previous = _capture_pane(socket_path, tmux_target)
+    while time.monotonic() < deadline:
+        time.sleep(_POLL_INTERVAL_S)
+        current = _capture_pane(socket_path, tmux_target)
+        if current and current == previous:
+            return
+        previous = current
+
+
+def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
+    """Cancel the in-flight Cursor turn and clear the composer.
+
+    Sends ``Escape`` to stop the running turn, then clears the input box:
+    cursor-agent restores the interrupted prompt into the composer on cancel, so
+    without this the leftover prompt sits in the box and prepends the next
+    message (the web UI's Stop button would otherwise leave a half-sent draft).
     The harness ``run_turn`` returns right after the paste, so the runner's
     in-process cancel floor can't reach the turn — this is the analog of
     :func:`inject_user_message` for the web UI's Stop button.
@@ -477,8 +838,15 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
     # No ``-l``: tmux must interpret ``Escape`` as a key name.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+    # Let the cancel land and the restored draft settle, then clear it. The
+    # next injection also clears (defense in depth), but clearing here means the
+    # composer is empty the moment the user looks at the TUI after pressing Stop.
+    _wait_for_pane_settle(socket_path, tmux_target, timeout_s=_INTERRUPT_SETTLE_TIMEOUT_S)
+    _clear_composer(socket_path, tmux_target)
 
 
 def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:

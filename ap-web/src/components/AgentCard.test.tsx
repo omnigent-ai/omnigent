@@ -18,8 +18,11 @@ function stub(name: string) {
 vi.mock("@/components/icons/ClaudeIcon", () => ({ ClaudeIcon: stub("claude") }));
 vi.mock("@/components/icons/CodexIcon", () => ({ CodexIcon: stub("codex") }));
 vi.mock("@/components/icons/CursorIcon", () => ({ CursorIcon: stub("cursor") }));
+vi.mock("@/components/icons/GooseIcon", () => ({ GooseIcon: stub("goose") }));
 vi.mock("@/components/icons/NessieIcon", () => ({ NessieIcon: stub("nessie") }));
+vi.mock("@/components/icons/OpenCodeIcon", () => ({ OpenCodeIcon: stub("opencode") }));
 vi.mock("@/components/icons/PiIcon", () => ({ PiIcon: stub("pi") }));
+vi.mock("@/components/icons/AntigravityIcon", () => ({ AntigravityIcon: stub("antigravity") }));
 vi.mock("lucide-react", () => ({ BotIcon: stub("bot") }));
 
 function agent(overrides: Partial<AvailableAgent> = {}): AvailableAgent {
@@ -47,11 +50,20 @@ describe("AgentCard icon selection", () => {
     // "design-reviewer" must still read as Codex, not fall back to bot.
     { name: "design-reviewer", harness: "codex", expected: "codex" },
     { name: "codex-native-ui", harness: "codex-native", expected: "codex" },
+    { name: "opencode-native-ui", harness: "opencode-native", expected: "opencode" },
     { name: "claude-native-ui", harness: "claude-native", expected: "claude" },
     { name: "pi-native-ui", harness: "pi-native", expected: "pi" },
     { name: "cursor-native-ui", harness: "cursor-native", expected: "cursor" },
+    { name: "goose-native-ui", harness: "goose-native", expected: "goose" },
+    // A goose-harnessed agent also reads as Goose via the harness fallback —
+    // both the native TUI ("goose-native") and the headless ACP harness ("goose").
+    { name: "x", harness: "goose-native", expected: "goose" },
+    { name: "x", harness: "goose", expected: "goose" },
     // The SDK "cursor" harness also reads as Cursor via the harness fallback.
     { name: "x", harness: "cursor", expected: "cursor" },
+    { name: "antigravity-native-ui", harness: "antigravity-native", expected: "antigravity" },
+    // The in-process Antigravity SDK harness shares the same glyph.
+    { name: "x", harness: "antigravity", expected: "antigravity" },
     { name: "x", harness: "claude-sdk", expected: "claude" },
     { name: "pi", harness: "pi", expected: "pi" },
     // The pi match is exact: a harness merely containing "pi" stays generic.

@@ -184,6 +184,9 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.template: str | None = None
         self.secrets: list[str] | None = None
         self.env: list[str] | None = None
+        self.endpoint: str | None = None
+        self.home_dir: str | None = None
+        self.registry: dict[str, object] | None = None
         self.base_url: str | None = None
         self.gateway_profile: str | None = None
         self.snapshot_name: str | None = None
@@ -192,6 +195,14 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.memory_mb: int | None = None
         self.disk_gb: int | None = None
         self.cluster: str | None = None
+        # Kubernetes ctor wiring (captured by install_fake_kubernetes_launcher).
+        self.namespace: str | None = None
+        self.secret_name: str | None = None
+        self.service_account: str | None = None
+        self.node_selector: dict[str, str] | None = None
+        self.kubeconfig: str | None = None
+        self.in_cluster: bool | None = None
+        self.resources: dict[str, object] | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
@@ -341,6 +352,41 @@ def install_fake_daytona_launcher(
     monkeypatch.setattr(daytona_mod, "DaytonaSandboxLauncher", _ctor)
 
 
+def install_fake_boxlite_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``BoxliteSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``BoxliteSandboxLauncher(endpoint=…,
+    image=…, env=…)``; the shim records all three on the fake and hands
+    the fake back, so production code runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.boxlite as boxlite_mod
+
+    def _ctor(
+        *,
+        endpoint: str | None = None,
+        image: str | None = None,
+        env: list[str] | None = None,
+        home_dir: str | None = None,
+        registry: dict[str, object] | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.endpoint = endpoint
+        fake.image = image
+        fake.env = env
+        fake.home_dir = home_dir
+        fake.registry = registry
+        return fake
+
+    monkeypatch.setattr(boxlite_mod, "BoxliteSandboxLauncher", _ctor)
+
+
 def install_fake_islo_launcher(
     monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
     fake: FakeSandboxLauncher,
@@ -444,6 +490,51 @@ def install_fake_openshell_launcher(
         return fake
 
     monkeypatch.setattr(openshell_mod, "OpenShellSandboxLauncher", _ctor)
+
+
+def install_fake_kubernetes_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``KubernetesSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``KubernetesSandboxLauncher(image=…, env=…,
+    namespace=…, secret_name=…, service_account=…, node_selector=…,
+    kubeconfig=…, in_cluster=…, resources=…)``; the shim records those
+    constructor args on the fake and hands it back, so production code runs
+    unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.kubernetes as kubernetes_mod
+
+    def _ctor(
+        *,
+        image: str | None = None,
+        env: list[str] | None = None,
+        namespace: str | None = None,
+        secret_name: str | None = None,
+        service_account: str | None = None,
+        node_selector: dict[str, str] | None = None,
+        kubeconfig: str | None = None,
+        in_cluster: bool | None = None,
+        resources: dict[str, object] | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.image = image
+        fake.env = env
+        fake.namespace = namespace
+        fake.secret_name = secret_name
+        fake.service_account = service_account
+        fake.node_selector = node_selector
+        fake.kubeconfig = kubeconfig
+        fake.in_cluster = in_cluster
+        fake.resources = resources
+        return fake
+
+    monkeypatch.setattr(kubernetes_mod, "KubernetesSandboxLauncher", _ctor)
 
 
 async def wait_for_completion(

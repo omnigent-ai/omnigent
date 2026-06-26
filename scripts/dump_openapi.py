@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,223 @@ _SSE_ROUTES: list[tuple[str, str]] = [
     ("/v1/responses", "post"),
     ("/v1/sessions/{session_id}/stream", "get"),
 ]
+
+# ── Document-level enrichment ─────────────────────────────────────
+#
+# FastAPI emits accurate per-operation schemas but none of the
+# document-level metadata an integrator needs: no ``servers``, no auth
+# description, no ``info.description``, and only bare snake_case tags.
+# We inject that connective tissue here so the published reference
+# (rendered by Scalar on the omnigent website) is usable for building
+# an integration. Keeping it in this script — rather than scattering it
+# across the route decorators — confines presentation concerns to the
+# spec-generation layer, and the drift test
+# (``tests/server/test_openapi_drift.py``) guards the result.
+
+# Self-hosted base URL. ``omnigent server`` binds 127.0.0.1:6767 by
+# default (see ``_DEFAULT_LOCAL_PORT`` in
+# ``omnigent/host/local_server.py``).
+_SERVERS: list[dict[str, str]] = [
+    {
+        "url": "http://127.0.0.1:6767",
+        "description": "Self-hosted Omnigent server (default local port).",
+    },
+]
+
+# Markdown prose shown at the top of the rendered reference. Covers
+# what the API is, the self-hosted base URL, and the deployment-driven
+# auth model (there is no bearer/API-key scheme — see
+# ``omnigent/server/auth.py``).
+_INFO_DESCRIPTION: str = """\
+Omnigent is an open-source meta-harness for building and running AI \
+agents. This is the REST API exposed by the Omnigent server: use it to \
+create and drive **sessions**, manage **agents**, **hosts**, and \
+**runners**, attach **contextual policies**, post **comments**, and work \
+with session **resources** — files, terminals, and sandboxed \
+environments.
+
+## Base URL
+
+Omnigent is self-hosted. The server binds `http://127.0.0.1:6767` by \
+default (`omnigent server`); point the base URL at your own deployment.
+
+## Authentication
+
+There is no API-key or bearer-token scheme. Identity is supplied by the \
+deployment's configured auth provider (`OMNIGENT_AUTH_PROVIDER`):
+
+- **Trusted proxy header** (default) — an upstream proxy injects an \
+identity header (`X-Forwarded-Email`, configurable). Single-user local \
+runtimes fall back to a reserved `local` user.
+- **Session cookie** — a signed session cookie minted after an \
+interactive OIDC or accounts login. It is named `ap_session` over HTTP \
+(the advertised local default) and `__Host-ap_session` under HTTPS, where \
+the `__Host-` prefix guards against subdomain cookie-tossing.
+
+Auth is configured server-side; clients send the cookie or proxy header \
+according to your deployment.
+
+## Streaming
+
+`GET /v1/sessions/{session_id}/stream` streams Server-Sent Events \
+(`text/event-stream`). Each event conforms to the `ServerStreamEvent` \
+schema documented below.
+"""
+
+# Auth representations. Omnigent has no bearer/API-key scheme — identity
+# arrives via a trusted-proxy header or a signed session cookie,
+# selected by ``OMNIGENT_AUTH_PROVIDER``. We model both as OpenAPI
+# ``apiKey`` schemes so SDK generators and the reference can surface
+# them. We deliberately do NOT assert a top-level ``security``
+# requirement: the active scheme is deployment-specific, and public
+# endpoints (``/health``, ``/api/version``) require none — the prose in
+# :data:`_INFO_DESCRIPTION` carries the human-facing explanation.
+_SECURITY_SCHEMES: dict[str, dict[str, str]] = {
+    "proxyHeaderAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Forwarded-Email",
+        "description": (
+            "Trusted-proxy identity header (header-auth mode, the "
+            "default). The header name is configurable via "
+            "``OMNIGENT_AUTH_HEADER``."
+        ),
+    },
+    "sessionCookieAuth": {
+        "type": "apiKey",
+        "in": "cookie",
+        # Named to match the advertised HTTP server. The ``__Host-``
+        # prefix requires HTTPS (browsers drop it on plain HTTP), so the
+        # cookie is ``ap_session`` for the default local deployment and
+        # ``__Host-ap_session`` only under HTTPS — see ``secure_cookies``
+        # in ``accounts_config.py`` / ``oidc.py``.
+        "name": "ap_session",
+        "description": (
+            "Signed session cookie minted after an interactive OIDC or "
+            "accounts login (oidc / accounts auth modes). Named "
+            "``ap_session`` over HTTP (the advertised local default); "
+            "under HTTPS the secure ``__Host-ap_session`` prefixed form "
+            "is used instead."
+        ),
+    },
+}
+
+# Tag display metadata: human descriptions + sidebar order. Each
+# ``name`` MUST match the tag FastAPI puts on operations (the route
+# decorators use these snake_case values). ``x-displayName`` gives docs
+# tooling a readable label in place of the raw tag. Order here is the
+# order tags render in the reference sidebar.
+#
+# This intentionally covers only the stub-build surface that
+# ``generate_spec()`` emits: the ``terminals`` router is WebSocket-only
+# (no HTTP operations in the spec) and the ``auth`` router is mounted
+# only when an auth provider with a ``login_url`` is configured (absent
+# in the stub build). If either ever surfaces HTTP operations here, add
+# its tag below so the operation doesn't render without a description.
+_TAGS: list[dict[str, str]] = [
+    {
+        "name": "sessions",
+        "x-displayName": "Sessions",
+        "description": (
+            "Create, inspect, fork, and drive agent sessions — the core "
+            "unit of work. Covers session items and events, agent "
+            "binding, permissions, labels, and child sessions. The "
+            "files, terminals, and sandboxed environments attached to a "
+            "session live under Session Resources."
+        ),
+    },
+    {
+        "name": "session_resources",
+        "x-displayName": "Session Resources",
+        "description": (
+            "Files, terminals, and sandboxed environments attached to a "
+            "session: upload and read files, create and manage "
+            "terminals, and read, write, edit, and search the "
+            "environment filesystem."
+        ),
+    },
+    {
+        "name": "session_mcp_servers",
+        "x-displayName": "Session MCP Servers",
+        "description": (
+            "Manage the MCP server declarations on a session's bound "
+            "agent: list the configured servers and create, update, and "
+            "remove them on session-scoped agents."
+        ),
+    },
+    {
+        "name": "agents",
+        "x-displayName": "Agents",
+        "description": "Discover the built-in agents available to bind to a session.",
+    },
+    {
+        "name": "hosts",
+        "x-displayName": "Hosts",
+        "description": (
+            "Hosts that can launch runners. Browse the host filesystem and create directories."
+        ),
+    },
+    {
+        "name": "runners",
+        "x-displayName": "Runners",
+        "description": "Launch runners on a host and check their status.",
+    },
+    {
+        "name": "session_policies",
+        "x-displayName": "Session Policies",
+        "description": (
+            "Contextual policies scoped to a single session — list, create, update, and remove."
+        ),
+    },
+    {
+        "name": "default_policies",
+        "x-displayName": "Default Policies",
+        "description": "Server-level default policies applied to new sessions.",
+    },
+    {
+        "name": "policy_registry",
+        "x-displayName": "Policy Registry",
+        "description": "The catalog of policy types available to instantiate.",
+    },
+    {
+        "name": "comments",
+        "x-displayName": "Comments",
+        "description": (
+            "Threaded comments on a session, including sending a comment to the agent."
+        ),
+    },
+    {
+        "name": "system",
+        "x-displayName": "System",
+        "description": "Health, version, and identity endpoints for the running server.",
+    },
+]
+
+# Utility endpoints FastAPI leaves untagged. We assign them a synthetic
+# ``system`` tag so they group cleanly in the reference instead of
+# floating in an unlabeled "default" bucket. Keyed ``(path, method)``
+# like :data:`_SSE_ROUTES`; keep accurate if the route inventory grows.
+_SYSTEM_ROUTES: list[tuple[str, str]] = [
+    ("/health", "get"),
+    ("/api/version", "get"),
+    ("/v1/info", "get"),
+    ("/v1/me", "get"),
+]
+
+# HTTP methods that denote an operation object inside a path item
+# (everything else under a path — ``parameters``, ``servers``, … — is
+# not an operation and must be skipped when retagging).
+_HTTP_METHODS: frozenset[str] = frozenset(
+    {"get", "put", "post", "delete", "patch", "options", "head", "trace"},
+)
+
+# Path prefix whose operations form the dedicated "Session Resources"
+# group. The sessions router is mounted with ``tags=["sessions"]`` in
+# app.py, so every session route — including the resource subtree —
+# inherits that single tag. We split this subtree (files, terminals,
+# sandboxed environments) into its own section in the published
+# reference rather than fracturing the router.
+_SESSION_RESOURCES_PREFIX: str = "/v1/sessions/{session_id}/resources"
 
 
 def _build_app_with_stub_stores() -> Any:
@@ -199,6 +417,342 @@ def _rewrite_sse_route(
         sse_entry["itemSchema"] = sse_entry.pop("schema")
 
 
+def _tag_system_routes(paths: dict[str, Any]) -> None:
+    """
+    Assign the synthetic ``system`` tag to untagged utility routes.
+
+    FastAPI leaves ``/health``, ``/api/version``, ``/v1/info``, and
+    ``/v1/me`` untagged. Without a tag they render in an unlabeled
+    "default" bucket in the reference; tagging them groups the lot
+    under "System". Only fills in a tag where none exists — never
+    overrides one FastAPI already set.
+
+    No-op for any ``(path, method)`` not present, so
+    :data:`_SYSTEM_ROUTES` stays resilient to inventory changes.
+
+    :param paths: The OpenAPI ``paths`` map; mutated in place.
+    """
+    for path, method in _SYSTEM_ROUTES:
+        op = paths.get(path, {}).get(method)
+        if op is None:
+            continue
+        if not op.get("tags"):
+            op["tags"] = ["system"]
+
+
+def _retag_session_resources(paths: dict[str, Any]) -> None:
+    """
+    Move the session-resource subtree into its own ``session_resources`` tag.
+
+    Every operation whose path starts with
+    :data:`_SESSION_RESOURCES_PREFIX` has its tag list *replaced* (not
+    appended) with ``["session_resources"]`` so it renders as a
+    dedicated section instead of inheriting the broad ``sessions`` tag.
+    Prefix-based so newly added resource endpoints group automatically.
+
+    :param paths: The OpenAPI ``paths`` map; mutated in place.
+    """
+    for path, methods in paths.items():
+        if not path.startswith(_SESSION_RESOURCES_PREFIX):
+            continue
+        for method, op in methods.items():
+            if method in _HTTP_METHODS and isinstance(op, dict):
+                op["tags"] = ["session_resources"]
+
+
+# ── reStructuredText docstring → Markdown ─────────────────────────
+#
+# FastAPI uses each route handler's docstring verbatim as the OpenAPI
+# operation ``description``. Our docstrings are Sphinx/reST: ``:param
+# name:`` / ``:returns:`` / ``:raises Exc:`` field lists and inline
+# ``:class:`Foo``` cross-reference roles. Docs renderers (Scalar) treat
+# the description as Markdown, so reST field lists collapse into one
+# unreadable run of literal text. We convert that markup to Markdown:
+#
+#   * each ``:param name:`` whose name matches a real query/path
+#     parameter is moved onto that parameter's ``description`` (so it
+#     renders inline in the parameter table, not in the prose blob);
+#   * request-body / form ``:param`` entries that have no matching
+#     parameter become a Markdown ``**Parameters**`` bullet list;
+#   * ``:returns:`` becomes a ``**Returns:**`` line, ``:raises:`` a
+#     ``**Raises**`` bullet list;
+#   * framework-internal params (``request``/``response``/…) are dropped;
+#   * inline ``:role:`X``` roles collapse to `` `X` `` and reST double
+#     backticks (`` ``X`` ``) normalize to Markdown single backticks.
+
+# Field-list line markers (matched at column 0; continuation lines are
+# indented and accumulate onto the field opened above them).
+_RST_PARAM = re.compile(r"^:(?:param|parameter|arg|argument|keyword|kwarg)\s+(\S+)\s*:\s*(.*)$")
+_RST_RETURNS = re.compile(r"^:returns?\s*:\s*(.*)$")
+_RST_RAISES = re.compile(r"^:raises?\s+([^:]+?)\s*:\s*(.*)$")
+# Any other reST field marker (``:rtype:``, ``:type x:``, …) — dropped.
+_RST_OTHER_FIELD = re.compile(r"^:[a-zA-Z][\w ]*:")
+# Inline cross-reference role, e.g. ``:class:`Foo``` → `` `Foo` ``.
+_RST_ROLE = re.compile(r":[a-zA-Z]+:`([^`]+)`")
+# reST inline literal (double backtick) → Markdown code span (single).
+# Non-greedy + DOTALL so a literal may span lines and contain nested
+# single backticks (e.g. a role left inside it); the replacement flattens
+# those so the resulting code span is valid.
+_RST_DOUBLE_BACKTICK = re.compile(r"``(.+?)``", re.DOTALL)
+
+# Handler parameters that are FastAPI plumbing, not API inputs.
+_INTERNAL_PARAMS = frozenset(
+    {"request", "response", "websocket", "ws", "background_tasks", "bg", "_", "args", "kwargs"},
+)
+
+
+def _rst_double_backtick_to_code(match: re.Match[str]) -> str:
+    """Flatten a reST ``literal`` into a single-line Markdown code span."""
+    inner = re.sub(r"\s+", " ", match.group(1).replace("`", "")).strip()
+    return f"`{inner}`"
+
+
+def _rst_inline_to_md(text: str) -> str:
+    """Convert inline reST roles / literals in *text* to Markdown."""
+    text = _RST_ROLE.sub(r"`\1`", text)
+    return _RST_DOUBLE_BACKTICK.sub(_rst_double_backtick_to_code, text)
+
+
+def _rst_field_text(lines: list[str]) -> str:
+    """Join a field's (possibly multi-line) body into one Markdown string."""
+    joined = re.sub(r"\s+", " ", " ".join(lines)).strip()
+    return _rst_inline_to_md(joined)
+
+
+def _parse_rst_doc(desc: str) -> tuple[str, list[tuple[str, str | None, str]]]:
+    """
+    Split a reST docstring into Markdown prose and parsed fields.
+
+    Lines before the first reST field marker are prose; ``:param:`` /
+    ``:returns:`` / ``:raises:`` open a field that subsequent indented
+    continuation lines accumulate onto. Unknown field markers (e.g.
+    ``:rtype:``) are discarded.
+
+    :param desc: The raw (reST) description text.
+    :returns: ``(prose_markdown, fields)`` where ``fields`` is a list of
+        ``(kind, name, text)`` triples (``kind`` in ``param`` /
+        ``returns`` / ``raises``) with ``text`` already Markdown.
+    """
+    prose: list[str] = []
+    fields: list[tuple[str, str | None, list[str]]] = []
+    cur: tuple[str, str | None, list[str]] | None = None
+    in_fields = False
+    for line in desc.split("\n"):
+        param_m = _RST_PARAM.match(line)
+        if param_m:
+            in_fields = True
+            cur = ("param", param_m.group(1).strip().lstrip("*"), [param_m.group(2)])
+            fields.append(cur)
+            continue
+        returns_m = _RST_RETURNS.match(line)
+        if returns_m:
+            in_fields = True
+            cur = ("returns", None, [returns_m.group(1)])
+            fields.append(cur)
+            continue
+        raises_m = _RST_RAISES.match(line)
+        if raises_m:
+            in_fields = True
+            cur = ("raises", raises_m.group(1).strip(), [raises_m.group(2)])
+            fields.append(cur)
+            continue
+        if in_fields and _RST_OTHER_FIELD.match(line):
+            cur = ("drop", None, [])  # unknown field (e.g. :rtype:) — discard
+            fields.append(cur)
+            continue
+        if in_fields:
+            if cur is not None:
+                cur[2].append(line)
+        else:
+            prose.append(line)
+
+    prose_md = _rst_inline_to_md("\n".join(prose).strip())
+    parsed = [(kind, name, _rst_field_text(body)) for kind, name, body in fields if kind != "drop"]
+    return prose_md, parsed
+
+
+def _reformat_doc(
+    desc: str | None,
+    targets: dict[str, Any],
+    internal: frozenset[str] | None = None,
+) -> str | None:
+    """
+    Convert one reST ``description`` to Markdown.
+
+    Each ``:param name:`` whose ``name`` is a key in *targets* (a
+    parameter or property object) is moved onto that object's own
+    ``description``; entries with no matching target become a Markdown
+    ``**Parameters**`` list. ``:returns:`` / ``:raises:`` become
+    ``**Returns:**`` / ``**Raises**`` sections. Names in *internal*
+    (FastAPI plumbing) are dropped.
+
+    :param desc: The raw description, or ``None``.
+    :param targets: Map of name -> object that may receive a moved
+        ``description`` (empty when there are no field targets).
+    :param internal: Parameter names to drop entirely (``None`` = drop
+        none, used for schema fields).
+    :returns: The rebuilt Markdown description, or the original falsy
+        value when *desc* is empty.
+    """
+    if not desc:
+        return desc
+    skip = internal or frozenset()
+    prose_md, fields = _parse_rst_doc(desc)
+    body_params: list[tuple[str, str]] = []
+    raises: list[tuple[str, str]] = []
+    returns: str | None = None
+    for kind, name, text in fields:
+        if kind == "param":
+            if not text or name in skip:
+                continue
+            target = targets.get(name) if name else None
+            if isinstance(target, dict):
+                # Move onto the matching field; don't clobber an explicit
+                # Field/Query description if one already exists.
+                if not target.get("description"):
+                    target["description"] = text
+            else:
+                body_params.append((name or "", text))
+        elif kind == "raises" and text:
+            raises.append((name or "", text))
+        elif kind == "returns" and text:
+            returns = text
+
+    sections: list[str] = []
+    if prose_md:
+        sections.append(prose_md)
+    if body_params:
+        sections.append("**Parameters**\n\n" + "\n".join(f"- `{n}` — {t}" for n, t in body_params))
+    if returns:
+        sections.append(f"**Returns:** {returns}")
+    if raises:
+        sections.append("**Raises**\n\n" + "\n".join(f"- `{e}` — {t}" for e, t in raises))
+    return "\n\n".join(sections)
+
+
+def _reformat_operation_doc(op: dict[str, Any]) -> None:
+    """
+    Rewrite an operation's (and its responses') reST docs as Markdown.
+
+    Matched ``:param:`` entries move onto ``op['parameters']``; response
+    descriptions are reformatted with no field targets.
+
+    :param op: An OpenAPI operation object; mutated in place.
+    """
+    if op.get("description"):
+        targets = {p.get("name"): p for p in op.get("parameters", []) if isinstance(p, dict)}
+        op["description"] = _reformat_doc(op["description"], targets, _INTERNAL_PARAMS)
+    for resp in (op.get("responses") or {}).values():
+        if isinstance(resp, dict) and resp.get("description"):
+            resp["description"] = _reformat_doc(resp["description"], {})
+
+
+def _reformat_schema_node(node: Any) -> None:
+    """
+    Rewrite a JSON-Schema node's reST ``description`` as Markdown.
+
+    A model's docstring becomes its schema ``description`` with
+    ``:param name:`` entries describing its fields; each moves onto the
+    matching ``properties[name]`` description. Recurses into nested
+    schema positions so inline sub-objects are handled too.
+
+    :param node: A JSON-Schema object (non-dicts are ignored); mutated
+        in place.
+    """
+    if not isinstance(node, dict):
+        return
+    if node.get("description"):
+        props = node.get("properties")
+        node["description"] = _reformat_doc(
+            node["description"],
+            props if isinstance(props, dict) else {},
+        )
+    properties = node.get("properties")
+    if isinstance(properties, dict):
+        for sub in properties.values():
+            _reformat_schema_node(sub)
+    for defs_key in ("$defs", "definitions"):
+        defs = node.get(defs_key)
+        if isinstance(defs, dict):
+            for sub in defs.values():
+                _reformat_schema_node(sub)
+    for child_key in ("items", "additionalProperties"):
+        _reformat_schema_node(node.get(child_key))
+    for combinator in ("allOf", "anyOf", "oneOf", "prefixItems"):
+        members = node.get(combinator)
+        if isinstance(members, list):
+            for sub in members:
+                _reformat_schema_node(sub)
+
+
+def _reformat_descriptions(paths: dict[str, Any]) -> None:
+    """Convert every operation's reST description to Markdown in place."""
+    for methods in paths.values():
+        for method, op in methods.items():
+            if method in _HTTP_METHODS and isinstance(op, dict):
+                _reformat_operation_doc(op)
+
+
+def _reformat_component_schemas(components: dict[str, Any]) -> None:
+    """Convert every component schema's reST description to Markdown."""
+    schemas = components.get("schemas")
+    if isinstance(schemas, dict):
+        for schema in schemas.values():
+            _reformat_schema_node(schema)
+
+
+def _normalize_inline_descriptions(node: Any) -> None:
+    """
+    Final safety net: normalize inline reST in any remaining description.
+
+    Walks the whole document and converts inline ``:role:`X``` roles and
+    reST double-backtick literals to Markdown `` `X` `` in every
+    ``description`` string — covering responses, ``info``, tags and
+    security schemes that the structured passes don't rewrite.
+
+    :param node: Any spec fragment; mutated in place.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "description" and isinstance(value, str):
+                node[key] = _rst_inline_to_md(value)
+            else:
+                _normalize_inline_descriptions(value)
+    elif isinstance(node, list):
+        for value in node:
+            _normalize_inline_descriptions(value)
+
+
+def _enrich_spec(spec: dict[str, Any]) -> None:
+    """
+    Inject document-level metadata for docs / SDK tooling.
+
+    Adds ``info.description``, ``servers``, top-level ``tags`` with
+    human-readable descriptions, and ``components.securitySchemes`` —
+    none of which FastAPI emits — tags the untagged utility routes, and
+    rewrites reST docstrings (operations, parameters, and component
+    schemas) as Markdown.
+    Mutates ``spec`` in place. See the module-level enrichment
+    constants for the rationale behind each value.
+
+    :param spec: The generated OpenAPI dict; mutated in place.
+    """
+    info = spec.setdefault("info", {})
+    info["description"] = _INFO_DESCRIPTION
+    spec["servers"] = _SERVERS
+    spec["tags"] = _TAGS
+
+    components = spec.setdefault("components", {})
+    components["securitySchemes"] = _SECURITY_SCHEMES
+
+    paths = spec.setdefault("paths", {})
+    _tag_system_routes(paths)
+    _retag_session_resources(paths)
+    _reformat_descriptions(paths)
+    _reformat_component_schemas(components)
+    _normalize_inline_descriptions(spec)
+
+
 def generate_spec() -> dict[str, Any]:
     """
     Build, generate, and post-process the OpenAPI 3.2 spec.
@@ -235,6 +789,10 @@ def generate_spec() -> dict[str, Any]:
     paths = spec.get("paths", {})
     for path, method in _SSE_ROUTES:
         _rewrite_sse_route(paths, path, method)
+
+    # Inject document-level metadata (servers, auth, tags, prose) that
+    # FastAPI doesn't emit but docs / SDK tooling needs.
+    _enrich_spec(spec)
 
     return spec  # type: ignore[no-any-return]
 

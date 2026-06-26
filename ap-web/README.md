@@ -1,17 +1,13 @@
 # ap-web
 
 The web UI for `omnigent server --agent <agent>`. SPA built with Vite + React + TypeScript +
-Tailwind v4 + shadcn/ui. Talks to the omnigent FastAPI server's
-OpenAI-compatible API surface (`/v1/responses`, `/v1/conversations`,
-session-scoped `/v1/sessions/{id}/resources/files`,
-`/api/agents`).
-
-This is the new UI. The legacy `web/` folder targets the old `/api/chat/stream`
-server and is unrelated.
+Tailwind v4 + shadcn/ui. Talks to the current Omnigent API surface
+(`/v1/agents`, `/v1/sessions`, session-scoped
+`/v1/sessions/{id}/resources/files`).
 
 ## Develop
 
-In one terminal, start the omnigent server (default port `8000`). Use
+In one terminal, start the omnigent server (default port `6767`). Use
 `--agent` to pre-register one or more agents at startup (accepts a YAML file or
 an agent-image directory; can be repeated):
 
@@ -36,15 +32,15 @@ OMNIGENT_URL=http://localhost:9000 npm run dev
 
 Additional `omnigent server` options:
 
-| Flag                  | Default                 | Description                          |
-| --------------------- | ----------------------- | ------------------------------------ |
-| `--host`              | `127.0.0.1`             | Host to bind to                      |
-| `-p` / `--port`       | `8000`                  | Port to listen on                    |
-| `--database-uri`      | `sqlite:///omnigent.db` | Database URI for stores              |
-| `--artifact-location` | `./artifacts`           | Path for artifact storage            |
-| `-c` / `--config`     | (none)                  | Path to YAML config file             |
-| `--execution-timeout` | `7200`                  | Max wall-clock seconds per execution |
-| `--agent`             | (none)                  | Pre-register an agent (repeatable)   |
+| Flag                  | Default                | Description                          |
+| --------------------- | ---------------------- | ------------------------------------ |
+| `--host`              | `127.0.0.1`            | Host to bind to                      |
+| `-p` / `--port`       | `6767`                 | Port to listen on                    |
+| `--database-uri`      | `<data-dir>/chat.db`   | Database URI for stores              |
+| `--artifact-location` | `<data-dir>/artifacts` | Path for artifact storage            |
+| `-c` / `--config`     | (none)                 | Path to YAML config file             |
+| `--execution-timeout` | `7200`                 | Max wall-clock seconds per execution |
+| `--agent`             | (none)                 | Pre-register an agent (repeatable)   |
 
 ## Build + serve from the Omnigent server
 

@@ -134,6 +134,13 @@ _ALT_COVERED: frozenset[str] = frozenset(
         #   test.
         "supervisor-terminal-test",
         "sys-terminal-test",
+        # Bundled @tool-source fixtures (config.yaml + tools/python/) loaded by
+        # register_dir_agent_with_mock_llm — covered by the shared tests
+        # test_decorated_tools_e2e.py / test_async_tools_e2e.py /
+        # test_tool_call_policy_e2e.py, not test_example_<name>.py files.
+        "decorator-tools",
+        "async-tools",
+        "tool-call-policy",
         # Skills-filter test fixtures under tests/resources/agents/.
         # Loaded by tests/e2e/test_codex_skills_filter_e2e.py,
         # test_pi_skills_filter_e2e.py, and
@@ -162,6 +169,20 @@ _ALT_COVERED: frozenset[str] = frozenset(
         # risk_score_agent: the built-in session-risk-score policy is
         # exercised in tests/runtime/policies/test_example_omnigent_yamls.py.
         "risk_score_agent",
+        # qwen_perm_test: qwen-harness permission fixture exercised by
+        # tests/inner/test_qwen_agent_integration.py against a mocked ACP
+        # subprocess. The live qwen round-trip lives in
+        # tests/e2e/omnigent/test_per_harness_qwen.py (skipped without a
+        # qwen CLI), not a test_example_<name>.py file.
+        "qwen_perm_test",
+        # kimi_hello: single-YAML launcher for the SDK kimi harness. The
+        # harness is covered by tests/inner/test_kimi_harness.py (executor
+        # unit tests with a stubbed kimi subprocess) and the native picker
+        # flows in tests/e2e_ui/start_session/test_start_session.py. A live
+        # round-trip needs the kimi CLI + Moonshot auth (not available in
+        # CI), so there is no test_example_<name>.py file — same shape as
+        # qwen_perm_test above.
+        "kimi_hello",
         # ── tests/resources/agents/ fixtures covered by name elsewhere ──
         # workspace-file-writer: loaded by the changed-files e2e tests
         # (test_filesystem_changed_files_e2e.py /

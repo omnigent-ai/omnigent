@@ -1314,6 +1314,31 @@ describe("BlockStream — status events", () => {
     }
   });
 
+  it("output_item.done error event preserves persisted ids", () => {
+    const blocks = reduce([
+      {
+        type: "error",
+        source: "execution",
+        toolName: null,
+        error: {
+          code: "kiro_native_prompt_not_recorded",
+          message: "Kiro did not accept this web message.",
+        },
+        itemId: "err_kiro",
+        responseId: "resp_kiro_failed_input",
+      },
+    ]);
+
+    const err = blocks.find((b) => b.type === "error");
+    expect(err).toBeDefined();
+    if (err && err.type === "error") {
+      expect(err.ctx.itemId).toBe("err_kiro");
+      expect(err.ctx.responseId).toBe("resp_kiro_failed_input");
+      expect(err.message).toBe("Kiro did not accept this web message.");
+      expect(err.code).toBe("kiro_native_prompt_not_recorded");
+    }
+  });
+
   it("retry event → RetryBlock with attempt/max/delay fields", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse() },
@@ -1476,6 +1501,54 @@ describe("BlockStream — elicitation", () => {
     expect(elic!.phase).toBe("request");
     expect(elic!.ctx.responseId).toBe("elicit_elic_req");
     expect(elic!.ctx.responseId).not.toBe("resp_prev");
+  });
+
+  it("stamps a no-active-turn pre_tool_use card (cursor-native) with its own id", () => {
+    // cursor-native is terminal-driven: it never emits `response_created`, so
+    // `state.responseId` is still "" when its `pre_tool_use` approval card
+    // arrives. The card must still get its own id so it forms a standalone
+    // bubble (not group under the empty id), letting the ChatPage reorder lift
+    // the gated user message above it.
+    const blocks = reduce([
+      {
+        type: "elicitation_request",
+        elicitationId: "elic_cursor",
+        message: "Run this command?",
+        requestedSchema: {},
+        mode: "form",
+        phase: "pre_tool_use",
+        policyName: "cursor_native_permission",
+        contentPreview: "echo it-works > approval_test.txt",
+      },
+    ]);
+
+    const elic = blocks.find((b): b is ElicitationBlock => b.type === "elicitation");
+    expect(elic).toBeDefined();
+    expect(elic!.phase).toBe("pre_tool_use");
+    expect(elic!.ctx.responseId).toBe("elicit_elic_cursor");
+  });
+
+  it("keeps the active turn's id for a pre_tool_use card inside an SDK turn", () => {
+    // The SDK path DOES have an active turn (response_created fired), so a
+    // `pre_tool_use` card must render inline with that turn — NOT get a
+    // standalone `elicit_*` id. Guards the cursor-native fix from leaking into
+    // the in-turn SDK case.
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse({ responseId: "resp_sdk" }) },
+      {
+        type: "elicitation_request",
+        elicitationId: "elic_sdk",
+        message: "Allow tool?",
+        requestedSchema: {},
+        mode: "form",
+        phase: "pre_tool_use",
+        policyName: "approve_shell_commands",
+        contentPreview: "{}",
+      },
+    ]);
+
+    const elic = blocks.find((b): b is ElicitationBlock => b.type === "elicitation");
+    expect(elic!.ctx.responseId).toBe("resp_sdk");
   });
 
   it("carries structured Codex command approval details", () => {

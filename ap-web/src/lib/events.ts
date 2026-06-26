@@ -8,7 +8,7 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseCreated → "response_created").
 
-import type { ErrorInfo, ModelUsage, Response, SandboxLaunchStage } from "./types";
+import type { ErrorInfo, ModelUsage, RememberScope, Response, SandboxLaunchStage } from "./types";
 
 /** Provider-native tool item types. */
 export const NATIVE_TOOL_TYPES = new Set<string>([
@@ -237,6 +237,22 @@ export interface ElicitationRequest {
    * mode switch is meaningful.
    */
   allowAllEdits?: boolean;
+  /**
+   * Producer-supplied extra (claude-native non-edit tool prompts only):
+   * present when the PermissionRequest endpoint is gating a tool that
+   * supports a persistent "don't ask again" allow rule (everything
+   * except edit tools, ExitPlanMode, and AskUserQuestion). ``tool`` is
+   * the gated tool name; ``host`` is the WebFetch request domain when
+   * present. The UI's ApprovalCard renders an "Approve & don't ask
+   * again for <host|tool>" button that, on accept, asks the server to
+   * install a session-scoped allow rule — the web equivalent of the
+   * native TUI's "don't ask again" permission option.
+   *
+   * Absent/null for every other elicitation (edit tools, ExitPlanMode,
+   * AskUserQuestion, codex, policy ASK), so the button only appears
+   * where the allow rule is meaningful.
+   */
+  rememberScope?: RememberScope | null;
 }
 
 /**
@@ -298,6 +314,26 @@ export interface SlashCommand {
 }
 
 /**
+ * Intelligent-model-router decision from `output_item.done`
+ * (type `routing_decision`). Emitted by the runner's cost advisor at
+ * turn start; the reducer produces a `RoutingDecisionBlock` rendered as
+ * a muted chip. Display-only — never enters the model's history.
+ */
+export interface RoutingDecision {
+  type: "routing_decision";
+  /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */
+  model: string;
+  /** Difficulty tier the router assigned. */
+  tier: "cheap" | "medium" | "expensive";
+  /** `true` when the brain ran on `model`; `false` = "would have picked". */
+  applied: boolean;
+  /** The router's one-line rationale. */
+  rationale: string;
+  itemId: string;
+  responseId: string;
+}
+
+/**
  * Terminal command item from `output_item.done` (type `terminal_command`).
  * Produced by the claude-native transcript forwarder when the user types `!cmd`.
  */
@@ -343,6 +379,10 @@ export interface ErrorEvent {
   source: string;
   toolName: string | null;
   error: ErrorInfo;
+  /** Server-assigned item id when parsed from `response.output_item.done`. */
+  itemId?: string;
+  /** Server-assigned response id when parsed from `response.output_item.done`. */
+  responseId?: string;
 }
 
 // ── Compaction ───────────────────────────────────────────
@@ -760,6 +800,7 @@ export type StreamEvent =
   | ToolResult
   | NativeToolCall
   | SlashCommand
+  | RoutingDecision
   | TerminalCommandEvent
   | MessageDone
   | OutputFileDone

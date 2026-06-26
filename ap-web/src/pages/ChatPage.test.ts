@@ -8,6 +8,7 @@ import {
   buildSlashCommandMap,
   buildSlashCommandWithArgsSet,
   collectBubbleMarkdown,
+  collectPendingElicitations,
   computeIsWorking,
   computeShowsWorking,
   containsMarkdownTable,
@@ -22,6 +23,7 @@ import {
   shouldShowWorkingIndicator,
   shouldShowTerminalSurface,
   splitSlashCommand,
+  stripPendingElicitations,
   subAgentComposerLabel,
 } from "./ChatPage";
 
@@ -444,6 +446,14 @@ describe("reorderCommittedRequestElicitations", () => {
     expect(bubbleIds(reorderCommittedRequestElicitations(committed))).toEqual(["u1", "e1"]);
   });
 
+  it("swaps a cursor-native pre_tool_use card below the user message it gated", () => {
+    // cursor-native's standalone approval card arrives in the live stream
+    // before the forwarder mirrors the triggering user message, giving
+    // [card, message]. It must drop below the prompt, exactly like REQUEST.
+    const committed = [elicitationBubble("e1", "pre_tool_use"), userBubble("u1")];
+    expect(bubbleIds(reorderCommittedRequestElicitations(committed))).toEqual(["u1", "e1"]);
+  });
+
   it("keeps the card between the prompt and the assistant response", () => {
     const committed = [
       assistantText("a0"),
@@ -470,6 +480,96 @@ describe("reorderCommittedRequestElicitations", () => {
     const result = reorderCommittedRequestElicitations(committed);
     expect(result).toBe(committed);
     expect(bubbleIds(result)).toEqual(["e1", "u1"]);
+  });
+});
+
+// ── pinned elicitations ─────────────────────────────────────────────────────
+
+// Assistant bubble carrying arbitrary render items — lets these tests mix a
+// card with trailing text (the "card + a bunch of text" case that motivated
+// pinning) and toggle a card's answered status.
+const assistantWith = (id: string, items: RenderItem[]): Bubble => ({
+  kind: "assistant",
+  responseId: id,
+  stableId: id,
+  lifecycle: "completed",
+  error: null,
+  items,
+});
+const textItem = (id: string): RenderItem => ({
+  kind: "text",
+  itemId: id,
+  text: "hi",
+  final: true,
+});
+const elicitItem = (id: string, status: "pending" | "responded"): RenderItem => ({
+  kind: "elicitation",
+  itemId: id,
+  elicitationId: id,
+  message: "Continue?",
+  phase: "tool_call",
+  policyName: "p",
+  contentPreview: "{}",
+  requestedSchema: {},
+  status,
+  response: status === "responded" ? { action: "accept" } : null,
+});
+const pendingIds = (items: RenderItem[]): string[] =>
+  items.map((it) => (it.kind === "elicitation" ? it.elicitationId : ""));
+
+describe("collectPendingElicitations", () => {
+  it("collects pending cards across bubbles in document order (newest last)", () => {
+    const bubbles = [
+      assistantWith("a1", [elicitItem("e1", "pending")]),
+      userBubble("u1"),
+      assistantWith("a2", [textItem("t1"), elicitItem("e2", "pending")]),
+    ];
+    expect(pendingIds(collectPendingElicitations(bubbles))).toEqual(["e1", "e2"]);
+  });
+
+  it("ignores answered cards and user bubbles", () => {
+    const bubbles = [
+      userBubble("u1"),
+      assistantWith("a1", [elicitItem("e1", "responded")]),
+      assistantWith("a2", [elicitItem("e2", "pending")]),
+    ];
+    expect(pendingIds(collectPendingElicitations(bubbles))).toEqual(["e2"]);
+  });
+
+  it("returns an empty list when nothing is pending", () => {
+    const bubbles = [userBubble("u1"), assistantText("a1")];
+    expect(collectPendingElicitations(bubbles)).toEqual([]);
+  });
+});
+
+describe("stripPendingElicitations", () => {
+  it("removes a pending card but keeps the trailing text in the same bubble", () => {
+    // The motivating case: the agent emits a card AND a bunch of text. The
+    // card floats to the bottom (removed here); the text stays inline.
+    const bubbles = [assistantWith("a1", [elicitItem("e1", "pending"), textItem("t1")])];
+    const stripped = stripPendingElicitations(bubbles);
+    const a1 = stripped[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(a1.items.map((it) => it.kind)).toEqual(["text"]);
+  });
+
+  it("leaves answered cards inline", () => {
+    const bubbles = [assistantWith("a1", [elicitItem("e1", "responded")])];
+    const stripped = stripPendingElicitations(bubbles);
+    expect(stripped).toBe(bubbles);
+  });
+
+  it("returns the same array reference when nothing is pending (memo stability)", () => {
+    const bubbles = [userBubble("u1"), assistantText("a1")];
+    expect(stripPendingElicitations(bubbles)).toBe(bubbles);
+  });
+
+  it("clones only the affected bubble and keeps other references intact", () => {
+    const a1 = assistantText("a1");
+    const a2 = assistantWith("a2", [elicitItem("e2", "pending")]);
+    const stripped = stripPendingElicitations([a1, a2]);
+    expect(stripped[0]).toBe(a1);
+    expect(stripped[1]).not.toBe(a2);
+    expect((stripped[1] as Extract<Bubble, { kind: "assistant" }>).items).toEqual([]);
   });
 });
 
@@ -788,6 +888,24 @@ describe("buildSlashCommandMap", () => {
     expect(buildSlashCommandMap([], true, false)["/model"]).toBeUndefined();
     // Gating /model must not disturb the other built-ins.
     expect(buildSlashCommandMap([], true, false)["/compact"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/compact"],
+    );
+  });
+
+  it("omits /compact when showCompact is false", () => {
+    const map = buildSlashCommandMap([], true, true, false);
+    expect(map["/compact"]).toBeUndefined();
+    expect(map["/effort"]).toBe(BUILTIN_SLASH_COMMANDS["/effort"]);
+    expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
+  });
+
+  it("includes /compact by default and when showCompact is true", () => {
+    // Default (no showCompact arg) → included for backward compat.
+    expect(buildSlashCommandMap([], true, true)["/compact"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/compact"],
+    );
+    // Explicit true → included.
+    expect(buildSlashCommandMap([], true, true, true)["/compact"]).toBe(
       BUILTIN_SLASH_COMMANDS["/compact"],
     );
   });

@@ -126,6 +126,9 @@ class _ConversationStore:
         *,
         title: str | None = None,
         agent_id: str | None = None,
+        cloned_agent_name: str | None = None,
+        cloned_agent_bundle_location: str | None = None,
+        cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
@@ -139,6 +142,11 @@ class _ConversationStore:
         :param title: Optional title for the fork.
         :param agent_id: Agent ID override. When ``None``, inherits
             the source's ``agent_id``.
+        :param cloned_agent_name: Name for the fork's cloned agent row
+            (route supplies ``"<name> (fork <id>)"`` when cloning).
+        :param cloned_agent_bundle_location: Bundle the fork clones into
+            a session-scoped agent row created atomically in the store.
+        :param cloned_agent_description: Optional clone description.
         :param copy_model_settings: Whether the source's model settings
             carry over (route passes ``False`` on a cross-family switch).
         :param carry_history_into_native: Whether to mark the fork for
@@ -163,6 +171,9 @@ class _ConversationStore:
                 "source": source_conversation_id,
                 "title": title,
                 "agent_id": agent_id,
+                "cloned_agent_name": cloned_agent_name,
+                "cloned_agent_bundle_location": cloned_agent_bundle_location,
+                "cloned_agent_description": cloned_agent_description,
                 "copy_model_settings": copy_model_settings,
                 "carry_history_into_native": carry_history_into_native,
                 "resume_source_native_session": resume_source_native_session,
@@ -396,20 +407,33 @@ async def test_fork_session_happy_path() -> None:
     )
     assert body["title"] == "My Fork"
 
-    # Exactly 1 agent clone — more means the route duplicated the clone
-    # step; 0 means it skipped cloning and reused the source agent.
-    assert len(agent_store.create_calls) == 1
-    clone_call = agent_store.create_calls[0]
-    assert clone_call["bundle_location"] == "ag_test/fakehash"
-    assert clone_call["description"] == "A test agent"
-    assert "fork" in clone_call["name"], "Cloned agent name should contain 'fork'"
+    # The agent clone is created INSIDE fork_conversation (atomically), not
+    # via a separate agent_store.create — a pre-created row would leak as a
+    # phantom built-in on a fork failure. So the route must NOT pre-create,
+    # and must hand the clone's bundle/description to the store instead.
+    assert len(agent_store.create_calls) == 0, (
+        "Route must not pre-create the clone; it's created atomically in the fork txn"
+    )
 
     # Exactly 1 store fork — more means the route called fork_conversation
     # multiple times; 0 means it never forked.
     assert len(conv_store.fork_calls) == 1
-    assert conv_store.fork_calls[0]["source"] == "conv_src"
-    assert conv_store.fork_calls[0]["title"] == "My Fork"
-    assert conv_store.fork_calls[0]["agent_id"] == clone_call["agent_id"]
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["source"] == "conv_src"
+    assert fork_call["title"] == "My Fork"
+    # The store receives the clone's bundle/name/description so it can mint
+    # the session-scoped agent row in the same transaction.
+    assert fork_call["cloned_agent_bundle_location"] == "ag_test/fakehash"
+    assert fork_call["cloned_agent_description"] == "A test agent"
+    # The clone keeps the source's ROOT name — no "(fork …)" suffix. Being
+    # session-scoped it's exempt from the unique built-in-name index, so no
+    # disambiguator is needed and the name matches its origin directly.
+    assert fork_call["cloned_agent_name"] == "test-agent", (
+        f"Cloned agent should keep the source's root name, got {fork_call['cloned_agent_name']!r}"
+    )
+    assert fork_call["agent_id"] == body["agent_id"], (
+        "Fork must bind the same cloned agent id it asked the store to create"
+    )
 
 
 @pytest.mark.asyncio
@@ -685,18 +709,20 @@ async def test_fork_switch_binds_target_agent_bundle() -> None:
     )
 
     assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
-    # Exactly one clone, of the TARGET agent's bundle (not ag_test/hash).
-    assert len(agent_store.create_calls) == 1
-    clone_call = agent_store.create_calls[0]
-    assert clone_call["bundle_location"] == "ag_codex_native/hash", (
+    # The clone is minted inside fork_conversation, so the route hands it the
+    # TARGET agent's bundle (not ag_test/hash) — not a separate create call.
+    assert len(agent_store.create_calls) == 0
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["cloned_agent_bundle_location"] == "ag_codex_native/hash", (
         "Switch must clone the target agent's bundle; cloning the source's "
         "bundle would launch the wrong harness."
     )
-    # Clone name derives from the target agent ("codex"), proving the
-    # response reflects the bound (switched) agent.
-    assert "codex" in clone_call["name"]
-    # The fork binds the cloned agent id.
-    assert conv_store.fork_calls[0]["agent_id"] == clone_call["agent_id"]
+    # Clone keeps the TARGET agent's root name ("codex"), proving the
+    # response reflects the bound (switched) agent — not the source.
+    assert fork_call["cloned_agent_name"] == "codex"
+    # The fork binds the cloned agent id it asked the store to create.
+    assert fork_call["agent_id"] is not None
+    assert fork_call["agent_id"] != "ag_test"
 
 
 @pytest.mark.asyncio
@@ -770,22 +796,28 @@ async def test_fork_switch_404_unknown_target() -> None:
             False,
             {"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"},
         ),
-        # cursor/pi targets are native terminal-first harnesses, but they
-        # cannot replay fork history (no resumable native session and no TUI
-        # transcript import), so do not stamp carry_history_into_native.
+        # cursor target carries history via a text preamble (its conversation
+        # is server-backed, so the runner can't seed a local store for --resume),
+        # so carry_history_into_native IS stamped — the runner branches on the
+        # harness to choose preamble vs transcript rebuild.
         (
             "claude_sdk",
             "cursor-native",
             False,
-            False,
+            True,
             False,
             {"omnigent.ui": "terminal", "omnigent.wrapper": "cursor-native-ui"},
         ),
+        # pi-native CAN carry fork history: the runner rebuilds Pi's JSONL
+        # session file from the copied Omnigent items. Cross-family from a
+        # claude SDK source, so model settings reset and the source's native
+        # session id is NOT stamped (Pi rebuilds from items, not a source
+        # file) — same shape as the codex-native cross-family case.
         (
             "claude_sdk",
             "pi-native",
             False,
-            False,
+            True,
             False,
             {"omnigent.ui": "terminal", "omnigent.wrapper": "pi-native-ui"},
         ),
@@ -820,9 +852,9 @@ async def test_fork_switch_model_and_carry_gating(
     """The switch gates model copy + native carry + UI mode on the target.
 
     A model id is provider-bound, so ``copy_model_settings`` must be True
-    only within a family. ``carry_history_into_native`` must be True only for
-    native targets that can replay fork history (claude/codex); cursor/pi
-    targets are terminal-first but launch fresh, and SDK targets replay
+    only within a family. ``carry_history_into_native`` must be True for
+    native targets that carry fork history (claude/codex/pi rebuild a
+    transcript, cursor replays a text preamble), and SDK targets replay
     history themselves so they never set it. ``resume_source_native_session``
     must be False on a cross-family switch so the store skips the fork-source
     directive (the source's native transcript is the wrong format; a clone
@@ -911,18 +943,31 @@ async def test_fork_no_switch_native_source_carries_history(
     )
 
 
-@pytest.mark.parametrize("harness", ["cursor-native", "pi-native"])
+@pytest.mark.parametrize(
+    "harness,expect_carry",
+    [
+        # cursor carries history via a text preamble the runner replays on the
+        # first message (its conversation is server-backed, so no local store to
+        # seed for --resume) — so a same-agent fork DOES mark native carry.
+        ("cursor-native", True),
+        # pi rebuilds its JSONL session file from the copied Omnigent items
+        # (it is in _FORK_HISTORY_NATIVE_HARNESSES), so a same-agent fork marks
+        # native carry — parity with claude/codex.
+        ("pi-native", True),
+    ],
+)
 @pytest.mark.asyncio
-async def test_fork_cursor_native_does_not_carry_history(
+async def test_fork_cursor_pi_native_carry_gating(
     monkeypatch: pytest.MonkeyPatch,
     harness: str,
+    expect_carry: bool,
 ) -> None:
-    """A fork of a cursor/pi native source must NOT mark native carry.
+    """A same-agent fork marks native carry for both cursor and pi.
 
-    Unlike claude/codex native, the cursor and pi harnesses record no
-    resumable native session and their TUIs can't import a transcript, so
-    ``carry_history_into_native`` must be False — stamping it would be a
-    false promise the runner can't keep (the fork launches fresh anyway).
+    cursor carries fork history via a text preamble (its conversation is
+    server-backed, so no local store to seed for --resume); pi rebuilds its
+    JSONL session file from the copied Omnigent items. Both therefore mark
+    ``carry_history_into_native``.
     """
     conv = _make_conversation()
     conv_store = _ConversationStore(
@@ -939,9 +984,8 @@ async def test_fork_cursor_native_does_not_carry_history(
 
     assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
     fork_call = conv_store.fork_calls[0]
-    assert fork_call["carry_history_into_native"] is False, (
-        f"A {harness} fork must not mark native carry — that harness can't "
-        "replay fork history, so the directive would be a false promise."
+    assert fork_call["carry_history_into_native"] is expect_carry, (
+        f"A {harness} fork should set carry_history_into_native={expect_carry}."
     )
 
 
@@ -952,11 +996,12 @@ async def test_fork_cursor_native_does_not_carry_history(
         # valid harness ids that canonicalize_harness passes through unchanged,
         # so the carry gate must recognize them just like their canonical
         # spellings — otherwise an identically-behaving agent silently loses
-        # fork history. cursor/pi (either spelling) still must NOT carry.
+        # fork history. cursor carries (preamble); ``native-pi`` IS aliased to
+        # ``pi-native`` (which is in the set), so it carries too (rebuild).
         ("native-claude", True),
         ("native-codex", True),
-        ("native-cursor", False),
-        ("native-pi", False),
+        ("native-cursor", True),
+        ("native-pi", True),
     ],
 )
 @pytest.mark.asyncio
@@ -967,9 +1012,10 @@ async def test_fork_reversed_native_spelling_carry_gating(
 ) -> None:
     """The carry gate honors reversed native spellings like the canonical ones.
 
-    ``canonicalize_harness`` only aliases ``native-pi``; the other reversed
-    spellings pass through unchanged, so the predicate must list both forms
-    explicitly. claude/codex carry fork history; cursor/pi never do.
+    ``canonicalize_harness`` aliases ``native-pi`` to ``pi-native``; the other
+    reversed spellings pass through unchanged, so the predicate lists both
+    forms explicitly. claude/codex/cursor/pi all carry fork history (claude /
+    codex / pi via transcript rebuild, cursor via preamble).
     """
     conv = _make_conversation()
     conv_store = _ConversationStore(
@@ -989,4 +1035,33 @@ async def test_fork_reversed_native_spelling_carry_gating(
     assert fork_call["carry_history_into_native"] is expect_carry, (
         f"A {harness} fork should set carry_history_into_native={expect_carry}: "
         "reversed native spellings must be treated like their canonical form."
+    )
+
+
+@pytest.mark.asyncio
+async def test_fork_clone_reuses_source_agent_name_verbatim() -> None:
+    """The fork clone reuses the source agent's name as-is — no suffix added."""
+    conv = _make_conversation(agent_id="ag_src")
+    conv_store = _ConversationStore(
+        conversations={"conv_src": conv},
+        items_by_conv={"conv_src": [_make_item("msg_1", "Hi")]},
+    )
+    agent_store = _AgentStore(
+        agents={
+            "ag_src": Agent(
+                id="ag_src",
+                created_at=1,
+                name="claude-native-ui",
+                bundle_location="ag_claude/hash",
+                version=1,
+            ),
+        }
+    )
+    client = TestClient(_build_app(conv_store, agent_store=agent_store))
+
+    resp = client.post("/v1/sessions/conv_src/fork", json={})
+
+    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    assert conv_store.fork_calls[0]["cloned_agent_name"] == "claude-native-ui", (
+        "Fork clone should reuse the source name verbatim, no '(fork …)' suffix"
     )

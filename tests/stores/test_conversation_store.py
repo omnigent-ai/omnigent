@@ -2988,6 +2988,12 @@ def test_fork_conversation_drops_instance_scoped_labels(
     longer active after /clear" because the bridge's active-session
     marker wasn't the clone. The fork must drop them (and re-bind its
     own runtime), while ordinary labels still copy.
+
+    The DANGEROUS codex full-bypass directive is in the same set for a
+    different reason: a fork is a new session + workspace, so re-arming
+    ``--dangerously-bypass-approvals-and-sandbox`` there with no typed
+    re-confirmation would violate the "impossible to enable accidentally"
+    contract (#657). It must be dropped so the clone opts in afresh.
     """
     agent_store.create(
         agent_id="ag_fork_instance",
@@ -3002,6 +3008,8 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.codex_native.bridge_id": source.id,
             "omnigent.last_context_tokens": "39903",
             "omnigent.last_context_window": "1000000",
+            # The dangerous bypass opt-in must NOT ride into the fork.
+            "omnigent.codex_native.bypass_sandbox": "1",
             # An ordinary, non-instance label that SHOULD carry over.
             "omnigent.wrapper": "claude-code-native-ui",
         },
@@ -3292,6 +3300,79 @@ def test_fork_conversation_up_to_unknown_response_raises(
         conversation_store.fork_conversation(source.id, up_to_response_id="resp_nope")
 
 
+def test_fork_clone_agent_is_session_scoped(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A fork that clones an agent creates a session-scoped row, not a built-in.
+
+    The clone must be born with ``session_id`` set so it never appears in
+    the built-in agent list (``session_id IS NULL``) that backs the fork
+    picker — the regression that surfaced as duplicate "Claude Code" /
+    "Codex" entries in the fork dialog.
+    """
+    agent_store.create(
+        agent_id="ag_fork_src",
+        name="claude-native-ui",
+        bundle_location="ag_fork_src/hash",
+    )
+    source = conversation_store.create_conversation(agent_id="ag_fork_src")
+
+    fork = conversation_store.fork_conversation(
+        source.id,
+        agent_id="ag_clone_ok",
+        cloned_agent_name="claude-native-ui (fork ag_clone_o)",
+        cloned_agent_bundle_location="ag_fork_src/hash",
+        cloned_agent_description=None,
+    )
+
+    assert fork.agent_id == "ag_clone_ok"
+    cloned = agent_store.get("ag_clone_ok")
+    assert cloned is not None
+    assert cloned.session_id == fork.id, "clone must be bound to the fork session"
+    # The clone is session-scoped, so it must NOT leak into the built-in
+    # list (the source built-in is the only template-name row).
+    builtin_ids = {a.id for a in agent_store.list(limit=100).data}
+    assert "ag_clone_ok" not in builtin_ids
+    assert "ag_fork_src" in builtin_ids
+
+
+def test_fork_clone_agent_failure_leaves_no_orphan(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A failed clone-fork rolls the agent row back — no orphaned built-in.
+
+    Pre-fix the route pre-created the clone in its own committed
+    transaction, so a fork failure (here a stale ``up_to_response_id``)
+    orphaned a ``session_id IS NULL`` row that polluted the built-in agent
+    catalog. Creating the clone inside the fork transaction means the
+    failure rolls it back too.
+    """
+    agent_store.create(
+        agent_id="ag_fork_src2",
+        name="codex-native-ui",
+        bundle_location="ag_fork_src2/hash",
+    )
+    source = conversation_store.create_conversation(agent_id="ag_fork_src2")
+    _append_three_responses(conversation_store, source.id)
+
+    before = {a.id for a in agent_store.list(limit=100).data}
+    with pytest.raises(ValueError, match="resp_nope"):
+        conversation_store.fork_conversation(
+            source.id,
+            agent_id="ag_clone_orphan",
+            cloned_agent_name="codex-native-ui (fork ag_clone_o)",
+            cloned_agent_bundle_location="ag_fork_src2/hash",
+            up_to_response_id="resp_nope",
+        )
+
+    # The clone must not exist at all, and the built-in list is unchanged.
+    assert agent_store.get("ag_clone_orphan") is None
+    after = {a.id for a in agent_store.list(limit=100).data}
+    assert after == before
+
+
 def test_instance_scoped_label_keys_match_harness_constants() -> None:
     """
     The store's instance-scoped denylist matches the harness label keys.
@@ -3510,6 +3591,10 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
         conv_id,
         {
             instance_label: "1",
+            # DANGEROUS codex bypass opt-in: in the instance-scoped set so a
+            # switch (a new agent/harness context) drops it rather than
+            # silently re-arming bypass without a fresh typed confirmation.
+            "omnigent.codex_native.bypass_sandbox": "1",
             UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
             WRAPPER_LABEL_KEY: "claude-code-native-ui",
         },
@@ -3564,6 +3649,9 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
     assert updated.labels[FORK_CARRY_HISTORY_LABEL_KEY] == "1"
     assert updated.labels[SWITCH_PREVIOUS_BUILTIN_LABEL_KEY] == "ag_builtin_claude"
     assert instance_label not in updated.labels, "instance-scoped labels must not survive a switch"
+    assert "omnigent.codex_native.bypass_sandbox" not in updated.labels, (
+        "the dangerous bypass opt-in must not survive a switch (re-confirm per context)"
+    )
     # Transcript is untouched (in place, not copied).
     assert len(conversation_store.list_items(conv_id).data) == 1
 

@@ -8,7 +8,7 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseStartBlock → "response_start").
 
-import type { Response } from "./types";
+import type { RememberScope, Response } from "./types";
 
 /**
  * Metadata attached to every stream block.
@@ -193,6 +193,25 @@ export function slashCommandEchoText(name: string, args: string): string {
  */
 export function slashCommandEchoItemId(slashItemId: string): string {
   return `${slashItemId}:user`;
+}
+
+/**
+ * An intelligent-model-router decision, rendered as a standalone muted
+ * chip at its transcript position (turn start). Display-only — the
+ * server keeps the matching `routing_decision` item out of the model's
+ * history.
+ */
+export interface RoutingDecisionBlock {
+  type: "routing_decision";
+  ctx: BlockContext;
+  /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */
+  model: string;
+  /** Difficulty tier the router assigned. */
+  tier: "cheap" | "medium" | "expensive";
+  /** `true` when the brain ran on `model`; `false` = "would have picked". */
+  applied: boolean;
+  /** The router's one-line rationale; empty string when absent. */
+  rationale: string;
 }
 
 export interface TerminalCommandBlock {
@@ -435,6 +454,15 @@ export interface ElicitationBlock {
    * switch is a no-op.
    */
   allowAllEdits?: boolean;
+  /**
+   * Claude-native non-edit tool prompts only: present when the card
+   * should render an "Approve & don't ask again for <host|tool>" button
+   * that installs a session-scoped allow rule on accept (the web
+   * equivalent of the native TUI's "don't ask again" option). ``tool``
+   * is the gated tool; ``host`` is the WebFetch domain when present.
+   * Absent/null for all other elicitations.
+   */
+  rememberScope?: RememberScope | null;
 }
 
 /** Union of all block types. */
@@ -445,6 +473,7 @@ export type AnyBlock =
   | ToolResultBlock
   | NativeToolBlock
   | SlashCommandBlock
+  | RoutingDecisionBlock
   | TerminalCommandBlock
   | TextChunk
   | TextDone

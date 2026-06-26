@@ -25,6 +25,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "@/lib/routing";
 import { CopyIcon, KeyRoundIcon, RefreshCwIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
+import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -160,10 +161,7 @@ export function MembersPage() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-3xl px-6 py-8 pt-14">
-      {/* pt-14 leaves room for the AppShell's absolute-positioned
-          header (sidebar toggle / account menu) so the page title
-          isn't tucked under it. */}
+    <PageScroll contentClassName="px-6">
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Members</h1>
         <Button onClick={() => setShowCreateInvite(true)}>
@@ -389,7 +387,7 @@ export function MembersPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </PageScroll>
   );
 }
 

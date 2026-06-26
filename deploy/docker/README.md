@@ -182,18 +182,39 @@ accept over HTTPS. Three options:
 ## Header-proxy mode (for deploys behind an existing SSO proxy)
 
 If you already have oauth2-proxy, Databricks Apps, AWS ALB OIDC,
-Tailscale Funnel, or any other proxy that injects
-`X-Forwarded-Email`, set `OMNIGENT_AUTH_PROVIDER=header`. The
+Cloudflare Access, Tailscale Funnel, or any other proxy that injects
+an identity header, set `OMNIGENT_AUTH_PROVIDER=header`. The
 server will reject requests without the header.
 
 ```bash
 OMNIGENT_AUTH_PROVIDER=header
 ```
 
+The header read is `X-Forwarded-Email` by default. Proxies that use
+a different header name set `OMNIGENT_AUTH_HEADER` to point the
+server at it — for example, Cloudflare Access supplies the
+authenticated email in `Cf-Access-Authenticated-User-Email`:
+
+```bash
+OMNIGENT_AUTH_PROVIDER=header
+OMNIGENT_AUTH_HEADER=Cf-Access-Authenticated-User-Email
+```
+
+Some proxies namespace the value they inject. Google IAP forwards the
+email in `X-Goog-Authenticated-User-Email` prefixed with
+`accounts.google.com:`; set `OMNIGENT_AUTH_HEADER_STRIP_PREFIX` to drop
+it and recover the bare email:
+
+```bash
+OMNIGENT_AUTH_PROVIDER=header
+OMNIGENT_AUTH_HEADER=X-Goog-Authenticated-User-Email
+OMNIGENT_AUTH_HEADER_STRIP_PREFIX=accounts.google.com:
+```
+
 **Security note:** in this mode the proxy is responsible for
-stripping any inbound `X-Forwarded-Email` from the client request —
-otherwise any visitor can spoof an identity. The server trusts
-whatever value reaches it.
+stripping any inbound copy of the identity header from the client
+request — otherwise any visitor can spoof an identity. The server
+trusts whatever value reaches it.
 
 ## Environment variables
 
@@ -204,6 +225,8 @@ whatever value reaches it.
 | `OMNIGENT_PORT` | `8000` | Host port the server is published on. |
 | `OMNIGENT_AUTH_ENABLED` | `1` (in compose) | Master auth switch. `1` → accounts (or oidc if `OMNIGENT_OIDC_ISSUER` is set); `0` → single-user local mode (every request is the shared `local` user — local dev only, never shared deploys). |
 | `OMNIGENT_AUTH_PROVIDER` | unset | Escape hatch to pin a mode explicitly: `header` / `accounts` / `oidc`. Overrides the `AUTH_ENABLED` auto-selection. |
+| `OMNIGENT_AUTH_HEADER` | `X-Forwarded-Email` | Header-mode only: name of the trusted identity header. Set for proxies that use another name, e.g. `Cf-Access-Authenticated-User-Email` (Cloudflare Access). |
+| `OMNIGENT_AUTH_HEADER_STRIP_PREFIX` | unset (strip nothing) | Header-mode only: prefix removed from the identity header value. Set to `accounts.google.com:` for Google IAP's `X-Goog-Authenticated-User-Email`. |
 | `OMNIGENT_OIDC_*` | unset | OIDC config — required in oidc mode (issuer set, or `AUTH_PROVIDER=oidc`). See `.env.example`. |
 | `PYPI_INDEX_URL` | `https://pypi.org/simple` | Build-time PyPI index — override only behind a corporate proxy. |
 
@@ -218,8 +241,8 @@ seconds instead of paying an in-sandbox dependency install. It bakes
 the full omnigent install (all three packages + deps, `python` and
 `pip` on PATH), `git` (workspaces / worktrees), `tmux` (terminal
 sessions spawned by native harnesses), and the coding-harness CLIs —
-`claude`, `codex`, and `pi`, with the Node runtime they need — so
-claude-sdk / claude-native / codex / pi agents run in sandboxes
+`claude`, `codex`, `pi`, and `kiro-cli`, with the runtime they need — so
+claude-sdk / claude-native / codex / pi / kiro-native agents run in sandboxes
 without an in-sandbox install. None of the server-only bits are
 included (no SPA bundle, no psycopg, no uvicorn entrypoint).
 

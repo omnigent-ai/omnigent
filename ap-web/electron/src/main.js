@@ -31,6 +31,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { registerLocalhostCors } = require("./localhost_cors");
+const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
+const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
@@ -596,123 +598,6 @@ function rememberRecentServer(settings, url) {
   ].slice(0, MAX_RECENT_SERVERS);
 }
 
-/**
- * Normalize a user-entered server URL into something navigable. Accepts bare
- * `host:port` (assumes http), trims whitespace, and rejects anything that
- * isn't an http(s) URL — fail loud rather than navigate to garbage.
- *
- * @param {string} raw
- * @returns {string} A normalized absolute http(s) URL.
- */
-function normalizeUrl(raw) {
-  const trimmed = (raw ?? "").trim();
-  if (trimmed === "") throw new Error("server URL is empty");
-  const withScheme = trimmed.includes("://") ? trimmed : `http://${trimmed}`;
-  let url;
-  try {
-    url = new URL(withScheme);
-  } catch (e) {
-    throw new Error(`invalid URL: ${e.message}`);
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error(`unsupported scheme '${url.protocol}' (use http/https)`);
-  }
-  return url.toString();
-}
-
-/**
- * Path under a Databricks workspace where the Omnigent web UI is mounted. A
- * bare workspace URL serves the workspace's own web app at the root, so a user
- * who pastes just the workspace host (e.g.
- * ``https://<ws>.azuredatabricks.net``) lands on a 404 unless this suffix is
- * appended.
- *
- * NOTE: the Python CLI records the same UI mount as ``/ml/omnigent``
- * (singular) in ``omnigent/conversation_browser.py`` (WORKSPACE_UI_PATH); the
- * plural here is the path that actually resolves on the live workspace. The
- * two should be reconciled — see also that file's WORKSPACE_API_PATH.
- */
-const WORKSPACE_UI_PATH = "/ml/omnigents";
-
-/**
- * CSS that hides the Databricks workspace navigation chrome around a
- * workspace-hosted Omnigent SPA.
- *
- * On a workspace the SPA is mounted as a workspace *page*, so Databricks wraps
- * it in its top-nav shell (the dark bar with the workspace switcher). In a
- * dedicated desktop window that chrome is just noise. We promote Omnigent's
- * own root — ``.omnigent-app``, the wrapper ap-web's embed entry sets
- * (``ap-web/src/embed.tsx``) — to a full-viewport overlay so it paints over
- * the workspace bar. Keying on Omnigent's wrapper (defined in THIS repo)
- * rather than the monolith-owned, unstable workspace nav markup keeps this
- * from silently breaking when Databricks reshuffles its chrome; on a
- * standalone (non-embed) build there is no ``.omnigent-app``, so the rule is
- * a harmless no-op.
- */
-const WORKSPACE_CHROME_HIDE_CSS = `
-  .omnigent-app {
-    position: fixed !important;
-    inset: 0 !important;
-    z-index: 2147483647 !important;
-  }
-`;
-
-/**
- * Probe timeout for Databricks workspace detection. Deliberately short: a slow
- * or unreachable host must not stall the connect flow — on timeout we fall
- * back to loading the URL exactly as entered.
- */
-const WORKSPACE_PROBE_TIMEOUT_MS = 8000;
-
-/**
- * Expand a bare Databricks workspace URL to its Omnigent web-UI mount.
- *
- * Mirrors the omni CLI's behavioral detection
- * (``omnigent/cli.py:_workspace_api_server_url``): rather than match
- * hostnames, probe the URL and adopt the mount only when the host answers
- * like a Databricks workspace — a response carrying the ``server: databricks``
- * header. URLs that already carry a path, or aren't https, are returned
- * untouched WITHOUT a probe, so a user who pastes the full ``…/ml/omnigents``
- * URL (or connects to any non-workspace server) is never second-guessed.
- *
- * The CLI appends the API mount because it's an API client; the desktop shell
- * loads the web UI, so it appends the SPA mount instead.
- *
- * @param {string} normalized A normalized http(s) URL from {@link normalizeUrl}.
- * @returns {Promise<string>} The workspace UI URL when expansion applies, else
- *   the input unchanged.
- */
-async function expandDatabricksWorkspaceUrl(normalized) {
-  let url;
-  try {
-    url = new URL(normalized);
-  } catch {
-    return normalized;
-  }
-  // Only bare https roots are candidates: a non-root path means the user
-  // already pointed at a specific mount, and Databricks workspaces are
-  // https-only.
-  if (url.protocol !== "https:" || (url.pathname !== "/" && url.pathname !== "")) {
-    return normalized;
-  }
-  let probe;
-  try {
-    probe = await fetch(`${url.origin}/`, {
-      method: "HEAD",
-      redirect: "manual",
-      signal: AbortSignal.timeout(WORKSPACE_PROBE_TIMEOUT_MS),
-    });
-  } catch {
-    // Unreachable / DNS / TLS / timeout: connect to the URL as given and let
-    // the did-fail-load fallback surface any real failure.
-    return normalized;
-  }
-  if ((probe.headers.get("server") ?? "").toLowerCase() !== "databricks") {
-    return normalized;
-  }
-  return `${url.origin}${WORKSPACE_UI_PATH}`;
-}
-
 // ---------------------------------------------------------------------------
 // Window + navigation
 // ---------------------------------------------------------------------------
@@ -951,20 +836,8 @@ function createWindow(targetUrl, opts = {}) {
   // Databricks workspace-hosted Omnigent renders inside the workspace's
   // top-nav chrome (the SPA is a workspace page). On a dedicated desktop
   // window, hide it by overlaying Omnigent's own root — see
-  // WORKSPACE_CHROME_HIDE_CSS. Re-applied on every full load (a server switch
-  // is a fresh document); the SPA's own client-side routing keeps the same
-  // document, so the injected stylesheet persists across in-app navigation.
-  win.webContents.on("did-finish-load", () => {
-    let pathname = "";
-    try {
-      pathname = new URL(win.webContents.getURL()).pathname;
-    } catch {
-      return;
-    }
-    if (pathname.startsWith(WORKSPACE_UI_PATH)) {
-      void win.webContents.insertCSS(WORKSPACE_CHROME_HIDE_CSS);
-    }
-  });
+  // registerWorkspaceChromeHide, which wires the inject-on-did-finish-load.
+  registerWorkspaceChromeHide(win.webContents);
 
   win.on("closed", () => {
     windows.delete(win);

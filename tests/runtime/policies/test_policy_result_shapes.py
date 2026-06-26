@@ -42,6 +42,7 @@ def test_policy_result_defaults() -> None:
     assert r.reason is None
     assert r.set_labels is None
     assert r.deciding_policy is None
+    assert r.deciding_policies is None
 
 
 def test_policy_result_full_construction() -> None:
@@ -50,13 +51,13 @@ def test_policy_result_full_construction() -> None:
         action=PolicyAction.DENY,
         reason="blocked",
         set_labels={"a": "1"},
-        deciding_policy="p",
+        deciding_policies=["p"],
     )
     r2 = PolicyResult(
         action=PolicyAction.DENY,
         reason="blocked",
         set_labels={"a": "1"},
-        deciding_policy="p",
+        deciding_policies=["p"],
     )
     # Equality is structural — two results with the same
     # fields compare equal.
@@ -71,12 +72,14 @@ def test_policy_result_inequality_on_action() -> None:
 
 
 def test_policy_result_inequality_on_deciding_policy() -> None:
-    """deciding_policy participates in equality — used by
-    observability to distinguish identical-reason results
-    from different sources."""
-    a = PolicyResult(action=PolicyAction.DENY, deciding_policy="a")
-    b = PolicyResult(action=PolicyAction.DENY, deciding_policy="b")
+    """deciding_policy (derived from deciding_policies[0]) participates
+    in equality via deciding_policies — used by observability to
+    distinguish identical-reason results from different sources."""
+    a = PolicyResult(action=PolicyAction.DENY, deciding_policies=["a"])
+    b = PolicyResult(action=PolicyAction.DENY, deciding_policies=["b"])
     assert a != b
+    assert a.deciding_policy == "a"
+    assert b.deciding_policy == "b"
 
 
 # ── Evaluation context shape ──────────────────────────

@@ -7,10 +7,8 @@ name: Rerun Security Gate Run
 # number, resolves the PR's CURRENT head SHA, and re-runs every gate-bearing
 # workflow whose latest run for that SHA is a completed failure whose
 # `Security Gate` job failed -- so a workflow that already self-triggered on the
-# label (ci/e2e trigger on `labeled` for force-all-tests etc.) is in-progress or
-# green and skipped, avoiding a double-run. fork-e2e-mirror is excluded: it is
-# approval-driven mirror plumbing with branch side effects, not a
-# gate-mirroring check.
+# label (ci/e2e trigger on `labeled` to re-poll the security gate) is in-progress or
+# green and skipped, avoiding a double-run.
 #
 # RACE GUARD: the label event fires this relay AND the Security Scan re-run
 # concurrently. Before re-running anything we WAIT for the Security Scan check on

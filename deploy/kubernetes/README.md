@@ -146,6 +146,61 @@ with its own 10 Gi PVC. Good for dev/testing clusters.
    kubectl kustomize deploy/kubernetes/overlays/postgres/ | kubectl apply -f -
    ```
 
+## Deploy with OpenShell sandboxes
+
+The `overlays/openshell/` overlay configures the server to provision
+[NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) sandboxes for managed
+sessions, and includes RBAC for the
+[kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox)
+CRD when the gateway uses a Kubernetes compute driver.
+
+1. **Edit the configmap patch** — set `OMNIGENT_SANDBOX_SERVER_URL` to the
+   public URL sandboxes will dial back to, and optionally set `OPENSHELL_GATEWAY`
+   to a specific gateway name:
+
+   ```bash
+   # deploy/kubernetes/overlays/openshell/configmap-patch.yaml
+   OMNIGENT_SANDBOX_SERVER_URL: "https://omnigent.example.com"
+   OPENSHELL_GATEWAY: "my-gateway"
+   ```
+
+2. **Edit secrets** — in `overlays/openshell/secret-patch.yaml`, set the
+   database URL, cookie secret, and the LLM API keys your harness needs:
+
+   ```bash
+   DATABASE_URL: "postgresql+psycopg://omnigent:<password>@your-db-host:5432/omnigent"
+   OMNIGENT_ACCOUNTS_COOKIE_SECRET: "$(openssl rand -hex 32)"
+   ANTHROPIC_API_KEY: "sk-ant-..."
+   ```
+
+3. **Gateway access** — the server pod needs to reach the OpenShell gateway's
+   gRPC endpoint. If the gateway runs in-cluster, make sure the NetworkPolicy
+   allows it (the included policy allows all egress on 443 — tighten to taste).
+   If the gateway stores its config/TLS material in a Secret, create
+   `openshell-gateway-config` in the `omnigent` namespace and the deployment
+   mounts it at `~/.config/openshell`.
+
+4. **Install the agent-sandbox CRD** *(optional)* — if the OpenShell gateway
+   delegates to the kubernetes-sigs/agent-sandbox controller:
+
+   ```bash
+   kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/main/config/crd/bases/sandbox.agent.k8s.io_agentsandboxes.yaml
+   ```
+
+   The overlay's RBAC already grants the server's ServiceAccount permission to
+   manage `AgentSandbox` resources.
+
+5. **Apply:**
+
+   ```bash
+   kubectl kustomize deploy/kubernetes/overlays/openshell/ | kubectl apply -f -
+   ```
+
+For OpenShell + in-cluster Postgres, layer the postgres overlay on top (compose
+both bases in a new kustomization, or apply the postgres StatefulSet separately).
+See [Network egress policy](../openshell/README.md#network-egress-policy) for
+the sandbox-side egress allow-list (server URL + LLM provider hosts).
+
 ## Building a UBI image (Red Hat / OpenShift)
 
 For RHEL and OpenShift environments that require UBI-compliant containers, use
@@ -187,6 +242,34 @@ security contexts:
 # edit overlays/openshift-postgres/secret-patch.yaml with real passwords first
 kubectl kustomize deploy/kubernetes/overlays/openshift-postgres/ | oc apply -f -
 ```
+
+## On-demand sandbox runners
+
+The `overlays/sandbox-runners/` overlay turns on the **`kubernetes`** managed
+sandbox provider: a `host_type: managed` session spawns one runner Pod that runs
+`omnigent host` as its entrypoint and dials back over the launch-token tunnel. It
+adds a dedicated runner namespace, a least-privilege server SA (scoped Pod +
+Secret rights, **no `pods/exec`**), and the `sandbox:` server config. The server
+image must be built with the `kubernetes` extra
+(`--build-arg OMNIGENT_EXTRAS=kubernetes`). See
+`overlays/sandbox-runners/README.md` for the full guide.
+
+```bash
+# set the server image in overlays/sandbox-runners/kustomization.yaml first
+kubectl apply -k deploy/kubernetes/overlays/sandbox-runners
+# then create the omnigent-creds harness Secret (see the overlay README)
+```
+
+**Credentials & auth** — two separate concerns, don't conflate:
+
+- **Server auth.** Front the server with `header`/`oidc` auth or run single-user;
+  the built-in `accounts` mode refuses the per-session runner dial-back (`403`),
+  a framework-level limit shared by all sandbox providers — see [Auth](../README.md#auth).
+- **Model keys** (`ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / `OPENAI_API_KEY`
+  / `GIT_TOKEN` / …) ride the `omnigent-creds` Secret projected into every runner Pod.
+
+Both are detailed in
+[`overlays/sandbox-runners/README.md`](overlays/sandbox-runners/README.md#server-auth-managed-hosts).
 
 ## Verify the deployment
 
