@@ -60,6 +60,7 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.tracing import TracingContext, is_tracing_enabled
+from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
@@ -784,12 +785,27 @@ class ExecutorAdapter(HarnessApp):
         """
         ctx = self._current_ctx
         if ctx is None:
+            # Orphaned callback after a turn-context desync (#1026). Blanket
+            # ALLOW here silently bypasses guardrails: for a PHASE_TOOL_CALL this
+            # adapter is the only enforcement point (the call is never re-checked
+            # server-side), so an unevaluable verdict must fail closed. Mirror
+            # the runner's phase-aware default in _evaluate_policy_via_omnigent —
+            # tool calls DENY; advisory LLM phases and the post-execution result
+            # phase ALLOW so a transient desync never needlessly wedges them.
+            fail_closed = phase in FAIL_CLOSED_PHASES
+            action = "POLICY_ACTION_DENY" if fail_closed else "POLICY_ACTION_ALLOW"
             _logger.warning(
                 "policy evaluator fired with no active turn context (phase=%s); "
-                "returning ALLOW by default",
+                "returning %s by default",
                 phase,
+                "DENY" if fail_closed else "ALLOW",
             )
-            return PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+            return PolicyVerdictPayload(
+                action=action,
+                reason=(
+                    f"No active turn context; failing closed for {phase}." if fail_closed else None
+                ),
+            )
         evaluation_id = f"poleval_{secrets.token_hex(16)}"
         return await ctx.evaluate_policy(evaluation_id, phase, data)
 
