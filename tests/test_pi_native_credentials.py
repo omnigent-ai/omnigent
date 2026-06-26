@@ -278,6 +278,262 @@ def test_openai_responses_wire_api_explicit() -> None:
     assert provider.model == "gpt-4o"
 
 
+def _cli_config_databricks_config() -> dict[str, object]:
+    """A config whose default is a cli-config Databricks gateway (openai surface)."""
+    return {
+        "providers": {
+            "codex-databricks": {
+                "kind": "cli-config",
+                "default": True,
+                "cli": "codex",
+                "model_provider": "Databricks",
+                "display_name": "Databricks AI Gateway",
+            },
+        }
+    }
+
+
+def _write_codex_config(home: Path, body: str) -> None:
+    """Write a ``~/.codex/config.toml`` under *home* (the resolver reads $HOME)."""
+    codex_dir = home / ".codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    (codex_dir / "config.toml").write_text(body, encoding="utf-8")
+
+
+_DATABRICKS_CODEX_CONFIG = """
+model_provider = "Databricks"
+
+[model_providers.Databricks]
+name = "Databricks AI Gateway"
+base_url = "https://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1"
+wire_api = "responses"
+
+[model_providers.Databricks.auth]
+command = "jq"
+args = ["-r", ".access_token", "/Users/me/.databricks/model-serving-token.json"]
+timeout_ms = 5000
+"""
+
+
+def test_cli_config_databricks_resolves_to_anthropic_gateway(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cli-config Databricks default → Pi anthropic-messages gateway provider.
+
+    The bug this fixes: previously the resolver returned ``None`` for
+    ``cli-config``, silently dropping Pi to its own login. Now it reads the
+    transport (base_url + auth command) from the pinned ``[model_providers.X]``
+    table in ``~/.codex/config.toml``, rewrites the Codex base URL to the
+    gateway's Anthropic surface, and emits a ``!command`` apiKey.
+    """
+    _write_codex_config(tmp_path, _DATABRICKS_CODEX_CONFIG)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
+
+    assert provider is not None
+    assert provider.api == "anthropic-messages"
+    # /codex/v1 rewritten to the /anthropic surface Pi speaks natively.
+    assert (
+        provider.base_url == "https://1965859176160743.ai-gateway.cloud.databricks.com/anthropic"
+    )
+    assert provider.model == "databricks-claude-sonnet-4-6"
+    assert provider.auth_header is True
+    # apiKey is a "!command" rebuilt from the table's [X.auth] command + args
+    # so Pi refreshes the gateway token per request.
+    assert provider.api_key == (
+        "!jq -r .access_token /Users/me/.databricks/model-serving-token.json"
+    )
+
+
+def test_cli_config_databricks_respects_model_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A session model override wins over the cli-config Databricks default."""
+    _write_codex_config(tmp_path, _DATABRICKS_CODEX_CONFIG)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(
+        model="databricks-claude-opus-4-8",
+        config_loader=_cli_config_databricks_config,
+    )
+    assert provider is not None
+    assert provider.model == "databricks-claude-opus-4-8"
+    assert (
+        provider.base_url == "https://1965859176160743.ai-gateway.cloud.databricks.com/anthropic"
+    )
+
+
+def test_cli_config_missing_codex_table_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cli-config entry whose codex table is absent → None (graceful fallback)."""
+    # config.toml exists but defines no [model_providers.Databricks] table.
+    _write_codex_config(tmp_path, 'model_provider = "Databricks"\n')
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config) is None
+
+
+def test_cli_config_non_databricks_gateway_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cli-config provider that is NOT a Databricks gateway → None.
+
+    Gateway detection is by base_url shape (``*.ai-gateway.*databricks*``), so a
+    generic custom provider pointing elsewhere falls back to Pi's own login
+    rather than being mistranslated as the Databricks Anthropic surface.
+    """
+    _write_codex_config(
+        tmp_path,
+        """
+model_provider = "Databricks"
+
+[model_providers.Databricks]
+name = "Some Other Proxy"
+base_url = "https://proxy.example.com/v1"
+
+[model_providers.Databricks.auth]
+command = "printf"
+args = ["%s", "sk-static"]
+""",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config) is None
+
+
+def test_cli_config_databricks_warns_on_unresolvable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unresolvable cli-config Databricks logs a clear reason (not silent)."""
+    _write_codex_config(tmp_path, 'model_provider = "Databricks"\n')
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="omnigent.pi_native_credentials"):
+        assert (
+            creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config) is None
+        )
+    assert any("codex-databricks" in rec.getMessage() for rec in caplog.records)
+
+
+def _codex_config_with_base_url(base_url: str) -> str:
+    """A codex config.toml whose Databricks table points at *base_url*."""
+    return f"""
+model_provider = "Databricks"
+
+[model_providers.Databricks]
+name = "Databricks AI Gateway"
+base_url = "{base_url}"
+wire_api = "responses"
+
+[model_providers.Databricks.auth]
+command = "jq"
+args = ["-r", ".access_token", "/Users/me/.databricks/model-serving-token.json"]
+timeout_ms = 5000
+"""
+
+
+# Look-alike base URLs from the security finding: each embeds the "databricks"
+# and "ai-gateway" substrings somewhere in scheme+host+path, defeating the old
+# substring scan, but NONE is a real Databricks AI Gateway host. Routing any of
+# them would leak the workspace bearer token to an attacker-controlled host.
+_LOOKALIKE_GATEWAY_URLS = [
+    # "ai-gateway" + "databricks" labels, but the real host is evil.test.
+    "https://databricks-ai-gateway.evil.test/codex/v1",
+    # Trusted suffix appears mid-host; the actual parent domain is .evil.test.
+    "https://x.ai-gateway.cloud.databricks.com.evil.test/codex/v1",
+    # Both substrings live in the path, not the host.
+    "https://evil.test/databricks/ai-gateway/v1",
+    # Right host shape but plaintext http (token must never go over http).
+    "http://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1",
+]
+
+
+@pytest.mark.parametrize("gateway_url", _LOOKALIKE_GATEWAY_URLS)
+def test_cli_config_lookalike_gateway_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, gateway_url: str
+) -> None:
+    """A look-alike (non-Databricks) gateway URL → None, never forwards the token.
+
+    The old detector matched the "databricks" and "ai-gateway" substrings
+    anywhere in the full base_url, so these look-alikes all passed and the code
+    would emit the workspace bearer token as the apiKey for an attacker host.
+    The hardened detector parses the URL and validates the *hostname* against a
+    trusted Databricks domain suffix allowlist, so each falls back to Pi login.
+    """
+    _write_codex_config(tmp_path, _codex_config_with_base_url(gateway_url))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config) is None
+
+
+def test_real_gateway_still_resolves_after_hardening(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The proven real gateway URL still resolves end-to-end after hardening.
+
+    Guards against over-tightening: the canonical
+    ``<workspace>.ai-gateway.cloud.databricks.com`` host must still translate to
+    the Anthropic surface with the ``!command`` apiKey.
+    """
+    _write_codex_config(
+        tmp_path,
+        _codex_config_with_base_url(
+            "https://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1"
+        ),
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
+
+    assert provider is not None
+    assert (
+        provider.base_url == "https://1965859176160743.ai-gateway.cloud.databricks.com/anthropic"
+    )
+    assert provider.api == "anthropic-messages"
+    assert provider.api_key == (
+        "!jq -r .access_token /Users/me/.databricks/model-serving-token.json"
+    )
+
+
+@pytest.mark.parametrize(
+    "gateway_url",
+    [
+        # Canonical AWS gateway.
+        "https://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1",
+        # Staging variant (still ends in .cloud.databricks.com).
+        "https://wkspc.ai-gateway.staging.cloud.databricks.com/codex/v1",
+        # Azure / GCP parent domains carrying the ai-gateway label.
+        "https://wkspc.ai-gateway.azuredatabricks.net/codex/v1",
+        "https://wkspc.ai-gateway.gcp.databricks.com/codex/v1",
+    ],
+)
+def test_is_databricks_ai_gateway_url_accepts_real_hosts(gateway_url: str) -> None:
+    """The hardened detector accepts genuine Databricks AI Gateway hosts."""
+    assert creds._is_databricks_ai_gateway_url(gateway_url) is True
+
+
+@pytest.mark.parametrize(
+    "gateway_url",
+    [
+        *_LOOKALIKE_GATEWAY_URLS,
+        # ai-gateway label, databricks substring, but non-databricks suffix.
+        "https://ai-gateway.databricks.evil.test/codex/v1",
+        # Trusted suffix but no ai-gateway label (a non-gateway Databricks host).
+        "https://wkspc.cloud.databricks.com/codex/v1",
+        # ai-gateway only as a substring of a label, not a full label.
+        "https://my-ai-gateway-proxy.cloud.databricks.com/codex/v1",
+        # Garbage / no hostname.
+        "not-a-url",
+        "",
+    ],
+)
+def test_is_databricks_ai_gateway_url_rejects_lookalikes(gateway_url: str) -> None:
+    """The hardened detector rejects look-alike and malformed URLs."""
+    assert creds._is_databricks_ai_gateway_url(gateway_url) is False
+
+
 def test_anthropic_family_ignores_wire_api() -> None:
     """The Anthropic family always uses anthropic-messages, ignoring wire_api.
 

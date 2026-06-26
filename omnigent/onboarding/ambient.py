@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import socket
 import sys
 import time
@@ -378,6 +379,86 @@ def codex_config_custom_provider(config_path: Path) -> CodexConfigProvider | Non
     name = table.get("name")
     display_name = name if isinstance(name, str) and name.strip() else provider_id
     return CodexConfigProvider(provider_id=provider_id, display_name=display_name)
+
+
+@dataclass(frozen=True)
+class CodexConfigTransport:
+    """The base URL + auth command from a Codex ``[model_providers.X]`` table.
+
+    The runtime-routing counterpart of :class:`CodexConfigProvider` (which
+    only carries the id / display name for the setup menu). This reads the
+    fields a harness needs to actually talk to the provider — the ones
+    ``isaac configure codex`` writes for the Databricks AI Gateway.
+
+    :param base_url: The provider table's ``base_url``, e.g.
+        ``"https://<workspace>.ai-gateway.cloud.databricks.com/codex/v1"``.
+    :param auth_command: A single shell command string that prints a bearer
+        token to stdout, reconstructed from the table's ``[X.auth]``
+        ``command`` + ``args`` (e.g. ``"jq -r .access_token /path/token.json"``).
+        ``None`` when the table carries no ``[X.auth]`` token command (e.g. it
+        authenticates via a static header or AWS SigV4 instead).
+    """
+
+    base_url: str
+    auth_command: str | None
+
+
+def codex_config_provider_transport(
+    config_path: Path, provider_id: str
+) -> CodexConfigTransport | None:
+    """Read the base URL + auth command for one Codex ``[model_providers.X]``.
+
+    A harness that pinned a ``cli-config`` provider (e.g. pi-native routing the
+    user's Databricks AI Gateway) needs the *transport* — where to send
+    requests and how to authenticate — not just the id. This parses the named
+    ``[model_providers.<provider_id>]`` table out of ``config.toml`` and returns
+    its ``base_url`` plus a shell command (rebuilt from ``[X.auth]``
+    ``command`` + ``args``) that prints a bearer token.
+
+    Purely local and structural (parses one TOML file, runs nothing). Returns
+    ``None`` — rather than raising — for every "can't resolve" case so a caller
+    can fall back gracefully without crashing a launch.
+
+    :param config_path: Path to the Codex ``config.toml`` to inspect, e.g.
+        ``Path("~/.codex/config.toml").expanduser()``.
+    :param provider_id: The ``[model_providers.X]`` id to read, e.g.
+        ``"Databricks"``.
+    :returns: The :class:`CodexConfigTransport`, or ``None`` when the file is
+        missing / malformed, the table is absent, or it declares no
+        ``base_url``.
+    """
+    try:
+        raw = config_path.read_bytes()
+    except OSError:
+        return None
+    try:
+        config = tomllib.loads(raw.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return None
+
+    providers = config.get("model_providers")
+    if not isinstance(providers, dict):
+        return None
+    table = providers.get(provider_id)
+    if not isinstance(table, dict):
+        return None
+    base_url = table.get("base_url")
+    if not isinstance(base_url, str) or not base_url.strip():
+        return None
+
+    auth_command: str | None = None
+    auth = table.get("auth")
+    if isinstance(auth, dict):
+        command = auth.get("command")
+        args = auth.get("args")
+        if isinstance(command, str) and command.strip():
+            parts = [command]
+            if isinstance(args, list):
+                parts.extend(str(arg) for arg in args)
+            # shlex.join produces a single shell-safe string Pi can run as a
+            # "!command" apiKey (it shell-quotes the token file path etc.).
+            auth_command = shlex.join(parts)
+    return CodexConfigTransport(base_url=base_url.strip(), auth_command=auth_command)
 
 
 def codex_config_detection() -> DetectedProvider | None:
