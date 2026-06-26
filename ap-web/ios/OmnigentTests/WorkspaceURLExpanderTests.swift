@@ -53,6 +53,18 @@ final class WorkspaceURLExpanderTests: XCTestCase {
     XCTAssertNil(URLProtocolStub.handler)
   }
 
+  func testLeavesDatabricksAppsHostUnchangedWithoutProbe() async {
+    let app = URL(string: "https://my-app-123.aws.databricksapps.com")!
+    let expandedApp = await WorkspaceURLExpander.expandIfNeeded(app, session: stubbedSession())
+    XCTAssertEqual(expandedApp, app)
+
+    let apex = URL(string: "https://databricksapps.com")!
+    let expandedApex = await WorkspaceURLExpander.expandIfNeeded(apex, session: stubbedSession())
+    XCTAssertEqual(expandedApex, apex)
+
+    XCTAssertNil(URLProtocolStub.handler)
+  }
+
   private func stubbedSession() -> URLSession {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [URLProtocolStub.self]

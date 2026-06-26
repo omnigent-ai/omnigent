@@ -115,6 +115,15 @@
   const WORKSPACE_UI_PATH = "/ml/omnigents";
 
   /**
+   * Databricks Apps are served from ``*.databricksapps.com`` and answer with the
+   * same ``server: databricks`` header as a workspace, but they are NOT
+   * workspaces and have no ``/ml/omnigents`` mount. Skip expansion for these
+   * hosts so a user who points the shell at a Databricks App is left on the URL
+   * they entered.
+   */
+  const DATABRICKS_APPS_HOST_SUFFIX = "databricksapps.com";
+
+  /**
    * Probe timeout for Databricks workspace detection. Deliberately short: a
    * slow or unreachable host must not stall the connect flow — on timeout we
    * fall back to loading the URL exactly as entered.
@@ -150,6 +159,12 @@
     // already pointed at a specific mount, and Databricks workspaces are
     // https-only.
     if (url.protocol !== "https:" || (url.pathname !== "/" && url.pathname !== "")) {
+      return normalized;
+    }
+    // Databricks Apps share the workspace ``server: databricks`` header but have
+    // no ``/ml/omnigents`` mount, so never expand them.
+    const host = url.hostname.toLowerCase();
+    if (host === DATABRICKS_APPS_HOST_SUFFIX || host.endsWith(`.${DATABRICKS_APPS_HOST_SUFFIX}`)) {
       return normalized;
     }
     let probe;

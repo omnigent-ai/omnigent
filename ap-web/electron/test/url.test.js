@@ -161,6 +161,25 @@ describe("expandDatabricksWorkspaceUrl", () => {
     assert.equal(probed, false);
   });
 
+  it("leaves a Databricks Apps host untouched, without probing", async () => {
+    let probed = false;
+    await withFetch(
+      async () => {
+        probed = true;
+        return fakeResponse("databricks");
+      },
+      async () => {
+        const url = "https://my-app-123.aws.databricksapps.com/";
+        assert.equal(await expandDatabricksWorkspaceUrl(url), url);
+        assert.equal(
+          await expandDatabricksWorkspaceUrl("https://databricksapps.com/"),
+          "https://databricksapps.com/",
+        );
+      },
+    );
+    assert.equal(probed, false);
+  });
+
   it("leaves a non-https URL untouched, without probing", async () => {
     let probed = false;
     await withFetch(
