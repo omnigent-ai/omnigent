@@ -84,7 +84,7 @@ dependencies = [
     "claude-agent-sdk>=0.1.62",
     "openai-agents>=0.0.17",
     "PyJWT[crypto]>=2.8,<3",
-    "argon2-cffi>=23.1,<24",
+    "argon2-cffi>=23.1,<26",
     # PEP 440 version comparison for the update check / `omni upgrade`
     # (omnigent/update_check.py, omnigent/cli.py): compares the installed
     # version against the latest PyPI release. Previously only a
