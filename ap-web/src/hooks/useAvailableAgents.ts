@@ -101,6 +101,26 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
 }
 
 /**
+ * Fetch the caller's standalone, owner-scoped agents (`GET /v1/agents/mine`)
+ * — the first-class agents managed from the sidebar "Agents" section. Same
+ * wire shape as the built-in list. Including these here is what makes a
+ * sidebar-created agent selectable in the new-chat picker.
+ */
+async function fetchMyStandaloneAgents(): Promise<AvailableAgent[]> {
+  const res = await authenticatedFetch("/v1/agents/mine");
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const body = (await res.json()) as { data: BuiltinAgentWire[] };
+  return body.data.map((a) => ({
+    id: a.id,
+    name: a.name,
+    display_name: displayNameForAgent(a.name, a.harness),
+    description: a.description ?? null,
+    harness: a.harness ?? null,
+    skills: a.skills ?? [],
+  }));
+}
+
+/**
  * A unique session-bound agent discovered by the sessions scan, paired
  * with one session it was seen on (used to fetch the full AgentObject
  * via `GET /v1/sessions/{id}/agent`, which is keyed by session id).
@@ -212,11 +232,17 @@ async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<Availab
  * availability must not be hostage to the discovery extension.
  */
 async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
-  const [builtins, scanned] = await Promise.all([
+  const [builtins, mine, scanned] = await Promise.all([
     fetchBuiltinAgents(),
+    // Degrades to [] so the picker still shows built-ins if /agents/mine
+    // fails (older server / transient error), same posture as the scan.
+    fetchMyStandaloneAgents().catch(() => [] as AvailableAgent[]),
     scanSessionAgents().catch(() => [] as ScannedSessionAgent[]),
   ]);
-  const builtinIds = new Set(builtins.map((a) => a.id));
+  // Standalone agents are already first-class rows; session-scan dedup is
+  // against built-ins AND standalone (by id) so a standalone agent that has
+  // been used in a session isn't listed twice.
+  const knownIds = new Set([...builtins, ...mine].map((a) => a.id));
   const builtinNames = new Set(builtins.map((a) => a.name));
   const hasKiroBuiltin = builtins.some(
     (a) => nativeCodingAgentForAvailableAgent(a)?.key === "kiro",
@@ -232,7 +258,7 @@ async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
     // leaves `"<builtin> (fork ag_a)"` — which is not a built-in name, so
     // the clone would slip past the shadow check and pollute the picker.
     const base = agentRootName(agent.agentName);
-    if (builtinIds.has(agent.agentId) || builtinNames.has(base)) continue;
+    if (knownIds.has(agent.agentId) || builtinNames.has(base)) continue;
     if (hasKiroBuiltin && kiroLegacyNames.has(base.toLocaleLowerCase())) continue;
     if (!customByName.has(base)) customByName.set(base, agent);
   }
@@ -242,10 +268,10 @@ async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
     const nativeKey = nativeCodingAgentForAvailableAgent(agent)?.key;
     return nativeKey !== "kiro" || !hasKiroBuiltin;
   });
-  // Built-ins first; custom agents follow in scan order (newest session
-  // first). NewChatDialog's display-order sort is stable, so unranked
-  // custom names keep this relative order.
-  return [...builtins, ...enriched];
+  // Built-ins first, then the caller's standalone agents, then any remaining
+  // session-discovered custom agents (newest session first). NewChatDialog's
+  // display-order sort is stable, so unranked names keep this relative order.
+  return [...builtins, ...mine, ...enriched];
 }
 
 interface UseAvailableAgentsOptions {

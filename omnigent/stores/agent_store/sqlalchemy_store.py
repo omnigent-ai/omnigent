@@ -43,17 +43,20 @@ class SqlAlchemyAgentStore(AgentStore):
         name: str,
         bundle_location: str,
         description: str | None = None,
+        owner: str | None = None,
     ) -> Agent:
         """
         Register a new agent in the database.
 
         :param agent_id: Pre-generated unique agent identifier,
             e.g. ``"ag_0f1a2b3c..."``.
-        :param name: Human-readable agent name. Must be unique,
-            e.g. ``"code-assistant"``.
+        :param name: Human-readable agent name. Unique among built-ins
+            when ``owner`` is ``None``, else unique per owner.
         :param bundle_location: Artifact store key for the bundle,
             e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
         :param description: Optional free-text description.
+        :param owner: Owning user id for a standalone agent, else
+            ``None`` for an operator built-in.
         :returns: The newly created :class:`Agent`.
         """
         row = SqlAgent(
@@ -63,10 +66,27 @@ class SqlAlchemyAgentStore(AgentStore):
             bundle_location=bundle_location,
             version=1,
             description=description,
+            owner=owner,
         )
         with self._session() as session:
             session.add(row)
             return sql_agent_to_entity(row)
+
+    def list_for_owner(self, owner: str) -> list[Agent]:
+        """
+        List standalone agents owned by ``owner``, newest-first.
+
+        :param owner: Owning user id, e.g. ``"alice@example.com"``.
+        :returns: The owner's standalone agents (``session_id IS NULL``
+            and ``owner`` matching).
+        """
+        with self._session() as session:
+            rows = session.execute(
+                select(SqlAgent)
+                .where(SqlAgent.session_id.is_(None), SqlAgent.owner == owner)
+                .order_by(desc(SqlAgent.created_at), desc(SqlAgent.id))
+            ).scalars().all()
+            return [sql_agent_to_entity(r) for r in rows]
 
     def get(self, agent_id: str) -> Agent | None:
         """
@@ -93,6 +113,7 @@ class SqlAlchemyAgentStore(AgentStore):
                 select(SqlAgent).where(
                     SqlAgent.name == name,
                     SqlAgent.session_id.is_(None),
+                    SqlAgent.owner.is_(None),
                 )
             ).scalar_one_or_none()
             return sql_agent_to_entity(row) if row else None
@@ -119,7 +140,10 @@ class SqlAlchemyAgentStore(AgentStore):
         with self._session() as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
-            template_agent = SqlAgent.session_id.is_(None)
+            # Built-in/template agents only: no session AND no owner, so the
+            # built-in picker never leaks one user's standalone agents to
+            # another (those are listed via ``list_for_owner``).
+            template_agent = and_(SqlAgent.session_id.is_(None), SqlAgent.owner.is_(None))
             stmt = select(SqlAgent).where(template_agent)
             if after:
                 sub = (

@@ -57,11 +57,18 @@ def test_agents_session_id_column_is_nullable_and_indexed(db_engine: Engine) -> 
 
 
 def test_agents_name_unique_index_is_template_scoped(db_engine: Engine) -> None:
-    """Registered agent names stay unique while session copies may share them."""
+    """Registered agent names stay unique while session copies may share them.
+
+    The later ``add_owner_to_agents`` migration (o1a2b3c4d5e6) replaces the
+    original ``ix_agents_template_name`` with ``ix_agents_builtin_name``
+    (built-in name uniqueness, now scoped to ``owner IS NULL`` as well);
+    the end-state schema here reflects that successor index. Built-in name
+    uniqueness — what this test guards — is unchanged.
+    """
     indexes = sa.inspect(db_engine).get_indexes("agents")
-    template_indexes = [index for index in indexes if index["name"] == "ix_agents_template_name"]
+    template_indexes = [index for index in indexes if index["name"] == "ix_agents_builtin_name"]
     assert len(template_indexes) == 1, (
-        f"Expected ix_agents_template_name, got {[index['name'] for index in indexes]}"
+        f"Expected ix_agents_builtin_name, got {[index['name'] for index in indexes]}"
     )
     assert bool(template_indexes[0]["unique"]) is True
 

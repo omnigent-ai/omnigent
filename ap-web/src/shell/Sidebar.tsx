@@ -40,10 +40,12 @@ import {
   SquareCheckIcon,
   SquarePenIcon,
   Trash2Icon,
+  UsersIcon,
   XIcon,
 } from "lucide-react";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
+import { ManageAgentsDialog } from "./ManageAgentsDialog";
 import {
   Dialog,
   DialogContent,
@@ -259,6 +261,10 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   // Which top-level nav button to highlight for the current route.
   const { isNewChatPage, isInboxPage } = useActiveNavItem();
 
+  // The "Agents" manage dialog (list/create/delete standalone agents),
+  // opened from the button below "New session".
+  const [manageAgentsOpen, setManageAgentsOpen] = useState(false);
+
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
   // shouldn't replace the whole sidebar.
@@ -444,6 +450,20 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
                 New session
               </Link>
             </Button>
+            {/* "Agents" opens the manage dialog for standalone, reusable
+            agents (list / create / delete) — independent of any session,
+            unlike the new-chat custom-agent flow. */}
+            <Button
+              type="button"
+              className="mt-1 w-full justify-start gap-2 text-sm"
+              variant="ghost"
+              data-testid="manage-agents-button"
+              onClick={() => setManageAgentsOpen(true)}
+            >
+              <UsersIcon className="size-4 text-foreground" />
+              Agents
+            </Button>
+            <ManageAgentsDialog open={manageAgentsOpen} onOpenChange={setManageAgentsOpen} />
             {selectionMode ? (
               <BulkActionBar
                 selectedIds={selectedIds}

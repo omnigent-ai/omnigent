@@ -76,6 +76,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
+import { MY_AGENTS_QUERY_KEY, createAgent } from "@/lib/agentsApi";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 
 // Hidden from the new-session picker only. `nessie` is superseded by polly.
@@ -2709,10 +2710,28 @@ export function NewChatLandingScreen() {
       <CreateAgentDialog
         open={createAgentOpen}
         onOpenChange={setCreateAgentOpen}
-        onCreate={(input) => {
-          setPendingAgent(input);
-          setPickedAgentId(PENDING_AGENT_ID);
-          setPickedHarness(null);
+        onCreate={async (input) => {
+          // Persist as a first-class standalone agent so it shows up in the
+          // sidebar "Agents" list AND this picker, and is reusable across
+          // sessions. Invalidate both catalogs, then select the created
+          // agent by id (the normal agent-id session path takes over from
+          // here — no per-session bundle). Falls back to the legacy
+          // session-scoped staging if the create fails (e.g. older server
+          // without /v1/agents), so a chat can still be started.
+          try {
+            const created = await createAgent(input);
+            await Promise.all([
+              queryClient.invalidateQueries({ queryKey: ["available-agents"] }),
+              queryClient.invalidateQueries({ queryKey: MY_AGENTS_QUERY_KEY }),
+            ]);
+            setPendingAgent(null);
+            setPickedAgentId(created.id);
+            setPickedHarness(created.harness ?? null);
+          } catch {
+            setPendingAgent(input);
+            setPickedAgentId(PENDING_AGENT_ID);
+            setPickedHarness(null);
+          }
         }}
       />
     </div>

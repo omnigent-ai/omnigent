@@ -22,4 +22,5 @@ def sql_agent_to_entity(row: SqlAgent) -> Agent:
         description=row.description,
         updated_at=row.updated_at,
         session_id=row.session_id,
+        owner=row.owner,
     )
