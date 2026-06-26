@@ -463,6 +463,40 @@ def test_codex_config_custom_provider_detected(clean_env) -> None:
     assert detect_providers() == [_ISAAC_STYLE_DETECTION]
 
 
+def test_codex_config_provider_transport_reads_base_url_and_auth(clean_env) -> None:
+    """``codex_config_provider_transport`` returns base_url + a shell auth command.
+
+    The runtime-routing counterpart of the detection: pi-native reads this to
+    point Pi at the user's Databricks gateway. The ``[X.auth]`` command + args
+    are rebuilt into a single shell-safe string.
+    """
+    from omnigent.onboarding.ambient import (
+        _codex_config_path,
+        codex_config_provider_transport,
+    )
+
+    _write_codex_config(clean_env, _ISAAC_STYLE_CODEX_CONFIG)
+    transport = codex_config_provider_transport(_codex_config_path(), "Databricks")
+    assert transport is not None
+    assert transport.base_url == "https://example.ai-gateway.cloud.databricks.com/codex/v1"
+    assert transport.auth_command == (
+        "jq -r .access_token /home/user/.databricks/model-serving-token.json"
+    )
+
+
+def test_codex_config_provider_transport_missing_table_returns_none(clean_env) -> None:
+    """An absent / unnamed ``[model_providers.X]`` table → ``None``."""
+    from omnigent.onboarding.ambient import (
+        _codex_config_path,
+        codex_config_provider_transport,
+    )
+
+    _write_codex_config(clean_env, 'model_provider = "Databricks"\n')
+    assert codex_config_provider_transport(_codex_config_path(), "Databricks") is None
+    # Missing file is also graceful.
+    assert codex_config_provider_transport(clean_env / "nope.toml", "Databricks") is None
+
+
 def test_codex_config_detected_before_codex_login(clean_env) -> None:
     """With BOTH a custom config provider and a codex login, config wins priority.
 

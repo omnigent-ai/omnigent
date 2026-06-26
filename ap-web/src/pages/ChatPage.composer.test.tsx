@@ -364,6 +364,66 @@ describe("Composer slash-command submit routing", () => {
     expect(screen.getAllByTestId("model-picker-item").length).toBeGreaterThan(0);
   });
 
+  it("shows the read-only model hint for bare /model on opencode-native", () => {
+    // opencode surfaces showModels (its pill mirrors the live TUI model) but
+    // has no web model options to populate a dropdown. The bare-/model intercept
+    // must NOT fire — opening an empty picker and swallowing the command was the
+    // regression. Instead it falls through to the builtin /model handler, which
+    // surfaces the current model as a read-only hint. ("/model <name>" still
+    // routes to setModel below — opencode reads model_override on the next turn,
+    // so a web switch is functional even though the picker list is empty.)
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setModel, llmModel: "openrouter/nemotron" });
+    const onSend = vi.fn();
+    render(
+      <Composer
+        {...composerProps({
+          onSend,
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "opencode",
+        })}
+      />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/model " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    // Not sent as plaintext, not a switch, and the (empty) web picker stays shut.
+    expect(onSend).not.toHaveBeenCalled();
+    expect(setModel).not.toHaveBeenCalled();
+    expect(screen.queryAllByTestId("model-picker-item")).toHaveLength(0);
+    // The builtin handler surfaced the current model as a read-only hint.
+    expect(screen.getByText(/openrouter\/nemotron/)).toBeTruthy();
+  });
+
+  it("routes /model <name> to setModel on opencode-native (functional switch)", () => {
+    // Even with an empty picker list, "/model <name>" must persist the override
+    // via setModel — the opencode executor reads model_override on the next
+    // web-injected turn. It must NOT leak to the agent as plaintext "/model …".
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setModel });
+    const onSend = vi.fn();
+    render(
+      <Composer
+        {...composerProps({
+          onSend,
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "opencode",
+        })}
+      />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/model openrouter/llama-3.3-70b" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(setModel).toHaveBeenCalledWith("openrouter/llama-3.3-70b");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
   it("routes /model <name> to setModel on claude-native sessions", () => {
     // Sent as plaintext, "/model fable" would pop Claude's "Switch model?"
     // dialog inside the vendor TUI with nothing web-side to answer it —
@@ -526,6 +586,58 @@ describe("AgentPicker trigger label", () => {
     expect(trigger).not.toHaveTextContent("fable");
     expect(trigger).not.toHaveTextContent("Low");
     expect(within(trigger).getByText("Composer 2.5")).toHaveClass("text-foreground");
+  });
+
+  it("surfaces an SDK/bundle session's model from the override, not the cross-session sticky", () => {
+    // Polly/Debby (claude-sdk) repro: a model picked in some other (Codex)
+    // session lingers in the global sticky `selectedModel`. SDK/bundle sessions
+    // (modelPickerKind === null) never have the sticky applied, so the trigger
+    // must read the session's own applied model (`sessionModelOverride`), never
+    // the stale sticky — the "gpt-5.5 on a Claude-SDK Polly" report.
+    useChatStore.setState({
+      selectedModel: "gpt-5.5", // stale cross-session sticky — must be ignored
+      sessionModelOverride: "claude-opus-4-8",
+      selectedEffort: null,
+      llmModel: null,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "polly" }],
+          selectedAgentId: "a1",
+          modelPickerKind: null,
+        })}
+      />,
+    );
+    const trigger = screen.getByTestId("agent-picker-trigger");
+    expect(trigger).toHaveTextContent("claude-opus-4-8");
+    expect(trigger).not.toHaveTextContent("gpt-5.5");
+  });
+
+  it("does not leak the cross-session sticky model on an SDK/bundle session with no applied model", () => {
+    // The exact report: a Polly (claude-sdk) session with no override and no
+    // bound model, but a `gpt-5.5` left in the sticky from a prior Codex
+    // session. The model label stays empty — only the real effort shows.
+    useChatStore.setState({
+      selectedModel: "gpt-5.5", // stale cross-session sticky — must not surface
+      sessionModelOverride: null,
+      selectedEffort: "high",
+      llmModel: null,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "polly" }],
+          selectedAgentId: "a1",
+          modelPickerKind: null,
+        })}
+      />,
+    );
+    const trigger = screen.getByTestId("agent-picker-trigger");
+    expect(trigger).not.toHaveTextContent("gpt-5.5");
+    // The real effort still renders — proving the trigger is present and only
+    // the leaked model was suppressed.
+    expect(trigger).toHaveTextContent("High");
   });
 });
 

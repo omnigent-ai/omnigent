@@ -74,7 +74,7 @@ from omnigent.runner.resource_registry import (
     TerminalLifecycle,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.spec.parser import discover_host_skills
+from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -479,6 +479,12 @@ class _CodexNativeLaunchConfig:
         rollout exists to clone (an SDK or cross-family source) the runner
         builds the clone's rollout from the copied Omnigent items instead (see
         ``_ensure_local_codex_resume_rollout``).
+    :param bypass_sandbox: ``True`` when the session opted into Codex's
+        DANGEROUS full-bypass stance (``omnigent.codex_native.bypass_sandbox``
+        label == ``"1"``). The runner then launches the ``--remote`` TUI with
+        ``--dangerously-bypass-approvals-and-sandbox`` and aligns the
+        app-server threads (no approval prompts, no command sandbox). Default
+        ``False``. See issue #657.
     """
 
     workspace: Path
@@ -489,6 +495,7 @@ class _CodexNativeLaunchConfig:
     fork_source_id: str | None
     fork_source_external_id: str | None
     fork_carry_history: bool
+    bypass_sandbox: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -506,21 +513,28 @@ class _PiNativeLaunchConfig:
     :param terminal_launch_args: User pass-through native CLI args.
     :param external_session_id: Existing external session id, when captured by
         the extension.
+    :param fork_source_external_id: SOURCE Pi session id stamped on a forked
+        clone (``omnigent.fork.source_external_session_id``); consulted only
+        when the clone has no native session of its own yet.
+    :param fork_carry_history: ``True`` on a forked clone bound to a native
+        target (``omnigent.fork.carry_history``); when no source session
+        exists to clone, the clone's session is rebuilt from its OWN copied
+        Omnigent items (see :func:`_auto_create_pi_terminal`). Also consumed by
+        the cursor-native launch to replay prior turns as a text preamble on
+        the first message.
     :param model_override: Persisted per-session ``/model`` override, e.g.
         ``"claude-4.6-sonnet-medium"``; ``None`` when unset. Consumed by the
         cursor-native launch (``--model``), ignored by pi-native.
-    :param fork_carry_history: ``True`` when the session is a fork bound to a
-        carry-history native target (``omnigent.fork.carry_history``). Consumed
-        by the cursor-native launch to replay prior turns as a text preamble on
-        the first message; ignored by pi-native.
     """
 
     workspace: Path
     server_url: str
     terminal_launch_args: list[str] | None
     external_session_id: str | None
-    model_override: str | None = None
+    fork_source_id: str | None = None
+    fork_source_external_id: str | None = None
     fork_carry_history: bool = False
+    model_override: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -708,6 +722,28 @@ async def _pi_native_launch_config(
         not isinstance(session_workspace, str) or not session_workspace
     ):
         raise RuntimeError(f"Invalid workspace for Pi session {session_id!r}.")
+    # Fork directives stamped on a clone at fork time. Only consulted when the
+    # clone has no external_session_id of its own yet (see the fork branches in
+    # _auto_create_pi_terminal); inert otherwise. Mirrors the codex-native and
+    # claude-native launch-config fork handling.
+    from omnigent.stores.conversation_store import (
+        FORK_CARRY_HISTORY_LABEL_KEY,
+        FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+        FORK_SOURCE_LABEL_KEY,
+    )
+
+    fork_source_id: str | None = None
+    fork_source_external_id: str | None = None
+    fork_carry_history = False
+    labels = snapshot.get("labels")
+    if isinstance(labels, dict):
+        _fsi = labels.get(FORK_SOURCE_LABEL_KEY)
+        if isinstance(_fsi, str) and _fsi:
+            fork_source_id = _fsi
+        _fse = labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
+        if isinstance(_fse, str) and _fse:
+            fork_source_external_id = _fse
+        fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
     model_override = snapshot.get("model_override")
     if model_override is not None:
         if not isinstance(model_override, str) or not model_override:
@@ -718,19 +754,15 @@ async def _pi_native_launch_config(
             raise RuntimeError(
                 f"Invalid model_override for session {session_id!r}: {exc}"
             ) from exc
-    from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
-
-    labels = snapshot.get("labels")
-    fork_carry_history = (
-        isinstance(labels, dict) and labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
-    )
     return _PiNativeLaunchConfig(
         workspace=_pi_session_workspace(session_workspace),
         server_url=os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
         terminal_launch_args=terminal_launch_args,
         external_session_id=external_session_id,
-        model_override=model_override,
+        fork_source_id=fork_source_id,
+        fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
+        model_override=model_override,
     )
 
 
@@ -811,6 +843,7 @@ async def _codex_native_launch_config(
     # the clone has no external_session_id of its own yet (see the
     # fork-source branch in _auto_create_codex_terminal); inert otherwise.
     from omnigent.stores.conversation_store import (
+        CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
         FORK_SOURCE_LABEL_KEY,
@@ -819,6 +852,10 @@ async def _codex_native_launch_config(
     fork_source_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history = False
+    # DANGEROUS opt-in: full approval/sandbox bypass, stored as a plain
+    # conversation label ("1" to enable). Read here so the runner applies
+    # it at launch; any other value (incl. absent) leaves the normal stance.
+    bypass_sandbox = False
     labels = snapshot.get("labels")
     if isinstance(labels, dict):
         _fsi = labels.get(FORK_SOURCE_LABEL_KEY)
@@ -828,6 +865,7 @@ async def _codex_native_launch_config(
         if isinstance(_fse, str) and _fse:
             fork_source_external_id = _fse
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
+        bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
     return _CodexNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
         policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
@@ -837,6 +875,7 @@ async def _codex_native_launch_config(
         fork_source_id=fork_source_id,
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
+        bypass_sandbox=bypass_sandbox,
     )
 
 
@@ -850,6 +889,10 @@ class _OpenCodeNativeLaunchConfig:
     :param terminal_launch_args: User pass-through OpenCode CLI args.
     :param model_override: Persisted model override, or ``None``.
     :param external_session_id: Existing OpenCode session id to resume.
+    :param fork_carry_history: ``True`` on a forked clone whose prior
+        transcript should be seeded as a text preamble
+        (``omnigent.fork.carry_history``); opencode has no native session to
+        clone, so the runner rehydrates from the copied Omnigent transcript.
     """
 
     workspace: Path
@@ -857,6 +900,7 @@ class _OpenCodeNativeLaunchConfig:
     terminal_launch_args: list[str] | None
     model_override: str | None
     external_session_id: str | None
+    fork_carry_history: bool = False
 
 
 async def _opencode_native_launch_config(
@@ -923,12 +967,22 @@ async def _opencode_native_launch_config(
         not isinstance(session_workspace, str) or not session_workspace
     ):
         raise RuntimeError(f"Invalid workspace for OpenCode session {session_id!r}.")
+    # On a forked clone, the server stamps carry-history (opencode has no native
+    # session to clone, so the runner rehydrates the copied transcript as a
+    # noReply preamble — same path as a lost-session resume).
+    from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
+
+    labels = snapshot.get("labels")
+    fork_carry_history = (
+        isinstance(labels, dict) and labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
+    )
     return _OpenCodeNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
         policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
         terminal_launch_args=terminal_launch_args,
         model_override=model_override,
         external_session_id=external_session_id,
+        fork_carry_history=fork_carry_history,
     )
 
 
@@ -939,6 +993,7 @@ async def _auto_create_opencode_terminal(
     *,
     agent_spec: Any | None = None,
     server_client: httpx.AsyncClient | None = None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
 ) -> SessionResourceView:
     """
     Auto-create an OpenCode terminal for an opencode-native session.
@@ -955,6 +1010,10 @@ async def _auto_create_opencode_terminal(
     :param publish_event: Per-session SSE emitter for the new terminal.
     :param agent_spec: Optional resolved agent spec (os_env + model).
     :param server_client: Runner Omnigent server HTTP client.
+    :param ensure_comment_relay: Callback that starts the Omnigent builtin-tool
+        relay for this session's bridge dir (the nested
+        ``_ensure_comment_relay_started``). ``None`` skips wiring the Omnigent
+        MCP relay (tests / no server).
     :returns: The created terminal resource view.
     """
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -969,6 +1028,8 @@ async def _auto_create_opencode_terminal(
         prepare_bridge_dir,
         seed_opencode_auth,
         write_bridge_state,
+        write_opencode_policy_plugin,
+        write_relay_bridge_config,
     )
     from omnigent.opencode_native_forwarder import OpenCodeNativeForwarder
 
@@ -978,6 +1039,11 @@ async def _auto_create_opencode_terminal(
     )
     workspace = str(launch_config.workspace)
     bridge_dir = prepare_bridge_dir(session_id)
+    # Seed the token the shared ``serve-mcp`` reads at boot (idempotent) so the
+    # Omnigent builtin-tool relay (wired below) can start. Safe to call before
+    # the relay; ``start_tool_relay`` mints its own relay token in
+    # ``tool_relay.json``.
+    write_relay_bridge_config(bridge_dir)
     # Cancel any surviving forwarder first so its teardown closes the OLD
     # server, then clear stale bridge state so web injection waits for the
     # new launch's URL/session instead of a dead one.
@@ -998,12 +1064,17 @@ async def _auto_create_opencode_terminal(
     # provider config the ambient env/global config already gives it.
     from omnigent.opencode_native_bridge import xdg_config_home_for_bridge_dir
     from omnigent.opencode_native_provider import (
+        build_opencode_mcp_block,
         build_opencode_model_default_config,
+        build_opencode_omnigent_mcp_server,
         build_opencode_provider_config,
         resolve_databricks_gateway,
         write_opencode_provider_config,
     )
 
+    # Accumulate the synthesized opencode.json: provider/model (Databricks
+    # gateway or a pinned default) + the agent's MCP servers + force-ask.
+    config: dict[str, object] = {}
     gateway = resolve_databricks_gateway(
         _opencode_native_profile_from_spec(agent_spec), model_id=model_override
     )
@@ -1011,19 +1082,60 @@ async def _auto_create_opencode_terminal(
         # Pin the per-prompt model to the synthesized provider/endpoint id, and
         # write it as opencode's default model too so the TUI launches on it.
         model_override = gateway.qualified_model
-        config = build_opencode_provider_config(gateway)
+        config = dict(build_opencode_provider_config(gateway))
         config["model"] = model_override
-        write_opencode_provider_config(xdg_config_home_for_bridge_dir(bridge_dir), config)
     elif model_override:
         # No custom provider, but a model is pinned (``omni opencode --model`` or
         # the ``omni setup`` OpenCode default): write opencode's default model so
         # the native TUI and the first turn use it instead of ``opencode/big-pickle``.
         # OpenCode resolves the provider from the model-id prefix against its own
         # auth.json, so no provider block is needed.
-        write_opencode_provider_config(
-            xdg_config_home_for_bridge_dir(bridge_dir),
-            build_opencode_model_default_config(model_override),
-        )
+        config = dict(build_opencode_model_default_config(model_override))
+
+    # Build opencode's ``mcp`` block: the Omnigent builtin-tool relay (so the
+    # model can call sys_*/load_skill/web_fetch — the real "connects to Omnigent
+    # MCP") PLUS the agent's own declared MCP servers (translated into opencode's
+    # config). The relay is added only when we'll actually start it below
+    # (``ensure_comment_relay`` present), else serve-mcp would launch with no
+    # tool_relay.json to read. Force every tool call to prompt so it routes
+    # through Omnigent's policy engine via the forwarder's permission gate —
+    # opencode's enforcement is reactive (no pre-tool hook), so "ask" is what
+    # makes the policy verdicts apply to MCP (and other) tools.
+    mcp_block = build_opencode_mcp_block(_opencode_native_mcp_servers_from_spec(agent_spec))
+    if server_client is not None and ensure_comment_relay is not None:
+        mcp_block.update(build_opencode_omnigent_mcp_server(bridge_dir))
+    if mcp_block:
+        config.setdefault("$schema", "https://opencode.ai/config.json")
+        config["mcp"] = mcp_block
+        config["permission"] = "ask"
+
+    # Load the Omnigent policy-bridge plugin so opencode's lifecycle hooks reach
+    # the policy engine at phases the reactive permission.asked path can't:
+    # REQUEST (gate TUI-typed prompts at submit) and TOOL_RESULT (gate/redact
+    # tool output). The plugin POSTs PHASE_REQUEST / PHASE_TOOL_RESULT to
+    # ``/policies/evaluate`` (same contract as claude's UserPromptSubmit /
+    # PostToolUse hooks); coordinates come from the OMNIGENT_* env stamped on
+    # the server below. Only wired when there's a server to evaluate against.
+    policy_env: dict[str, str] = {}
+    runner_server_url = os.environ.get("RUNNER_SERVER_URL")
+    if server_client is not None and runner_server_url:
+        plugin_path = write_opencode_policy_plugin(bridge_dir)
+        config.setdefault("$schema", "https://opencode.ai/config.json")
+        config["plugin"] = [str(plugin_path)]
+        policy_env["OMNIGENT_POLICY_URL"] = runner_server_url
+        policy_env["OMNIGENT_SESSION_ID"] = session_id
+        # One-shot auth-token snapshot (mirrors codex's policy_hook.json /
+        # cost-popup). Long-session staleness degrades to fail-open (no
+        # enforcement), like codex; a refreshable token file is the follow-up.
+        from omnigent.runner._entry import _make_auth_token_factory
+
+        _policy_factory = _make_auth_token_factory()
+        _policy_token = _policy_factory() if _policy_factory is not None else None
+        if _policy_token:
+            policy_env["OMNIGENT_POLICY_AUTH"] = f"Bearer {_policy_token}"
+
+    if config:
+        write_opencode_provider_config(xdg_config_home_for_bridge_dir(bridge_dir), config)
 
     # The server runs with a per-session XDG_DATA_HOME, so copy the user's
     # `opencode auth login` credentials in — otherwise it can't authenticate
@@ -1031,7 +1143,22 @@ async def _auto_create_opencode_terminal(
     # remote runner (no local auth.json) / Databricks-gateway path.
     seed_opencode_auth(bridge_dir)
 
-    server = OpenCodeNativeServer(bridge_dir=bridge_dir, workspace=launch_config.workspace)
+    # Start the Omnigent builtin-tool relay BEFORE opencode boots, so
+    # ``tool_relay.json`` exists when opencode launches the ``serve-mcp`` MCP
+    # server and lists its tools (the sys_*/load_skill/web_fetch surface). The
+    # relay POSTs each call back through the Omnigent server (policy enforced).
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
+
+    server = OpenCodeNativeServer(
+        bridge_dir=bridge_dir,
+        workspace=launch_config.workspace,
+        extra_env=policy_env or None,
+    )
     await server.start()
     _AUTO_OPENCODE_SERVERS[session_id] = server
 
@@ -1039,13 +1166,30 @@ async def _auto_create_opencode_terminal(
         client = server.client()
         try:
             opencode_session_id: str | None = None
+            resume_lost_history = False
             if launch_config.external_session_id is not None:
                 existing = await client.get_session(launch_config.external_session_id)
                 if existing is not None:
                     opencode_session_id = existing.id
+                else:
+                    # The persisted opencode session is gone (new host / wiped
+                    # XDG store) — we'll rehydrate from the Omnigent transcript
+                    # below instead of silently starting empty.
+                    resume_lost_history = True
             if opencode_session_id is None:
                 created = await client.create_session({"title": f"omnigent:{session_id}"})
                 opencode_session_id = created.id
+                # Rehydrate prior context (text-prefix replay) when this is a
+                # lost-session resume OR a forked clone carrying history — both
+                # seed the copied Omnigent transcript as a noReply preamble.
+                if resume_lost_history or launch_config.fork_carry_history:
+                    await _rehydrate_opencode_session_from_transcript(
+                        opencode_client=client,
+                        opencode_session_id=opencode_session_id,
+                        omnigent_session_id=session_id,
+                        server_client=server_client,
+                        model_override=model_override,
+                    )
                 # Persist the OpenCode session id so a later relaunch resumes
                 # it (best effort, like codex-native).
                 if server_client is not None:
@@ -1309,6 +1453,111 @@ def _opencode_native_profile_from_spec(agent_spec: Any | None) -> str | None:
         return None
 
 
+def _opencode_native_mcp_servers_from_spec(agent_spec: Any | None) -> list[Any]:
+    """
+    Return the resolved agent spec's MCP server declarations (or empty).
+
+    :param agent_spec: Optional resolved agent spec.
+    :returns: The spec's ``mcp_servers`` list, or ``[]``.
+    """
+    if agent_spec is None:
+        return []
+    try:
+        spec = getattr(agent_spec, "spec", agent_spec)
+        return list(getattr(spec, "mcp_servers", []) or [])
+    except Exception:  # noqa: BLE001 - best effort.
+        return []
+
+
+def _render_opencode_transcript_text(items: list[Any]) -> str:
+    """
+    Render committed Omnigent message items into a plain-text transcript.
+
+    Used for opencode resume's text-prefix replay. Extracts user/assistant
+    text from ``GET /v1/sessions/{id}/items`` message items.
+
+    :param items: Raw API items.
+    :returns: A ``"User: …\\n\\nAssistant: …"`` transcript, or ``""``.
+    """
+    lines: list[str] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, list):
+            continue
+        texts = [
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str) and block["text"]
+        ]
+        if texts:
+            lines.append(f"{role.capitalize()}: " + "\n".join(texts))
+    return "\n\n".join(lines)
+
+
+async def _rehydrate_opencode_session_from_transcript(
+    *,
+    opencode_client: Any,
+    opencode_session_id: str,
+    omnigent_session_id: str,
+    server_client: Any | None,
+    model_override: str | None,
+) -> bool:
+    """
+    Seed a fresh opencode session with prior context (text-prefix replay).
+
+    opencode has no history-import API, so on a cross-host resume (where the
+    persisted opencode session is gone) inject the Omnigent transcript as a
+    single ``noReply`` context message — the agent resumes with its prior
+    context instead of silent amnesia. Best-effort: returns ``False`` when the
+    transcript can't be fetched or is empty.
+
+    :returns: ``True`` when prior context was seeded.
+    """
+    if server_client is None:
+        return False
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{urllib.parse.quote(omnigent_session_id, safe='')}/items",
+            params={"limit": 1000, "order": "asc"},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except (httpx.HTTPError, ValueError):
+        _logger.warning(
+            "opencode resume: could not fetch transcript for %s",
+            omnigent_session_id,
+            exc_info=True,
+        )
+        return False
+    items = payload.get("data", []) if isinstance(payload, dict) else []
+    transcript = _render_opencode_transcript_text(items if isinstance(items, list) else [])
+    if not transcript:
+        return False
+    provider_id: str | None = None
+    model_id: str | None = None
+    if model_override and "/" in model_override:
+        provider_id, model_id = model_override.split("/", 1)
+    text = (
+        "[Resumed session — the prior opencode session was unavailable on this "
+        "host, so the earlier conversation is included below for context. Treat "
+        "it as history; do not re-run prior actions.]\n\n" + transcript
+    )
+    try:
+        await opencode_client.seed_context(
+            opencode_session_id, text, provider_id=provider_id, model_id=model_id
+        )
+    except Exception:  # noqa: BLE001 - rehydration is best effort.
+        _logger.warning(
+            "opencode resume: rehydration seed failed for %s", omnigent_session_id, exc_info=True
+        )
+        return False
+    return True
+
+
 def _pi_args_have_session_control(args: list[str]) -> bool:
     """
     Return whether user Pi args already specify session behavior.
@@ -1377,6 +1626,151 @@ def _build_pi_native_args(
     return args
 
 
+async def _resolve_pi_resume_session(
+    *,
+    session_id: str,
+    launch_config: _PiNativeLaunchConfig,
+    session_dir: Path,
+    workspace: Path,
+    server_client: httpx.AsyncClient | None,
+) -> str | None:
+    """
+    Ensure Pi has a local session JSONL and return the id to launch with.
+
+    Three cases, mirroring claude-native / codex-native fork+resume:
+
+    1. **Cold resume** — the session already carries a captured Pi
+       ``external_session_id`` but the local session file may be missing
+       (cross-machine, a fresh runner, or a cleared bridge dir). Synthesize the
+       file from committed Omnigent items so ``pi --session <id>`` opens with
+       prior context. An existing file is reused untouched.
+    2. **Fork rebuild** — a forked clone bound to a pi-native target with NO
+       captured session of its own and a carry-history marker: mint a new Pi
+       session id, build its file from the clone's OWN copied Omnigent items,
+       and patch the server so Omnigent reflects the clone's session id and a
+       later relaunch resumes it via case 1.
+    3. **Fresh / nothing to carry** — return ``None`` so Pi launches a brand
+       new session.
+
+    Best-effort: on any failure we return the (possibly ``None``) captured id
+    so Pi launches fresh rather than pointing ``--session`` at a file that does
+    not exist.
+
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param launch_config: Resolved Pi launch config (carries the captured id
+        and fork directives).
+    :param session_dir: Directory passed to ``pi --session-dir``.
+    :param workspace: Resolved cwd Pi will run in.
+    :param server_client: Runner Omnigent server client.
+    :returns: Pi session id to launch with via ``--session``, or ``None`` to
+        launch fresh.
+    """
+    if server_client is None:
+        return launch_config.external_session_id
+
+    from omnigent.pi_native_resume import ensure_local_pi_resume_session, mint_pi_session_id
+
+    # Resolve the provider's model only for the synthesized assistant records'
+    # informational ``model`` field; Pi's resume uses the live provider, so a
+    # missing model is harmless.
+    model = ""
+    try:
+        from omnigent.pi_native_credentials import resolve_pi_native_provider
+
+        provider = resolve_pi_native_provider()
+        if provider is not None and getattr(provider, "model", None):
+            model = provider.model
+    except Exception:  # noqa: BLE001 — informational only; never block launch
+        model = ""
+
+    # Case 1: cold resume of a session that already has a captured Pi id.
+    if launch_config.external_session_id is not None:
+        built: Path | None = None
+        try:
+            built = await ensure_local_pi_resume_session(
+                server_client,
+                session_id=session_id,
+                external_session_id=launch_config.external_session_id,
+                session_dir=session_dir,
+                workspace=workspace,
+                model=model,
+            )
+        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
+            built = None
+            _logger.warning(
+                "Could not synthesize Pi resume session for %s; launching fresh",
+                session_id,
+                exc_info=True,
+            )
+        # Only launch with ``--session <id>`` when a session file actually
+        # exists/was written. ``ensure_local_pi_resume_session`` returns
+        # ``None`` when nothing resumable was produced (missing/cleared bridge
+        # dir, empty history, or a transient fetch/write failure caught above).
+        # Returning the captured id regardless would emit ``pi --session <id>``
+        # for a file that does not exist — Pi then exits instead of launching,
+        # defeating the best-effort fallback this function promises. Fall back
+        # to a fresh session (return ``None``) in that case.
+        if built is None:
+            _logger.info(
+                "Pi cold-resume produced no local session file for %s; launching fresh",
+                session_id,
+            )
+            return None
+        return launch_config.external_session_id
+
+    # Case 2: forked clone bound to a pi-native target with no captured session
+    # yet. Build the clone's session from its OWN copied Omnigent items under a
+    # minted id. (A same-provider source's captured id, when present, is stamped
+    # as fork_source_external_id; but Pi session files are runner-local and the
+    # clone has its OWN copied items, so we rebuild from items either way —
+    # there is no cross-session "resume the source's file" like codex's clone.)
+    if launch_config.fork_carry_history:
+        minted = mint_pi_session_id()
+        try:
+            built = await ensure_local_pi_resume_session(
+                server_client,
+                session_id=session_id,
+                external_session_id=minted,
+                session_dir=session_dir,
+                workspace=workspace,
+                model=model,
+            )
+        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
+            built = None
+            _logger.warning(
+                "Could not build Pi session from items for forked clone %s; launching fresh",
+                session_id,
+                exc_info=True,
+            )
+        _logger.info(
+            "Pi terminal fork-rebuild decision: session=%s minted=%s built=%s",
+            session_id,
+            minted,
+            str(built) if built is not None else None,
+        )
+        if built is not None:
+            # Record the minted id so Omnigent reflects the clone's own Pi
+            # session and a later relaunch resumes it via case 1. Best-effort:
+            # the extension also re-captures the id on session_start, so a
+            # failed patch is recovered then.
+            try:
+                await server_client.patch(
+                    f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                    json={"external_session_id": minted},
+                    timeout=10.0,
+                )
+            except httpx.HTTPError:
+                _logger.warning(
+                    "Could not pre-set external_session_id for forked Pi clone %s; "
+                    "relying on extension capture",
+                    session_id,
+                    exc_info=True,
+                )
+            return minted
+
+    return None
+
+
 async def _auto_create_pi_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -1425,19 +1819,51 @@ async def _auto_create_pi_terminal(
     auth_factory = _make_auth_token_factory()
     auth_token = auth_factory() if auth_factory is not None else None
     auth_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    # Build the Omnigent tool surface (sys_* tools) the Pi extension registers
+    # via pi.registerTool. Reuses the same schema set the claude-native /
+    # codex-native relay advertises, gated by the session's spec. Each tool's
+    # execute() round-trips through POST /v1/sessions/{id}/mcp, so the Pi agent
+    # can call Omnigent tools with centralized server-side policy enforcement
+    # — parity with the other native harnesses. Best-effort: a schema-build
+    # failure must not block the terminal launch, so fall back to no tools.
+    pi_tools: list[dict[str, Any]] = []
+    try:
+        from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
+
+        spec_for_tools = _unwrap_resolved_spec(agent_spec)
+        pi_tools = build_native_relay_tool_schemas(spec_for_tools)
+    except Exception:  # noqa: BLE001 — tool registration is additive
+        _logger.warning(
+            "Failed to build pi-native tool schemas for session %s; "
+            "Pi will run with its built-in tools only",
+            session_id,
+            exc_info=True,
+        )
     _extension, config = write_extension_files(
         bridge_dir,
         session_id=session_id,
         server_url=launch_config.server_url,
         conversation_url=conversation_url(launch_config.server_url, session_id),
         auth_headers=auth_headers,
+        tools=pi_tools,
     )
     pi_command = resolve_pi_executable()
+    # Rebuild the local Pi session JSONL from committed Omnigent items so a
+    # cold-resume or fork opens with prior conversation context (parity with
+    # claude-native / codex-native). Returns the id to launch with via
+    # ``--session`` (the captured id, a minted fork id, or None for fresh).
+    resume_session_id = await _resolve_pi_resume_session(
+        session_id=session_id,
+        launch_config=launch_config,
+        session_dir=session_dir,
+        workspace=launch_config.workspace,
+        server_client=server_client,
+    )
     pi_args = _build_pi_native_args(
         terminal_launch_args=launch_config.terminal_launch_args,
         extension_path=pi_extension,
         session_dir=session_dir,
-        external_session_id=launch_config.external_session_id,
+        external_session_id=resume_session_id,
     )
     pi_env = {
         PI_NATIVE_CONFIG_ENV_VAR: str(config),
@@ -1456,7 +1882,13 @@ async def _auto_create_pi_terminal(
             resolve_pi_native_provider,
         )
 
-        provider = resolve_pi_native_provider()
+        # Thread the agent spec's pinned model (``executor.model``) into the
+        # resolved provider so the generated ``models.json`` — and the
+        # appended ``--model`` arg (see ``pi_native_provider_launch``) — select
+        # it, reaching parity with claude-native / cursor-native. ``None``
+        # (no model declared) keeps the provider's default model.
+        spec_model = _pi_native_model_from_spec(agent_spec)
+        provider = resolve_pi_native_provider(model=spec_model)
         if provider is not None:
             cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
             pi_env.update(cred_env)
@@ -2003,10 +2435,76 @@ async def _auto_create_hermes_terminal(
     # cursor (clear_hermes_bridge_state above) starts it at that row's first row.
     launch_epoch_s = time.time()
     hermes_args = [*(launch_config.terminal_launch_args or [])]
+    # Resolve the per-session HERMES_HOME early: the fork block below needs it
+    # to place the cloned state.db, and the env block after needs it for the
+    # HERMES_HOME env var.
+    _hermes_home_path = read_hermes_home(bridge_dir)
+    # Fork with history: clone the source Hermes session's state.db into the
+    # new session's HERMES_HOME so the TUI loads the prior conversation context
+    # under a fresh session id (true fork, not a shared --resume).
+    if launch_config.fork_carry_history and launch_config.fork_source_external_id:
+        from omnigent.hermes_native_bridge import (
+            clone_hermes_session,
+            mint_hermes_session_id,
+        )
+
+        # Resolve the source session's state.db from its bridge dir.
+        _source_bridge = (
+            bridge_dir_for_session_id(launch_config.fork_source_id)
+            if launch_config.fork_source_id
+            else None
+        )
+        _source_hermes_home = read_hermes_home(_source_bridge) if _source_bridge else None
+        _source_db = _source_hermes_home / "state.db" if _source_hermes_home else None
+        if _source_db is not None and _source_db.is_file():
+            _target_session_id = mint_hermes_session_id()
+            _target_db = _hermes_home_path / "state.db" if _hermes_home_path else None
+            if _target_db is not None:
+                try:
+                    _clone_max_id = await asyncio.to_thread(
+                        clone_hermes_session,
+                        _source_db,
+                        _target_db,
+                        launch_config.fork_source_external_id,
+                        _target_session_id,
+                        workspace=workspace,
+                    )
+                    hermes_args.extend(["--resume", _target_session_id])
+                    # Pre-seed the forwarder cursor past cloned messages so
+                    # the forwarder only mirrors NEW messages (Omnigent already
+                    # has the cloned ones from the fork item copy).
+                    if _clone_max_id > 0:
+                        from omnigent.hermes_native_forwarder import (
+                            _ForwardState,
+                            _write_state,
+                        )
+
+                        _write_state(
+                            bridge_dir,
+                            _ForwardState(
+                                hermes_session_id=_target_session_id,
+                                last_id=_clone_max_id,
+                                launch_epoch_s=launch_epoch_s,
+                            ),
+                        )
+                    _logger.info(
+                        "Cloned hermes session %s -> %s for fork; session=%s",
+                        launch_config.fork_source_external_id,
+                        _target_session_id,
+                        session_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    _logger.warning(
+                        "Failed to clone hermes session for fork; launching fresh; session=%s",
+                        session_id,
+                        exc_info=True,
+                    )
+                    # Remove broken state.db so Hermes starts fresh.
+                    if _target_db.exists():
+                        _target_db.unlink()
     # If a per-session HERMES_HOME was written (policy hook), pass it via env
     # so the TUI picks up the hook config alongside its own approval prompt.
     _hermes_terminal_env: dict[str, str] = {}
-    _hermes_home_path = read_hermes_home(bridge_dir)
     if _hermes_home_path is not None:
         _hermes_terminal_env["HERMES_HOME"] = str(_hermes_home_path)
     terminal_view = await resource_registry.launch_required_terminal(
@@ -2392,8 +2890,14 @@ async def _auto_create_qwen_terminal(
     server_url = _required_runner_env("RUNNER_SERVER_URL")
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
-    from omnigent.qwen_native_forwarder import supervise_qwen_forwarder
+    from omnigent.qwen_native_bridge import qwen_session_recording_path
+    from omnigent.qwen_native_forwarder import (
+        supervise_qwen_compaction_mirror,
+        supervise_qwen_forwarder,
+    )
     from omnigent.qwen_native_permissions import supervise_qwen_approval_mirror
+
+    qwen_recording_path = qwen_session_recording_path(qwen_session_id, workspace)
 
     if server_client is not None and ensure_comment_relay is not None:
         await ensure_comment_relay(
@@ -2403,15 +2907,18 @@ async def _auto_create_qwen_terminal(
         )
 
     async def _supervise_qwen_native_bridges() -> None:
-        """Run the transcript forwarder and the approval mirror together.
+        """Run the transcript forwarder, approval mirror, and compaction mirror together.
 
-        Both are per-session, runner-owned, and self-healing (they catch and
+        All three are per-session, runner-owned, and self-healing (they catch and
         log their own failures rather than exiting); gathering them under one
         task keeps a single registration/cancellation handle
         (:func:`_register_auto_forwarder_task`) for session teardown. The
         forwarder mirrors qwen's replies onto the conversation; the approval
         mirror surfaces qwen's native ``can_use_tool`` prompts as web
-        elicitations (see :mod:`omnigent.qwen_native_permissions`).
+        elicitations (see :mod:`omnigent.qwen_native_permissions`); the compaction
+        mirror tails qwen's chat recording for the ``chat_compression`` marker and
+        posts the ``external_compaction_status: completed`` edge (see
+        :func:`omnigent.qwen_native_forwarder.supervise_qwen_compaction_mirror`).
         """
         await asyncio.gather(
             supervise_qwen_forwarder(
@@ -2427,6 +2934,13 @@ async def _auto_create_qwen_terminal(
                 headers={},
                 session_id=session_id,
                 bridge_dir=bridge_dir,
+                auth=_runner_auth,
+            ),
+            supervise_qwen_compaction_mirror(
+                base_url=server_url,
+                headers={},
+                session_id=session_id,
+                recording_path=qwen_recording_path,
                 auth=_runner_auth,
             ),
         )
@@ -2532,7 +3046,12 @@ async def _auto_create_kimi_terminal(
     server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/")
     _auth_factory = _make_auth_token_factory()
     _auth_token = _auth_factory() if _auth_factory is not None else None
-    _runner_headers = {"Authorization": f"Bearer {_auth_token}"} if _auth_token else {}
+    # The hook subprocess replays these static headers from its config (no
+    # refresh-capable httpx.Auth of its own); the helper pairs the bearer with
+    # the workspace-routing header so neither is dropped.
+    from omnigent.cli_auth import databricks_auth_headers
+
+    _runner_headers = databricks_auth_headers(server_url, _auth_token)
     write_hook_config(
         bridge_dir,
         server_url=server_url,
@@ -2890,9 +3409,12 @@ async def _auto_create_codex_terminal(
 
     _policy_auth_factory = _make_auth_token_factory()
     _policy_auth_token = _policy_auth_factory() if _policy_auth_factory is not None else None
-    policy_headers = (
-        {"Authorization": f"Bearer {_policy_auth_token}"} if _policy_auth_token else {}
-    )
+    # The codex policy hook subprocess replays these static headers from its
+    # config (no refresh-capable auth of its own); the helper pairs the bearer
+    # with the workspace-routing header so neither is dropped.
+    from omnigent.cli_auth import databricks_auth_headers
+
+    policy_headers = databricks_auth_headers(launch_config.policy_server_url, _policy_auth_token)
 
     app_server = build_codex_native_server(
         socket_path=socket_path,
@@ -2904,6 +3426,7 @@ async def _auto_create_codex_terminal(
         bridge_dir=bridge_dir,
         ap_server_url=launch_config.policy_server_url,
         ap_auth_headers=policy_headers,
+        bypass_sandbox=launch_config.bypass_sandbox,
     )
     app_server.listen_url = codex_ws_url
     await app_server.start()
@@ -2976,6 +3499,7 @@ async def _auto_create_codex_terminal(
                     codex_args=tuple(launch_config.terminal_launch_args or ()),
                     thread_id=launch_config.external_session_id,
                     remote_url=codex_ws_url,
+                    bypass_sandbox=launch_config.bypass_sandbox,
                     # The --remote TUI loads its own config and does not
                     # inherit the app-server's -c flags; pass the same
                     # provider/model overrides so it resolves the
@@ -4038,6 +4562,32 @@ def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
     return model
 
 
+def _pi_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
+    """
+    Read the Pi model id to launch the native TUI with, from a spec.
+
+    Reads the canonical ``spec.executor.model`` field (the same field the
+    in-process harnesses and cursor-native consume). Unlike cursor-native,
+    a gateway-routed id (``databricks-*``) IS usable here: the runner-owned
+    Pi process routes through the Databricks AI Gateway, whose ``models.json``
+    selects the model by its gateway id (see
+    :func:`omnigent.pi_native_credentials.resolve_pi_native_provider`). The
+    resolved model is threaded into ``resolve_pi_native_provider(model=...)``
+    so the generated ``models.json`` (and the appended ``--model``) selects
+    it.
+
+    :param agent_spec: Agent spec object, or a resolved wrapper carrying a
+        ``spec`` attribute. ``None`` means no spec was available.
+    :returns: A model id, e.g. ``"databricks-claude-opus-4-7"``, or ``None``
+        when the spec declares no model (Pi then uses the provider default).
+    """
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None:
+        return None
+    model = spec.executor.model
+    return model if isinstance(model, str) and model else None
+
+
 def _cursor_native_resume_args(chat_id: str | None, existing_args: list[str]) -> list[str]:
     """Return ``["--resume", chat_id]`` for a cursor-native cold resume, or ``[]``.
 
@@ -4519,25 +5069,35 @@ async def _auto_create_claude_terminal(
         agent_name,
         skills_filter,
     )
-    # prepare_bridge_dir uses session_id as the bridge_id (no explicit
-    # bridge_id passed), so the bridge dir is keyed by session_id.  If the
-    # Omnigent session carries a stale bridge_id label from a prior rotation that
-    # timed out before the terminal transfer completed, _ensure_comment_relay_started
-    # would read the label and write tool_relay.json to the wrong directory —
-    # the bridge subprocess would never see it and the relay tools would be absent.
-    # Correcting the label here ensures all subsequent label lookups return
-    # session_id, which matches the actual bridge dir.
+    # Pick the bridge id this session's dir is keyed on. Normally session_id,
+    # and we (re)assert the label = session_id so a STALE label from a rotation
+    # that timed out before its terminal transfer can't make
+    # _ensure_comment_relay_started write tool_relay.json to the wrong dir.
+    #
+    # EXCEPTION: a session superseded by /clear is deliberately re-keyed to
+    # "{session_id}-cleared" (see _create_clear_replacement_session). Its natural
+    # D(session_id) is the NEW session's live pane; resuming there would share
+    # one transcript with two forwarders (duplicate items) and trip the
+    # "no longer active after /clear" guard. So when the label is exactly that
+    # marker, honour it and resume in the session's own isolated dir. The
+    # executor spawn_env already resolves the same label, so the two agree.
+    cleared_bridge_id = f"{session_id}-cleared"
+    existing_bridge_id = await _claude_native_bridge_id_for_session(
+        server_client=server_client,
+        session_id=session_id,
+    )
+    bridge_id = cleared_bridge_id if existing_bridge_id == cleared_bridge_id else session_id
     try:
         await server_client.patch(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            json={"labels": {BRIDGE_ID_LABEL_KEY: session_id}},
+            json={"labels": {BRIDGE_ID_LABEL_KEY: bridge_id}},
         )
     except httpx.HTTPError:
         _logger.debug(
-            "Could not reset bridge_id label for %s; relay may target wrong dir",
+            "Could not set bridge_id label for %s; relay may target wrong dir",
             session_id,
         )
-    bridge_dir = prepare_bridge_dir(session_id, workspace=Path(workspace))
+    bridge_dir = prepare_bridge_dir(session_id, bridge_id=bridge_id, workspace=Path(workspace))
     # Cancel any surviving forwarder BEFORE wiping its cursor/seen state, else it
     # re-posts with fresh dedup state alongside the forwarder spawned below.
     await _cancel_auto_forwarder_task(session_id)
@@ -4573,7 +5133,12 @@ async def _auto_create_claude_terminal(
     # stop forwarding after the token lapses. ``_RunnerDatabricksAuth``
     # with a ``None`` factory is a safe no-op (local unauthenticated).
     _auth_token = _auth_factory() if _auth_factory is not None else None
-    _runner_headers = {"Authorization": f"Bearer {_auth_token}"} if _auth_token else {}
+    # The hook subprocess replays these static headers from its config (no
+    # refresh-capable auth of its own); the helper pairs the bearer with the
+    # workspace-routing header so neither is dropped.
+    from omnigent.cli_auth import databricks_auth_headers
+
+    _runner_headers = databricks_auth_headers(server_url, _auth_token)
     _runner_auth = _RunnerDatabricksAuth(_auth_factory)
 
     from omnigent.claude_native import (
@@ -4977,18 +5542,19 @@ async def _auto_create_claude_terminal(
     _publish_tmux_target_for_bridge(
         resource_registry=resource_registry,
         session_id=session_id,
-        # The bridge dir was created via ``prepare_bridge_dir(session_id)``
-        # above (no explicit bridge_id), so it is keyed by session_id.
-        # Pass the same id so the tmux target lands in that dir and the
-        # claude-native harness can find it.
-        bridge_id=session_id,
+        # Use the SAME bridge id the dir was prepared under (``bridge_id``,
+        # which is the "-cleared" fork for a /clear-superseded resume, else
+        # session_id). Hardcoding session_id here would write tmux.json into
+        # D(session_id) while the executor + forwarder read D(bridge_id) — the
+        # "tmux target not advertised yet" mismatch on a resumed old session.
+        bridge_id=bridge_id,
         terminal_name="claude",
         session_key="main",
     )
     _logger.info(
         "Claude terminal tmux target published: session=%s bridge_id=%s",
         session_id,
-        session_id,
+        bridge_id,
     )
 
     # Start the transcript forwarder so Claude's responses flow
@@ -6865,6 +7431,14 @@ def get_session_agent_id(session_id: str) -> str | None:
     return _session_agent_ids_ref.get(session_id)
 
 
+# How long a session's discovered skills stay cached before the runner
+# re-walks the filesystem. Short enough that a skill or plugin installed
+# mid-session surfaces in the composer menu without a session restart, long
+# enough to collapse the bursty menu-open + per-invocation resolve calls onto
+# a single walk. Module-level so it can be tuned/patched in one place.
+_SESSION_SKILLS_CACHE_TTL_SECONDS = 60.0
+
+
 def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
@@ -6973,10 +7547,12 @@ def create_runner_app(
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
-    # session_id → merged (bundled + host) skills, discovered against
-    # this runner's filesystem. Skills are runner-owned: the walk runs
-    # once per session lifetime and is dropped in ``delete_session``.
-    _session_skills_cache: dict[str, list[SkillSpec]] = {}
+    # session_id → (monotonic expiry, merged bundled + host skills),
+    # discovered against this runner's filesystem. Skills are runner-owned:
+    # the walk reruns at most once per ``_SESSION_SKILLS_CACHE_TTL_SECONDS``
+    # (so a mid-session skill/plugin install surfaces) and the entry is
+    # dropped in ``delete_session``.
+    _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_agent_ids = _session_agent_ids_ref  # shared with module-level get_session_agent_id
     # Sub-agent name per session. Set from POST /v1/sessions body
@@ -8445,6 +9021,7 @@ def create_runner_app(
                             _publish_event,
                             agent_spec=_opencode_spec,
                             server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
                         )
                     except Exception as exc:
                         _logger.exception(
@@ -10813,6 +11390,134 @@ def create_runner_app(
             )
         return Response(status_code=200)
 
+    async def _handle_opencode_native_compact(conv_id: str) -> Response:
+        """
+        Compact an opencode-native session via ``POST /session/{id}/summarize``.
+
+        opencode-native owns its context window server-side, so explicit
+        compaction is a real HTTP call (no tmux, unlike claude/codex): resolve
+        the live ``opencode serve`` + the opencode session id from bridge state,
+        read the session's current model (``/summarize`` requires it, and the v2
+        ``/compact`` endpoint is unavailable in 1.17.x), ask opencode to
+        compact, and return 200 so the Omnigent server skips its AP-side
+        fallback. Completion streams back as a ``session.compacted`` event the
+        forwarder surfaces as the web compaction marker.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :returns: 200 once opencode accepted the compaction; 204 when no live
+            opencode server/session is registered or the model can't be
+            resolved (the server falls back to in-process compaction); 503 if
+            the compaction request failed.
+        """
+        from omnigent.opencode_native_bridge import bridge_dir_for_bridge_id, read_bridge_state
+        from omnigent.opencode_native_client import OpenCodeClientError
+
+        server = _AUTO_OPENCODE_SERVERS.get(conv_id)
+        state = read_bridge_state(bridge_dir_for_bridge_id(conv_id))
+        if server is None or state is None or not state.opencode_session_id:
+            # No live opencode server/session — let the server run AP-side compaction.
+            return Response(status_code=204)
+        client = server.client()
+        try:
+            session = await client.get_session(state.opencode_session_id)
+            model = session.raw.get("model") if session is not None else None
+            provider_id = model.get("providerID") if isinstance(model, dict) else None
+            model_id = model.get("id") if isinstance(model, dict) else None
+            if not provider_id or not model_id:
+                # Can't resolve the session's model — fall back to AP-side.
+                return Response(status_code=204)
+            await client.summarize(
+                state.opencode_session_id, provider_id=provider_id, model_id=model_id
+            )
+        except (httpx.HTTPError, OpenCodeClientError, RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "opencode_native_compact_failed",
+                    "detail": _client_safe_error_detail(exc, context="opencode-native compact"),
+                },
+            )
+        finally:
+            await client.aclose()
+        return Response(status_code=200)
+
+    async def _handle_opencode_native_model_change(conv_id: str, model: str | None) -> Response:
+        """
+        Apply an Omnigent-initiated model switch to an opencode-native session.
+
+        opencode has no session-level model setting — the model is a per-prompt
+        field, and the executor reads ``model_override`` from bridge state on
+        every web-injected turn. So a model switch is just a bridge-state write;
+        the NEXT injected turn uses it. (A model typed in the opencode TUI itself
+        is mirrored the other way by the forwarder's ``session.next.model.switched``
+        handler.) A blank/null model clears the override.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param model: New qualified model id, or ``None`` / blank to clear.
+        :returns: 200 once the override is persisted; 204 when no bridge state
+            exists yet (server not launched — the next launch reads the spec).
+        """
+        from omnigent.opencode_native_bridge import (
+            bridge_dir_for_bridge_id,
+            update_model_override,
+        )
+
+        updated = await asyncio.to_thread(
+            update_model_override, bridge_dir_for_bridge_id(conv_id), model
+        )
+        return Response(status_code=200 if updated else 204)
+
+    async def _handle_opencode_native_clear(conv_id: str) -> Response:
+        """
+        Clear an opencode-native session by abandoning its opencode session.
+
+        opencode exposes no reset/clear endpoint (verified against 1.17.x: only
+        ``/summarize`` compacts; there is no message-wipe), so a true "clear" =
+        start a FRESH opencode session and rebind the live forwarder + TUI to it.
+        We do that by clearing the persisted ``external_session_id`` (so the next
+        launch can't resume the old context) and relaunching the opencode
+        terminal, which cancels the old forwarder/server and creates a brand-new
+        opencode session — the cleanest reset available without an opencode API.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :returns: 200 once the fresh session is launched; 204 when the session is
+            not an opencode-native session with a resolvable spec; 503 on
+            relaunch failure.
+        """
+        if _session_harness_name(conv_id) != "opencode-native":
+            return Response(status_code=204)
+        # Drop the persisted opencode session id so the relaunch starts fresh
+        # instead of resuming the just-cleared context (best effort).
+        if server_client is not None:
+            with contextlib.suppress(httpx.HTTPError):
+                await server_client.patch(
+                    f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
+                    json={"external_session_id": None},
+                    timeout=10.0,
+                )
+        try:
+            spec = await _resolve_session_agent_spec(conv_id)
+        except OmnigentError:
+            spec = None
+        try:
+            await _auto_create_opencode_terminal(
+                conv_id,
+                resource_registry,
+                _publish_event,
+                agent_spec=spec,
+                server_client=server_client,
+                ensure_comment_relay=_ensure_comment_relay_started,
+            )
+        except Exception as exc:  # noqa: BLE001 - report relaunch failure to caller.
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "opencode_native_clear_failed",
+                    "detail": _client_safe_error_detail(exc, context="opencode-native clear"),
+                },
+            )
+        return Response(status_code=200)
+
     async def _handle_cursor_native_compact(conv_id: str) -> Response:
         """
         Inject ``/summarize`` into the cursor-agent TUI pane.
@@ -10882,6 +11587,63 @@ def create_runner_app(
             )
         return Response(status_code=200)
 
+    async def _handle_pi_native_compact(conv_id: str) -> Response:
+        """
+        Ask the resident Pi extension to compact its own context.
+
+        Pi owns its own context window inside the already-open Pi TUI
+        process, so explicit ``/compact`` must run there. The Omnigent
+        server's own compaction path (``_run_compact_locked``) would only
+        summarise the AP-side transcript mirror — it cannot shrink Pi's
+        real context and would desync the two, plus it 400s on the
+        LLM-less pi-native pseudo-agent (the same failure mode the
+        claude-native compact handler exists to avoid).
+
+        Pi-native turns live inside that TUI process and the runner's
+        harness task only queues messages into the extension inbox and
+        returns, so there is nothing for the runner to drive directly.
+        Mirror :func:`_handle_pi_native_interrupt`: queue a ``compact``
+        inbox payload that the extension consumes in the Pi process and
+        feeds to Pi's active ``ExtensionContext.compact()``. The extension
+        emits a ``response.compaction.in_progress`` marker when it triggers
+        compaction and a ``…completed``/``…failed`` edge from Pi's
+        ``onComplete``/``onError`` callbacks, so the web UI's "Compacting
+        conversation…" spinner tracks Pi's real progress.
+
+        Returns 200 (not 204) on successful enqueue so the Omnigent server
+        knows the control was handled in the terminal and skips its own
+        AP-side compaction — the same contract the claude/codex/cursor
+        native compact handlers use. 503 if the bridge inbox could not be
+        written (the server then surfaces the failure rather than silently
+        running its own wrong compaction).
+
+        :param conv_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: 200 once the compact payload is queued; 503 if the bridge
+            inbox could not be written.
+        """
+        from omnigent.pi_native_bridge import bridge_dir_for_session_id, enqueue_compact
+
+        try:
+            await asyncio.to_thread(
+                enqueue_compact,
+                bridge_dir_for_session_id(conv_id),
+            )
+        except OSError as exc:
+            _logger.warning(
+                "Pi-native compact failed for session=%s",
+                conv_id,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "pi_native_compact_failed",
+                    "detail": _client_safe_error_detail(exc, context="pi-native compact"),
+                },
+            )
+        return Response(status_code=200)
+
     def _inject_codex_compact(socket_path: str, target: str) -> None:
         """
         Blocking helper: type ``/compact`` into a codex tmux pane.
@@ -10932,6 +11694,47 @@ def create_runner_app(
                 content={
                     "error": "hermes_native_compact_failed",
                     "detail": _client_safe_error_detail(exc, context="hermes-native compact"),
+                },
+            )
+        return Response(status_code=200)
+
+    async def _handle_qwen_native_compact(conv_id: str) -> Response:
+        """Submit ``/compress`` into the qwen TUI via the input file.
+
+        qwen-native sessions own their context window inside the qwen TUI, so
+        explicit compaction must run there (qwen's ``/compress`` slash command),
+        not as AP-side compaction — same rationale as
+        :func:`_handle_cursor_native_compact`. Injection is **file-based**, not
+        tmux send-keys: a ``{"type":"submit","text":"/compress"}`` line on the
+        input file routes through qwen's ``RemoteInputWatcher`` → ``submitQuery``
+        (the keyboard's own submit path), which processes the slash command —
+        sidestepping cursor's autocomplete-dropdown trap (verified, qwen v0.18.2:
+        it compresses and emits no ``/compress`` user bubble on the stream).
+
+        Publishes ``response.compaction.in_progress`` to raise the web "Compacting
+        conversation…" spinner; the matching ``completed`` edge is emitted later by
+        :func:`omnigent.qwen_native_forwarder.supervise_qwen_compaction_mirror` when
+        it observes the ``chat_compression`` record in qwen's recording, so the
+        permanent marker tracks qwen's real progress. On injection failure we
+        publish ``response.compaction.failed`` so the spinner is dismissed rather
+        than stranded. Returns 200 so the server skips its own AP-side compaction.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 200 once ``/compress`` has been submitted; 503 on injection error.
+        """
+        from omnigent.qwen_native_bridge import bridge_dir_for_session_id, submit_user_message
+
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        _publish_event(conv_id, {"type": "response.compaction.in_progress", "task_id": conv_id})
+        try:
+            await asyncio.to_thread(submit_user_message, bridge_dir, content="/compress")
+        except (RuntimeError, OSError) as exc:
+            _publish_event(conv_id, {"type": "response.compaction.failed", "task_id": conv_id})
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "qwen_native_compact_failed",
+                    "detail": _client_safe_error_detail(exc, context="qwen-native compact"),
                 },
             )
         return Response(status_code=200)
@@ -11070,16 +11873,127 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _handle_opencode_native_cost_popup(
+        conv_id: str,
+        elicitation_id: str,
+        message: str,
+        policy_name: str | None = None,
+    ) -> Response:
+        """
+        Overlay a cost-budget approval modal on opencode's tmux pane.
+
+        Without this, a cost-budget ASK only surfaced as the web ApprovalCard,
+        so a user working in the ``opencode attach`` TUI could keep sending
+        turns past the budget — the web was gated but the TUI was not. This
+        pops the SAME elicitation as a ``tmux display-popup`` on the opencode
+        pane (the claude/codex behaviour), so the budget blocks the TUI too.
+        The pane socket/target come from the resource registry (opencode's
+        terminal is registry-launched like cursor's); AP routing is written
+        fresh by :func:`_native_cost_popup_config_file`. The launch itself is
+        the shared, harness-agnostic :func:`launch_cost_popup`.
+
+        Best-effort: 204 when no live opencode terminal is registered (the web
+        card stays the only surface).
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param elicitation_id: Outstanding elicitation correlation id.
+        :param message: Approval reason to display.
+        :param policy_name: Deciding policy name (modal header); ``None`` →
+            generic header.
+        :returns: 204 once dispatched (or skipped); 503 if launching raised.
+        """
+        from omnigent.native_cost_popup import launch_cost_popup
+
+        registry = resource_registry.terminal_registry
+        instance = registry.get(conv_id, "opencode", "main") if registry is not None else None
+        if instance is None or not instance.running:
+            # No live opencode terminal to render on; web card is the surface.
+            return Response(status_code=204)
+        config_file = await _native_cost_popup_config_file(conv_id, "opencode-native")
+        try:
+            await asyncio.to_thread(
+                launch_cost_popup,
+                str(instance.socket_path),
+                instance.tmux_target,
+                config_file,
+                session_id=conv_id,
+                elicitation_id=elicitation_id,
+                message=message,
+                policy_name=policy_name,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "opencode_native_cost_popup_failed",
+                    "detail": _client_safe_error_detail(exc, context="opencode-native cost popup"),
+                },
+            )
+        return Response(status_code=204)
+
+    async def _handle_opencode_native_blocked_notice(
+        conv_id: str,
+        message: str,
+        policy_name: str | None = None,
+    ) -> Response:
+        """
+        Pop a dismissable HARD-block notice on opencode's tmux pane.
+
+        The DENY counterpart of :func:`_handle_opencode_native_cost_popup` (no
+        approve/decline). opencode hard-blocks a denied prompt by its policy
+        plugin throwing — which opencode renders as a generic "Unexpected server
+        error" — so this surfaces the policy reason as a clean ``display-popup``
+        on the pane. Only opencode-native reaches here; claude/codex show a clean
+        ``UserPromptSubmit`` block and the dispatch no-ops them.
+
+        Best-effort: 204 when no live opencode terminal is registered.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param message: The block reason to display.
+        :param policy_name: Deciding policy name (popup header); ``None`` →
+            generic header.
+        :returns: 204 once dispatched (or skipped); 503 if launching raised.
+        """
+        from omnigent.native_cost_popup import launch_blocked_notice
+
+        registry = resource_registry.terminal_registry
+        instance = registry.get(conv_id, "opencode", "main") if registry is not None else None
+        if instance is None or not instance.running:
+            return Response(status_code=204)
+        try:
+            await asyncio.to_thread(
+                launch_blocked_notice,
+                str(instance.socket_path),
+                instance.tmux_target,
+                message=message,
+                policy_name=policy_name,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "opencode_native_blocked_notice_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="opencode-native blocked notice"
+                    ),
+                },
+            )
+        return Response(status_code=204)
+
     async def _native_cost_popup_config_file(conv_id: str, harness: str) -> Path:
         """
         Resolve the AP-routing config file the cost popup reads, per harness.
 
         The popup script reads ``ap_server_url`` + ``ap_auth_headers`` from
         this file: ``permission_hook.json`` in the claude-native bridge dir,
-        ``policy_hook.json`` in the codex-native bridge dir.
+        ``policy_hook.json`` in the codex-native bridge dir. opencode-native
+        has no permission/policy hook of its own (it gates via the SSE
+        forwarder), so there is no such file at rest — write a fresh snapshot
+        here (the only consumer is this popup).
 
         :param conv_id: Session/conversation id, e.g. ``"conv_abc123"``.
-        :param harness: ``"claude-native"`` or ``"codex-native"``.
+        :param harness: ``"claude-native"``, ``"codex-native"``, or
+            ``"opencode-native"``.
         :returns: Path to the harness's AP-routing config file.
         """
         if harness == "claude-native":
@@ -11089,6 +12003,23 @@ def create_runner_app(
                 server_client=server_client, session_id=conv_id
             )
             return _cnb.bridge_dir_for_bridge_id(bridge_id) / _cnb._PERMISSION_HOOK_FILE
+        if harness == "opencode-native":
+            from omnigent.opencode_native_bridge import (
+                bridge_dir_for_bridge_id as _oc_bridge_dir,
+            )
+            from omnigent.opencode_native_bridge import (
+                write_cost_popup_config,
+            )
+            from omnigent.runner._entry import _make_auth_token_factory
+
+            _factory = _make_auth_token_factory()
+            _token = _factory() if _factory is not None else None
+            return await asyncio.to_thread(
+                write_cost_popup_config,
+                _oc_bridge_dir(conv_id),
+                ap_server_url=_required_runner_env("RUNNER_SERVER_URL"),
+                ap_auth_headers={"Authorization": f"Bearer {_token}"} if _token else {},
+            )
         from omnigent import codex_native_bridge as _cxb
 
         return _cxb.bridge_dir_for_bridge_id(conv_id) / _cxb._POLICY_HOOK_FILE
@@ -11119,7 +12050,7 @@ def create_runner_app(
         :returns: None.
         """
         harness = _session_harness_name(conv_id)
-        if harness not in ("claude-native", "codex-native"):
+        if harness not in ("claude-native", "codex-native", "opencode-native"):
             return
         from omnigent.native_cost_popup import launch_cost_popup, wait_for_tmux_client
 
@@ -11677,25 +12608,6 @@ def create_runner_app(
             post_tools_changed,
             start_tool_relay,
         )
-        from omnigent.runner.tool_dispatch import _NATIVE_RELAY_BUILTIN_TOOLS
-        from omnigent.tools.builtins.agents import (
-            SysAgentDownloadTool,
-            SysAgentGetTool,
-            SysAgentListTool,
-        )
-        from omnigent.tools.builtins.list_comments import ListCommentsTool
-        from omnigent.tools.builtins.os_env import (
-            SysOsEditTool,
-            SysOsReadTool,
-            SysOsShellTool,
-            SysOsWriteTool,
-        )
-        from omnigent.tools.builtins.spawn import (
-            SysSessionGetHistoryTool,
-            SysSessionGetInfoTool,
-            SysSessionListTool,
-        )
-        from omnigent.tools.builtins.update_comment import UpdateCommentTool
 
         # Resolve the bridge dir. When an explicit bridge_dir is
         # provided (codex-native path), skip the claude-native bridge
@@ -11720,49 +12632,13 @@ def create_runner_app(
 
             bridge_dir = bridge_dir_for_bridge_id(bridge_id or session_id)
 
-        # Build flat tool schemas (name + description + parameters) for the
-        # native relay. start_tool_relay normalises these via
-        # _normalize_relay_tool_specs before writing tool_relay.json.
-        #
         # claude-native / codex-native ignore the harness ``tools`` list, so
         # this relay is the ONLY tool surface reaching the real CLI — tools
         # added here override the bridge's static tools of the same name,
-        # giving centralized policy evaluation on the Omnigent server. Two groups
-        # are assembled:
+        # giving centralized policy evaluation on the Omnigent server. The exact
+        # set (spec-gated builtin surface + unconditional sys_os_*) is assembled
+        # by ``build_native_relay_tool_schemas`` below.
         #
-        # 1. The runner-/server-proxied builtin surface
-        #    (``_NATIVE_RELAY_BUILTIN_TOOLS`` — comment, session read/write,
-        #    agent-discovery, and terminal families), derived from the
-        #    session's own ToolManager so the relayed set and the
-        #    spec-dependent schemas (e.g. sys_session_send's named-mode
-        #    ``agent`` enum, present only when the spec declares
-        #    sub-agents; sys_terminal_*, present only when the spec
-        #    declares ``terminals:``) exactly match what non-native
-        #    harnesses receive via ``request.tools``.
-        # 2. OS tools (``sys_os_*``), relayed unconditionally below to
-        #    override the bridge's static (non-policy-enforced) versions —
-        #    independent of the spec's ``os_env`` gate.
-        relay_schemas: list[dict[str, Any]] = []
-
-        def _append_flat_schema(function_dict: dict[str, Any]) -> None:
-            """
-            Append a tool's OpenAI ``function`` schema in flat relay shape.
-
-            :param function_dict: The ``"function"`` sub-dict of a tool
-                schema, e.g. ``{"name": "sys_session_list", "parameters":
-                {...}}``.
-            :returns: None.
-            """
-            relay_schemas.append(
-                {
-                    "name": function_dict["name"],
-                    "description": function_dict.get("description", ""),
-                    "parameters": function_dict.get(
-                        "parameters", {"type": "object", "properties": {}}
-                    ),
-                }
-            )
-
         # Resolve the session's agent spec so the relayed builtin surface
         # mirrors the spec's gating exactly. This is an await, so re-check
         # for a concurrently-started relay afterward. The relay is additive
@@ -11775,63 +12651,13 @@ def create_runner_app(
             relay_spec = None
         if session_id in _session_comment_relays:
             return
-        if relay_spec is not None:
-            from omnigent.tools.manager import ToolManager
+        # Build the flat tool schemas (name + description + parameters) for the
+        # native relay via the shared helper, which also backs pi-native's
+        # pi.registerTool surface. start_tool_relay normalises these via
+        # _normalize_relay_tool_specs before writing tool_relay.json.
+        from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
-            for _schema in ToolManager(relay_spec).get_tool_schemas():
-                _fn = _schema["function"]
-                if _fn["name"] in _NATIVE_RELAY_BUILTIN_TOOLS:
-                    _append_flat_schema(_fn)
-        else:
-            # No resolvable spec: fall back to the always-on read/discovery
-            # surface — never the opt-in spawn writes (send/close/create),
-            # whose gate (``tools.agents`` or ``spawn: true``) can't be
-            # evaluated without the spec.
-            from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool
-
-            for _cls in (
-                ListCommentsTool,
-                UpdateCommentTool,
-                SysSessionListTool,
-                SysSessionGetHistoryTool,
-                SysSessionGetInfoTool,
-                SysAgentGetTool,
-                SysAgentListTool,
-                SysAgentDownloadTool,
-                SysAddPolicyTool,
-                SysPolicyRegistryTool,
-            ):
-                _append_flat_schema(_cls().get_schema()["function"])
-
-        # Add OS tool schemas. Create a minimal OSEnvironment for schema extraction.
-        from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-        from omnigent.inner.os_env import create_os_environment
-
-        _os_spec = OSEnvSpec(
-            type="caller_process",
-            cwd=str(Path.cwd()),
-            sandbox=OSEnvSandboxSpec(type="none"),
-            fork=False,
-        )
-        try:
-            _os_env = create_os_environment(_os_spec)
-            for _tool in (
-                SysOsReadTool(_os_env),
-                SysOsWriteTool(_os_env),
-                SysOsEditTool(_os_env),
-                SysOsShellTool(_os_env),
-            ):
-                _append_flat_schema(_tool.get_schema()["function"])
-            _os_env.close()
-        except Exception:  # noqa: BLE001
-            # OS environment setup failed; relay will run without OS tools.
-            # This should not happen in practice, but we log and continue
-            # since the relay is additive.
-            _logger.debug(
-                "Could not create OSEnvironment for relay OS tool schemas; "
-                "OS tools will not be available in relay for session=%s",
-                session_id,
-            )
+        relay_schemas: list[dict[str, Any]] = build_native_relay_tool_schemas(relay_spec)
 
         # Capture session_id in the closure so concurrent sessions are
         # routed correctly.
@@ -12117,6 +12943,19 @@ def create_runner_app(
         _subagent_wake_pending.discard(conv)
         try:
             await _run_turn_bg_setup_and_stream(msg_body, conv)
+        except asyncio.CancelledError as exc:
+            # Task cancellation (e.g. event-loop teardown) must still
+            # publish a terminal ``failed`` status so the session never
+            # hangs on a stale "running" turn. Re-raise after cleanup to
+            # preserve asyncio cancellation semantics.
+            _logger.error(
+                "turn cancelled for %s: %s",
+                conv,
+                exc,
+                exc_info=True,
+            )
+            _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+            raise
         except Exception as exc:
             # Any failure before the harness stream starts (e.g. a provider
             # with no resolvable model raising OmnigentError from
@@ -13777,7 +14616,7 @@ def create_runner_app(
             # update. Other harnesses pick up the persisted value on the
             # next turn and 204 here.
             harness = _session_harness_name(conversation_id)
-            if harness in ("claude-native", "codex-native", "cursor-native"):
+            if harness in ("claude-native", "codex-native", "cursor-native", "opencode-native"):
                 model = body.get("model") if isinstance(body, dict) else None
                 if model is not None and not isinstance(model, str):
                     return JSONResponse(
@@ -13796,6 +14635,11 @@ def create_runner_app(
                     )
                 if harness == "cursor-native":
                     return await _handle_cursor_native_model_change(
+                        conversation_id,
+                        model,
+                    )
+                if harness == "opencode-native":
+                    return await _handle_opencode_native_model_change(
                         conversation_id,
                         model,
                     )
@@ -13839,18 +14683,37 @@ def create_runner_app(
             # Omnigent server forwards explicit /compact here. claude-native
             # and codex-native inject the slash command into the tmux
             # pane so the CLI compacts its own context, and return 200
-            # to signal the control was handled in the terminal. Other
-            # harnesses 204 no-op — their explicit compaction is an
+            # to signal the control was handled in the terminal. pi-native
+            # owns its context inside the Pi TUI process too, so it queues a
+            # ``compact`` inbox payload the resident extension feeds to Pi's
+            # ``ExtensionContext.compact()`` (mirroring the interrupt path).
+            # Other harnesses 204 no-op — their explicit compaction is an
             # AP-side operation the server runs when the runner does
             # not handle the control (see ``_run_compact_locked``).
             if _session_harness_name(conversation_id) == "claude-native":
                 return await _handle_claude_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "codex-native":
                 return await _handle_codex_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "opencode-native":
+                return await _handle_opencode_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "cursor-native":
                 return await _handle_cursor_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "pi-native":
+                return await _handle_pi_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "hermes-native":
                 return await _handle_hermes_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "qwen-native":
+                return await _handle_qwen_native_compact(conversation_id)
+            return Response(status_code=204)
+
+        if body_type == "clear":
+            # Omnigent server forwards an explicit /clear here. opencode-native
+            # has no reset endpoint, so a true clear relaunches the opencode
+            # terminal on a brand-new session (see the handler). Other harnesses
+            # 204 no-op — their clear is an AP-side conversation reset the server
+            # performs without runner involvement.
+            if _session_harness_name(conversation_id) == "opencode-native":
+                return await _handle_opencode_native_clear(conversation_id)
             return Response(status_code=204)
 
         if body_type == "cost_approval_popup":
@@ -13858,8 +14721,8 @@ def create_runner_app(
             # be answered from the native terminal (a tmux display-popup),
             # not only the web ApprovalCard. The popup resolves the SAME
             # elicitation via the resolve endpoint the web card uses, so
-            # whichever surface answers first wins. claude-native and
-            # codex-native each pop the modal on their pane (different
+            # whichever surface answers first wins. claude-native, codex-native,
+            # and opencode-native each pop the modal on their pane (different
             # tmux/AP-config sources, shared launcher); other harnesses
             # 204 no-op (the web card is their only surface).
             elicitation_id = body.get("elicitation_id") if isinstance(body, dict) else None
@@ -13894,6 +14757,26 @@ def create_runner_app(
             if harness == "codex-native":
                 return await _handle_codex_native_cost_popup(
                     conversation_id, elicitation_id, popup_message, popup_policy_name
+                )
+            if harness == "opencode-native":
+                return await _handle_opencode_native_cost_popup(
+                    conversation_id, elicitation_id, popup_message, popup_policy_name
+                )
+            return Response(status_code=204)
+
+        if body_type == "policy_blocked_notice":
+            # Informational HARD-block notice (request-phase DENY). opencode-native
+            # hard-blocks a denied prompt by its plugin throwing (a generic error
+            # in the TUI), so pop a dismissable popup carrying the reason. Only
+            # opencode-native renders it; claude/codex show a clean
+            # UserPromptSubmit block, so they 204 no-op.
+            if _session_harness_name(conversation_id) == "opencode-native":
+                message = body.get("message") if isinstance(body, dict) else None
+                policy_name = body.get("policy_name") if isinstance(body, dict) else None
+                return await _handle_opencode_native_blocked_notice(
+                    conversation_id,
+                    message if isinstance(message, str) and message else "Blocked by policy.",
+                    policy_name if isinstance(policy_name, str) and policy_name else None,
                 )
             return Response(status_code=204)
 
@@ -14370,6 +15253,7 @@ def create_runner_app(
                         _publish_event,
                         agent_spec=opencode_agent_spec,
                         server_client=server_client,
+                        ensure_comment_relay=_ensure_comment_relay_started,
                     )
                 except Exception as exc:
                     _logger.exception(
@@ -15739,8 +16623,11 @@ def create_runner_app(
         contributes nothing). Falls back to the runner's global workspace,
         then the process cwd, when no workspace is known. Deduplicated by
         name with bundled winning, then earlier roots winning. Cached per
-        session so the filesystem walk runs once per session lifetime
-        (dropped in ``delete_session``).
+        session with a short TTL (``_SESSION_SKILLS_CACHE_TTL_SECONDS``) so the
+        walk reruns at most once per window — fresh enough to surface a
+        skill/plugin installed mid-session, while still collapsing the bursty
+        menu-open + per-invocation resolve calls (dropped in
+        ``delete_session``).
 
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -15752,7 +16639,11 @@ def create_runner_app(
         """
         cached = _session_skills_cache.get(session_id)
         if cached is not None:
-            return cached
+            expires_at, cached_skills = cached
+            if time.monotonic() < expires_at:
+                return cached_skills
+            # TTL elapsed — fall through to re-walk so a skill or plugin
+            # installed mid-session surfaces without a session restart.
         entry = await _resolve_session_spec_entry(session_id)
         spec = _unwrap_resolved_spec(entry) if entry is not None else None
         if spec is None:
@@ -15781,18 +16672,44 @@ def create_runner_app(
             roots.append(Path.cwd())
 
         def _discover() -> list[SkillSpec]:
-            """Merge bundled + host skills (every root) off the event loop."""
-            merged: list[SkillSpec] = list(spec.skills)
-            seen = {s.name for s in merged}
-            for root in roots:
-                for hs in discover_host_skills(root, spec.skills_filter):
-                    if hs.name not in seen:
-                        seen.add(hs.name)
-                        merged.append(hs)
+            """Merge bundled skills with the harness's extra skills off the loop."""
+            # Drop user-invocable:false skills from the bundle too, so the
+            # composer menu never lists a non-invocable skill regardless of
+            # source (harness skills are already filtered in resolve_harness_skills).
+            merged: list[SkillSpec] = [s for s in spec.skills if s.user_invocable]
+            # Seed the dedup set from EVERY bundled name — including the
+            # non-invocable ones dropped above — so marking a bundled skill
+            # non-invocable can't un-shadow a same-named host/harness skill
+            # the author never meant to surface.
+            seen = {s.name for s in spec.skills}
+            # Also dedup by on-disk skill dir: a harness provider (e.g. codex)
+            # may rediscover a bundle skill under a *different* name than its
+            # frontmatter ``name`` (it keys by directory), which would otherwise
+            # double-list the same skill. Same dir == same skill, drop it.
+            seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
+            ctx = SkillSourceContext(
+                roots=tuple(roots),
+                home=Path.home(),
+                skills_filter=spec.skills_filter,
+                bundle_dir=_resolved_spec_workdir(entry),
+            )
+            harness = canonicalize_harness(spec.executor.harness_kind)
+            for hs in resolve_harness_skills(ctx, harness):
+                if hs.name in seen:
+                    continue
+                if hs.skill_dir is not None and hs.skill_dir.resolve() in seen_dirs:
+                    continue
+                seen.add(hs.name)
+                if hs.skill_dir is not None:
+                    seen_dirs.add(hs.skill_dir.resolve())
+                merged.append(hs)
             return merged
 
         skills = await asyncio.to_thread(_discover)
-        _session_skills_cache[session_id] = skills
+        _session_skills_cache[session_id] = (
+            time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,
+            skills,
+        )
         return skills
 
     @app.get("/v1/sessions/{session_id}/skills")

@@ -415,28 +415,39 @@ async def test_switch_cross_family_resets_model_but_carries_history(
 
 
 @pytest.mark.parametrize(
-    "target_agent,target_harness,expected_labels",
+    "target_agent,target_harness,expected_labels,expected_carry",
     [
+        # cursor-native has no resumable session file to rebuild → no carry.
         (
             _BUILTIN_CURSOR,
             "cursor-native",
             {"omnigent.ui": "terminal", "omnigent.wrapper": "cursor-native-ui"},
+            False,
         ),
+        # pi-native rebuilds its JSONL session file from the copied items →
+        # carry history (parity with claude/codex native).
         (
             _BUILTIN_PI,
             "pi-native",
             {"omnigent.ui": "terminal", "omnigent.wrapper": "pi-native-ui"},
+            True,
         ),
     ],
 )
 @pytest.mark.asyncio
-async def test_switch_cursor_pi_native_targets_do_not_carry_history(
+async def test_switch_cursor_pi_native_targets_carry_history_gating(
     monkeypatch: pytest.MonkeyPatch,
     target_agent: Agent,
     target_harness: str,
     expected_labels: dict[str, str],
+    expected_carry: bool,
 ) -> None:
-    """Switching into cursor/pi native keeps terminal UI but does not carry history."""
+    """Switching into cursor/pi native keeps terminal UI; carry gates per harness.
+
+    Cross-family from a claude SDK source so ``copy_model_settings`` is always
+    False. ``carry_history_into_native`` is True only for the harness with a
+    rebuildable session file (pi-native), False for cursor-native.
+    """
     conv_store = _ConversationStore(conversations={"conv_src": _conv()})
     agent_store = _AgentStore(
         {
@@ -459,9 +470,8 @@ async def test_switch_cursor_pi_native_targets_do_not_carry_history(
     assert resp.status_code == 200, resp.text
     call = conv_store.switch_calls[0]
     assert call["copy_model_settings"] is False
-    assert call["carry_history_into_native"] is False, (
-        f"{target_harness} cannot replay fork history; switching to it must not "
-        "stamp carry_history_into_native."
+    assert call["carry_history_into_native"] is expected_carry, (
+        f"{target_harness} carry_history_into_native should be {expected_carry}."
     )
     assert call["presentation_labels"] == expected_labels
 

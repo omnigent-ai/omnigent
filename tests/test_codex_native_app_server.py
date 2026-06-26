@@ -226,6 +226,75 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
     assert 'databricks auth token --profile \\"oss\\"' in overrides
 
 
+def test_build_codex_native_server_without_bypass_emits_no_bypass_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The default (``bypass_sandbox=False``) writes no approval/sandbox overrides.
+
+    Guards the safe default: an app-server built without the opt-in must
+    leave Codex's normal approval-prompt + own-sandbox stance untouched, so
+    no ``approval_policy`` / ``sandbox_mode`` override leaks in. A regression
+    that always emitted them would silently disable the sandbox for every
+    native Codex session.
+    """
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+    )
+
+    overrides = "\n".join(app_server.config_overrides)
+    assert "approval_policy" not in overrides
+    assert "sandbox_mode" not in overrides
+
+
+def test_build_codex_native_server_bypass_emits_full_access_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``bypass_sandbox=True`` puts the app-server threads into the bypass stance.
+
+    The ``--remote`` TUI launched with
+    ``--dangerously-bypass-approvals-and-sandbox`` fixes the thread's
+    approval/sandbox stance, but the chat/forwarder seam drives the SAME
+    thread through the app-server, so the app-server config must match —
+    ``approval_policy="never"`` (no prompts a headless seam can't answer)
+    and ``sandbox_mode="danger-full-access"`` (commands run with no command
+    sandbox, the #657 ask). Without these the app-server-driven turns would
+    keep prompting / keep the sandbox even though the TUI bypassed it.
+    """
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+        bypass_sandbox=True,
+    )
+
+    assert 'approval_policy="never"' in app_server.config_overrides
+    assert 'sandbox_mode="danger-full-access"' in app_server.config_overrides
+
+
 def _test_app_server(
     tmp_path: Path,
     codex_home: Path,
@@ -793,3 +862,349 @@ class TestPinCodexConfigModel:
         # read_codex_config_model resolves codex-home under the bridge dir.
         _pin_codex_config_model(home, "databricks-gpt-5-4-mini")
         assert read_codex_config_model(bridge_dir) == "databricks-gpt-5-4-mini"
+
+
+class TestModelFlagHelpers:
+    """Unit coverage for the explicit ``--model`` launch-flag helpers."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("1", True),
+            ("true", True),
+            ("YES", True),
+            ("on", True),
+            ("0", False),
+            ("false", False),
+            ("", False),
+            ("maybe", False),
+        ],
+    )
+    def test_model_flag_enabled_reads_truthy_env(self, value: str, expected: bool) -> None:
+        """The opt-in flag honors the shared truthy-string convention."""
+        from omnigent.codex_native_app_server import (
+            _MODEL_FLAG_ENV_VAR,
+            _model_flag_enabled,
+        )
+
+        assert _model_flag_enabled({_MODEL_FLAG_ENV_VAR: value}) is expected
+
+    def test_model_flag_disabled_when_env_absent(self) -> None:
+        """An unset flag defaults OFF (config.toml pin remains the only route)."""
+        from omnigent.codex_native_app_server import _model_flag_enabled
+
+        assert _model_flag_enabled({}) is False
+
+    async def test_supports_model_flag_true_when_help_lists_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--model`` in ``codex --help`` output → flag supported."""
+        from omnigent.codex_native_app_server import _codex_supports_model_flag
+
+        async def _fake_exec(*_args: Any, **_kwargs: Any) -> Any:
+            return _HelpProc(b"Options:\n  -m, --model <MODEL>\n      Model to use\n")
+
+        monkeypatch.setattr("omnigent.codex_native_app_server._create_subprocess_exec", _fake_exec)
+        assert await _codex_supports_model_flag("/usr/bin/codex") is True
+
+    async def test_supports_model_flag_false_when_help_omits_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A codex build whose ``--help`` lacks ``--model`` → unsupported."""
+        from omnigent.codex_native_app_server import _codex_supports_model_flag
+
+        async def _fake_exec(*_args: Any, **_kwargs: Any) -> Any:
+            return _HelpProc(b"Options:\n  -c, --config <key=value>\n")
+
+        monkeypatch.setattr("omnigent.codex_native_app_server._create_subprocess_exec", _fake_exec)
+        assert await _codex_supports_model_flag("/usr/bin/codex") is False
+
+    async def test_supports_model_flag_false_when_probe_cannot_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An OSError spawning the probe is treated as unsupported (flag skipped)."""
+        from omnigent.codex_native_app_server import _codex_supports_model_flag
+
+        async def _fake_exec(*_args: Any, **_kwargs: Any) -> Any:
+            raise OSError("no codex")
+
+        monkeypatch.setattr("omnigent.codex_native_app_server._create_subprocess_exec", _fake_exec)
+        assert await _codex_supports_model_flag("/usr/bin/codex") is False
+
+    async def test_supports_model_flag_ignores_lookalike_options_and_prose(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only a real ``--model`` option definition counts, not lookalikes.
+
+        A build without ``--model`` may still mention a ``--model-provider``
+        flag or the word in prose; the matcher must not false-positive on
+        either and pass an unsupported flag to the launch.
+        """
+        from omnigent.codex_native_app_server import _codex_supports_model_flag
+
+        async def _fake_exec(*_args: Any, **_kwargs: Any) -> Any:
+            return _HelpProc(
+                b"Options:\n"
+                b"      --model-provider <ID>\n"
+                b"          Override the default model provider\n"
+                b"  -c, --config <key=value>\n"
+                b"          e.g. set the --model in config.toml\n"
+            )
+
+        monkeypatch.setattr("omnigent.codex_native_app_server._create_subprocess_exec", _fake_exec)
+        assert await _codex_supports_model_flag("/usr/bin/codex") is False
+
+
+@dataclass
+class _HelpProc:
+    """Minimal fake process for the ``codex --help`` capability probe.
+
+    :param out: Bytes returned as the probe's stdout.
+    """
+
+    out: bytes
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        """Return the scripted stdout (stderr is discarded by the probe)."""
+        return self.out, b""
+
+    def kill(self) -> None:
+        """No-op kill (the probe only kills on timeout, untested here)."""
+
+    async def wait(self) -> int:
+        """Return a success exit code."""
+        return 0
+
+
+@dataclass
+class _SpawnRecorder:
+    """Captures the argv + env handed to ``create_subprocess_exec`` in start().
+
+    Stands in for the real app-server subprocess so a startup unit test can
+    assert how the explicit ``--model`` flag is plumbed without spawning
+    codex. Exposes just the surface ``start`` and ``_stderr_loop`` touch.
+    """
+
+    argv: tuple[str, ...] | None = None
+    env: dict[str, str] | None = None
+    returncode: int | None = None
+
+    async def _record(self, *argv: str, env: dict[str, str], **_kwargs: Any) -> _SpawnRecorder:
+        self.argv = argv
+        self.env = env
+        return self
+
+    @property
+    def stderr(self) -> None:
+        """No stderr stream — the patched ``_stderr_loop`` never reads it."""
+        return None
+
+    async def wait(self) -> int:
+        """Return the (already terminated) exit code."""
+        return 0
+
+
+async def _model_flag_app_server(
+    tmp_path: Path,
+    *,
+    codex_path: str,
+    model: str | None,
+    env: dict[str, str],
+) -> CodexNativeAppServer:
+    """Build an app-server wrapper for the ``--model`` launch-flag tests.
+
+    :param tmp_path: Test temp dir.
+    :param codex_path: Codex executable path recorded into the argv.
+    :param model: Session-pinned model, or ``None``.
+    :param env: Spawn env (carries the opt-in flag).
+    :returns: Configured wrapper (not yet started).
+    """
+    codex_home = tmp_path / "codex-home"
+    bridge_dir = tmp_path / "bridge"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    return CodexNativeAppServer(
+        codex_path=codex_path,
+        socket_path=tmp_path / "codex.sock",
+        codex_home=codex_home,
+        env=env,
+        config_overrides=[],
+        cwd=workspace,
+        bridge_dir=bridge_dir,
+        python_executable="/new/python",
+        pinned_model=model,
+    )
+
+
+def _patch_start_spawn(monkeypatch: pytest.MonkeyPatch, recorder: _SpawnRecorder) -> None:
+    """Stub the subprocess spawn + readiness waits used by ``start()``.
+
+    The version probe is stubbed to an old (pre-policy-hook) codex so
+    ``start`` skips hook registration — fewer side effects — and so its own
+    subprocess spawn never reaches the recorder. The recorder is wired only
+    to the final app-server spawn.
+
+    The spawn is captured by patching the module-level
+    ``_create_subprocess_exec`` indirection (which ``start`` now calls),
+    NOT ``…app_server.asyncio.create_subprocess_exec`` — the latter walks the
+    real asyncio module singleton and leaks the mock into every other test in
+    the process.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param recorder: Recorder whose ``_record`` captures the spawn argv/env.
+    """
+    _disable_codex_startup_rpc(monkeypatch)
+    _set_codex_version(monkeypatch, (0, 100, 0))
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._create_subprocess_exec", recorder._record
+    )
+    # The crash-reap registration path (added alongside this flag) is exercised
+    # by the process-registry tests; these flag tests only assert argv/env, so
+    # skip registration by denying the owner lock (the recorder has no pid).
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.acquire_codex_native_process_owner_lock",
+        lambda: None,
+    )
+
+    async def _noop_stderr(self: CodexNativeAppServer) -> None:
+        return None
+
+    monkeypatch.setattr(CodexNativeAppServer, "_stderr_loop", _noop_stderr)
+
+
+class TestModelFlagPlumbing:
+    """``start()`` plumbs the override per the opt-in flag and CLI support."""
+
+    async def test_flag_off_omits_model_flag_and_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With the opt-in off, no ``--model`` flag is passed.
+
+        The config.toml pin (asserted below) remains the only route.
+        """
+        from omnigent.codex_native_app_server import _MODEL_FLAG_ENV_VAR
+
+        # The opt-in is read from the server's own process env (os.environ);
+        # ensure it isn't ambiently set so "off" is genuinely off.
+        monkeypatch.delenv(_MODEL_FLAG_ENV_VAR, raising=False)
+        recorder = _SpawnRecorder()
+        _patch_start_spawn(monkeypatch, recorder)
+        server = await _model_flag_app_server(
+            tmp_path, codex_path="/usr/bin/codex", model="databricks-gpt-5-4-mini", env={}
+        )
+        await server.start()
+
+        assert recorder.argv is not None
+        assert "--model" not in recorder.argv
+        # config.toml pin still seeds the model regardless of the flag.
+        assert 'model = "databricks-gpt-5-4-mini"' in (
+            server.codex_home / "config.toml"
+        ).read_text(encoding="utf-8")
+
+    async def test_flag_on_with_cli_support_passes_global_model_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Opt-in + a codex that supports ``--model`` → global ``--model <id>``.
+
+        The flag must precede the ``app-server`` subcommand (it is a codex
+        global option).
+        """
+        from omnigent.codex_native_app_server import _MODEL_FLAG_ENV_VAR
+
+        async def _supports(_codex_path: str) -> bool:
+            return True
+
+        monkeypatch.setattr(
+            "omnigent.codex_native_app_server._codex_supports_model_flag", _supports
+        )
+        # The opt-in lives in the server's process env, NOT the cleaned codex
+        # spawn env (env={}): _clean_codex_env strips OMNIGENT_* keys, so a
+        # flag passed via env= would never be seen in production.
+        monkeypatch.setenv(_MODEL_FLAG_ENV_VAR, "1")
+        recorder = _SpawnRecorder()
+        _patch_start_spawn(monkeypatch, recorder)
+        server = await _model_flag_app_server(
+            tmp_path,
+            codex_path="/usr/bin/codex",
+            model="databricks-gpt-5-4-mini",
+            env={},
+        )
+        await server.start()
+
+        assert recorder.argv is not None
+        argv = list(recorder.argv)
+        assert "--model" in argv
+        model_idx = argv.index("--model")
+        assert argv[model_idx + 1] == "databricks-gpt-5-4-mini"
+        # Global option: precedes the subcommand.
+        assert model_idx < argv.index("app-server")
+
+    async def test_flag_on_without_cli_support_skips_model_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Opt-in + a codex lacking ``--model`` -> no flag (config.toml pin carries it).
+
+        Passing an unknown flag would error, so an unsupported codex simply
+        doesn't get ``--model``; the always-on config.toml pin still launches
+        it on the right model.
+        """
+        from omnigent.codex_native_app_server import _MODEL_FLAG_ENV_VAR
+
+        async def _unsupported(_codex_path: str) -> bool:
+            return False
+
+        monkeypatch.setattr(
+            "omnigent.codex_native_app_server._codex_supports_model_flag", _unsupported
+        )
+        # Opt-in lives in the server process env, not the cleaned spawn env.
+        monkeypatch.setenv(_MODEL_FLAG_ENV_VAR, "1")
+        recorder = _SpawnRecorder()
+        _patch_start_spawn(monkeypatch, recorder)
+        server = await _model_flag_app_server(
+            tmp_path,
+            codex_path="/usr/bin/codex",
+            model="databricks-gpt-5-4-mini",
+            env={},
+        )
+        await server.start()
+
+        assert recorder.argv is not None
+        assert "--model" not in recorder.argv
+        # config.toml pin still seeds the model regardless of the flag.
+        assert 'model = "databricks-gpt-5-4-mini"' in (
+            server.codex_home / "config.toml"
+        ).read_text(encoding="utf-8")
+
+    async def test_flag_in_spawn_env_alone_does_not_enable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The flag in the cleaned spawn env (``self.env``) must NOT enable it.
+
+        Regression guard: ``self.env`` is the ``_clean_codex_env`` output,
+        whose prefix allowlist strips ``OMNIGENT_*`` keys, so the opt-in can
+        only arrive via the server's own ``os.environ``. If the gate ever
+        reverts to reading ``self.env``, this fails: the flag would appear to
+        work in a unit test that injects it via ``env=`` but be dead in prod.
+        """
+        from omnigent.codex_native_app_server import _MODEL_FLAG_ENV_VAR
+
+        async def _supports(_codex_path: str) -> bool:
+            return True
+
+        monkeypatch.setattr(
+            "omnigent.codex_native_app_server._codex_supports_model_flag", _supports
+        )
+        # NOT set in os.environ -- only smuggled into the spawn env.
+        monkeypatch.delenv(_MODEL_FLAG_ENV_VAR, raising=False)
+        recorder = _SpawnRecorder()
+        _patch_start_spawn(monkeypatch, recorder)
+        server = await _model_flag_app_server(
+            tmp_path,
+            codex_path="/usr/bin/codex",
+            model="databricks-gpt-5-4-mini",
+            env={_MODEL_FLAG_ENV_VAR: "1"},
+        )
+        await server.start()
+
+        assert recorder.argv is not None
+        assert "--model" not in recorder.argv

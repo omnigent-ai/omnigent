@@ -31,6 +31,7 @@ from collections.abc import Callable
 from typing import Protocol, cast
 
 import click
+from rich.cells import cell_len
 from rich.console import Console
 from rich.text import Text
 
@@ -72,6 +73,23 @@ def clear_screen() -> None:
     sys.stdout.flush()
 
 
+def _truncate_cells(text: str, max_cells: int) -> str:
+    """Truncate *text* to a terminal-cell budget, adding an ellipsis if needed."""
+    if cell_len(text) <= max_cells:
+        return text
+    ellipsis = "…"
+    budget = max(0, max_cells - cell_len(ellipsis))
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        width = cell_len(ch)
+        if used + width > budget:
+            break
+        out.append(ch)
+        used += width
+    return "".join(out) + ellipsis
+
+
 def _render_menu(
     title: str,
     options: list[str],
@@ -83,6 +101,7 @@ def _render_menu(
     status: str | None = None,
     max_visible: int | None = None,
     window_start: int = 0,
+    compact: bool = False,
 ) -> str:
     """Render the menu frame to an ANSI string for the termios redraw.
 
@@ -117,10 +136,13 @@ def _render_menu(
 
     render_console.print()
     if status:
-        render_console.print(Text.from_markup(f"  [bold green]{status}[/]"))
+        render_console.print(Text(f"  {status}", style="bold green"))
         render_console.print()
-    render_console.print(Text.from_markup(f"  [bold {ACCENT}]{title}[/]"))
-    render_console.print()
+    render_console.print(Text(f"  {title}", style=f"bold {ACCENT}"))
+    if not compact:
+        # The compact overview hugs the title to the list (Hermes-style); other
+        # menus keep a blank line below the title for breathing room.
+        render_console.print()
 
     # Optional scrolling viewport: when *max_visible* is set and the list is
     # longer, render only ``options[window_start : window_start + max_visible]``
@@ -171,10 +193,21 @@ def _render_menu(
 
     if descriptions is not None and descriptions[selected]:
         render_console.print()
-        render_console.print(Text.from_markup(f"    [dim italic]{descriptions[selected]}[/]"))
+        description = descriptions[selected]
+        if compact:
+            description = _truncate_cells(description, max(8, width - 4))
+        render_console.print(Text(f"    {description}", style="dim italic"))
 
     render_console.print()
-    render_console.print(Text.from_markup(f"  [{MUTED}]↑/↓ move  ·  Enter select  ·  Esc back[/]"))
+    # The compact overview is a top-level menu (Esc exits setup), so it shows a
+    # navigate/select/exit hint in the spirit of other modern CLIs; nested menus
+    # keep the "Esc back" wording, where Esc returns rather than exits.
+    hint = (
+        "↑/↓ nav  ·  Enter select  ·  Esc exit"
+        if compact
+        else "↑/↓ move  ·  Enter select  ·  Esc back"
+    )
+    render_console.print(Text.from_markup(f"  [{MUTED}]{hint}[/]"))
 
     return buf.getvalue()
 
@@ -301,6 +334,7 @@ def select(
     clear_on_exit: bool = False,
     status: str | None = None,
     max_visible: int | None = None,
+    compact: bool = False,
 ) -> int:
     """Show a theme-picker-styled arrow-key menu and return the choice.
 
@@ -346,6 +380,11 @@ def select(
         cursor (with "N more" markers) so a long flat list fits one screen
         instead of overflowing and flickering. ``None`` renders every row.
         No-op on the numbered fallback.
+    :param compact: When ``True`` (TTY only), render the dense top-level
+        overview layout: the title hugs the list (no blank line below it) and
+        the footer reads ``nav · select · Esc exit`` (Esc exits rather
+        than goes back). Intended for the setup harness overview. No-op on the
+        numbered fallback.
     :returns: The chosen zero-based index into *options* (always a
         selectable row), or ``-1`` when the user aborts — Esc / Ctrl-C /
         Ctrl-D on the TTY, or ``q`` on the numbered fallback.
@@ -397,6 +436,7 @@ def select(
             status=status,
             max_visible=max_visible,
             window_start=window_start[0],
+            compact=compact,
         )
         if prev_lines[0] > 0:
             sys.stdout.write(f"\033[{prev_lines[0]}A")

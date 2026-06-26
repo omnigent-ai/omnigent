@@ -18,7 +18,13 @@
 // `ActiveChatOverride`) so sends don't reorder it.
 
 import { useMemo } from "react";
-import { useInfiniteQuery, useMutation, useQueries, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import {
   filtersFromConversationQueryKey,
@@ -346,6 +352,11 @@ export function useArchiveConversation() {
     onSuccess: (updated) => {
       markConversationSeen(updated.id, updated.updated_at);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      // Archiving/unarchiving the last (or first) non-archived member of a
+      // project removes/restores it from the server's project list, and adds
+      // or drops it from that project folder's own paginated list.
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
     },
   });
 }
@@ -396,14 +407,26 @@ export function useStopAndDeleteConversation() {
     },
     onSuccess: (_data, { id }) => {
       const ids = new Set([id]);
-      for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-        queryKey: ["conversations"],
-      })) {
-        const { data: next, removed } = removeIdsFromPages(data, ids);
-        if (removed) queryClient.setQueryData(key, next);
+      // Drop the row from the global list AND every project folder's own
+      // paginated list (["project-sessions", <name>]) — both share the same
+      // page shape. Patched in place rather than invalidated for the same
+      // reason as the global list: an immediate refetch races the server's
+      // async search reindex and can resurrect the just-deleted row.
+      for (const queryKey of [["conversations"], ["project-sessions"]]) {
+        for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+          queryKey,
+        })) {
+          const { data: next, removed } = removeIdsFromPages(data, ids);
+          if (removed) queryClient.setQueryData(key, next);
+        }
       }
       queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
       queryClient.removeQueries({ queryKey: ["session", id] });
+      // Deleting the last member of a project empties it, so refresh the
+      // project list to drop the now-empty folder. Unlike the conversations
+      // list, /v1/sessions/projects reads the DB directly (no search-index
+      // lag), so this can't resurrect the deleted row.
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
   });
 }
@@ -462,6 +485,8 @@ export function useBulkArchiveConversations() {
     },
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
     },
   });
 }
@@ -498,30 +523,41 @@ export function useBulkDeleteConversations() {
     },
     onSuccess: (_data, ids) => {
       const idSet = new Set(ids);
-      for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-        queryKey: ["conversations"],
-      })) {
-        const { data: next, removed } = removeIdsFromPages(data, idSet);
-        if (removed) queryClient.setQueryData(key, next);
+      // Splice deleted rows out of the global list AND every project folder's
+      // own paginated list (same page shape) so filed sessions leave their
+      // folder without a refresh.
+      for (const queryKey of [["conversations"], ["project-sessions"]]) {
+        for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+          queryKey,
+        })) {
+          const { data: next, removed } = removeIdsFromPages(data, idSet);
+          if (removed) queryClient.setQueryData(key, next);
+        }
       }
       for (const id of ids) {
         queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
         queryClient.removeQueries({ queryKey: ["session", id] });
       }
+      // Refresh the project list so a project emptied by these deletes drops
+      // its now-empty folder (DB-direct read, no search-index lag).
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
     onError: (err: any) => {
       if (err?.succeeded) {
         const idSet = new Set(err.succeeded as string[]);
-        for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-          queryKey: ["conversations"],
-        })) {
-          const { data: next, removed } = removeIdsFromPages(data, idSet);
-          if (removed) queryClient.setQueryData(key, next);
+        for (const queryKey of [["conversations"], ["project-sessions"]]) {
+          for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+            queryKey,
+          })) {
+            const { data: next, removed } = removeIdsFromPages(data, idSet);
+            if (removed) queryClient.setQueryData(key, next);
+          }
         }
         for (const id of err.succeeded) {
           queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
           queryClient.removeQueries({ queryKey: ["session", id] });
         }
+        void queryClient.invalidateQueries({ queryKey: ["projects"] });
       }
     },
   });
@@ -596,4 +632,192 @@ export function usePinnedConversationBackfill(
     return backfilled;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resolvedIds]);
+}
+
+// ── Project hooks ─────────────────────────────────────────────────────────────
+
+/**
+ * The reserved `conversation_labels` key that stores a session's project
+ * membership. Namespaced (`omni_*`) so it never collides with the user-facing
+ * "project" term or other reserved keys, and is filtered out of generic label
+ * surfaces.
+ */
+export const PROJECT_LABEL_KEY = "omni_project";
+
+/** Fetch all project names from `GET /v1/sessions/projects`. */
+export function useProjects() {
+  return useQuery<string[]>({
+    queryKey: ["projects"],
+    queryFn: async () => {
+      const res = await authenticatedFetch("/v1/sessions/projects");
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return (await res.json()) as string[];
+    },
+    staleTime: 30_000,
+  });
+}
+
+async function moveConversationToProject(id: string, project: string): Promise<Conversation> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    // Empty string signals "remove from project" (server deletes the label row).
+    body: JSON.stringify({ labels: { [PROJECT_LABEL_KEY]: project } }),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()) as Conversation;
+}
+
+/**
+ * Move a session to a project (or remove it from all projects when `project=""`).
+ *
+ * Invalidates both the conversations list (so sidebar sections re-group) and
+ * the projects list (so counts update). Patch-in-place is skipped here — project
+ * changes affect which sidebar section a session belongs to, so a full
+ * re-render of the list is correct.
+ */
+export function useMoveToProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, project }: { id: string; project: string }) =>
+      moveConversationToProject(id, project),
+    onSuccess: (updated) => {
+      markConversationSeen(updated.id, updated.updated_at);
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      // Moving into/out of a project changes both folders' paginated lists.
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+    },
+  });
+}
+
+/**
+ * Collect every session id filed under a project, paging through the
+ * server-side `?project=` filter (archived included). Used by "Delete project"
+ * so it removes ALL members, not just those in the loaded sidebar window.
+ */
+async function fetchAllProjectSessionIds(project: string): Promise<string[]> {
+  const ids: string[] = [];
+  let after: string | undefined;
+  for (;;) {
+    const params = new URLSearchParams({
+      order: "desc",
+      sort_by: "updated_at",
+      limit: "100",
+      include_archived: "true",
+      project,
+    });
+    if (after) params.set("after", after);
+    // Sequential by necessity: each page's request needs the previous page's
+    // cursor (`after`), so these awaits can't be parallelized.
+    // eslint-disable-next-line no-await-in-loop
+    const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    // eslint-disable-next-line no-await-in-loop
+    const page = (await res.json()) as ConversationsPage;
+    for (const conv of page.data) ids.push(conv.id);
+    if (!page.has_more || !page.last_id) break;
+    after = page.last_id;
+  }
+  return ids;
+}
+
+/**
+ * Fetch up to `limit` session ids filed under a project (archived included),
+ * server-side via the `?project=` filter. A single page — enough to answer
+ * "is this session the project's last member?" reliably (unaffected by the
+ * sidebar's loaded window or pin-precedence placement). Default `limit=2` is
+ * the minimum that distinguishes "only this one" from "more than one".
+ */
+export async function fetchProjectSessionIds(project: string, limit = 2): Promise<string[]> {
+  const params = new URLSearchParams({
+    order: "desc",
+    sort_by: "updated_at",
+    limit: String(limit),
+    include_archived: "true",
+    project,
+  });
+  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const page = (await res.json()) as ConversationsPage;
+  return page.data.map((conv) => conv.id);
+}
+
+/** One page of a project's (non-archived) sessions, newest-first. */
+async function fetchProjectSessionsPage(
+  project: string,
+  after?: string,
+): Promise<ConversationsPage> {
+  const params = new URLSearchParams({
+    order: "desc",
+    sort_by: "updated_at",
+    limit: "20",
+    project,
+  });
+  if (after) params.set("after", after);
+  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()) as ConversationsPage;
+}
+
+/**
+ * Cursor-paginated list of the sessions filed under one project, fetched
+ * server-side via `?project=` so a folder shows ALL its members regardless of
+ * how far the global sidebar list has been scrolled. Archived sessions are
+ * excluded (they leave the active sidebar). `enabled` gates the fetch so a
+ * collapsed folder costs nothing — pass the folder's expanded state.
+ *
+ * Same page size (20) and sort (`updated_at desc`) as the global list, so a
+ * folder paginates independently with its own infinite-scroll sentinel.
+ */
+export function useProjectSessions(project: string, enabled: boolean) {
+  return useInfiniteQuery({
+    queryKey: ["project-sessions", project],
+    queryFn: ({ pageParam }) => fetchProjectSessionsPage(project, pageParam as string | undefined),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) =>
+      lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
+    enabled,
+  });
+}
+
+/**
+ * Delete a whole project by ARCHIVING every session filed under it. The
+ * sessions keep their `omni_project` label (so unarchiving restores them to
+ * this project) and their history; they only leave the active sidebar. The
+ * project is implicit and the server's project list excludes all-archived
+ * projects, so the folder disappears once its last member is archived. Throws
+ * `{ failed, succeeded, total }` if any session failed (e.g. a shared session
+ * the user can't modify), leaving those sessions in place.
+ */
+export function useDeleteProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (project: string) => {
+      const ids = await fetchAllProjectSessionIds(project);
+      const results = await Promise.allSettled(ids.map((id) => archiveConversation(id, true)));
+      const succeeded: string[] = [];
+      const failed: string[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].status === "fulfilled") {
+          succeeded.push(ids[i]);
+          markConversationSeen(
+            ids[i],
+            (results[i] as PromiseFulfilledResult<Conversation>).value.updated_at,
+          );
+        } else {
+          failed.push(ids[i]);
+        }
+      }
+      if (failed.length > 0) throw { failed, succeeded, total: ids.length };
+      return { succeeded, failed };
+    },
+    onSettled: () => {
+      // Refresh regardless of partial failure so the sidebar reflects whatever
+      // was actually archived.
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+    },
+  });
 }

@@ -276,11 +276,11 @@ async def _drive_codex_needs_auth(base_url: str) -> None:
 def test_codex_needs_auth_badge_in_harness_menu(
     seeded_session: tuple[str, str],
 ) -> None:
-    """A bundle agent's Advanced "Agent Harness" menu badges the Codex row "needs auth".
+    """A bundle agent's harness picker badges the Codex row "needs auth".
 
-    For a brain-harness bundle agent (Polly), the Advanced menu lists each brain
-    harness as a radio row. When the selected host reports the ``codex`` harness
-    as ``needs-auth``, that row carries the warning badge
+    For a brain-harness bundle agent (Polly), the composer's harness picker
+    lists each brain harness as a radio row. When the selected host reports the
+    ``codex`` harness as ``needs-auth``, that row carries the warning badge
     (``new-chat-landing-harness-warning-codex``) reading "needs auth" — the
     per-row counterpart to the under-composer message.
     """
@@ -311,9 +311,9 @@ async def _drive_codex_badge(base_url: str) -> None:
                 state="visible", timeout=30_000
             )
 
-            # Polly auto-selects (sole agent), so the Advanced chip opens the
+            # Polly auto-selects (sole agent), so the harness picker opens the
             # brain-harness radio group.
-            await page.get_by_test_id("new-chat-landing-advanced-chip").click()
+            await page.get_by_test_id("new-chat-landing-harness-trigger").click()
             badge = page.get_by_test_id("new-chat-landing-harness-warning-codex")
             await expect(badge).to_be_visible(timeout=30_000)
             await expect(badge).to_contain_text("needs auth")

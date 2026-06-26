@@ -66,6 +66,26 @@ export function derivePermissionLevel(
   return null;
 }
 
+/**
+ * Whether a session is visible to anyone other than the viewer: another
+ * principal owns it (so it's shared *with* the viewer), or the viewer owns
+ * it and granted access to a non-viewer principal (a user or the
+ * ``__public__`` sentinel). ``ownerGrants`` is ``undefined`` until loaded /
+ * when the viewer isn't the owner and can't read the manage-only grant list.
+ *
+ * Used to gate owner-attribution UI (author labels, the info popover's Owner
+ * row) so private solo sessions stay uncluttered.
+ */
+export function isSessionSharedWithOthers(
+  owner: string | null,
+  viewerId: string | null,
+  ownerGrants: readonly { user_id: string }[] | undefined,
+): boolean {
+  if (owner !== null && viewerId !== null && owner !== viewerId) return true;
+  const viewerOwnsSession = owner !== null && owner === viewerId;
+  return viewerOwnsSession && (ownerGrants ?? []).some((g) => g.user_id !== viewerId);
+}
+
 export interface Permission {
   user_id: string;
   conversation_id: string;

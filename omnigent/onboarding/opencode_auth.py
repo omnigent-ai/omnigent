@@ -55,7 +55,10 @@ def opencode_auth_path() -> Path:
 def _stored_providers() -> tuple[str, ...]:
     """Return provider ids with stored credentials in ``auth.json``.
 
-    Best-effort: a missing/unreadable/non-object file yields ``()``.
+    Best-effort: a missing/unreadable/non-object file yields ``()``. OpenCode's
+    auth file is a provider-id keyed JSON object; an empty object value is not a
+    credential, so ignore it rather than reporting a false ready state from a
+    structural shell like ``{"openai": {}}``.
     """
     try:
         data = json.loads(opencode_auth_path().read_text(encoding="utf-8"))
@@ -63,7 +66,7 @@ def _stored_providers() -> tuple[str, ...]:
         return ()
     if not isinstance(data, dict):
         return ()
-    return tuple(str(k) for k in data)
+    return tuple(str(k) for k, v in data.items() if bool(v))
 
 
 def _env_providers(environ: dict[str, str] | None = None) -> tuple[str, ...]:

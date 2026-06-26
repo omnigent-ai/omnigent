@@ -87,7 +87,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
-from omnigent.model_override import validate_model_override
+from omnigent.model_override import model_family_mismatch, validate_model_override
 from omnigent.native_coding_agents import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
@@ -244,6 +244,7 @@ from omnigent.server.schemas import (
     SessionSandboxStatusEvent,
     SessionSkillsEvent,
     SessionStatusEvent,
+    SessionSupersededEvent,
     SessionSwitchAgentRequest,
     SessionTerminalPendingEvent,
     SessionTodosEvent,
@@ -267,6 +268,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
+    PROJECT_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
@@ -346,6 +348,16 @@ _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE: str = "external_output_reasoning_delta"
 # explicit ``session.interrupted`` edge observed outside the Omnigent
 # task runtime. Payload is empty.
 _EXTERNAL_SESSION_INTERRUPTED_TYPE: str = "external_session_interrupted"
+
+# Internal input used by the claude-native forwarder when a Claude
+# ``/clear`` rotates a session away: the old conversation keeps its
+# history but the live terminal moves to a fresh conversation. Republished
+# as a transient ``session.superseded`` SSE event so a client actively
+# viewing the old conversation auto-redirects to the new one. Live-only
+# (no replay) — the durable counterpart is the persisted notice message
+# the forwarder also appends to the old conversation. Payload:
+# ``{"target_conversation_id": "conv_new"}``.
+_EXTERNAL_SESSION_SUPERSEDED_TYPE: str = "external_session_superseded"
 
 # Internal input used by Codex-native forwarders to clear a harness
 # elicitation that another Codex client already answered. Payload:
@@ -793,6 +805,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
     _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
+    _EXTERNAL_SESSION_SUPERSEDED_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
@@ -2610,7 +2623,22 @@ def _resolve_harness(conv: Conversation | None) -> str | None:
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
         executor = loaded.spec.executor
-        harness = executor.config.get("harness") or executor.type
+        # For a bundled-agent head sub-agent, report the HEAD's own harness,
+        # not the bundle brain's — `harness` is this session's provider family
+        # (a gpt head runs codex, not the claude-sdk brain). Falls back to the
+        # brain harness when the head declares none or can't be matched.
+        if conv.sub_agent_name:
+            sub = next(
+                (s for s in loaded.spec.sub_agents if s.name == conv.sub_agent_name),
+                None,
+            )
+            if sub is not None:
+                executor = sub.executor
+        harness = (
+            executor.config.get("harness")
+            or loaded.spec.executor.config.get("harness")
+            or executor.type
+        )
         return canonicalize_harness(harness) or harness
     except (KeyError, AttributeError, ValueError, ImportError, OSError):
         return None
@@ -3896,6 +3924,45 @@ def _spawn_native_approval_popup_forward(
             {
                 "type": "cost_approval_popup",
                 "elicitation_id": elicitation_id,
+                "message": message,
+                "policy_name": policy_name,
+            },
+        )
+
+    task = asyncio.create_task(_forward())
+    _native_popup_forward_tasks.add(task)
+    task.add_done_callback(_native_popup_forward_tasks.discard)
+
+
+def _spawn_native_blocked_notice_forward(
+    session_id: str, message: str, policy_name: str | None = None
+) -> None:
+    """
+    Ask the bound runner to pop an INFORMATIONAL hard-block notice on the pane.
+
+    The request-phase HARD-DENY counterpart of
+    :func:`_spawn_native_approval_popup_forward`: no approve/decline (the prompt
+    is blocked). opencode can only hard-block a prompt by its policy plugin
+    throwing, which opencode renders as a generic "Unexpected server error";
+    this forwards the policy reason so the runner can surface it as a dismissable
+    tmux popup on the opencode pane. Fire-and-forget; the runner dispatch is
+    harness-gated (only ``opencode-native`` pops — claude/codex already show a
+    clean ``UserPromptSubmit`` block, so they no-op).
+
+    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
+    :param message: The block reason shown in the popup.
+    :param policy_name: Deciding policy, rendered as the popup header. ``None``
+        falls back to a generic header on the runner.
+    :returns: None. Forwarding failures (runner offline / none bound) are
+        swallowed and never affect the verdict.
+    """
+
+    async def _forward() -> None:
+        await _forward_session_change_to_runner(
+            session_id,
+            _server_runner_router,
+            {
+                "type": "policy_blocked_notice",
                 "message": message,
                 "policy_name": policy_name,
             },
@@ -5354,6 +5421,49 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
         if isinstance(data, dict):
             data.pop("response_id", None)
     session_stream.publish(session_id, payload)
+
+
+def _publish_session_superseded(session_id: str, target_conversation_id: str) -> None:
+    """
+    Publish a ``session.superseded`` event to the live stream.
+
+    Emitted when a Claude ``/clear`` rotates a session away (see
+    ``_post_clear_supersession`` in
+    ``omnigent/claude_native_forwarder.py``): a client actively viewing
+    ``session_id`` follows to ``target_conversation_id``. Live-only —
+    there is no SSE replay, so a client connecting after the rotation
+    relies on the persisted notice message instead.
+
+    :param session_id: The superseded (old) conversation id whose stream
+        should receive the event, e.g. ``"conv_old"``.
+    :param target_conversation_id: The conversation to redirect to, e.g.
+        ``"conv_new"``.
+    """
+    event = SessionSupersededEvent(
+        type="session.superseded",
+        conversation_id=session_id,
+        target_conversation_id=target_conversation_id,
+        reason="clear",
+    )
+    session_stream.publish(session_id, event.model_dump())
+    # Discard any unconsumed pending inputs on the superseded session — notably
+    # the ``/clear`` the user typed in the web UI. ``/clear`` is never mirrored
+    # back as a committed item (the session rotated away), so its pending entry
+    # would otherwise linger forever as a stuck optimistic bubble, re-hydrating
+    # from the snapshot on every reload of the old chat. Live viewers already
+    # drop the bubble on the ``session.superseded`` event above; this stops it
+    # coming back. We deliberately do NOT emit ``session.input.consumed`` (that
+    # would commit ``/clear`` as a user message) — the persisted clear notice
+    # already explains the rotation, so the input is simply abandoned.
+    discarded = 0
+    while pending_inputs.resolve_oldest(session_id) is not None:
+        discarded += 1
+    if discarded:
+        _logger.info(
+            "Discarded %d unconsumed pending input(s) on superseded session %s",
+            discarded,
+            session_id,
+        )
 
 
 async def _get_runner_client(
@@ -9679,14 +9789,42 @@ def _same_provider_family(a: Agent, b: Agent) -> bool:
     return family_a is not None and family_a == _agent_provider_family(b)
 
 
+def _agent_harness_id(agent: Agent) -> str | None:
+    """Return an agent's canonical harness id, or ``None`` when unloadable.
+
+    Used to family-check a fork's explicit ``model_override`` against the
+    harness the fork will actually run (e.g. reject a Claude model on a
+    codex-native fork). ``None`` when the bundle can't be loaded — the
+    caller then skips the family guard (the runner's fail-loud launch
+    remains the safety net) rather than blocking the fork.
+
+    :param agent: The agent whose harness to resolve, e.g. the fork's
+        base agent.
+    :returns: The canonical harness id, e.g. ``"codex-native"``, or
+        ``None`` when the bundle can't be loaded.
+    """
+    try:
+        spec = (
+            get_agent_cache()
+            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .spec
+        )
+    except Exception:  # noqa: BLE001 — unloadable bundle → skip the family guard
+        return None
+    from omnigent.harness_aliases import canonicalize_harness
+
+    harness_kind = spec.executor.harness_kind
+    return canonicalize_harness(harness_kind) or harness_kind
+
+
 def _agent_is_native(agent: Agent) -> bool:
     """Return whether an agent runs a native CLI harness.
 
     Loads the agent's spec to read its ``harness_kind``. Native targets run
     a vendor TUI in a terminal (claude-native / codex-native / pi-native /
-    cursor-native). This is broader than "can replay fork history" — only
-    claude/codex native carry the transcript-rebuild path; use
-    ``_agent_carries_native_fork_history`` for that narrower gate. Returns
+    cursor-native). This is broader than "can replay fork history" — every
+    native harness except cursor-native carries the session-file-rebuild path;
+    use ``_agent_carries_native_fork_history`` for that narrower gate. Returns
     ``False`` when the bundle can't be loaded (treated as non-native).
 
     :param agent: The agent whose harness to classify.
@@ -9707,37 +9845,56 @@ def _agent_is_native(agent: Agent) -> bool:
 
 # Native harnesses that rebuild a resumable on-disk transcript from the copied
 # Omnigent items and relaunch the CLI with --resume, so prior turns reappear as
-# native chat history. Used by BOTH fork and switch-agent. Both spellings are
-# listed because canonicalize_harness passes the reversed native ids through
-# unchanged (only "native-pi" is aliased) — same reasoning as
-# model_override._CLAUDE_FAMILY_HARNESSES.
+# native chat history. Used by BOTH fork and switch-agent. claude/codex are
+# listed in both spellings because canonicalize_harness passes their reversed
+# native ids through unchanged; pi-native needs only the one canonical id
+# ("native-pi" is aliased to "pi-native") — same reasoning as
+# model_override._CLAUDE_FAMILY_HARNESSES. pi-native rebuilds the Pi CLI's JSONL
+# session file from copied items (omnigent/pi_native_resume.py), the same
+# file-based mechanism claude/codex use.
 #
 # cursor is intentionally absent here: its conversation is server-backed (a
 # synthesized/cloned local store.db is NOT loaded by `cursor-agent --resume`),
 # so it can't rebuild a transcript. Instead a FORK carries cursor history as a
 # text preamble (see _CURSOR_FORK_HISTORY_HARNESSES below) — switch-agent keeps
-# the current fresh-launch behavior. pi has no carry-history path yet.
+# the current fresh-launch behavior.
 _FORK_HISTORY_NATIVE_HARNESSES: frozenset[str] = frozenset(
-    {"claude-native", "native-claude", "codex-native", "native-codex"}
+    {
+        "claude-native",
+        "native-claude",
+        "codex-native",
+        "native-codex",
+        "hermes-native",
+        "native-hermes",
+        "pi-native",
+    }
 )
 
 # Native harnesses that carry FORK history as a text preamble (text-prefix
 # replay) instead of a rebuilt transcript. Fork-only — switch-agent does not
-# use this set, so switching into cursor still launches fresh. The runner
-# branches on the harness to choose preamble vs transcript rebuild (see
-# _auto_create_cursor_terminal / cursor_native_executor).
-_CURSOR_FORK_HISTORY_HARNESSES: frozenset[str] = frozenset({"cursor-native", "native-cursor"})
+# use this set, so switching into one still launches fresh. The runner branches
+# on the harness to choose preamble vs transcript rebuild (see
+# _auto_create_cursor_terminal / cursor_native_executor and the opencode
+# resume/fork rehydration in _auto_create_opencode_terminal). opencode-native
+# joins cursor here: opencode has no history-import API, so a fork seeds prior
+# context as a noReply preamble rather than a rebuilt session.
+_CURSOR_FORK_HISTORY_HARNESSES: frozenset[str] = frozenset(
+    {"cursor-native", "native-cursor", "opencode-native", "native-opencode"}
+)
 
 
 def _agent_carries_native_fork_history(agent: Agent) -> bool:
     """Return whether *agent*'s native harness rebuilds a fork's transcript.
 
-    Only claude-native / codex-native record a resumable native session and can
-    rebuild a fork's transcript from the copied Omnigent items. Used by both
-    fork and switch-agent. cursor carries fork history a different way (a text
-    preamble, fork-only — see :func:`_agent_carries_cursor_fork_history`); pi has
-    no carry-history path yet. Returns ``False`` when the bundle can't be loaded
-    (treated as non-carrying).
+    claude-native / codex-native / pi-native each record a resumable native
+    session file that the runner rebuilds from the copied Omnigent items on
+    fork/resume, so a fork bound to one of them carries prior history into the
+    native CLI. Used by both fork and switch-agent. cursor-native is a native
+    CLI but has no resumable session file to rebuild; it carries fork history a
+    different way (a text preamble, fork-only — see
+    :func:`_agent_carries_cursor_fork_history`), so stamping
+    ``carry_history_into_native`` for it here would be a false promise. Returns
+    ``False`` when the bundle can't be loaded (treated as non-carrying).
 
     :param agent: The agent whose harness to classify.
     :returns: ``True`` only for transcript-rebuild native harnesses.
@@ -9756,16 +9913,17 @@ def _agent_carries_native_fork_history(agent: Agent) -> bool:
 
 
 def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
-    """Return whether *agent* is cursor-native (carries FORK history via preamble).
+    """Return whether *agent*'s native harness carries FORK history via preamble.
 
-    Cursor's conversation is server-backed, so a fork can't seed a local store
-    for ``--resume``; instead the runner replays the prior turns as a text
-    preamble on the fork's first message. Fork-only — switch-agent does not call
-    this, so switching into cursor still launches fresh. Returns ``False`` when
-    the bundle can't be loaded.
+    Cursor's conversation is server-backed and opencode has no history-import
+    API, so neither can seed a local store for a rebuilt resume; instead the
+    runner replays prior turns as a text preamble on the fork (cursor: the
+    first message; opencode: a ``noReply`` context message). Fork-only —
+    switch-agent does not call this, so switching into one still launches fresh.
+    Returns ``False`` when the bundle can't be loaded.
 
     :param agent: The agent whose harness to classify.
-    :returns: ``True`` only for the cursor-native harness (either spelling).
+    :returns: ``True`` for the cursor-native / opencode-native harnesses.
     """
     from omnigent.harness_aliases import canonicalize_harness
 
@@ -9994,7 +10152,7 @@ def _build_actor(user_id: str | None) -> dict[str, str] | None:
 
 def _build_evaluation_context(
     phase: Phase,
-    data: dict[str, Any],
+    data: dict[str, Any] | str,
     event: dict[str, Any],
     *,
     actor: dict[str, str] | None = None,
@@ -10072,8 +10230,18 @@ def _build_evaluation_context(
             model=hook_model,
             harness=hook_harness,
         )
-    # REQUEST / RESPONSE — content is the user/assistant text.
-    text = data.get("text") or data.get("content") or str(data)
+    # REQUEST / RESPONSE — content is the user/assistant text. The wire ``data``
+    # is a dict for the native command hooks (``{"text"|"content": ...}``), but
+    # may be a bare string — opencode's policy plugin sends the prompt text
+    # directly for ``PHASE_REQUEST``. Accept both, and NEVER raise here: a crash
+    # 500s the evaluate endpoint, which silently fails the request/result gate
+    # OPEN (the exact symptom that let cost-over-budget terminal prompts through).
+    if isinstance(data, str):
+        text = data
+    elif isinstance(data, dict):
+        text = data.get("text") or data.get("content") or str(data)
+    else:
+        text = str(data)
     return EvaluationContext(
         phase=phase,
         content=text if isinstance(text, str) else json.dumps(text),
@@ -11521,6 +11689,25 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    # Persisted effort reaches a native CLI as a ``--effort`` argv element
+    # at terminal launch (and SDK harnesses via the spawn env). Validate
+    # against the shared vocabulary before any row exists; provider-specific
+    # support (e.g. ANTHROPIC_EFFORTS) is enforced downstream at launch,
+    # mirroring the multipart metadata create path.
+    reasoning_effort: str | None = None
+    if body.reasoning_effort is not None:
+        try:
+            reasoning_effort = validate_effort(
+                body.reasoning_effort,
+                "session metadata",
+                EFFORT_VALUES,
+            )
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid reasoning_effort: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+
     # Validated before any row exists so a bad value never creates an
     # orphan session; None (unset) defers to the spec default.
     cost_control_mode_override = _validated_cost_control_mode_override(
@@ -11658,6 +11845,7 @@ async def _create_session_from_existing_agent(
         raise
     if (
         model_override is not None
+        or reasoning_effort is not None
         or cost_control_mode_override is not None
         or harness_override is not None
     ):
@@ -11669,6 +11857,7 @@ async def _create_session_from_existing_agent(
             conversation_store.update_conversation,
             conv.id,
             model_override=model_override,
+            reasoning_effort=reasoning_effort,
             cost_control_mode_override=cost_control_mode_override,
             harness_override=harness_override,
         )
@@ -13389,6 +13578,35 @@ def create_sessions_router(
             )
         return result
 
+    # ── GET /sessions/projects ────────────────────────────────────
+    #
+    # MUST be registered before ``GET /sessions/{session_id}``: FastAPI
+    # matches routes in registration order, so a literal ``/sessions/projects``
+    # would otherwise be captured by the ``{session_id}`` path param and 404
+    # as a missing conversation.
+
+    @router.get(
+        "/sessions/projects",
+        response_model=None,
+    )
+    async def list_session_projects(
+        request: Request,
+    ) -> list[str]:
+        """
+        Return all project names for the authenticated user, ordered
+        alphabetically.
+
+        Projects are implicit: they exist while at least one session
+        has a ``conversation_labels`` row with ``key="omni_project"``.
+
+        :returns: List of project names.
+        """
+        user_id = _require_user(request, auth_provider)
+        return await asyncio.to_thread(
+            conversation_store.list_projects,
+            accessible_by=user_id,
+        )
+
     # ── GET /sessions/{session_id} ───────────────────────────────
 
     @router.get(
@@ -13520,6 +13738,7 @@ def create_sessions_router(
         search_query: str | None = Query(default=None),
         include_archived: bool = Query(default=False),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
+        project: str | None = Query(default=None),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -13596,6 +13815,7 @@ def create_sessions_router(
             sort_by=sort_by,
             search_query=normalized_query,
             include_archived=include_archived,
+            project=project,
         )
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.
@@ -14375,6 +14595,12 @@ def create_sessions_router(
                 _codex_plan_enabled,
                 _runner_result,
             )
+        # The project label is special: an empty-string value means "remove
+        # from project" (delete the label row) rather than upsert an empty value.
+        # Split it out before the bulk upsert so other labels are unaffected.
+        if labels_to_set and labels_to_set.get(PROJECT_LABEL_KEY) == "":
+            labels_to_set = {k: v for k, v in labels_to_set.items() if k != PROJECT_LABEL_KEY}
+            await asyncio.to_thread(conversation_store.delete_label, session_id, PROJECT_LABEL_KEY)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
         if requested_codex_collaboration_mode is not None:
@@ -14520,6 +14746,37 @@ def create_sessions_router(
         cloned_agent_id = generate_agent_id()
         cloned_agent_name = base_agent.name
 
+        # An explicit "restart with model" override for the fork. Validated
+        # (charset/length) and family-checked against the harness the fork
+        # will actually run, so a bad or cross-family id (e.g. a Claude model
+        # on a codex-native fork) fails loud here rather than after launch.
+        # Wins over the source's copied model in the store.
+        fork_model_override: str | None = None
+        if body.model_override is not None:
+            try:
+                fork_model_override = validate_model_override(body.model_override)
+            except ValueError as exc:
+                raise OmnigentError(
+                    f"invalid model_override: {exc}",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
+            base_harness = await asyncio.to_thread(_agent_harness_id, base_agent)
+            # Fail CLOSED: if the fork harness can't be resolved we can't
+            # family-check the override, so reject rather than launch an
+            # unvalidated cross-family model. (Only when an override was
+            # actually supplied — a normal fork with no override is
+            # unaffected by an unloadable bundle here.)
+            if base_harness is None:
+                raise OmnigentError(
+                    "cannot validate model_override: the fork's harness could not "
+                    "be resolved. Retry without a model override to keep the "
+                    "source's model.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            mismatch = model_family_mismatch(base_harness, fork_model_override)
+            if mismatch is not None:
+                raise OmnigentError(mismatch, code=ErrorCode.INVALID_INPUT)
+
         # A model id is provider-bound, so the source's model_override /
         # reasoning_effort only carry over when the switch stays in the same
         # provider family. A cross-family switch (or an undeterminable
@@ -14539,12 +14796,13 @@ def create_sessions_router(
         # items (the converters consume Omnigent's normalized item shape, so
         # the source harness doesn't matter). SDK targets replay the
         # transcript as context regardless, so the marker is inert for them.
-        # claude/codex native rebuild the transcript; cursor native instead
-        # replays prior turns as a text preamble (its conversation is
-        # server-backed, so a local store can't be seeded — fork-only, see
-        # _agent_carries_cursor_fork_history). pi has no carry path yet, so don't
-        # stamp a promise it would break with a fresh launch. The single
-        # FORK_CARRY_HISTORY label drives both; the runner branches on harness.
+        # claude/codex/pi native rebuild the transcript (each rebuilds its
+        # resumable session file from the copied items, so all three sit in
+        # _FORK_HISTORY_NATIVE_HARNESSES); cursor native instead replays prior
+        # turns as a text preamble (its conversation is server-backed, so a
+        # local store can't be seeded — fork-only, see
+        # _agent_carries_cursor_fork_history). The single FORK_CARRY_HISTORY
+        # label drives both; the runner branches on harness.
         target_is_cursor = await asyncio.to_thread(_agent_carries_cursor_fork_history, base_agent)
         carry_history_into_native = target_is_cursor or await asyncio.to_thread(
             _agent_carries_native_fork_history, base_agent
@@ -14581,6 +14839,7 @@ def create_sessions_router(
                 cloned_agent_bundle_location=base_agent.bundle_location,
                 cloned_agent_description=base_agent.description,
                 copy_model_settings=copy_model_settings,
+                model_override=fork_model_override,
                 carry_history_into_native=carry_history_into_native,
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
@@ -14745,9 +15004,10 @@ def create_sessions_router(
         copy_model_settings = await asyncio.to_thread(
             _same_provider_family, current_agent, target_agent
         )
-        # Only claude/codex native can replay fork history; cursor/pi native
-        # can't (no resumable session, TUI can't import a transcript), so don't
-        # stamp a carry-history promise they'd silently break with a fresh launch.
+        # claude/codex/pi native can replay fork history (each rebuilds its
+        # resumable session file from the copied items); cursor-native can't
+        # (no resumable session file), so don't stamp a carry-history promise
+        # it would silently break with a fresh launch.
         carry_history_into_native = await asyncio.to_thread(
             _agent_carries_native_fork_history, target_agent
         )
@@ -15393,6 +15653,15 @@ def create_sessions_router(
             resp_body["reason"] = result.reason
         if result.data is not None:
             resp_body["data"] = result.data
+        # A request-phase HARD DENY (no approve option) — surface the reason as a
+        # dismissable tmux popup on the native pane. opencode hard-blocks the
+        # prompt by its plugin throwing (rendered as a generic error), so this is
+        # the clean explanation; the runner dispatch only pops for opencode
+        # (claude/codex already show a clean UserPromptSubmit block). Best-effort.
+        if result.action == PolicyAction.DENY and phase == Phase.REQUEST and not is_read_only:
+            _spawn_native_blocked_notice_forward(
+                session_id, result.reason or "Blocked by policy.", result.deciding_policy
+            )
         return Response(
             content=json.dumps(resp_body),
             media_type="application/json",
@@ -17568,6 +17837,7 @@ def create_sessions_router(
             _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
             _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
             _EXTERNAL_SESSION_INTERRUPTED_TYPE,
+            _EXTERNAL_SESSION_SUPERSEDED_TYPE,
             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
             _EXTERNAL_SESSION_STATUS_TYPE,
             _EXTERNAL_SESSION_USAGE_TYPE,
@@ -17945,6 +18215,16 @@ def create_sessions_router(
                     code=ErrorCode.INVALID_INPUT,
                 )
             _publish_interrupted(session_id, response_id=response_id)
+            return {"queued": False}
+        if body.type == _EXTERNAL_SESSION_SUPERSEDED_TYPE:
+            target_conversation_id = body.data.get("target_conversation_id")
+            if not isinstance(target_conversation_id, str) or not target_conversation_id.strip():
+                raise OmnigentError(
+                    "external_session_superseded requires a non-empty string "
+                    "data.target_conversation_id",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            _publish_session_superseded(session_id, target_conversation_id.strip())
             return {"queued": False}
         if body.type == _EXTERNAL_ELICITATION_RESOLVED_TYPE:
             elicitation_id = body.data.get("elicitation_id")
@@ -19215,6 +19495,14 @@ def create_sessions_router(
             raise OmnigentError(
                 f"Agent not found: {conv.agent_id!r}",
                 code=ErrorCode.NOT_FOUND,
+            )
+
+        # Shared/template agents are read-only here;
+        # mirrors the guard in session_mcp_servers._editable_agent.
+        if agent.session_id is None:
+            raise OmnigentError(
+                "Built-in agents are read-only through this endpoint.",
+                code=ErrorCode.INVALID_INPUT,
             )
 
         bundle_bytes = await bundle.read()

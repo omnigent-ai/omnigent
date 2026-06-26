@@ -328,6 +328,110 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _TERMINAL_TOOLS
 )
 
+
+def build_native_relay_tool_schemas(spec: Any | None) -> list[dict[str, Any]]:
+    """Build the flat Omnigent tool surface for native harness bridges.
+
+    Returns the same tool set the claude-native / codex-native relay advertises
+    and that pi-native registers via ``pi.registerTool``: the spec-gated builtin
+    surface (``_NATIVE_RELAY_BUILTIN_TOOLS`` — comment, session read/write,
+    agent-discovery, policy, and terminal families) plus the ``sys_os_*`` tools,
+    relayed unconditionally so they override any harness-static versions and get
+    centralized policy enforcement on the Omnigent server.
+
+    Each entry is a flat ``{"name", "description", "parameters"}`` dict (the
+    ``"function"`` sub-dict of an OpenAI tool schema), which is exactly what
+    ``pi.registerTool`` and the claude-native relay both consume.
+
+    :param spec: The session's resolved agent spec. ``None`` falls back to the
+        always-on read/discovery surface (never the opt-in spawn writes, whose
+        gate can't be evaluated without the spec), mirroring the relay.
+    :returns: Flat tool schemas for native bridges.
+    """
+    from omnigent.tools.builtins.agents import (
+        SysAgentDownloadTool,
+        SysAgentGetTool,
+        SysAgentListTool,
+    )
+    from omnigent.tools.builtins.list_comments import ListCommentsTool
+    from omnigent.tools.builtins.os_env import (
+        SysOsEditTool,
+        SysOsReadTool,
+        SysOsShellTool,
+        SysOsWriteTool,
+    )
+    from omnigent.tools.builtins.spawn import (
+        SysSessionGetHistoryTool,
+        SysSessionGetInfoTool,
+        SysSessionListTool,
+    )
+    from omnigent.tools.builtins.update_comment import UpdateCommentTool
+
+    schemas: list[dict[str, Any]] = []
+
+    def _append(function_dict: dict[str, Any]) -> None:
+        schemas.append(
+            {
+                "name": function_dict["name"],
+                "description": function_dict.get("description", ""),
+                "parameters": function_dict.get(
+                    "parameters", {"type": "object", "properties": {}}
+                ),
+            }
+        )
+
+    if spec is not None:
+        from omnigent.tools.manager import ToolManager
+
+        for _schema in ToolManager(spec).get_tool_schemas():
+            _fn = _schema["function"]
+            if _fn["name"] in _NATIVE_RELAY_BUILTIN_TOOLS:
+                _append(_fn)
+    else:
+        from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool
+
+        for _cls in (
+            ListCommentsTool,
+            UpdateCommentTool,
+            SysSessionListTool,
+            SysSessionGetHistoryTool,
+            SysSessionGetInfoTool,
+            SysAgentGetTool,
+            SysAgentListTool,
+            SysAgentDownloadTool,
+            SysAddPolicyTool,
+            SysPolicyRegistryTool,
+        ):
+            _append(_cls().get_schema()["function"])
+
+    # OS tools (sys_os_*), relayed unconditionally to override any harness-static
+    # versions and centralize policy enforcement. Create a minimal OSEnvironment
+    # purely for schema extraction.
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import create_os_environment
+
+    _os_spec = OSEnvSpec(
+        type="caller_process",
+        cwd=str(Path.cwd()),
+        sandbox=OSEnvSandboxSpec(type="none"),
+        fork=False,
+    )
+    try:
+        _os_env = create_os_environment(_os_spec)
+        for _tool in (
+            SysOsReadTool(_os_env),
+            SysOsWriteTool(_os_env),
+            SysOsEditTool(_os_env),
+            SysOsShellTool(_os_env),
+        ):
+            _append(_tool.get_schema()["function"])
+        _os_env.close()
+    except Exception:  # noqa: BLE001 — OS env setup is best-effort for schema only
+        _logger.debug("Could not create OSEnvironment for native relay OS tool schemas")
+
+    return schemas
+
+
 # sys_agent_list: locally-authored agent config YAMLs live under this
 # subdirectory of the agent's os_env cwd, so the list tool can find them
 # and the agent can read/edit them via sys_os_* (configs are authored with

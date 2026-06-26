@@ -130,6 +130,7 @@ class _ConversationStore:
         cloned_agent_bundle_location: str | None = None,
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
+        model_override: str | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -149,6 +150,8 @@ class _ConversationStore:
         :param cloned_agent_description: Optional clone description.
         :param copy_model_settings: Whether the source's model settings
             carry over (route passes ``False`` on a cross-family switch).
+        :param model_override: Explicit "restart with model" override the
+            route passes through; ``None`` keeps the copied/source model.
         :param carry_history_into_native: Whether to mark the fork for
             native transcript rebuild (route passes ``True`` for any
             native target, regardless of family).
@@ -175,6 +178,7 @@ class _ConversationStore:
                 "cloned_agent_bundle_location": cloned_agent_bundle_location,
                 "cloned_agent_description": cloned_agent_description,
                 "copy_model_settings": copy_model_settings,
+                "model_override": model_override,
                 "carry_history_into_native": carry_history_into_native,
                 "resume_source_native_session": resume_source_native_session,
                 "presentation_labels": presentation_labels,
@@ -213,6 +217,11 @@ class _ConversationStore:
             root_conversation_id=fork_id,
             title=title or f"Fork of {src.title}",
             agent_id=effective_agent_id,
+            model_override=(
+                model_override
+                if model_override is not None
+                else (src.model_override if copy_model_settings else None)
+            ),
         )
 
     def list_items(
@@ -808,13 +817,16 @@ async def test_fork_switch_404_unknown_target() -> None:
             False,
             {"omnigent.ui": "terminal", "omnigent.wrapper": "cursor-native-ui"},
         ),
-        # pi target is native terminal-first but has no carry-history path yet,
-        # so it launches fresh — do not stamp carry_history_into_native.
+        # pi-native CAN carry fork history: the runner rebuilds Pi's JSONL
+        # session file from the copied Omnigent items. Cross-family from a
+        # claude SDK source, so model settings reset and the source's native
+        # session id is NOT stamped (Pi rebuilds from items, not a source
+        # file) — same shape as the codex-native cross-family case.
         (
             "claude_sdk",
             "pi-native",
             False,
-            False,
+            True,
             False,
             {"omnigent.ui": "terminal", "omnigent.wrapper": "pi-native-ui"},
         ),
@@ -850,10 +862,9 @@ async def test_fork_switch_model_and_carry_gating(
 
     A model id is provider-bound, so ``copy_model_settings`` must be True
     only within a family. ``carry_history_into_native`` must be True for
-    native targets that carry fork history (claude/codex rebuild a transcript,
-    cursor replays a text preamble); pi is terminal-first but launches fresh,
-    and SDK targets replay history themselves so they never set it.
-    ``resume_source_native_session``
+    native targets that carry fork history (claude/codex/pi rebuild a
+    transcript, cursor replays a text preamble), and SDK targets replay
+    history themselves so they never set it. ``resume_source_native_session``
     must be False on a cross-family switch so the store skips the fork-source
     directive (the source's native transcript is the wrong format; a clone
     attempt would fail and launch fresh). ``presentation_labels`` must reflect the TARGET
@@ -948,9 +959,10 @@ async def test_fork_no_switch_native_source_carries_history(
         # first message (its conversation is server-backed, so no local store to
         # seed for --resume) — so a same-agent fork DOES mark native carry.
         ("cursor-native", True),
-        # pi has no carry-history path yet, so it launches fresh — stamping the
-        # directive would be a false promise the runner can't keep.
-        ("pi-native", False),
+        # pi rebuilds its JSONL session file from the copied Omnigent items
+        # (it is in _FORK_HISTORY_NATIVE_HARNESSES), so a same-agent fork marks
+        # native carry — parity with claude/codex.
+        ("pi-native", True),
     ],
 )
 @pytest.mark.asyncio
@@ -959,7 +971,13 @@ async def test_fork_cursor_pi_native_carry_gating(
     harness: str,
     expect_carry: bool,
 ) -> None:
-    """A same-agent fork marks native carry for cursor (preamble) but not pi."""
+    """A same-agent fork marks native carry for both cursor and pi.
+
+    cursor carries fork history via a text preamble (its conversation is
+    server-backed, so no local store to seed for --resume); pi rebuilds its
+    JSONL session file from the copied Omnigent items. Both therefore mark
+    ``carry_history_into_native``.
+    """
     conv = _make_conversation()
     conv_store = _ConversationStore(
         conversations={"conv_src": conv},
@@ -987,11 +1005,12 @@ async def test_fork_cursor_pi_native_carry_gating(
         # valid harness ids that canonicalize_harness passes through unchanged,
         # so the carry gate must recognize them just like their canonical
         # spellings — otherwise an identically-behaving agent silently loses
-        # fork history. cursor carries (preamble); pi (either spelling) does not.
+        # fork history. cursor carries (preamble); ``native-pi`` IS aliased to
+        # ``pi-native`` (which is in the set), so it carries too (rebuild).
         ("native-claude", True),
         ("native-codex", True),
         ("native-cursor", True),
-        ("native-pi", False),
+        ("native-pi", True),
     ],
 )
 @pytest.mark.asyncio
@@ -1002,9 +1021,10 @@ async def test_fork_reversed_native_spelling_carry_gating(
 ) -> None:
     """The carry gate honors reversed native spellings like the canonical ones.
 
-    ``canonicalize_harness`` only aliases ``native-pi``; the other reversed
-    spellings pass through unchanged, so the predicate must list both forms
-    explicitly. claude/codex/cursor carry fork history; pi does not.
+    ``canonicalize_harness`` aliases ``native-pi`` to ``pi-native``; the other
+    reversed spellings pass through unchanged, so the predicate lists both
+    forms explicitly. claude/codex/cursor/pi all carry fork history (claude /
+    codex / pi via transcript rebuild, cursor via preamble).
     """
     conv = _make_conversation()
     conv_store = _ConversationStore(
@@ -1054,3 +1074,162 @@ async def test_fork_clone_reuses_source_agent_name_verbatim() -> None:
     assert conv_store.fork_calls[0]["cloned_agent_name"] == "claude-native-ui", (
         "Fork clone should reuse the source name verbatim, no '(fork …)' suffix"
     )
+
+
+@pytest.mark.asyncio
+async def test_fork_with_model_override_passes_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fork with an explicit model_override plumbs it into the store call.
+
+    The "restart with model" path: the override is validated, family-checked
+    against the fork's (codex-native) harness, and handed to
+    ``fork_conversation`` so the clone launches on the chosen model.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"conv_src": conv},
+        items_by_conv={"conv_src": [_make_item("msg_1", "Hi")]},
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_agent_cache",
+        lambda: _StubAgentCache({"ag_test": "codex-native"}),
+    )
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post(
+        "/v1/sessions/conv_src/fork",
+        json={"model_override": "databricks-gpt-5-4-mini"},
+    )
+
+    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["model_override"] == "databricks-gpt-5-4-mini", (
+        "The validated override must reach fork_conversation so the clone "
+        "launches on the chosen model."
+    )
+
+
+@pytest.mark.asyncio
+async def test_fork_with_invalid_model_override_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shell-/flag-shaped model_override is rejected before any fork."""
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"conv_src": conv},
+        items_by_conv={"conv_src": [_make_item("msg_1", "Hi")]},
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_agent_cache",
+        lambda: _StubAgentCache({"ag_test": "codex-native"}),
+    )
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post(
+        "/v1/sessions/conv_src/fork",
+        json={"model_override": "--evil"},
+    )
+
+    assert resp.status_code == 400, f"Expected 400, got {resp.status_code}: {resp.text}"
+    assert conv_store.fork_calls == [], "No fork should be created on a bad override."
+
+
+@pytest.mark.asyncio
+async def test_fork_with_cross_family_model_override_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Claude model on a codex-native fork fails the family guard (400).
+
+    codex stays single-vendor (GPT-only), so a Claude id can never route —
+    reject it at the fork gate instead of after a doomed launch.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"conv_src": conv},
+        items_by_conv={"conv_src": [_make_item("msg_1", "Hi")]},
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_agent_cache",
+        lambda: _StubAgentCache({"ag_test": "codex-native"}),
+    )
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post(
+        "/v1/sessions/conv_src/fork",
+        json={"model_override": "databricks-claude-opus-4-8"},
+    )
+
+    assert resp.status_code == 400, f"Expected 400, got {resp.status_code}: {resp.text}"
+    assert conv_store.fork_calls == [], "No fork should be created on a family mismatch."
+
+
+@pytest.mark.asyncio
+async def test_fork_model_override_rejected_when_harness_unresolvable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An override fork fails CLOSED when the fork harness can't be resolved.
+
+    If ``_agent_harness_id`` can't load the fork's bundle it returns ``None``;
+    the family guard then has nothing to check against. Rather than launch an
+    unvalidated (possibly cross-family) model, the route must reject — a bad
+    bundle must not become a hole in the family check.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"conv_src": conv},
+        items_by_conv={"conv_src": [_make_item("msg_1", "Hi")]},
+    )
+    # Harness loads fine for the OTHER route paths; only the override family
+    # check sees None (simulating an unloadable / unresolvable fork bundle).
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_agent_cache",
+        lambda: _StubAgentCache({"ag_test": "codex-native"}),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._agent_harness_id",
+        lambda _agent: None,
+    )
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post(
+        "/v1/sessions/conv_src/fork",
+        json={"model_override": "databricks-gpt-5-4-mini"},
+    )
+
+    assert resp.status_code == 400, f"Expected 400, got {resp.status_code}: {resp.text}"
+    assert conv_store.fork_calls == [], (
+        "No fork should be created when the override can't be family-checked."
+    )
+
+
+@pytest.mark.asyncio
+async def test_fork_unresolvable_harness_ok_without_model_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A normal fork (no override) is unaffected by an unresolvable harness.
+
+    The fail-closed guard only fires when an explicit ``model_override`` is
+    supplied; a plain fork must still succeed even if the harness id can't be
+    resolved (it isn't needed without an override to validate).
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"conv_src": conv},
+        items_by_conv={"conv_src": [_make_item("msg_1", "Hi")]},
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_agent_cache",
+        lambda: _StubAgentCache({"ag_test": "codex-native"}),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._agent_harness_id",
+        lambda _agent: None,
+    )
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post("/v1/sessions/conv_src/fork", json={})
+
+    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    assert len(conv_store.fork_calls) == 1
+    assert conv_store.fork_calls[0]["model_override"] is None

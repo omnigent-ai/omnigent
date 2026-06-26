@@ -33,6 +33,7 @@ the native CLI to take a turn.
 
 from __future__ import annotations
 
+import os
 import re
 
 import httpx
@@ -87,16 +88,11 @@ def _agent_id_by_name(base_url: str, name: str) -> str:
         ),
         # SDK → Codex: SAME-family native target. Same carry-history rebuild
         # path; the wrapper flips to the codex-native terminal UI.
-        pytest.param(
-            "codex-native-ui",
-            "codex-native-ui",
-            True,
-            id="sdk-to-codex",
-            marks=pytest.mark.nightly,
-        ),
-        # SDK → Pi: native, but it cannot replay fork history, so the fork
-        # must flip to the Pi terminal UI without carry-history stamped.
-        pytest.param("pi-native-ui", "pi-native-ui", False, id="sdk-to-pi"),
+        pytest.param("codex-native-ui", "codex-native-ui", True, id="sdk-to-codex"),
+        # SDK → Pi: CROSS-family native target. The runner rebuilds Pi's JSONL
+        # session file from the copied items, so carry-history is stamped and
+        # the wrapper flips to the pi-native terminal UI.
+        pytest.param("pi-native-ui", "pi-native-ui", True, id="sdk-to-pi"),
     ],
 )
 def test_fork_switch_agent_carries_history(
@@ -115,9 +111,15 @@ def test_fork_switch_agent_carries_history(
     :param expected_wrapper: TARGET ``omnigent.wrapper`` value, or ``None``
         when the target runs as plain chat (SDK).
     :param expect_carry_history: Whether the fork must stamp the
-        carry-history label (true only for native targets that can replay
-        fork history, currently claude/codex native).
+        carry-history label (true for native targets that rebuild a resumable
+        session file — claude/codex/pi native).
     """
+    # Native targets (claude-code, codex, pi) need real CLI credentials that
+    # CI does not have; skip those parametrizations when LLM_API_KEY is absent.
+    _NATIVE_TARGETS = {"claude-native-ui", "codex-native-ui", "pi-native-ui"}
+    if target_name in _NATIVE_TARGETS and not os.environ.get("LLM_API_KEY"):
+        pytest.skip(f"Fork into {target_name} needs real credentials (LLM_API_KEY).")
+
     base_url, session_id = seeded_session
     target_agent_id = _agent_id_by_name(base_url, target_name)
 
