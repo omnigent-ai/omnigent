@@ -1057,6 +1057,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "SOME_RANDOM_VAR": "x",
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
         "KUBECONFIG": "/home/alice/.kube/config",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
     }
 
     env = _build_runner_env(
@@ -1093,6 +1094,9 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
     # need it to resolve the user's cluster contexts and namespaces.
     assert env["KUBECONFIG"] == "/home/alice/.kube/config"
+    # CLAUDE_CODE_SKIP_BEDROCK_AUTH disables AWS SigV4 auth for LiteLLM
+    # proxies — a non-secret boolean, same rationale as CLAUDE_CODE_USE_BEDROCK.
+    assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env

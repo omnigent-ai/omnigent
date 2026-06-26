@@ -5168,7 +5168,116 @@ def _session_usage_data_from_params(params: dict[str, Any]) -> dict[str, int] | 
     return data
 
 
+@dataclass
+class _ForwardHealth:
+    """
+    Process-level health of Omnigent session-event forwarding (#1120).
+
+    Network failures (connect timeouts, 503s, resets) make
+    ``_post_session_event`` drop transcript/usage events after its bounded
+    retries, previously visible only as scattered per-item warnings. This
+    tracks consecutive permanent failures so a sustained outage escalates
+    to a single loud signal instead of staying effectively silent.
+
+    :param consecutive_failures: Permanent post failures since the last
+        success.
+    :param degraded_logged: Whether the degraded-sync edge has already
+        been logged for the current outage (so it logs once, not per item).
+    """
+
+    consecutive_failures: int = 0
+    degraded_logged: bool = False
+
+
+# After this many consecutive permanent forward failures, sync is treated as
+# degraded and escalated once to ERROR. Small enough to fire during a real
+# outage, large enough to ride out a transient blip the retries already cover.
+_FORWARD_DEGRADED_THRESHOLD = 5
+_forward_health = _ForwardHealth()
+
+
+def _reset_forward_health() -> None:
+    """
+    Reset forward-health tracking (test seam / new forwarder lifetime).
+
+    :returns: None.
+    """
+    global _forward_health
+    _forward_health = _ForwardHealth()
+
+
+def _note_forward_success() -> None:
+    """
+    Record a successful forward, clearing any degraded-sync state.
+
+    :returns: None.
+    """
+    if _forward_health.degraded_logged:
+        _logger.info(
+            "codex-native forward sync recovered after %d consecutive failures",
+            _forward_health.consecutive_failures,
+        )
+    _forward_health.consecutive_failures = 0
+    _forward_health.degraded_logged = False
+
+
+def _note_forward_failure(event_type: str) -> None:
+    """
+    Record a permanent forward failure; escalate once when sync degrades.
+
+    :param event_type: Session event type that failed to post, e.g.
+        ``"external_conversation_item"``.
+    :returns: None.
+    """
+    _forward_health.consecutive_failures += 1
+    if (
+        _forward_health.consecutive_failures >= _FORWARD_DEGRADED_THRESHOLD
+        and not _forward_health.degraded_logged
+    ):
+        _logger.error(
+            "codex-native forward sync degraded: %d consecutive Omnigent "
+            "event-post failures; transcript/usage mirroring may be incomplete "
+            "(latest type=%s)",
+            _forward_health.consecutive_failures,
+            event_type,
+        )
+        _forward_health.degraded_logged = True
+
+
 async def _post_session_event(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    event_type: str,
+    data: dict[str, Any],
+) -> httpx.Response | None:
+    """
+    Post one Omnigent session event, tracking forward-sync health (#1120).
+
+    Thin wrapper over :func:`_post_session_event_inner` that classifies the
+    outcome — a sub-400 response is a success; ``None`` or a >=400 final
+    response is a permanent failure — and updates :data:`_forward_health`
+    so a sustained outage escalates to a single ERROR instead of silently
+    dropping events.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param event_type: Session event type, e.g.
+        ``"external_conversation_item"``.
+    :param data: Event data payload, e.g. ``{"status": "running"}``.
+    :returns: The same value as :func:`_post_session_event_inner`.
+    """
+    response = await _post_session_event_inner(
+        client, session_id, event_type=event_type, data=data
+    )
+    if response is not None and response.status_code < 400:
+        _note_forward_success()
+    else:
+        _note_forward_failure(event_type)
+    return response
+
+
+async def _post_session_event_inner(
     client: httpx.AsyncClient,
     session_id: str,
     *,

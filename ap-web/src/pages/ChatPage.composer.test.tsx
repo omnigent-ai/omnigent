@@ -364,6 +364,66 @@ describe("Composer slash-command submit routing", () => {
     expect(screen.getAllByTestId("model-picker-item").length).toBeGreaterThan(0);
   });
 
+  it("shows the read-only model hint for bare /model on opencode-native", () => {
+    // opencode surfaces showModels (its pill mirrors the live TUI model) but
+    // has no web model options to populate a dropdown. The bare-/model intercept
+    // must NOT fire — opening an empty picker and swallowing the command was the
+    // regression. Instead it falls through to the builtin /model handler, which
+    // surfaces the current model as a read-only hint. ("/model <name>" still
+    // routes to setModel below — opencode reads model_override on the next turn,
+    // so a web switch is functional even though the picker list is empty.)
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setModel, llmModel: "openrouter/nemotron" });
+    const onSend = vi.fn();
+    render(
+      <Composer
+        {...composerProps({
+          onSend,
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "opencode",
+        })}
+      />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/model " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    // Not sent as plaintext, not a switch, and the (empty) web picker stays shut.
+    expect(onSend).not.toHaveBeenCalled();
+    expect(setModel).not.toHaveBeenCalled();
+    expect(screen.queryAllByTestId("model-picker-item")).toHaveLength(0);
+    // The builtin handler surfaced the current model as a read-only hint.
+    expect(screen.getByText(/openrouter\/nemotron/)).toBeTruthy();
+  });
+
+  it("routes /model <name> to setModel on opencode-native (functional switch)", () => {
+    // Even with an empty picker list, "/model <name>" must persist the override
+    // via setModel — the opencode executor reads model_override on the next
+    // web-injected turn. It must NOT leak to the agent as plaintext "/model …".
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setModel });
+    const onSend = vi.fn();
+    render(
+      <Composer
+        {...composerProps({
+          onSend,
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "opencode",
+        })}
+      />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/model openrouter/llama-3.3-70b" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(setModel).toHaveBeenCalledWith("openrouter/llama-3.3-70b");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
   it("routes /model <name> to setModel on claude-native sessions", () => {
     // Sent as plaintext, "/model fable" would pop Claude's "Switch model?"
     // dialog inside the vendor TUI with nothing web-side to answer it —

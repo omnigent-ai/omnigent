@@ -250,6 +250,49 @@ def test_agent_info_mcp_server_add_and_remove(
     _wait_for(lambda: not _agent_mcp_names(base_url, session_id))
 
 
+def test_agent_info_mcp_dirty_warning_after_edit(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Restart warning appears in dialog and Tools section after MCP edit."""
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+
+    _open_popover(page)
+    page.get_by_role("button", name="Manage MCP servers").click()
+    dialog = page.get_by_role("dialog").filter(has=page.get_by_text("Manage MCP Servers"))
+    expect(dialog).to_be_visible(timeout=15_000)
+
+    # No warning before any edit.
+    expect(dialog.get_by_text("Restart the session to apply your changes.")).to_be_hidden()
+
+    # Add a server to trigger the dirty state.
+    dialog.get_by_label("Name").fill("dirty-test")
+    dialog.get_by_label("URL").fill("https://example.com/sse")
+    dialog.get_by_role("button", name="Save").click()
+    _wait_for(lambda: _agent_mcp_names(base_url, session_id) == {"dirty-test"})
+
+    # Warning should now appear inside the dialog.
+    expect(dialog.get_by_text("Restart the session to apply your changes.")).to_be_visible(
+        timeout=15_000
+    )
+
+    # Close the dialog; warning should also appear in the Tools section.
+    page.keyboard.press("Escape")
+    expect(dialog).to_be_hidden(timeout=5_000)
+    _open_popover(page)
+    expect(page.get_by_text("Restart to apply changes")).to_be_visible(timeout=15_000)
+
+    # Cleanup: delete the server.
+    page.get_by_role("button", name="Manage MCP servers").click()
+    dialog = page.get_by_role("dialog").filter(has=page.get_by_text("Manage MCP Servers"))
+    expect(dialog).to_be_visible(timeout=15_000)
+    dialog.get_by_role("button", name="Delete dirty-test").click()
+    _wait_for(lambda: not _agent_mcp_names(base_url, session_id))
+
+
 def test_agent_info_mcp_server_added_to_running_session_is_callable(
     page: Page,
     seeded_session: tuple[str, str],

@@ -497,6 +497,119 @@ def test_real_gateway_still_resolves_after_hardening(
     )
 
 
+# ── Cross-surface selection: a cli-config Databricks gateway must be reachable
+#    and selectable for pi (the bug: the old pi filter excluded all cli-config) ──
+
+
+def _cli_config_databricks_pinned_pi() -> dict[str, object]:
+    """A config where the cli-config Databricks gateway is pinned ``default: [openai, pi]``.
+
+    Alongside an anthropic key that defaults only the anthropic surface, the
+    Databricks gateway explicitly claims the pi scope — which the parser now
+    accepts for a Databricks cli-config gateway. ``resolve_pi_native_provider``
+    must select the gateway (its explicit pi default wins the shared
+    selection), NOT api.anthropic.com.
+    """
+    return {
+        "providers": {
+            "anthropic": {
+                "kind": "key",
+                "default": "anthropic",
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "sk-test-literal",
+                },
+            },
+            "codex-databricks": {
+                "kind": "cli-config",
+                "default": ["openai", "pi"],
+                "cli": "codex",
+                "model_provider": "Databricks",
+                "display_name": "Databricks AI Gateway",
+            },
+        }
+    }
+
+
+def test_explicit_pi_pin_selects_cli_config_databricks_over_anthropic_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An explicit ``default: pi`` on a cli-config Databricks gateway wins for pi.
+
+    Even with an anthropic key present (its own anthropic-surface default), the
+    Databricks gateway pinned to the pi scope must be the pi selection — proving
+    the parser accepts ``default: [openai, pi]`` for a Databricks cli-config AND
+    the shared selection routes pi to it (base_url is the gateway's /anthropic
+    surface, NOT api.anthropic.com).
+    """
+    _write_codex_config(tmp_path, _DATABRICKS_CODEX_CONFIG)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_pinned_pi)
+
+    assert provider is not None
+    assert (
+        provider.base_url == "https://1965859176160743.ai-gateway.cloud.databricks.com/anthropic"
+    )
+    assert provider.api == "anthropic-messages"
+    assert provider.auth_header is True
+    assert provider.api_key == (
+        "!jq -r .access_token /Users/me/.databricks/model-serving-token.json"
+    )
+    # NOT the anthropic key endpoint.
+    assert provider.base_url != "https://api.anthropic.com"
+
+
+def test_cli_config_databricks_as_sole_default_selected_for_pi(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cli-config Databricks gateway as the only openai default is selected for pi.
+
+    No explicit pi default and no anthropic default: the shared pi fallback
+    reaches the openai default, and because it is a pi-consumable Databricks
+    gateway, selection no longer skips it (the bug: the old filter excluded all
+    cli-config from pi). Pi routes to the gateway's /anthropic surface.
+    """
+    _write_codex_config(tmp_path, _DATABRICKS_CODEX_CONFIG)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
+
+    assert provider is not None
+    assert (
+        provider.base_url == "https://1965859176160743.ai-gateway.cloud.databricks.com/anthropic"
+    )
+
+
+def test_non_databricks_cli_config_not_selected_for_pi_via_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A NON-Databricks cli-config openai default is NOT selected for pi (falls back).
+
+    A generic (non-Databricks) cli-config provider cannot serve pi, so the pi
+    fallback must skip it rather than select it (selecting it would just drop to
+    Pi's own login). With no other pi-consumable default, resolution returns
+    None.
+    """
+    _write_codex_config(
+        tmp_path,
+        """
+model_provider = "Databricks"
+
+[model_providers.Databricks]
+name = "Some Other Proxy"
+base_url = "https://proxy.example.com/v1"
+
+[model_providers.Databricks.auth]
+command = "printf"
+args = ["%s", "sk-static"]
+""",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # codex-databricks here points at a non-Databricks proxy → not pi-consumable.
+    assert creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config) is None
+
+
 @pytest.mark.parametrize(
     "gateway_url",
     [

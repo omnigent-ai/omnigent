@@ -6,6 +6,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckIcon,
   CopyIcon,
+  AlertTriangleIcon,
   PencilIcon,
   InfoIcon,
   PlusIcon,
@@ -730,11 +731,15 @@ function McpServerManagerDialog({
   servers,
   open,
   onOpenChange,
+  dirty,
+  onDirty,
 }: {
   sessionId: string;
   servers: McpServerSummary[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  dirty: boolean;
+  onDirty: () => void;
 }) {
   const [form, setForm] = useState<McpFormState>(EMPTY_MCP_FORM);
   const [formError, setFormError] = useState<string | null>(null);
@@ -751,6 +756,7 @@ function McpServerManagerDialog({
   }
 
   function notifyRestart() {
+    onDirty();
     showToast(
       <span className="text-sm">MCP servers updated. Restart the session to apply changes.</span>,
     );
@@ -797,6 +803,12 @@ function McpServerManagerDialog({
           <DialogTitle>Manage MCP Servers</DialogTitle>
           <DialogDescription>Add, edit, or remove MCP servers for this session.</DialogDescription>
         </DialogHeader>
+        {dirty && (
+          <div className="flex items-center gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-700 dark:text-yellow-400">
+            <AlertTriangleIcon className="size-4 shrink-0" />
+            Restart the session to apply your changes.
+          </div>
+        )}
         <div className="grid gap-4 pt-1 md:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
           <div className="flex min-w-0 flex-col gap-1.5">
             <SectionLabel>Servers</SectionLabel>
@@ -959,6 +971,16 @@ function McpServersSection({
   editable: boolean;
 }) {
   const [managerOpen, setManagerOpen] = useState(false);
+  const [mcpDirty, setMcpDirty] = useState(false);
+  const sessionStatus = useChatStore((s) => s.sessionStatus);
+  // Clear the dirty flag when the session restarts (launching picks up
+  // the updated MCP config) or when the user navigates to another session.
+  useEffect(() => {
+    if (sessionStatus === "launching") setMcpDirty(false);
+  }, [sessionStatus]);
+  useEffect(() => {
+    setMcpDirty(false);
+  }, [sessionId]);
   const canEdit = !!(sessionId && editable);
   const deleteServer = useDeleteMcpServer(canEdit ? sessionId : "");
   const showSection = servers.length > 0 || canEdit;
@@ -980,6 +1002,12 @@ function McpServersSection({
           </button>
         )}
       </div>
+      {mcpDirty && (
+        <p className="flex items-center gap-1 text-xs text-yellow-700 dark:text-yellow-400">
+          <AlertTriangleIcon className="size-3 shrink-0" />
+          Restart to apply changes
+        </p>
+      )}
       {servers.length > 0 ? (
         <McpServerList
           servers={servers}
@@ -987,12 +1015,14 @@ function McpServersSection({
             canEdit
               ? (name) =>
                   deleteServer.mutate(name, {
-                    onSuccess: () =>
+                    onSuccess: () => {
+                      setMcpDirty(true);
                       showToast(
                         <span className="text-sm">
                           MCP servers updated. Restart the session to apply changes.
                         </span>,
-                      ),
+                      );
+                    },
                   })
               : undefined
           }
@@ -1006,6 +1036,8 @@ function McpServersSection({
           servers={servers}
           open={managerOpen}
           onOpenChange={setManagerOpen}
+          dirty={mcpDirty}
+          onDirty={() => setMcpDirty(true)}
         />
       )}
     </div>
@@ -1062,15 +1094,17 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
                 <PopoverContent
                   side="top"
                   align="start"
-                  className="w-64"
+                  className="max-w-72"
                   onClick={(e) => e.stopPropagation()}
                 >
                   <div className="flex flex-col gap-2">
                     <div className="flex items-center gap-1.5">
                       <ShieldCheckIcon className="size-3.5 text-muted-foreground" />
-                      <span className="font-medium text-sm">{p.name}</span>
+                      <span className="min-w-0 break-all font-medium text-sm">{p.name}</span>
                     </div>
-                    {description && <p className="text-xs text-muted-foreground">{description}</p>}
+                    {description && (
+                      <p className="break-words text-xs text-muted-foreground">{description}</p>
+                    )}
                     <button
                       type="button"
                       onClick={() => p.id && deletePolicy.mutate(p.id)}
