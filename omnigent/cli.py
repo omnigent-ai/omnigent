@@ -11707,7 +11707,11 @@ def _workspace_api_server_url(server: str) -> str:
 
     import httpx as _httpx
 
-    from omnigent.conversation_browser import WORKSPACE_API_PATH, WORKSPACE_UI_PATH
+    from omnigent.conversation_browser import (
+        WORKSPACE_API_PATH,
+        WORKSPACE_UI_PATH,
+        display_server_url,
+    )
 
     server = server.rstrip("/")
     parsed = urlsplit(server)
@@ -11751,7 +11755,9 @@ def _workspace_api_server_url(server: str) -> str:
     except _httpx.HTTPError:
         return server
     if _workspace_mount_probe_matches(candidate, api_probe):
-        click.echo(f"Using {candidate} (Databricks workspace-hosted omnigent).")
+        click.echo(
+            f"Using {display_server_url(candidate)} (Databricks workspace-hosted omnigent)."
+        )
         return candidate
     # The anonymous probe came back inconclusive (404 on Azure even
     # when the mount exists). Retry it with a cached workspace bearer;
@@ -11769,7 +11775,9 @@ def _workspace_api_server_url(server: str) -> str:
         except _httpx.HTTPError:
             authed_probe = None
         if authed_probe is not None and _workspace_mount_probe_matches(candidate, authed_probe):
-            click.echo(f"Using {candidate} (Databricks workspace-hosted omnigent).")
+            click.echo(
+                f"Using {display_server_url(candidate)} (Databricks workspace-hosted omnigent)."
+            )
             return candidate
         click.echo(
             f"Note: {server} answers like a Databricks workspace, but "
