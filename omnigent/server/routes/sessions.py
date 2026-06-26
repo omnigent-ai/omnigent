@@ -87,7 +87,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
-from omnigent.model_override import validate_model_override
+from omnigent.model_override import model_family_mismatch, validate_model_override
 from omnigent.native_coding_agents import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
@@ -242,6 +242,7 @@ from omnigent.server.schemas import (
     SessionSandboxStatusEvent,
     SessionSkillsEvent,
     SessionStatusEvent,
+    SessionSupersededEvent,
     SessionSwitchAgentRequest,
     SessionTerminalPendingEvent,
     SessionTodosEvent,
@@ -265,6 +266,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
+    PROJECT_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
@@ -344,6 +346,16 @@ _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE: str = "external_output_reasoning_delta"
 # explicit ``session.interrupted`` edge observed outside the Omnigent
 # task runtime. Payload is empty.
 _EXTERNAL_SESSION_INTERRUPTED_TYPE: str = "external_session_interrupted"
+
+# Internal input used by the claude-native forwarder when a Claude
+# ``/clear`` rotates a session away: the old conversation keeps its
+# history but the live terminal moves to a fresh conversation. Republished
+# as a transient ``session.superseded`` SSE event so a client actively
+# viewing the old conversation auto-redirects to the new one. Live-only
+# (no replay) — the durable counterpart is the persisted notice message
+# the forwarder also appends to the old conversation. Payload:
+# ``{"target_conversation_id": "conv_new"}``.
+_EXTERNAL_SESSION_SUPERSEDED_TYPE: str = "external_session_superseded"
 
 # Internal input used by Codex-native forwarders to clear a harness
 # elicitation that another Codex client already answered. Payload:
@@ -791,6 +803,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
     _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
+    _EXTERNAL_SESSION_SUPERSEDED_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
@@ -5408,6 +5421,49 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
     session_stream.publish(session_id, payload)
 
 
+def _publish_session_superseded(session_id: str, target_conversation_id: str) -> None:
+    """
+    Publish a ``session.superseded`` event to the live stream.
+
+    Emitted when a Claude ``/clear`` rotates a session away (see
+    ``_post_clear_supersession`` in
+    ``omnigent/claude_native_forwarder.py``): a client actively viewing
+    ``session_id`` follows to ``target_conversation_id``. Live-only —
+    there is no SSE replay, so a client connecting after the rotation
+    relies on the persisted notice message instead.
+
+    :param session_id: The superseded (old) conversation id whose stream
+        should receive the event, e.g. ``"conv_old"``.
+    :param target_conversation_id: The conversation to redirect to, e.g.
+        ``"conv_new"``.
+    """
+    event = SessionSupersededEvent(
+        type="session.superseded",
+        conversation_id=session_id,
+        target_conversation_id=target_conversation_id,
+        reason="clear",
+    )
+    session_stream.publish(session_id, event.model_dump())
+    # Discard any unconsumed pending inputs on the superseded session — notably
+    # the ``/clear`` the user typed in the web UI. ``/clear`` is never mirrored
+    # back as a committed item (the session rotated away), so its pending entry
+    # would otherwise linger forever as a stuck optimistic bubble, re-hydrating
+    # from the snapshot on every reload of the old chat. Live viewers already
+    # drop the bubble on the ``session.superseded`` event above; this stops it
+    # coming back. We deliberately do NOT emit ``session.input.consumed`` (that
+    # would commit ``/clear`` as a user message) — the persisted clear notice
+    # already explains the rotation, so the input is simply abandoned.
+    discarded = 0
+    while pending_inputs.resolve_oldest(session_id) is not None:
+        discarded += 1
+    if discarded:
+        _logger.info(
+            "Discarded %d unconsumed pending input(s) on superseded session %s",
+            discarded,
+            session_id,
+        )
+
+
 async def _get_runner_client(
     session_id: str,
     runner_router: RunnerRouter | None,
@@ -9731,6 +9787,34 @@ def _same_provider_family(a: Agent, b: Agent) -> bool:
     return family_a is not None and family_a == _agent_provider_family(b)
 
 
+def _agent_harness_id(agent: Agent) -> str | None:
+    """Return an agent's canonical harness id, or ``None`` when unloadable.
+
+    Used to family-check a fork's explicit ``model_override`` against the
+    harness the fork will actually run (e.g. reject a Claude model on a
+    codex-native fork). ``None`` when the bundle can't be loaded — the
+    caller then skips the family guard (the runner's fail-loud launch
+    remains the safety net) rather than blocking the fork.
+
+    :param agent: The agent whose harness to resolve, e.g. the fork's
+        base agent.
+    :returns: The canonical harness id, e.g. ``"codex-native"``, or
+        ``None`` when the bundle can't be loaded.
+    """
+    try:
+        spec = (
+            get_agent_cache()
+            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .spec
+        )
+    except Exception:  # noqa: BLE001 — unloadable bundle → skip the family guard
+        return None
+    from omnigent.harness_aliases import canonicalize_harness
+
+    harness_kind = spec.executor.harness_kind
+    return canonicalize_harness(harness_kind) or harness_kind
+
+
 def _agent_is_native(agent: Agent) -> bool:
     """Return whether an agent runs a native CLI harness.
 
@@ -9773,7 +9857,15 @@ def _agent_is_native(agent: Agent) -> bool:
 # text preamble (see _CURSOR_FORK_HISTORY_HARNESSES below) — switch-agent keeps
 # the current fresh-launch behavior.
 _FORK_HISTORY_NATIVE_HARNESSES: frozenset[str] = frozenset(
-    {"claude-native", "native-claude", "codex-native", "native-codex", "pi-native"}
+    {
+        "claude-native",
+        "native-claude",
+        "codex-native",
+        "native-codex",
+        "hermes-native",
+        "native-hermes",
+        "pi-native",
+    }
 )
 
 # Native harnesses that carry FORK history as a text preamble (text-prefix
@@ -11595,6 +11687,25 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    # Persisted effort reaches a native CLI as a ``--effort`` argv element
+    # at terminal launch (and SDK harnesses via the spawn env). Validate
+    # against the shared vocabulary before any row exists; provider-specific
+    # support (e.g. ANTHROPIC_EFFORTS) is enforced downstream at launch,
+    # mirroring the multipart metadata create path.
+    reasoning_effort: str | None = None
+    if body.reasoning_effort is not None:
+        try:
+            reasoning_effort = validate_effort(
+                body.reasoning_effort,
+                "session metadata",
+                EFFORT_VALUES,
+            )
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid reasoning_effort: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+
     # Validated before any row exists so a bad value never creates an
     # orphan session; None (unset) defers to the spec default.
     cost_control_mode_override = _validated_cost_control_mode_override(
@@ -11732,6 +11843,7 @@ async def _create_session_from_existing_agent(
         raise
     if (
         model_override is not None
+        or reasoning_effort is not None
         or cost_control_mode_override is not None
         or harness_override is not None
     ):
@@ -11743,6 +11855,7 @@ async def _create_session_from_existing_agent(
             conversation_store.update_conversation,
             conv.id,
             model_override=model_override,
+            reasoning_effort=reasoning_effort,
             cost_control_mode_override=cost_control_mode_override,
             harness_override=harness_override,
         )
@@ -13463,6 +13576,35 @@ def create_sessions_router(
             )
         return result
 
+    # ── GET /sessions/projects ────────────────────────────────────
+    #
+    # MUST be registered before ``GET /sessions/{session_id}``: FastAPI
+    # matches routes in registration order, so a literal ``/sessions/projects``
+    # would otherwise be captured by the ``{session_id}`` path param and 404
+    # as a missing conversation.
+
+    @router.get(
+        "/sessions/projects",
+        response_model=None,
+    )
+    async def list_session_projects(
+        request: Request,
+    ) -> list[str]:
+        """
+        Return all project names for the authenticated user, ordered
+        alphabetically.
+
+        Projects are implicit: they exist while at least one session
+        has a ``conversation_labels`` row with ``key="omni_project"``.
+
+        :returns: List of project names.
+        """
+        user_id = _require_user(request, auth_provider)
+        return await asyncio.to_thread(
+            conversation_store.list_projects,
+            accessible_by=user_id,
+        )
+
     # ── GET /sessions/{session_id} ───────────────────────────────
 
     @router.get(
@@ -13594,6 +13736,7 @@ def create_sessions_router(
         search_query: str | None = Query(default=None),
         include_archived: bool = Query(default=False),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
+        project: str | None = Query(default=None),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -13670,6 +13813,7 @@ def create_sessions_router(
             sort_by=sort_by,
             search_query=normalized_query,
             include_archived=include_archived,
+            project=project,
         )
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.
@@ -14449,6 +14593,12 @@ def create_sessions_router(
                 _codex_plan_enabled,
                 _runner_result,
             )
+        # The project label is special: an empty-string value means "remove
+        # from project" (delete the label row) rather than upsert an empty value.
+        # Split it out before the bulk upsert so other labels are unaffected.
+        if labels_to_set and labels_to_set.get(PROJECT_LABEL_KEY) == "":
+            labels_to_set = {k: v for k, v in labels_to_set.items() if k != PROJECT_LABEL_KEY}
+            await asyncio.to_thread(conversation_store.delete_label, session_id, PROJECT_LABEL_KEY)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
         if requested_codex_collaboration_mode is not None:
@@ -14594,6 +14744,37 @@ def create_sessions_router(
         cloned_agent_id = generate_agent_id()
         cloned_agent_name = base_agent.name
 
+        # An explicit "restart with model" override for the fork. Validated
+        # (charset/length) and family-checked against the harness the fork
+        # will actually run, so a bad or cross-family id (e.g. a Claude model
+        # on a codex-native fork) fails loud here rather than after launch.
+        # Wins over the source's copied model in the store.
+        fork_model_override: str | None = None
+        if body.model_override is not None:
+            try:
+                fork_model_override = validate_model_override(body.model_override)
+            except ValueError as exc:
+                raise OmnigentError(
+                    f"invalid model_override: {exc}",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
+            base_harness = await asyncio.to_thread(_agent_harness_id, base_agent)
+            # Fail CLOSED: if the fork harness can't be resolved we can't
+            # family-check the override, so reject rather than launch an
+            # unvalidated cross-family model. (Only when an override was
+            # actually supplied — a normal fork with no override is
+            # unaffected by an unloadable bundle here.)
+            if base_harness is None:
+                raise OmnigentError(
+                    "cannot validate model_override: the fork's harness could not "
+                    "be resolved. Retry without a model override to keep the "
+                    "source's model.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            mismatch = model_family_mismatch(base_harness, fork_model_override)
+            if mismatch is not None:
+                raise OmnigentError(mismatch, code=ErrorCode.INVALID_INPUT)
+
         # A model id is provider-bound, so the source's model_override /
         # reasoning_effort only carry over when the switch stays in the same
         # provider family. A cross-family switch (or an undeterminable
@@ -14656,6 +14837,7 @@ def create_sessions_router(
                 cloned_agent_bundle_location=base_agent.bundle_location,
                 cloned_agent_description=base_agent.description,
                 copy_model_settings=copy_model_settings,
+                model_override=fork_model_override,
                 carry_history_into_native=carry_history_into_native,
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
@@ -17549,6 +17731,7 @@ def create_sessions_router(
             _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
             _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
             _EXTERNAL_SESSION_INTERRUPTED_TYPE,
+            _EXTERNAL_SESSION_SUPERSEDED_TYPE,
             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
             _EXTERNAL_SESSION_STATUS_TYPE,
             _EXTERNAL_SESSION_USAGE_TYPE,
@@ -17926,6 +18109,16 @@ def create_sessions_router(
                     code=ErrorCode.INVALID_INPUT,
                 )
             _publish_interrupted(session_id, response_id=response_id)
+            return {"queued": False}
+        if body.type == _EXTERNAL_SESSION_SUPERSEDED_TYPE:
+            target_conversation_id = body.data.get("target_conversation_id")
+            if not isinstance(target_conversation_id, str) or not target_conversation_id.strip():
+                raise OmnigentError(
+                    "external_session_superseded requires a non-empty string "
+                    "data.target_conversation_id",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            _publish_session_superseded(session_id, target_conversation_id.strip())
             return {"queued": False}
         if body.type == _EXTERNAL_ELICITATION_RESOLVED_TYPE:
             elicitation_id = body.data.get("elicitation_id")
@@ -19196,6 +19389,14 @@ def create_sessions_router(
             raise OmnigentError(
                 f"Agent not found: {conv.agent_id!r}",
                 code=ErrorCode.NOT_FOUND,
+            )
+
+        # Shared/template agents are read-only here;
+        # mirrors the guard in session_mcp_servers._editable_agent.
+        if agent.session_id is None:
+            raise OmnigentError(
+                "Built-in agents are read-only through this endpoint.",
+                code=ErrorCode.INVALID_INPUT,
             )
 
         bundle_bytes = await bundle.read()

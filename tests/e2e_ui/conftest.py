@@ -65,6 +65,7 @@ from tests.e2e_ui.url_safety import DEV_PORTS, unsafe_ui_base_url_reason
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ALLOW_DEV_BASE_URL_ENV = "OMNIGENT_E2E_ALLOW_DEV_BASE_URL"
 _CODEX_GOAL_MIN_VERSION = (0, 139, 0)
+_PUBLIC_LOOPBACK_HOST = "omnigent-e2e-public.test"
 
 
 def open_right_rail(page: Page) -> None:
@@ -269,6 +270,10 @@ def browser_type_launch_args(
         launch_args["headless"] = True
     elif not pytestconfig.getoption("--headed", default=False):
         launch_args.setdefault("headless", True)
+    launch_args["args"] = [
+        *launch_args.get("args", []),
+        f"--host-resolver-rules=MAP {_PUBLIC_LOOPBACK_HOST} 127.0.0.1",
+    ]
     # The pinned Playwright Docker image (the visual-snapshot renderer, both in
     # ui-snapshot.yml and the local regen script) runs as root, where Chromium
     # refuses to start without --no-sandbox; --disable-dev-shm-usage avoids the
@@ -1386,16 +1391,21 @@ def terminal_session(
     try:
         yield (live_server, session_id)
     finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        # Restore the "found" state: if we respawned the runner (a prior
-        # test had killed it), tear our copy down so it doesn't outlive us.
-        if respawned_runner is not None:
-            respawned_runner.terminate()
+        try:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        finally:
             try:
-                respawned_runner.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                respawned_runner.kill()
-                respawned_runner.wait(timeout=5)
+                reset_mock_llm(mock_llm_server_url)
+            finally:
+                # Restore the "found" state: if we respawned the runner (a prior
+                # test had killed it), tear our copy down so it doesn't outlive us.
+                if respawned_runner is not None:
+                    respawned_runner.terminate()
+                    try:
+                        respawned_runner.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        respawned_runner.kill()
+                        respawned_runner.wait(timeout=5)
 
 
 _TWO_AGENT_PARENT_NAME = "hitchhikers_chat"

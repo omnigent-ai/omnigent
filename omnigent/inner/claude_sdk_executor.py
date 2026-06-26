@@ -2443,18 +2443,37 @@ class ClaudeSDKExecutor(Executor):
                                 error_status in {401, 403}
                                 or retry_error == "authentication_failed"
                             ):
+                                if self._gateway_uses_databricks_profile:
+                                    auth_hint = "Check your selected ~/.databrickscfg profile."
+                                elif self._gateway:
+                                    auth_hint = (
+                                        "Check your provider's base URL and auth command "
+                                        "(ANTHROPIC_BASE_URL / gateway auth)."
+                                    )
+                                else:
+                                    auth_hint = (
+                                        "Check your Claude CLI login status "
+                                        "(`claude /status`) or API key configuration."
+                                    )
                                 terminal_error = (
                                     "Claude SDK provider authentication failed"
                                     f" ({retry_error}, status={error_status}). "
-                                    "Check your selected ~/.databrickscfg profile."
+                                    f"{auth_hint}"
                                 )
                                 break
 
                             if error_status == 404:
+                                if self._gateway:
+                                    endpoint_hint = (
+                                        "Check ANTHROPIC_BASE_URL / gateway endpoint "
+                                        "configuration."
+                                    )
+                                else:
+                                    endpoint_hint = "Check ANTHROPIC_BASE_URL configuration."
                                 terminal_error = (
                                     "Claude SDK provider endpoint was not found "
                                     f"({retry_error}, status={error_status}). "
-                                    "Check ANTHROPIC_BASE_URL / Databricks endpoint configuration."
+                                    f"{endpoint_hint}"
                                 )
                                 break
                         elif getattr(system_msg, "hook_event_name", None) == "PreCompact":

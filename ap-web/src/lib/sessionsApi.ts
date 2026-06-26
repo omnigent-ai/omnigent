@@ -480,14 +480,24 @@ export async function createBundledSession(
  * @param upToResponseId - Optional truncation point, e.g. "resp_abc". When
  *   set, the fork copies history only up to and including that response
  *   ("fork from here"); omitted, the full history is copied.
+ * @param modelOverride - Optional model id to launch the fork on, e.g.
+ *   "databricks-gpt-5-4-mini" — the "restart with model" path. Overrides
+ *   the model the fork would inherit from the source; the server validates
+ *   and family-checks it. Omitted → keep the source's model.
  */
 export async function forkSession(
   sourceId: string,
   title?: string,
   agentId?: string,
   upToResponseId?: string,
+  modelOverride?: string,
 ): Promise<Session> {
-  const body: { title?: string; agent_id?: string; up_to_response_id?: string } = {};
+  const body: {
+    title?: string;
+    agent_id?: string;
+    up_to_response_id?: string;
+    model_override?: string;
+  } = {};
   if (title !== undefined) {
     body.title = title;
   }
@@ -496,6 +506,9 @@ export async function forkSession(
   }
   if (upToResponseId !== undefined) {
     body.up_to_response_id = upToResponseId;
+  }
+  if (modelOverride !== undefined) {
+    body.model_override = modelOverride;
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",

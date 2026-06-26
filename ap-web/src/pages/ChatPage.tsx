@@ -85,7 +85,11 @@ import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useIOSNativeKeyboardVisible } from "@/hooks/useIOSNativeKeyboardInset";
 import type { MessageContentBlock } from "@/lib/blocks";
-import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import {
+  derivePermissionLevel,
+  isOwnerLevel,
+  isSessionSharedWithOthers,
+} from "@/lib/permissionsApi";
 import {
   type Bubble,
   type RenderItem,
@@ -380,21 +384,6 @@ export function shouldShowAuthorBadge(
   return isSessionShared && author !== undefined && author !== viewerId;
 }
 
-// Shared = someone other than the viewer can see the session: another
-// principal owns it (shared with the viewer), or the viewer owns it and
-// granted access to a non-viewer principal (a user or the __public__
-// sentinel). ownerGrants is undefined until loaded / when the viewer
-// isn't the owner and can't read the manage-only grant list.
-export function isSessionSharedWithOthers(
-  owner: string | null,
-  viewerId: string | null,
-  ownerGrants: readonly { user_id: string }[] | undefined,
-): boolean {
-  if (owner !== null && viewerId !== null && owner !== viewerId) return true;
-  const viewerOwnsSession = owner !== null && owner === viewerId;
-  return viewerOwnsSession && (ownerGrants ?? []).some((g) => g.user_id !== viewerId);
-}
-
 // Author labels render only in a shared session; ChatPage provides the
 // value and UserBubble reads it, so the gate lives in one place.
 const SessionSharedContext = createContext(false);
@@ -526,6 +515,22 @@ export function ChatPage() {
   useEffect(() => {
     void useChatStore.getState().switchTo(urlConvId ?? null);
   }, [urlConvId]);
+
+  // Server-driven redirect: when the active conversation is superseded
+  // (a `session.superseded` event — e.g. a Claude `/clear` rotated it
+  // away), the store records the follow-to target in
+  // `redirectToConversationId`. Perform the router navigation here (the
+  // store can't), replacing history so Back doesn't return to the
+  // cleared session, then clear the flag so it fires exactly once. Skip
+  // when we're already on the target URL.
+  const redirectToConversationId = useChatStore((s) => s.redirectToConversationId);
+  useEffect(() => {
+    if (!redirectToConversationId) return;
+    if (redirectToConversationId !== urlConvId) {
+      navigate(`/c/${redirectToConversationId}`, { replace: true });
+    }
+    useChatStore.setState({ redirectToConversationId: null });
+  }, [redirectToConversationId, urlConvId, navigate]);
 
   // Pull the first message the landing composer stashed for this conversation,
   // if any. Read-once (consume deletes), so a refresh/back can't replay

@@ -479,6 +479,12 @@ class _CodexNativeLaunchConfig:
         rollout exists to clone (an SDK or cross-family source) the runner
         builds the clone's rollout from the copied Omnigent items instead (see
         ``_ensure_local_codex_resume_rollout``).
+    :param bypass_sandbox: ``True`` when the session opted into Codex's
+        DANGEROUS full-bypass stance (``omnigent.codex_native.bypass_sandbox``
+        label == ``"1"``). The runner then launches the ``--remote`` TUI with
+        ``--dangerously-bypass-approvals-and-sandbox`` and aligns the
+        app-server threads (no approval prompts, no command sandbox). Default
+        ``False``. See issue #657.
     """
 
     workspace: Path
@@ -489,6 +495,7 @@ class _CodexNativeLaunchConfig:
     fork_source_id: str | None
     fork_source_external_id: str | None
     fork_carry_history: bool
+    bypass_sandbox: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -524,6 +531,7 @@ class _PiNativeLaunchConfig:
     server_url: str
     terminal_launch_args: list[str] | None
     external_session_id: str | None
+    fork_source_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
     model_override: str | None = None
@@ -721,12 +729,17 @@ async def _pi_native_launch_config(
     from omnigent.stores.conversation_store import (
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+        FORK_SOURCE_LABEL_KEY,
     )
 
+    fork_source_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history = False
     labels = snapshot.get("labels")
     if isinstance(labels, dict):
+        _fsi = labels.get(FORK_SOURCE_LABEL_KEY)
+        if isinstance(_fsi, str) and _fsi:
+            fork_source_id = _fsi
         _fse = labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
         if isinstance(_fse, str) and _fse:
             fork_source_external_id = _fse
@@ -746,6 +759,7 @@ async def _pi_native_launch_config(
         server_url=os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
         terminal_launch_args=terminal_launch_args,
         external_session_id=external_session_id,
+        fork_source_id=fork_source_id,
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         model_override=model_override,
@@ -829,6 +843,7 @@ async def _codex_native_launch_config(
     # the clone has no external_session_id of its own yet (see the
     # fork-source branch in _auto_create_codex_terminal); inert otherwise.
     from omnigent.stores.conversation_store import (
+        CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
         FORK_SOURCE_LABEL_KEY,
@@ -837,6 +852,10 @@ async def _codex_native_launch_config(
     fork_source_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history = False
+    # DANGEROUS opt-in: full approval/sandbox bypass, stored as a plain
+    # conversation label ("1" to enable). Read here so the runner applies
+    # it at launch; any other value (incl. absent) leaves the normal stance.
+    bypass_sandbox = False
     labels = snapshot.get("labels")
     if isinstance(labels, dict):
         _fsi = labels.get(FORK_SOURCE_LABEL_KEY)
@@ -846,6 +865,7 @@ async def _codex_native_launch_config(
         if isinstance(_fse, str) and _fse:
             fork_source_external_id = _fse
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
+        bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
     return _CodexNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
         policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
@@ -855,6 +875,7 @@ async def _codex_native_launch_config(
         fork_source_id=fork_source_id,
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
+        bypass_sandbox=bypass_sandbox,
     )
 
 
@@ -1798,12 +1819,33 @@ async def _auto_create_pi_terminal(
     auth_factory = _make_auth_token_factory()
     auth_token = auth_factory() if auth_factory is not None else None
     auth_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    # Build the Omnigent tool surface (sys_* tools) the Pi extension registers
+    # via pi.registerTool. Reuses the same schema set the claude-native /
+    # codex-native relay advertises, gated by the session's spec. Each tool's
+    # execute() round-trips through POST /v1/sessions/{id}/mcp, so the Pi agent
+    # can call Omnigent tools with centralized server-side policy enforcement
+    # — parity with the other native harnesses. Best-effort: a schema-build
+    # failure must not block the terminal launch, so fall back to no tools.
+    pi_tools: list[dict[str, Any]] = []
+    try:
+        from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
+
+        spec_for_tools = _unwrap_resolved_spec(agent_spec)
+        pi_tools = build_native_relay_tool_schemas(spec_for_tools)
+    except Exception:  # noqa: BLE001 — tool registration is additive
+        _logger.warning(
+            "Failed to build pi-native tool schemas for session %s; "
+            "Pi will run with its built-in tools only",
+            session_id,
+            exc_info=True,
+        )
     _extension, config = write_extension_files(
         bridge_dir,
         session_id=session_id,
         server_url=launch_config.server_url,
         conversation_url=conversation_url(launch_config.server_url, session_id),
         auth_headers=auth_headers,
+        tools=pi_tools,
     )
     pi_command = resolve_pi_executable()
     # Rebuild the local Pi session JSONL from committed Omnigent items so a
@@ -2393,10 +2435,76 @@ async def _auto_create_hermes_terminal(
     # cursor (clear_hermes_bridge_state above) starts it at that row's first row.
     launch_epoch_s = time.time()
     hermes_args = [*(launch_config.terminal_launch_args or [])]
+    # Resolve the per-session HERMES_HOME early: the fork block below needs it
+    # to place the cloned state.db, and the env block after needs it for the
+    # HERMES_HOME env var.
+    _hermes_home_path = read_hermes_home(bridge_dir)
+    # Fork with history: clone the source Hermes session's state.db into the
+    # new session's HERMES_HOME so the TUI loads the prior conversation context
+    # under a fresh session id (true fork, not a shared --resume).
+    if launch_config.fork_carry_history and launch_config.fork_source_external_id:
+        from omnigent.hermes_native_bridge import (
+            clone_hermes_session,
+            mint_hermes_session_id,
+        )
+
+        # Resolve the source session's state.db from its bridge dir.
+        _source_bridge = (
+            bridge_dir_for_session_id(launch_config.fork_source_id)
+            if launch_config.fork_source_id
+            else None
+        )
+        _source_hermes_home = read_hermes_home(_source_bridge) if _source_bridge else None
+        _source_db = _source_hermes_home / "state.db" if _source_hermes_home else None
+        if _source_db is not None and _source_db.is_file():
+            _target_session_id = mint_hermes_session_id()
+            _target_db = _hermes_home_path / "state.db" if _hermes_home_path else None
+            if _target_db is not None:
+                try:
+                    _clone_max_id = await asyncio.to_thread(
+                        clone_hermes_session,
+                        _source_db,
+                        _target_db,
+                        launch_config.fork_source_external_id,
+                        _target_session_id,
+                        workspace=workspace,
+                    )
+                    hermes_args.extend(["--resume", _target_session_id])
+                    # Pre-seed the forwarder cursor past cloned messages so
+                    # the forwarder only mirrors NEW messages (Omnigent already
+                    # has the cloned ones from the fork item copy).
+                    if _clone_max_id > 0:
+                        from omnigent.hermes_native_forwarder import (
+                            _ForwardState,
+                            _write_state,
+                        )
+
+                        _write_state(
+                            bridge_dir,
+                            _ForwardState(
+                                hermes_session_id=_target_session_id,
+                                last_id=_clone_max_id,
+                                launch_epoch_s=launch_epoch_s,
+                            ),
+                        )
+                    _logger.info(
+                        "Cloned hermes session %s -> %s for fork; session=%s",
+                        launch_config.fork_source_external_id,
+                        _target_session_id,
+                        session_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    _logger.warning(
+                        "Failed to clone hermes session for fork; launching fresh; session=%s",
+                        session_id,
+                        exc_info=True,
+                    )
+                    # Remove broken state.db so Hermes starts fresh.
+                    if _target_db.exists():
+                        _target_db.unlink()
     # If a per-session HERMES_HOME was written (policy hook), pass it via env
     # so the TUI picks up the hook config alongside its own approval prompt.
     _hermes_terminal_env: dict[str, str] = {}
-    _hermes_home_path = read_hermes_home(bridge_dir)
     if _hermes_home_path is not None:
         _hermes_terminal_env["HERMES_HOME"] = str(_hermes_home_path)
     terminal_view = await resource_registry.launch_required_terminal(
@@ -2782,8 +2890,14 @@ async def _auto_create_qwen_terminal(
     server_url = _required_runner_env("RUNNER_SERVER_URL")
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
-    from omnigent.qwen_native_forwarder import supervise_qwen_forwarder
+    from omnigent.qwen_native_bridge import qwen_session_recording_path
+    from omnigent.qwen_native_forwarder import (
+        supervise_qwen_compaction_mirror,
+        supervise_qwen_forwarder,
+    )
     from omnigent.qwen_native_permissions import supervise_qwen_approval_mirror
+
+    qwen_recording_path = qwen_session_recording_path(qwen_session_id, workspace)
 
     if server_client is not None and ensure_comment_relay is not None:
         await ensure_comment_relay(
@@ -2793,15 +2907,18 @@ async def _auto_create_qwen_terminal(
         )
 
     async def _supervise_qwen_native_bridges() -> None:
-        """Run the transcript forwarder and the approval mirror together.
+        """Run the transcript forwarder, approval mirror, and compaction mirror together.
 
-        Both are per-session, runner-owned, and self-healing (they catch and
+        All three are per-session, runner-owned, and self-healing (they catch and
         log their own failures rather than exiting); gathering them under one
         task keeps a single registration/cancellation handle
         (:func:`_register_auto_forwarder_task`) for session teardown. The
         forwarder mirrors qwen's replies onto the conversation; the approval
         mirror surfaces qwen's native ``can_use_tool`` prompts as web
-        elicitations (see :mod:`omnigent.qwen_native_permissions`).
+        elicitations (see :mod:`omnigent.qwen_native_permissions`); the compaction
+        mirror tails qwen's chat recording for the ``chat_compression`` marker and
+        posts the ``external_compaction_status: completed`` edge (see
+        :func:`omnigent.qwen_native_forwarder.supervise_qwen_compaction_mirror`).
         """
         await asyncio.gather(
             supervise_qwen_forwarder(
@@ -2817,6 +2934,13 @@ async def _auto_create_qwen_terminal(
                 headers={},
                 session_id=session_id,
                 bridge_dir=bridge_dir,
+                auth=_runner_auth,
+            ),
+            supervise_qwen_compaction_mirror(
+                base_url=server_url,
+                headers={},
+                session_id=session_id,
+                recording_path=qwen_recording_path,
                 auth=_runner_auth,
             ),
         )
@@ -2922,7 +3046,12 @@ async def _auto_create_kimi_terminal(
     server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/")
     _auth_factory = _make_auth_token_factory()
     _auth_token = _auth_factory() if _auth_factory is not None else None
-    _runner_headers = {"Authorization": f"Bearer {_auth_token}"} if _auth_token else {}
+    # The hook subprocess replays these static headers from its config (no
+    # refresh-capable httpx.Auth of its own); the helper pairs the bearer with
+    # the workspace-routing header so neither is dropped.
+    from omnigent.cli_auth import databricks_auth_headers
+
+    _runner_headers = databricks_auth_headers(server_url, _auth_token)
     write_hook_config(
         bridge_dir,
         server_url=server_url,
@@ -3280,9 +3409,12 @@ async def _auto_create_codex_terminal(
 
     _policy_auth_factory = _make_auth_token_factory()
     _policy_auth_token = _policy_auth_factory() if _policy_auth_factory is not None else None
-    policy_headers = (
-        {"Authorization": f"Bearer {_policy_auth_token}"} if _policy_auth_token else {}
-    )
+    # The codex policy hook subprocess replays these static headers from its
+    # config (no refresh-capable auth of its own); the helper pairs the bearer
+    # with the workspace-routing header so neither is dropped.
+    from omnigent.cli_auth import databricks_auth_headers
+
+    policy_headers = databricks_auth_headers(launch_config.policy_server_url, _policy_auth_token)
 
     app_server = build_codex_native_server(
         socket_path=socket_path,
@@ -3294,6 +3426,7 @@ async def _auto_create_codex_terminal(
         bridge_dir=bridge_dir,
         ap_server_url=launch_config.policy_server_url,
         ap_auth_headers=policy_headers,
+        bypass_sandbox=launch_config.bypass_sandbox,
     )
     app_server.listen_url = codex_ws_url
     await app_server.start()
@@ -3366,6 +3499,7 @@ async def _auto_create_codex_terminal(
                     codex_args=tuple(launch_config.terminal_launch_args or ()),
                     thread_id=launch_config.external_session_id,
                     remote_url=codex_ws_url,
+                    bypass_sandbox=launch_config.bypass_sandbox,
                     # The --remote TUI loads its own config and does not
                     # inherit the app-server's -c flags; pass the same
                     # provider/model overrides so it resolves the
@@ -4935,25 +5069,35 @@ async def _auto_create_claude_terminal(
         agent_name,
         skills_filter,
     )
-    # prepare_bridge_dir uses session_id as the bridge_id (no explicit
-    # bridge_id passed), so the bridge dir is keyed by session_id.  If the
-    # Omnigent session carries a stale bridge_id label from a prior rotation that
-    # timed out before the terminal transfer completed, _ensure_comment_relay_started
-    # would read the label and write tool_relay.json to the wrong directory —
-    # the bridge subprocess would never see it and the relay tools would be absent.
-    # Correcting the label here ensures all subsequent label lookups return
-    # session_id, which matches the actual bridge dir.
+    # Pick the bridge id this session's dir is keyed on. Normally session_id,
+    # and we (re)assert the label = session_id so a STALE label from a rotation
+    # that timed out before its terminal transfer can't make
+    # _ensure_comment_relay_started write tool_relay.json to the wrong dir.
+    #
+    # EXCEPTION: a session superseded by /clear is deliberately re-keyed to
+    # "{session_id}-cleared" (see _create_clear_replacement_session). Its natural
+    # D(session_id) is the NEW session's live pane; resuming there would share
+    # one transcript with two forwarders (duplicate items) and trip the
+    # "no longer active after /clear" guard. So when the label is exactly that
+    # marker, honour it and resume in the session's own isolated dir. The
+    # executor spawn_env already resolves the same label, so the two agree.
+    cleared_bridge_id = f"{session_id}-cleared"
+    existing_bridge_id = await _claude_native_bridge_id_for_session(
+        server_client=server_client,
+        session_id=session_id,
+    )
+    bridge_id = cleared_bridge_id if existing_bridge_id == cleared_bridge_id else session_id
     try:
         await server_client.patch(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            json={"labels": {BRIDGE_ID_LABEL_KEY: session_id}},
+            json={"labels": {BRIDGE_ID_LABEL_KEY: bridge_id}},
         )
     except httpx.HTTPError:
         _logger.debug(
-            "Could not reset bridge_id label for %s; relay may target wrong dir",
+            "Could not set bridge_id label for %s; relay may target wrong dir",
             session_id,
         )
-    bridge_dir = prepare_bridge_dir(session_id, workspace=Path(workspace))
+    bridge_dir = prepare_bridge_dir(session_id, bridge_id=bridge_id, workspace=Path(workspace))
     # Cancel any surviving forwarder BEFORE wiping its cursor/seen state, else it
     # re-posts with fresh dedup state alongside the forwarder spawned below.
     await _cancel_auto_forwarder_task(session_id)
@@ -4989,7 +5133,12 @@ async def _auto_create_claude_terminal(
     # stop forwarding after the token lapses. ``_RunnerDatabricksAuth``
     # with a ``None`` factory is a safe no-op (local unauthenticated).
     _auth_token = _auth_factory() if _auth_factory is not None else None
-    _runner_headers = {"Authorization": f"Bearer {_auth_token}"} if _auth_token else {}
+    # The hook subprocess replays these static headers from its config (no
+    # refresh-capable auth of its own); the helper pairs the bearer with the
+    # workspace-routing header so neither is dropped.
+    from omnigent.cli_auth import databricks_auth_headers
+
+    _runner_headers = databricks_auth_headers(server_url, _auth_token)
     _runner_auth = _RunnerDatabricksAuth(_auth_factory)
 
     from omnigent.claude_native import (
@@ -5393,18 +5542,19 @@ async def _auto_create_claude_terminal(
     _publish_tmux_target_for_bridge(
         resource_registry=resource_registry,
         session_id=session_id,
-        # The bridge dir was created via ``prepare_bridge_dir(session_id)``
-        # above (no explicit bridge_id), so it is keyed by session_id.
-        # Pass the same id so the tmux target lands in that dir and the
-        # claude-native harness can find it.
-        bridge_id=session_id,
+        # Use the SAME bridge id the dir was prepared under (``bridge_id``,
+        # which is the "-cleared" fork for a /clear-superseded resume, else
+        # session_id). Hardcoding session_id here would write tmux.json into
+        # D(session_id) while the executor + forwarder read D(bridge_id) — the
+        # "tmux target not advertised yet" mismatch on a resumed old session.
+        bridge_id=bridge_id,
         terminal_name="claude",
         session_key="main",
     )
     _logger.info(
         "Claude terminal tmux target published: session=%s bridge_id=%s",
         session_id,
-        session_id,
+        bridge_id,
     )
 
     # Start the transcript forwarder so Claude's responses flow
@@ -11437,6 +11587,63 @@ def create_runner_app(
             )
         return Response(status_code=200)
 
+    async def _handle_pi_native_compact(conv_id: str) -> Response:
+        """
+        Ask the resident Pi extension to compact its own context.
+
+        Pi owns its own context window inside the already-open Pi TUI
+        process, so explicit ``/compact`` must run there. The Omnigent
+        server's own compaction path (``_run_compact_locked``) would only
+        summarise the AP-side transcript mirror — it cannot shrink Pi's
+        real context and would desync the two, plus it 400s on the
+        LLM-less pi-native pseudo-agent (the same failure mode the
+        claude-native compact handler exists to avoid).
+
+        Pi-native turns live inside that TUI process and the runner's
+        harness task only queues messages into the extension inbox and
+        returns, so there is nothing for the runner to drive directly.
+        Mirror :func:`_handle_pi_native_interrupt`: queue a ``compact``
+        inbox payload that the extension consumes in the Pi process and
+        feeds to Pi's active ``ExtensionContext.compact()``. The extension
+        emits a ``response.compaction.in_progress`` marker when it triggers
+        compaction and a ``…completed``/``…failed`` edge from Pi's
+        ``onComplete``/``onError`` callbacks, so the web UI's "Compacting
+        conversation…" spinner tracks Pi's real progress.
+
+        Returns 200 (not 204) on successful enqueue so the Omnigent server
+        knows the control was handled in the terminal and skips its own
+        AP-side compaction — the same contract the claude/codex/cursor
+        native compact handlers use. 503 if the bridge inbox could not be
+        written (the server then surfaces the failure rather than silently
+        running its own wrong compaction).
+
+        :param conv_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: 200 once the compact payload is queued; 503 if the bridge
+            inbox could not be written.
+        """
+        from omnigent.pi_native_bridge import bridge_dir_for_session_id, enqueue_compact
+
+        try:
+            await asyncio.to_thread(
+                enqueue_compact,
+                bridge_dir_for_session_id(conv_id),
+            )
+        except OSError as exc:
+            _logger.warning(
+                "Pi-native compact failed for session=%s",
+                conv_id,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "pi_native_compact_failed",
+                    "detail": _client_safe_error_detail(exc, context="pi-native compact"),
+                },
+            )
+        return Response(status_code=200)
+
     def _inject_codex_compact(socket_path: str, target: str) -> None:
         """
         Blocking helper: type ``/compact`` into a codex tmux pane.
@@ -11487,6 +11694,47 @@ def create_runner_app(
                 content={
                     "error": "hermes_native_compact_failed",
                     "detail": _client_safe_error_detail(exc, context="hermes-native compact"),
+                },
+            )
+        return Response(status_code=200)
+
+    async def _handle_qwen_native_compact(conv_id: str) -> Response:
+        """Submit ``/compress`` into the qwen TUI via the input file.
+
+        qwen-native sessions own their context window inside the qwen TUI, so
+        explicit compaction must run there (qwen's ``/compress`` slash command),
+        not as AP-side compaction — same rationale as
+        :func:`_handle_cursor_native_compact`. Injection is **file-based**, not
+        tmux send-keys: a ``{"type":"submit","text":"/compress"}`` line on the
+        input file routes through qwen's ``RemoteInputWatcher`` → ``submitQuery``
+        (the keyboard's own submit path), which processes the slash command —
+        sidestepping cursor's autocomplete-dropdown trap (verified, qwen v0.18.2:
+        it compresses and emits no ``/compress`` user bubble on the stream).
+
+        Publishes ``response.compaction.in_progress`` to raise the web "Compacting
+        conversation…" spinner; the matching ``completed`` edge is emitted later by
+        :func:`omnigent.qwen_native_forwarder.supervise_qwen_compaction_mirror` when
+        it observes the ``chat_compression`` record in qwen's recording, so the
+        permanent marker tracks qwen's real progress. On injection failure we
+        publish ``response.compaction.failed`` so the spinner is dismissed rather
+        than stranded. Returns 200 so the server skips its own AP-side compaction.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 200 once ``/compress`` has been submitted; 503 on injection error.
+        """
+        from omnigent.qwen_native_bridge import bridge_dir_for_session_id, submit_user_message
+
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        _publish_event(conv_id, {"type": "response.compaction.in_progress", "task_id": conv_id})
+        try:
+            await asyncio.to_thread(submit_user_message, bridge_dir, content="/compress")
+        except (RuntimeError, OSError) as exc:
+            _publish_event(conv_id, {"type": "response.compaction.failed", "task_id": conv_id})
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "qwen_native_compact_failed",
+                    "detail": _client_safe_error_detail(exc, context="qwen-native compact"),
                 },
             )
         return Response(status_code=200)
@@ -12360,25 +12608,6 @@ def create_runner_app(
             post_tools_changed,
             start_tool_relay,
         )
-        from omnigent.runner.tool_dispatch import _NATIVE_RELAY_BUILTIN_TOOLS
-        from omnigent.tools.builtins.agents import (
-            SysAgentDownloadTool,
-            SysAgentGetTool,
-            SysAgentListTool,
-        )
-        from omnigent.tools.builtins.list_comments import ListCommentsTool
-        from omnigent.tools.builtins.os_env import (
-            SysOsEditTool,
-            SysOsReadTool,
-            SysOsShellTool,
-            SysOsWriteTool,
-        )
-        from omnigent.tools.builtins.spawn import (
-            SysSessionGetHistoryTool,
-            SysSessionGetInfoTool,
-            SysSessionListTool,
-        )
-        from omnigent.tools.builtins.update_comment import UpdateCommentTool
 
         # Resolve the bridge dir. When an explicit bridge_dir is
         # provided (codex-native path), skip the claude-native bridge
@@ -12403,49 +12632,13 @@ def create_runner_app(
 
             bridge_dir = bridge_dir_for_bridge_id(bridge_id or session_id)
 
-        # Build flat tool schemas (name + description + parameters) for the
-        # native relay. start_tool_relay normalises these via
-        # _normalize_relay_tool_specs before writing tool_relay.json.
-        #
         # claude-native / codex-native ignore the harness ``tools`` list, so
         # this relay is the ONLY tool surface reaching the real CLI — tools
         # added here override the bridge's static tools of the same name,
-        # giving centralized policy evaluation on the Omnigent server. Two groups
-        # are assembled:
+        # giving centralized policy evaluation on the Omnigent server. The exact
+        # set (spec-gated builtin surface + unconditional sys_os_*) is assembled
+        # by ``build_native_relay_tool_schemas`` below.
         #
-        # 1. The runner-/server-proxied builtin surface
-        #    (``_NATIVE_RELAY_BUILTIN_TOOLS`` — comment, session read/write,
-        #    agent-discovery, and terminal families), derived from the
-        #    session's own ToolManager so the relayed set and the
-        #    spec-dependent schemas (e.g. sys_session_send's named-mode
-        #    ``agent`` enum, present only when the spec declares
-        #    sub-agents; sys_terminal_*, present only when the spec
-        #    declares ``terminals:``) exactly match what non-native
-        #    harnesses receive via ``request.tools``.
-        # 2. OS tools (``sys_os_*``), relayed unconditionally below to
-        #    override the bridge's static (non-policy-enforced) versions —
-        #    independent of the spec's ``os_env`` gate.
-        relay_schemas: list[dict[str, Any]] = []
-
-        def _append_flat_schema(function_dict: dict[str, Any]) -> None:
-            """
-            Append a tool's OpenAI ``function`` schema in flat relay shape.
-
-            :param function_dict: The ``"function"`` sub-dict of a tool
-                schema, e.g. ``{"name": "sys_session_list", "parameters":
-                {...}}``.
-            :returns: None.
-            """
-            relay_schemas.append(
-                {
-                    "name": function_dict["name"],
-                    "description": function_dict.get("description", ""),
-                    "parameters": function_dict.get(
-                        "parameters", {"type": "object", "properties": {}}
-                    ),
-                }
-            )
-
         # Resolve the session's agent spec so the relayed builtin surface
         # mirrors the spec's gating exactly. This is an await, so re-check
         # for a concurrently-started relay afterward. The relay is additive
@@ -12458,63 +12651,13 @@ def create_runner_app(
             relay_spec = None
         if session_id in _session_comment_relays:
             return
-        if relay_spec is not None:
-            from omnigent.tools.manager import ToolManager
+        # Build the flat tool schemas (name + description + parameters) for the
+        # native relay via the shared helper, which also backs pi-native's
+        # pi.registerTool surface. start_tool_relay normalises these via
+        # _normalize_relay_tool_specs before writing tool_relay.json.
+        from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
-            for _schema in ToolManager(relay_spec).get_tool_schemas():
-                _fn = _schema["function"]
-                if _fn["name"] in _NATIVE_RELAY_BUILTIN_TOOLS:
-                    _append_flat_schema(_fn)
-        else:
-            # No resolvable spec: fall back to the always-on read/discovery
-            # surface — never the opt-in spawn writes (send/close/create),
-            # whose gate (``tools.agents`` or ``spawn: true``) can't be
-            # evaluated without the spec.
-            from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool
-
-            for _cls in (
-                ListCommentsTool,
-                UpdateCommentTool,
-                SysSessionListTool,
-                SysSessionGetHistoryTool,
-                SysSessionGetInfoTool,
-                SysAgentGetTool,
-                SysAgentListTool,
-                SysAgentDownloadTool,
-                SysAddPolicyTool,
-                SysPolicyRegistryTool,
-            ):
-                _append_flat_schema(_cls().get_schema()["function"])
-
-        # Add OS tool schemas. Create a minimal OSEnvironment for schema extraction.
-        from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-        from omnigent.inner.os_env import create_os_environment
-
-        _os_spec = OSEnvSpec(
-            type="caller_process",
-            cwd=str(Path.cwd()),
-            sandbox=OSEnvSandboxSpec(type="none"),
-            fork=False,
-        )
-        try:
-            _os_env = create_os_environment(_os_spec)
-            for _tool in (
-                SysOsReadTool(_os_env),
-                SysOsWriteTool(_os_env),
-                SysOsEditTool(_os_env),
-                SysOsShellTool(_os_env),
-            ):
-                _append_flat_schema(_tool.get_schema()["function"])
-            _os_env.close()
-        except Exception:  # noqa: BLE001
-            # OS environment setup failed; relay will run without OS tools.
-            # This should not happen in practice, but we log and continue
-            # since the relay is additive.
-            _logger.debug(
-                "Could not create OSEnvironment for relay OS tool schemas; "
-                "OS tools will not be available in relay for session=%s",
-                session_id,
-            )
+        relay_schemas: list[dict[str, Any]] = build_native_relay_tool_schemas(relay_spec)
 
         # Capture session_id in the closure so concurrent sessions are
         # routed correctly.
@@ -12800,6 +12943,19 @@ def create_runner_app(
         _subagent_wake_pending.discard(conv)
         try:
             await _run_turn_bg_setup_and_stream(msg_body, conv)
+        except asyncio.CancelledError as exc:
+            # Task cancellation (e.g. event-loop teardown) must still
+            # publish a terminal ``failed`` status so the session never
+            # hangs on a stale "running" turn. Re-raise after cleanup to
+            # preserve asyncio cancellation semantics.
+            _logger.error(
+                "turn cancelled for %s: %s",
+                conv,
+                exc,
+                exc_info=True,
+            )
+            _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+            raise
         except Exception as exc:
             # Any failure before the harness stream starts (e.g. a provider
             # with no resolvable model raising OmnigentError from
@@ -14527,8 +14683,11 @@ def create_runner_app(
             # Omnigent server forwards explicit /compact here. claude-native
             # and codex-native inject the slash command into the tmux
             # pane so the CLI compacts its own context, and return 200
-            # to signal the control was handled in the terminal. Other
-            # harnesses 204 no-op — their explicit compaction is an
+            # to signal the control was handled in the terminal. pi-native
+            # owns its context inside the Pi TUI process too, so it queues a
+            # ``compact`` inbox payload the resident extension feeds to Pi's
+            # ``ExtensionContext.compact()`` (mirroring the interrupt path).
+            # Other harnesses 204 no-op — their explicit compaction is an
             # AP-side operation the server runs when the runner does
             # not handle the control (see ``_run_compact_locked``).
             if _session_harness_name(conversation_id) == "claude-native":
@@ -14539,8 +14698,12 @@ def create_runner_app(
                 return await _handle_opencode_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "cursor-native":
                 return await _handle_cursor_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "pi-native":
+                return await _handle_pi_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "hermes-native":
                 return await _handle_hermes_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "qwen-native":
+                return await _handle_qwen_native_compact(conversation_id)
             return Response(status_code=204)
 
         if body_type == "clear":
