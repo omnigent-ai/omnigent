@@ -559,6 +559,82 @@ async def _post_conversation_item(
     resp.raise_for_status()
 
 
+def _has_new_compaction(db_path: Path, hermes_session_id: str) -> bool:
+    """Check if hermes has compacted messages for this session."""
+    con = _connect_ro(db_path)
+    if con is None:
+        return False
+    try:
+        row = con.execute(
+            "SELECT 1 FROM messages WHERE session_id = ? AND compacted = 1 LIMIT 1",
+            (hermes_session_id,),
+        ).fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return False
+    finally:
+        con.close()
+
+
+async def _persist_hermes_compaction_item(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    db_path: Path,
+    hermes_session_id: str,
+) -> None:
+    """Persist a compaction boundary item with post-compaction messages."""
+    resp = await client.get(
+        f"/v1/sessions/{session_id}/items",
+        params={"limit": 1, "order": "desc"},
+    )
+    resp.raise_for_status()
+    items = resp.json().get("data", [])
+    last_item_id = items[0]["id"] if items else f"compact_boundary_{session_id}"
+
+    compacted_messages = None
+    con = _connect_ro(db_path)
+    if con is not None:
+        try:
+            rows = con.execute(
+                "SELECT role, content FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id",
+                (hermes_session_id,),
+            ).fetchall()
+            msgs = []
+            for role, content in rows:
+                if role in ("user", "assistant") and content:
+                    block_type = "input_text" if role == "user" else "output_text"
+                    msgs.append(
+                        {
+                            "type": "message",
+                            "role": role,
+                            "content": [{"type": block_type, "text": content}],
+                        }
+                    )
+            if msgs:
+                compacted_messages = msgs
+        except sqlite3.Error as exc:
+            _warn_sqlite_once("compaction read", exc)
+        finally:
+            con.close()
+
+    data: dict[str, object] = {
+        "summary": "[Hermes compaction — context was compacted via /compress]",
+        "last_item_id": last_item_id,
+        "model": "unknown",
+        "token_count": 0,
+    }
+    if compacted_messages:
+        data["compacted_messages"] = compacted_messages
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "compaction", "data": data},
+    )
+    resp.raise_for_status()
+
+
 async def forward_hermes_store_to_session(
     *,
     base_url: str,
@@ -604,6 +680,7 @@ async def forward_hermes_store_to_session(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
         usage_tracker = _HermesUsageTracker(client, session_id, bridge_dir)
+        compaction_persisted = False
         while True:
             try:
                 if hermes_session_id is None:
@@ -674,6 +751,23 @@ async def forward_hermes_store_to_session(
                                     launch_epoch_s=launch_epoch_s,
                                 ),
                             )
+                        if not compaction_persisted and await asyncio.to_thread(
+                            _has_new_compaction, db, hermes_session_id
+                        ):
+                            try:
+                                await _persist_hermes_compaction_item(
+                                    client,
+                                    session_id=session_id,
+                                    db_path=db,
+                                    hermes_session_id=hermes_session_id,
+                                )
+                                compaction_persisted = True
+                            except Exception:  # noqa: BLE001
+                                _logger.warning(
+                                    "Failed to persist hermes compaction item for %s",
+                                    session_id,
+                                    exc_info=True,
+                                )
                         # Post model/usage data after mirroring messages.
                         await usage_tracker.flush()
                         # Refresh the claim heartbeat every poll (even with no new
