@@ -195,24 +195,30 @@ const CODEX_NATIVE_APPROVAL_MODES: {
   },
 ];
 
-function HostOption({ host, thisMachine }: { host: Host; thisMachine?: boolean }) {
+function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
   const isOnline = host.status === "online";
   return (
-    <span className="flex items-center gap-2">
+    <span className="flex min-w-0 items-center gap-2">
       {host.name.toLowerCase().includes("cloud") ? (
-        <MonitorCloudIcon className="size-4 text-muted-foreground" />
+        <MonitorCloudIcon className="size-4 shrink-0 text-muted-foreground" />
       ) : (
-        <MonitorIcon className="size-4 text-muted-foreground" />
+        <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
       )}
-      <span className="text-xs">{host.name}</span>
-      {thisMachine && <span className="text-[10px] text-muted-foreground">· this machine</span>}
-      <span
-        className={`inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${isOnline ? "text-green-600" : "text-muted-foreground"}`}
-      >
-        <span
-          className={`inline-block size-1.5 rounded-full ${isOnline ? "bg-green-500" : "bg-muted-foreground"}`}
-        />
-        {host.status}
+      <span className="flex min-w-0 flex-col">
+        <span className="flex items-center gap-2">
+          <span className="truncate text-xs">{host.name}</span>
+          <span
+            className={`inline-flex shrink-0 items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${isOnline ? "text-green-600" : "text-muted-foreground"}`}
+          >
+            <span
+              className={`inline-block size-1.5 rounded-full ${isOnline ? "bg-green-500" : "bg-muted-foreground"}`}
+            />
+            {host.status}
+          </span>
+        </span>
+        {subtitle && (
+          <span className="text-[10px] leading-tight text-muted-foreground">{subtitle}</span>
+        )}
       </span>
     </span>
   );
@@ -996,13 +1002,15 @@ export function NewChatLandingScreen() {
   const onlineHosts = allHosts.filter((h) => h.status === "online");
   const offlineHosts = allHosts.filter((h) => h.status === "offline");
 
-  // Identify the current desktop machine in the list, and whether we can offer
-  // to auto-connect it (under the desktop shell, CLI present, and not already
-  // an online host here).
+  // Identify the current desktop machine and whether we can connect it. When
+  // it's already in the host list (online or offline) we connect via that row;
+  // only when it's absent do we show a standalone "Run on this machine" item —
+  // so the machine never appears twice.
   const thisMachineHostId = desktopHost?.hostId ?? null;
-  const thisMachineOnline =
-    thisMachineHostId != null && onlineHosts.some((h) => h.host_id === thisMachineHostId);
-  const canRunOnThisMachine = Boolean(desktopHost?.cliInstalled) && !thisMachineOnline;
+  const thisMachineInList =
+    thisMachineHostId != null && allHosts.some((h) => h.host_id === thisMachineHostId);
+  const canConnectThisMachine = Boolean(desktopHost?.cliInstalled);
+  const showConnectThisMachine = canConnectThisMachine && !thisMachineInList;
 
   // Track this machine's host status from the desktop shell (no-op in a browser).
   useEffect(() => {
@@ -1904,7 +1912,7 @@ export function NewChatLandingScreen() {
                       <DropdownMenuSeparator />
                     </>
                   )}
-                  {allHosts.length === 0 && !canRunOnThisMachine && (
+                  {allHosts.length === 0 && !showConnectThisMachine && (
                     <div className="px-2 py-1.5 text-xs text-muted-foreground">
                       No hosts connected yet.
                     </div>
@@ -1916,19 +1924,50 @@ export function NewChatLandingScreen() {
                       data-active={host.host_id === selectedHostId ? "true" : undefined}
                       className="text-xs data-[active=true]:bg-accent/60"
                     >
-                      <HostOption host={host} thisMachine={host.host_id === thisMachineHostId} />
+                      <HostOption
+                        host={host}
+                        subtitle={host.host_id === thisMachineHostId ? "this machine" : undefined}
+                      />
                     </DropdownMenuItem>
                   ))}
-                  {offlineHosts.map((host) => (
-                    <DropdownMenuItem key={host.host_id} disabled className="text-xs">
-                      <HostOption host={host} thisMachine={host.host_id === thisMachineHostId} />
-                    </DropdownMenuItem>
-                  ))}
-                  {/* Desktop shell: this machine can host but isn't connected to
-                    this server yet. Offer to connect it in one click (keeps the
-                    menu open while connecting; it then appears as a selected
-                    host above). */}
-                  {canRunOnThisMachine && (
+                  {offlineHosts.map((host) => {
+                    // This machine, offline: make the row itself the connect
+                    // affordance (clickable, keeps the menu open while
+                    // connecting) instead of a disabled entry + a duplicate
+                    // "Run on this machine" item.
+                    if (host.host_id === thisMachineHostId && canConnectThisMachine) {
+                      return (
+                        <DropdownMenuItem
+                          key={host.host_id}
+                          onSelect={(e) => {
+                            e.preventDefault();
+                            void connectThisMachine();
+                          }}
+                          disabled={connectingThisMachine}
+                          data-testid="new-chat-landing-run-on-this-machine"
+                          className="text-xs"
+                        >
+                          <HostOption
+                            host={host}
+                            subtitle={
+                              connectingThisMachine ? "connecting…" : "this machine · connect"
+                            }
+                          />
+                        </DropdownMenuItem>
+                      );
+                    }
+                    return (
+                      <DropdownMenuItem key={host.host_id} disabled className="text-xs">
+                        <HostOption
+                          host={host}
+                          subtitle={host.host_id === thisMachineHostId ? "this machine" : undefined}
+                        />
+                      </DropdownMenuItem>
+                    );
+                  })}
+                  {/* Desktop shell, machine not in the list yet: offer to connect
+                    it in one click. */}
+                  {showConnectThisMachine && (
                     <DropdownMenuItem
                       onSelect={(e) => {
                         e.preventDefault();
@@ -1938,13 +1977,13 @@ export function NewChatLandingScreen() {
                       data-testid="new-chat-landing-run-on-this-machine"
                       className="gap-2 text-xs"
                     >
-                      <MonitorIcon className="size-4 text-muted-foreground" />
+                      <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
                       <span className="text-xs">
                         {connectingThisMachine ? "Connecting this machine…" : "Run on this machine"}
                       </span>
                     </DropdownMenuItem>
                   )}
-                  {(allHosts.length > 0 || canRunOnThisMachine) && <DropdownMenuSeparator />}
+                  {(allHosts.length > 0 || showConnectThisMachine) && <DropdownMenuSeparator />}
                   {/* Persistent escape hatch: open the connect-a-host
                     instructions. Present even with zero hosts so a fresh user
                     is never stuck. */}
