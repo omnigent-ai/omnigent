@@ -661,9 +661,11 @@ class CursorExecutor(Executor):
         try:
             from cursor_sdk import AsyncAgent, AsyncClient, LocalAgentOptions
         except ImportError as exc:
+            from omnigent.onboarding.extra_install import extra_install_display
+
             raise ImportError(
                 "CursorExecutor requires the 'cursor-sdk' package. "
-                "Install it with: uv pip install cursor-sdk"
+                f"Install it with: {extra_install_display('cursor')}"
             ) from exc
 
         loop = asyncio.get_running_loop()
