@@ -46,11 +46,15 @@ interface MobileSessionMenuProps {
   filesPanelOpen: boolean;
   /** True while the mobile agents drawer is open. */
   subagentsPanelOpen: boolean;
+  /** True while the mobile shells drawer is open. */
+  shellsPanelOpen: boolean;
   /** True while the mobile tasks drawer is open. */
   todosPanelOpen: boolean;
   /** Hide the Shells entry (claude-native sub-agents only). */
   hideTerminalsTab: boolean;
-  /** Number of open terminals (entry badge + visibility). */
+  /** Whether the Shells entry is available. */
+  showShellsTab: boolean;
+  /** Number of open terminals (entry badge). */
   terminalsLength: number;
   /** Whether this is a claude-native session (gates the Tasks entry). */
   isClaudeNative: boolean;
@@ -71,8 +75,8 @@ interface MobileSessionMenuProps {
   agentCount: number;
   /** Open the mobile files drawer. */
   onOpenFiles: () => void;
-  /** Open the first terminal in the terminals push panel. */
-  onOpenFirstTerminal: () => void;
+  /** Open the mobile shells drawer. */
+  onOpenShells: () => void;
   /** Open the mobile agents drawer. */
   onOpenSubagents: () => void;
   /** Open the mobile tasks drawer. */
@@ -391,6 +395,7 @@ export function ChatHeader({
           !mobileMenu.executionLogsOpen &&
           !mobileMenu.filesPanelOpen &&
           !mobileMenu.subagentsPanelOpen &&
+          !mobileMenu.shellsPanelOpen &&
           !mobileMenu.todosPanelOpen &&
           (hasRailContent || mobileMenu.debugMode) && (
             <DropdownMenu>
@@ -445,22 +450,24 @@ export function ChatHeader({
                       : mobileMenu.agentCount}
                   </span>
                 </DropdownMenuItem>
-                {/* Shells — hidden only for claude-native sub-agents,
-                    matching the desktop rail's Shells tab. The agent's
-                    own terminal (SDK REPL / native vendor pane) is
-                    excluded from the count (it's reached via the
-                    Chat/Terminal pill), so this entry appears only
-                    when real shells exist. */}
-                {!mobileMenu.hideTerminalsTab && mobileMenu.terminalsLength > 0 && (
+                {/* Shells — mirrors the desktop rail's Shells tab: visible
+                    when a real shell exists, or when the agent spec declares
+                    shell access so the empty-state "+ New shell" affordance
+                    is reachable on mobile too. */}
+                {!mobileMenu.hideTerminalsTab && mobileMenu.showShellsTab && (
                   <DropdownMenuItem
-                    onSelect={mobileMenu.onOpenFirstTerminal}
+                    onSelect={mobileMenu.onOpenShells}
                     className="gap-2.5 px-2.5 py-2 text-base"
                   >
                     <TerminalIcon className="size-4" />
                     Shells
-                    <span className={cn(TAB_BADGE_BASE, "ml-auto bg-muted text-muted-foreground")}>
-                      {mobileMenu.terminalsLength}
-                    </span>
+                    {mobileMenu.terminalsLength > 0 && (
+                      <span
+                        className={cn(TAB_BADGE_BASE, "ml-auto bg-muted text-muted-foreground")}
+                      >
+                        {mobileMenu.terminalsLength}
+                      </span>
+                    )}
                   </DropdownMenuItem>
                 )}
                 {mobileMenu.isClaudeNative && mobileMenu.todosTotal > 0 && (
