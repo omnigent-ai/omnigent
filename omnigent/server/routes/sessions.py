@@ -9801,7 +9801,15 @@ def _agent_is_native(agent: Agent) -> bool:
 # text preamble (see _CURSOR_FORK_HISTORY_HARNESSES below) — switch-agent keeps
 # the current fresh-launch behavior.
 _FORK_HISTORY_NATIVE_HARNESSES: frozenset[str] = frozenset(
-    {"claude-native", "native-claude", "codex-native", "native-codex", "pi-native"}
+    {
+        "claude-native",
+        "native-claude",
+        "codex-native",
+        "native-codex",
+        "hermes-native",
+        "native-hermes",
+        "pi-native",
+    }
 )
 
 # Native harnesses that carry FORK history as a text preamble (text-prefix

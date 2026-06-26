@@ -596,6 +596,9 @@ async def forward_hermes_store_to_session(
     persisted = _read_state(bridge_dir)
     hermes_session_id: str | None = persisted.hermes_session_id
     last_id = persisted.last_id if hermes_session_id is not None else 0
+    # Track whether we have already PATCHed the external_session_id to the
+    # Omnigent server so we do it at most once per forwarder lifetime.
+    _external_id_synced = False
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
@@ -621,6 +624,24 @@ async def forward_hermes_store_to_session(
                                 last_id=last_id,
                                 launch_epoch_s=launch_epoch_s,
                             ),
+                        )
+                # PATCH the external_session_id once so the server
+                # knows which Hermes session backs this conversation
+                # (needed for fork/resume).
+                if hermes_session_id is not None and not _external_id_synced:
+                    try:
+                        resp = await client.patch(
+                            f"/v1/sessions/{session_id}",
+                            json={"external_session_id": hermes_session_id},
+                        )
+                        resp.raise_for_status()
+                        _external_id_synced = True
+                    except httpx.HTTPError:
+                        _logger.debug(
+                            "hermes forwarder failed to PATCH external_session_id; "
+                            "will retry next poll; session=%s",
+                            session_id,
+                            exc_info=True,
                         )
                 if hermes_session_id is not None:
                     # Yield to an earlier-launched live session rather than mirror

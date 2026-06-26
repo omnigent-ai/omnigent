@@ -2407,6 +2407,10 @@ async def _auto_create_hermes_terminal(
     # cursor (clear_hermes_bridge_state above) starts it at that row's first row.
     launch_epoch_s = time.time()
     hermes_args = [*(launch_config.terminal_launch_args or [])]
+    # Fork with history: resume the source Hermes session so the TUI
+    # loads the prior conversation context.
+    if launch_config.fork_carry_history and launch_config.fork_source_external_id:
+        hermes_args.extend(["--resume", launch_config.fork_source_external_id])
     # If a per-session HERMES_HOME was written (policy hook), pass it via env
     # so the TUI picks up the hook config alongside its own approval prompt.
     _hermes_terminal_env: dict[str, str] = {}

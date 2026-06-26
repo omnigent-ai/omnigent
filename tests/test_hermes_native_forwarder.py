@@ -216,9 +216,14 @@ class _Resp:
 class _FakeClient:
     def __init__(self) -> None:
         self.posts: list[tuple[str, dict]] = []
+        self.patches: list[tuple[str, dict]] = []
 
     async def post(self, url, json=None, **_kwargs):
         self.posts.append((url, json or {}))
+        return _Resp()
+
+    async def patch(self, url, json=None, **_kwargs):
+        self.patches.append((url, json or {}))
         return _Resp()
 
 
@@ -274,6 +279,97 @@ async def test_forward_loop_discovers_and_mirrors_new_messages(tmp_path, monkeyp
     assert roles == ["user", "assistant"]
     # High-water cursor persisted so a restart resumes without re-posting.
     assert f._read_state(tmp_path).hermes_session_id == "20260620_1"
+
+
+async def test_forward_loop_patches_external_session_id_once(tmp_path, monkeypatch) -> None:
+    """The forwarder PATCHes external_session_id when it first discovers the Hermes session.
+
+    Runs the full forward loop with all HTTP calls intercepted at the
+    ``httpx.AsyncClient`` level (constructor replaced by a fake async-context-
+    manager). The first ``test_forward_loop_discovers_and_mirrors_new_messages``
+    test creates a *real* ``httpx.AsyncClient`` which can interfere with
+    class-level patches on subsequent tests, so we replace the constructor
+    entirely to stay fully in-process.
+    """
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    _seed_db(db, cwd=workspace, started_at=1000.0)
+
+    patched_calls: list[tuple[str, dict]] = []
+
+    async def _fake_post(_client, *, session_id, item):
+        pass  # ignore mirrored items for this test
+
+    monkeypatch.setattr(f, "_post_conversation_item", _fake_post)
+
+    iteration = {"n": 0}
+
+    # Build a self-contained fake client + constructor so the forward loop
+    # never touches real httpx internals.
+    class _Client:
+        async def post(self, url, json=None, **_kw):
+            return _Resp()
+
+        async def patch(self, url, json=None, **_kw):
+            patched_calls.append((url, json or {}))
+            return _Resp()
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _make_client(**_kw):
+        yield _Client()
+
+    # Patch the module attribute that ``forward_hermes_store_to_session`` reads
+    # at call time (``httpx.AsyncClient``).  Using ``monkeypatch.setattr`` on
+    # the *module* object the forwarder imports (``f.httpx``) guarantees the
+    # right target and automatic undo.
+    monkeypatch.setattr(
+        f,
+        "httpx",
+        type(
+            "_httpx",
+            (),
+            {
+                "AsyncClient": _make_client,
+                "Timeout": lambda *a, **kw: None,
+                "Auth": None,
+                "HTTPError": Exception,
+            },
+        ),
+    )
+
+    async def _sleep(_s):
+        iteration["n"] += 1
+        if iteration["n"] >= 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+
+    # Use a subdirectory for bridge_dir so the claim guard doesn't see
+    # sibling test directories (which may contain state from earlier tests
+    # that used the same hermes session id).
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_hermes_store_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv_patch",
+            bridge_dir=bridge_dir,
+            agent_name="hermes-native-ui",
+            workspace=workspace,
+            launch_epoch_s=1000.0,
+            db_path=db,
+        )
+
+    # The PATCH should have been called exactly once even though we ran 3 iterations.
+    patch_calls = [(url, body) for url, body in patched_calls if "external_session_id" in body]
+    assert len(patch_calls) == 1
+    url, body = patch_calls[0]
+    assert url == "/v1/sessions/conv_patch"
+    assert body["external_session_id"] == "20260620_1"
 
 
 # --- Usage tracker tests ---------------------------------------------------
