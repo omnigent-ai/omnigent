@@ -12320,13 +12320,21 @@ async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolate
         lambda **_kwargs: "/usr/bin/kiro-cli",
     )
     forwarder_calls: list[dict[str, Any]] = []
+    permission_mirror_calls: list[dict[str, Any]] = []
 
     async def _fake_supervise_kiro_session_forwarder(**kwargs: Any) -> None:
         forwarder_calls.append(kwargs)
 
+    async def _fake_supervise_kiro_permission_mirror(**kwargs: Any) -> None:
+        permission_mirror_calls.append(kwargs)
+
     monkeypatch.setattr(
         "omnigent.kiro_native_session_forwarder.supervise_kiro_session_forwarder",
         _fake_supervise_kiro_session_forwarder,
+    )
+    monkeypatch.setattr(
+        "omnigent.kiro_native_permissions.supervise_kiro_permission_mirror",
+        _fake_supervise_kiro_permission_mirror,
     )
 
     async def _fake_launch_config(**_kwargs: Any) -> _KiroNativeLaunchConfig:
@@ -12376,7 +12384,10 @@ async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolate
         lambda _sid, evt: published.append(evt),
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    await asyncio.sleep(0)
+    for _ in range(20):
+        if forwarder_calls and permission_mirror_calls:
+            break
+        await asyncio.sleep(0)
 
     spec = captured["spec"]
     assert captured["terminal_name"] == "kiro"
@@ -12400,12 +12411,20 @@ async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolate
     assert spec.env[kiro_native_bridge.KIRO_NATIVE_BRIDGE_DIR_ENV_VAR] == str(
         kiro_native_bridge.bridge_dir_for_session_id("conv_kiro")
     )
+    assert spec.env[kiro_native_bridge.KIRO_ACP_RECORD_PATH_ENV_VAR] == str(
+        kiro_native_bridge.acp_record_path(
+            kiro_native_bridge.bridge_dir_for_session_id("conv_kiro")
+        )
+    )
     assert any(evt.get("type") == "session.resource.created" for evt in published)
     assert forwarder_calls
     assert forwarder_calls[0]["base_url"] == "http://127.0.0.1:6767"
     assert forwarder_calls[0]["session_id"] == "conv_kiro"
     assert forwarder_calls[0]["agent_name"] == "kiro-native-ui"
     assert forwarder_calls[0]["workspace"] == str(tmp_path)
+    assert permission_mirror_calls
+    assert permission_mirror_calls[0]["base_url"] == "http://127.0.0.1:6767"
+    assert permission_mirror_calls[0]["session_id"] == "conv_kiro"
 
 
 @pytest.mark.asyncio

@@ -99,6 +99,9 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   https://docs.npmjs.com/downloading-and-installing-node-js-and-npm
 - **Kiro CLI** (optional), for `omnigent kiro`: install with
   `curl -fsSL https://cli.kiro.dev/install | bash`, then sign in with Kiro.
+  Kiro tool approvals stay answerable in the embedded Terminal; supported
+  one-time approvals also appear as Chat cards. See
+  `docs/kiro-native-elicitation.md`.
 - **`tmux`**, required by the native `omnigent claude` / `omnigent codex` /
   `omnigent kiro`
   wrappers (`brew install tmux` / `apt install tmux`; the installer offers
@@ -451,4 +454,3 @@ Thanks to all of our amazing contributors!
 <a href="https://github.com/omnigent-ai/omnigent/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=omnigent-ai/omnigent" />
 </a>
-
