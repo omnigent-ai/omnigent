@@ -21,8 +21,10 @@ from typing import Any
 
 from mcp.types import Tool as McpToolDef
 
+from omnigent.inner.datamodel import CredentialBrokerSpec
 from omnigent.runner.mcp_manager import (  # noqa: F401 — McpSchemasResult re-exported for callers
     McpSchemasResult,
+    _agent_credential_broker,
     compute_spec_hash,
 )
 from omnigent.spec.types import AgentSpec, MCPServerConfig
@@ -82,6 +84,7 @@ class _AgentEntry:
     spec_hash: str
     servers: dict[str, _McpServerEntry] = field(default_factory=dict)
     prewarm_task: asyncio.Task[None] | None = None
+    credential_broker: CredentialBrokerSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -163,7 +166,7 @@ class ServerMcpPool:
         configs = list(spec.mcp_servers or [])
         if not configs:
             return []
-        await self._ensure_warm(agent_id, configs)
+        await self._ensure_warm(agent_id, configs, _agent_credential_broker(spec))
 
         async with self._lock:
             entry = self._entries.get(agent_id)
@@ -218,7 +221,7 @@ class ServerMcpPool:
         configs = list(spec.mcp_servers or [])
         if not configs:
             raise RuntimeError(f"agent {agent_id!r} has no MCP servers configured")
-        await self._ensure_warm(agent_id, configs)
+        await self._ensure_warm(agent_id, configs, _agent_credential_broker(spec))
 
         async with self._lock:
             entry = self._entries.get(agent_id)
@@ -271,6 +274,7 @@ class ServerMcpPool:
         self,
         agent_id: str,
         configs: list[MCPServerConfig],
+        credential_broker: CredentialBrokerSpec | None = None,
     ) -> None:
         """Ensure connections are warm for *agent_id*; await the prewarm task.
 
@@ -284,7 +288,7 @@ class ServerMcpPool:
         :param configs: The agent's MCP server configs (pre-extracted
             from ``spec.mcp_servers``).
         """
-        spec_hash = compute_spec_hash(configs)
+        spec_hash = compute_spec_hash(configs, credential_broker=credential_broker)
         prewarm: asyncio.Task[None] | None = None
 
         async with self._lock:
@@ -310,6 +314,7 @@ class ServerMcpPool:
                     agent_id=agent_id,
                     spec_hash=spec_hash,
                     servers={cfg.name: _McpServerEntry(config=cfg) for cfg in configs},
+                    credential_broker=credential_broker,
                 )
                 self._entries[agent_id] = entry
                 self._lru.append(agent_id)
@@ -337,7 +342,7 @@ class ServerMcpPool:
         """
         tasks = [
             asyncio.create_task(
-                self._connect_server(server),
+                self._connect_server(server, entry.credential_broker),
                 name=f"server-mcp-connect:{entry.agent_id}:{server.config.name}",
             )
             for server in entry.servers.values()
@@ -346,14 +351,20 @@ class ServerMcpPool:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _connect_server(self, server: _McpServerEntry) -> None:
+    async def _connect_server(
+        self,
+        server: _McpServerEntry,
+        credential_broker: CredentialBrokerSpec | None = None,
+    ) -> None:
         """Connect one MCP server, storing tools on success or error on failure.
 
         :param server: The server entry to connect. Modified in place:
             sets ``connection``, ``tools``, and ``error``.
+        :param credential_broker: Non-HTTP broker spec for resolving the
+            server's ``credential_groups`` into its stdio spawn env.
         """
         try:
-            conn = McpServerConnection(config=server.config)
+            conn = McpServerConnection(config=server.config, credential_broker=credential_broker)
             tools = await conn.connect()
             server.connection = conn
             server.tools = list(tools)

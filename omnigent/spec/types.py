@@ -919,6 +919,10 @@ class MCPServerConfig:
     command: str | None = None
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict, repr=False)
+    # Names of credential_broker groups (from os_env.sandbox.credential_broker)
+    # whose resolved values are merged into this stdio server's spawn env at
+    # connection time. Stdio-only; group NAMES are non-secret. Empty = none.
+    credential_groups: list[str] = field(default_factory=list)
     description: str | None = None
     # Per-tool timeout/retry overrides. None = inherit from
     # tools.timeout / tools.retry.
@@ -942,7 +946,7 @@ class MCPServerConfig:
             f"url={self.url!r}, headers={redacted_headers!r}, "
             f"databricks_profile={self.databricks_profile!r}, "
             f"command={self.command!r}, args={self.args!r}, "
-            f"env={redacted_env!r}, "
+            f"env={redacted_env!r}, credential_groups={self.credential_groups!r}, "
             f"timeout={self.timeout!r}, retry={self.retry!r})"
         )
 

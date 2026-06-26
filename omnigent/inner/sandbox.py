@@ -18,7 +18,7 @@ from typing import TypeAlias, cast
 
 from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 
-from .datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
+from .datamodel import CredentialBrokerSpec, CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +155,11 @@ class SandboxPolicy:
     # non-secret synthetic payload over the config FD, and resolved
     # secrets never touch the policy that serialises into logs / dumps.
     credential_proxy: CredentialProxySpec | None = None
+    # Parent-side only (like credential_proxy): read in
+    # _HelperProcessClient._start_locked to start the broker + write shims.
+    # Intentionally absent from to_jsonable/from_jsonable — the helper never
+    # receives the policy; secrets never touch a serialised structure.
+    credential_broker: CredentialBrokerSpec | None = None
 
     def to_jsonable(self) -> dict[str, JsonValue]:
         result: dict[str, JsonValue] = {
@@ -405,6 +410,7 @@ def _clone_policy_with(
         # ``_start_locked``, so dropping it here would silently disable
         # the feature.
         credential_proxy=policy.credential_proxy,
+        credential_broker=policy.credential_broker,
         # Egress fields are intentionally NOT preserved here — the
         # ``with_additional_*`` helpers run BEFORE the egress proxy
         # starts, so the source policy never carries egress fields.

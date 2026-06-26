@@ -50,6 +50,7 @@ from mcp.types import (
 )
 from mcp.types import Tool as McpToolDef
 
+from omnigent.inner.datamodel import CredentialBrokerSpec
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
 
@@ -398,6 +399,10 @@ class McpServerConnection:
     elicitation_callback: Callable[[str, ElicitRequestParams], Awaitable[ElicitResult]] | None = (
         field(default=None, repr=False)
     )
+    # Non-HTTP credential broker spec (from os_env.sandbox.credential_broker).
+    # When set, this server's ``config.credential_groups`` are resolved
+    # parent-side and merged into the stdio spawn env. The agent never sees it.
+    credential_broker: CredentialBrokerSpec | None = field(default=None, repr=False)
     # Guards concurrent tool calls so ``_active_session_id`` is
     # safe to read in the elicitation handler (which runs on the
     # SDK's receive-loop task, not the caller's task).
@@ -1004,21 +1009,63 @@ class McpServerConnection:
                 f"MCP server {self.config.name!r} transport='stdio' but command is "
                 "None — validator should have caught this"
             )
+        broker_env = self._resolve_broker_env()
         params = StdioServerParameters(
             command=self.config.command,
             args=list(self.config.args),
             cwd=self.cwd,
             # ``env=None`` inherits the SDK's ``get_default_environment``
-            # allowlist (no runner-auth secret). The ``config.env`` branch
-            # overlays author-declared vars (e.g. ``GITHUB_TOKEN``) on the
-            # full parent env, so strip the runner tunnel binding token
-            # first: an MCP server command is spec-author code.
-            env=(strip_runner_auth_secrets(os.environ) | self.config.env)
-            if self.config.env
+            # allowlist (no runner-auth secret). When the author set ``env`` or
+            # brokered ``credential_groups`` resolved to values, overlay them on
+            # the runner-secret-stripped parent env (an MCP command is
+            # spec-author code, so the binding token must be stripped first).
+            env=(strip_runner_auth_secrets(os.environ) | self.config.env | broker_env)
+            if (self.config.env or broker_env)
             else None,
         )
         read_stream, write_stream = await stack.enter_async_context(stdio_client(params))
         return read_stream, write_stream
+
+    def _resolve_broker_env(self) -> dict[str, str]:
+        """Resolve this server's brokered ``credential_groups`` into env vars.
+
+        Parent-side resolution: the stdio MCP subprocess runs unsandboxed in the
+        parent, so the agent can't read its env regardless. The broker's value
+        here is keeping long-lived secrets out of static MCP config and
+        supporting ephemeral (per-connect) resolution. ``command`` fallbacks run
+        against a runner-secret-stripped env so they can't read the binding
+        token.
+        """
+        groups = list(self.config.credential_groups or [])
+        if not groups:
+            return {}
+        if self.credential_broker is None:
+            _logger.warning(
+                "MCP server %r declares credential_groups %s but the agent has no "
+                "os_env.sandbox.credential_broker; ignoring.",
+                self.config.name,
+                groups,
+            )
+            return {}
+        from omnigent.inner.credential_broker import _load_store, _resolve_tool_env
+        from omnigent.inner.datamodel import CredentialBrokerSpec as _Spec
+        from omnigent.inner.datamodel import CredentialBrokerTool as _Tool
+
+        missing = [g for g in groups if g not in self.credential_broker.groups]
+        if missing:
+            raise RuntimeError(
+                f"MCP server {self.config.name!r} credential_groups reference unknown "
+                f"broker groups: {missing}"
+            )
+        synthetic = _Spec(
+            load=self.credential_broker.load,
+            groups=self.credential_broker.groups,
+            tools={"__mcp__": _Tool(credentials=groups)},
+        )
+        store = _load_store(synthetic.load, parent_env=dict(os.environ))
+        return _resolve_tool_env(
+            synthetic, "__mcp__", store, command_env=strip_runner_auth_secrets(os.environ)
+        )
 
     async def _elicitation_handler(
         self,

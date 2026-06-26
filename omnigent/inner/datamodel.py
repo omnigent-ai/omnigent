@@ -459,6 +459,74 @@ class CredentialProxySpec:
 
 
 @dataclass
+class CredentialBrokerField:
+    """One credential a brokered non-HTTP tool needs in its environment.
+
+    Resolution order at call time: the broker store value keyed by
+    :attr:`key` (loaded at unlock) → :attr:`fallback` source → skip if
+    :attr:`optional` else error. A ``fallback`` of kind ``command`` is the
+    way to keep a long-lived secret out of the sandbox entirely (mint a
+    short-lived token per invocation); a value resolved from the store
+    crosses into the tool's process verbatim.
+    """
+
+    env: str
+    key: str | None = None
+    optional: bool = False
+    fallback: CredentialSourceSpec | None = None
+
+
+@dataclass
+class CredentialBrokerLoadSource:
+    """A source the broker resolves ONCE at session start (the "unlock").
+
+    ``from_="file"`` reads ``KEY=VALUE`` lines from :attr:`path` (mode 0600,
+    outside the sandbox read scope). ``from_="env"`` lifts :attr:`names` from
+    the runner's own environment. Resolved values are held in the parent
+    broker's RAM and served per tool invocation.
+    """
+
+    from_: Literal["file", "env"]
+    path: str | None = None
+    names: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CredentialBrokerGroup:
+    """A named set of credential fields a tool can request together."""
+
+    fields: list[CredentialBrokerField]
+
+
+@dataclass
+class CredentialBrokerTool:
+    """Maps a tool name to the credential groups it receives.
+
+    :param binary: Absolute path to the real tool binary the shim execs.
+        ``None`` resolves it from the parent ``PATH`` (minus the shim dir).
+        Set this for tools outside the default-bound system dirs.
+    """
+
+    credentials: list[str]
+    binary: str | None = None
+
+
+@dataclass
+class CredentialBrokerSpec:
+    """Broker policy for non-HTTP credentialed tools (parent-side only).
+
+    Real secrets stay in the parent. A shim on the helper ``PATH`` fetches a
+    tool's credentials over an ``AF_UNIX`` socket and execs the real tool with
+    them, so nothing credential-shaped sits in the agent's ambient env.
+    Requires ``allow_network: true`` and is incompatible with ``egress_rules``.
+    """
+
+    load: list[CredentialBrokerLoadSource] = field(default_factory=list)
+    groups: dict[str, CredentialBrokerGroup] = field(default_factory=dict)
+    tools: dict[str, CredentialBrokerTool] = field(default_factory=dict)
+
+
+@dataclass
 class OSEnvSandboxSpec:
     """Sandbox configuration for an OS environment."""
 
@@ -656,6 +724,11 @@ class OSEnvSandboxSpec:
     # credential and rejects placeholder leaks) and a backend that
     # hard-isolates the network (``linux_bwrap`` / ``darwin_seatbelt``).
     credential_proxy: CredentialProxySpec | None = None
+    # Optional non-HTTP credential broker. Real secrets stay in the parent
+    # (loaded at unlock or resolved per-call); a PATH shim hands them to one
+    # tool invocation. Unlike credential_proxy this needs no egress_rules and
+    # works on both linux_bwrap and darwin_seatbelt.
+    credential_broker: CredentialBrokerSpec | None = None
 
 
 @dataclass

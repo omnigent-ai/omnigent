@@ -10,11 +10,23 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import (
     DEFAULT_BASIC_USERNAME,
+    CredentialBrokerField,
+    CredentialBrokerGroup,
+    CredentialBrokerLoadSource,
+    CredentialBrokerSpec,
+    CredentialBrokerTool,
     CredentialProxyEntry,
     CredentialProxySpec,
     CredentialSourceSpec,
@@ -842,6 +854,28 @@ def _parse_os_env_sandbox(
     macos_reason = _credential_proxy_macos_unsupported_reason(credential_proxy, sandbox_type)
     if macos_reason is not None:
         raise OmnigentError(macos_reason, code=ErrorCode.INVALID_INPUT)
+    credential_broker = _parse_credential_broker(raw.get("credential_broker"))
+    if credential_broker is not None:
+        if egress_rules:
+            raise OmnigentError(
+                "os_env.sandbox.credential_broker is not compatible with egress_rules: "
+                "brokered tools (e.g. psql) need raw TCP, but egress isolates the network "
+                "to an HTTP-only proxy.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
+            raise OmnigentError(
+                "os_env.sandbox.credential_broker requires sandbox.type=linux_bwrap "
+                f"or darwin_seatbelt. Got sandbox.type={sandbox_type!r}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not bool(raw.get("allow_network", True)):
+            raise OmnigentError(
+                "os_env.sandbox.credential_broker requires allow_network: true: brokered "
+                "tools connect to a network service, and the broker socket needs network "
+                "access on darwin_seatbelt.",
+                code=ErrorCode.INVALID_INPUT,
+            )
     allow_private = raw.get("egress_allow_private_destinations", False)
     if not isinstance(allow_private, bool):
         raise OmnigentError(
@@ -862,6 +896,7 @@ def _parse_os_env_sandbox(
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,
         credential_proxy=credential_proxy,
+        credential_broker=credential_broker,
     )
 
 
@@ -1366,6 +1401,155 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
             )
         seen_hosts[host_key] = entry.host
     return CredentialProxySpec(entries=entries)
+
+
+# Env names that are loader/interpreter hooks: brokering a value into one of
+# these would let a spec author inject code into the real tool's process. The
+# agent can't add field names (only spec-declared names cross), but we reject
+# these at parse time as defense in depth.
+_BROKER_FIELD_ENV_DENYLIST = frozenset(
+    {
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "BASH_ENV",
+        "ENV",
+        "PATH",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "IFS",
+    }
+)
+
+
+class _CredentialBrokerFieldModel(BaseModel):
+    """Pydantic boundary model for one ``credential_broker.groups[*][n]`` field."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    env: str
+    key: str | None = None
+    optional: bool = False
+    fallback: _CredentialSourceModel | None = None
+
+    @field_validator("env")
+    @classmethod
+    def _env_ok(cls, value: str) -> str:
+        if not _ENV_VAR_NAME_RE.match(value):
+            raise ValueError("env must be a POSIX environment variable name")
+        if value in _BROKER_FIELD_ENV_DENYLIST:
+            raise ValueError(f"env {value!r} is a loader/interpreter hook and may not be brokered")
+        return value
+
+    def to_spec(self) -> CredentialBrokerField:
+        return CredentialBrokerField(
+            env=self.env,
+            key=self.key,
+            optional=self.optional,
+            fallback=self.fallback.to_spec() if self.fallback else None,
+        )
+
+
+class _CredentialBrokerLoadModel(BaseModel):
+    """Pydantic boundary model for one ``credential_broker.load`` entry."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    from_: Literal["file", "env"] = Field(alias="from")
+    path: str | None = None
+    names: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check(self) -> _CredentialBrokerLoadModel:
+        if self.from_ == "file" and not (self.path and self.path.strip()):
+            raise ValueError("load 'from: file' requires a non-empty 'path'")
+        if self.from_ == "env" and not self.names:
+            raise ValueError("load 'from: env' requires a non-empty 'names' list")
+        for name in self.names:
+            if not _ENV_VAR_NAME_RE.match(name):
+                raise ValueError(
+                    f"load env name {name!r} must be a POSIX environment variable name"
+                )
+        return self
+
+    def to_spec(self) -> CredentialBrokerLoadSource:
+        return CredentialBrokerLoadSource(from_=self.from_, path=self.path, names=list(self.names))
+
+
+class _CredentialBrokerToolModel(BaseModel):
+    """Pydantic boundary model for one ``credential_broker.tools`` entry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    credentials: list[str]
+    binary: str | None = None
+
+
+class _CredentialBrokerModel(BaseModel):
+    """Pydantic boundary model for the ``credential_broker`` block."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    load: list[_CredentialBrokerLoadModel] = Field(default_factory=list)
+    groups: dict[str, list[_CredentialBrokerFieldModel]] = Field(default_factory=dict)
+    tools: dict[str, _CredentialBrokerToolModel] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _check_refs(self) -> _CredentialBrokerModel:
+        if not self.tools:
+            raise ValueError("credential_broker must declare at least one tool")
+        for tname, tool in self.tools.items():
+            if not tool.credentials:
+                raise ValueError(f"credential_broker tool {tname!r} must list at least one group")
+            for c in tool.credentials:
+                if c not in self.groups:
+                    raise ValueError(
+                        f"credential_broker tool {tname!r} references unknown group {c!r}"
+                    )
+        return self
+
+
+def _parse_credential_broker(raw: object) -> CredentialBrokerSpec | None:
+    """
+    Parse and validate the ``credential_broker:`` field of ``os_env.sandbox``.
+
+    Resolves non-HTTP credentialed tools (e.g. ``psql``). Each tool maps to one
+    or more credential groups; each group field resolves from the load-at-unlock
+    store, then an optional ``fallback`` source, then is skipped if ``optional``.
+    The shape is validated by :class:`_CredentialBrokerModel`; a
+    :class:`pydantic.ValidationError` is re-raised as :class:`OmnigentError`.
+
+    :param raw: Raw ``credential_broker`` mapping, or ``None`` when absent.
+    :returns: A populated :class:`CredentialBrokerSpec`, or ``None`` when absent.
+    :raises OmnigentError: If the value isn't a mapping or fails validation
+        (unknown group reference, interpreter-hook env, bad source, etc.).
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            f"os_env.sandbox.credential_broker must be a mapping, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        model = _CredentialBrokerModel.model_validate(raw)
+    except ValidationError as exc:
+        raise OmnigentError(
+            f"os_env.sandbox.credential_broker is invalid: {_format_validation_error(exc)}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    return CredentialBrokerSpec(
+        load=[m.to_spec() for m in model.load],
+        groups={
+            g: CredentialBrokerGroup(fields=[f.to_spec() for f in fields])
+            for g, fields in model.groups.items()
+        },
+        tools={
+            t: CredentialBrokerTool(credentials=list(v.credentials), binary=v.binary)
+            for t, v in model.tools.items()
+        },
+    )
 
 
 def _credential_proxy_macos_unsupported_reason(
@@ -2347,12 +2531,20 @@ def _parse_stdio_mcp_server(
             f"per-MCP outbound-host allowlist with a different schema.",
             code=ErrorCode.INVALID_INPUT,
         )
+    raw_groups = raw.get("credential_groups", [])
+    if not isinstance(raw_groups, list) or not all(isinstance(g, str) for g in raw_groups):
+        raise OmnigentError(
+            f"MCP server {name!r} (transport='stdio') 'credential_groups' must be a list "
+            f"of strings: {yaml_file}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return MCPServerConfig(
         name=str(name),
         transport="stdio",
         command=str(command),
         args=[str(a) for a in raw_args],
         env={str(k): str(v) for k, v in env.items()},
+        credential_groups=[str(g) for g in raw_groups],
         description=raw.get("description"),
         timeout=int(raw["timeout"]) if "timeout" in raw else None,
         retry=_parse_retry(raw["retry"]) if "retry" in raw else None,

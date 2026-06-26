@@ -26,6 +26,10 @@ from omnigent.runner.identity import (
 )
 
 from .async_utils import run_sync_on_thread
+from .credential_broker import (
+    CredentialBrokerRuntime,
+    prepare_credential_broker_runtime,
+)
 from .credential_proxy import (
     CredentialProxyRuntime,
     CredentialRewriteRule,
@@ -346,6 +350,10 @@ class _HelperProcessClient:
         # introspects them, but the lifecycle is driven through
         # the handle when present.
         self._egress_handle: Any | None = None  # EgressProxyHandle
+        # Parent-side broker for non-HTTP credentialed tools; serves creds to
+        # the PATH shim over a socket in the scratch tmpdir. None when no
+        # credential_broker is configured.
+        self._broker_runtime: CredentialBrokerRuntime | None = None
         self._lock = threading.Lock()
         self._closed = False
         atexit.register(self.close)
@@ -432,6 +440,24 @@ class _HelperProcessClient:
                     parent_env=credential_parent_env,
                 )
                 env.update(credential_runtime.helper_env_updates)
+            if sandbox.credential_broker is not None:
+                # Non-HTTP credential broker: resolve secrets in the parent and
+                # expose them only via a PATH shim that fetches them over a
+                # socket in the scratch tmpdir (already a bound write root).
+                # ``command_env`` is the filtered helper env (captured BEFORE
+                # the shim is prepended to PATH) so a fallback command can't
+                # enumerate the parent's secret-bearing environment.
+                if self._broker_runtime is not None:
+                    self._broker_runtime.stop()
+                    self._broker_runtime = None
+                self._broker_runtime = prepare_credential_broker_runtime(
+                    sandbox.credential_broker,
+                    parent_env=dict(os.environ),
+                    command_env=dict(env),
+                    scratch_dir=self._tmpdir,
+                )
+                if self._broker_runtime is not None:
+                    env["PATH"] = f"{self._broker_runtime.shim_dir}{os.pathsep}{env['PATH']}"
 
         # Start L7 egress proxy if rules are configured. The proxy
         # listens on a Unix socket in the scratch tmpdir; the helper
@@ -462,6 +488,11 @@ class _HelperProcessClient:
         # execve time, not on later libc mutations.
         if self._egress_auth_token is not None:
             config["egress_auth_token"] = self._egress_auth_token
+        # Broker token: delivered out of band via the same config FD (never on
+        # argv/env-at-exec) so a same-UID reader of the helper's environ can't
+        # forge it; the helper splices it into its in-process environ below.
+        if self._broker_runtime is not None:
+            config["cred_broker_token"] = self._broker_runtime.auth_token
         # S3 (security): deliver the config via an inherited pipe fd
         # instead of base64-encoding it onto argv. The legacy argv
         # form put the policy bytes on the helper's command line,
@@ -582,6 +613,9 @@ class _HelperProcessClient:
                         proc.kill()
         finally:
             self._stop_egress_proxy_locked()
+            if self._broker_runtime is not None:
+                self._broker_runtime.stop()
+                self._broker_runtime = None
             cleanup_private_tmpdir(self._tmpdir)
             self._tmpdir = None
 
@@ -1440,6 +1474,14 @@ def _run_helper(config_fd: int) -> int:
             if parts.port is not None:
                 netloc += f":{parts.port}"
             os.environ[env_key] = urlunparse(parts._replace(netloc=netloc))
+
+    # Broker token: splice it into the in-process environ (like the egress
+    # token above) so the shim's client inherits it but a same-UID reader of
+    # the execve-time /proc/<pid>/environ snapshot (incl. another agent)
+    # cannot. Sibling agent shells inherit it too — admitted same-agent replay.
+    cred_broker_token = config.get("cred_broker_token")
+    if isinstance(cred_broker_token, str) and cred_broker_token:
+        os.environ["OMNIGENT_CRED_BROKER_TOKEN"] = cred_broker_token
 
     cwd = Path(cwd_value)
     os.chdir(cwd)

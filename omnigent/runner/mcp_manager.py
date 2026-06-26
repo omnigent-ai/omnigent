@@ -15,6 +15,7 @@ from typing import Any
 from mcp.types import ElicitRequestParams, ElicitResult
 from mcp.types import Tool as McpToolDef
 
+from omnigent.inner.datamodel import CredentialBrokerSpec
 from omnigent.spec.types import AgentSpec, MCPServerConfig
 from omnigent.tools.base import is_valid_tool_name
 from omnigent.tools.mcp import McpServerConnection
@@ -60,6 +61,7 @@ class _SpecEntry:
     spec_hash: str
     servers: dict[str, _ServerEntry] = field(default_factory=dict)
     prewarm_task: asyncio.Task[None] | None = None
+    credential_broker: CredentialBrokerSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -71,11 +73,24 @@ class McpSchemasResult:
     failures: dict[str, str]  # server_name → error message
 
 
-def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -> str:
-    """Stable content hash over ``spec.mcp_servers`` (+ stdio cwd)."""
+def compute_spec_hash(
+    configs: list[MCPServerConfig],
+    cwd: Path | None = None,
+    credential_broker: CredentialBrokerSpec | None = None,
+) -> str:
+    """Stable content hash over ``spec.mcp_servers`` (+ stdio cwd + broker).
+
+    The credential broker is folded in so a broker change (rotated load
+    source, new fallback) invalidates cached connections even when the
+    ``mcp_servers`` list is unchanged. ``repr`` is a stable serialization of
+    the (secret-value-free) broker spec.
+    """
     payload = json.dumps(
         {
             "cwd": str(cwd) if cwd is not None else None,
+            "credential_broker": (
+                repr(credential_broker) if credential_broker is not None else None
+            ),
             "servers": [
                 {
                     "name": c.name,
@@ -85,6 +100,7 @@ def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -
                     "args": list(c.args or []),
                     "env": dict(c.env or {}),
                     "tools": list(getattr(c, "tools", None) or []),
+                    "credential_groups": list(getattr(c, "credential_groups", None) or []),
                 }
                 for c in configs
             ],
@@ -93,6 +109,17 @@ def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _agent_credential_broker(spec: AgentSpec) -> CredentialBrokerSpec | None:
+    """Extract the non-HTTP credential broker spec from an agent's os_env.
+
+    Returns ``None`` when the agent has no ``os_env``, no ``sandbox``, or no
+    ``credential_broker`` configured.
+    """
+    os_env = getattr(spec, "os_env", None)
+    sandbox = getattr(os_env, "sandbox", None)
+    return getattr(sandbox, "credential_broker", None)
 
 
 def _mcp_tool_schema(
@@ -281,9 +308,10 @@ class RunnerMcpManager:
         configs = list(spec.mcp_servers or [])
         if not configs:
             return
-        spec_hash = compute_spec_hash(configs, self._stdio_cwd)
+        broker = _agent_credential_broker(spec)
+        spec_hash = compute_spec_hash(configs, self._stdio_cwd, broker)
         async with self._lock:
-            entry = self._ensure_entry(spec_hash, configs)
+            entry = self._ensure_entry(spec_hash, configs, broker)
             if entry.prewarm_task is None or entry.prewarm_task.done():
                 entry.prewarm_task = asyncio.create_task(
                     self._connect_all(entry),
@@ -295,9 +323,10 @@ class RunnerMcpManager:
         configs = list(spec.mcp_servers or [])
         if not configs:
             return McpSchemasResult(schemas=[], tool_names=set(), failures={})
-        spec_hash = compute_spec_hash(configs, self._stdio_cwd)
+        broker = _agent_credential_broker(spec)
+        spec_hash = compute_spec_hash(configs, self._stdio_cwd, broker)
         async with self._lock:
-            entry = self._ensure_entry(spec_hash, configs)
+            entry = self._ensure_entry(spec_hash, configs, broker)
             self._touch(spec_hash)
             prewarm = entry.prewarm_task
             needs_connect = any(s.connection is None for s in entry.servers.values())
@@ -362,7 +391,7 @@ class RunnerMcpManager:
             raise RuntimeError(
                 f"runner has no MCPs registered for this spec; cannot dispatch {tool_name!r}"
             )
-        spec_hash = compute_spec_hash(configs, self._stdio_cwd)
+        spec_hash = compute_spec_hash(configs, self._stdio_cwd, _agent_credential_broker(spec))
         entry = self._specs.get(spec_hash)
         if entry is None:
             # Dispatch before schemas_for(): populate + await prewarm.
@@ -420,7 +449,7 @@ class RunnerMcpManager:
         configs = list(spec.mcp_servers or [])
         if not configs:
             return None
-        spec_hash = compute_spec_hash(configs, self._stdio_cwd)
+        spec_hash = compute_spec_hash(configs, self._stdio_cwd, _agent_credential_broker(spec))
         entry = self._specs.get(spec_hash)
         if entry is None:
             return None
@@ -450,12 +479,17 @@ class RunnerMcpManager:
         self._specs.clear()
         self._lru.clear()
 
-    def _ensure_entry(self, spec_hash: str, configs: list[MCPServerConfig]) -> _SpecEntry:
+    def _ensure_entry(
+        self,
+        spec_hash: str,
+        configs: list[MCPServerConfig],
+        credential_broker: CredentialBrokerSpec | None = None,
+    ) -> _SpecEntry:
         """Return or create the pool entry for *spec_hash*. Caller holds lock."""
         entry = self._specs.get(spec_hash)
         if entry is not None:
             return entry
-        entry = _SpecEntry(spec_hash=spec_hash)
+        entry = _SpecEntry(spec_hash=spec_hash, credential_broker=credential_broker)
         for cfg in configs:
             entry.servers[cfg.name] = _ServerEntry(config=cfg)
         self._specs[spec_hash] = entry
@@ -510,6 +544,7 @@ class RunnerMcpManager:
                     config=server.config,
                     cwd=self._stdio_cwd,
                     elicitation_callback=self._build_elicitation_callback(),
+                    credential_broker=entry.credential_broker,
                 )
                 tools = await conn.connect()
                 server.connection = conn

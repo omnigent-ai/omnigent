@@ -148,10 +148,18 @@ def patch_mcp_connection(
     class _FakeMcpServerConnection:
         """Drop-in for McpServerConnection; delegates to the closure dict."""
 
-        def __init__(self, *, config: MCPServerConfig) -> None:
+        def __init__(
+            self,
+            *,
+            config: MCPServerConfig,
+            credential_broker: object = None,
+            **_kwargs: object,
+        ) -> None:
             """Register a stub for *config.name* if not already present.
 
             :param config: The server config whose name keys the stub dict.
+            :param credential_broker: Accepted to match the real connection's
+                signature (the pool now threads it through); ignored by the stub.
             """
             self._name = config.name
             if config.name not in conns:
