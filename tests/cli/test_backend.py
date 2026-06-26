@@ -233,6 +233,25 @@ def test_build_host_daemon_env_local_preserves_server_credentials(
     assert empty_string_env["OPENAI_API_KEY"] == "test-key"
 
 
+def test_build_host_daemon_env_local_forwards_bedrock_skip_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLAUDE_CODE_SKIP_BEDROCK_AUTH reaches the local daemon env.
+
+    LiteLLM proxies fronting Bedrock need this flag to disable AWS SigV4
+    auth. Without it in the daemon allowlist, ``omni claude`` drops the
+    flag and Claude Code falls back to native AWS auth (which fails).
+    """
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SKIP_BEDROCK_AUTH", "1")
+
+    env = _build_host_daemon_env(server_url=None)
+
+    assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+    assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
+
+
 def test_build_host_daemon_env_remote_strips_provider_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
