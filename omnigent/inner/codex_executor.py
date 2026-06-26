@@ -1174,6 +1174,12 @@ class _CodexAppServerSession:
         self._loop: asyncio.AbstractEventLoop | None = None
         self.thread_id: str | None = None
         self.active_turn_id: str | None = None
+        # Last reasoning effort applied via ``thread/settings/update`` on the
+        # current thread. Effort is not part of the executor's session
+        # signature, so a change must be re-applied per turn; this is reset on
+        # a fresh thread so it is re-sent. ``turn/start`` carries no ``effort``
+        # field (it is silently dropped), hence the separate settings update.
+        self._applied_effort: str | None = None
         self._recent_stderr: list[str] = []
         self._recent_events: list[CodexMessage] = []
         self._process_cwd: Path | None = None
@@ -1439,6 +1445,9 @@ class _CodexAppServerSession:
             # below fails loud for a protocol violation instead of
             # silently carrying an empty-string thread id.
             self.thread_id = raw_thread_id if isinstance(raw_thread_id, str) else None
+            # Fresh thread: forget the prior thread's applied effort so the
+            # settings update below re-sends it for this thread.
+            self._applied_effort = None
 
         assert self.thread_id is not None
         prompt = _prompt_for_turn(messages, is_new_thread=is_new_thread)
@@ -1446,12 +1455,22 @@ class _CodexAppServerSession:
             turn_input = _to_codex_input_items(prompt)
         else:
             turn_input = [{"type": "text", "text": prompt}]
+        # Apply reasoning effort via ``thread/settings/update``: Codex's
+        # ``TurnStartParams`` has no ``effort`` field, so an ``effort`` set on
+        # ``turn/start`` is silently dropped by serde and never takes effect.
+        # ``ThreadSettingsUpdateParams`` is where ``model``/``effort`` live —
+        # the same path the TUI ``/model`` picker uses. Deduped against the
+        # last value applied on this thread to avoid a redundant per-turn RPC.
+        if reasoning_effort and reasoning_effort != self._applied_effort:
+            await self._request(
+                "thread/settings/update",
+                {"threadId": self.thread_id, "effort": reasoning_effort},
+            )
+            self._applied_effort = reasoning_effort
         turn_params: CodexParams = {
             "threadId": self.thread_id,
             "input": turn_input,
         }
-        if reasoning_effort:
-            turn_params["effort"] = reasoning_effort
         start_response = await self._request(
             "turn/start",
             turn_params,
