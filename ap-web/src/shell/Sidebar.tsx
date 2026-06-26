@@ -891,23 +891,24 @@ function ConversationList({
       return next;
     });
   }, []);
-  // "Collapse all" folds every open project folder at once and remembers the
-  // set, so a follow-up "Reopen previous" restores exactly what was open
-  // (not every folder). The snapshot is session-only — not persisted.
-  const [reopenSnapshot, setReopenSnapshot] = useState<string[]>([]);
-  const collapseAllProjects = useCallback(() => {
+  // "Expand all" opens every project folder at once and remembers the set that
+  // was open beforehand, so a follow-up "Revert to last state" restores exactly
+  // what was open (not collapse-everything). The snapshot is session-only — not
+  // persisted.
+  const [revertSnapshot, setRevertSnapshot] = useState<string[]>([]);
+  const expandAllProjects = useCallback((allNames: string[]) => {
     setExpandedProjects((prev) => {
-      setReopenSnapshot(prev);
-      writeExpandedProjectSections([]);
-      return [];
+      setRevertSnapshot(prev);
+      writeExpandedProjectSections(allNames);
+      return allNames;
     });
   }, []);
-  const reopenPreviousProjects = useCallback(() => {
+  const revertProjects = useCallback(() => {
     setExpandedProjects(() => {
-      writeExpandedProjectSections(reopenSnapshot);
-      return reopenSnapshot;
+      writeExpandedProjectSections(revertSnapshot);
+      return revertSnapshot;
     });
-  }, [reopenSnapshot]);
+  }, [revertSnapshot]);
 
   // The project the currently-selected session is filed under, if any. Derived
   // as a primitive so the auto-expand effect below only fires when the
@@ -1033,37 +1034,41 @@ function ConversationList({
               title="Projects"
               collapsed={effectiveCollapsedSections.includes("Projects")}
               onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-              headerAction={
-                expandedProjects.length > 0 ? (
+              headerAction={(() => {
+                const allNames = sections.projectGroups.map((g) => g.name);
+                // Once every folder is open the only useful move is to undo it,
+                // so the control flips to "revert"; otherwise it expands all.
+                const allExpanded = allNames.every((n) => expandedProjects.includes(n));
+                return allExpanded ? (
                   <Button
                     type="button"
                     variant="ghost"
                     size="icon-sm"
-                    aria-label="Collapse all projects"
-                    data-testid="collapse-all-projects"
+                    aria-label="Revert to last state"
+                    data-testid="revert-projects"
                     onClick={(e) => {
                       e.stopPropagation();
-                      collapseAllProjects();
+                      revertProjects();
                     }}
                   >
                     <Minimize2Icon className="size-3.5" />
                   </Button>
-                ) : reopenSnapshot.length > 0 ? (
+                ) : (
                   <Button
                     type="button"
                     variant="ghost"
                     size="icon-sm"
-                    aria-label="Reopen previous projects"
-                    data-testid="reopen-previous-projects"
+                    aria-label="Expand all projects"
+                    data-testid="expand-all-projects"
                     onClick={(e) => {
                       e.stopPropagation();
-                      reopenPreviousProjects();
+                      expandAllProjects(allNames);
                     }}
                   >
                     <Maximize2Icon className="size-3.5" />
                   </Button>
-                ) : null
-              }
+                );
+              })()}
             >
               {sections.projectGroups.map((group) => (
                 <ProjectFolder
