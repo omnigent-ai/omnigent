@@ -566,54 +566,21 @@ function senderServerUrl(event) {
 }
 
 /**
- * Push fresh host-connection status to every pinned window, deduplicating CLI
- * queries by server URL (two windows on one server share a single query). Sent
- * on a timer and immediately after a connect/disconnect toggle so the in-app
- * indicator stays live.
+ * Notify every pinned window that host/server status may have changed, so the
+ * SPA re-reads it. This is a bare ping — NOT a poll: it fires only on real
+ * events (a host child connecting or exiting, and after a control action), so
+ * there is no periodic querying of the server. The renderer reads the actual
+ * status on demand via the get-status handlers.
  */
 function broadcastHostStatus() {
-  const cliPath = resolvedCliPath();
-  const winsByUrl = new Map();
   for (const [win, state] of windows) {
     if (win.isDestroyed() || !state.origin || !state.serverUrl) continue;
-    if (!winsByUrl.has(state.serverUrl)) winsByUrl.set(state.serverUrl, []);
-    winsByUrl.get(state.serverUrl).push(win);
-  }
-  for (const [serverUrl, wins] of winsByUrl) {
-    serverManager
-      .statusFor(cliPath, serverUrl)
-      .then((status) => {
-        for (const win of wins) {
-          if (win.isDestroyed()) continue;
-          try {
-            win.webContents.send("omnigent:host-status-changed", status);
-          } catch {
-            // Window torn down between the check and the send; ignore.
-          }
-        }
-      })
-      .catch(() => {});
-  }
-}
-
-/** Interval handle for the host-status poller; started lazily in registerIpc. */
-let hostStatusTimer = null;
-
-/**
- * Poll host status every few seconds while at least one pinned window exists,
- * broadcasting changes to the SPA. Idempotent.
- */
-function startHostStatusPoller() {
-  if (hostStatusTimer) return;
-  hostStatusTimer = setInterval(() => {
-    for (const state of windows.values()) {
-      if (state.origin && state.serverUrl) {
-        broadcastHostStatus();
-        return;
-      }
+    try {
+      win.webContents.send("omnigent:host-status-changed");
+    } catch {
+      // Window torn down between the check and the send; ignore.
     }
-  }, 5000);
-  if (typeof hostStatusTimer.unref === "function") hostStatusTimer.unref();
+  }
 }
 
 /**
@@ -1871,7 +1838,10 @@ function registerIpc() {
     return result;
   });
 
-  startHostStatusPoller();
+  // Push a status ping when a host child connects or exits on its own (no
+  // polling) — the server-management module owns the subprocess and reports
+  // lifecycle changes here.
+  serverManager.onChange(broadcastHostStatus);
 }
 
 // ---------------------------------------------------------------------------

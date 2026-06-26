@@ -92,15 +92,15 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   controlServer: (action) => ipcRenderer.invoke("omnigent:server-control", action),
   /**
-   * Subscribe to pushed host-status updates (emitted on a timer). The callback
-   * receives the same shape as getHostStatus. Returns an unsubscribe function.
-   * @param {(status: object) => void} callback
+   * Subscribe to host/server status-change pings. Fired only on real events (a
+   * host child connecting/exiting, or a control action) — never on a timer — so
+   * the renderer re-reads status on demand. The callback takes no argument.
+   * Returns an unsubscribe function.
+   * @param {() => void} callback
    * @returns {() => void}
    */
   onHostStatusChanged: (callback) => {
-    const listener = (_event, status) => {
-      if (status && typeof status === "object") callback(status);
-    };
+    const listener = () => callback();
     ipcRenderer.on("omnigent:host-status-changed", listener);
     return () => ipcRenderer.removeListener("omnigent:host-status-changed", listener);
   },

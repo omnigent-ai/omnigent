@@ -132,8 +132,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   controlHost?: (action: HostControlAction) => Promise<HostActionResult>;
   /** Start / stop / restart the local server (loopback only). */
   controlServer?: (action: HostControlAction) => Promise<HostActionResult>;
-  /** Subscribe to pushed host-status updates; returns an unsubscribe. */
-  onHostStatusChanged?: (callback: (status: HostStatus) => void) => () => void;
+  /** Subscribe to host/server status-change pings (re-read on fire); returns an unsubscribe. */
+  onHostStatusChanged?: (callback: () => void) => () => void;
 }
 
 /** A lifecycle action for the host daemon or the local server. */
@@ -535,14 +535,16 @@ export async function controlServer(action: HostControlAction): Promise<HostActi
 }
 
 /**
- * Subscribe to host-status updates pushed by the desktop shell (on a timer), so
- * the in-app host indicator stays live.
+ * Subscribe to host/server status-change pings from the desktop shell. The
+ * shell fires these only on real events — a host child connecting or exiting,
+ * or a control action — never on a timer, so the callback should re-read status
+ * (getHostStatus / getLocalServerStatus) when it fires.
  *
  * Returns an unsubscribe function. A no-op (returning a no-op unsubscribe)
  * outside the Electron shell or under a shell too old to push updates, so
  * callers can register it unconditionally.
  */
-export function onHostStatusChanged(callback: (status: HostStatus) => void): () => void {
+export function onHostStatusChanged(callback: () => void): () => void {
   const electron = electronApi();
   if (!electron?.onHostStatusChanged) return () => {};
   try {

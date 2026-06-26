@@ -33,6 +33,31 @@ const hostChildren = new Map();
 /** { url, port, pid } when this app started the local server; null otherwise. */
 let ownedLocalServer = null;
 
+/** Single listener notified when a host child's lifecycle changes (no polling). */
+let changeListener = null;
+
+/**
+ * Register a callback fired when a managed host child connects or exits on its
+ * own, so the main process can push a status ping to the renderer without
+ * polling. One listener; a second call replaces the first.
+ *
+ * @param {(() => void) | null} cb
+ */
+function onChange(cb) {
+  changeListener = typeof cb === "function" ? cb : null;
+}
+
+/** Fire the change listener, swallowing listener errors. */
+function emitChange() {
+  if (changeListener) {
+    try {
+      changeListener();
+    } catch {
+      // A broken listener must not take down lifecycle handling.
+    }
+  }
+}
+
 /**
  * Append to a capped log buffer (newest kept).
  *
@@ -140,9 +165,15 @@ async function ensureHostConnected(cliPath, serverUrl) {
     return { ok: false, ownedByDesktop: false, error: spawned.error };
   }
   hostChildren.set(key, { child: spawned.child, serverUrl, log: spawned.holder });
-  // Persistent cleanup: drop the entry when this child eventually exits.
+  // Persistent cleanup: drop the entry when this child eventually exits. If the
+  // entry is still ours here, this is a SPONTANEOUS exit (crash / external
+  // kill), not a user-initiated disconnect (which removes the entry first), so
+  // ping the UI — this is how a dying daemon is reflected without polling.
   spawned.child.on("exit", () => {
-    if (hostChildren.get(key)?.child === spawned.child) hostChildren.delete(key);
+    if (hostChildren.get(key)?.child === spawned.child) {
+      hostChildren.delete(key);
+      emitChange();
+    }
   });
   return { ok: true, ownedByDesktop: true };
 }
@@ -352,6 +383,7 @@ module.exports = {
   statusFor,
   serverStatusFor,
   shutdown,
+  onChange,
   // Exposed for tests / introspection.
   _hostChildren: hostChildren,
   ownsLiveHost,
