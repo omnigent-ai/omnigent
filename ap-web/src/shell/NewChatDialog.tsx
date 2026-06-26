@@ -1268,19 +1268,28 @@ export function NewChatLandingScreen() {
   // Seed the harness's mode knob from the user's last pick when the selected
   // harness changes (including the first mount), so a returning user starts a
   // new session on the mode they used last for that harness instead of the
-  // default. A stale stored value not in the current list is ignored. Keyed
-  // on the harness so an in-session edit isn't clobbered on re-render — only a
-  // harness switch reseeds.
+  // default. Keyed on the harness so an in-session edit isn't clobbered on
+  // re-render — only a harness switch reseeds.
   useEffect(() => {
     if (!selectedNativeHarness) return;
     const stored = readLastModeForHarness(selectedNativeHarness);
-    if (stored == null) return;
+    // Resolve to the stored value when it's still valid for this harness,
+    // else the harness default. The else branch must RESET (not early-return)
+    // because codex-native and opencode-native share the single approvalMode
+    // state: returning early would leave the previously-selected harness's
+    // mode in place — e.g. codex's "full-access" carried onto OpenCode — and
+    // flow into the launch args unchanged. A stale value not in the current
+    // list resolves to the default for the same reason.
+    const resolve = (modes: readonly { value: string }[], dflt: string) =>
+      stored != null && modes.some((m) => m.value === stored) ? stored : dflt;
     if (supportsPermissionMode) {
-      if (CLAUDE_NATIVE_PERMISSION_MODES.some((m) => m.value === stored)) setPermissionMode(stored);
+      setPermissionMode(
+        resolve(CLAUDE_NATIVE_PERMISSION_MODES, CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE),
+      );
     } else if (supportsApprovalMode) {
-      if (CODEX_NATIVE_APPROVAL_MODES.some((m) => m.value === stored)) setApprovalMode(stored);
+      setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
     } else if (supportsCursorMode) {
-      if (CURSOR_NATIVE_EXEC_MODES.some((m) => m.value === stored)) setCursorExecMode(stored);
+      setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
     }
     // Reseed only on harness change; capability flags are derived from the
     // same harness so they don't need to be deps.

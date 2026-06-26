@@ -597,6 +597,52 @@ describe("NewChatLandingScreen create flow", () => {
     );
   });
 
+  it("resets the shared approval mode to default when switching codex-native → opencode-native", async () => {
+    // codex-native and opencode-native share a single approvalMode state. A
+    // codex pick must NOT linger after switching to OpenCode (which has no
+    // stored pick) — otherwise a more-permissive mode would silently flow
+    // into the OpenCode launch args. Regression test for the seeding effect's
+    // reset-on-no-stored-value branch.
+    setAgents([
+      agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" }),
+      agent({ id: "ag_opencode", name: "opencode-native-ui", display_name: "OpenCode" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_opencode" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // Pick "Full access" for Codex.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-approval-full-access"));
+    expect(screen.getByTestId("new-chat-landing-approval-pill").textContent).toContain(
+      "Full access",
+    );
+
+    // Switch the picker to OpenCode (Radix opens on pointerdown).
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_opencode"));
+
+    // OpenCode has no stored pick → the shared approval knob must reset to
+    // Default, not keep Codex's "Full access".
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-approval-pill").textContent).toContain("Default"),
+    );
+    expect(screen.getByTestId("new-chat-landing-approval-pill").textContent).not.toContain(
+      "Full access",
+    );
+
+    // And that reset must reach the launch args: no sandbox/approval flags.
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.terminal_launch_args).toBeUndefined();
+  });
+
   it("omits terminal_launch_args when permission mode is left at default for claude-native", async () => {
     setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
