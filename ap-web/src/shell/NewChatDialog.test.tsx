@@ -934,6 +934,26 @@ describe("NewChatLandingScreen", () => {
     expect(banner.textContent).toContain("1 other agent is");
   });
 
+  it("caps each footer chip label with truncate so a long label can't wrap the row", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    // The host / working-directory / project / worktree chips each clamp their
+    // label to a fixed max width and `truncate` it, so a long value (a deep
+    // working-directory path, a long project or branch name) is ellipsized
+    // rather than growing the chip and pushing the tray onto a second row.
+    // Dropping `truncate` or the `max-w-*` cap would regress the single-row
+    // layout this guards.
+    const label = (testid: string) =>
+      screen.getByTestId(testid).querySelector("span.truncate");
+
+    expect(label("new-chat-landing-workspace-chip")?.className).toContain("max-w-24");
+    expect(label("new-chat-landing-host-chip")?.className).toContain("max-w-24");
+    expect(label("new-chat-landing-project-chip")?.className).toContain("max-w-20");
+    expect(label("new-chat-landing-branch-chip")?.className).toContain("max-w-20");
+  });
+
   it("suppresses the conflict banner once a git branch is named", async () => {
     useDirectorySessionsMock.mockReturnValue({
       data: [conv({ id: "s1", host_id: "host_1", workspace: "/Users/corey/repo" })],

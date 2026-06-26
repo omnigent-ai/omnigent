@@ -703,13 +703,13 @@ function LandingProjectPicker({
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="flex h-6 items-center gap-1.5 rounded-full px-3 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+          className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
           data-testid="new-chat-landing-project-chip"
         >
           <TagIcon className="size-4 shrink-0" />
           {/* Label collapses to icon-only on narrow viewports (mobile),
               matching the host/workspace/worktree chips. */}
-          <span className={`hidden max-w-32 truncate sm:block ${value ? "text-foreground" : ""}`}>
+          <span className={`hidden max-w-20 truncate sm:block ${value ? "text-foreground" : ""}`}>
             {value || "No project"}
           </span>
           <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
@@ -1958,13 +1958,15 @@ export function NewChatLandingScreen() {
   const workspaceChip = (
     <button
       type="button"
-      className="flex h-6 items-center gap-1.5 rounded-full px-3 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
       data-testid="new-chat-landing-workspace-chip"
     >
       <FolderIcon className="size-4 shrink-0" />
-      {/* Label collapses to icon-only on narrow viewports (mobile). */}
+      {/* Label collapses to icon-only on narrow viewports (mobile). Capped
+          tight so a long working-directory path truncates instead of pushing
+          the chip row onto a second line. */}
       <span
-        className={`hidden max-w-40 truncate sm:block ${workspaceTrimmed !== "" ? "text-foreground" : ""}`}
+        className={`hidden max-w-24 truncate sm:block ${workspaceTrimmed !== "" ? "text-foreground" : ""}`}
       >
         {workspaceLabel}
       </span>
@@ -2289,13 +2291,13 @@ export function NewChatLandingScreen() {
               chips overflowed the viewport on phones, widening the whole
               page (#sidebar-wider-than-screen on the landing page). */}
           <div className="relative z-0 -mt-9 flex w-full items-center rounded-b-2xl bg-tray/40 pt-8 pr-3 pb-2 pl-2">
-            <div className="flex flex-wrap items-center gap-1.5">
+            <div className="flex flex-wrap items-center gap-1">
               {/* Host chip */}
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="flex h-6 items-center gap-1.5 rounded-full px-3 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+                    className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
                     data-testid="new-chat-landing-host-chip"
                   >
                     {isCloudHost ? (
@@ -2304,7 +2306,7 @@ export function NewChatLandingScreen() {
                       <MonitorIcon className="size-4 shrink-0" />
                     )}
                     <span
-                      className={`hidden max-w-32 truncate sm:block ${sandboxSelected || selectedHost != null ? "text-foreground" : ""}`}
+                      className={`hidden max-w-24 truncate sm:block ${sandboxSelected || selectedHost != null ? "text-foreground" : ""}`}
                     >
                       {hostLabel}
                     </span>
@@ -2408,12 +2410,12 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1.5 rounded-full px-3 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-repo-chip"
                     >
                       <GitBranchIcon className="size-4 shrink-0" />
                       <span
-                        className={`hidden max-w-40 truncate sm:block ${sandboxRepoName ? "text-foreground" : "text-muted-foreground"}`}
+                        className={`hidden max-w-24 truncate sm:block ${sandboxRepoName ? "text-foreground" : "text-muted-foreground"}`}
                       >
                         {sandboxRepoLabel}
                       </span>
@@ -2521,12 +2523,12 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1.5 rounded-full px-3 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-branch-chip"
                     >
                       <GitBranchIcon className="size-4 shrink-0" />
                       <span
-                        className={`hidden max-w-32 truncate sm:block ${branchName.trim() ? "text-foreground" : ""}`}
+                        className={`hidden max-w-20 truncate sm:block ${branchName.trim() ? "text-foreground" : ""}`}
                       >
                         {worktreeLabel}
                       </span>
