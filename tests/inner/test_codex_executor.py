@@ -566,18 +566,18 @@ class TestCodexExecutor(unittest.TestCase):
                 )
 
             inject_task = asyncio.create_task(_inject_turn_completed())
-            _ = [
-                event
-                async for event in session.run_turn(
-                    messages=[{"role": "user", "content": "hi"}],
-                    tools=[],
-                    system_prompt="",
-                    model="gpt-5.4-mini",
-                    cwd=".",
-                    sandbox="workspace-write",
-                    reasoning_effort="high",
-                )
-            ]
+            # Drive the turn to completion (consume the event stream for its
+            # side effects — the RPCs we assert on below).
+            async for _event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+                reasoning_effort="high",
+            ):
+                pass
             await inject_task
 
             methods = [call.args[0] for call in session._request.await_args_list]
@@ -619,18 +619,18 @@ class TestCodexExecutor(unittest.TestCase):
                 )
 
             inject_task = asyncio.create_task(_inject_turn_completed())
-            _ = [
-                event
-                async for event in session.run_turn(
-                    messages=[{"role": "user", "content": "again"}],
-                    tools=[],
-                    system_prompt="",
-                    model="gpt-5.4-mini",
-                    cwd=".",
-                    sandbox="workspace-write",
-                    reasoning_effort="high",
-                )
-            ]
+            # Drive the turn to completion (consume the event stream for its
+            # side effects — the RPCs we assert on below).
+            async for _event in session.run_turn(
+                messages=[{"role": "user", "content": "again"}],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+                reasoning_effort="high",
+            ):
+                pass
             await inject_task
 
             methods = [call.args[0] for call in session._request.await_args_list]
