@@ -285,6 +285,21 @@ def _make_auth_token_factory(
     :returns: A sync callable returning a bearer token string, or
         ``None`` when no refresh mechanism is available.
     """
+    # Managed-sandbox runner: the server mints a short-lived owner JWT at launch
+    # and the host seeds it as RUNNER_AUTH_TOKEN_ENV_VAR. It is the only
+    # credential such a runner has (no stored OIDC token, no Databricks config),
+    # so return it as the highest-priority source. Because EVERY runner→server
+    # auth path funnels through this factory — the WS tunnel, the HTTP
+    # server_client, and every native transcript forwarder (_runner_auth =
+    # _RunnerDatabricksAuth(_make_auth_token_factory())) — handling it here
+    # authenticates all of them uniformly.
+    from omnigent.runner.identity import RUNNER_AUTH_TOKEN_ENV_VAR
+
+    _managed_owner_jwt = os.environ.get(RUNNER_AUTH_TOKEN_ENV_VAR)
+    if _managed_owner_jwt and _managed_owner_jwt.strip():
+        _jwt = _managed_owner_jwt.strip()
+        return lambda: _jwt
+
     from omnigent.inner.databricks_executor import (
         DatabricksAuthError,
         _DatabricksBearerAuth,
@@ -849,40 +864,15 @@ async def _run_tunnel_from_env() -> None:
 
     :returns: None.
     """
-    from omnigent.runner.identity import RUNNER_AUTH_TOKEN_ENV_VAR, get_stable_runner_id
+    from omnigent.runner.identity import get_stable_runner_id
     from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel
 
     server_url = _server_url_from_env()
+    # In a managed sandbox this factory returns the server-minted owner JWT (see
+    # _make_auth_token_factory) — the single source every runner→server auth path
+    # uses (this tunnel, the HTTP server_client, and the native forwarders).
     auth_token_factory = _make_auth_token_factory()
     auth_token = auth_token_factory() if auth_token_factory is not None else None
-    # Managed-sandbox runners have no logged-in user credential of their own
-    # (the OIDC token factory above finds nothing in the sandbox). The server
-    # mints a short-lived owner JWT at launch and the host seeds it here;
-    # prefer it so the tunnel handshake carries an owner identity the server
-    # can resolve when accounts/OIDC auth is enabled. Unset → unchanged
-    # (single-user / no-auth, or the binding-token-only legacy path).
-    managed_auth_token = os.environ.get(RUNNER_AUTH_TOKEN_ENV_VAR)
-    if managed_auth_token and managed_auth_token.strip():
-        managed_owner_jwt = managed_auth_token.strip()
-        auth_token = managed_owner_jwt
-        # Authenticate the runner's HTTP client too (the server_client built in
-        # create_app: spec resolution, session queries, event posts) — not just
-        # the WS tunnel. A managed sandbox has no OIDC/Databricks credential, so
-        # the default factory yields nothing and every server call 401s. A
-        # static factory returning the owner JWT feeds both the app's httpx auth
-        # and serve_tunnel's refresh below.
-        def _managed_owner_token_factory(_jwt: str = managed_owner_jwt) -> str:
-            return _jwt
-
-        auth_token_factory = _managed_owner_token_factory
-        # The claude-native bridge authenticates its server callbacks (session
-        # cost + the item/status/delta mirroring that drives the web UI) via a
-        # SEPARATE path: chat._server_auth / _remote_headers read the
-        # OMNIGENT_REMOTE_AUTH_TOKEN env var, not the factory above. Seed it with
-        # the same owner JWT so native forwarding doesn't 401. (Literal name to
-        # avoid importing the heavy chat module here; matches
-        # chat._REMOTE_AUTH_TOKEN_ENV.)
-        os.environ.setdefault("OMNIGENT_REMOTE_AUTH_TOKEN", managed_owner_jwt)
     binding_token = _runner_tunnel_binding_token_from_env()
     parent_pid = _runner_parent_pid_from_env()
     runner_id = get_stable_runner_id()
