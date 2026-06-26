@@ -101,6 +101,10 @@ interface ChatHeaderProps {
   boundAgent: Agent | undefined;
   /** Whether the Share button/menu entry should render. */
   canShare: boolean;
+  /** Whether the rendered Share controls should be disabled. */
+  shareDisabled?: boolean;
+  /** User-facing reason for the disabled Share controls. */
+  shareDisabledReason?: string;
   /** Open the share dialog. */
   onShare: () => void;
   /** Whether the agent has tools/policies worth surfacing. */
@@ -152,6 +156,8 @@ export function ChatHeader({
   conversationId,
   boundAgent,
   canShare,
+  shareDisabled = false,
+  shareDisabledReason,
   onShare,
   hasAgentInfo,
   onAgentInfo,
@@ -284,8 +290,10 @@ export function ChatHeader({
             <DropdownMenuContent align="end" className="min-w-44">
               {canShare && (
                 <DropdownMenuItem
-                  onSelect={onShare}
+                  onSelect={shareDisabled ? undefined : onShare}
+                  disabled={shareDisabled}
                   data-testid="mobile-share-session"
+                  title={shareDisabledReason}
                   className="gap-2.5 px-2.5 py-2 text-base"
                 >
                   <ShareIcon className="size-4" />
@@ -305,7 +313,33 @@ export function ChatHeader({
             </DropdownMenuContent>
           </DropdownMenu>
         )}
-        {canShare && (
+        {canShare && shareDisabled && shareDisabledReason ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              {/* Disabled buttons don't receive pointer events, so the wrapper
+                  owns hover/focus for the explanatory tooltip. */}
+              <span
+                tabIndex={0}
+                aria-label={`Share session disabled: ${shareDisabledReason}`}
+                className="hidden md:inline-flex"
+              >
+                <Button
+                  type="button"
+                  aria-label="Share session"
+                  disabled
+                  title={shareDisabledReason}
+                  // share-button-glassy (index.css) paints the pink gradient,
+                  // shadow, and white text in both light and dark mode.
+                  className="share-button-glassy h-8 rounded-full px-6 text-13 font-normal text-white"
+                >
+                  <ShareIcon className="size-4" />
+                  Share
+                </Button>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">{shareDisabledReason}</TooltipContent>
+          </Tooltip>
+        ) : canShare ? (
           <Button
             type="button"
             aria-label="Share session"
@@ -317,7 +351,7 @@ export function ChatHeader({
             <ShareIcon className="size-4" />
             Share
           </Button>
-        )}
+        ) : null}
         {conversationId && hasRailContent && (
           <Tooltip>
             <TooltipTrigger asChild>
