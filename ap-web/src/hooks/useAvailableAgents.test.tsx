@@ -495,6 +495,137 @@ describe("useAvailableAgents", () => {
     ]);
   });
 
+  it("lets a newer upload supersede a same-named user-registered template (builtin: false)", async () => {
+    // The regression this guards: a user registers agent A as a template
+    // (e.g. `omnigent server --agent`, builtin: false), then `omnigent run`s
+    // a NEWER agent A whose session-scoped row has a distinct agent_id. The
+    // picker must bind the newest (the upload), not the stale template.
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          // Seeded built-in — protected, always listed verbatim.
+          { id: "ag_debby", name: "debby", harness: "claude-sdk", builtin: true, created_at: 100 },
+          // User-registered template for "agent-a" (older).
+          {
+            id: "ag_template",
+            name: "agent-a",
+            harness: "claude-sdk",
+            builtin: false,
+            created_at: 200,
+          },
+        ],
+        has_more: false,
+      }),
+      [SCAN_URL]: mockResponse({
+        object: "list",
+        data: [
+          // A session that bound the template directly — dropped by id (the
+          // template already represents it as a candidate).
+          { id: "conv_a", agent_id: "ag_template", agent_name: "agent-a", created_at: 250 },
+          // The newer `omnigent run` upload: distinct agent_id, same name,
+          // created AFTER the template — must win.
+          { id: "conv_b", agent_id: "ag_upload_v2", agent_name: "agent-a", created_at: 300 },
+        ],
+        has_more: false,
+      }),
+      "/v1/sessions/conv_b/agent": mockResponse({
+        id: "ag_upload_v2",
+        object: "agent",
+        name: "agent-a",
+        description: "version 2",
+        harness: "claude-sdk",
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // Exactly one "agent-a", bound to the newer upload (ag_upload_v2). The
+    // seeded debby is untouched. ag_template winning would mean the stale
+    // template shadowed the upload (the original bug); two agent-a rows would
+    // mean the template and upload both leaked.
+    const ids = result.current.data?.map((a) => a.id);
+    expect(ids).toEqual(["ag_debby", "ag_upload_v2"]);
+    // The enrich ran against the upload's session, not the template-bound one.
+    const enrichCalls = fetchMock.mock.calls
+      .map((c) => c[0] as string)
+      .filter((u) => u.endsWith("/agent"));
+    expect(enrichCalls).toEqual(["/v1/sessions/conv_b/agent"]);
+  });
+
+  it("keeps a user-registered template when no newer upload exists", async () => {
+    // Mirror image of the supersede case: the template is the only agent-a,
+    // and a same-named session that simply bound it must not duplicate it.
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          {
+            id: "ag_template",
+            name: "agent-a",
+            description: "the template",
+            harness: "claude-sdk",
+            builtin: false,
+            created_at: 200,
+          },
+        ],
+        has_more: false,
+      }),
+      [SCAN_URL]: mockResponse({
+        object: "list",
+        data: [{ id: "conv_a", agent_id: "ag_template", agent_name: "agent-a", created_at: 250 }],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // One agent-a (the template), carried with its full catalog info. No
+    // enrich fetch — the only session bound the template directly.
+    expect(result.current.data?.map((a) => ({ id: a.id, description: a.description }))).toEqual([
+      { id: "ag_template", description: "the template" },
+    ]);
+    const enrichCalls = fetchMock.mock.calls
+      .map((c) => c[0] as string)
+      .filter((u) => u.endsWith("/agent"));
+    expect(enrichCalls).toEqual([]);
+  });
+
+  it("protects a seeded built-in from a same-named upload (builtin: true)", async () => {
+    // Option-1 half of the policy: a same-named upload must NOT shadow a
+    // SEEDED built-in (unlike a user-registered template). debby stays canonical.
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "ag_debby", name: "debby", harness: "claude-sdk", builtin: true, created_at: 100 },
+        ],
+        has_more: false,
+      }),
+      [SCAN_URL]: mockResponse({
+        object: "list",
+        data: [
+          // A newer upload named "debby" — must be dropped, not surfaced.
+          { id: "conv_x", agent_id: "ag_fake_debby", agent_name: "debby", created_at: 999 },
+        ],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // Only the seeded debby; the same-named upload is shadowed (Option 1) and
+    // never enriched, even though it is newer than the built-in.
+    expect(result.current.data?.map((a) => a.id)).toEqual(["ag_debby"]);
+    const enrichCalls = fetchMock.mock.calls
+      .map((c) => c[0] as string)
+      .filter((u) => u.endsWith("/agent"));
+    expect(enrichCalls).toEqual([]);
+  });
+
   it("degrades to built-ins when the sessions scan fails", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({

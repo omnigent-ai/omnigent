@@ -49,6 +49,12 @@
       "AgentObject": {
         "description": "API representation of a registered agent.",
         "properties": {
+          "builtin": {
+            "default": false,
+            "description": "Whether this is a server-*seeded* built-in agent (deterministic, name-derived id) as opposed to an operator/user-registered template (random id, e.g. via `omnigent server --agent`) or a session-scoped upload. The Web UI's new-session picker uses this to decide whether a same-named `omnigent run` upload may shadow the catalog entry: seeded built-ins are protected, while a user-registered template is superseded by a newer same-named upload. Always `False` for session-scoped agents.",
+            "title": "Builtin",
+            "type": "boolean"
+          },
           "created_at": {
             "description": "Unix epoch timestamp of creation.",
             "title": "Created At",
