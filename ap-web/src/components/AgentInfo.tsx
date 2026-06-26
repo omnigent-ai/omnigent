@@ -38,7 +38,8 @@ import {
   useDeletePolicy,
   type PolicyRegistryEntry,
 } from "@/hooks/usePolicies";
-import { useSessionOwner } from "@/hooks/usePermissions";
+import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
+import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import { getCurrentUserId } from "@/lib/identity";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -1216,6 +1217,14 @@ export function AgentInfoContent({
   // (no mid-turn switch), so a model change is a fork that carries history.
   const showRestartWithModel = isCodexHarness(agent?.harness) && !!sessionId;
   const [restartOpen, setRestartOpen] = useState(false);
+  // Only surface the owner once the session is actually shared — a private
+  // solo session has no "owner" worth showing. A non-owner viewer already
+  // implies a share; the owner needs the grant list (manage-only, readable by
+  // the owner) to know they've granted access to anyone else or made it
+  // public. Mirrors the author-label gate in ChatPage.
+  const viewerOwnsSession = owner != null && owner === viewerId;
+  const { data: ownerGrants } = usePermissions(viewerOwnsSession ? (sessionId ?? null) : null);
+  const isSessionShared = isSessionSharedWithOthers(owner ?? null, viewerId, ownerGrants);
 
   useEffect(() => {
     return () => {
@@ -1246,7 +1255,7 @@ export function AgentInfoContent({
           )}
         </div>
       )}
-      {sessionId && owner && (
+      {sessionId && owner && isSessionShared && (
         <div className="flex flex-col gap-1.5">
           <SectionLabel>Owner</SectionLabel>
           <span
