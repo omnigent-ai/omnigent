@@ -816,26 +816,24 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
                 code=ErrorCode.INVALID_INPUT,
             )
         display_name_raw = raw.get("display_name")
-        cli_config_entry = ProviderEntry(
+        return ProviderEntry(
             name=name,
             kind=kind,
             cli=cli_raw,
             model_provider=model_provider_raw,
             display_name=display_name_raw if isinstance(display_name_raw, str) else None,
-        )
-        # A codex cli-config provider serves the openai surface, like a codex
-        # subscription. It may ALSO claim the pi scope when it is a Databricks
-        # AI Gateway (Pi speaks its Anthropic surface natively) — so a user can
-        # pin pi→Databricks with ``default: [openai, pi]``. We only run the
-        # (disk-reading) capability check when a ``default`` is actually
-        # declared, so the common no-default parse stays cheap and side-effect
-        # free; a non-Databricks cli-config remains pi-incapable (its
-        # ``default: pi`` is rejected at parse, parity with a subscription).
-        pi_capable = bool(default_raw) and _cli_config_serves_pi(cli_config_entry)
-        return replace(
-            cli_config_entry,
+            # A codex cli-config provider serves the openai surface, like a codex
+            # subscription. It may ALSO claim the pi scope (``default: [openai,
+            # pi]``) because a Databricks AI Gateway is pi-consumable (Pi speaks
+            # its Anthropic surface natively). This is allowed structurally —
+            # without reading the ambient ~/.codex/config.toml at parse — so a
+            # user can pin pi→Databricks; whether the pinned provider is a *real*
+            # Databricks gateway is validated at pi launch, which falls back to
+            # Pi's own login when it is not (see :func:`_cli_config_serves_pi`
+            # and ``resolve_pi_native_provider``). A codex subscription stays
+            # pi-incapable (its ``default: pi`` is still rejected at parse).
             default_families=_parse_default_families(
-                name, default_raw, {OPENAI_FAMILY}, pi_capable=pi_capable
+                name, default_raw, {OPENAI_FAMILY}, pi_capable=True
             ),
         )
 
@@ -1039,12 +1037,20 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
         if entry.cli == "claude":
             return frozenset({ANTHROPIC_FAMILY})
         if entry.cli == "codex":
-            # A codex cli-config provider that is a Databricks AI Gateway also
-            # serves pi — the gateway's Anthropic Messages surface is reusable
-            # by Pi (see :func:`_cli_config_serves_pi`). A codex *subscription*
-            # never does (a CLI login is unusable outside its own CLI), so the
-            # pi scope is gated on the cli-config Databricks-gateway capability.
-            if entry.kind == CLI_CONFIG_KIND and _cli_config_serves_pi(entry):
+            # A codex *cli-config* provider may ALSO serve pi: a Databricks AI
+            # Gateway exposes an Anthropic Messages surface Pi speaks natively
+            # (pi-native translates it via ``_cli_config_pi_provider``; the
+            # gateway-harness pi path routes it via
+            # ``configure_agent_harness_with_provider``). This is reported at the
+            # KIND level — structurally, without reading the ambient
+            # ~/.codex/config.toml — so ``provider_families`` stays pure (the
+            # setup menus / ``set_default_provider`` may offer/accept the pi
+            # scope for a codex cli-config). Whether the pinned provider is a
+            # *real* Databricks gateway is validated at resolution time
+            # (``default_provider_for_harness`` fallback + the pi launch), which
+            # falls back gracefully when it is not. A codex *subscription* never
+            # serves pi — a CLI login is unusable outside its own CLI.
+            if entry.kind == CLI_CONFIG_KIND:
                 return frozenset({OPENAI_FAMILY, PI_SURFACE})
             return frozenset({OPENAI_FAMILY})
         return frozenset()
