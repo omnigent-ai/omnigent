@@ -100,17 +100,31 @@ def _make_user(db_uri: str, email: str, *, is_admin: bool = False) -> None:
     SqlAlchemyPermissionStore(db_uri).ensure_user(email, is_admin=is_admin)
 
 
-def _make_session_for(db_uri: str, owner: str) -> str:
-    """Create a conversation and grant ``owner`` owner-level access.
+def _make_session_for(
+    db_uri: str,
+    owner: str,
+    *,
+    cost_usd: float | None = None,
+    total_tokens: int | None = None,
+) -> str:
+    """Create a conversation, grant ``owner`` owner access, optionally set usage.
 
     :param db_uri: Per-test SQLite URI.
     :param owner: The user to make owner, e.g. ``"alice@example.com"``.
+    :param cost_usd: If set, written into the session's usage rollup.
+    :param total_tokens: If set, written into the session's usage rollup.
     :returns: The new conversation id.
     """
-    conv = SqlAlchemyConversationStore(db_uri).create_conversation()
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation()
     perm = SqlAlchemyPermissionStore(db_uri)
     perm.ensure_user(owner)
     perm.grant(owner, conv.id, level=LEVEL_OWNER)
+    if cost_usd is not None or total_tokens is not None:
+        conv_store.set_session_usage(
+            conv.id,
+            {"total_cost_usd": cost_usd or 0.0, "total_tokens": total_tokens or 0},
+        )
     return conv.id
 
 
@@ -154,6 +168,24 @@ async def test_list_users_as_admin(auth_client: httpx.AsyncClient, db_uri: str) 
     assert "__public__" not in users
 
 
+async def test_list_users_includes_cost_rollup(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Each user row carries a cost/token rollup summed across their sessions."""
+    _make_user(db_uri, "boss@example.com", is_admin=True)
+    _make_session_for(db_uri, "alice@example.com", cost_usd=1.25, total_tokens=1000)
+    _make_session_for(db_uri, "alice@example.com", cost_usd=0.75, total_tokens=500)
+
+    resp = await auth_client.get("/v1/admin/users", headers=_headers("boss@example.com"))
+
+    assert resp.status_code == 200
+    by_id = {u["user_id"]: u for u in resp.json()["users"]}
+    alice = by_id["alice@example.com"]
+    assert alice["cost_usd"] == pytest.approx(2.0)
+    assert alice["total_tokens"] == 1500
+    assert alice["session_count"] == 2
+
+
 async def test_list_users_forbidden_for_non_admin(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
@@ -186,6 +218,26 @@ async def test_list_user_sessions_as_admin(auth_client: httpx.AsyncClient, db_ur
     assert body["user_id"] == "alice@example.com"
     ids = [s["id"] for s in body["sessions"]]
     assert conv_id in ids
+
+
+async def test_list_user_sessions_includes_cost(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Each session row carries its own cost/tokens, and totals roll them up."""
+    _make_user(db_uri, "boss@example.com", is_admin=True)
+    _make_session_for(db_uri, "alice@example.com", cost_usd=2.5, total_tokens=4200)
+
+    resp = await auth_client.get(
+        "/v1/admin/users/alice@example.com/sessions",
+        headers=_headers("boss@example.com"),
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["sessions"][0]["cost_usd"] == pytest.approx(2.5)
+    assert body["sessions"][0]["total_tokens"] == 4200
+    assert body["totals"]["cost_usd"] == pytest.approx(2.5)
+    assert body["totals"]["total_tokens"] == 4200
 
 
 async def test_list_user_sessions_forbidden_for_non_admin(

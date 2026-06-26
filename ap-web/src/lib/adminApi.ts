@@ -11,10 +11,13 @@
 
 import { authenticatedFetch } from "./identity";
 
-/** A user row from ``GET /v1/admin/users``. */
+/** A user row from ``GET /v1/admin/users`` (with a usage rollup). */
 export interface AdminUser {
   user_id: string;
   is_admin: boolean;
+  cost_usd: number;
+  total_tokens: number;
+  session_count: number;
 }
 
 /** A session row from ``GET /v1/admin/users/{id}/sessions``. */
@@ -23,6 +26,21 @@ export interface AdminSession {
   title: string | null;
   created_at: number;
   updated_at: number;
+  cost_usd: number;
+  total_tokens: number;
+}
+
+/** Aggregate usage across a user's sessions. */
+export interface UsageTotals {
+  cost_usd: number;
+  total_tokens: number;
+  session_count: number;
+}
+
+/** Response of ``GET /v1/admin/users/{id}/sessions``. */
+export interface AdminUserSessions {
+  sessions: AdminSession[];
+  totals: UsageTotals;
 }
 
 /**
@@ -42,17 +60,17 @@ export async function listAllUsers(): Promise<AdminUser[] | null> {
 }
 
 /**
- * GET /v1/admin/users/{id}/sessions — list a user's sessions (admin only).
+ * GET /v1/admin/users/{id}/sessions — list a user's sessions + usage totals
+ * (admin only).
  *
  * :param userId: The user whose sessions to list.
- * :returns: The session list, or ``null`` on error / forbidden.
+ * :returns: The sessions + totals, or ``null`` on error / forbidden.
  */
-export async function listUserSessions(userId: string): Promise<AdminSession[] | null> {
+export async function listUserSessions(userId: string): Promise<AdminUserSessions | null> {
   try {
     const res = await authenticatedFetch(`/v1/admin/users/${encodeURIComponent(userId)}/sessions`);
     if (!res.ok) return null;
-    const data = (await res.json()) as { sessions: AdminSession[] };
-    return data.sessions;
+    return (await res.json()) as AdminUserSessions;
   } catch {
     return null;
   }

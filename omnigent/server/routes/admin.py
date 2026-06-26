@@ -63,15 +63,33 @@ def create_admin_router(
 
     @router.get("/admin/users")
     async def list_users(request: Request) -> dict[str, list[dict[str, object]]]:
-        """List all users (admin only).
+        """List all users (admin only), each with a usage rollup.
 
-        :returns: ``{"users": [{"user_id", "is_admin"}, ...]}``.
+        ``cost_usd`` / ``total_tokens`` sum the user's top-level
+        sessions — the same set ``/admin/users/{id}/sessions`` returns,
+        so a row's rollup equals the sum of that user's session rows.
+
+        :returns: ``{"users": [{"user_id", "is_admin", "cost_usd",
+            "total_tokens", "session_count"}, ...]}``.
         """
         await _require_admin(request)
-        users = await asyncio.to_thread(permission_store.list_users)
-        return {
-            "users": [{"user_id": u.user_id, "is_admin": u.is_admin} for u in users],
-        }
+
+        def _build() -> list[dict[str, object]]:
+            out: list[dict[str, object]] = []
+            for u in permission_store.list_users():
+                totals = conversation_store.usage_totals_for_user(u.user_id)
+                out.append(
+                    {
+                        "user_id": u.user_id,
+                        "is_admin": u.is_admin,
+                        "cost_usd": totals.cost_usd,
+                        "total_tokens": totals.total_tokens,
+                        "session_count": totals.session_count,
+                    }
+                )
+            return out
+
+        return {"users": await asyncio.to_thread(_build)}
 
     @router.get("/admin/users/{user_id}/sessions")
     async def list_user_sessions(
@@ -88,21 +106,34 @@ def create_admin_router(
         :param user_id: The user whose sessions to list, e.g.
             ``"alice@example.com"``.
         :param limit: Maximum sessions to return (1–500).
-        :returns: ``{"user_id", "sessions": [{"id", "title",
-            "created_at", "updated_at"}, ...]}``.
+        :returns: ``{"user_id", "totals": {...}, "sessions": [{"id",
+            "title", "created_at", "updated_at", "cost_usd",
+            "total_tokens"}, ...]}``. Per-session cost/tokens come from
+            each conversation's ``session_usage``; ``totals`` is the
+            user rollup (sums every session, not just this page).
         """
         await _require_admin(request)
-        paged = await asyncio.to_thread(
-            lambda: conversation_store.list_conversations(accessible_by=user_id, limit=limit)
+        paged, totals = await asyncio.to_thread(
+            lambda: (
+                conversation_store.list_conversations(accessible_by=user_id, limit=limit),
+                conversation_store.usage_totals_for_user(user_id),
+            )
         )
         return {
             "user_id": user_id,
+            "totals": {
+                "cost_usd": totals.cost_usd,
+                "total_tokens": totals.total_tokens,
+                "session_count": totals.session_count,
+            },
             "sessions": [
                 {
                     "id": c.id,
                     "title": c.title,
                     "created_at": c.created_at,
                     "updated_at": c.updated_at,
+                    "cost_usd": float(c.session_usage.get("total_cost_usd") or 0.0),
+                    "total_tokens": int(c.session_usage.get("total_tokens") or 0),
                 }
                 for c in paged.data
             ],

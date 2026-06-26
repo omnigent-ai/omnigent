@@ -16,7 +16,13 @@ import { useCallback, useEffect, useState } from "react";
 import { RefreshCwIcon } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import { getCurrentIsAdmin, getCurrentUserId, resolveIdentity } from "@/lib/identity";
-import { type AdminSession, type AdminUser, listAllUsers, listUserSessions } from "@/lib/adminApi";
+import {
+  type AdminSession,
+  type AdminUser,
+  type UsageTotals,
+  listAllUsers,
+  listUserSessions,
+} from "@/lib/adminApi";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -30,6 +36,7 @@ export function AdminPage() {
 
   const [selectedUser, setSelectedUser] = useState<string | null>(null);
   const [sessions, setSessions] = useState<AdminSession[] | null>(null);
+  const [sessionTotals, setSessionTotals] = useState<UsageTotals | null>(null);
   const [sessionsLoading, setSessionsLoading] = useState(false);
 
   const refreshUsers = useCallback(async () => {
@@ -59,10 +66,12 @@ export function AdminPage() {
   const onSelectUser = useCallback(async (userId: string) => {
     setSelectedUser(userId);
     setSessions(null);
+    setSessionTotals(null);
     setSessionsLoading(true);
-    const list = await listUserSessions(userId);
+    const result = await listUserSessions(userId);
     setSessionsLoading(false);
-    setSessions(list ?? []);
+    setSessions(result?.sessions ?? []);
+    setSessionTotals(result?.totals ?? null);
   }, []);
 
   if (isAdmin === null) {
@@ -109,6 +118,9 @@ export function AdminPage() {
                 <th className="px-3 py-2 font-medium">User</th>
                 <th className="px-3 py-2 font-medium">Role</th>
                 <th className="px-3 py-2 text-right font-medium">Sessions</th>
+                <th className="px-3 py-2 text-right font-medium">Tokens</th>
+                <th className="px-3 py-2 text-right font-medium">Cost</th>
+                <th className="px-3 py-2 text-right font-medium" aria-label="actions" />
               </tr>
             </thead>
             <tbody>
@@ -130,6 +142,15 @@ export function AdminPage() {
                   </td>
                   <td className="px-3 py-2 align-middle">
                     {u.is_admin ? <Badge>Admin</Badge> : <Badge variant="secondary">Member</Badge>}
+                  </td>
+                  <td className="px-3 py-2 text-right align-middle tabular-nums text-muted-foreground">
+                    {u.session_count}
+                  </td>
+                  <td className="px-3 py-2 text-right align-middle tabular-nums text-muted-foreground">
+                    {formatTokens(u.total_tokens)}
+                  </td>
+                  <td className="px-3 py-2 text-right align-middle tabular-nums font-medium">
+                    {formatUsd(u.cost_usd)}
                   </td>
                   <td className="px-3 py-2 text-right">
                     <Button
@@ -156,9 +177,20 @@ export function AdminPage() {
       {/* ── Selected user's sessions ─────────────────────────────── */}
       {selectedUser !== null && (
         <div className="mt-8">
-          <h2 className="mb-2 text-sm font-medium text-muted-foreground">
-            Sessions for <span className="font-semibold text-foreground">{selectedUser}</span>
-          </h2>
+          <div className="mb-2 flex items-baseline justify-between">
+            <h2 className="text-sm font-medium text-muted-foreground">
+              Sessions for <span className="font-semibold text-foreground">{selectedUser}</span>
+            </h2>
+            {sessionTotals !== null && (
+              <span className="text-xs text-muted-foreground tabular-nums">
+                {sessionTotals.session_count} sessions · {formatTokens(sessionTotals.total_tokens)}{" "}
+                tokens ·{" "}
+                <span className="font-medium text-foreground">
+                  {formatUsd(sessionTotals.cost_usd)}
+                </span>
+              </span>
+            )}
+          </div>
           {sessionsLoading && <p className="text-sm text-muted-foreground">Loading…</p>}
           {!sessionsLoading && sessions !== null && sessions.length === 0 && (
             <p className="text-sm text-muted-foreground">This user has no sessions.</p>
@@ -170,6 +202,8 @@ export function AdminPage() {
                   <tr>
                     <th className="px-3 py-2 font-medium">Title</th>
                     <th className="px-3 py-2 font-medium">Updated</th>
+                    <th className="px-3 py-2 text-right font-medium">Tokens</th>
+                    <th className="px-3 py-2 text-right font-medium">Cost</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -186,6 +220,12 @@ export function AdminPage() {
                       <td className="px-3 py-2 align-middle text-muted-foreground">
                         {formatEpoch(s.updated_at)}
                       </td>
+                      <td className="px-3 py-2 text-right align-middle tabular-nums text-muted-foreground">
+                        {formatTokens(s.total_tokens)}
+                      </td>
+                      <td className="px-3 py-2 text-right align-middle tabular-nums font-medium">
+                        {formatUsd(s.cost_usd)}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -200,4 +240,20 @@ export function AdminPage() {
 
 function formatEpoch(epoch: number): string {
   return new Date(epoch * 1000).toLocaleString();
+}
+
+/**
+ * Format a USD cost. Sub-cent spend still shows as `$0.00` rather than
+ * being hidden, so a session with negligible-but-nonzero cost reads as
+ * "cheap", not "free".
+ */
+function formatUsd(cost: number): string {
+  return `$${cost.toFixed(2)}`;
+}
+
+/** Compact token count: 1234 → "1.2K", 1500000 → "1.5M". */
+function formatTokens(tokens: number): string {
+  if (tokens < 1000) return String(tokens);
+  if (tokens < 1_000_000) return `${(tokens / 1000).toFixed(1)}K`;
+  return `${(tokens / 1_000_000).toFixed(1)}M`;
 }
