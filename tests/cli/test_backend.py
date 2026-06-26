@@ -1410,11 +1410,11 @@ def _patch_auth_preflight(
     monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: tty)
     login_calls: list[str] = []
-    monkeypatch.setattr(
-        cli,
-        "_databricks_login",
-        lambda server, workspace_host: login_calls.append(f"{server} {workspace_host}"),
-    )
+
+    def _capture_login(server: str, workspace_host: str, org_id: str | None = None) -> None:
+        login_calls.append(f"{server} {workspace_host}")
+
+    monkeypatch.setattr(cli, "_databricks_login", _capture_login)
     return login_calls
 
 

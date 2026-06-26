@@ -3046,7 +3046,12 @@ async def _auto_create_kimi_terminal(
     server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/")
     _auth_factory = _make_auth_token_factory()
     _auth_token = _auth_factory() if _auth_factory is not None else None
-    _runner_headers = {"Authorization": f"Bearer {_auth_token}"} if _auth_token else {}
+    # The hook subprocess replays these static headers from its config (no
+    # refresh-capable httpx.Auth of its own); the helper pairs the bearer with
+    # the workspace-routing header so neither is dropped.
+    from omnigent.cli_auth import databricks_auth_headers
+
+    _runner_headers = databricks_auth_headers(server_url, _auth_token)
     write_hook_config(
         bridge_dir,
         server_url=server_url,
@@ -3404,9 +3409,12 @@ async def _auto_create_codex_terminal(
 
     _policy_auth_factory = _make_auth_token_factory()
     _policy_auth_token = _policy_auth_factory() if _policy_auth_factory is not None else None
-    policy_headers = (
-        {"Authorization": f"Bearer {_policy_auth_token}"} if _policy_auth_token else {}
-    )
+    # The codex policy hook subprocess replays these static headers from its
+    # config (no refresh-capable auth of its own); the helper pairs the bearer
+    # with the workspace-routing header so neither is dropped.
+    from omnigent.cli_auth import databricks_auth_headers
+
+    policy_headers = databricks_auth_headers(launch_config.policy_server_url, _policy_auth_token)
 
     app_server = build_codex_native_server(
         socket_path=socket_path,
@@ -5125,7 +5133,12 @@ async def _auto_create_claude_terminal(
     # stop forwarding after the token lapses. ``_RunnerDatabricksAuth``
     # with a ``None`` factory is a safe no-op (local unauthenticated).
     _auth_token = _auth_factory() if _auth_factory is not None else None
-    _runner_headers = {"Authorization": f"Bearer {_auth_token}"} if _auth_token else {}
+    # The hook subprocess replays these static headers from its config (no
+    # refresh-capable auth of its own); the helper pairs the bearer with the
+    # workspace-routing header so neither is dropped.
+    from omnigent.cli_auth import databricks_auth_headers
+
+    _runner_headers = databricks_auth_headers(server_url, _auth_token)
     _runner_auth = _RunnerDatabricksAuth(_auth_factory)
 
     from omnigent.claude_native import (

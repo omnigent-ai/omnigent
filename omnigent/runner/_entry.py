@@ -171,14 +171,23 @@ class _RunnerDatabricksAuth(httpx.Auth):
     unauthenticated servers), the auth flow is a no-op.
     """
 
-    def __init__(self, factory: Callable[[], str | None] | None) -> None:
+    def __init__(
+        self,
+        factory: Callable[[], str | None] | None,
+        server_url: str | None = None,
+    ) -> None:
         """
         :param factory: Sync callable that returns a fresh bearer
             token, e.g. the return value of
             :func:`_make_auth_token_factory`. ``None`` disables
             auth (local unauthenticated servers).
+        :param server_url: Omnigent server URL used to look up the ``?o=``
+            workspace selector for the ``X-Databricks-Org-Id`` routing
+            header. Defaults to ``RUNNER_SERVER_URL`` so existing callers
+            (which pass only the factory) need no change.
         """
         self._factory = factory
+        self._server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
 
     def auth_flow(
         self,
@@ -207,6 +216,13 @@ class _RunnerDatabricksAuth(httpx.Auth):
         :raises httpx.RequestError: When the factory is configured
             but returns no token.
         """
+        # Workspace routing: name the workspace or the request routes to the
+        # account (the forwarder's POST /events otherwise 403s). Empty when
+        # none recorded. Set once here; it persists across the retry yield.
+        if self._server_url:
+            from omnigent.cli_auth import databricks_org_id_headers
+
+            request.headers.update(databricks_org_id_headers(self._server_url))
         if self._factory is not None:
             token = self._factory()
             if not token:
@@ -654,6 +670,7 @@ def create_app(
         a second time during runner boot.
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
+    from omnigent.cli_auth import databricks_org_id_headers
     from omnigent.runner.app import create_runner_app
     from omnigent.runner.identity import (
         OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -707,7 +724,10 @@ def create_app(
         # — both reached from tool_dispatch over this client) requires a
         # trusted Origin; the runner sends none otherwise, so the sentinel is
         # what lets sys_session_create / sys_upload_file through.
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+        #
+        # The workspace-routing header (empty unless a ?o= selector was
+        # recorded for this server) routes these callbacks to the workspace.
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, **databricks_org_id_headers(server_url)},
         timeout=httpx.Timeout(5.0, read=None),
         # NOTE: ``follow_redirects`` deliberately stays False.
         # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the

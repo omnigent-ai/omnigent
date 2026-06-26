@@ -2300,6 +2300,48 @@ def test_remote_headers_falls_back_to_ambient_databricks_creds(
     assert read_calls == [None]
 
 
+def test_remote_headers_adds_org_id_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A recorded ?o= selector rides every ad-hoc request.
+
+    These probes (session info, agent pick, runner status, native
+    forwarders) carry no httpx Auth, so the workspace-routing header must be
+    added here or the request routes to the account. It accompanies
+    whichever bearer the resolution chain produced.
+    """
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: "rec-tok")
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_org_id", lambda _url: "2850744067564480"
+    )
+
+    headers = _remote_headers(server_url="https://acme.databricks.com/api/2.0/omnigent")
+
+    assert headers == {
+        "Authorization": "Bearer rec-tok",
+        "X-Databricks-Org-Id": "2850744067564480",
+    }
+
+
+def test_remote_headers_omits_org_when_no_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No recorded ?o= selector → the request URL/headers carry no org header.
+
+    Guards the "unchanged when nothing recorded" claim: a single-workspace
+    or Databricks Apps server (no stored org id) must produce only the
+    bearer, so the runtime replay never appends a routing header where none
+    was recorded.
+    """
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: "rec-tok")
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+
+    headers = _remote_headers(server_url="https://single.databricks.com/api/2.0/omnigent")
+
+    assert headers == {"Authorization": "Bearer rec-tok"}
+    assert "X-Databricks-Org-Id" not in headers
+
+
 def test_server_headers_do_not_encode_runner_affinity() -> None:
     """Runner affinity is persisted by PATCH /v1/sessions, not headers."""
     headers = chat_module._server_headers(runner_id="runner_local_test")
@@ -2817,6 +2859,38 @@ def test_databricks_token_auth_resolves_sdk_once(
     # authenticate() runs per request (4) — cheap in-memory SDK cache hits,
     # NOT CLI shell-outs. That's the behavior the fix preserves.
     assert cfg.authenticate_calls == 4
+
+
+def test_databricks_token_auth_sets_org_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every SDK-client request carries the workspace-routing header.
+
+    The header is set at the top of ``auth_flow`` — independent of which
+    credential branch runs — so the workspace-routing signal rides even when
+    a request carries no bearer.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.databricks_org_id_headers",
+        lambda _url: {"X-Databricks-Org-Id": "2850744067564480"},
+    )
+    # Isolate from real Databricks SDK resolution: the bearer is irrelevant
+    # here — only the routing header is under test.
+    monkeypatch.setattr(chat_module._DatabricksTokenAuth, "_sdk_token", lambda self: None)
+
+    auth = chat_module._DatabricksTokenAuth(
+        server_url="https://acme.databricks.com/api/2.0/omnigent"
+    )
+    flow = auth.auth_flow(
+        httpx.Request("GET", "https://acme.databricks.com/api/2.0/omnigent/v1/sessions")
+    )
+    request = next(flow)
+    flow.close()
+
+    assert request.headers["X-Databricks-Org-Id"] == "2850744067564480"
 
 
 # ── _spec_used_families (startup-header creds line) ──────

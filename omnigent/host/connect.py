@@ -1402,6 +1402,12 @@ class HostProcess:
         # is not a browser. Seeded before either auth branch so it is sent
         # on both the managed-token and Bearer paths.
         headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+        # Workspace routing: the tunnel handshake must name the workspace or
+        # it routes to the account. Empty for single-workspace and managed
+        # hosts (no recorded selector), so neither is affected.
+        from omnigent.cli_auth import databricks_org_id_headers
+
+        headers.update(databricks_org_id_headers(self._server_url))
 
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:

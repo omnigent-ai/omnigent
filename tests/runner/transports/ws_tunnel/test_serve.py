@@ -114,6 +114,7 @@ async def test_serve_tunnel_backs_off_after_clean_close(
         app: Any,
         *,
         tunnel_url: str,
+        server_url: str = "",
         runner_id: str,
         runner_version: str,
         auth_token: str | None = None,
@@ -174,6 +175,7 @@ async def test_serve_tunnel_resets_backoff_after_successful_connection(
         app: Any,
         *,
         tunnel_url: str,
+        server_url: str = "",
         runner_id: str,
         runner_version: str,
         auth_token: str | None = None,
@@ -238,6 +240,7 @@ async def test_serve_tunnel_fails_loud_on_protocol_rejection(
         app: Any,
         *,
         tunnel_url: str,
+        server_url: str = "",
         runner_id: str,
         runner_version: str,
         auth_token: str | None = None,
@@ -281,6 +284,7 @@ async def test_serve_tunnel_fails_loud_on_http_auth_rejection(
         app: Any,
         *,
         tunnel_url: str,
+        server_url: str = "",
         runner_id: str,
         runner_version: str,
         auth_token: str | None = None,
@@ -393,6 +397,7 @@ async def test_serve_tunnel_fails_loud_on_auth_redirect(
         app: Any,
         *,
         tunnel_url: str,
+        server_url: str = "",
         runner_id: str,
         runner_version: str,
         auth_token: str | None = None,
@@ -537,10 +542,14 @@ async def test_serve_tunnel_once_sends_bearer_header(
         return _ConnectContext()
 
     monkeypatch.setattr(websockets, "connect", _fake_connect)
+    # No recorded ?o= selector, so no workspace-routing header rides the
+    # handshake (keeps the asserted header set exact).
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _server_url: None)
 
     await _serve_tunnel_once(
         _noop_app,
         tunnel_url="wss://example.databricksapps.com/v1/runners/runner_auth/tunnel",
+        server_url="https://example.databricksapps.com",
         runner_id="runner_auth",
         runner_version="0.1.0",
         auth_token="tok-auth",
@@ -561,6 +570,62 @@ async def test_serve_tunnel_once_sends_bearer_header(
         "max_size": serve_module.RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
     }
     assert isinstance(captured["sent"], str)
+
+
+async def test_serve_tunnel_once_sends_org_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recorded ?o= selector rides the tunnel handshake.
+
+    The WS upgrade must name the workspace via ``X-Databricks-Org-Id`` or it
+    routes to the account. The selector is keyed by the server URL, not the
+    ws tunnel URL, so the handshake resolves it from *server_url*.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import websockets
+
+    captured: dict[str, object] = {}
+
+    class _FakeWS:
+        async def send(self, data: str) -> None:
+            del data
+
+        def __aiter__(self) -> _FakeWS:
+            return self
+
+        async def __anext__(self) -> str:
+            raise StopAsyncIteration
+
+    class _Ctx:
+        async def __aenter__(self) -> _FakeWS:
+            return _FakeWS()
+
+        async def __aexit__(self, *_exc: object) -> None:
+            return None
+
+    def _fake_connect(url: str, **kwargs: object) -> _Ctx:
+        captured["headers"] = kwargs.get("additional_headers")
+        return _Ctx()
+
+    monkeypatch.setattr(websockets, "connect", _fake_connect)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_org_id", lambda _server_url: "2850744067564480"
+    )
+
+    await _serve_tunnel_once(
+        _noop_app,
+        tunnel_url="wss://acme.databricks.com/v1/runners/r/tunnel",
+        server_url="https://acme.databricks.com/api/2.0/omnigent",
+        runner_id="r",
+        runner_version="0.1.0",
+        auth_token="tok",
+    )
+
+    headers = captured["headers"]
+    assert isinstance(headers, dict)
+    assert headers["X-Databricks-Org-Id"] == "2850744067564480"
 
 
 @pytest.mark.parametrize(
@@ -810,6 +875,7 @@ async def test_serve_tunnel_calls_factory_on_each_reconnect(
         app: Any,
         *,
         tunnel_url: str,
+        server_url: str = "",
         runner_id: str,
         runner_version: str,
         auth_token: str | None = None,
@@ -882,6 +948,7 @@ async def test_serve_tunnel_401_with_factory_retries(
         app: Any,
         *,
         tunnel_url: str,
+        server_url: str = "",
         runner_id: str,
         runner_version: str,
         auth_token: str | None = None,
@@ -947,6 +1014,7 @@ async def test_serve_tunnel_401_without_factory_is_fatal(
         app: Any,
         *,
         tunnel_url: str,
+        server_url: str = "",
         runner_id: str,
         runner_version: str,
         auth_token: str | None = None,
@@ -1003,6 +1071,7 @@ async def test_serve_tunnel_403_remains_fatal_with_factory(
         app: Any,
         *,
         tunnel_url: str,
+        server_url: str = "",
         runner_id: str,
         runner_version: str,
         auth_token: str | None = None,
@@ -1077,6 +1146,7 @@ async def test_serve_tunnel_reconnect_uses_fresh_token_not_stale(
         app: Any,
         *,
         tunnel_url: str,
+        server_url: str = "",
         runner_id: str,
         runner_version: str,
         auth_token: str | None = None,

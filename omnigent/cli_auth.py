@@ -220,6 +220,55 @@ def load_databricks_org_id(server_url: str) -> str | None:
     return org_id if isinstance(org_id, str) and org_id else None
 
 
+# Workspace-routing header. When a Databricks host fronts many workspaces
+# under one hostname, the bare host is the account; the API proxy routes a
+# workspace request by this header (equivalently to the ``?o=`` query param).
+DATABRICKS_ORG_ID_HEADER = "X-Databricks-Org-Id"
+
+
+def databricks_org_id_headers(server_url: str) -> dict[str, str]:
+    """Return the workspace-routing header for *server_url*, or ``{}``.
+
+    ``omnigent login https://<host>/?o=<id>`` records the ``?o=`` selector;
+    this surfaces it as the :data:`DATABRICKS_ORG_ID_HEADER` so requests
+    route to the workspace instead of the account. Empty when no selector
+    is recorded (single-workspace / non-Databricks hosts), so those callers
+    are unaffected.
+
+    :param server_url: The server URL, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``.
+    :returns: ``{"X-Databricks-Org-Id": "<id>"}`` when a selector is
+        recorded for *server_url*, otherwise ``{}``.
+    """
+    org_id = load_databricks_org_id(server_url)
+    return {DATABRICKS_ORG_ID_HEADER: org_id} if org_id else {}
+
+
+def databricks_auth_headers(server_url: str, bearer_token: str | None) -> dict[str, str]:
+    """Mint the bearer and the workspace-routing header together.
+
+    Pairs ``Authorization`` with :data:`DATABRICKS_ORG_ID_HEADER` in one
+    call so a hand-built header dict can't carry the bearer without the
+    routing header. Use it where a static dict is constructed (the
+    WebSocket handshakes, the hook-config replay) instead of writing the
+    ``Authorization`` entry inline; the long-lived httpx clients set both
+    in their ``auth_flow``. Either value is omitted when absent, so
+    single-workspace and unauthenticated callers are unaffected.
+
+    :param server_url: The server URL, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``.
+    :param bearer_token: The workspace bearer token, or ``None`` to omit
+        the ``Authorization`` header (local unauthenticated runs).
+    :returns: A header dict carrying ``Authorization`` and/or
+        ``X-Databricks-Org-Id`` as available, possibly empty.
+    """
+    headers: dict[str, str] = {}
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+    headers.update(databricks_org_id_headers(server_url))
+    return headers
+
+
 def clear_token(server_url: str) -> None:
     """Remove a stored token for a server.
 
