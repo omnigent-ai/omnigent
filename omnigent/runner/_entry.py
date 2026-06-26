@@ -875,6 +875,14 @@ async def _run_tunnel_from_env() -> None:
             return _jwt
 
         auth_token_factory = _managed_owner_token_factory
+        # The claude-native bridge authenticates its server callbacks (session
+        # cost + the item/status/delta mirroring that drives the web UI) via a
+        # SEPARATE path: chat._server_auth / _remote_headers read the
+        # OMNIGENT_REMOTE_AUTH_TOKEN env var, not the factory above. Seed it with
+        # the same owner JWT so native forwarding doesn't 401. (Literal name to
+        # avoid importing the heavy chat module here; matches
+        # chat._REMOTE_AUTH_TOKEN_ENV.)
+        os.environ.setdefault("OMNIGENT_REMOTE_AUTH_TOKEN", managed_owner_jwt)
     binding_token = _runner_tunnel_binding_token_from_env()
     parent_pid = _runner_parent_pid_from_env()
     runner_id = get_stable_runner_id()
