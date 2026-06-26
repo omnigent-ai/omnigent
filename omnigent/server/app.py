@@ -3,7 +3,9 @@
 import asyncio
 import logging
 import os
+import re
 import tarfile
+import uuid
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -45,6 +47,9 @@ from omnigent.server.performance_metrics import (
     ServerPerformanceMetrics,
     publish_server_metrics_periodically,
     set_request_duration_for_access_log,
+    set_request_id_for_access_log,
+    set_request_session_id_for_access_log,
+    set_request_user_agent_for_access_log,
 )
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
@@ -87,6 +92,7 @@ _QWEN_NATIVE_AGENT_NAME = QWEN_NATIVE_CODING_AGENT.agent_name
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
+_SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 # polly's and debby's multi-file bundles are packaged under
 # omnigent.resources.examples (see pyproject package-data), so they resolve
 # in both a repo checkout and an installed wheel. The presence check in each
@@ -1178,19 +1184,35 @@ def create_app(
         call_next: _FastAPICallNext,
     ) -> Response:
         """
-        Count each HTTP request while it is being processed.
+        Count each HTTP request and enrich access logs.
+
+        Generates a per-request correlation ID, captures the
+        ``User-Agent`` header and session ID from the URL path, and
+        stores them in context variables for the Uvicorn access
+        formatter.
 
         :param request: Incoming FastAPI request, e.g. ``GET /health``.
         :param call_next: FastAPI middleware continuation that executes
             the matched route and returns its response.
         :returns: The downstream route response.
         """
+        request_id = uuid.uuid4().hex
+        set_request_id_for_access_log(request_id)
+        set_request_user_agent_for_access_log(
+            request.headers.get("user-agent"),
+        )
+        session_match = _SESSION_PATH_RE.search(request.url.path)
+        set_request_session_id_for_access_log(
+            session_match.group(1) if session_match else None,
+        )
+
         failed = False
         status_code: int | None = None
         started_at = server_metrics.request_started()
         try:
             response = await call_next(request)
             status_code = response.status_code
+            response.headers["X-Request-Id"] = request_id
             return response
         except Exception:
             failed = True
