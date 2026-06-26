@@ -51,6 +51,11 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
   getCurrentUserId: () => viewerData.current,
 }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+// The codex-only "Restart with model…" dialog mounts (closed) inside
+// AgentInfoContent for codex sessions; stub its routing + fork deps so it
+// renders without a Router/network in jsdom.
+vi.mock("@/lib/routing", () => ({ useNavigate: () => vi.fn() }));
+vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn() }));
 
 // The version footer reads the server version (capabilities probe) and the
 // per-session host version (health poll). Mock both hooks so the footer
@@ -673,6 +678,46 @@ describe("agentDisplayLabel", () => {
   it("capitalizes non-native names and strips their clone suffix", () => {
     expect(agentDisplayLabel("polly")).toBe("Polly");
     expect(agentDisplayLabel("polly (fork conv_ab12)")).toBe("Polly");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// "Restart with model…" trigger — codex-only affordance gated on harness.
+// ---------------------------------------------------------------------------
+
+function renderContentForAgent(agent: Agent, sessionId: string) {
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={qc}>
+      <TooltipProvider>
+        <AgentInfoContent agent={agent} sessionId={sessionId} />
+      </TooltipProvider>
+    </QueryClientProvider>,
+  );
+}
+
+describe("AgentInfoContent restart-with-model trigger", () => {
+  it("shows the trigger for a codex-native session", () => {
+    renderContentForAgent(
+      { id: "ag_codex", name: "codex-native-ui", harness: "codex-native" },
+      "conv_codex",
+    );
+    expect(screen.getByTestId("restart-with-model-trigger")).toBeInTheDocument();
+  });
+
+  it("hides the trigger for a non-codex (claude) harness", () => {
+    renderContentForAgent(
+      { id: "ag_claude", name: "claude-native-ui", harness: "claude-native" },
+      "conv_claude",
+    );
+    expect(screen.queryByTestId("restart-with-model-trigger")).not.toBeInTheDocument();
+  });
+
+  it("hides the trigger when the harness is unknown (not yet loaded)", () => {
+    renderContentForAgent({ id: "ag_x", name: "mystery" }, "conv_x");
+    expect(screen.queryByTestId("restart-with-model-trigger")).not.toBeInTheDocument();
   });
 });
 

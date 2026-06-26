@@ -1903,11 +1903,18 @@ class SessionForkRequest(BaseModel):
         the last item of that response are copied — items after it are
         dropped from the fork. When ``None`` (default), the full history
         is copied.
+    :param model_override: Model id to launch the fork on, e.g.
+        ``"databricks-gpt-5-4-mini"`` — the "restart with model" path.
+        Overrides the model the fork would otherwise inherit from the
+        source; the value is validated and family-checked against the
+        fork's harness. When ``None`` (default), the fork keeps the
+        source's model (within the same provider family).
     """
 
     title: str | None = None
     agent_id: str | None = None
     up_to_response_id: str | None = None
+    model_override: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 

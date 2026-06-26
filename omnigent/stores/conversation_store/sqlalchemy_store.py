@@ -2116,6 +2116,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         cloned_agent_bundle_location: str | None = None,
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
+        model_override: str | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -2171,6 +2172,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
+        :param model_override: When set, the fork's ``model_override`` is
+            this value instead of the source's copied one — the
+            "restart with model" path, where the whole point is to launch
+            the clone on a different model. Wins over the
+            ``copy_model_settings`` copy; ``reasoning_effort`` still follows
+            ``copy_model_settings`` (a same-family model switch keeps the
+            effort). ``None`` (default) leaves the copy behavior unchanged.
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript instead of starting
@@ -2243,7 +2251,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                     else (agent_id if agent_id is not None else source.agent_id)
                 ),
                 reasoning_effort=source.reasoning_effort if copy_model_settings else None,
-                model_override=source.model_override if copy_model_settings else None,
+                # An explicit override wins over the copied value — this is
+                # the "restart with model" launch model. Otherwise fall back
+                # to the source's copied model (gated by copy_model_settings).
+                model_override=(
+                    model_override
+                    if model_override is not None
+                    else (source.model_override if copy_model_settings else None)
+                ),
                 # The brain-harness override is family-bound like the model,
                 # so it follows the same copy gate.
                 harness_override=source.harness_override if copy_model_settings else None,

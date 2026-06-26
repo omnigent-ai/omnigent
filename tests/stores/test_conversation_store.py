@@ -3486,6 +3486,39 @@ def test_fork_conversation_copy_model_settings_false_resets(
     assert reloaded_default.reasoning_effort == "high"
 
 
+def test_fork_conversation_model_override_wins_over_copy(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """An explicit ``model_override`` overrides the source's copied model.
+
+    The "restart with model" path: the fork must launch on the requested
+    model, not the source's. ``reasoning_effort`` still follows
+    ``copy_model_settings`` (a same-family model switch keeps the effort).
+    """
+    agent_store.create(
+        agent_id="ag_fork_mo",
+        name="fork-mo",
+        bundle_location="ag_fork_mo/fakehash",
+    )
+    source = conversation_store.create_conversation(agent_id="ag_fork_mo")
+    conversation_store.update_conversation(
+        source.id, reasoning_effort="high", model_override="databricks-gpt-5-5"
+    )
+
+    fork = conversation_store.fork_conversation(
+        source.id, model_override="databricks-gpt-5-4-mini"
+    )
+
+    reloaded = conversation_store.get_conversation(fork.id)
+    assert reloaded is not None
+    assert reloaded.model_override == "databricks-gpt-5-4-mini", (
+        "An explicit model_override must win over the source's copied model."
+    )
+    # reasoning_effort still copies (same-family switch keeps the effort).
+    assert reloaded.reasoning_effort == "high"
+
+
 def test_fork_conversation_carry_history_into_native_stamps_label(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
