@@ -130,14 +130,25 @@ class AdvisorVerdict:
     turn_anchor: str
 
 
+# Conversation labels persist into a varchar(256) column; values longer
+# than this are rejected wholesale by Postgres.
+_LABEL_VALUE_MAX_LEN = 256
+
+
 def verdict_to_label_value(verdict: AdvisorVerdict) -> str:
     """
     Serialize a verdict into the :data:`COST_CONTROL_PLAN_LABEL` value.
 
+    Long judge rationales are trimmed so the value fits the labels
+    column — an oversized value fails the whole write (the verdict then
+    never surfaces). The full rationale still reaches the UI via the
+    ``routing_decision`` transcript item.
+
     :param verdict: The verdict to serialize.
     :returns: Compact JSON, e.g. ``'{"applied":true,"model":
         "databricks-claude-opus-4-8","rationale":"...","tier":
-        "expensive","turn_anchor":"...","version":3}'``.
+        "expensive","turn_anchor":"...","version":3}'``, at most
+        :data:`_LABEL_VALUE_MAX_LEN` characters.
     """
     payload = {
         "version": verdict.version,
@@ -147,7 +158,18 @@ def verdict_to_label_value(verdict: AdvisorVerdict) -> str:
         "rationale": verdict.rationale,
         "turn_anchor": verdict.turn_anchor,
     }
-    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    overflow = len(serialized) - _LABEL_VALUE_MAX_LEN
+    if overflow > 0 and verdict.rationale:
+        # JSON escaping means a raw char can serialize to >1 char, so cutting
+        # overflow+3 raw chars (the "..." replaces them) always fits or more.
+        keep = max(0, len(verdict.rationale) - overflow - 3)
+        payload["rationale"] = (verdict.rationale[:keep] + "...") if keep > 0 else None
+        serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    if len(serialized) > _LABEL_VALUE_MAX_LEN:
+        payload["rationale"] = None
+        serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    return serialized
 
 
 def parse_verdict(labels: Mapping[str, str]) -> AdvisorVerdict | None:

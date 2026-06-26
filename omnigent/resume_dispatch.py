@@ -288,6 +288,15 @@ def _dispatch_wrapper(
             qwen_args=(),
         )
         return True
+    if native_agent.key == "kimi":
+        from omnigent.kimi_native import run_kimi_native
+
+        run_kimi_native(
+            server=server,
+            session_id=session_id,
+            kimi_args=(),
+        )
+        return True
     if native_agent.key == "hermes":
         from omnigent.hermes_native import run_hermes_native
 

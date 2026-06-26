@@ -407,6 +407,61 @@ def test_parse_skill(agent_dir: Path) -> None:
     assert skill.description == "Search the web for sources."
     assert skill.content == "When asked to research, use search.web."
     assert skill.skill_dir == skill_dir
+    # Absent ``user-invocable`` frontmatter defaults to invocable.
+    assert skill.user_invocable is True
+
+
+def test_parse_skill_user_invocable_false(agent_dir: Path) -> None:
+    """``user-invocable: false`` frontmatter parses to ``user_invocable=False``."""
+    skill_dir = agent_dir / "skills" / "internal-hook"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: internal-hook\n"
+        "description: Internal orchestration skill.\n"
+        "user-invocable: false\n"
+        "---\n"
+        "Body."
+    )
+    spec = parse(agent_dir)
+    skill = next(s for s in spec.skills if s.name == "internal-hook")
+    assert skill.user_invocable is False
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # Quoted-string spellings (YAML keeps these as ``str``, not bool) —
+        # the string branch of _falsey_flag, never exercised by the bare forms.
+        ('"false"', False),
+        ('"False"', False),
+        ('"FALSE"', False),
+        ('" false "', False),
+        ('"no"', False),  # extended false spellings (quoted → str)
+        ('"off"', False),
+        ('"0"', False),
+        ('"true"', True),
+        ('"yes"', True),  # not in the false set
+        ('"maybe"', True),
+        # Genuine YAML booleans — PyYAML parses bare false/no/off to ``bool``.
+        ("false", False),
+        ("no", False),
+        ("off", False),
+        ("true", True),
+    ],
+)
+def test_parse_skill_user_invocable_string_and_bool_spellings(
+    agent_dir: Path, raw: str, expected: bool
+) -> None:
+    """Both the YAML bool ``false`` and the quoted string ``"false"`` parse falsey."""
+    skill_dir = agent_dir / "skills" / "flag-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: flag-skill\ndescription: d\nuser-invocable: {raw}\n---\nBody."
+    )
+    spec = parse(agent_dir)
+    skill = next(s for s in spec.skills if s.name == "flag-skill")
+    assert skill.user_invocable is expected
 
 
 def test_parse_skill_missing_frontmatter(agent_dir: Path) -> None:
@@ -430,6 +485,20 @@ def test_parse_skill_missing_description(agent_dir: Path) -> None:
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("---\nname: no-desc\n---\nContent.")
     with pytest.raises(OmnigentError, match=r"missing required field 'description'"):
+        parse(agent_dir)
+
+
+def test_parse_skill_non_utf8_raises_omnigent_error(agent_dir: Path) -> None:
+    """
+    A non-UTF-8 SKILL.md must funnel through OmnigentError (not escape as a
+    bare UnicodeDecodeError) so the lenient scanner / menu providers can
+    catch it and skip the file instead of crashing.
+    """
+    skill_dir = agent_dir / "skills" / "bad-bytes"
+    skill_dir.mkdir(parents=True)
+    # 0xff is invalid UTF-8 — read_text() raises UnicodeDecodeError.
+    (skill_dir / "SKILL.md").write_bytes(b"---\nname: bad-bytes\ndescription: \xff\n---\nx")
+    with pytest.raises(OmnigentError, match=r"could not be read"):
         parse(agent_dir)
 
 

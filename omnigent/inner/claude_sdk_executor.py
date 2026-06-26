@@ -34,7 +34,6 @@ import logging
 import os
 import pathlib
 import shutil
-import signal
 import sys
 import tempfile
 import time
@@ -44,6 +43,8 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
 
+from omnigent._platform import stable_user_id
+from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
@@ -485,27 +486,11 @@ def _sandbox_disabled_by_env() -> bool:
 
 
 def _terminate_process_tree(process: _Process | None) -> None:
-    if process is None or process.returncode is not None:
-        return
-    pid = process.pid
-    if pid is not None:
-        with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGTERM)
-            return
-    with suppress(ProcessLookupError, Exception):
-        process.terminate()
+    _proc.terminate_tree(process)
 
 
 def _kill_process_tree(process: _Process | None) -> None:
-    if process is None or process.returncode is not None:
-        return
-    pid = process.pid
-    if pid is not None:
-        with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGKILL)
-            return
-    with suppress(ProcessLookupError, Exception):
-        process.kill()
+    _proc.kill_tree(process)
 
 
 @contextmanager
@@ -886,7 +871,7 @@ def _claude_internal_write_roots() -> list[pathlib.Path]:
         pathlib.Path.home() / ".claude" / "session-env",
         pathlib.Path.home() / ".claude" / "sessions",
         pathlib.Path.home() / ".npm" / "_logs",
-        pathlib.Path(tempfile.gettempdir()) / f"claude-{os.getuid()}",
+        pathlib.Path(tempfile.gettempdir()) / f"claude-{stable_user_id()}",
     ]
     for root in roots:
         root.mkdir(parents=True, exist_ok=True)
@@ -2550,9 +2535,24 @@ class ClaudeSDKExecutor(Executor):
                     for m in _msgs
                     if isinstance(m.message, dict)
                 ]
+                if not _compacted:
+                    logger.warning(
+                        "Claude post-compaction read returned no messages "
+                        "(session=%s); resume will fall back to the synthetic "
+                        "summary instead of the harness's real compacted state.",
+                        claude_session_id,
+                    )
             except Exception:  # noqa: BLE001
-                logger.debug(
-                    "Failed to read Claude session messages for compaction persist",
+                # WARNING, not DEBUG: a swallowed read here silently degrades
+                # EVERY later resume of this conversation. The runner persists a
+                # compaction item with no ``compacted_messages``, so resume
+                # replays the lossy synthetic-summary pair instead of the
+                # harness's real post-compaction context. Surface it.
+                logger.warning(
+                    "Failed to read Claude post-compaction session messages "
+                    "(session=%s); resume fidelity for this conversation will "
+                    "degrade to the synthetic summary.",
+                    claude_session_id,
                     exc_info=True,
                 )
             yield CompactionComplete(

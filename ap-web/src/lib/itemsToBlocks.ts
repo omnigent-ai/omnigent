@@ -15,6 +15,7 @@ import {
   type CompactionBlock,
   type ErrorBlock,
   type NativeToolBlock,
+  type RoutingDecisionBlock,
   type SlashCommandBlock,
   type TerminalCommandBlock,
   type TextDone,
@@ -34,6 +35,7 @@ import {
   type FunctionCallOutputItem,
   type MessageItem,
   type NativeToolItem,
+  type RoutingDecisionItem,
   type SlashCommandItem,
   type TerminalCommandItem,
   isCompactionItem,
@@ -42,6 +44,7 @@ import {
   isFunctionCallOutputItem,
   isMessageItem,
   isNativeToolItem,
+  isRoutingDecisionItem,
   isSlashCommandItem,
   isTerminalCommandItem,
 } from "./conversationItems";
@@ -98,6 +101,9 @@ function itemToBlock(item: ConversationItem): AnyBlock | null {
   }
   if (isSlashCommandItem(item)) {
     return slashCommandToBlock(item);
+  }
+  if (isRoutingDecisionItem(item)) {
+    return routingDecisionToBlock(item);
   }
   if (isTerminalCommandItem(item)) {
     return terminalCommandToBlock(item);
@@ -236,6 +242,17 @@ function slashCommandToBlock(item: SlashCommandItem): SlashCommandBlock {
     name: item.name,
     arguments: item.arguments,
     output: typeof item.output === "string" ? item.output : null,
+  };
+}
+
+function routingDecisionToBlock(item: RoutingDecisionItem): RoutingDecisionBlock {
+  return {
+    type: "routing_decision",
+    ctx: ctxFor(item),
+    model: item.model,
+    tier: item.tier,
+    applied: item.applied,
+    rationale: typeof item.rationale === "string" ? item.rationale : "",
   };
 }
 

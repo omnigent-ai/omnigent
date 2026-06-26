@@ -35,6 +35,15 @@ Seam design (so the timeout logic is unit-testable without a live agy):
 * ``deliver`` — defaults to :func:`_deliver_via_rpc`, which offloads the blocking
   :func:`omnigent.antigravity_native_rpc.handle_user_interaction` to a worker
   thread (the function is synchronous); injectable so tests don't need a live agy.
+* ``inject_tui`` — defaults to :func:`_inject_via_tui`, which types the verdict's
+  key sequence into the agy TUI pane AFTER the RPC delivery. The attended agy TUI
+  keeps its OWN permission/question prompt open in parallel with the RPC step
+  (live-verified — ``docs/claude/antigravity-rpc-spike-notes.md`` §"attended
+  TUI"): the RPC flips the backend step to DONE, but the TUI prompt lingers, so a
+  web Approve/Reject would not advance the terminal (and the next typed turn would
+  fold into the stale prompt's buffer) without this keystroke (#1200). Injectable
+  so tests assert the key sequence without a live pane; mirrors cursor-native's
+  ``send_cursor_pane_keys`` approval drive.
 
 The deterministic elicitation id is derived from
 ``(cascade_id, trajectory_id, step_index)`` (mirrors
@@ -60,6 +69,7 @@ from omnigent.antigravity_native_steps import PendingInteraction, pending_intera
 from omnigent.server.routes._antigravity_elicitation import (
     to_elicitation_params,
     to_interaction_payload,
+    to_tui_selection_keys,
 )
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
@@ -120,6 +130,41 @@ class Deliver(Protocol):
     ) -> None:
         """Deliver one interaction answer to agy (see ``handle_user_interaction``)."""
         ...
+
+
+# Types the verdict's tmux key sequence into the agy TUI pane to dismiss its
+# in-process prompt (see ``_inject_via_tui`` / the module's "attended TUI" note).
+InjectTui = Callable[[list[str]], Awaitable[None]]
+
+
+async def _inject_via_tui(keys: list[str]) -> None:
+    """
+    Default :class:`InjectTui`: type the verdict keys into the agy TUI pane.
+
+    Offloads the blocking tmux ``send-keys`` (via
+    :func:`omnigent.antigravity_native_bridge.send_interaction_keys_via_tui`) to a
+    worker thread — the same pattern :func:`_deliver_via_rpc` uses for the RPC —
+    so the async bridge does not stall the event loop. The bridge directory is
+    resolved from the harness spawn env (the reader/CLI both run with it set), so
+    this seam takes only the keys.
+
+    A missing tmux target / exited pane raises ``RuntimeError`` from the bridge
+    primitive; the caller logs it and proceeds (the RPC delivery already advanced
+    the backend step — the keystroke is the belt-and-braces TUI dismissal).
+
+    :param keys: Ordered tmux key arguments (e.g. ``["1", "Enter"]`` to approve).
+    :returns: None.
+    :raises RuntimeError: Propagated from the bridge primitive (no target / pane
+        exited / send-keys failed).
+    """
+    # Lazy imports: keep this module importable from the lightweight CLI process
+    # without eagerly pulling the bridge env helpers, and resolve the bridge dir
+    # the same way the executor does.
+    from omnigent.antigravity_native_bridge import send_interaction_keys_via_tui
+    from omnigent.inner.antigravity_native_executor import _bridge_dir_from_env
+
+    bridge_dir = _bridge_dir_from_env()
+    await asyncio.to_thread(send_interaction_keys_via_tui, bridge_dir, *keys)
 
 
 def agy_elicitation_id(cascade_id: str, trajectory_id: str, step_index: int) -> str:
@@ -235,6 +280,7 @@ async def bridge_interaction(
     get_steps: GetSteps,
     request_elicitation: RequestElicitation,
     deliver: Deliver = _deliver_via_rpc,
+    inject_tui: InjectTui = _inject_via_tui,
     max_retries: int = _DEFAULT_MAX_RETRIES,
 ) -> None:
     """
@@ -271,6 +317,13 @@ async def bridge_interaction(
         :func:`_deliver_via_rpc`, which offloads the blocking
         :func:`omnigent.antigravity_native_rpc.handle_user_interaction` to a
         worker thread.
+    :param inject_tui: Types the verdict's key sequence into the agy TUI pane to
+        dismiss its in-process prompt AFTER a successful RPC delivery; defaults to
+        :func:`_inject_via_tui` (offloads ``send-keys`` to a worker thread). The
+        RPC flips the backend step, but the attended TUI keeps its own prompt open
+        in parallel — so the keystroke is required to actually advance the
+        terminal (#1200). A failure here is logged, not raised: the backend step
+        is already answered, so the turn proceeds regardless.
     :param max_retries: Upper bound on detect→deliver iterations.
     :returns: None. Never raises on the expected timeout/cancel/RPC-error paths —
         all are logged and end the loop so the long-lived caller stays alive.
@@ -321,6 +374,29 @@ async def bridge_interaction(
                 step_index=fresh["step_index"],
                 payload=payload,
             )
+            # The RPC flipped the backend trajectory step, but the attended agy
+            # TUI keeps its OWN permission/question prompt open in parallel
+            # (live-verified — see the module note / spike doc). Type the verdict's
+            # selection into the pane so the terminal actually advances (#1200) and
+            # the next typed turn does not land in the stale prompt's buffer. The
+            # backend is already answered, so a TUI-typing failure is logged, not
+            # raised — never undo a delivered verdict over a flaky pane.
+            keys = to_tui_selection_keys(current["kind"], result, current["spec"])
+            if keys:
+                try:
+                    await inject_tui(keys)
+                except Exception as tui_exc:
+                    # Best-effort TUI dismissal — the backend step is already
+                    # answered, so never undo a delivered verdict over a flaky pane.
+                    _logger.warning(
+                        "agy interaction delivered over RPC but TUI dismissal failed "
+                        "(cascade=%s, kind=%s, step=%d, keys=%r): %r",
+                        cascade_id,
+                        current["kind"],
+                        fresh["step_index"],
+                        keys,
+                        tui_exc,
+                    )
             return  # delivered successfully
         except AntigravityRpcError as exc:
             if _INPUT_NOT_REGISTERED not in str(exc).lower():

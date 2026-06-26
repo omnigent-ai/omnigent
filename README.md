@@ -4,7 +4,7 @@
 
 ### The open-source AI agent framework and meta-harness for all your AI agents.
 
-Omnigent is an open-source **AI agent framework** and meta-harness that gives you a common orchestration layer over Claude Code, Codex, Cursor, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device.
+Omnigent is an open-source **AI agent framework** and meta-harness that gives you a common orchestration layer over Claude Code, Codex, Cursor, Kimi Code, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
@@ -118,6 +118,33 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 </details>
 
 <details>
+<summary>Windows (native)</summary>
+
+Omnigent runs natively on Windows in a degraded mode. The `install_oss.sh`
+bootstrap is POSIX-only, so install with `uv` directly:
+
+```powershell
+uv tool install --python 3.12 omnigent
+# or from the repo:
+uv tool install --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
+```
+
+What works on Windows: `omnigent server`, the web UI, and the SDK-based
+harnesses (`omnigent run <agent.yaml>` with the claude-sdk / cursor / copilot
+/ codex harnesses). Agents run under a Windows **Job Object** for process-tree
+containment.
+
+What is **not** available on Windows (use Linux/macOS, or WSL, for these):
+
+- the native `omnigent claude` / `omnigent codex` / `omnigent cursor`
+  tmux/PTY terminal wrappers (run an SDK harness or the web UI instead);
+- `bwrap`/`seatbelt` filesystem & network sandboxing and the L7 egress proxy
+  — the Job Object backend contains the process tree and enforces resource
+  limits but does **not** isolate the filesystem or network.
+
+</details>
+
+<details>
 <summary>Updating to a new release</summary>
 
 When a newer release is on PyPI, Omnigent shows a one-line notice (once per
@@ -168,6 +195,7 @@ Or launch a specific agent runtime, or your own agent:
 omnigent claude                      # Claude Code, in a session your team can join
 omnigent codex                       # Codex
 omnigent kiro                        # Kiro CLI
+omnigent kimi                        # Kimi Code (https://kimi.com), headless
 omnigent run path/to/agent.yaml      # your own agent (see "Write your own agent")
 ```
 
@@ -383,7 +411,7 @@ name: my_agent
 prompt: You are a helpful data analyst.
 
 executor:
-  harness: claude-sdk          # or: claude-native, codex, codex-native, cursor, cursor-native, kiro-native, openai-agents, pi, pi-native, antigravity, qwen, copilot
+  harness: claude-sdk          # or: claude-native, codex, codex-native, cursor, cursor-native, kiro-native, openai-agents, pi, pi-native, antigravity, qwen, kimi, copilot
 
 tools:
   # A local Python function (schema auto-generated from the signature)

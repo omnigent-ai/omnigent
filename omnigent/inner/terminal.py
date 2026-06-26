@@ -21,8 +21,10 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeAlias
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.runner.identity import strip_runner_auth_secrets
 
+from . import _proc
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from .egress import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .os_env import (
@@ -544,6 +546,14 @@ def _process_alive(pid: int) -> bool:
         e.g. ``48213``.
     :returns: ``True`` when a process with that pid exists.
     """
+    # POSIX uses ``os.kill(pid, 0)`` so a killed-but-not-yet-reaped zombie
+    # still counts as present (matches ``process_manager._pid_alive``). The
+    # ``_proc.process_alive`` psutil probe treats a zombie as gone and can
+    # transiently miss a live process, which raced the orphan sweep against a
+    # just-exited owner. ``os.kill(pid, 0)`` can't be used on Windows (maps to
+    # TerminateProcess and would kill the target), so fall back to psutil there.
+    if IS_WINDOWS:
+        return _proc.process_alive(pid)
     if pid <= 0:
         return False
     try:
@@ -1711,6 +1721,12 @@ def create_terminal_instance(
     :returns: A :class:`TerminalCreateResult` carrying the new instance
         and the resolved cwd to pass to ``launch()``.
     """
+    if IS_WINDOWS:
+        raise RuntimeError(
+            "Native terminal harnesses (tmux/PTY) are not supported on Windows. "
+            "Run an SDK-based harness via `omnigent run <agent.yaml>` (e.g. the "
+            "claude-sdk, cursor, copilot, or codex harness) or use the web UI."
+        )
     if not _tmux_available():
         raise RuntimeError("tmux is not installed or not on PATH")
 
