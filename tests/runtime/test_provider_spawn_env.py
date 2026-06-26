@@ -1081,6 +1081,39 @@ def test_openai_agents_cli_config_default_fails_loud(config_home: Path) -> None:
         _build_openai_agents_sdk_spawn_env(spec)
 
 
+def test_pi_cli_config_databricks_default_routes_gateway(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cli-config Databricks gateway default routes the pi (gateway) harness.
+
+    Unlike openai-agents (which fails loud), pi CAN consume a cli-config
+    Databricks AI Gateway — the gateway's Anthropic Messages surface is one Pi
+    speaks. The gateway-harness pi path must translate it into the
+    ``HARNESS_PI_GATEWAY_*`` transport (the same vars an inline gateway emits),
+    pointing at the gateway's ``/anthropic`` surface — NOT raise the
+    "can only drive the 'codex' harness" error.
+    """
+    _isolate_home_with_codex_config(config_home, monkeypatch)
+    _write_config(config_home, _cli_config_default_config())
+    spec = _make_spec(harness="pi")
+
+    env = _build_pi_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_PI_GATEWAY"] == "true"
+    # The gateway's codex /codex/v1 base_url is rewritten to the /anthropic
+    # surface Pi speaks natively, registered under pi's "claude" family key.
+    assert env["HARNESS_PI_GATEWAY_BASE_URLS"] == (
+        '{"claude": "https://example.ai-gateway.cloud.databricks.com/anthropic"}'
+    )
+    assert env["HARNESS_PI_GATEWAY_HOST"] == "https://example.ai-gateway.cloud.databricks.com"
+    # The bearer-token command comes from the codex [model_providers.X.auth]
+    # table (the "!" Pi-models.json prefix is stripped for the transport var).
+    # The fixture's [auth] declares command="jq" with no args, so it is "jq".
+    assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "jq"
+    # Default model is the Databricks gateway default (no spec/override model).
+    assert env["HARNESS_PI_MODEL"] == "databricks-claude-sonnet-4-6"
+
+
 _DISMISSIBLE_CODEX_CONFIG_TOML = """
 model_provider = "Databricks"
 

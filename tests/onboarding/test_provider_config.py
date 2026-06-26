@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from omnigent.errors import OmnigentError
@@ -131,34 +133,102 @@ def test_default_provider_for_pi_none_when_only_subscriptions() -> None:
     assert default_provider_for_harness(config, "pi") is None
 
 
-def test_default_provider_for_pi_skips_cli_config_defaults() -> None:
-    """For the unmapped ``pi`` harness, a cli-config default is skipped.
+_DATABRICKS_CODEX_CONFIG_TOML = """
+model_provider = "Databricks"
 
-    A cli-config entry pins a provider table in ~/.codex/config.toml (e.g.
-    isaac's Databricks AI Gateway); only the codex harness bridges that file,
-    and ``configure_agent_harness_with_provider`` raises for any other
-    harness. A regression here makes the resolver hand pi the codex-only
-    gateway: the REPL startup header then shows "Pi → ⚙️ Databricks AI
-    Gateway" while ``setup`` (which filters via ``provider_families``)
-    correctly shows pi as credential-less, and an actual pi spawn fails.
+[model_providers.Databricks]
+name = "Databricks AI Gateway"
+base_url = "https://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1"
+wire_api = "responses"
+
+[model_providers.Databricks.auth]
+command = "jq"
+args = ["-r", ".access_token", "/Users/me/.databricks/model-serving-token.json"]
+timeout_ms = 5000
+"""
+
+
+def _write_codex_toml(home: Path, body: str) -> None:
+    """Write a ``~/.codex/config.toml`` under *home* (resolver reads $HOME)."""
+    codex_dir = home / ".codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    (codex_dir / "config.toml").write_text(body, encoding="utf-8")
+
+
+def test_default_provider_for_pi_selects_cli_config_databricks_gateway(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """For the unmapped ``pi`` harness, a cli-config Databricks gateway IS selected.
+
+    A cli-config entry pins a provider table in ~/.codex/config.toml. PR #1251
+    made a Databricks AI Gateway cli-config pi-consumable (Pi speaks its
+    Anthropic surface natively), and pi resolution now routes it (pi-native
+    translates it; the gateway-harness pi path translates it too). So when the
+    pinned ``[model_providers.X]`` resolves to a real Databricks gateway, the
+    shared selection returns it for pi — the previous "skip all cli-config for
+    pi" behavior was the bug.
     """
+    _write_codex_toml(tmp_path, _DATABRICKS_CODEX_CONFIG_TOML)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
     config = {
         "providers": {
             "codex-databricks": {
                 "kind": "cli-config",
                 "default": True,
                 "cli": "codex",
-                "model_provider": "databricks",
+                "model_provider": "Databricks",
             },
         }
     }
-    # With only the codex-pinned gateway configured, pi must resolve no
-    # default — the gateway's credential lives in codex's config.toml,
-    # which pi cannot read. A non-None result means the fallback regressed
-    # to accepting cli-config and the header/setup readouts diverge again.
+    pi_default = default_provider_for_harness(config, "pi")
+    assert pi_default is not None
+    assert pi_default.name == "codex-databricks"
+    # The codex harness still takes the cli-config default — it is exactly the
+    # CLI whose config.toml carries the provider table.
+    assert default_provider_for_harness(config, "codex").name == "codex-databricks"
+
+
+def test_default_provider_for_pi_skips_non_databricks_cli_config_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A NON-Databricks (or unresolvable) cli-config default is still skipped for pi.
+
+    Selecting a non-Databricks cli-config for pi would just drop to Pi's own
+    login (``_cli_config_pi_provider`` returns None for it), so the pi fallback
+    must skip it. Here the pinned table points at a generic proxy, so pi
+    resolves no default (the REPL header / setup must show pi credential-less),
+    while codex still takes it.
+    """
+    _write_codex_toml(
+        tmp_path,
+        """
+model_provider = "Databricks"
+
+[model_providers.Databricks]
+name = "Some Other Proxy"
+base_url = "https://proxy.example.com/v1"
+
+[model_providers.Databricks.auth]
+command = "printf"
+args = ["%s", "sk-static"]
+""",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    config = {
+        "providers": {
+            "codex-databricks": {
+                "kind": "cli-config",
+                "default": True,
+                "cli": "codex",
+                "model_provider": "Databricks",
+            },
+        }
+    }
+    # A non-Databricks cli-config is not pi-consumable → pi falls back to None.
     assert default_provider_for_harness(config, "pi") is None
-    # The codex harness itself still takes the cli-config default — it is
-    # exactly the CLI whose config.toml carries the provider table.
+    # The codex harness still takes the cli-config default.
     assert default_provider_for_harness(config, "codex").name == "codex-databricks"
 
 
@@ -572,8 +642,12 @@ def test_parse_cli_config_entry() -> None:
     assert entry.cli == "codex"
     assert entry.model_provider == "Databricks"
     assert entry.display_name == "Databricks AI Gateway"
-    # Serves (and can default) exactly the codex/openai surface.
-    assert provider_families(entry) == frozenset({OPENAI_FAMILY})
+    # A codex cli-config serves the openai surface AND is structurally
+    # pi-capable: a Databricks AI Gateway is reusable by Pi (its Anthropic
+    # surface), so it can claim the pi scope. (``default: true`` deliberately
+    # never expands to pi — only an explicit ``pi`` does — so default_families
+    # stays openai-only here.)
+    assert provider_families(entry) == frozenset({OPENAI_FAMILY, PI_SURFACE})
     assert entry.default_families == frozenset({OPENAI_FAMILY})
 
 

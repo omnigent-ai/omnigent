@@ -24,24 +24,28 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from omnigent.model_override import normalize_model_for_provider
 from omnigent.onboarding.provider_config import (
-    ANTHROPIC_FAMILY,
     CHAT_WIRE_API,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
     GATEWAY_KIND,
     KEY_KIND,
     LOCAL_KIND,
-    OPENAI_FAMILY,
     PI_SURFACE,
     ProviderEntry,
-    get_default_provider,
+    default_provider_for_harness,
     load_config,
 )
+
+if TYPE_CHECKING:
+    # Annotation-only import (the runtime import is lazy inside the function,
+    # since ``ambient`` pulls in onboarding-only deps this module avoids on the
+    # runner's session-create hot path).
+    from omnigent.onboarding.ambient import CodexConfigTransport
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -207,29 +211,20 @@ def _gateway_anthropic_base_url(codex_base_url: str) -> str:
     return f"{trimmed}{_DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX}"
 
 
-def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiProviderConfig | None:
-    """Resolve a Codex ``cli-config`` Databricks-gateway provider into Pi config.
+def _cli_config_databricks_transport(entry: ProviderEntry) -> CodexConfigTransport | None:
+    """Return the codex transport for a pi-consumable Databricks cli-config entry.
 
-    The common enterprise setup: ``isaac configure codex`` writes a custom
-    ``[model_providers.X]`` table (base_url + token-printing ``auth`` command)
-    into ``~/.codex/config.toml`` and ``omnigent setup`` adopts it as a
-    ``cli-config`` provider. Codex-native routes through that table; pi-native
-    used to return ``None`` here — silently falling back to Pi's own
-    ``/login`` (often stale creds) — which is the bug this fixes.
+    Shared core of :func:`_cli_config_pi_provider` and
+    :func:`cli_config_pi_provider_capable`: validates that *entry* is a codex
+    ``cli-config`` whose pinned ``[model_providers.X]`` table in
+    ``~/.codex/config.toml`` is a genuine Databricks AI Gateway carrying a
+    bearer-token command. Returns the resolved
+    :class:`~omnigent.onboarding.ambient.CodexConfigTransport` when so, else
+    ``None`` (logging the reason at INFO).
 
-    We read the *transport* (base URL + bearer-token command) from the codex
-    config table the entry pins, rewrite the base URL to the gateway's
-    Anthropic Messages surface (Pi speaks it natively), and emit a ``!command``
-    apiKey so Pi refreshes the gateway token per request — exactly like the
-    ``databricks`` kind path. The workspace-specific base URL and token path
-    are read from config, never hardcoded.
-
-    :param entry: The resolved default provider (``kind="cli-config"``,
-        ``cli="codex"``), carrying the ``model_provider`` id and display name.
-    :param model: Session model override, or ``None`` to use the default.
-    :returns: The Pi provider config, or ``None`` when the entry is not a
-        Databricks gateway, its codex provider table can't be resolved, or it
-        carries no token command (caller falls back to Pi's own login).
+    :param entry: The provider entry (expected ``kind="cli-config"``).
+    :returns: The codex transport when *entry* is a pi-consumable Databricks
+        AI Gateway, else ``None``.
     """
     # Only codex cli-config providers are model_provider-shaped today; a
     # claude analog would be a different mechanism entirely.
@@ -273,6 +268,55 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
             entry.name,
             entry.model_provider,
         )
+        return None
+    return transport
+
+
+def cli_config_pi_provider_capable(entry: ProviderEntry) -> bool:
+    """Return whether a ``cli-config`` *entry* is pi-consumable.
+
+    A codex ``cli-config`` provider IS reusable by Pi exactly when
+    :func:`_cli_config_pi_provider` would resolve — i.e. its pinned
+    ``[model_providers.X]`` table is a genuine Databricks AI Gateway with a
+    bearer-token command. This is the capability predicate the selection layer
+    (:mod:`omnigent.onboarding.provider_config`) consults to decide whether a
+    cli-config provider may serve / default the ``pi`` surface, keeping the
+    single source of truth here (and avoiding an import cycle —
+    ``provider_config`` lazy-imports this rather than the reverse).
+
+    :param entry: The provider entry to classify (expected
+        ``kind="cli-config"``; any other kind returns ``False``).
+    :returns: ``True`` iff Pi can route through this cli-config provider.
+    """
+    return _cli_config_databricks_transport(entry) is not None
+
+
+def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiProviderConfig | None:
+    """Resolve a Codex ``cli-config`` Databricks-gateway provider into Pi config.
+
+    The common enterprise setup: ``isaac configure codex`` writes a custom
+    ``[model_providers.X]`` table (base_url + token-printing ``auth`` command)
+    into ``~/.codex/config.toml`` and ``omnigent setup`` adopts it as a
+    ``cli-config`` provider. Codex-native routes through that table; pi-native
+    used to return ``None`` here — silently falling back to Pi's own
+    ``/login`` (often stale creds) — which is the bug this fixes.
+
+    We read the *transport* (base URL + bearer-token command) from the codex
+    config table the entry pins, rewrite the base URL to the gateway's
+    Anthropic Messages surface (Pi speaks it natively), and emit a ``!command``
+    apiKey so Pi refreshes the gateway token per request — exactly like the
+    ``databricks`` kind path. The workspace-specific base URL and token path
+    are read from config, never hardcoded.
+
+    :param entry: The resolved default provider (``kind="cli-config"``,
+        ``cli="codex"``), carrying the ``model_provider`` id and display name.
+    :param model: Session model override, or ``None`` to use the default.
+    :returns: The Pi provider config, or ``None`` when the entry is not a
+        Databricks gateway, its codex provider table can't be resolved, or it
+        carries no token command (caller falls back to Pi's own login).
+    """
+    transport = _cli_config_databricks_transport(entry)
+    if transport is None:
         return None
     return PiProviderConfig(
         provider_id=_PI_PROVIDER_ID,
@@ -369,13 +413,14 @@ def resolve_pi_native_provider(
     try:
         config = config_loader()
         # Pi is multi-family; ``omnigent setup`` marks defaults per family, not
-        # for ``pi``. Prefer an explicit pi default, then Anthropic (Pi's native
-        # surface), then OpenAI.
-        entry = (
-            get_default_provider(config, PI_SURFACE)
-            or get_default_provider(config, ANTHROPIC_FAMILY)
-            or get_default_provider(config, OPENAI_FAMILY)
-        )
+        # for ``pi``. Use the shared house-pattern selection so pi resolves its
+        # default exactly like the rest of the codebase — an explicit pi default
+        # wins, else the anthropic (Pi's native surface) then openai family
+        # default, skipping kinds that can't drive pi. Crucially this now lets a
+        # cli-config Databricks AI Gateway through (it is pi-consumable via
+        # ``_cli_config_pi_provider``), so an unrelated anthropic-family default
+        # no longer shadows it.
+        entry = default_provider_for_harness(config, PI_SURFACE)
         if entry is None:
             _LOGGER.info(
                 "pi-native: no omnigent-configured provider for the pi/anthropic/openai "
