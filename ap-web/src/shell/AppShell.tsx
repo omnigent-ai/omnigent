@@ -41,6 +41,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { isNativeWrapper as isNativeWrapperLabel } from "@/lib/nativeCodingAgents";
+import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
@@ -327,6 +328,10 @@ export function AppShell() {
   // the server's parent-delegation path — so we hide the affordance.
   const canShare =
     !!conversationId && isKnownTopLevel && (permissionLevel === null || permissionLevel >= 3);
+  const shareDisabled = canShare && isCurrentServerLocal();
+  const shareDisabledReason = shareDisabled
+    ? "Sharing is unavailable from a local server."
+    : undefined;
   // Any viewer can fork a shared session; top-level only (the server
   // rejects forking a sub-agent). Surfaced as ForkDialogContext.canFork —
   // the per-message "Fork from here" action is the only fork entry point.
@@ -1072,6 +1077,8 @@ export function AppShell() {
                   conversationId={conversationId}
                   boundAgent={boundAgent}
                   canShare={canShare}
+                  shareDisabled={shareDisabled}
+                  shareDisabledReason={shareDisabledReason}
                   onShare={() => setShareOpen(true)}
                   hasAgentInfo={hasAgentInfo}
                   onAgentInfo={() => setAgentInfoOpen(true)}

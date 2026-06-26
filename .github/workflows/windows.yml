@@ -10,11 +10,11 @@ name: Windows (native)
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore: ['ap-web/**']
+    paths-ignore: ['ap-web/**', 'tests/e2e_ui/**']
   push:
     branches:
       - main
-    paths-ignore: ['ap-web/**']
+    paths-ignore: ['ap-web/**', 'tests/e2e_ui/**']
 
 permissions:
   contents: read

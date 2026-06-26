@@ -23,9 +23,13 @@ import json
 import logging
 import os
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from omnigent.spec.types import MCPServerConfig
 
 _logger = logging.getLogger(__name__)
 
@@ -127,6 +131,111 @@ def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, o
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
     return path
+
+
+def build_opencode_mcp_block(
+    servers: Sequence[MCPServerConfig],
+) -> dict[str, dict[str, object]]:
+    """
+    Translate Omnigent MCP server declarations into opencode.json's ``mcp`` block.
+
+    Mirrors how codex/claude expose the agent's MCP servers, but via opencode's
+    own config (no relay): ``stdio`` → ``{type:"local", command:[cmd, *args],
+    environment, enabled}``; ``http`` → ``{type:"remote", url, headers,
+    enabled}``. A ``databricks_profile`` resolves a bearer token into the
+    ``Authorization`` header at spawn (re-resolved on resume, like the gateway
+    provider). Entries opencode can't represent (missing command / url) are
+    skipped.
+
+    :param servers: The agent spec's ``mcp_servers``.
+    :returns: An opencode ``mcp`` block keyed by server name (empty when none
+        are representable).
+    """
+    block: dict[str, dict[str, object]] = {}
+    for server in servers:
+        name = getattr(server, "name", None)
+        if not name:
+            continue
+        if getattr(server, "transport", "http") == "stdio":
+            command = getattr(server, "command", None)
+            if not command:
+                continue
+            entry: dict[str, object] = {
+                "type": "local",
+                "command": [command, *getattr(server, "args", [])],
+                "enabled": True,
+            }
+            env = dict(getattr(server, "env", {}) or {})
+            if env:
+                entry["environment"] = env
+        else:
+            url = getattr(server, "url", None)
+            if not url:
+                continue
+            headers = dict(getattr(server, "headers", {}) or {})
+            profile = getattr(server, "databricks_profile", None)
+            if profile and "Authorization" not in headers:
+                token = _databricks_bearer_token(profile)
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+            entry = {"type": "remote", "url": url, "enabled": True}
+            if headers:
+                entry["headers"] = headers
+        block[str(name)] = entry
+    return block
+
+
+def build_opencode_omnigent_mcp_server(
+    bridge_dir: Path, *, python_executable: str | None = None
+) -> dict[str, dict[str, object]]:
+    """
+    Build the opencode ``mcp`` entry that connects opencode to Omnigent's MCP.
+
+    This is what makes opencode's model call the Omnigent builtin tools
+    (``sys_session_*``, ``sys_agent_*``, ``load_skill``, ``web_fetch``,
+    ``list_comments``/``update_comment``, policy tools, …). opencode launches the
+    SHARED ``omnigent.claude_native_bridge serve-mcp`` as a ``{type:"local"}``
+    stdio MCP server (the same relay codex/cursor/qwen use); ``serve-mcp`` reads
+    the relay URL+token from ``tool_relay.json`` in *bridge_dir* (written by the
+    runner's comment relay) and proxies each tool call back through the Omnigent
+    server, where policy is enforced. The command is sourced from
+    :func:`claude_native_bridge.build_mcp_config` so the invocation stays in one
+    place.
+
+    :param bridge_dir: OpenCode-native bridge directory (must hold ``bridge.json``
+        + ``tool_relay.json``).
+    :param python_executable: Python to run ``serve-mcp`` with; ``None`` uses the
+        runner interpreter (has ``omnigent`` importable).
+    :returns: A one-entry ``mcp`` block ``{"omnigent": {type:"local", …}}``.
+    """
+    from omnigent.claude_native_bridge import build_mcp_config
+
+    claude_cfg = build_mcp_config(bridge_dir, python_executable=python_executable)
+    # build_mcp_config returns {"mcpServers": {"<name>": {command, args, env}}};
+    # opencode wants a flat command list + ``environment``.
+    name, server = next(iter(claude_cfg["mcpServers"].items()))
+    entry: dict[str, object] = {
+        "type": "local",
+        "command": [server["command"], *server.get("args", [])],
+        "enabled": True,
+    }
+    env = dict(server.get("env", {}) or {})
+    if env:
+        entry["environment"] = env
+    return {str(name): entry}
+
+
+def _databricks_bearer_token(profile: str) -> str | None:
+    """Resolve a bearer token for a ``~/.databrickscfg`` profile (best-effort)."""
+    try:
+        from databricks.sdk.core import Config
+
+        headers = Config(profile=profile).authenticate() or {}
+        authz = headers.get("Authorization", "")
+        return authz.split(" ", 1)[1] if authz.lower().startswith("bearer ") else None
+    except Exception as exc:  # noqa: BLE001 - SDK absent / bad profile / auth failure.
+        _logger.info("opencode MCP databricks token resolve failed for %r: %r", profile, exc)
+        return None
 
 
 def resolve_databricks_gateway(
