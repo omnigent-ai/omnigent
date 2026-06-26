@@ -11041,6 +11041,7 @@ def _run_configure_harnesses_interactive() -> None:
         # harness shows at once. Each row is (target, name, status, kind, hint),
         # where ``hint`` is the selection-only description (install command /
         # next step), empty for a ready harness.
+        from omnigent.onboarding.hermes_auth import hermes_config_summary
         from omnigent.onboarding.opencode_auth import opencode_auth_summary
 
         rows: list[tuple[str, str, str, str, str]] = []
@@ -11099,21 +11100,14 @@ def _run_configure_harnesses_interactive() -> None:
                 ),
             )
 
-        # Hermes — curl-installed, but provider/model config is opaque until
-        # `hermes model` has been run. Treat an installed binary as
-        # "not configured" rather than ready so setup does not overstate the
-        # state of a fresh install.
-        if harness_cli_installed(HERMES_KEY):
-            rows.append(
-                (
-                    _HERMES,
-                    "Hermes",
-                    "Not configured",
-                    "warn",
-                    "Open to configure with `hermes model`.",
-                ),
-            )
-        else:
+        # Hermes — curl-installed; its provider/model live in
+        # ``~/.hermes/config.yaml`` (written by `hermes model`). Read that so a
+        # configured Hermes shows the picked model as ready, instead of always
+        # reading "not configured" on an installed binary. A fresh install
+        # ships ``provider: auto`` (nothing picked), so it still reads
+        # "not configured" until `hermes model` selects a concrete provider.
+        hermes = hermes_config_summary()
+        if not hermes.installed:
             hermes_spec = harness_install_spec(HERMES_KEY)
             hermes_hint = (
                 hermes_spec.install_hint
@@ -11122,6 +11116,18 @@ def _run_configure_harnesses_interactive() -> None:
             )
             rows.append(
                 (_HERMES, "Hermes", "Not installed", "missing", _install_hint(hermes_hint)),
+            )
+        elif hermes.ready:
+            rows.append((_HERMES, "Hermes", hermes.describe(), "ready", ""))
+        else:
+            rows.append(
+                (
+                    _HERMES,
+                    "Hermes",
+                    "Not configured",
+                    "warn",
+                    "Open to configure with `hermes model`.",
+                ),
             )
 
         rows.append(_family_row(PI_SURFACE))
