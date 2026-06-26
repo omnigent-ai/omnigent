@@ -7,39 +7,51 @@
 #                                  └▶ if needs-doc ─▶ draft (doc-drafter, with a
 #                                     checkout of omnigent-site) ─▶ open site PR
 #
-# Trigger semantics (per design):
-#   - needs-doc-update applied PRE-merge  -> drafts on merge (the `closed` event).
-#   - needs-doc-update applied POST-merge  -> drafts at apply time (`labeled` event).
-#   - unlabeled at merge                   -> the AI classifies and labels; if
-#                                             needs-doc it also drafts in the same run.
-#   - no-doc-update present                -> nothing to do.
+# Trigger: a push to main (i.e. a PR merged). The Plan step resolves the PR from
+# the merge commit via the commits/<sha>/pulls API and reads its labels:
+#   - no-doc-update label present     -> nothing to do (human opted out).
+#   - needs-doc-update label present  -> draft straight away (human opted in).
+#   - unlabeled                       -> the AI classifies + labels; if needs-doc
+#                                        it also drafts in the same run.
+#   - commit with no associated PR (direct push) -> nothing to do.
+# Keying off the merge commit (not pull_request_target) is what makes this fire for
+# FORK PRs too — see the `on:` comment.
 #
-# Tokens: omnigent labels/comments use GITHUB_TOKEN (applying a label with it does
-# NOT recursively trigger this workflow, which is why classify+draft live in ONE
-# workflow). The cross-repo omnigent-site PR uses a token minted from the existing
-# `omnigent-ci` App, scoped to omnigent-site. That App is ALREADY installed on
-# omnigent-site with contents + PR write — the sync-openapi-to-site.yml workflow on
-# main uses it the same way. If the App is ever unavailable the draft still runs
-# and prints its diff to the run summary but does not push — this fail-open relies
-# on omnigent-site being PUBLIC so the github.token read-only checkout works.
+# Tokens: omnigent labels/comments use GITHUB_TOKEN via the issues API. This
+# workflow never pushes to main (it writes only to omnigent-site and to the source
+# PR's labels/comments), so it cannot recursively trigger itself. The cross-repo
+# omnigent-site PR uses a token minted from the existing `omnigent-ci` App, scoped
+# to omnigent-site. That App is ALREADY installed on omnigent-site with contents +
+# PR write — the sync-openapi-to-site.yml workflow on main uses it the same way. If
+# the App is ever unavailable the draft still runs and prints its diff to the run
+# summary but does not push — this fail-open relies on omnigent-site being PUBLIC so
+# the github.token read-only checkout works.
 #
-# Safety: pull_request_target runs in the trusted base-repo context. We check out
-# the trusted DEFAULT branch and read the PR diff via the API; PR-authored code is
-# never executed. The drafter is unsandboxed like the examples/polly CI reviewer,
-# but only runs on already-merged PRs, the write-token is minted after it finishes
-# (never in its reach), and the agents are fed only the code diff (never the PR
-# title/description) to shrink the injection surface. The output/drafted-file
-# secret-scans catch a key written to stdout or a file — they do NOT cover network
-# exfiltration; see the residual-risk note in .github/agents/doc-drafter/config.yaml.
+# Safety: `push: [main]` only ever runs on code already merged to main — inherently
+# trusted, no PR-event-with-secrets surface (this replaced pull_request_target,
+# which also fixed the fork gap). We check out main and read the PR diff via the
+# API; PR-authored code is never executed. The drafter is unsandboxed like the
+# examples/polly CI reviewer, runs only on already-merged code, the write-token is
+# minted after it finishes (never in its reach), and the agents are fed only the
+# code diff (never the PR title/description) to shrink the injection surface. The
+# output/drafted-file secret-scans catch a key written to stdout or a file — they
+# do NOT cover network exfiltration; see the residual-risk note in
+# .github/agents/doc-drafter/config.yaml.
 name: Doc sync
 
 on:
-  pull_request_target:
-    types: [closed, labeled]
+  # Fire when commits land on main — i.e. when a PR merges. Keying off the merge
+  # commit (rather than pull_request_target) means it runs for EVERY merge,
+  # including fork PRs: a fork's pull_request_target `closed` event is gated by
+  # GitHub's fork-workflow rules and doesn't reliably fire, but a push to main is
+  # always a trusted, fully-credentialed event regardless of where the PR came
+  # from. The PR (number/author/labels) is resolved from the commit via the API.
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       pr:
-        description: "PR number to classify/draft (manual test)."
+        description: "PR number to classify/draft (manual run)."
         required: true
         type: string
 
@@ -49,7 +61,7 @@ permissions:
   issues: write  # labels + PR comments are served by the issues API
 
 concurrency:
-  group: doc-sync-${{ github.event.pull_request.number || inputs.pr }}
+  group: doc-sync-${{ inputs.pr || github.sha }}
   cancel-in-progress: false
 
 env:
@@ -62,17 +74,11 @@ env:
 jobs:
   doc-sync:
     name: Classify and draft docs
-    # Cheap pre-gate; the `plan` step refines (e.g. a no-doc-labeled merge → no-op).
+    # Cheap pre-gate; the `plan` step refines (no associated PR, or a
+    # no-doc-update-labeled merge → no-op).
     if: >-
-      github.repository == 'omnigent-ai/omnigent' && (
-        github.event_name == 'workflow_dispatch' ||
-        (
-          github.event.pull_request.merged == true && (
-            github.event.action == 'closed' ||
-            (github.event.action == 'labeled' && github.event.label.name == 'needs-doc-update')
-          )
-        )
-      )
+      github.repository == 'omnigent-ai/omnigent' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -92,33 +98,40 @@ jobs:
           classify = predraft = False
           pr = author = title = ""
 
+          repo = os.environ["CODE_REPO"]
           if event == "workflow_dispatch":
               pr = os.environ.get("INPUT_PR", "").strip()
               meta = json.loads(subprocess.run(
-                  ["gh", "pr", "view", pr, "--repo", os.environ["CODE_REPO"],
+                  ["gh", "pr", "view", pr, "--repo", repo,
                    "--json", "author,title"], capture_output=True, text=True).stdout or "{}")
               author = (meta.get("author") or {}).get("login", "")
               title = meta.get("title", "")
-              classify = True  # manual test: classify, and draft if needs-doc
-          elif event == "pull_request_target":
-              prj = payload["pull_request"]
-              pr = str(prj["number"]); author = (prj.get("user") or {}).get("login", "")
-              title = prj.get("title", "")
-              merged = bool(prj.get("merged"))
-              labels = [l["name"] for l in prj.get("labels", [])]
-              action = payload.get("action")
-              if not merged:
-                  pass
-              elif action == "labeled":
-                  if (payload.get("label") or {}).get("name") == NEEDS:
-                      predraft = True            # post-merge label → draft now
-              elif action == "closed":
-                  if NEEDS in labels:
-                      predraft = True            # pre-merge needs-doc → draft on merge
-                  elif NO in labels:
-                      pass                       # already decided: no docs
+              classify = True  # manual run: classify, and draft if needs-doc
+          elif event == "push":
+              # A commit just landed on main (a PR merged). Resolve the PR that
+              # introduced it — works for fork and internal PRs alike, since we're
+              # reading trusted main history, not a PR event. Squash-merge → one PR.
+              sha = os.environ.get("GITHUB_SHA", "")
+              out = subprocess.run(
+                  ["gh", "api", f"repos/{repo}/commits/{sha}/pulls", "--jq",
+                   "[.[] | {number, author: (.user.login // \"\"), title, labels: [.labels[].name]}]"],
+                  capture_output=True, text=True).stdout.strip()
+              prs = json.loads(out) if out else []
+              if not prs:
+                  print(f"::notice::commit {sha[:8]} has no associated PR (direct push?) — nothing to do.")
+              else:
+                  if len(prs) > 1:
+                      print(f"::warning::commit {sha[:8]} maps to {len(prs)} PRs "
+                            f"({[p['number'] for p in prs]}); processing #{prs[0]['number']} only.")
+                  p = prs[0]
+                  pr = str(p["number"]); author = p.get("author") or ""; title = p.get("title", "")
+                  labels = p.get("labels", [])
+                  if NO in labels:
+                      pass                       # human set no-doc-update → skip
+                  elif NEEDS in labels:
+                      predraft = True            # human set needs-doc-update → draft
                   else:
-                      classify = True            # unlabeled → classify
+                      classify = True            # unlabeled → let the classifier decide
 
           proceed = classify or predraft
           out = os.environ["GITHUB_OUTPUT"]
