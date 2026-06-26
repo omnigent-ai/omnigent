@@ -4,10 +4,29 @@ from __future__ import annotations
 
 import hashlib
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.spec import AgentSpec, ExtractionError, load
+
+
+def _cwd_escapes_workspace(spec_cwd: str) -> bool:
+    """Whether an agent-spec ``os_env.cwd`` would escape the session workspace.
+
+    ``True`` for an absolute path or one containing a ``..`` segment, in
+    either POSIX or Windows form (the runner is POSIX, but checking both
+    avoids a separator-style bypass). Such a cwd must be rejected for
+    untrusted uploads (GHSA-p8rw-8qj3-hf33): on a runner without
+    ``OMNIGENT_RUNNER_WORKSPACE`` it becomes the agent environment root and
+    ``copytree`` source, exposing the host filesystem.
+    """
+    posix, win = PurePosixPath(spec_cwd), PureWindowsPath(spec_cwd)
+    return (
+        posix.is_absolute()
+        or win.is_absolute()
+        or ".." in posix.parts
+        or ".." in win.parts
+    )
 
 
 def validate_agent_bundle(
@@ -43,7 +62,8 @@ def validate_agent_bundle(
     :returns: The validated :class:`AgentSpec`.
     :raises OmnigentError: If the bundle is invalid, the spec is
         missing a name, or (when *enforce_handler_allowlist*) a policy
-        names an unregistered handler.
+        names an unregistered handler or ``os_env.cwd`` is an absolute
+        or escaping path.
     """
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -70,6 +90,25 @@ def validate_agent_bundle(
             "agent spec must include a name",
             code=ErrorCode.INVALID_INPUT,
         )
+
+    # Untrusted uploads may not pin an absolute or escaping os_env.cwd
+    # (GHSA-p8rw-8qj3-hf33). This is gated on the same trust signal as the
+    # handler allowlist: a trusted single-user/local server
+    # (enforce_handler_allowlist=False) uploads the operator's OWN bundle, and
+    # the operator legitimately controls cwd — matching the documented
+    # absolute-cwd behavior for direct/local runs in
+    # designs/SESSION_WORKSPACE_SELECTION.md.
+    if enforce_handler_allowlist:
+        os_env = getattr(spec, "os_env", None)
+        spec_cwd = getattr(os_env, "cwd", None) if os_env is not None else None
+        if spec_cwd is not None and spec_cwd not in (".", "./") and _cwd_escapes_workspace(
+            spec_cwd
+        ):
+            raise OmnigentError(
+                "agent os_env.cwd must be a relative path within the workspace "
+                f"(no absolute paths or '..'); got {spec_cwd!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
     return spec
 

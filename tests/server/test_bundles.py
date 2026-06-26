@@ -286,3 +286,65 @@ def test_validate_bundle_accepts_registered_handler_in_sub_agent() -> None:
     )
     spec = validate_agent_bundle(bundle)
     assert spec.name == "root_agent"
+
+
+# ── os_env.cwd containment on the upload path (GHSA-p8rw-8qj3-hf33) ──
+
+
+def _bundle_with_cwd(cwd: str) -> bytes:
+    """Pack a minimal valid bundle whose ``os_env.cwd`` is *cwd*."""
+    return _make_bundle_bytes(
+        {
+            "config.yaml": yaml.dump(
+                {
+                    "spec_version": 1,
+                    "name": "uploaded-agent",
+                    "executor": {
+                        "type": "omnigent",
+                        "config": {"harness": "claude-sdk"},
+                    },
+                    "prompt": "hi",
+                    "os_env": {
+                        "type": "caller_process",
+                        "cwd": cwd,
+                        "sandbox": {"type": "none"},
+                    },
+                }
+            )
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_cwd", ["/", "/etc", "/etc/passwd", "../../etc", "a/../../b"]
+)
+def test_validate_agent_bundle_rejects_escaping_os_env_cwd(bad_cwd: str) -> None:
+    """An uploaded bundle may not pin an absolute or ``..``-escaping cwd.
+
+    On a runner without ``OMNIGENT_RUNNER_WORKSPACE`` such a cwd becomes the
+    agent environment root / ``copytree`` source, exposing the host
+    filesystem (GHSA-p8rw-8qj3-hf33). The untrusted upload path must reject it.
+    """
+    with pytest.raises(OmnigentError, match=r"os_env\.cwd must be a relative path"):
+        validate_agent_bundle(_bundle_with_cwd(bad_cwd))
+
+
+@pytest.mark.parametrize("ok_cwd", ["sub", "sub/dir", "a/b/c", ".", "./"])
+def test_validate_agent_bundle_allows_contained_relative_cwd(ok_cwd: str) -> None:
+    """A relative, non-escaping ``os_env.cwd`` is accepted on the upload path."""
+    spec = validate_agent_bundle(_bundle_with_cwd(ok_cwd))
+    assert spec.name == "uploaded-agent"
+
+
+def test_validate_agent_bundle_allows_absolute_cwd_for_trusted_local_server() -> None:
+    """The trusted single-user/local path keeps the documented absolute-cwd
+    behavior.
+
+    With ``enforce_handler_allowlist=False`` the operator uploads their OWN
+    bundle and legitimately controls cwd, so containment is not enforced —
+    matching ``designs/SESSION_WORKSPACE_SELECTION.md`` for direct/local runs.
+    """
+    spec = validate_agent_bundle(
+        _bundle_with_cwd("/abs/operator/path"), enforce_handler_allowlist=False
+    )
+    assert spec.name == "uploaded-agent"
