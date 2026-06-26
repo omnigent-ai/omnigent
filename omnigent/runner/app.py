@@ -2572,8 +2572,14 @@ async def _auto_create_qwen_terminal(
     server_url = _required_runner_env("RUNNER_SERVER_URL")
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
-    from omnigent.qwen_native_forwarder import supervise_qwen_forwarder
+    from omnigent.qwen_native_bridge import qwen_session_recording_path
+    from omnigent.qwen_native_forwarder import (
+        supervise_qwen_compaction_mirror,
+        supervise_qwen_forwarder,
+    )
     from omnigent.qwen_native_permissions import supervise_qwen_approval_mirror
+
+    qwen_recording_path = qwen_session_recording_path(qwen_session_id, workspace)
 
     if server_client is not None and ensure_comment_relay is not None:
         await ensure_comment_relay(
@@ -2583,15 +2589,18 @@ async def _auto_create_qwen_terminal(
         )
 
     async def _supervise_qwen_native_bridges() -> None:
-        """Run the transcript forwarder and the approval mirror together.
+        """Run the transcript forwarder, approval mirror, and compaction mirror together.
 
-        Both are per-session, runner-owned, and self-healing (they catch and
+        All three are per-session, runner-owned, and self-healing (they catch and
         log their own failures rather than exiting); gathering them under one
         task keeps a single registration/cancellation handle
         (:func:`_register_auto_forwarder_task`) for session teardown. The
         forwarder mirrors qwen's replies onto the conversation; the approval
         mirror surfaces qwen's native ``can_use_tool`` prompts as web
-        elicitations (see :mod:`omnigent.qwen_native_permissions`).
+        elicitations (see :mod:`omnigent.qwen_native_permissions`); the compaction
+        mirror tails qwen's chat recording for the ``chat_compression`` marker and
+        posts the ``external_compaction_status: completed`` edge (see
+        :func:`omnigent.qwen_native_forwarder.supervise_qwen_compaction_mirror`).
         """
         await asyncio.gather(
             supervise_qwen_forwarder(
@@ -2607,6 +2616,13 @@ async def _auto_create_qwen_terminal(
                 headers={},
                 session_id=session_id,
                 bridge_dir=bridge_dir,
+                auth=_runner_auth,
+            ),
+            supervise_qwen_compaction_mirror(
+                base_url=server_url,
+                headers={},
+                session_id=session_id,
+                recording_path=qwen_recording_path,
                 auth=_runner_auth,
             ),
         )
@@ -11152,6 +11168,47 @@ def create_runner_app(
             )
         return Response(status_code=200)
 
+    async def _handle_qwen_native_compact(conv_id: str) -> Response:
+        """Submit ``/compress`` into the qwen TUI via the input file.
+
+        qwen-native sessions own their context window inside the qwen TUI, so
+        explicit compaction must run there (qwen's ``/compress`` slash command),
+        not as AP-side compaction — same rationale as
+        :func:`_handle_cursor_native_compact`. Injection is **file-based**, not
+        tmux send-keys: a ``{"type":"submit","text":"/compress"}`` line on the
+        input file routes through qwen's ``RemoteInputWatcher`` → ``submitQuery``
+        (the keyboard's own submit path), which processes the slash command —
+        sidestepping cursor's autocomplete-dropdown trap (verified, qwen v0.18.2:
+        it compresses and emits no ``/compress`` user bubble on the stream).
+
+        Publishes ``response.compaction.in_progress`` to raise the web "Compacting
+        conversation…" spinner; the matching ``completed`` edge is emitted later by
+        :func:`omnigent.qwen_native_forwarder.supervise_qwen_compaction_mirror` when
+        it observes the ``chat_compression`` record in qwen's recording, so the
+        permanent marker tracks qwen's real progress. On injection failure we
+        publish ``response.compaction.failed`` so the spinner is dismissed rather
+        than stranded. Returns 200 so the server skips its own AP-side compaction.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 200 once ``/compress`` has been submitted; 503 on injection error.
+        """
+        from omnigent.qwen_native_bridge import bridge_dir_for_session_id, submit_user_message
+
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        _publish_event(conv_id, {"type": "response.compaction.in_progress", "task_id": conv_id})
+        try:
+            await asyncio.to_thread(submit_user_message, bridge_dir, content="/compress")
+        except (RuntimeError, OSError) as exc:
+            _publish_event(conv_id, {"type": "response.compaction.failed", "task_id": conv_id})
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "qwen_native_compact_failed",
+                    "detail": _client_safe_error_detail(exc, context="qwen-native compact"),
+                },
+            )
+        return Response(status_code=200)
+
     async def _handle_claude_native_cost_popup(
         conv_id: str,
         elicitation_id: str,
@@ -14067,6 +14124,8 @@ def create_runner_app(
                 return await _handle_cursor_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "hermes-native":
                 return await _handle_hermes_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "qwen-native":
+                return await _handle_qwen_native_compact(conversation_id)
             return Response(status_code=204)
 
         if body_type == "cost_approval_popup":
