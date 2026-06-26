@@ -271,16 +271,18 @@ async def test_cost_is_attributed_to_owner_not_invitee(
     conv_id = _make_session_for(db_uri, "alice@example.com", cost_usd=5.0, total_tokens=8000)
     _invite(db_uri, conv_id, "btallman@example.com", level=1)  # read-only invite
 
-    # User-list rollup: cost goes to alice, not btallman.
+    # User-list rollup: cost goes to alice; btallman (invite-only phantom) is
+    # hidden entirely, and counted under "hidden".
     users_resp = await auth_client.get("/v1/admin/users", headers=_headers("boss@example.com"))
-    by_id = {u["user_id"]: u for u in users_resp.json()["users"]}
+    payload = users_resp.json()
+    by_id = {u["user_id"]: u for u in payload["users"]}
     assert by_id["alice@example.com"]["cost_usd"] == pytest.approx(5.0)
     assert by_id["alice@example.com"]["session_count"] == 1
-    assert by_id["btallman@example.com"]["cost_usd"] == pytest.approx(0.0)
-    assert by_id["btallman@example.com"]["session_count"] == 0
+    assert "btallman@example.com" not in by_id
+    assert payload["hidden"] == 1
 
-    # btallman's session view: the session appears, but labeled as a read-role
-    # invite owned by alice — and the rollup total stays $0.
+    # btallman's session view still works directly: the session is labeled as a
+    # read-role invite owned by alice, and the rollup total stays $0.
     sess_resp = await auth_client.get(
         "/v1/admin/users/btallman@example.com/sessions",
         headers=_headers("boss@example.com"),
@@ -292,6 +294,32 @@ async def test_cost_is_attributed_to_owner_not_invitee(
     assert sess["is_owner"] is False
     assert body["totals"]["cost_usd"] == pytest.approx(0.0)
     assert body["totals"]["session_count"] == 0
+
+
+async def test_logged_in_idle_user_and_admin_not_hidden(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Hiding targets ONLY invite-only phantoms — not idle real users or admins.
+
+    A user who logged in but owns/joined nothing (no grants) and an admin who
+    owns nothing both stay visible; only the invited-but-owns-nothing phantom
+    is filtered.
+    """
+    _make_user(db_uri, "boss@example.com", is_admin=True)
+    _make_user(db_uri, "idle@example.com", is_admin=False)  # logged in, no grants
+    _make_user(db_uri, "ghostadmin@example.com", is_admin=True)  # admin, no sessions
+    conv_id = _make_session_for(db_uri, "alice@example.com", cost_usd=1.0)
+    _invite(db_uri, conv_id, "phantom@example.com", level=2)  # invited, owns nothing
+
+    resp = await auth_client.get("/v1/admin/users", headers=_headers("boss@example.com"))
+    payload = resp.json()
+    ids = {u["user_id"] for u in payload["users"]}
+
+    assert "idle@example.com" in ids  # real login, kept
+    assert "ghostadmin@example.com" in ids  # admin, kept
+    assert "alice@example.com" in ids  # owns a session, kept
+    assert "phantom@example.com" not in ids  # invite-only phantom, hidden
+    assert payload["hidden"] == 1
 
 
 async def test_list_user_sessions_forbidden_for_non_admin(

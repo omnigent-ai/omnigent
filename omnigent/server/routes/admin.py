@@ -82,23 +82,41 @@ def create_admin_router(
         return user_id
 
     @router.get("/admin/users")
-    async def list_users(request: Request) -> dict[str, list[dict[str, object]]]:
-        """List all users (admin only), each with an owned-usage rollup.
+    async def list_users(request: Request) -> dict[str, object]:
+        """List real users (admin only), each with an owned-usage rollup.
 
         ``cost_usd`` / ``total_tokens`` / ``session_count`` cover the
         sessions the user OWNS — cost is attributed to the owner, so a
-        user merely invited to a session is not credited its cost (and a
-        pure-invitee shows a $0 rollup).
+        user merely invited to a session is not credited its cost.
+
+        **Invite-only phantoms are hidden.** A row is created in the
+        ``users`` table whenever someone is granted access to a session
+        (the grant's FK requires it), even if that person never logged
+        in. Such an account — not an admin, owns no session, but holds an
+        invite (read/edit/manage) grant — is omitted here; ``hidden``
+        reports how many were filtered. A real user who logged in but has
+        not created anything (no grants at all) is kept, as are admins.
 
         :returns: ``{"users": [{"user_id", "is_admin", "cost_usd",
-            "total_tokens", "session_count"}, ...]}``.
+            "total_tokens", "session_count"}, ...], "hidden": N}``.
         """
         await _require_admin(request)
 
-        def _build() -> list[dict[str, object]]:
+        def _build() -> dict[str, object]:
             out: list[dict[str, object]] = []
+            hidden = 0
             for u in permission_store.list_users():
                 totals = conversation_store.usage_totals_for_user(u.user_id)
+                # Hide invite-only phantoms: own nothing, hold only invite
+                # grants, not an admin. Skip the grant lookup for users who
+                # already own a session (the common case).
+                if not u.is_admin and totals.session_count == 0:
+                    grants = permission_store.list_for_user(u.user_id)
+                    owns = any(g.level >= LEVEL_OWNER for g in grants)
+                    invited = any(g.level < LEVEL_OWNER for g in grants)
+                    if not owns and invited:
+                        hidden += 1
+                        continue
                 out.append(
                     {
                         "user_id": u.user_id,
@@ -108,9 +126,9 @@ def create_admin_router(
                         "session_count": totals.session_count,
                     }
                 )
-            return out
+            return {"users": out, "hidden": hidden}
 
-        return {"users": await asyncio.to_thread(_build)}
+        return await asyncio.to_thread(_build)
 
     @router.get("/admin/users/{user_id}/sessions")
     async def list_user_sessions(
