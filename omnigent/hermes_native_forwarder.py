@@ -92,6 +92,91 @@ def _warn_sqlite_once(context: str, exc: sqlite3.Error) -> None:
 # an internal bridge detail).
 _ATTACHMENT_MARKER_RE = re.compile(r"\[Attached:[^\]]*\]")
 
+# Hermes injects skill content as a user message prefixed with this marker.
+# The full skill prompt is not useful in the web UI — replace it with a
+# short summary so the chat view stays clean.
+_SKILL_INVOKE_RE = re.compile(
+    r'^\[IMPORTANT: The user has invoked the "(?P<name>[^"]+)" skill',
+)
+
+#: Maximum characters for a tool output mirrored into the web UI chat view.
+#: Longer outputs are truncated so skill loads and other verbose results don't
+#: flood the conversation bubbles. The full output remains visible in the
+
+
+def _read_model_from_hermes_config(bridge_dir: Path) -> str | None:
+    """Best-effort read of the model name from the per-session HERMES_HOME config.
+
+    Falls back to the user's ``~/.hermes/config.yaml`` if no per-session config
+    exists. Returns ``None`` when the model cannot be determined.
+    """
+    candidates = [
+        bridge_dir / "hermes_home" / "config.yaml",
+        Path.home() / ".hermes" / "config.yaml",
+    ]
+    for config_path in candidates:
+        if not config_path.is_file():
+            continue
+        try:
+            import yaml
+
+            data = yaml.safe_load(config_path.read_text()) or {}
+            model = data.get("model")
+            if isinstance(model, str) and model:
+                return model
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+class _HermesUsageTracker:
+    """Post ``external_session_usage`` events for a hermes-native session.
+
+    Hermes' SQLite ``state.db`` does not expose per-message token counts, so
+    this tracker posts only the model name to the server — enough for the
+    server to associate the model for display and (eventually) pricing.
+
+    Follows the :class:`omnigent.codex_native_forwarder._SessionUsageCoalescer`
+    pattern: deduplicates (only posts when the model changes) and is flushed
+    from the poll loop.
+
+    TODO: Token-level cost tracking (input_tokens, output_tokens, total_tokens)
+    requires Hermes to expose usage data in its state.db or session transcript.
+    """
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        session_id: str,
+        bridge_dir: Path,
+    ) -> None:
+        self._client = client
+        self._session_id = session_id
+        self._bridge_dir = bridge_dir
+        self._model: str | None = None
+        self._posted_model: str | None = None
+
+    async def flush(self) -> None:
+        """Post the model name if it changed since the last flush."""
+        if self._model is None:
+            self._model = await asyncio.to_thread(_read_model_from_hermes_config, self._bridge_dir)
+        if not self._model or self._model == self._posted_model:
+            return
+        try:
+            resp = await self._client.post(
+                f"/v1/sessions/{self._session_id}/events",
+                json={
+                    "type": "external_session_usage",
+                    "data": {"model": self._model},
+                },
+            )
+            if resp.status_code < 400:
+                self._posted_model = self._model
+            else:
+                _logger.warning("hermes usage tracker POST failed: status=%s", resp.status_code)
+        except httpx.HTTPError:
+            _logger.debug("hermes usage tracker POST failed", exc_info=True)
+
 
 def _hermes_home() -> Path:
     """Return Hermes' home dir for this process (``$HERMES_HOME`` or ``~/.hermes``)."""
@@ -319,43 +404,106 @@ class _MirrorItem:
     response_id: str
 
 
-def _message_to_item(
-    msg_id: int, role: object, content: object, agent_name: str
-) -> _MirrorItem | None:
-    """Convert one ``messages`` row to a mirror item, or ``None`` to skip it.
+def _message_to_items(
+    msg_id: int,
+    role: object,
+    content: object,
+    tool_calls: object,
+    tool_call_id: object,
+    tool_name: object,  # noqa: ARG001 — reserved for future use (e.g. logging)
+    agent_name: str,
+) -> list[_MirrorItem]:
+    """Convert one ``messages`` row to mirror items.
 
-    Hermes stores ``content`` as plain text (not JSON), so the body is used
-    directly after stripping bridge attachment markers.
+    An assistant row with ``tool_calls`` emits a ``function_call`` item per
+    call, followed by a ``message`` item if it also has prose content. A tool
+    row emits a ``function_call_output`` item. Returns an empty list to skip.
     """
     if not isinstance(role, str):
-        return None
+        return []
     text = ""
     if isinstance(content, str):
         text = _ATTACHMENT_MARKER_RE.sub("", content).strip()
     response_id = f"hermes:{msg_id}"
+
     if role == "user":
         if not text:
-            return None
-        return _MirrorItem(
-            msg_id=msg_id,
-            item_type="message",
-            item_data={"role": "user", "content": [{"type": "input_text", "text": text}]},
-            response_id=response_id,
-        )
+            return []
+        # Hermes injects skill content as a user message — replace with
+        # a short summary so the chat view stays readable.
+        skill_match = _SKILL_INVOKE_RE.match(text)
+        if skill_match:
+            text = f"/{skill_match.group('name')}"
+        return [
+            _MirrorItem(
+                msg_id=msg_id,
+                item_type="message",
+                item_data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+                response_id=response_id,
+            )
+        ]
+
     if role == "assistant":
-        if not text:
-            return None  # tool-only / reasoning-only turn with no prose
-        return _MirrorItem(
-            msg_id=msg_id,
-            item_type="message",
-            item_data={
-                "role": "assistant",
-                "agent": agent_name,
-                "content": [{"type": "output_text", "text": text}],
-            },
-            response_id=response_id,
-        )
-    return None  # tool / system / other scaffolding
+        items: list[_MirrorItem] = []
+        # Parse tool_calls JSON — assistant rows may include tool call requests.
+        if isinstance(tool_calls, str) and tool_calls:
+            try:
+                calls = json.loads(tool_calls)
+            except (json.JSONDecodeError, ValueError):
+                calls = []
+            if isinstance(calls, list):
+                for call in calls:
+                    if not isinstance(call, dict):
+                        continue
+                    call_id = call.get("call_id") or call.get("id") or ""
+                    func = call.get("function", {})
+                    name = func.get("name", "") if isinstance(func, dict) else ""
+                    arguments = func.get("arguments", "{}") if isinstance(func, dict) else "{}"
+                    if call_id and name:
+                        items.append(
+                            _MirrorItem(
+                                msg_id=msg_id,
+                                item_type="function_call",
+                                item_data={
+                                    "agent": agent_name,
+                                    "name": name,
+                                    "arguments": arguments,
+                                    "call_id": call_id,
+                                },
+                                response_id=response_id,
+                            )
+                        )
+        # Also emit a message item if there's prose content.
+        if text:
+            items.append(
+                _MirrorItem(
+                    msg_id=msg_id,
+                    item_type="message",
+                    item_data={
+                        "role": "assistant",
+                        "agent": agent_name,
+                        "content": [{"type": "output_text", "text": text}],
+                    },
+                    response_id=response_id,
+                )
+            )
+        return items
+
+    if role == "tool":
+        # Tool result row — emit function_call_output.
+        if isinstance(tool_call_id, str) and tool_call_id:
+            output = text or ""
+            return [
+                _MirrorItem(
+                    msg_id=msg_id,
+                    item_type="function_call_output",
+                    item_data={"call_id": tool_call_id, "output": output},
+                    response_id=response_id,
+                )
+            ]
+        return []
+
+    return []
 
 
 def _read_new_items(
@@ -371,7 +519,8 @@ def _read_new_items(
         return []
     try:
         rows = con.execute(
-            "SELECT id, role, content FROM messages "
+            "SELECT id, role, content, tool_calls, tool_call_id, tool_name "
+            "FROM messages "
             "WHERE session_id = ? AND id > ? AND active = 1 ORDER BY id",
             (hermes_session_id, last_id),
         ).fetchall()
@@ -381,10 +530,12 @@ def _read_new_items(
     finally:
         con.close()
     items: list[_MirrorItem] = []
-    for msg_id, role, content in rows:
-        item = _message_to_item(msg_id, role, content, agent_name)
-        if item is not None:
-            items.append(item)
+    for msg_id, role, content, tool_calls_json, tool_call_id, tool_name_val in rows:
+        converted = _message_to_items(
+            msg_id, role, content, tool_calls_json, tool_call_id, tool_name_val, agent_name
+        )
+        if converted:
+            items.extend(converted)
         else:
             items.append(_MirrorItem(msg_id=msg_id, item_type="", item_data={}, response_id=""))
     return items
@@ -404,6 +555,82 @@ async def _post_conversation_item(
                 "response_id": item.response_id,
             },
         },
+    )
+    resp.raise_for_status()
+
+
+def _has_new_compaction(db_path: Path, hermes_session_id: str) -> bool:
+    """Check if hermes has compacted messages for this session."""
+    con = _connect_ro(db_path)
+    if con is None:
+        return False
+    try:
+        row = con.execute(
+            "SELECT 1 FROM messages WHERE session_id = ? AND compacted = 1 LIMIT 1",
+            (hermes_session_id,),
+        ).fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return False
+    finally:
+        con.close()
+
+
+async def _persist_hermes_compaction_item(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    db_path: Path,
+    hermes_session_id: str,
+) -> None:
+    """Persist a compaction boundary item with post-compaction messages."""
+    resp = await client.get(
+        f"/v1/sessions/{session_id}/items",
+        params={"limit": 1, "order": "desc"},
+    )
+    resp.raise_for_status()
+    items = resp.json().get("data", [])
+    last_item_id = items[0]["id"] if items else f"compact_boundary_{session_id}"
+
+    compacted_messages = None
+    con = _connect_ro(db_path)
+    if con is not None:
+        try:
+            rows = con.execute(
+                "SELECT role, content FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id",
+                (hermes_session_id,),
+            ).fetchall()
+            msgs = []
+            for role, content in rows:
+                if role in ("user", "assistant") and content:
+                    block_type = "input_text" if role == "user" else "output_text"
+                    msgs.append(
+                        {
+                            "type": "message",
+                            "role": role,
+                            "content": [{"type": block_type, "text": content}],
+                        }
+                    )
+            if msgs:
+                compacted_messages = msgs
+        except sqlite3.Error as exc:
+            _warn_sqlite_once("compaction read", exc)
+        finally:
+            con.close()
+
+    data: dict[str, object] = {
+        "summary": "[Hermes compaction — context was compacted via /compress]",
+        "last_item_id": last_item_id,
+        "model": "unknown",
+        "token_count": 0,
+    }
+    if compacted_messages:
+        data["compacted_messages"] = compacted_messages
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "compaction", "data": data},
     )
     resp.raise_for_status()
 
@@ -445,10 +672,15 @@ async def forward_hermes_store_to_session(
     persisted = _read_state(bridge_dir)
     hermes_session_id: str | None = persisted.hermes_session_id
     last_id = persisted.last_id if hermes_session_id is not None else 0
+    # Track whether we have already PATCHed the external_session_id to the
+    # Omnigent server so we do it at most once per forwarder lifetime.
+    _external_id_synced = False
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
+        usage_tracker = _HermesUsageTracker(client, session_id, bridge_dir)
+        compaction_persisted = False
         while True:
             try:
                 if hermes_session_id is None:
@@ -469,6 +701,24 @@ async def forward_hermes_store_to_session(
                                 last_id=last_id,
                                 launch_epoch_s=launch_epoch_s,
                             ),
+                        )
+                # PATCH the external_session_id once so the server
+                # knows which Hermes session backs this conversation
+                # (needed for fork/resume).
+                if hermes_session_id is not None and not _external_id_synced:
+                    try:
+                        resp = await client.patch(
+                            f"/v1/sessions/{session_id}",
+                            json={"external_session_id": hermes_session_id},
+                        )
+                        resp.raise_for_status()
+                        _external_id_synced = True
+                    except httpx.HTTPError:
+                        _logger.debug(
+                            "hermes forwarder failed to PATCH external_session_id; "
+                            "will retry next poll; session=%s",
+                            session_id,
+                            exc_info=True,
                         )
                 if hermes_session_id is not None:
                     # Yield to an earlier-launched live session rather than mirror
@@ -501,6 +751,25 @@ async def forward_hermes_store_to_session(
                                     launch_epoch_s=launch_epoch_s,
                                 ),
                             )
+                        if not compaction_persisted and await asyncio.to_thread(
+                            _has_new_compaction, db, hermes_session_id
+                        ):
+                            try:
+                                await _persist_hermes_compaction_item(
+                                    client,
+                                    session_id=session_id,
+                                    db_path=db,
+                                    hermes_session_id=hermes_session_id,
+                                )
+                                compaction_persisted = True
+                            except Exception:  # noqa: BLE001
+                                _logger.warning(
+                                    "Failed to persist hermes compaction item for %s",
+                                    session_id,
+                                    exc_info=True,
+                                )
+                        # Post model/usage data after mirroring messages.
+                        await usage_tracker.flush()
                         # Refresh the claim heartbeat every poll (even with no new
                         # items) so an idle owner keeps its claim.
                         _write_state(

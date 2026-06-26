@@ -8,7 +8,10 @@ import {
   deriveHomeDir,
   deriveRepoName,
   describeCreateError,
+  harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
+  harnessWarningBadgeText,
+  harnessWarningMessageText,
   isValidSandboxRepoUrl,
   isValidWorkspace,
   matchSkillInvocation,
@@ -375,7 +378,7 @@ describe("describeCreateError", () => {
 });
 
 describe("harnessUnconfiguredOnHost", () => {
-  const hostWith = (configured: Record<string, boolean> | null | undefined): Host =>
+  const hostWith = (configured: Record<string, boolean | string> | null | undefined): Host =>
     ({
       host_id: "host_1",
       name: "laptop",
@@ -385,10 +388,41 @@ describe("harnessUnconfiguredOnHost", () => {
     }) as Host;
 
   it("warns only on an explicit false from the host", () => {
-    const host = hostWith({ "claude-sdk": true, codex: false });
+    const testHost = hostWith({ "claude-sdk": true, codex: false });
     // Explicit false → warn; explicit true → no warning.
-    expect(harnessUnconfiguredOnHost("codex", host)).toBe(true);
-    expect(harnessUnconfiguredOnHost("claude-sdk", host)).toBe(false);
+    expect(harnessUnconfiguredOnHost("codex", testHost)).toBe(true);
+    expect(harnessUnconfiguredOnHost("claude-sdk", testHost)).toBe(false);
+  });
+
+  it("keeps legacy non-codex false availability generic", () => {
+    const testHost = hostWith({ "claude-native": false });
+    const reason = harnessUnavailableReasonOnHost("claude-native", testHost);
+    expect(reason).toBe("unconfigured");
+    expect(harnessWarningBadgeText(reason)).toBe("needs setup");
+    expect(harnessWarningMessageText("Claude Code", "laptop", reason)).toBe(
+      "Claude Code isn't configured on laptop — run omnigent setup on that machine.",
+    );
+  });
+
+  it("surfaces structured codex unavailable reasons", () => {
+    const testHost = hostWith({ codex: "needs-auth", "codex-native": "binary-missing" });
+    expect(harnessUnconfiguredOnHost("codex", testHost)).toBe(true);
+    expect(harnessUnavailableReasonOnHost("codex", testHost)).toBe("needs-auth");
+    expect(harnessUnavailableReasonOnHost("codex-native", testHost)).toBe("binary-missing");
+    expect(harnessWarningBadgeText("needs-auth")).toBe("needs auth");
+    expect(harnessWarningMessageText("Codex", "laptop", "needs-auth")).toBe(
+      "Codex needs Codex authentication on laptop — run codex login on that machine.",
+    );
+    expect(harnessWarningBadgeText("binary-missing")).toBe("binary missing");
+    expect(harnessWarningMessageText("Codex", "laptop", "binary-missing")).toBe(
+      "Codex is missing the Codex binary on laptop — run omnigent setup on that machine.",
+    );
+  });
+
+  it("ignores unknown future reason strings", () => {
+    expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "future-reason" }))).toBe(
+      null,
+    );
   });
 
   it("never warns when readiness is unknown", () => {
@@ -544,6 +578,8 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}) {
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    server_version: null,
+    smart_routing_enabled: false,
     ...infoOverrides,
   };
   return render(
@@ -720,14 +756,14 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
   });
 
-  it("shows permission-mode options in the Advanced menu only for the claude-native agent", () => {
+  it("shows permission-mode options behind the run-mode pill for the claude-native agent", () => {
     renderLanding();
-    // The radios live behind the footer tray's Advanced chip — absent
+    // The radios live behind the composer's left-side run-mode pill — absent
     // until the menu opens.
     expect(screen.queryByTestId("new-chat-landing-permission-plan")).toBeNull();
-    // a1 (Claude Code, claude-native) is the default agent → the footer
-    // tray surfaces the Advanced chip with the permission-mode radios.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    // a1 (Claude Code, claude-native) is the default agent → the composer
+    // surfaces the permission-mode pill with the permission-mode radios.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-pill"), { button: 0 });
     const planOption = screen.getByTestId("new-chat-landing-permission-plan");
     expect(planOption.textContent).toContain("Plan");
     // The footer line explains the SELECTED mode until a row is hovered —
@@ -737,21 +773,21 @@ describe("NewChatLandingScreen", () => {
     expect(detail.textContent).toContain("Prompts before edits and commands");
     fireEvent.pointerEnter(planOption);
     expect(detail.textContent).toContain("Plans only; makes no edits");
-    // Switch to Codex (a2: codex-native) — the Advanced chip stays visible
+    // Switch to Codex (a2: codex-native) — the run-mode pill stays visible
     // but now shows approval-mode radios instead of permission-mode radios.
-    // Close the Advanced menu first (Escape), then switch agents.
+    // Close the menu first (Escape), then switch agents.
     fireEvent.keyDown(document.activeElement!, { key: "Escape" });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    expect(screen.queryByTestId("new-chat-landing-advanced-chip")).not.toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-approval-pill")).not.toBeNull();
   });
 
-  it("shows approval-mode options in the Advanced menu for the codex-native agent", () => {
+  it("shows approval-mode options behind the run-mode pill for the codex-native agent", () => {
     renderLanding();
     // Switch to Codex first.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-advanced-chip"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
     const fullAccessOption = screen.getByTestId("new-chat-landing-approval-full-access");
     expect(fullAccessOption.textContent).toContain("Full access");
     // The footer line explains the SELECTED mode until a row is hovered.
@@ -760,6 +796,115 @@ describe("NewChatLandingScreen", () => {
     expect(detail.textContent).toContain("Read/edit/run in workspace");
     fireEvent.pointerEnter(fullAccessOption);
     expect(detail.textContent).toContain("Edit any file and access the internet");
+  });
+
+  it("arms codex full bypass only after the confirmation phrase is typed", async () => {
+    renderLanding();
+    // Switch to Codex, open the Advanced menu.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    const toggle = screen.getByTestId(
+      "new-chat-landing-bypass-sandbox-switch",
+    ) as HTMLButtonElement;
+    // OFF by default and not flippable until the phrase is typed: a click
+    // while disabled must not arm it (no in-menu banner appears).
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(toggle.disabled).toBe(true);
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-banner")).toBeNull();
+    // Confirmation is VERBATIM — none of these near-misses unlock the toggle:
+    // a prefix, a different case, or leading/trailing whitespace.
+    for (const nearMiss of ["bypass", "Bypass Sandbox", " bypass sandbox", "bypass sandbox "]) {
+      fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
+        target: { value: nearMiss },
+      });
+      expect(
+        (screen.getByTestId("new-chat-landing-bypass-sandbox-switch") as HTMLButtonElement)
+          .disabled,
+      ).toBe(true);
+    }
+    // Only the exact phrase unlocks it; flipping on renders the red banner.
+    fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
+      target: { value: "bypass sandbox" },
+    });
+    const armed = screen.getByTestId("new-chat-landing-bypass-sandbox-switch") as HTMLButtonElement;
+    expect(armed.disabled).toBe(false);
+    fireEvent.click(armed);
+    expect(
+      (
+        screen.getByTestId("new-chat-landing-bypass-sandbox-switch") as HTMLButtonElement
+      ).getAttribute("aria-checked"),
+    ).toBe("true");
+    const banner = screen.getByTestId("new-chat-landing-bypass-sandbox-banner");
+    expect(banner.textContent).toContain("approvals and the sandbox disabled");
+  });
+
+  it("disarms the dangerous bypass when the agent changes (re-confirm per context)", () => {
+    renderLanding();
+    // Arm bypass on Codex (a2): type the phrase, flip the switch, close tray.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
+      target: { value: "bypass sandbox" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-bypass-sandbox-switch"));
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    // Armed → the persistent banner is up under the composer.
+    expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeTruthy();
+
+    // Switch away to Claude (a1): the armed bypass must clear immediately, so
+    // the persistent banner disappears (Claude has no bypass toggle at all).
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a1"));
+    expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeNull();
+
+    // Switch back to Codex and reopen Advanced: the toggle is OFF and disabled
+    // again — the confirmation phrase must be re-typed for this fresh context.
+    // Without the reset effect it would re-render armed from stale state.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    const toggle = screen.getByTestId(
+      "new-chat-landing-bypass-sandbox-switch",
+    ) as HTMLButtonElement;
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(toggle.disabled).toBe(true);
+    expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-banner")).toBeNull();
+  });
+
+  it("seeds the bypass-sandbox label in the create body when armed", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
+      target: { value: "bypass sandbox" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-bypass-sandbox-switch"));
+    // Close the menu and submit a real task.
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    // The persistent banner remains visible under the composer after the
+    // Advanced tray closes.
+    expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeTruthy();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    const labels = body.labels as Record<string, string>;
+    // The label is what the runner reads to launch with the bypass flag.
+    expect(labels["omnigent.codex_native.bypass_sandbox"]).toBe("1");
+    // The native wrapper labels still ride alongside it.
+    expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
   });
 
   it("shows a conflict banner in the file browser for an occupied directory", async () => {

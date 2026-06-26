@@ -1972,7 +1972,7 @@ def test_materialize_directory_bundle_with_override_keeps_nested_harness_unpinne
                 "pi": "pi",
             },
         ),
-        ("debby", {"claude": "claude-sdk", "gpt": "codex", "opencode": "opencode-native"}),
+        ("debby", {"claude": "claude-sdk", "gpt": "codex"}),
     ],
 )
 def test_materialize_bundle_overrides_brain_harness(

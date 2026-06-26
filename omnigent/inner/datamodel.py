@@ -675,11 +675,6 @@ class OSEnvSpec:
     sandbox: OSEnvSandboxSpec | None = None
     fork: bool = False
     start_in_scratch: bool = False
-    # createos provider fields (ignored unless type='createos')
-    createos_base_url: str | None = None
-    createos_api_key: str | None = None
-    createos_shape: str | None = None
-    createos_rootfs: str | None = None
 
 
 @dataclass

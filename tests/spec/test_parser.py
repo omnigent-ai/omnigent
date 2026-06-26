@@ -8,7 +8,6 @@ import pytest
 import yaml
 
 from omnigent.errors import OmnigentError
-from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.spec.parser import discover_host_skills, parse
 from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
@@ -408,6 +407,61 @@ def test_parse_skill(agent_dir: Path) -> None:
     assert skill.description == "Search the web for sources."
     assert skill.content == "When asked to research, use search.web."
     assert skill.skill_dir == skill_dir
+    # Absent ``user-invocable`` frontmatter defaults to invocable.
+    assert skill.user_invocable is True
+
+
+def test_parse_skill_user_invocable_false(agent_dir: Path) -> None:
+    """``user-invocable: false`` frontmatter parses to ``user_invocable=False``."""
+    skill_dir = agent_dir / "skills" / "internal-hook"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: internal-hook\n"
+        "description: Internal orchestration skill.\n"
+        "user-invocable: false\n"
+        "---\n"
+        "Body."
+    )
+    spec = parse(agent_dir)
+    skill = next(s for s in spec.skills if s.name == "internal-hook")
+    assert skill.user_invocable is False
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # Quoted-string spellings (YAML keeps these as ``str``, not bool) —
+        # the string branch of _falsey_flag, never exercised by the bare forms.
+        ('"false"', False),
+        ('"False"', False),
+        ('"FALSE"', False),
+        ('" false "', False),
+        ('"no"', False),  # extended false spellings (quoted → str)
+        ('"off"', False),
+        ('"0"', False),
+        ('"true"', True),
+        ('"yes"', True),  # not in the false set
+        ('"maybe"', True),
+        # Genuine YAML booleans — PyYAML parses bare false/no/off to ``bool``.
+        ("false", False),
+        ("no", False),
+        ("off", False),
+        ("true", True),
+    ],
+)
+def test_parse_skill_user_invocable_string_and_bool_spellings(
+    agent_dir: Path, raw: str, expected: bool
+) -> None:
+    """Both the YAML bool ``false`` and the quoted string ``"false"`` parse falsey."""
+    skill_dir = agent_dir / "skills" / "flag-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: flag-skill\ndescription: d\nuser-invocable: {raw}\n---\nBody."
+    )
+    spec = parse(agent_dir)
+    skill = next(s for s in spec.skills if s.name == "flag-skill")
+    assert skill.user_invocable is expected
 
 
 def test_parse_skill_missing_frontmatter(agent_dir: Path) -> None:
@@ -431,6 +485,20 @@ def test_parse_skill_missing_description(agent_dir: Path) -> None:
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("---\nname: no-desc\n---\nContent.")
     with pytest.raises(OmnigentError, match=r"missing required field 'description'"):
+        parse(agent_dir)
+
+
+def test_parse_skill_non_utf8_raises_omnigent_error(agent_dir: Path) -> None:
+    """
+    A non-UTF-8 SKILL.md must funnel through OmnigentError (not escape as a
+    bare UnicodeDecodeError) so the lenient scanner / menu providers can
+    catch it and skip the file instead of crashing.
+    """
+    skill_dir = agent_dir / "skills" / "bad-bytes"
+    skill_dir.mkdir(parents=True)
+    # 0xff is invalid UTF-8 — read_text() raises UnicodeDecodeError.
+    (skill_dir / "SKILL.md").write_bytes(b"---\nname: bad-bytes\ndescription: \xff\n---\nx")
+    with pytest.raises(OmnigentError, match=r"could not be read"):
         parse(agent_dir)
 
 
@@ -1400,53 +1468,6 @@ def test_parse_os_env_caller_process(tmp_path: Path) -> None:
     # Sandbox absent → None (the wrap then defaults appropriately).
     assert spec.os_env.sandbox is None
     assert spec.os_env.fork is False
-
-
-def test_parse_os_env_createos_populates_provider_fields(tmp_path: Path) -> None:
-    """The native parser wires the createos provider keys into the
-    ``createos_*`` fields, in lockstep with the legacy loader.
-
-    What breaks if this fails: an agent loaded via native YAML gets
-    ``type='createos'`` but base_url/api_key/shape/rootfs are silently
-    dropped, so the provider falls back to env vars / defaults only.
-    """
-    config = {
-        "spec_version": 1,
-        "name": "with-createos",
-        "os_env": {
-            "type": "createos",
-            "base_url": "https://api.example.test",
-            "api_key": "sk-test",
-            "shape": "small",
-            "rootfs": "ubuntu-22.04",
-        },
-    }
-    (tmp_path / "config.yaml").write_text(yaml.dump(config))
-    spec = parse(tmp_path)
-    assert isinstance(spec.os_env, OSEnvSpec)
-    assert spec.os_env.type == "createos"
-    assert spec.os_env.createos_base_url == "https://api.example.test"
-    assert spec.os_env.createos_api_key == "sk-test"
-    assert spec.os_env.createos_shape == "small"
-    assert spec.os_env.createos_rootfs == "ubuntu-22.04"
-
-
-def test_parse_os_env_createos_fields_default_none(tmp_path: Path) -> None:
-    """Absent createos keys leave the ``createos_*`` fields ``None`` so
-    the provider falls back to env vars / defaults.
-    """
-    config = {
-        "spec_version": 1,
-        "name": "createos-bare",
-        "os_env": {"type": "createos"},
-    }
-    (tmp_path / "config.yaml").write_text(yaml.dump(config))
-    spec = parse(tmp_path)
-    assert isinstance(spec.os_env, OSEnvSpec)
-    assert spec.os_env.createos_base_url is None
-    assert spec.os_env.createos_api_key is None
-    assert spec.os_env.createos_shape is None
-    assert spec.os_env.createos_rootfs is None
 
 
 def test_parse_os_env_with_sandbox(tmp_path: Path) -> None:

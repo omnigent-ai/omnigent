@@ -698,11 +698,6 @@ def _parse_os_env(
         sandbox=sandbox,
         fork=fork,
         start_in_scratch=start_in_scratch,
-        # createos provider fields — keep in lockstep with loader._parse_os_env_spec
-        createos_base_url=str(raw["base_url"]) if raw.get("base_url") else None,
-        createos_api_key=str(raw["api_key"]) if raw.get("api_key") else None,
-        createos_shape=str(raw["shape"]) if raw.get("shape") else None,
-        createos_rootfs=str(raw["rootfs"]) if raw.get("rootfs") else None,
     )
 
 
@@ -1946,8 +1941,19 @@ def _discover_skills(
     """
     if not skills_dir.is_dir():
         return []
+    try:
+        entries = sorted(skills_dir.iterdir())
+    except OSError as exc:
+        # Lenient mode (a skipped list was passed, e.g. host/plugin menu
+        # discovery): an unreadable skills dir must not 500 the caller —
+        # log and yield nothing. Strict mode (bundle parse) re-raises.
+        if skipped is None:
+            raise
+        _log.warning("Skipping unreadable skills dir %s: %s", skills_dir, exc)
+        skipped.append(f"{skills_dir}: {exc}")
+        return []
     skills: list[SkillSpec] = []
-    for skill_dir in sorted(skills_dir.iterdir()):
+    for skill_dir in entries:
         if not skill_dir.is_dir():
             continue
         skill_md = skill_dir / "SKILL.md"
@@ -1964,6 +1970,35 @@ def _discover_skills(
             continue
         skills.append(skill)
     return skills
+
+
+# Quoted string spellings treated as boolean false. PyYAML already parses the
+# *bare* YAML 1.1 false words (``false``/``False``/``no``/``off``) to a real
+# ``bool``, caught by the ``raw is False`` branch below; this set only catches
+# the *quoted* forms (e.g. ``user-invocable: "no"``) that arrive as ``str``.
+_FALSEY_STRINGS = frozenset({"false", "no", "off", "0"})
+
+
+def _falsey_flag(raw: object) -> bool:
+    """
+    Return whether a YAML frontmatter flag reads as boolean ``false``.
+
+    Accepts a genuine YAML bool (``raw is False`` — which already covers
+    the bare words ``false``/``no``/``off`` that PyYAML parses to a
+    ``bool``) and the quoted string spellings in :data:`_FALSEY_STRINGS`
+    (case-insensitive, surrounding whitespace ignored) — YAML keeps a
+    quoted value as a ``str``, so the string branch is the one that
+    silently regresses without a test. Every other value (absent ⇒
+    caller's default, ``true``, other strings, ``0`` as int) is not
+    falsey.
+
+    :param raw: The raw frontmatter value, e.g. ``False``, ``"no"``,
+        or ``True``.
+    :returns: ``True`` only when *raw* means boolean false.
+    """
+    if raw is False:
+        return True
+    return isinstance(raw, str) and raw.strip().lower() in _FALSEY_STRINGS
 
 
 def _parse_skill(skill_md: Path) -> SkillSpec:
@@ -1984,7 +2019,11 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     """
     try:
         text = skill_md.read_text()
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # UnicodeDecodeError (a non-UTF-8 SKILL.md) is a ValueError, not an
+        # OSError — funnel it through OmnigentError too so the lenient
+        # scanner in _discover_skills and the per-skill guards in the menu
+        # providers catch it and skip the file instead of 500-ing the menu.
         raise OmnigentError(
             f"SKILL.md could not be read: {skill_md}: {exc}",
             code=ErrorCode.INVALID_INPUT,
@@ -2020,11 +2059,15 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
             f"SKILL.md frontmatter missing required field 'description': {skill_md}",
             code=ErrorCode.INVALID_INPUT,
         )
+    # ``user-invocable: false`` marks an internal orchestration skill that
+    # the user should not invoke directly; absent/true ⇒ invocable.
+    user_invocable = not _falsey_flag(frontmatter.get("user-invocable", True))
     return SkillSpec(
         name=str(name),
         description=str(description),
         content=content.strip(),
         skill_dir=skill_md.parent,
+        user_invocable=user_invocable,
     )
 
 

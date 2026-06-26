@@ -65,8 +65,11 @@ dependencies = [
     # object has no setter" on any `omni host ...` invocation.
     "click>=8.0,<8.2",
     "fastapi>=0.100,<1",
-    "pexpect>=4.9,<5",
-    "pyte>=0.8,<1",
+    # pexpect/pyte back the POSIX tmux/PTY terminal stack, which is disabled
+    # on Windows (no usable PTY); omnigent never imports them on the core
+    # path, so skip them there to avoid shipping an unusable dependency.
+    "pexpect>=4.9,<5; platform_system != 'Windows'",
+    "pyte>=0.8,<1; platform_system != 'Windows'",
     "pydantic>=2.0,<3",
     "sqlalchemy>=2.0,<3",
     "tiktoken>=0.7,<1",
@@ -317,6 +320,8 @@ markers = [
     "min_runner_version(version): skip this test when the pinned runner/host under test is older than `version` (PEP 440 release-tuple comparison, so a `.devN` of X satisfies X). Used by the runner/host backwards-compat CI (Config 2); inert in normal runs (no OMNIGENT_COMPAT_RUNNER_VERSION set).",
     "mock_only: tests/integration test that only works in mock-LLM mode (no --llm-api-key). Skipped by tests/integration/conftest.py when a real --llm-api-key is supplied (the real-LLM Integration jobs). Use for tests whose mock LLM is scripted with a fixed tool-call sequence — a real LLM cannot reproduce the scripted markers.",
     "visual: UI diff visual-regression snapshot (pytest-playwright-visual-snapshot). Runs only in the pinned-runner gate (.github/workflows/ui-snapshot.yml); the main e2e_ui suite excludes it via -m 'not visual' since it runs on the unpinned ubuntu-latest.",
+    "posix_only: test relies on POSIX-only behaviour (fork, PTY, tmux, Unix sockets, signals); auto-skipped on Windows by tests/conftest.py.",
+    "windows_only: test relies on Windows-only behaviour (Job Objects, cmd.exe); auto-skipped on POSIX by tests/conftest.py.",
 ]
 # Visual snapshot baselines are committed here, keyed per-OS by the plugin
 # (e.g. test_empty_landing_matches_baseline[linux].png). Failure artifacts

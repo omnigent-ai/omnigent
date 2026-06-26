@@ -250,7 +250,9 @@ export function ApprovalCard({
       ? "Antigravity needs your input"
       : policyName.startsWith("codex_") || phase.startsWith("codex_")
         ? "Codex needs input"
-        : "Claude has questions";
+        : policyName.startsWith("cursor_") || phase.startsWith("cursor_")
+          ? "Cursor has questions"
+          : "Claude has questions";
 
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-

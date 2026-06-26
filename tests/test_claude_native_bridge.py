@@ -571,6 +571,42 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
     assert current_response_id == tool_call.response_id
 
 
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        "Prompt is too long",
+        "prompt is too long: 210000 tokens > 200000 maximum",
+        "Prompt is too long\n",
+    ],
+)
+def test_read_transcript_rewrites_prompt_too_long(tmp_path: Path, raw_text: str) -> None:
+    """
+    When Claude Code writes "Prompt is too long" to the transcript, the
+    bridge rewrites it to actionable guidance so the web UI shows
+    something useful instead of the raw API error.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "err-1",
+                "message": {"role": "assistant", "content": raw_text},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _, _, items = read_transcript_items_since(transcript_path, 0, agent_name="claude-native-ui")
+
+    assert len(items) == 1
+    text = items[0].data["content"][0]["text"]
+    assert "Context limit reached" in text
+    assert "/compact" in text
+    assert "/clear" in text
+
+
 def test_read_transcript_items_from_offset_skips_existing_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3550,6 +3586,61 @@ async def test_start_tool_relay_accepts_antigravity_native_bridge_root(
         )
         relay_info = json.loads(relay_file.read_text(encoding="utf-8"))
         assert relay_info["tools"][0]["name"] == "sys_session_create"
+    finally:
+        if relay is not None:
+            relay.close()
+
+
+@pytest.mark.asyncio
+async def test_start_tool_relay_accepts_opencode_native_bridge_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Relay startup accepts OpenCode-native's persistent bridge root.
+
+    opencode-native reuses the Claude MCP relay but stores bridge files in
+    ``~/.omnigent/opencode-native`` (the same ``$HOME/.omnigent/<harness>``
+    shape codex/antigravity use). The missing allowlist entry made ``serve-mcp``
+    crash on startup (``_ensure_secure_dir`` → "not under an allowed bridge
+    root"), which opencode surfaced as ``MCP error -32000: Connection closed``
+    and the wrapped opencode got no ``sys_*`` tools. Guards the regression.
+
+    :param tmp_path: Pytest temp directory used as an isolated user state parent.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent import opencode_native_bridge
+
+    opencode_root = tmp_path / ".omnigent" / "opencode-native"
+    monkeypatch.setattr("omnigent.opencode_native_bridge._BRIDGE_ROOT", opencode_root)
+    bridge_dir = opencode_native_bridge.prepare_bridge_dir("conv_oc")
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+
+    async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """Return an empty result for the unused relay tool callback."""
+        del name, arguments
+        return {}
+
+    relay = None
+    try:
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[
+                {
+                    "name": "sys_session_list",
+                    "description": "List Omnigent sessions.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_executor=_executor,
+            loop=asyncio.get_running_loop(),
+        )
+        assert relay_file.exists(), (
+            "OpenCode-native relay did not write tool_relay.json under the persistent bridge root"
+        )
+        relay_info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert relay_info["tools"][0]["name"] == "sys_session_list"
     finally:
         if relay is not None:
             relay.close()

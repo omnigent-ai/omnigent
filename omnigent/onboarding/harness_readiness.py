@@ -45,8 +45,11 @@ from omnigent.onboarding.provider_config import (
     _EXECUTOR_TYPE_HARNESS_ALIASES,
     _HARNESS_FAMILY,
     GEMINI_FAMILY,
+    OPENAI_FAMILY,
     PI_SURFACE,
 )
+
+HarnessAvailability = bool | str
 
 # In-process SDK harnesses: no CLI binary, credentials resolved at runtime
 # from ambient/spec sources the daemon can't see. Never gated. Includes both
@@ -273,17 +276,30 @@ def harness_is_configured(harness: str) -> bool:
     return True
 
 
-def configured_harness_map() -> dict[str, bool]:
+def _harness_availability(canonical: str) -> HarnessAvailability:
+    """Return picker-facing availability for one canonical harness spelling."""
+    if (
+        canonical in {"codex", "codex-native", "native-codex"}
+        and _HARNESS_FAMILY.get(canonical) == OPENAI_FAMILY
+    ):
+        from omnigent.codex_native import _codex_auth_unavailable_reason
+
+        return _codex_auth_unavailable_reason() or True
+    return harness_is_configured(canonical)
+
+
+def configured_harness_map() -> dict[str, HarnessAvailability]:
     """Return per-harness readiness for every accepted harness spelling.
 
     Built so the server/web UI can do a plain dict lookup with whatever
     spelling it holds — canonical ids, executor-type spellings, the
     ``claude`` alias, and ``pi``. SDK and unknown harnesses map to
     ``True`` (never gated); CLI-wrapping harnesses map to whether their
-    binary is on ``PATH``.
+    binary is on ``PATH``. Codex entries use a structured string reason when
+    unavailable: ``"binary-missing"`` or ``"needs-auth"``.
 
     :returns: Mapping of harness spelling to readiness, e.g.
-        ``{"claude-native": False, "codex-native": False,
+        ``{"claude-native": False, "codex-native": "needs-auth",
         "claude-sdk": True, "openai-agents": True, "pi": True, "qwen": True}``.
     """
     spellings: set[str] = set(_HARNESS_FAMILY)
@@ -302,4 +318,6 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
     spellings.add(COPILOT_KEY)
-    return {spelling: harness_is_configured(spelling) for spelling in spellings}
+    return {
+        spelling: _harness_availability(_canonical_harness(spelling)) for spelling in spellings
+    }

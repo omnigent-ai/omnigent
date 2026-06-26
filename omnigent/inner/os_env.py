@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, TypeAlias, cast
 from urllib.parse import urlparse, urlunparse
 
+from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
@@ -33,6 +34,7 @@ from .credential_proxy import (
 )
 from .datamodel import CredentialProxySpec, OSEnvSpec
 from .sandbox import (
+    ContainmentHandle,
     SandboxPolicy,
     activate_sandbox,
     cleanup_private_tmpdir,
@@ -129,6 +131,9 @@ _DEFAULT_ENV_PASSTHROUGH: tuple[str, ...] = (
     # way CLAUDE_CODE / CODEX are visible in their agents' shells. Set on
     # the runner via runner.identity.OMNIGENT_SESSION_ENV_VAR.
     OMNIGENT_SESSION_ENV_VAR,
+    # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
+    # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
+    *WINDOWS_ENV_PASSTHROUGH,
 )
 
 
@@ -336,6 +341,10 @@ class _HelperProcessClient:
         # helper itself. Cleared in :meth:`_stop_egress_proxy_locked`.
         self._egress_relay_port: int | None = None
         self._proc: subprocess.Popen[str] | None = None
+        # Parent-held containment handle from the sandbox backend's
+        # post_spawn hook (e.g. a Windows Job Object). Closed in
+        # ``_stop_locked`` to tear down the helper's process tree.
+        self._sandbox_handle: ContainmentHandle | None = None
         self._tmpdir: Path | None = None
         self._egress_proxy: Any | None = None  # EgressProxy when active
         self._egress_loop: Any | None = None  # asyncio event loop for proxy
@@ -473,23 +482,41 @@ class _HelperProcessClient:
         # secret. Argv is a global side-channel; an inherited fd
         # is private to the parent/child pair.
         config_bytes = json.dumps(config, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        r_fd, w_fd = os.pipe()
-        # We write the entire config synchronously before spawning.
-        # The pipe buffer is typically 64 KiB on macOS/Linux; the
-        # config is well under that (paths + booleans). If a future
-        # change inflates the config past one pipe buffer we'd
-        # deadlock here — replace with a writer thread at that point.
-        try:
-            os.write(w_fd, config_bytes)
-        finally:
-            os.close(w_fd)
+        # Deliver the config off-band — not on argv (readable via
+        # ``/proc/<pid>/cmdline`` / ``ps -ww``) and not in env (readable via
+        # ``ps -E``) — because it may carry the per-helper egress auth token.
+        #
+        # POSIX uses an inherited pipe fd (never touches disk). Windows has no
+        # ``pass_fds`` / fd inheritance in ``subprocess`` (CPython rejects
+        # ``pass_fds`` outright there), so fall back to a short-lived file in the
+        # helper's own private tmpdir, which the helper reads and unlinks
+        # immediately. Egress is POSIX-only (its proxy binds a Unix socket), so
+        # the Windows config carries no secret — only non-sensitive
+        # paths/booleans — but we still keep the file private and ephemeral.
+        r_fd: int | None = None
+        if IS_WINDOWS:
+            assert self._tmpdir is not None
+            config_file = self._tmpdir / "helper-config.json"
+            config_file.write_bytes(config_bytes)
+            config_arg = ["--config-file", str(config_file)]
+        else:
+            r_fd, w_fd = os.pipe()
+            # We write the entire config synchronously before spawning.
+            # The pipe buffer is typically 64 KiB on macOS/Linux; the
+            # config is well under that (paths + booleans). If a future
+            # change inflates the config past one pipe buffer we'd
+            # deadlock here — replace with a writer thread at that point.
+            try:
+                os.write(w_fd, config_bytes)
+            finally:
+                os.close(w_fd)
+            config_arg = ["--config-fd", str(r_fd)]
         helper_argv = [
             sys.executable,
             "-m",
             "omnigent.inner.os_env",
             "helper",
-            "--config-fd",
-            str(r_fd),
+            *config_arg,
         ]
         # Spawn-time backends (e.g. linux_bwrap) wrap helper_argv with
         # their launcher; the no-op ``none`` backend leaves it
@@ -507,6 +534,15 @@ class _HelperProcessClient:
             )
         else:
             spawn_argv = helper_argv
+        # ``pass_fds`` (POSIX only) unsets ``FD_CLOEXEC`` on ``r_fd`` so the
+        # child (and any launcher wrapping it, e.g. bwrap or sandbox-exec)
+        # inherits it across the exec chain. The numeric fd value is preserved
+        # in the child, which is why we can pass it as a plain ``--config-fd``
+        # argv arg. On Windows the config came via ``--config-file`` instead,
+        # so there is no fd to inherit.
+        popen_kwargs: dict[str, Any] = {}
+        if r_fd is not None:
+            popen_kwargs["pass_fds"] = (r_fd,)
         try:
             self._proc = subprocess.Popen(
                 spawn_argv,
@@ -517,13 +553,7 @@ class _HelperProcessClient:
                 bufsize=1,
                 cwd=str(self.cwd),
                 env=env,
-                # ``pass_fds`` unsets ``FD_CLOEXEC`` on ``r_fd`` so
-                # the child (and any launcher wrapping it, e.g.
-                # bwrap or sandbox-exec) inherits it across the
-                # exec chain. The numeric fd value is preserved in
-                # the child, which is why we can pass it as a plain
-                # ``--config-fd`` argv arg.
-                pass_fds=(r_fd,),
+                **popen_kwargs,
             )
         except Exception:
             cleanup_private_tmpdir(self._tmpdir)
@@ -535,8 +565,18 @@ class _HelperProcessClient:
             # has already been written. Leaving the parent's copy
             # open would prevent the child from seeing EOF on the
             # pipe after reading the config.
-            with contextlib.suppress(OSError):
-                os.close(r_fd)
+            if r_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(r_fd)
+
+        # Post-spawn containment (parent side). A no-op for the POSIX
+        # launcher backends (they isolate via wrap_launcher_argv before
+        # exec); on Windows this assigns the helper to a kill-on-close
+        # Job Object so the whole tree is torn down in ``_stop_locked``.
+        if sandbox.active and self._proc.pid is not None:
+            self._sandbox_handle = get_backend(sandbox.backend_type).post_spawn(
+                sandbox, self._proc.pid
+            )
 
     def _helper_exit_detail_locked(self) -> str:
         if self._proc is None:
@@ -581,6 +621,13 @@ class _HelperProcessClient:
                     with contextlib.suppress(Exception):
                         proc.kill()
         finally:
+            # Release the containment handle (Windows Job Object): with
+            # kill-on-close this also reaps any helper descendants that
+            # outlived ``proc.terminate()`` above.
+            if self._sandbox_handle is not None:
+                with contextlib.suppress(Exception):
+                    self._sandbox_handle.close()
+                self._sandbox_handle = None
             self._stop_egress_proxy_locked()
             cleanup_private_tmpdir(self._tmpdir)
             self._tmpdir = None
@@ -837,10 +884,6 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
     """Instantiate the configured OS environment."""
     if spec is None:
         return None
-    if spec.type == "createos":
-        from .createos_os_env import CreateosOSEnvironment
-
-        return CreateosOSEnvironment.create_sync(spec)
     if spec.type != "caller_process":
         raise NotImplementedError(f"os_env type '{spec.type}' is not implemented")
 
@@ -857,7 +900,11 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
             "os_env.start_in_scratch requires an active sandbox; "
             f"resolved sandbox type {sandbox.backend_type!r} is inactive"
         )
-    shell_path = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+    shell_path = shutil.which("bash") or shutil.which("sh")
+    if shell_path is None:
+        # No POSIX shell on PATH. On Windows fall back to cmd.exe; elsewhere
+        # keep the historical /bin/sh default.
+        shell_path = os.environ.get("COMSPEC", "cmd.exe") if IS_WINDOWS else "/bin/sh"
     egress_rules = spec.sandbox.egress_rules if spec.sandbox else None
     egress_allow_private = (
         spec.sandbox.egress_allow_private_destinations if spec.sandbox else False
@@ -876,8 +923,6 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
 
 def default_os_env_spec_for_type(env_type: str) -> OSEnvSpec:
     """Build a default OSEnvSpec for string shorthand config."""
-    if env_type == "createos":
-        return OSEnvSpec(type="createos")
     if env_type != "caller_process":
         raise NotImplementedError(f"os_env type '{env_type}' is not implemented")
     return OSEnvSpec(type="caller_process")
@@ -1363,8 +1408,12 @@ def _is_within(path: Path, root: Path) -> bool:
 
 
 def _shell_argv(shell_path: str, command: str) -> list[str]:
-    shell_name = Path(shell_path).name
-    if shell_name == "bash":
+    shell_name = Path(shell_path).name.lower()
+    if shell_name in ("cmd.exe", "cmd"):
+        return [shell_path, "/c", command]
+    if shell_name in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
+        return [shell_path, "-NoProfile", "-Command", command]
+    if shell_name in ("bash", "bash.exe"):
         return [shell_path, "--noprofile", "--norc", "-c", command]
     return [shell_path, "-c", command]
 
@@ -1407,8 +1456,33 @@ def _read_config_from_fd(fd: int) -> JsonValue:
     return cast(JsonValue, json.loads(raw.decode("utf-8")))
 
 
-def _run_helper(config_fd: int) -> int:
-    config = _read_config_from_fd(config_fd)
+def _read_config_from_file(path: str) -> JsonValue:
+    """Read and unlink the helper config file (Windows config-delivery path).
+
+    The parent writes the config to a file in the helper's private tmpdir when
+    inherited-fd delivery is unavailable (Windows has no ``pass_fds``). Unlink
+    it immediately after reading so a secret-bearing config (none on Windows
+    today — egress is POSIX-only) lives on disk only momentarily.
+
+    :param path: Absolute path to the JSON config file.
+    :returns: Decoded JSON value (always a dict in practice).
+    :raises ValueError: When the file is empty or not valid JSON.
+    """
+    config_path = Path(path)
+    try:
+        raw = config_path.read_bytes()
+    finally:
+        with contextlib.suppress(OSError):
+            config_path.unlink()
+    if not raw:
+        raise ValueError(
+            f"os_env helper got empty config file {path!r}; expected a "
+            "JSON object written by the parent before spawn."
+        )
+    return cast(JsonValue, json.loads(raw.decode("utf-8")))
+
+
+def _run_helper(config: JsonValue) -> int:
     if not isinstance(config, dict):
         raise ValueError("Invalid os_env helper config")
 
@@ -1481,18 +1555,26 @@ def main(argv: list[str] | None = None) -> int:
 
     command = args[0]
     if command == "helper":
-        # Helper expects ``--config-fd N`` exclusively; the legacy
-        # positional ``<base64-json>`` form was removed (the parent
-        # now passes the config via an inherited pipe). Reject
-        # anything else loudly so a stale launcher script doesn't
-        # silently boot a helper with no config.
-        if len(args) != 3 or args[1] != "--config-fd":
-            raise SystemExit("usage: python -m omnigent.inner.os_env helper --config-fd <fd>")
-        try:
-            fd = int(args[2])
-        except ValueError as exc:
-            raise SystemExit(f"os_env helper: invalid --config-fd value {args[2]!r}") from exc
-        return _run_helper(fd)
+        # Config is delivered off-band so the policy/token never lands on argv:
+        # POSIX via an inherited pipe (``--config-fd N``); Windows via a private
+        # file (``--config-file PATH``), since Windows has no ``pass_fds``. The
+        # legacy positional ``<base64-json>`` form was removed (it leaked the
+        # policy onto the command line). Reject anything else loudly so a stale
+        # launcher script doesn't silently boot a helper with no config.
+        if len(args) != 3 or args[1] not in ("--config-fd", "--config-file"):
+            raise SystemExit(
+                "usage: python -m omnigent.inner.os_env helper "
+                "(--config-fd <fd> | --config-file <path>)"
+            )
+        if args[1] == "--config-fd":
+            try:
+                fd = int(args[2])
+            except ValueError as exc:
+                raise SystemExit(f"os_env helper: invalid --config-fd value {args[2]!r}") from exc
+            config = _read_config_from_fd(fd)
+        else:
+            config = _read_config_from_file(args[2])
+        return _run_helper(config)
 
     if command == "launch":
         if len(args) < 3:

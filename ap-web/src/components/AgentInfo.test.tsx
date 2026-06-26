@@ -3,7 +3,9 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
+import type { Session } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
+import { COST_CONTROL_PLAN_LABEL } from "./CostRoutingControl";
 
 // Mock the policies data layer so SessionPoliciesSection and AddPolicyDialog
 // render deterministically without network. The add/delete mutations expose
@@ -13,6 +15,15 @@ const { addMutate, deleteMutate, copyTextMock } = vi.hoisted(() => ({
   deleteMutate: vi.fn(),
   copyTextMock: vi.fn(() => Promise.resolve()),
 }));
+const { createMcpMutate, updateMcpMutate, deleteMcpMutate } = vi.hoisted(() => ({
+  createMcpMutate: vi.fn((_payload, options?: { onSuccess?: () => void }) =>
+    options?.onSuccess?.(),
+  ),
+  updateMcpMutate: vi.fn((_payload, options?: { onSuccess?: () => void }) =>
+    options?.onSuccess?.(),
+  ),
+  deleteMcpMutate: vi.fn(),
+}));
 const policiesData = { current: [] as unknown[] };
 const registryData = { current: [] as unknown[] };
 // Session owner + viewer identity, controllable per test. Dereferenced lazily
@@ -21,28 +32,63 @@ const registryData = { current: [] as unknown[] };
 // cost/id/usage tests untouched.
 const ownerData = { current: null as string | null | undefined };
 const viewerData = { current: null as string | null };
+// Grants the owner has handed out, returned by usePermissions. Only consulted
+// when the viewer owns the session; the owner row shows once it includes a
+// principal other than the viewer (a user or the __public__ sentinel).
+const grantsData = { current: undefined as { user_id: string }[] | undefined };
 vi.mock("@/hooks/usePolicies", () => ({
   usePolicies: () => ({ data: policiesData.current }),
   usePolicyRegistry: () => ({ data: registryData.current }),
   useAddPolicy: () => ({ mutate: addMutate, isPending: false, isError: false, error: null }),
   useDeletePolicy: () => ({ mutate: deleteMutate }),
 }));
+vi.mock("@/hooks/useAgents", () => ({
+  useCreateMcpServer: () => ({ mutate: createMcpMutate, isPending: false, error: null }),
+  useUpdateMcpServer: () => ({ mutate: updateMcpMutate, isPending: false, error: null }),
+  useDeleteMcpServer: () => ({ mutate: deleteMcpMutate, isPending: false, error: null }),
+}));
 vi.mock("@/hooks/usePermissions", () => ({
   useSessionOwner: () => ({ data: ownerData.current }),
+  usePermissions: () => ({ data: grantsData.current }),
 }));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/identity")>()),
   getCurrentUserId: () => viewerData.current,
 }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+// The codex-only "Restart with model…" dialog mounts (closed) inside
+// AgentInfoContent for codex sessions; stub its routing + fork deps so it
+// renders without a Router/network in jsdom.
+vi.mock("@/lib/routing", () => ({ useNavigate: () => vi.fn() }));
+vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn() }));
+
+// The version footer reads the server version (capabilities probe) and the
+// per-session host version (health poll). Mock both hooks so the footer
+// renders deterministically without those providers; `versionEnv` lets each
+// case dial the values. Defaults (server null / host undefined) keep the
+// footer hidden, so the unrelated cases above are unaffected.
+const versionEnv = vi.hoisted(() => ({
+  serverVersion: null as string | null,
+  hostVersion: undefined as string | null | undefined,
+}));
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({ server_version: versionEnv.serverVersion }),
+}));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionHostVersion: () => versionEnv.hostVersion,
+}));
 
 import { AgentInfoButton, AgentInfoContent, agentDisplayLabel } from "./AgentInfo";
 
 afterEach(() => {
   cleanup();
   copyTextMock.mockClear();
+  createMcpMutate.mockClear();
+  updateMcpMutate.mockClear();
+  deleteMcpMutate.mockClear();
   ownerData.current = null;
   viewerData.current = null;
+  grantsData.current = undefined;
 });
 
 function renderButton(agent: Agent | undefined) {
@@ -58,15 +104,30 @@ function renderButton(agent: Agent | undefined) {
  * policies section (react-query), so wrap in a QueryClientProvider with
  * retries off — the policy fetch failing in jsdom is irrelevant to the
  * cost row under test and must not crash the render.
+ *
+ * @param session Optional snapshot seeded into the shared
+ *   ``["session", id]`` cache the intelligent-routing section reads
+ *   (``staleTime: Infinity`` keeps the seed authoritative — no fetch).
  */
-function renderButtonWithSession(agent: Agent | undefined, sessionId: string) {
+function renderButtonWithSession(
+  agent: Agent | undefined,
+  sessionId: string,
+  session?: Session,
+  // The routing tests opt in; production defaults to dark until the go-ahead.
+  showIntelligentRouting = false,
+) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
+  if (session) qc.setQueryData(["session", sessionId], session);
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
-        <AgentInfoButton agent={agent} sessionId={sessionId} />
+        <AgentInfoButton
+          agent={agent}
+          sessionId={sessionId}
+          showIntelligentRouting={showIntelligentRouting}
+        />
       </TooltipProvider>
     </QueryClientProvider>,
   );
@@ -76,6 +137,7 @@ const AGENT_WITH_BOTH: Agent = {
   id: "agent_1",
   name: "databricks_coding_agent",
   description: "Codes against Databricks.",
+  mcp_servers_editable: true,
   mcp_servers: [
     { name: "slack", transport: "http", description: "Slack MCP", url: "https://example/slack" },
     { name: "jira", transport: "stdio", command: "jira-mcp" },
@@ -173,6 +235,49 @@ describe("AgentInfoButton session cost row", () => {
   });
 });
 
+describe("AgentInfoButton version footer", () => {
+  // The footer reads the server + bound-host versions via the mocked hooks
+  // above; reset between cases so a leaked value can't mask a regression.
+  beforeEach(() => {
+    versionEnv.serverVersion = null;
+    versionEnv.hostVersion = undefined;
+  });
+
+  it("joins server and host versions in the popover footer", () => {
+    versionEnv.serverVersion = "0.3.0.dev0";
+    versionEnv.hostVersion = "0.1.0";
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_ver");
+    // Closed popover: the footer is not mounted yet.
+    expect(screen.queryByTestId("agent-info-versions")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    expect(screen.getByTestId("agent-info-versions")).toHaveTextContent(
+      "server 0.3.0.dev0 · host 0.1.0",
+    );
+  });
+
+  it("shows only the server version when the host version is unknown", () => {
+    // No host binding (or host on another replica) → host omitted, not "—".
+    versionEnv.serverVersion = "0.3.0.dev0";
+    versionEnv.hostVersion = undefined;
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_ver");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    const footer = screen.getByTestId("agent-info-versions");
+    expect(footer).toHaveTextContent("server 0.3.0.dev0");
+    expect(footer).not.toHaveTextContent("host");
+  });
+
+  it("hides the footer when neither version is known", () => {
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_ver");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+    // Popover still opens (agent name proves it) — just no version footer.
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-info-versions")).toBeNull();
+  });
+});
+
 describe("AgentInfoButton session id row", () => {
   it("shows and copies the active session id in the popover", async () => {
     renderButtonWithSession(AGENT_WITH_BOTH, "conv_info123");
@@ -189,24 +294,30 @@ describe("AgentInfoButton session id row", () => {
 });
 
 describe("AgentInfoButton session owner row", () => {
-  // The owner row lets a viewer see whose session a shared chat is. It reads
-  // the owner via useSessionOwner (mocked) and the viewer via getCurrentUserId
-  // (mocked); both reset to null in afterEach.
+  // The owner row lets a viewer see whose session a shared chat is, and is
+  // shown *only* when the session is actually shared. It reads the owner via
+  // useSessionOwner, the viewer via getCurrentUserId, and the owner's grants
+  // via usePermissions (all mocked); all reset between cases.
 
-  it("shows the session owner in the popover when one is known", () => {
+  it("shows the session owner when someone else owns the shared session", () => {
+    // A different owner means the session was shared with this viewer.
     ownerData.current = "alice@example.com";
+    viewerData.current = "bob@example.com";
     renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
     // Closed popover: the owner row is not mounted yet.
     expect(screen.queryByTestId("agent-info-session-owner")).toBeNull();
 
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
 
-    expect(screen.getByTestId("agent-info-session-owner")).toHaveTextContent("alice@example.com");
+    const row = screen.getByTestId("agent-info-session-owner");
+    expect(row).toHaveTextContent("alice@example.com");
+    expect(row).not.toHaveTextContent("(you)");
   });
 
-  it("appends (you) when the viewer owns the session", () => {
+  it("shows the owner with (you) when the viewer owns it and shared with another user", () => {
     ownerData.current = "alice@example.com";
     viewerData.current = "alice@example.com";
+    grantsData.current = [{ user_id: "alice@example.com" }, { user_id: "bob@example.com" }];
     renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
 
@@ -215,20 +326,29 @@ describe("AgentInfoButton session owner row", () => {
     expect(row).toHaveTextContent("(you)");
   });
 
-  it("omits (you) when someone else owns the session", () => {
+  it("shows the owner row when the viewer owns it and made it public", () => {
     ownerData.current = "alice@example.com";
-    viewerData.current = "bob@example.com";
+    viewerData.current = "alice@example.com";
+    grantsData.current = [{ user_id: "alice@example.com" }, { user_id: "__public__" }];
     renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
 
-    const row = screen.getByTestId("agent-info-session-owner");
-    expect(row).toHaveTextContent("alice@example.com");
-    expect(row).not.toHaveTextContent("(you)");
+    expect(screen.getByTestId("agent-info-session-owner")).toHaveTextContent("alice@example.com");
+  });
+
+  it("omits the owner row for a private solo session (owner viewing, no other grants)", () => {
+    ownerData.current = "alice@example.com";
+    viewerData.current = "alice@example.com";
+    grantsData.current = [{ user_id: "alice@example.com" }];
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+    // The rest of the popover still renders (agent name proves it opened).
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-info-session-owner")).toBeNull();
   });
 
   it("omits the owner row when no owner is known (permissions off / loading)", () => {
-    // owner null → no row at all, rather than an empty placeholder. The rest of
-    // the popover still renders (agent name proves it opened).
+    // owner null → no row at all, rather than an empty placeholder.
     renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
     expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
@@ -475,6 +595,80 @@ describe("SessionPoliciesSection", () => {
   });
 });
 
+describe("McpServersSection", () => {
+  beforeEach(() => {
+    createMcpMutate.mockClear();
+    updateMcpMutate.mockClear();
+    deleteMcpMutate.mockClear();
+  });
+
+  it("creates an HTTP MCP server from the manager dialog", () => {
+    renderContent("conv_mcp");
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("Name"), { target: { value: "github" } });
+    fireEvent.change(within(dialog).getByLabelText("URL"), {
+      target: { value: "https://example.com/sse" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Save/ }));
+
+    expect(createMcpMutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "github",
+        transport: "http",
+        url: "https://example.com/sse",
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("updates an existing stdio MCP server", () => {
+    renderContent("conv_mcp");
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Edit jira" }));
+    fireEvent.change(within(dialog).getByLabelText("Command"), {
+      target: { value: "jira-mcp-new" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Save/ }));
+
+    expect(updateMcpMutate).toHaveBeenCalledWith(
+      {
+        serverName: "jira",
+        payload: expect.objectContaining({
+          name: "jira",
+          transport: "stdio",
+          command: "jira-mcp-new",
+        }),
+      },
+      expect.anything(),
+    );
+  });
+
+  it("deletes an MCP server from the manager dialog", () => {
+    renderContent("conv_mcp");
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete slack" }));
+
+    expect(deleteMcpMutate).toHaveBeenCalledWith("slack", expect.anything());
+  });
+
+  it("deletes an MCP server from the inline pill popover", () => {
+    renderContent("conv_mcp");
+
+    // Click the pill to open its popover
+    fireEvent.click(screen.getByRole("button", { name: "slack" }));
+    // Click "Remove" in the popover
+    fireEvent.click(screen.getByRole("button", { name: /Remove/ }));
+
+    expect(deleteMcpMutate).toHaveBeenCalledWith("slack", expect.anything());
+  });
+});
+
 describe("agentDisplayLabel", () => {
   it("maps native wrapper slugs to their display name", () => {
     expect(agentDisplayLabel("pi-native-ui")).toBe("Pi");
@@ -505,5 +699,228 @@ describe("agentDisplayLabel", () => {
   it("capitalizes non-native names and strips their clone suffix", () => {
     expect(agentDisplayLabel("polly")).toBe("Polly");
     expect(agentDisplayLabel("polly (fork conv_ab12)")).toBe("Polly");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// "Restart with model…" trigger — codex-only affordance gated on harness.
+// ---------------------------------------------------------------------------
+
+function renderContentForAgent(agent: Agent, sessionId: string) {
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={qc}>
+      <TooltipProvider>
+        <AgentInfoContent agent={agent} sessionId={sessionId} />
+      </TooltipProvider>
+    </QueryClientProvider>,
+  );
+}
+
+describe("AgentInfoContent restart-with-model trigger", () => {
+  it("shows the trigger for a codex-native session", () => {
+    renderContentForAgent(
+      { id: "ag_codex", name: "codex-native-ui", harness: "codex-native" },
+      "conv_codex",
+    );
+    expect(screen.getByTestId("restart-with-model-trigger")).toBeInTheDocument();
+  });
+
+  it("hides the trigger for a non-codex (claude) harness", () => {
+    renderContentForAgent(
+      { id: "ag_claude", name: "claude-native-ui", harness: "claude-native" },
+      "conv_claude",
+    );
+    expect(screen.queryByTestId("restart-with-model-trigger")).not.toBeInTheDocument();
+  });
+
+  it("hides the trigger when the harness is unknown (not yet loaded)", () => {
+    renderContentForAgent({ id: "ag_x", name: "mystery" }, "conv_x");
+    expect(screen.queryByTestId("restart-with-model-trigger")).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Intelligent routing section
+// ---------------------------------------------------------------------------
+
+/** Minimal session snapshot carrying the given labels. */
+function sessionWithLabels(
+  id: string,
+  labels: Record<string, string>,
+  // The gate keys on the snapshot's agentName (isCostRoutingSession).
+  agentName = "polly",
+): Session {
+  return {
+    id,
+    agentId: `agent_${agentName}`,
+    agentName,
+    status: "idle",
+    createdAt: 0,
+    title: null,
+    items: [],
+    labels,
+    permissionLevel: null,
+    parentSessionId: null,
+    subAgentName: null,
+  };
+}
+
+/** Serialize a v3 plan payload into the labels dict the server returns. */
+function planLabels(payload: Record<string, unknown>): Record<string, string> {
+  return { [COST_CONTROL_PLAN_LABEL]: JSON.stringify(payload) };
+}
+
+/** A fully-populated valid v3 plan; rationale is judge prose. */
+const APPLIED_PLAN = {
+  version: 3,
+  tier: "cheap",
+  model: "databricks-claude-haiku-4-5",
+  applied: true,
+  rationale: "Routine lookup; a small model suffices.",
+  turn_anchor: "2026-06-10T12:00:00+00:00",
+};
+
+describe("AgentInfoButton intelligent routing section", () => {
+  it("never renders on a sub-agent (child) session, even with a verdict", () => {
+    // The advisor governs only the orchestrator's brain; children inherit
+    // the parent's agentName, so the guard must key on parentSessionId.
+    const child = {
+      ...sessionWithLabels("conv_child", planLabels(APPLIED_PLAN)),
+      parentSessionId: "conv_parent",
+    };
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_child", child, true);
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.queryByTestId("intelligent-routing-section")).toBeNull();
+  });
+
+  beforeEach(() => {
+    // Mode comes from the store; capability comes from the snapshot.
+    useChatStore.setState({
+      sessionCostUsd: null,
+      costControlModeOverride: null,
+    });
+  });
+
+  function openInfo() {
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+  }
+
+  it("shows routing section for any top-level agent (not polly-specific)", () => {
+    renderButtonWithSession(
+      AGENT_WITH_BOTH,
+      "conv_r1",
+      sessionWithLabels("conv_r1", {}, "databricks_coding_agent"),
+      true,
+    );
+    openInfo();
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
+    // Any top-level agent now shows the routing section (server-side routing).
+    expect(screen.getByTestId("intelligent-routing-section")).toBeInTheDocument();
+  });
+
+  it("shows On plus the quiet no-decision line before the first verdict", () => {
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_r2", sessionWithLabels("conv_r2", {}), true);
+    openInfo();
+    // Renamed from "Intelligent routing" — the agreed product name.
+    expect(screen.getByTestId("intelligent-routing-section").textContent).toContain(
+      "Intelligent model router",
+    );
+    expect(screen.getByTestId("intelligent-routing-state")).toHaveTextContent("On");
+    expect(screen.getByTestId("intelligent-routing-section").textContent).toContain(
+      "No decision yet this session.",
+    );
+    expect(screen.queryByTestId("intelligent-routing-verdict")).toBeNull();
+  });
+
+  it("reads Off when the user disabled routing for the session", () => {
+    useChatStore.setState({ costControlModeOverride: "off" });
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_r3", sessionWithLabels("conv_r3", {}), true);
+    openInfo();
+    expect(screen.getByTestId("intelligent-routing-state")).toHaveTextContent("Off");
+  });
+
+  it("shows the applied decision in full: mono model, tier suffix, Applied, rationale, time", () => {
+    const fiveMinAgo = new Date(Date.now() - 5 * 60_000).toISOString();
+    renderButtonWithSession(
+      AGENT_WITH_BOTH,
+      "conv_r4",
+      sessionWithLabels("conv_r4", planLabels({ ...APPLIED_PLAN, turn_anchor: fiveMinAgo })),
+      true,
+    );
+    openInfo();
+    const model = screen.getByTestId("intelligent-routing-model");
+    // The full id (not the short pill hint) in mono — this is the
+    // detail surface the hover tooltip no longer carries.
+    expect(model).toHaveTextContent("databricks-claude-haiku-4-5");
+    expect(model.getAttribute("class")).toContain("font-mono");
+    const verdict = screen.getByTestId("intelligent-routing-verdict").textContent ?? "";
+    expect(verdict).toContain("cheap");
+    expect(verdict).toContain("Applied");
+    expect(verdict).toContain("Routine lookup; a small model suffices.");
+    expect(verdict).toContain("5m");
+  });
+
+  it("labels a shadow decision as would-have-picked, never Applied", () => {
+    renderButtonWithSession(
+      AGENT_WITH_BOTH,
+      "conv_r5",
+      sessionWithLabels("conv_r5", planLabels({ ...APPLIED_PLAN, applied: false })),
+      true,
+    );
+    openInfo();
+    const verdict = screen.getByTestId("intelligent-routing-verdict").textContent ?? "";
+    expect(verdict).toContain("Would have picked");
+    expect(verdict).not.toContain("Applied");
+  });
+
+  it("keeps the section when a decision exists even if the agent gate misses", () => {
+    // Data presence is proof of capability: deployments that force
+    // routing on must surface decisions regardless of the agent name.
+    renderButtonWithSession(
+      AGENT_WITH_BOTH,
+      "conv_r6",
+      sessionWithLabels("conv_r6", planLabels(APPLIED_PLAN), "renamed_orchestrator"),
+      true,
+    );
+    openInfo();
+    expect(screen.getByTestId("intelligent-routing-verdict")).toBeInTheDocument();
+  });
+
+  it("omits the timestamp for an unparseable turn_anchor (never NaN)", () => {
+    // v2 docs allowed an item id as the anchor — never render NaN.
+    renderButtonWithSession(
+      AGENT_WITH_BOTH,
+      "conv_r7",
+      sessionWithLabels("conv_r7", planLabels({ ...APPLIED_PLAN, turn_anchor: "item_abc123" })),
+      true,
+    );
+    openInfo();
+    const verdict = screen.getByTestId("intelligent-routing-verdict").textContent ?? "";
+    expect(verdict).toContain("databricks-claude-haiku-4-5");
+    expect(verdict).not.toContain("NaN");
+  });
+
+  it("never renders the banned vocabulary, with or without a decision", () => {
+    // Copy rule: the user-facing vocabulary is "Intelligent model router" —
+    // "cost", "routing:", "Auto", and "Spec default" must not appear.
+    const banned = [/cost/i, /routing:/i, /\bauto\b/i, /spec default/i];
+    renderButtonWithSession(
+      AGENT_WITH_BOTH,
+      "conv_r8",
+      sessionWithLabels("conv_r8", planLabels(APPLIED_PLAN)),
+      true,
+    );
+    openInfo();
+    const withVerdict = screen.getByTestId("intelligent-routing-section").textContent ?? "";
+    for (const re of banned) expect(withVerdict).not.toMatch(re);
+    cleanup();
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_r9", sessionWithLabels("conv_r9", {}), true);
+    openInfo();
+    const withoutVerdict = screen.getByTestId("intelligent-routing-section").textContent ?? "";
+    for (const re of banned) expect(withoutVerdict).not.toMatch(re);
   });
 });

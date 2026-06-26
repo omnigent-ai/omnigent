@@ -29,6 +29,7 @@ import {
   ShareIcon,
   SquareIcon,
   SquareCheckIcon,
+  SquarePenIcon,
   Trash2Icon,
   XIcon,
 } from "lucide-react";
@@ -63,13 +64,13 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
-import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useCommentInbox } from "@/hooks/useCommentInbox";
+import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { getSessionState } from "@/hooks/useSessionState";
 import { isConversationUnseen } from "@/hooks/useUnseenConversations";
-import { sumPendingApprovals } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
@@ -345,6 +346,38 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
               Omnigent
             </Link>
             <div className="flex items-center gap-1">
+              {/* Inbox lives at the top next to the collapse toggle. Rendered
+              as a Link so cmd/middle-click opens it in a new tab; onNavClick
+              still closes the sidebar on a plain mobile tap. */}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    asChild
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Inbox"
+                    className={cn("relative rounded-full", isInboxPage && "bg-muted")}
+                    data-testid="inbox-button"
+                  >
+                    <Link to="/inbox" onClick={onNavClick}>
+                      <InboxIcon className="size-4" />
+                      {inboxCount > 0 && (
+                        <span
+                          aria-label={
+                            inboxCount === 1
+                              ? "1 inbox item waiting"
+                              : `${inboxCount} inbox items waiting`
+                          }
+                          className="-top-0.5 -right-0.5 absolute inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-[10px] font-medium text-warning tabular-nums"
+                        >
+                          {inboxCount}
+                        </span>
+                      )}
+                    </Link>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Inbox</TooltipContent>
+              </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
@@ -383,34 +416,8 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
               data-testid="new-chat-button"
             >
               <Link to="/" onClick={onNavClick}>
-                <PencilIcon className="size-4 text-muted-foreground" />
+                <SquarePenIcon className="size-4 text-foreground" />
                 New session
-              </Link>
-            </Button>
-            <Button
-              asChild
-              className={cn(
-                "w-full justify-start gap-2 text-sm",
-                isInboxPage && "bg-muted font-semibold",
-              )}
-              variant="ghost"
-              data-testid="inbox-button"
-            >
-              <Link to="/inbox" onClick={onNavClick}>
-                <InboxIcon className="size-4" />
-                Inbox
-                {inboxCount > 0 && (
-                  <span
-                    aria-label={
-                      inboxCount === 1
-                        ? "1 inbox item waiting"
-                        : `${inboxCount} inbox items waiting`
-                    }
-                    className="ml-auto inline-flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full bg-warning/15 px-1.5 text-[11px] font-medium text-warning tabular-nums"
-                  >
-                    {inboxCount}
-                  </span>
-                )}
               </Link>
             </Button>
             {selectionMode ? (
@@ -459,7 +466,10 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
             )}
           </div>
 
-          <nav className="relative flex-1 overflow-y-auto px-3 pb-3 [scrollbar-gutter:stable]">
+          {/* Mobile: extra bottom padding so the last session scrolls clear of
+          the floating Settings icon (which is absolutely positioned, out of
+          flow, over the bottom-left corner). */}
+          <nav className="relative flex-1 overflow-y-auto px-3 pb-3 max-md:pb-16 [scrollbar-gutter:stable]">
             <ConversationList
               conversationsQuery={conversationsQuery}
               onRowClick={onNavClick}
@@ -473,23 +483,41 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
             />
           </nav>
 
-          {/* Settings footer. Sibling *after* the flex-1 nav so it pins to the
-          bottom of the sidebar column. Always present (every deploy): the
-          full settings surface — appearance, keyboard shortcuts, archived
-          chats, and the account/sign-out controls when accounts auth is on —
-          lives behind this row on the /settings page. */}
-          <div className="shrink-0 px-3 pb-3">
-            {/* Match the New session / Inbox buttons (default size, no extra
-            padding) so the gear icon lines up with their leading icons. */}
+          {/* Settings entry. Always present (every deploy): the full settings
+          surface — appearance, keyboard shortcuts, archived chats, and the
+          account/sign-out controls when accounts auth is on — lives behind
+          this on the /settings page.
+
+          Desktop: a full-width footer row pinned below the flex-1 nav, the
+          gear aligned with the New session / Inbox icons.
+          Mobile: pulled OUT of flow (absolute, bottom-left) so it floats over
+          the conversation list as a compact icon instead of stealing a row's
+          height from the scroll area. */}
+          <div className="md:shrink-0 md:px-3 md:pb-3 max-md:absolute max-md:bottom-3 max-md:left-3 max-md:z-10">
             <Button
               asChild
               variant="ghost"
-              className="w-full justify-start gap-2 text-sm"
+              className={cn(
+                "gap-2 text-sm",
+                // Desktop: full-width row with label, matching New session /
+                // Inbox. Mobile: a small round icon-only button with its own
+                // surface (border + solid bg + shadow) so it reads as a
+                // floating control over the scrolling list beneath it.
+                "md:w-full md:justify-start",
+                "max-md:size-9 max-md:justify-center max-md:rounded-full max-md:border max-md:border-border max-md:bg-card-solid max-md:p-0 max-md:shadow-sm",
+              )}
               data-testid="settings-button"
             >
-              <Link to="/settings" onClick={onNavClick}>
+              {/* No onNavClick here: on mobile the sidebar is a full-screen
+              overlay, and entering settings swaps it to the section list
+              (SettingsSidebarBody). Closing the overlay would skip that list
+              and drop straight onto the default section's content — instead we
+              keep it open so mobile lands on the section list, then tapping a
+              section (which DOES use onNavClick) closes it to show content. */}
+              <Link to="/settings" aria-label="Settings">
                 <SettingsIcon className="size-4 text-muted-foreground" />
-                Settings
+                {/* Label is desktop-only; the icon stands alone on mobile. */}
+                <span className="max-md:hidden">Settings</span>
               </Link>
             </Button>
           </div>
@@ -1015,7 +1043,7 @@ function ConversationRow({
         className={cn(
           "relative flex w-full flex-col gap-0.5 rounded-md px-4 py-2 text-left text-sm hover:bg-muted",
           !selectionMode &&
-            (sessionState?.kind === "awaiting" ? "pr-44 md:pr-28" : "pr-28 md:pr-16"),
+            (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-16"),
           selectionMode && "pr-10",
           isActive && "bg-muted",
           selectionMode && isSelected && "bg-primary/5",
@@ -1683,57 +1711,6 @@ function BulkActionBar({
           >
             Clear
           </Button>
-          <div className="flex items-center gap-1.5 md:hidden">
-            {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-7 gap-1.5 text-xs"
-                disabled={isBusy}
-                onClick={handleArchive}
-              >
-                {bulkArchive.isPending ? (
-                  <Loader2Icon className="size-3 animate-spin" />
-                ) : (
-                  <ArchiveIcon className="size-3" />
-                )}
-                Archive
-              </Button>
-            )}
-            {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-7 gap-1.5 text-xs"
-                disabled={isBusy}
-                onClick={handleUnarchive}
-              >
-                {bulkArchive.isPending ? (
-                  <Loader2Icon className="size-3 animate-spin" />
-                ) : (
-                  <ArchiveRestoreIcon className="size-3" />
-                )}
-                Unarchive
-              </Button>
-            )}
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className={cn("h-7 gap-1.5 text-xs", ownedSelected.length > 0 && "text-destructive")}
-              disabled={isBusy || ownedSelected.length === 0}
-              onClick={() => setConfirmDeleteOpen(true)}
-            >
-              {bulkDelete.isPending ? (
-                <Loader2Icon className="size-3 animate-spin" />
-              ) : (
-                <Trash2Icon className="size-3" />
-              )}
-              Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
-            </Button>
-          </div>
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
@@ -1752,7 +1729,7 @@ function BulkActionBar({
           </Tooltip>
         </div>
 
-        <div className="hidden items-center gap-1.5 px-2 md:flex">
+        <div className="flex items-center gap-1.5 px-2">
           {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
             <Button
               type="button"

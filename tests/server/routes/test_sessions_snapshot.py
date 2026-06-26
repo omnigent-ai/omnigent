@@ -654,6 +654,80 @@ async def test_session_snapshot_includes_model_options_from_runner(
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_serves_static_cursor_model_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Cursor-native model options are a curated *static* catalog, served directly.
+
+    Unlike codex (live runner ``model/list``), cursor's catalog never changes
+    per session, so the snapshot returns it on the FIRST read with no runner
+    round-trip and no background fetch. Serving it directly (not through the
+    runner-backed cache) is what keeps the picker from blanking on a
+    ``refresh_state`` snapshot — the regression behind the effort-change bug.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            return _FakeResponse({"status": "idle"})
+
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    conv = Conversation(
+        id="conv_cursor_options",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_cursor_options",
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CURSOR_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_cursor_options": conv},
+    )
+
+    # First snapshot already carries the full catalog — no kick-and-empty.
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_cursor_options",
+    )
+
+    # No runner round-trip for cursor model options (served statically).
+    assert not any("model-options" in url for url in fake_client.get_calls)
+    ids = [m["id"] for m in snapshot.model_options]
+    assert "claude-opus-4-6" in ids and "gpt-5.2" in ids and "composer-2.5" in ids
+    # base-id namespace only — no flattened effort variants leak through.
+    assert not any("-high" in i or "-xhigh" in i for i in ids)
+    # The cache must stay untouched — that's what makes it refresh_state-proof.
+    assert "conv_cursor_options" not in _mod._model_options_cache
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_refresh_state_reloads_model_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

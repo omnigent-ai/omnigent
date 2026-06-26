@@ -61,6 +61,22 @@ _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _DELTA_FLUSH_INTERVAL_SECONDS = 0.05
 _DELTA_FLUSH_CHAR_THRESHOLD = 64
 _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE = "external_reasoning_effort_change"
+# Context-compaction progress edge. Publishes the same
+# ``response.compaction.in_progress`` / ``response.compaction.completed`` SSE
+# the AP-side compaction path emits, so the web UI shows its "Compacting
+# conversation…" spinner while Codex compacts. Payload: ``{"status": ...}``.
+_EXTERNAL_COMPACTION_STATUS_TYPE = "external_compaction_status"
+# Codex ThreadItem type for a context compaction, and the thread-level
+# notification Codex emits when compaction finishes. (Codex 5.1-Codex-Max+
+# auto-compacts mid-turn.) Sourced from the Codex app-server protocol enums;
+# handlers are harmless no-ops if a build spells these differently.
+_CODEX_COMPACTION_ITEM_TYPE = "contextCompaction"
+_CODEX_THREAD_COMPACTED_METHOD = "thread/compacted"
+# Transient reasoning (chain-of-thought) delta — the reasoning analogue of
+# ``external_output_text_delta``. Nothing is persisted; it publishes
+# ``response.reasoning_text.delta`` (preceded by ``response.reasoning.started``
+# when ``data.started`` is true) so the web UI paints a live reasoning block.
+_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE = "external_output_reasoning_delta"
 _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE = "external_codex_collaboration_mode_change"
 # Per-attempt client budget for the elicitation long-poll, slightly above
 # the server-side wait (``_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S``) so
@@ -114,6 +130,47 @@ _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
         _CODEX_APPLY_PATCH_APPROVAL_METHOD,
     }
 )
+
+# Turn-error surfacing. A failed Codex turn arrives as ``turn/completed``
+# (or ``turn/failed``) with ``turn.status == "failed"`` and a ``turn.error``
+# object ``{message, codexErrorInfo?, additionalDetails?}``; keying status off
+# the method alone mapped such turns to ``idle`` — a "silent success". The
+# forwarder inspects ``turn.status``/``turn.error``, forces ``failed``, and
+# surfaces the reason. As a fallback it also catches an ``error`` ThreadItem in
+# ``turn.items``: both shapes exist in the app-server type system and the wire
+# shape varies by version, so detecting either keeps the fix robust.
+#
+# ``codexErrorInfo`` is the app-server's structured classification (e.g.
+# ``Unauthorized``, ``UsageLimitExceeded``); auth-class values get a re-auth
+# hint. httpStatusCode 401/403 is treated as auth too.
+_CODEX_ERROR_ITEM_TYPE = "error"
+_CODEX_AUTH_ERROR_INFO = frozenset({"Unauthorized"})
+_CODEX_AUTH_HTTP_STATUS = frozenset({401, 403})
+# Message-substring fallback for app-server versions that omit codexErrorInfo.
+# Surface-only, so recall is favored over precision: a false positive only
+# appends a re-auth hint to an already-failed turn.
+_CODEX_AUTH_ERROR_FRAGMENTS = (
+    "401",
+    "403",
+    "unauthorized",
+    "authentication",
+    "not logged in",
+    "not authenticated",
+    "log in",
+    "login",
+    "sign in",
+    "re-authenticate",
+    "reauthenticate",
+    "credentials",
+    "access token",
+    "token expired",
+    "expired token",
+    "session expired",
+    "api key",
+)
+_CODEX_ERROR_KIND_AUTH = "auth"
+_CODEX_ERROR_KIND_GENERIC = "generic"
+_CODEX_REAUTH_HINT = "Codex needs you to re-authenticate. Run `codex login` and retry."
 
 
 @dataclass
@@ -276,6 +333,22 @@ class _CodexForwarderState:
     completed_plan_text_by_turn: dict[str, str] = field(default_factory=dict)
     plan_thread_by_turn: dict[str, str] = field(default_factory=dict)
     prompted_plan_turns: set[str] = field(default_factory=set)
+    # Last context-compaction status mirrored to Omnigent
+    # (``"in_progress"`` / ``"completed"``), used to dedupe consecutive
+    # identical posts when Codex signals completion via both a
+    # ``contextCompaction`` item and a ``thread/compacted`` notification.
+    compaction_status_posted: str | None = None
+    # Whether the compaction item has already been persisted for the current
+    # compaction boundary.  Reset to ``False`` when a new ``"in_progress"``
+    # status is posted.
+    compaction_item_persisted: bool = False
+    # Codex reasoning item id whose live deltas are currently being mirrored.
+    # When a delta arrives for a different item, it opens a new reasoning
+    # block (``started=True`` → ``response.reasoning.started``). Reset at each
+    # ``turn/started`` so the next turn's first reasoning delta opens a fresh
+    # block. Reasoning is transient — it has no completed conversation item;
+    # the block finalizes when the turn's assistant message arrives.
+    reasoning_stream_item_id: str | None = None
 
     def note_resume_response(self, response: CodexMessage) -> None:
         """
@@ -636,6 +709,121 @@ class _CodexForwarderState:
 
 
 @dataclass(frozen=True)
+class _CodexTerminalError:
+    """
+    A turn-level failure surfaced from a Codex turn.
+
+    Produced by :func:`_terminal_error_from_turn` from ``turn.error`` or an
+    ``error`` ThreadItem. Forces the turn's Omnigent status to ``failed`` and
+    lets :func:`_post_turn_status_edge` surface the reason (and a re-auth hint
+    for auth-classified errors).
+
+    :param message: Human-readable error text, e.g.
+        ``"401 Unauthorized: ChatGPT login expired"``.
+    :param kind: Classification, either ``"auth"`` or ``"generic"``.
+    """
+
+    message: str
+    kind: str
+
+    @property
+    def is_auth(self) -> bool:
+        """:returns: ``True`` when the error was classified as auth-related."""
+        return self.kind == _CODEX_ERROR_KIND_AUTH
+
+
+def _classify_codex_error(error: dict[str, Any], message: str) -> str:
+    """
+    Classify a Codex ``turn.error`` / ``error`` item as auth-related or generic.
+
+    Prefers the structured ``codexErrorInfo`` (``Unauthorized`` or an
+    httpStatusCode of 401/403); falls back to substring matching against
+    :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes that omit it.
+
+    :param error: The ``turn.error`` object.
+    :param message: Its already-extracted message text.
+    :returns: :data:`_CODEX_ERROR_KIND_AUTH` or
+        :data:`_CODEX_ERROR_KIND_GENERIC`.
+    """
+    info = error.get("codexErrorInfo")
+    variant: str | None = None
+    http_status: Any = None
+    if isinstance(info, str):
+        variant = info
+    elif isinstance(info, dict):
+        variant = info.get("type") or info.get("kind") or info.get("variant")
+        http_status = info.get("httpStatusCode")
+    if variant in _CODEX_AUTH_ERROR_INFO or http_status in _CODEX_AUTH_HTTP_STATUS:
+        return _CODEX_ERROR_KIND_AUTH
+    lowered = message.lower()
+    if any(fragment in lowered for fragment in _CODEX_AUTH_ERROR_FRAGMENTS):
+        return _CODEX_ERROR_KIND_AUTH
+    return _CODEX_ERROR_KIND_GENERIC
+
+
+def _error_payload_message(payload: dict[str, Any]) -> str:
+    """
+    Extract a non-empty message from a Codex ``turn.error`` or ``error`` item.
+
+    Both shapes have surfaced the text under a few keys across app-server
+    versions; reads the first non-empty one, falling back to a stable string
+    so the surfaced error is never blank.
+
+    :param payload: A ``turn.error`` object or an ``error`` ThreadItem.
+    :returns: Non-empty error text.
+    """
+    for key in ("message", "error", "text", "detail"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "Codex turn ended with an unspecified error."
+
+
+def _error_item_from_turn(turn: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Return the first ``error`` ThreadItem in ``turn.items``, if any.
+
+    :param turn: A Codex turn object.
+    :returns: The first item whose ``type`` is :data:`_CODEX_ERROR_ITEM_TYPE`,
+        or ``None``.
+    """
+    items = turn.get("items")
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == _CODEX_ERROR_ITEM_TYPE:
+            return item
+    return None
+
+
+def _terminal_error_from_turn(params: dict[str, Any]) -> _CodexTerminalError | None:
+    """
+    Return the turn-level failure carried by a Codex turn, if any.
+
+    Prefers ``turn.error`` (the protocol's ``TurnError`` on a failed turn) and
+    falls back to an ``error`` ThreadItem in ``turn.items`` — both shapes exist
+    in the app-server type system and the wire shape varies by version. Single
+    source of truth reused by the live terminal edge and the ``thread/resume``
+    parity path.
+
+    :param params: Codex turn params, e.g. a ``turn/completed`` payload or a
+        single ``thread/resume`` turn wrapped as ``{"turn": <turn>}``.
+    :returns: The classified terminal error, or ``None`` when the turn did not
+        fail.
+    """
+    turn = params.get("turn")
+    if not isinstance(turn, dict):
+        return None
+    payload = turn.get("error")
+    if not isinstance(payload, dict):
+        payload = _error_item_from_turn(turn)
+    if payload is None:
+        return None
+    message = _error_payload_message(payload)
+    return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
+
+
+@dataclass(frozen=True)
 class _CodexTurnStatusEdge:
     """
     Omnigent session-status edge derived from Codex turn lifecycle state.
@@ -645,11 +833,15 @@ class _CodexTurnStatusEdge:
         ``"turn_abc123"``.
     :param source: Lifecycle source that produced the edge, e.g.
         ``"turn/started"``.
+    :param error: Turn-level error forcing this edge to ``failed``,
+        or ``None`` for ordinary lifecycle edges. Surfaced as the status
+        output by :func:`_post_turn_status_edge`.
     """
 
     status: str
     turn_id: str | None
     source: str
+    error: _CodexTerminalError | None = None
 
 
 # Codex ``item/completed`` item types that represent a built-in tool call.
@@ -1910,10 +2102,14 @@ def _resume_terminal_status_edge_for_latest_turn(
         if status is None:
             return None
         update_active_turn_id(bridge_dir, None)
+        # Parity with the live path — surface ``turn.error`` (if any) that
+        # forced this resume turn to ``failed``.
+        error = _terminal_error_from_turn({"turn": turn})
         return _CodexTurnStatusEdge(
             status=status,
             turn_id=turn_id,
-            source="thread/resume",
+            source="thread/resume:turn-error" if error is not None else "thread/resume",
+            error=error,
         )
     return None
 
@@ -1922,11 +2118,19 @@ def _omnigent_status_from_resume_turn(turn: dict[str, Any]) -> str | None:
     """
     Convert an explicit Codex resume turn status to Omnigent session status.
 
+    Applies the same ``turn.error`` check as the live terminal path
+    (:func:`_terminal_turn_status_edge`) so a resumed turn that carried an
+    error maps to ``failed`` even if its recorded status is not — the
+    resume-path side of the "silent success" fix.
+
     :param turn: Codex resume turn object, e.g.
         ``{"id": "turn_123", "status": "completed"}``.
     :returns: Omnigent status literal for terminal turns, or ``None`` for active
         or unrecognized statuses.
     """
+    # A ``turn.error`` forces ``failed`` regardless of the recorded status.
+    if _terminal_error_from_turn({"turn": turn}) is not None:
+        return "failed"
     status = turn.get("status")
     if isinstance(status, dict):
         status = status.get("type") or status.get("status")
@@ -1996,6 +2200,11 @@ async def _handle_event(
         item = params.get("item")
         if isinstance(item, dict) and item.get("type") == _CODEX_COLLAB_AGENT_ITEM_TYPE:
             await _handle_collab_item(client, params, item, forwarder_state)
+        elif isinstance(item, dict) and item.get("type") == _CODEX_COMPACTION_ITEM_TYPE:
+            # Compaction started mid-turn — show the spinner.
+            await _post_compaction_status(
+                client, route_session_id, "in_progress", forwarder_state=forwarder_state
+            )
         elif isinstance(item, dict) and item.get("type") == "agentMessage":
             # Post the turn's user message NOW — before the assistant's text
             # deltas start streaming. The live ``userMessage`` event can be
@@ -2389,6 +2598,9 @@ async def _maybe_handle_turn_event(
             await delta_coalescer.flush()
         await _handle_turn_started(client, session_id, bridge_dir, params)
         if forwarder_state is not None:
+            # A new turn opens a fresh reasoning block: the next reasoning
+            # delta must emit ``response.reasoning.started`` again.
+            forwarder_state.reasoning_stream_item_id = None
             # An in-TUI ``/model`` switch writes config.toml (the cost-policy
             # source of truth) but emits no notification. Re-read it at turn
             # start so a switch made since the last turn lands ``model_override``
@@ -2436,6 +2648,24 @@ async def _maybe_handle_turn_event(
         if delta_coalescer is not None:
             await delta_coalescer.flush()
         await _handle_turn_plan_updated(client, session_id, params)
+        return True
+    if method == _CODEX_THREAD_COMPACTED_METHOD:
+        # Codex finished compacting the thread's context window.
+        await _post_compaction_status(
+            client, session_id, "completed", forwarder_state=forwarder_state
+        )
+        if forwarder_state is None or not forwarder_state.compaction_item_persisted:
+            try:
+                await _persist_codex_compaction_item(
+                    client, session_id=session_id, bridge_dir=bridge_dir
+                )
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
+                )
+            else:
+                if forwarder_state is not None:
+                    forwarder_state.compaction_item_persisted = True
         return True
     return False
 
@@ -2490,6 +2720,13 @@ async def _maybe_handle_delta_event(
             delta_coalescer,
             forwarder_state,
         )
+        return True
+    if method in {"item/reasoning/textDelta", "item/reasoning/summaryTextDelta"}:
+        # Flush any buffered assistant text first so a reasoning delta never
+        # jumps ahead of earlier-streamed answer text in arrival order.
+        if delta_coalescer is not None:
+            await delta_coalescer.flush()
+        await _handle_reasoning_delta(client, session_id, params, forwarder_state)
         return True
     return False
 
@@ -2553,6 +2790,13 @@ async def _handle_terminal_turn_boundary(
     """
     if delta_coalescer is not None:
         await delta_coalescer.flush()
+    # Safety net: if a compaction was reported in progress but Codex never
+    # emitted a completion signal we recognize (e.g. a protocol-spelling
+    # drift), force the spinner closed at the turn boundary so it can't hang.
+    if forwarder_state is not None and forwarder_state.compaction_status_posted == "in_progress":
+        await _post_compaction_status(
+            client, session_id, "completed", forwarder_state=forwarder_state
+        )
     await _maybe_persist_interrupted_partial_text(
         client,
         session_id=session_id,
@@ -3197,11 +3441,84 @@ def _terminal_turn_status_edge(
         source = f"{method}:recovered"
     else:
         source = method
+    # A failed turn carries ``turn.error`` (or an ``error`` item) even when
+    # Codex reports it via ``turn/completed`` ("silent success"). Force
+    # ``failed`` and attach the error so the reason is surfaced downstream.
+    error = _terminal_error_from_turn(params)
+    if error is not None:
+        _logger.info(
+            "Codex forwarder forcing failed status from turn.error: turn_id=%s method=%s kind=%s",
+            terminal_turn_id,
+            method,
+            error.kind,
+        )
+        return _CodexTurnStatusEdge(
+            status="failed",
+            turn_id=terminal_turn_id,
+            source=f"{source}:turn-error",
+            error=error,
+        )
+    if _turn_status_is_failed(params):
+        _logger.info(
+            "Codex forwarder forcing failed status from turn.status: turn_id=%s method=%s",
+            terminal_turn_id,
+            method,
+        )
+        return _CodexTurnStatusEdge(
+            status="failed",
+            turn_id=terminal_turn_id,
+            source=f"{source}:turn-failed",
+        )
+    if method == "turn/completed" and _turn_items_are_empty(params):
+        _logger.warning(
+            "Codex forwarder observed an empty turn (zero items): "
+            "turn_id=%s method=%s; mapping to idle",
+            terminal_turn_id,
+            method,
+        )
     return _CodexTurnStatusEdge(
         status="idle" if method == "turn/completed" else "failed",
         turn_id=terminal_turn_id,
         source=source,
     )
+
+
+def _turn_status_is_failed(params: dict[str, Any]) -> bool:
+    """
+    Report whether a Codex turn recorded a ``failed`` status.
+
+    Catches a failure that lacks a populated ``turn.error`` object, so a
+    ``turn/completed`` whose ``turn.status`` is ``failed`` still maps to
+    ``failed`` rather than ``idle``.
+
+    :param params: Codex turn event params.
+    :returns: ``True`` when ``params['turn']['status']`` resolves to ``failed``.
+    """
+    turn = params.get("turn")
+    if not isinstance(turn, dict):
+        return False
+    status = turn.get("status")
+    if isinstance(status, dict):
+        status = status.get("type") or status.get("status")
+    return status in {"failed", "errored"}
+
+
+def _turn_items_are_empty(params: dict[str, Any]) -> bool:
+    """
+    Report whether a Codex turn explicitly carried zero items.
+
+    Only an explicitly present but empty ``items`` list counts as "empty":
+    a missing ``items`` key (e.g. a legacy ``turnId``-only terminal
+    notification) is unknown, not empty, and must not trip the WARN.
+
+    :param params: Codex turn event params.
+    :returns: ``True`` when ``params['turn']['items']`` is a zero-length list.
+    """
+    turn = params.get("turn")
+    if not isinstance(turn, dict):
+        return False
+    items = turn.get("items")
+    return isinstance(items, list) and len(items) == 0
 
 
 def _terminal_turn_id_from_params(params: dict[str, Any]) -> str | None:
@@ -3321,6 +3638,24 @@ async def _handle_completed_item(
     if item_type == _CODEX_COLLAB_AGENT_ITEM_TYPE:
         if forwarder_state is not None:
             await _handle_collab_item(client, params, item, forwarder_state)
+        return
+    # A context-compaction item is a status edge, not transcript history:
+    # clear the compaction spinner. Handled before the dedup gate (it never
+    # appends an item).
+    if item_type == _CODEX_COMPACTION_ITEM_TYPE:
+        await _post_compaction_status(
+            client, session_id, "completed", forwarder_state=forwarder_state
+        )
+        if forwarder_state is None or not forwarder_state.compaction_item_persisted:
+            try:
+                await _persist_codex_compaction_item(client, session_id=session_id)
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
+                )
+            else:
+                if forwarder_state is not None:
+                    forwarder_state.compaction_item_persisted = True
         return
     if not _claim_completed_item(params, item, forwarder_state):
         return
@@ -4513,6 +4848,8 @@ async def _post_status(
     status: str,
     *,
     response_id: str | None = None,
+    output: str | None = None,
+    reauth_required: bool = False,
 ) -> None:
     """
     Publish a native Codex status edge.
@@ -4522,11 +4859,21 @@ async def _post_status(
     :param status: Session status, e.g. ``"running"``.
     :param response_id: Optional response id for this status edge,
         e.g. ``"codex_turn_abc123"``.
+    :param output: Optional human-readable reason carried with a terminal
+        edge, e.g. a Codex error message. The server forwards this as
+        the authoritative terminal output for a ``failed`` / ``idle`` edge.
+    :param reauth_required: When ``True``, mark a ``failed`` edge as caused by
+        an authentication error so the surface can prompt a re-auth.
+        Surface-only: no automatic ``codex login`` is triggered.
     :returns: None.
     """
-    data = {"status": status}
+    data: dict[str, Any] = {"status": status}
     if response_id is not None:
         data["response_id"] = response_id
+    if output is not None:
+        data["output"] = output
+    if reauth_required:
+        data["reauth_required"] = True
     response = await _post_session_event(
         client,
         session_id,
@@ -4544,6 +4891,11 @@ async def _post_turn_status_edge(
     """
     Publish one Codex turn lifecycle edge if a valid edge was derived.
 
+    When the edge carries a turn-level error, the error message is
+    surfaced as the terminal ``output`` so the failure reason is visible
+    rather than silently swallowed; an auth-classified error additionally
+    flags ``reauth_required`` and appends a re-auth hint to the output.
+
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param edge: Derived lifecycle edge, or ``None`` when no status should
@@ -4559,7 +4911,21 @@ async def _post_turn_status_edge(
         edge.status,
     )
     response_id = _response_id(_params_with_turn_id({}, edge.turn_id)) if edge.turn_id else None
-    await _post_status(client, session_id, edge.status, response_id=response_id)
+    output: str | None = None
+    reauth_required = False
+    if edge.error is not None:
+        output = edge.error.message
+        if edge.error.is_auth:
+            reauth_required = True
+            output = f"{output}\n\n{_CODEX_REAUTH_HINT}"
+    await _post_status(
+        client,
+        session_id,
+        edge.status,
+        response_id=response_id,
+        output=output,
+        reauth_required=reauth_required,
+    )
 
 
 async def _post_external_elicitation_resolved(
@@ -4624,6 +4990,246 @@ async def _post_output_text_delta(
         data=data,
     )
     _log_failed_session_event_post("external_output_text_delta", response)
+
+
+async def _post_compaction_status(
+    client: httpx.AsyncClient,
+    session_id: str,
+    status: str,
+    *,
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """
+    Mirror a Codex context-compaction edge to Omnigent (#1255).
+
+    Publishes ``external_compaction_status`` so the web UI shows its
+    "Compacting conversation…" spinner while Codex compacts and clears it
+    when done — matching how claude-native brackets compaction. Consecutive
+    identical statuses are deduped because Codex may signal completion via
+    both a ``contextCompaction`` item and a ``thread/compacted``
+    notification.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param status: ``"in_progress"`` or ``"completed"``.
+    :param forwarder_state: Optional state carrying the dedupe baseline.
+    :returns: None.
+    """
+    if forwarder_state is not None and forwarder_state.compaction_status_posted == status:
+        return
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_COMPACTION_STATUS_TYPE,
+        data={"status": status},
+    )
+    _log_failed_session_event_post(_EXTERNAL_COMPACTION_STATUS_TYPE, response)
+    if forwarder_state is not None and response is not None and response.status_code < 400:
+        forwarder_state.compaction_status_posted = status
+        if status == "in_progress":
+            forwarder_state.compaction_item_persisted = False
+
+
+async def _persist_codex_compaction_item(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path | None = None,
+) -> None:
+    """Persist a compaction boundary item to the conversation store.
+
+    Codex appends a ``Compacted`` entry to the rollout JSONL after
+    compaction. That entry carries ``replacement_history`` — the
+    post-compaction context. When ``bridge_dir`` is available, we
+    read the latest ``Compacted`` entry from the rollout and use
+    its ``replacement_history`` as ``compacted_messages``.
+    """
+    resp = await client.get(
+        f"/v1/sessions/{session_id}/items",
+        params={"limit": 1, "order": "desc"},
+    )
+    resp.raise_for_status()
+    items = resp.json().get("data", [])
+    last_item_id = items[0]["id"] if items else f"compact_boundary_{session_id}"
+
+    compacted_messages = None
+    if bridge_dir is not None:
+        try:
+            state = read_bridge_state(bridge_dir)
+            if state is not None:
+                codex_home = Path(state.codex_home)
+                thread_id = state.thread_id
+                rollout_files = sorted(
+                    codex_home.glob(f"sessions/*/*rollout-*{thread_id}.jsonl"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if rollout_files:
+                    compacted_messages = _read_compacted_history(rollout_files[0])
+        except Exception:  # noqa: BLE001
+            _logger.debug(
+                "Failed to read codex rollout for compaction persist",
+                exc_info=True,
+            )
+
+    data: dict[str, object] = {
+        "summary": "[Codex compaction — context was compacted in the terminal]",
+        "last_item_id": last_item_id,
+        "model": "unknown",
+        "token_count": 0,
+    }
+    if compacted_messages:
+        data["compacted_messages"] = compacted_messages
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "compaction", "data": data},
+    )
+    resp.raise_for_status()
+
+
+def _read_compacted_history(rollout_path: Path) -> list[dict[str, object]] | None:
+    """Read ``replacement_history`` from the last ``Compacted`` entry in a rollout.
+
+    Codex appends a ``{type: "compacted", payload: {replacement_history: [...]}}``
+    entry to the JSONL after compaction. The ``replacement_history`` contains the
+    post-compaction ``ResponseItem`` list — the actual context the model sees.
+
+    :param rollout_path: Path to the rollout JSONL.
+    :returns: List of message dicts from ``replacement_history``, or ``None``.
+    """
+    last_compacted = None
+    with rollout_path.open() as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if entry.get("type") == "compacted":
+                last_compacted = entry
+    if last_compacted is None:
+        return None
+    payload = last_compacted.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    history = payload.get("replacement_history")
+    if not isinstance(history, list) or not history:
+        return None
+    # Convert ResponseItems to the harness input format.
+    msgs: list[dict[str, object]] = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        # ResponseItem shapes: {type: "message", role, content},
+        # {type: "function_call", ...}, {type: "function_call_output", ...}
+        item_type = item.get("type")
+        if item_type == "message":
+            role = item.get("role")
+            if role in ("user", "assistant"):
+                msgs.append(
+                    {
+                        "type": "message",
+                        "role": role,
+                        "content": item.get("content", []),
+                    }
+                )
+        elif item_type == "function_call":
+            msgs.append(
+                {
+                    "type": "function_call",
+                    "call_id": item.get("call_id"),
+                    "name": item.get("name"),
+                    "arguments": item.get("arguments"),
+                }
+            )
+        elif item_type == "function_call_output":
+            msgs.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": item.get("call_id"),
+                    "output": item.get("output"),
+                }
+            )
+    return msgs if msgs else None
+
+
+async def _handle_reasoning_delta(
+    client: httpx.AsyncClient,
+    session_id: str,
+    params: dict[str, Any],
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """
+    Forward one live Codex reasoning (chain-of-thought) delta to AP.
+
+    Codex emits ``item/reasoning/textDelta`` and
+    ``item/reasoning/summaryTextDelta`` while it thinks. Omnigent has no
+    completed reasoning conversation item — the reasoning block is
+    transient and is finalized when the turn's assistant message arrives —
+    so this only publishes a transient ``external_output_reasoning_delta``
+    so the web UI paints a live "thinking" block, matching the in-process
+    executor's wire shape (#1254). The first delta of a reasoning item
+    opens the block (``started=True`` → ``response.reasoning.started``).
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param params: Codex reasoning delta params, e.g.
+        ``{"turnId": "turn_123", "itemId": "item_r", "delta": "Let me"}``.
+    :param forwarder_state: Optional forwarder state tracking which
+        reasoning item is currently open (for the ``started`` edge).
+    :returns: None.
+    """
+    delta = params.get("delta")
+    if not isinstance(delta, str):
+        _logger.warning(
+            "Codex reasoning delta missing string delta: turn_id=%s",
+            _turn_id_from_payload(params),
+        )
+        return
+    item_id = _item_id_from_delta_params(params)
+    started = False
+    if forwarder_state is not None:
+        if item_id is not None:
+            started = forwarder_state.reasoning_stream_item_id != item_id
+            forwarder_state.reasoning_stream_item_id = item_id
+        else:
+            # Codex reasoning deltas normally carry an itemId; if one is
+            # missing, ``None`` on state means no block is open yet.
+            # ``""`` marks "open, id unknown" so later id-less deltas in the
+            # same block don't re-open it.
+            started = forwarder_state.reasoning_stream_item_id is None
+            forwarder_state.reasoning_stream_item_id = ""
+    # An empty, non-opening delta carries nothing to render.
+    if not delta and not started:
+        return
+    await _post_output_reasoning_delta(client, session_id, delta, started=started)
+
+
+async def _post_output_reasoning_delta(
+    client: httpx.AsyncClient,
+    session_id: str,
+    delta: str,
+    *,
+    started: bool,
+) -> None:
+    """
+    Publish a transient Codex reasoning delta.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param delta: Reasoning text fragment, e.g. ``"Let me think"``.
+    :param started: Whether this opens a new reasoning block; when
+        ``True`` the server precedes the delta with a single
+        ``response.reasoning.started`` SSE.
+    :returns: None.
+    """
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
+        data={"delta": delta, "started": started},
+    )
+    _log_failed_session_event_post(_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE, response)
 
 
 async def _post_session_interrupted(
@@ -4713,7 +5319,116 @@ def _session_usage_data_from_params(params: dict[str, Any]) -> dict[str, int] | 
     return data
 
 
+@dataclass
+class _ForwardHealth:
+    """
+    Process-level health of Omnigent session-event forwarding (#1120).
+
+    Network failures (connect timeouts, 503s, resets) make
+    ``_post_session_event`` drop transcript/usage events after its bounded
+    retries, previously visible only as scattered per-item warnings. This
+    tracks consecutive permanent failures so a sustained outage escalates
+    to a single loud signal instead of staying effectively silent.
+
+    :param consecutive_failures: Permanent post failures since the last
+        success.
+    :param degraded_logged: Whether the degraded-sync edge has already
+        been logged for the current outage (so it logs once, not per item).
+    """
+
+    consecutive_failures: int = 0
+    degraded_logged: bool = False
+
+
+# After this many consecutive permanent forward failures, sync is treated as
+# degraded and escalated once to ERROR. Small enough to fire during a real
+# outage, large enough to ride out a transient blip the retries already cover.
+_FORWARD_DEGRADED_THRESHOLD = 5
+_forward_health = _ForwardHealth()
+
+
+def _reset_forward_health() -> None:
+    """
+    Reset forward-health tracking (test seam / new forwarder lifetime).
+
+    :returns: None.
+    """
+    global _forward_health
+    _forward_health = _ForwardHealth()
+
+
+def _note_forward_success() -> None:
+    """
+    Record a successful forward, clearing any degraded-sync state.
+
+    :returns: None.
+    """
+    if _forward_health.degraded_logged:
+        _logger.info(
+            "codex-native forward sync recovered after %d consecutive failures",
+            _forward_health.consecutive_failures,
+        )
+    _forward_health.consecutive_failures = 0
+    _forward_health.degraded_logged = False
+
+
+def _note_forward_failure(event_type: str) -> None:
+    """
+    Record a permanent forward failure; escalate once when sync degrades.
+
+    :param event_type: Session event type that failed to post, e.g.
+        ``"external_conversation_item"``.
+    :returns: None.
+    """
+    _forward_health.consecutive_failures += 1
+    if (
+        _forward_health.consecutive_failures >= _FORWARD_DEGRADED_THRESHOLD
+        and not _forward_health.degraded_logged
+    ):
+        _logger.error(
+            "codex-native forward sync degraded: %d consecutive Omnigent "
+            "event-post failures; transcript/usage mirroring may be incomplete "
+            "(latest type=%s)",
+            _forward_health.consecutive_failures,
+            event_type,
+        )
+        _forward_health.degraded_logged = True
+
+
 async def _post_session_event(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    event_type: str,
+    data: dict[str, Any],
+) -> httpx.Response | None:
+    """
+    Post one Omnigent session event, tracking forward-sync health (#1120).
+
+    Thin wrapper over :func:`_post_session_event_inner` that classifies the
+    outcome — a sub-400 response is a success; ``None`` or a >=400 final
+    response is a permanent failure — and updates :data:`_forward_health`
+    so a sustained outage escalates to a single ERROR instead of silently
+    dropping events.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param event_type: Session event type, e.g.
+        ``"external_conversation_item"``.
+    :param data: Event data payload, e.g. ``{"status": "running"}``.
+    :returns: The same value as :func:`_post_session_event_inner`.
+    """
+    response = await _post_session_event_inner(
+        client, session_id, event_type=event_type, data=data
+    )
+    if response is not None and response.status_code < 400:
+        _note_forward_success()
+    else:
+        _note_forward_failure(event_type)
+    return response
+
+
+async def _post_session_event_inner(
     client: httpx.AsyncClient,
     session_id: str,
     *,

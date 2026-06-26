@@ -11,6 +11,14 @@ configuration in issues, tests, examples, or logs.
 This is a Python package with an optional frontend under `ap-web/`. Use
 [`uv`](https://docs.astral.sh/uv/) for local development:
 
+**Supported dev OS: macOS or Linux.** Native Windows is not supported for
+development — some test dependencies are POSIX-only (`pexpect`/`pyte` are
+excluded on Windows), a few modules import POSIX stdlib or call `os.getuid()`
+at import time, and the `pre-commit` hooks assume the Unix `.venv/bin/` layout,
+so `pytest` and `pre-commit` cannot pass natively. On Windows, use
+**WSL2 (Ubuntu)** and clone into the **Linux** filesystem (`~/…`, not `/mnt/c`);
+this matches CI. Git Bash is not sufficient — it runs native-Windows Python.
+
 Install local prerequisites first:
 
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/) for Python
