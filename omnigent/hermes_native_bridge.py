@@ -110,74 +110,61 @@ def clone_hermes_session(
 ) -> None:
     """Clone a Hermes session from *source_db* into *target_db* under a new id.
 
-    Copies the ``sessions`` row (remapping ``id`` and optionally ``cwd``) and
-    all ``messages`` rows (remapping ``session_id``). The target database and
-    its tables are created if they don't already exist.
+    Copies the entire source database (preserving whatever schema Hermes uses)
+    then remaps the session and message rows to the new id. This avoids
+    hard-coding the schema — if Hermes adds columns (e.g. ``parent_session_id``)
+    the clone picks them up automatically.
 
-    :param source_db: Path to the source Hermes ``state.db`` (opened read-only).
-    :param target_db: Path to the target Hermes ``state.db`` (created if absent).
+    :param source_db: Path to the source Hermes ``state.db``.
+    :param target_db: Path to the target Hermes ``state.db`` (created/overwritten).
     :param source_session_id: Hermes session id in the source database.
     :param target_session_id: New session id for the cloned rows.
     :param workspace: If provided, overrides ``cwd`` on the cloned session row.
     """
-    src_conn = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
-    try:
-        target_db.parent.mkdir(parents=True, exist_ok=True)
-        tgt_conn = sqlite3.connect(str(target_db))
-        try:
-            tgt_conn.execute(_SESSIONS_DDL)
-            tgt_conn.execute(_MESSAGES_DDL)
+    target_db.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_db, target_db)
 
-            # Copy session row.
-            row = src_conn.execute(
-                "SELECT id, source, cwd, started_at FROM sessions WHERE id = ?",
-                (source_session_id,),
-            ).fetchone()
-            if row is None:
-                _logger.warning(
-                    "Source hermes session %s not found in %s; skipping clone",
-                    source_session_id,
-                    source_db,
-                )
-                return
-            _id, source, cwd, _started_at = row
-            tgt_conn.execute(
-                "INSERT INTO sessions (id, source, cwd, started_at) VALUES (?, ?, ?, ?)",
-                (
-                    target_session_id,
-                    source,
-                    workspace if workspace is not None else cwd,
-                    # Use current time so the forwarder's started_at floor
-                    # discovery can find this cloned session.
-                    time.time(),
-                ),
+    conn = sqlite3.connect(str(target_db))
+    try:
+        # Verify the source session exists.
+        row = conn.execute(
+            "SELECT id FROM sessions WHERE id = ?",
+            (source_session_id,),
+        ).fetchone()
+        if row is None:
+            _logger.warning(
+                "Source hermes session %s not found in %s; skipping clone",
+                source_session_id,
+                source_db,
+            )
+            return
+
+        # Remap session id and update started_at so the forwarder can
+        # discover this cloned session (its floor is launch_epoch_s).
+        conn.execute(
+            "UPDATE sessions SET id = ?, started_at = ? WHERE id = ?",
+            (target_session_id, time.time(), source_session_id),
+        )
+        if workspace is not None:
+            conn.execute(
+                "UPDATE sessions SET cwd = ? WHERE id = ?",
+                (workspace, target_session_id),
             )
 
-            # Copy message rows.
-            msg_rows = src_conn.execute(
-                "SELECT session_id, role, content, tool_call_id, tool_calls, tool_name, "
-                "timestamp, token_count, finish_reason, reasoning, reasoning_content, "
-                "reasoning_details, codex_reasoning_items, codex_message_items, "
-                "platform_message_id, observed, active, compacted "
-                "FROM messages WHERE session_id = ? ORDER BY id",
-                (source_session_id,),
-            ).fetchall()
-            for msg in msg_rows:
-                tgt_conn.execute(
-                    "INSERT INTO messages (session_id, role, content, tool_call_id, "
-                    "tool_calls, tool_name, timestamp, token_count, finish_reason, "
-                    "reasoning, reasoning_content, reasoning_details, "
-                    "codex_reasoning_items, codex_message_items, platform_message_id, "
-                    "observed, active, compacted) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (target_session_id, *msg[1:]),
-                )
+        # Remap message rows to the new session id.
+        conn.execute(
+            "UPDATE messages SET session_id = ? WHERE session_id = ?",
+            (target_session_id, source_session_id),
+        )
 
-            tgt_conn.commit()
-        finally:
-            tgt_conn.close()
+        # Drop other sessions/messages that came along with the copy
+        # (the source DB may contain multiple sessions).
+        conn.execute("DELETE FROM sessions WHERE id != ?", (target_session_id,))
+        conn.execute("DELETE FROM messages WHERE session_id != ?", (target_session_id,))
+
+        conn.commit()
     finally:
-        src_conn.close()
+        conn.close()
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
