@@ -3374,6 +3374,7 @@ async def _post_external_session_status(
     *,
     session_id: str,
     status: str,
+    output: str | None = None,
 ) -> None:
     """
     Post one ``external_session_status`` event to the Sessions API.
@@ -3382,14 +3383,21 @@ async def _post_external_session_status(
     :param session_id: Omnigent session/conversation id.
     :param status: Session status value, e.g. ``"idle"`` or
         ``"failed"``.
+    :param output: Optional text attached to the event ``data``. On a
+        ``"failed"`` edge the server surfaces it as the session's failure
+        reason (``last_task_error``) so the UI renders a detail instead of
+        a bare "failed" (#1113). Ignored when falsy.
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
+    data: dict[str, Any] = {"status": status}
+    if output:
+        data["output"] = output
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
             "type": "external_session_status",
-            "data": {"status": status},
+            "data": data,
         },
     )
     resp.raise_for_status()
@@ -3596,7 +3604,9 @@ async def _post_forwarder_failed_status(
     :returns: None.
     """
     try:
-        await _post_external_session_status(client, session_id=session_id, status="failed")
+        await _post_external_session_status(
+            client, session_id=session_id, status="failed", output=reason
+        )
     except httpx.HTTPError:
         _logger.warning(
             "Failed to publish Claude forwarder failure status; "
