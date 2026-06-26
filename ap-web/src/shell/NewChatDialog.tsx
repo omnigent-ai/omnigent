@@ -1882,14 +1882,20 @@ export function NewChatLandingScreen() {
                   one ever applies to a given agent. */}
                 {supportsPermissionMode && (
                   <ModePill label={permissionModeLabel} testId="new-chat-landing-permission-pill">
-                    <PermissionModeOptions value={permissionMode} onValueChange={setPermissionMode} />
+                    <PermissionModeOptions
+                      value={permissionMode}
+                      onValueChange={setPermissionMode}
+                    />
                   </ModePill>
                 )}
                 {supportsApprovalMode && (
                   <ModePill label={approvalModeLabel} testId="new-chat-landing-approval-pill">
                     <ApprovalModeOptions value={approvalMode} onValueChange={setApprovalMode} />
                     <DropdownMenuSeparator />
-                    <BypassSandboxOption enabled={bypassSandbox} onEnabledChange={setBypassSandbox} />
+                    <BypassSandboxOption
+                      enabled={bypassSandbox}
+                      onEnabledChange={setBypassSandbox}
+                    />
                   </ModePill>
                 )}
                 {supportsCursorMode && (
@@ -2275,7 +2281,9 @@ export function NewChatLandingScreen() {
                     >
                       <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
                         <span className="truncate">{pendingAgent.name}</span>
-                        <span className="truncate text-[11px] text-muted-foreground/70">Custom</span>
+                        <span className="truncate text-[11px] text-muted-foreground/70">
+                          Custom
+                        </span>
                       </div>
                     </DropdownMenuItem>
                   )}
