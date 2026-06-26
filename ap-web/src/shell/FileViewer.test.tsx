@@ -1007,3 +1007,59 @@ describe("FileViewer keyboard shortcut — Alt+← / Alt+→", () => {
     document.body.removeChild(input);
   });
 });
+
+describe("FileViewer Escape closes the active tab", () => {
+  // Escape closes the open file tab via onCloseTab, but only when the press
+  // wasn't already consumed (in-file search or an overlay) and focus isn't in
+  // a text field — so dismissing a dialog or hitting Escape while typing never
+  // collapses the tab out from under the user.
+  function renderWithCloseTab(onCloseTab: () => void) {
+    useCommentsMock.mockReturnValue(makeCommentsQuery(undefined));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={["/"]}>
+          <FileViewer
+            open
+            conversationId="conv_1"
+            path="file1.py"
+            onClose={vi.fn()}
+            onCloseTab={onCloseTab}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("closes the tab on Escape when nothing else handled the key", () => {
+    const onCloseTab = vi.fn();
+    renderWithCloseTab(onCloseTab);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onCloseTab).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores Escape while focus is in a text field", () => {
+    const onCloseTab = vi.fn();
+    renderWithCloseTab(onCloseTab);
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(onCloseTab).not.toHaveBeenCalled();
+    document.body.removeChild(input);
+  });
+
+  it("ignores Escape already consumed by an overlay (defaultPrevented)", () => {
+    const onCloseTab = vi.fn();
+    renderWithCloseTab(onCloseTab);
+    // A Radix dialog dismisses on Escape in the capture phase and calls
+    // preventDefault; mirror that here so the tab-close guard bails.
+    const swallow = (e: KeyboardEvent) => {
+      if (e.key === "Escape") e.preventDefault();
+    };
+    window.addEventListener("keydown", swallow, { capture: true });
+    fireEvent.keyDown(window, { key: "Escape" });
+    window.removeEventListener("keydown", swallow, { capture: true });
+    expect(onCloseTab).not.toHaveBeenCalled();
+  });
+});
