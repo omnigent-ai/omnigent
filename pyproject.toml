@@ -58,7 +58,7 @@ dependencies = [
     # omnigent deps (runtime, spec, server, persistent terminal, etc.).
     "alembic>=1.0,<2",
     "anyio>=4.0,<5",
-    "cachetools>=5.0,<7",
+    "cachetools>=5.0,<8",
     # <8.2: click 8.2 made Context.protected_args a read-only property,
     # which breaks _HostGroup.parse_args's `ctx.protected_args = []`
     # (omnigents/cli.py) with "property 'protected_args' of 'Context'
