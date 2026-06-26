@@ -297,7 +297,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
         // conversations-sidebar only matters under the macOS Electron
         // shell, where it pushes the card below the traffic lights
         // (see the [data-electron-mac] rules in index.css).
-        "conversations-sidebar flex flex-col bg-card",
+        "conversations-sidebar flex flex-col bg-card md:select-none",
         // Mobile (default): fixed full-screen overlay, slide via
         // translate-x. Stays edge-to-edge — the floating-card
         // treatment below is desktop-only.
@@ -467,7 +467,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
                     onChange={(e) => setSearchQuery(e.target.value)}
                     aria-label="Search sessions"
                     placeholder="Search sessions"
-                    className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1"
+                    className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1 md:select-text"
                   />
                 </div>
                 <Tooltip>
@@ -2474,7 +2474,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
         onKeyDown={handleKeyDown}
         onBlur={handleBlur}
         data-testid="rename-conversation-input"
-        className="min-w-0 flex-1 truncate rounded bg-transparent px-1 py-1 text-sm outline-none"
+        className="min-w-0 flex-1 truncate rounded bg-transparent px-1 py-1 text-sm outline-none md:select-text"
       />
       <Button
         type="button"

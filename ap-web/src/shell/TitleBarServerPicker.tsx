@@ -79,7 +79,7 @@ export function TitleBarServerPicker({
   return (
     /* Sits over the drag strip; the button itself is no-drag via the blanket
        [data-electron-mac] rule in index.css, so it stays clickable. */
-    <div className="pointer-events-none absolute inset-x-0 top-0 z-40 flex h-9 justify-center">
+    <div className="pointer-events-none absolute inset-x-0 top-0 z-40 flex h-9 select-none justify-center">
       <DropdownMenu>
         <DropdownMenuTrigger
           className={cn(
