@@ -1664,7 +1664,13 @@ function ConversationRow({
             // "Pinned" section header (and pinned-first ordering inside a
             // project) already conveys the pinned state. Revealed glyph:
             // unpin if pinned, pin otherwise.
-            "hidden md:block",
+            //
+            // `md:inline-flex` (not `md:block`): the Button base is
+            // `inline-flex` and relies on it for `items-center justify-center`
+            // to center the icon. `md:block` would override that display and
+            // collapse the centering, leaving the glyph pinned to the top-left
+            // of the button — so keep the flex display when revealing it.
+            "hidden md:inline-flex",
             "md:opacity-0 md:group-hover:opacity-100",
             "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
           )}
