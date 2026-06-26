@@ -473,6 +473,55 @@ def test_git_list_changed_files_excludes_terminals_dir(tmp_path: Path) -> None:
     )
 
 
+def test_git_changed_files_suppress_ephemeral_files(tmp_path: Path) -> None:
+    """Git-backed changed files must hide temp/editor artifacts.
+
+    The non-git registry already suppresses these names when agent tools record
+    changes.  Git workspaces should behave the same way even though they read
+    from ``git status`` instead of recorded agent events.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+    ephemeral_files = [
+        "pyproject.toml.tmp.12345",
+        "pyproject.toml.tmp",
+        "notes.md~",
+        ".main.py.swp",
+        ".main.py.swo",
+        "#README.md#",
+    ]
+    for file_path in ephemeral_files:
+        (tmp_path / file_path).write_text("temporary artifact")
+    (tmp_path / "real_change.py").write_text("agent wrote this")
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    results = reg.list_changed_files("any-conv", limit=100)
+
+    paths = [r["path"] for r in results]
+    assert paths == ["real_change.py"], (
+        f"Expected only 'real_change.py', got {paths}. "
+        "Git-backed changed files should suppress temp/editor artifacts."
+    )
+    for file_path in ephemeral_files:
+        result = reg.get_changed_file("any-conv", file_path)
+        assert result is None, (
+            f"Expected get_changed_file to hide {file_path!r}, got {result!r}. "
+            "Direct file lookup should match the changed-files list."
+        )
+
+    real_result = reg.get_changed_file("any-conv", "real_change.py")
+    assert real_result is not None
+    assert real_result["status"] == "created"
+
+
 def test_git_list_changed_files_expands_untracked_nested_dir(tmp_path: Path) -> None:
     """A new file in a brand-new untracked directory tree returns its full path.
 

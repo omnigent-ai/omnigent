@@ -711,6 +711,8 @@ class GitFilesystemRegistry(FilesystemRegistry):
             rel_path = self._git_to_rel(git_path)
             if rel_path is None:
                 continue
+            if _is_ephemeral(rel_path):
+                continue
             # Skip runner-internal and build directories (e.g. terminals/,
             # node_modules/).  These are never agent-edited source files.
             first_component = Path(rel_path).parts[0] if Path(rel_path).parts else ""
@@ -734,6 +736,8 @@ class GitFilesystemRegistry(FilesystemRegistry):
         """
         norm = _normalize_path(path, self._cwd)
         if norm is None:
+            return None
+        if _is_ephemeral(norm):
             return None
         try:
             cwd_prefix = self._cwd.relative_to(self._git_root)
