@@ -235,3 +235,28 @@ describe("double-click to rename", () => {
     expect(mocks.rename.mutate).not.toHaveBeenCalled();
   });
 });
+
+describe("right-click context menu", () => {
+  it("opens the same action items as the kebab and drives the same handlers", () => {
+    renderSidebar();
+
+    // Nothing in the DOM until the row is right-clicked (the kebab menu is
+    // closed, so its items aren't rendered either).
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    // The context menu carries the full set of kebab actions — same testids,
+    // so it renders from the shared ConversationMenuItems body.
+    expect(screen.getByTestId("share-conversation")).toBeInTheDocument();
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(screen.getByTestId("move-to-project")).toBeInTheDocument();
+    expect(screen.getByTestId("archive-conversation")).toBeInTheDocument();
+    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+
+    // Selecting Rename runs the same path as the kebab / double-click: the
+    // inline rename input appears.
+    fireEvent.click(screen.getByTestId("rename-conversation"));
+    expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
+  });
+});

@@ -1,4 +1,5 @@
 import {
+  type ComponentType,
   type CSSProperties,
   type KeyboardEvent,
   type MouseEvent,
@@ -52,6 +53,16 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuSub,
+  ContextMenuSubContent,
+  ContextMenuSubTrigger,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -1372,6 +1383,305 @@ function ConversationSection({
   );
 }
 
+// The minimal item-prop shape shared by the dropdown- and context-menu
+// primitive families (both wrappers accept a superset). Typing the bundle
+// against this — rather than `ComponentProps<typeof DropdownMenuItem>` — lets
+// either family satisfy `MenuComponents` so `ConversationMenuItems` can author
+// the menu body once and render it under either menu kind.
+type MenuItemProps = {
+  children?: ReactNode;
+  className?: string;
+  disabled?: boolean;
+  variant?: "default" | "destructive";
+  // Radix's menu `onSelect` receives a native Event in both families.
+  onSelect?: (event: Event) => void;
+  "data-testid"?: string;
+};
+
+type MenuComponents = {
+  Item: ComponentType<MenuItemProps>;
+  Separator: ComponentType<{ className?: string }>;
+  Sub: ComponentType<{ children?: ReactNode }>;
+  SubTrigger: ComponentType<{
+    children?: ReactNode;
+    className?: string;
+    "data-testid"?: string;
+  }>;
+  SubContent: ComponentType<{ children?: ReactNode; className?: string }>;
+};
+
+// Two stable bundles, one per Radix menu family. Annotated so a future prop
+// divergence surfaces here rather than at the call site.
+const dropdownBundle: MenuComponents = {
+  Item: DropdownMenuItem,
+  Separator: DropdownMenuSeparator,
+  Sub: DropdownMenuSub,
+  SubTrigger: DropdownMenuSubTrigger,
+  SubContent: DropdownMenuSubContent,
+};
+
+const contextBundle: MenuComponents = {
+  Item: ContextMenuItem,
+  Separator: ContextMenuSeparator,
+  Sub: ContextMenuSub,
+  SubTrigger: ContextMenuSubTrigger,
+  SubContent: ContextMenuSubContent,
+};
+
+/**
+ * The conversation row's action menu body — authored once and rendered under
+ * both the kebab {@link DropdownMenu} and the row's right-click {@link ContextMenu}
+ * via the {@link MenuComponents} bundle, so the two menus stay identical.
+ *
+ * Radix requires a menu's Content and its Item/Sub* descendants to come from the
+ * same primitive family (roving focus / keyboard nav), so the items can't simply
+ * be shared as elements — they're rendered through the injected `components` set.
+ */
+function ConversationMenuItems({
+  components: C,
+  conversation,
+  isPinned,
+  isArchived,
+  isOwner,
+  canEdit,
+  canManage,
+  canStop,
+  currentProject,
+  onTogglePinned,
+  onProjectAssigned,
+  moveToProject,
+  stopSession,
+  setShareOpen,
+  setIsEditing,
+  setStopOpen,
+  setDeleteOpen,
+  setRemoveProjectOpen,
+  setMenuOpen,
+  runArchive,
+}: {
+  components: MenuComponents;
+  conversation: Conversation;
+  isPinned: boolean;
+  isArchived: boolean;
+  isOwner: boolean;
+  canEdit: boolean;
+  canManage: boolean;
+  canStop: boolean;
+  currentProject: string | null;
+  onTogglePinned: (conversationId: string) => void;
+  onProjectAssigned?: (projectName: string) => void;
+  moveToProject: ReturnType<typeof useMoveToProject>;
+  stopSession: ReturnType<typeof useStopSession>;
+  setShareOpen: (open: boolean) => void;
+  setIsEditing: (editing: boolean) => void;
+  setStopOpen: (open: boolean) => void;
+  setDeleteOpen: (open: boolean) => void;
+  setRemoveProjectOpen: (open: boolean) => void;
+  // Closes the controlled kebab after a project pick; a no-op for the
+  // (uncontrolled) context menu, which Radix closes on select automatically.
+  setMenuOpen: (open: boolean) => void;
+  runArchive: () => void;
+}) {
+  return (
+    <>
+      {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
+          hover-revealed quick-pin button. Archived rows omit it (archive
+          outranks pin). */}
+      {!isArchived && (
+        <C.Item
+          data-testid="pin-conversation"
+          className="md:hidden"
+          onSelect={() => onTogglePinned(conversation.id)}
+        >
+          {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+          {isPinned ? "Unpin" : "Pin"}
+        </C.Item>
+      )}
+      {canManage ? (
+        <C.Item data-testid="share-conversation" onSelect={() => setShareOpen(true)}>
+          <ShareIcon className="size-3.5" />
+          Share
+        </C.Item>
+      ) : (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div>
+              <C.Item data-testid="share-conversation" disabled>
+                <ShareIcon className="size-3.5" />
+                Share
+              </C.Item>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent side="left">
+            You need manage permissions to share this session
+          </TooltipContent>
+        </Tooltip>
+      )}
+      {canEdit ? (
+        <C.Item data-testid="rename-conversation" onSelect={() => setIsEditing(true)}>
+          <PencilIcon className="size-3.5" />
+          Rename
+        </C.Item>
+      ) : (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div>
+              <C.Item data-testid="rename-conversation" disabled>
+                <PencilIcon className="size-3.5" />
+                Rename
+              </C.Item>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent side="left">
+            You need edit permissions to rename this session
+          </TooltipContent>
+        </Tooltip>
+      )}
+      {canEdit && (
+        <C.Sub>
+          <C.SubTrigger data-testid="move-to-project" className="whitespace-nowrap">
+            <FolderInputIcon className="size-3.5" />
+            {/* "Add to project" until the session is filed, then "Move
+                session" to switch or remove it. */}
+            {currentProject ? "Move session" : "Add to project"}
+          </C.SubTrigger>
+          <C.SubContent className="w-56 p-1 [&_[role=menuitem]]:text-xs">
+            {/* A native submenu flyout — no separate popover layer, so no
+                open/dismiss race with the parent menu. */}
+            <ProjectPickerMenu
+              components={C}
+              currentProject={currentProject}
+              onSelect={(project) => {
+                setMenuOpen(false);
+                // Moving to another project is harmless — apply it now,
+                // and expand that (possibly new) project so the session
+                // is visible in it rather than hidden in a collapsed folder.
+                if (project !== "") {
+                  moveToProject.mutate({ id: conversation.id, project });
+                  onProjectAssigned?.(project);
+                  return;
+                }
+                // Removing: only confirm when this is the project's LAST
+                // session (removing it would delete the implicit project).
+                // Otherwise remove silently. The check is server-side so
+                // it's accurate regardless of the loaded window / pins.
+                void (async () => {
+                  let isLastSession = true;
+                  if (currentProject) {
+                    try {
+                      const ids = await fetchProjectSessionIds(currentProject);
+                      isLastSession = ids.every((id) => id === conversation.id);
+                    } catch {
+                      // If the check fails, fall back to confirming.
+                      isLastSession = true;
+                    }
+                  }
+                  if (isLastSession) {
+                    setRemoveProjectOpen(true);
+                  } else {
+                    moveToProject.mutate({ id: conversation.id, project: "" });
+                  }
+                })();
+              }}
+            />
+          </C.SubContent>
+        </C.Sub>
+      )}
+      {/* Stop / Archive / Delete are grouped at the bottom, below a
+          divider: lifecycle-ending actions separated from the everyday
+          ones above. */}
+      <C.Separator />
+      {/* Stop session — only on stoppable sessions whose runner isn't
+        already known-offline (canStop). Owner-gated like Delete:
+        non-owners see it disabled with an explanatory tooltip. */}
+      {canStop &&
+        (isOwner ? (
+          <C.Item
+            data-testid="stop-conversation"
+            variant="destructive"
+            onSelect={() => {
+              // Clear any prior failure so a stale "couldn't stop"
+              // message doesn't greet the next attempt. Must happen
+              // here: Radix only fires the Dialog's onOpenChange for
+              // Radix-initiated changes, not this programmatic open.
+              stopSession.reset();
+              setStopOpen(true);
+            }}
+          >
+            <CircleStopIcon className="size-3.5" />
+            Stop session
+          </C.Item>
+        ) : (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <div>
+                <C.Item data-testid="stop-conversation" disabled>
+                  <CircleStopIcon className="size-3.5" />
+                  Stop session
+                </C.Item>
+              </div>
+            </TooltipTrigger>
+            <TooltipContent side="left">
+              Only the session owner can stop this session
+            </TooltipContent>
+          </Tooltip>
+        ))}
+      {isOwner ? (
+        <C.Item data-testid="archive-conversation" onSelect={runArchive}>
+          {isArchived ? (
+            <ArchiveRestoreIcon className="size-3.5" />
+          ) : (
+            <ArchiveIcon className="size-3.5" />
+          )}
+          {isArchived ? "Unarchive" : "Archive"}
+        </C.Item>
+      ) : (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div>
+              <C.Item data-testid="archive-conversation" disabled>
+                {isArchived ? (
+                  <ArchiveRestoreIcon className="size-3.5" />
+                ) : (
+                  <ArchiveIcon className="size-3.5" />
+                )}
+                {isArchived ? "Unarchive" : "Archive"}
+              </C.Item>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent side="left">
+            Only the session owner can {isArchived ? "unarchive" : "archive"} this session
+          </TooltipContent>
+        </Tooltip>
+      )}
+      {isOwner ? (
+        <C.Item
+          data-testid="delete-conversation"
+          variant="destructive"
+          onSelect={() => setDeleteOpen(true)}
+        >
+          <Trash2Icon className="size-3.5" />
+          Delete
+        </C.Item>
+      ) : (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div>
+              <C.Item data-testid="delete-conversation" disabled>
+                <Trash2Icon className="size-3.5" />
+                Delete
+              </C.Item>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent side="left">
+            Only the session owner can delete this session
+          </TooltipContent>
+        </Tooltip>
+      )}
+    </>
+  );
+}
+
 function ConversationRow({
   conversation,
   isPinned,
@@ -1582,57 +1892,105 @@ function ConversationRow({
     });
   }
 
+  // Shared by the kebab dropdown and the right-click context menu so the two
+  // menus render identical items. `setMenuOpen` is supplied per-call (the
+  // controlled kebab passes the real setter; the uncontrolled context menu a
+  // no-op — Radix closes it on select).
+  const menuItemProps = {
+    conversation,
+    isPinned,
+    isArchived,
+    isOwner,
+    canEdit,
+    canManage,
+    canStop,
+    currentProject,
+    onTogglePinned,
+    onProjectAssigned,
+    moveToProject,
+    stopSession,
+    setShareOpen,
+    setIsEditing,
+    setStopOpen,
+    setDeleteOpen,
+    setRemoveProjectOpen,
+    runArchive,
+  };
+
+  // The clickable row surface. Extracted so it can be rendered bare (selection
+  // mode) or wrapped in the right-click ContextMenuTrigger below.
+  const rowLink = (
+    <Link
+      to={selectionMode ? "#" : `/c/${conversation.id}`}
+      className={cn(
+        "relative flex w-full flex-col gap-0.5 rounded-md px-4 py-2 text-left text-sm hover:bg-muted",
+        !selectionMode && (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-16"),
+        selectionMode && "pr-10",
+        isActive && "bg-muted",
+        selectionMode && isSelected && "bg-primary/5",
+      )}
+      onClick={(e) => {
+        if (selectionMode) {
+          e.preventDefault();
+          e.stopPropagation();
+          onToggleSelected(conversation.id);
+          return;
+        }
+        onClick(e);
+      }}
+      onDoubleClick={(e) => {
+        if (selectionMode) return;
+        if (!canEdit) return;
+        e.preventDefault();
+        setIsEditing(true);
+      }}
+      title={conversation.title ?? conversation.id}
+    >
+      {/* Row 1: the session name. Status markers (working, needs-approval,
+          unseen) render in the trailing time-marker slot below, replacing
+          the timestamp — not inline here. Leading icons (agent type, pin,
+          shared) were removed to keep rows text-clean; pinned rows still
+          group under "Pinned". */}
+      <div className="flex w-full items-center gap-1.5">
+        <span className="relative min-w-0 truncate">
+          {label}
+          {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
+        </span>
+      </div>
+      {/* Row 2: git branch subtitle, spanning the full row below. */}
+      {gitBranch !== null && (
+        <span
+          className="flex items-center gap-1 font-normal text-xs text-muted-foreground"
+          title={gitBranch}
+        >
+          <GitBranchIcon className="size-3 shrink-0" />
+          <span className="truncate">{gitBranch}</span>
+        </span>
+      )}
+    </Link>
+  );
+
   return (
     <li ref={rowRef} className="group relative">
-      <Link
-        to={selectionMode ? "#" : `/c/${conversation.id}`}
-        className={cn(
-          "relative flex w-full flex-col gap-0.5 rounded-md px-4 py-2 text-left text-sm hover:bg-muted",
-          !selectionMode &&
-            (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-16"),
-          selectionMode && "pr-10",
-          isActive && "bg-muted",
-          selectionMode && isSelected && "bg-primary/5",
-        )}
-        onClick={(e) => {
-          if (selectionMode) {
-            e.preventDefault();
-            e.stopPropagation();
-            onToggleSelected(conversation.id);
-            return;
-          }
-          onClick(e);
-        }}
-        onDoubleClick={(e) => {
-          if (selectionMode) return;
-          if (!canEdit) return;
-          e.preventDefault();
-          setIsEditing(true);
-        }}
-        title={conversation.title ?? conversation.id}
-      >
-        {/* Row 1: the session name. Status markers (working, needs-approval,
-            unseen) render in the trailing time-marker slot below, replacing
-            the timestamp — not inline here. Leading icons (agent type, pin,
-            shared) were removed to keep rows text-clean; pinned rows still
-            group under "Pinned". */}
-        <div className="flex w-full items-center gap-1.5">
-          <span className="relative min-w-0 truncate">
-            {label}
-            {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
-          </span>
-        </div>
-        {/* Row 2: git branch subtitle, spanning the full row below. */}
-        {gitBranch !== null && (
-          <span
-            className="flex items-center gap-1 font-normal text-xs text-muted-foreground"
-            title={gitBranch}
-          >
-            <GitBranchIcon className="size-3 shrink-0" />
-            <span className="truncate">{gitBranch}</span>
-          </span>
-        )}
-      </Link>
+      {/* Right-click anywhere on the row opens the same actions as the kebab.
+          Suppressed in selection mode (bulk-select owns the row), where the
+          bare link is rendered instead. ContextMenuTrigger preventDefaults the
+          native contextmenu event, so right-click never navigates; asChild
+          merges its handler onto the Link, preserving left-click / double-click. */}
+      {selectionMode ? (
+        rowLink
+      ) : (
+        <ContextMenu>
+          <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
+          <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
+            <ConversationMenuItems
+              components={contextBundle}
+              setMenuOpen={() => {}}
+              {...menuItemProps}
+            />
+          </ContextMenuContent>
+        </ContextMenu>
+      )}
       {selectionMode ? (
         <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 right-2.5 flex items-center">
           {isSelected ? (
@@ -1724,205 +2082,11 @@ function ConversationRow({
               denser kebab that reads closer to the row text. Scoped here so the
               shared dropdown-menu component is untouched. */}
           <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitem]]:text-xs">
-            {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
-                hover-revealed quick-pin button. Archived rows omit it (archive
-                outranks pin). */}
-            {!isArchived && (
-              <DropdownMenuItem
-                data-testid="pin-conversation"
-                className="md:hidden"
-                onSelect={() => onTogglePinned(conversation.id)}
-              >
-                {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
-                {isPinned ? "Unpin" : "Pin"}
-              </DropdownMenuItem>
-            )}
-            {canManage ? (
-              <DropdownMenuItem
-                data-testid="share-conversation"
-                onSelect={() => setShareOpen(true)}
-              >
-                <ShareIcon className="size-3.5" />
-                Share
-              </DropdownMenuItem>
-            ) : (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <div>
-                    <DropdownMenuItem data-testid="share-conversation" disabled>
-                      <ShareIcon className="size-3.5" />
-                      Share
-                    </DropdownMenuItem>
-                  </div>
-                </TooltipTrigger>
-                <TooltipContent side="left">
-                  You need manage permissions to share this session
-                </TooltipContent>
-              </Tooltip>
-            )}
-            {canEdit ? (
-              <DropdownMenuItem
-                data-testid="rename-conversation"
-                onSelect={() => setIsEditing(true)}
-              >
-                <PencilIcon className="size-3.5" />
-                Rename
-              </DropdownMenuItem>
-            ) : (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <div>
-                    <DropdownMenuItem data-testid="rename-conversation" disabled>
-                      <PencilIcon className="size-3.5" />
-                      Rename
-                    </DropdownMenuItem>
-                  </div>
-                </TooltipTrigger>
-                <TooltipContent side="left">
-                  You need edit permissions to rename this session
-                </TooltipContent>
-              </Tooltip>
-            )}
-            {canEdit && (
-              <DropdownMenuSub>
-                <DropdownMenuSubTrigger data-testid="move-to-project" className="whitespace-nowrap">
-                  <FolderInputIcon className="size-3.5" />
-                  {/* "Add to project" until the session is filed, then "Move
-                      session" to switch or remove it. */}
-                  {currentProject ? "Move session" : "Add to project"}
-                </DropdownMenuSubTrigger>
-                <DropdownMenuSubContent className="w-56 p-1 [&_[role=menuitem]]:text-xs">
-                  {/* A native submenu flyout — no separate popover layer, so no
-                      open/dismiss race with the parent menu. */}
-                  <ProjectPickerMenu
-                    currentProject={currentProject}
-                    onSelect={(project) => {
-                      setMenuOpen(false);
-                      // Moving to another project is harmless — apply it now,
-                      // and expand that (possibly new) project so the session
-                      // is visible in it rather than hidden in a collapsed folder.
-                      if (project !== "") {
-                        moveToProject.mutate({ id: conversation.id, project });
-                        onProjectAssigned?.(project);
-                        return;
-                      }
-                      // Removing: only confirm when this is the project's LAST
-                      // session (removing it would delete the implicit project).
-                      // Otherwise remove silently. The check is server-side so
-                      // it's accurate regardless of the loaded window / pins.
-                      void (async () => {
-                        let isLastSession = true;
-                        if (currentProject) {
-                          try {
-                            const ids = await fetchProjectSessionIds(currentProject);
-                            isLastSession = ids.every((id) => id === conversation.id);
-                          } catch {
-                            // If the check fails, fall back to confirming.
-                            isLastSession = true;
-                          }
-                        }
-                        if (isLastSession) {
-                          setRemoveProjectOpen(true);
-                        } else {
-                          moveToProject.mutate({ id: conversation.id, project: "" });
-                        }
-                      })();
-                    }}
-                  />
-                </DropdownMenuSubContent>
-              </DropdownMenuSub>
-            )}
-            {/* Stop / Archive / Delete are grouped at the bottom, below a
-                divider: lifecycle-ending actions separated from the everyday
-                ones above. */}
-            <DropdownMenuSeparator />
-            {/* Stop session — only on stoppable sessions whose runner isn't
-              already known-offline (canStop). Owner-gated like Delete:
-              non-owners see it disabled with an explanatory tooltip. */}
-            {canStop &&
-              (isOwner ? (
-                <DropdownMenuItem
-                  data-testid="stop-conversation"
-                  variant="destructive"
-                  onSelect={() => {
-                    // Clear any prior failure so a stale "couldn't stop"
-                    // message doesn't greet the next attempt. Must happen
-                    // here: Radix only fires the Dialog's onOpenChange for
-                    // Radix-initiated changes, not this programmatic open.
-                    stopSession.reset();
-                    setStopOpen(true);
-                  }}
-                >
-                  <CircleStopIcon className="size-3.5" />
-                  Stop session
-                </DropdownMenuItem>
-              ) : (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <div>
-                      <DropdownMenuItem data-testid="stop-conversation" disabled>
-                        <CircleStopIcon className="size-3.5" />
-                        Stop session
-                      </DropdownMenuItem>
-                    </div>
-                  </TooltipTrigger>
-                  <TooltipContent side="left">
-                    Only the session owner can stop this session
-                  </TooltipContent>
-                </Tooltip>
-              ))}
-            {isOwner ? (
-              <DropdownMenuItem data-testid="archive-conversation" onSelect={runArchive}>
-                {isArchived ? (
-                  <ArchiveRestoreIcon className="size-3.5" />
-                ) : (
-                  <ArchiveIcon className="size-3.5" />
-                )}
-                {isArchived ? "Unarchive" : "Archive"}
-              </DropdownMenuItem>
-            ) : (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <div>
-                    <DropdownMenuItem data-testid="archive-conversation" disabled>
-                      {isArchived ? (
-                        <ArchiveRestoreIcon className="size-3.5" />
-                      ) : (
-                        <ArchiveIcon className="size-3.5" />
-                      )}
-                      {isArchived ? "Unarchive" : "Archive"}
-                    </DropdownMenuItem>
-                  </div>
-                </TooltipTrigger>
-                <TooltipContent side="left">
-                  Only the session owner can {isArchived ? "unarchive" : "archive"} this session
-                </TooltipContent>
-              </Tooltip>
-            )}
-            {isOwner ? (
-              <DropdownMenuItem
-                data-testid="delete-conversation"
-                variant="destructive"
-                onSelect={() => setDeleteOpen(true)}
-              >
-                <Trash2Icon className="size-3.5" />
-                Delete
-              </DropdownMenuItem>
-            ) : (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <div>
-                    <DropdownMenuItem data-testid="delete-conversation" disabled>
-                      <Trash2Icon className="size-3.5" />
-                      Delete
-                    </DropdownMenuItem>
-                  </div>
-                </TooltipTrigger>
-                <TooltipContent side="left">
-                  Only the session owner can delete this session
-                </TooltipContent>
-              </Tooltip>
-            )}
+            <ConversationMenuItems
+              components={dropdownBundle}
+              setMenuOpen={setMenuOpen}
+              {...menuItemProps}
+            />
           </DropdownMenuContent>
         </DropdownMenu>
       )}
@@ -2307,9 +2471,11 @@ function ProjectFolderMenu({ projectName }: { projectName: string }) {
  * the menu's built-in typeahead and arrow-key navigation don't hijack typing.
  */
 function ProjectPickerMenu({
+  components: C,
   currentProject,
   onSelect,
 }: {
+  components: MenuComponents;
   currentProject: string | null;
   onSelect: (project: string) => void;
 }) {
@@ -2356,12 +2522,12 @@ function ProjectPickerMenu({
       </div>
       <div className="max-h-48 overflow-y-auto">
         {filtered.map((name) => (
-          <DropdownMenuItem key={name} onSelect={() => onSelect(name)}>
+          <C.Item key={name} onSelect={() => onSelect(name)}>
             <span className="flex-1 truncate text-left">{name}</span>
             {currentProject === name && (
               <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
             )}
-          </DropdownMenuItem>
+          </C.Item>
         ))}
         {filtered.length === 0 && !creatingNew && (
           <p className="px-2 py-1.5 text-xs text-muted-foreground">No projects yet.</p>
@@ -2390,7 +2556,7 @@ function ProjectPickerMenu({
             />
           </div>
         ) : (
-          <DropdownMenuItem
+          <C.Item
             // Keep the menu open so the inline input can take over in place.
             onSelect={(e) => {
               e.preventDefault();
@@ -2399,15 +2565,15 @@ function ProjectPickerMenu({
           >
             <PlusIcon className="size-3.5 shrink-0" />
             Create new project
-          </DropdownMenuItem>
+          </C.Item>
         )}
         {currentProject && (
-          <DropdownMenuItem onSelect={() => onSelect("")}>
+          <C.Item onSelect={() => onSelect("")}>
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}
             </span>
-          </DropdownMenuItem>
+          </C.Item>
         )}
       </div>
     </>
