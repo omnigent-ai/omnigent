@@ -64,6 +64,13 @@
   --color-status-yellow: var(--status-yellow);
   --color-status-red: var(--status-red);
   --color-status-gray: var(--status-gray);
+  --color-code-viewer: var(--code-viewer);
+  --color-comment-marker: var(--comment-marker);
+  --color-comment-highlight: var(--comment-highlight);
+  --color-comment-highlight-active: var(--comment-highlight-active);
+  --color-search-highlight: var(--search-highlight);
+  --color-search-highlight-current: var(--search-highlight-current);
+  --color-search-highlight-current-foreground: var(--search-highlight-current-foreground);
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
   --color-muted-foreground: var(--muted-foreground);
@@ -199,6 +206,40 @@
   --chart-3: #2ea65c;
   --chart-4: #d4972a;
   --chart-5: #8e99a4;
+  --code-viewer: var(--background);
+  --comment-marker: var(--status-yellow);
+  --comment-highlight: color-mix(in srgb, var(--status-yellow) 18%, transparent);
+  --comment-highlight-active: color-mix(in srgb, var(--status-yellow) 28%, transparent);
+  --search-highlight: color-mix(in srgb, var(--status-yellow) 45%, transparent);
+  --search-highlight-current: var(--warning);
+  --search-highlight-current-foreground: var(--foreground);
+  --selection-bg: color-mix(in srgb, var(--brand-accent) 20%, transparent);
+  --selection-fg: var(--brand-accent);
+  --avatar-fg: var(--primary-foreground);
+  --connection-end-fill: var(--background);
+  --image-checkerboard-color: color-mix(in srgb, var(--muted-foreground) 25%, transparent);
+  --shadow-color-soft: color-mix(in srgb, var(--foreground) 22%, transparent);
+  --shadow-color-medium: color-mix(in srgb, var(--foreground) 35%, transparent);
+  --shadow-highlight: color-mix(in srgb, var(--background) 72%, transparent);
+  --glass-border: color-mix(in srgb, var(--foreground) 9%, transparent);
+  --glass-border-strong: color-mix(in srgb, var(--foreground) 14%, transparent);
+  --glass-sheen: color-mix(in srgb, var(--foreground) 4%, transparent);
+  --glass-sheen-transparent: color-mix(in srgb, var(--foreground) 0%, transparent);
+  --shadow-composer-card:
+    0 12px 20px -20px color-mix(in srgb, var(--foreground) 14%, transparent),
+    0 20px 28px -28px color-mix(in srgb, var(--foreground) 10%, transparent);
+  --share-button-top: color-mix(in srgb, var(--brand-accent) 88%, white 12%);
+  --share-button-mid: var(--brand-accent);
+  --share-button-bottom: color-mix(in srgb, var(--brand-accent) 82%, black 18%);
+  --share-button-hover-top: color-mix(in srgb, var(--brand-accent) 82%, white 8%);
+  --share-button-hover-mid: color-mix(in srgb, var(--brand-accent) 88%, black 12%);
+  --share-button-hover-bottom: color-mix(in srgb, var(--brand-accent) 74%, black 26%);
+  --share-button-foreground: var(--destructive-foreground);
+  --md-alert-note: var(--status-blue);
+  --md-alert-tip: var(--status-green);
+  --md-alert-important: var(--brand-accent);
+  --md-alert-warning: var(--status-yellow);
+  --md-alert-caution: var(--status-red);
   --radius: 0.5rem;
   /* Sidebar + workspace cards are white (--card); they float on the
      * near-white .app-shell gradient canvas. --sidebar matches that
@@ -273,6 +314,37 @@
   --chart-3: oklch(0.68 0.15 145);
   --chart-4: oklch(0.75 0.16 70);
   --chart-5: oklch(0.65 0.008 240);
+  --code-viewer: var(--background);
+  --comment-marker: var(--status-yellow);
+  --comment-highlight: color-mix(in srgb, var(--status-yellow) 20%, transparent);
+  --comment-highlight-active: color-mix(in srgb, var(--status-yellow) 28%, transparent);
+  --search-highlight: color-mix(in srgb, var(--status-yellow) 36%, transparent);
+  --search-highlight-current: var(--warning);
+  --search-highlight-current-foreground: var(--foreground);
+  --selection-bg: var(--brand-accent);
+  --selection-fg: var(--primary-foreground);
+  --avatar-fg: var(--primary-foreground);
+  --connection-end-fill: var(--background);
+  --image-checkerboard-color: color-mix(in srgb, var(--muted-foreground) 22%, transparent);
+  --shadow-color-soft: color-mix(in srgb, black 28%, transparent);
+  --shadow-color-medium: color-mix(in srgb, black 55%, transparent);
+  --shadow-highlight: color-mix(in srgb, var(--foreground) 12%, transparent);
+  --glass-border: color-mix(in srgb, var(--foreground) 9%, transparent);
+  --glass-border-strong: color-mix(in srgb, var(--foreground) 14%, transparent);
+  --glass-sheen: color-mix(in srgb, var(--foreground) 4%, transparent);
+  --glass-sheen-transparent: color-mix(in srgb, var(--foreground) 0%, transparent);
+  --share-button-top: color-mix(in srgb, var(--brand-accent) 88%, white 20%);
+  --share-button-mid: var(--brand-accent);
+  --share-button-bottom: color-mix(in srgb, var(--brand-accent) 76%, black 24%);
+  --share-button-hover-top: color-mix(in srgb, var(--brand-accent) 82%, white 12%);
+  --share-button-hover-mid: color-mix(in srgb, var(--brand-accent) 88%, black 12%);
+  --share-button-hover-bottom: color-mix(in srgb, var(--brand-accent) 68%, black 32%);
+  --share-button-foreground: var(--destructive-foreground);
+  --md-alert-note: var(--status-blue);
+  --md-alert-tip: var(--status-green);
+  --md-alert-important: var(--brand-accent);
+  --md-alert-warning: var(--status-yellow);
+  --md-alert-caution: var(--status-red);
   /* bg-sidebar surfaces blend into the dark .app-shell gradient — a 45°
      * diagonal sweeping green (rgb 17,24,28) → purple (rgb 19,13,33);
      * --sidebar sits in the green-dominant region and stays translucent
@@ -365,16 +437,16 @@
    * build) collapses the pair and keeps only the last declaration. */
   -webkit-backdrop-filter: blur(32px) saturate(180%) !important;
   backdrop-filter: blur(32px) saturate(180%) !important;
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  border-top-color: rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--glass-border);
+  border-top-color: var(--glass-border-strong);
   background-image: linear-gradient(
     135deg,
-    rgba(255, 255, 255, 0.04) 0%,
-    rgba(255, 255, 255, 0) 60%
+    var(--glass-sheen) 0%,
+    var(--glass-sheen-transparent) 60%
   );
   box-shadow:
-    0 4px 16px rgba(0, 0, 0, 0.22),
-    0 1px 3px rgba(0, 0, 0, 0.16);
+    0 4px 16px var(--shadow-color-soft),
+    0 1px 3px var(--shadow-color-soft);
 }
 
 /* Side panels (FileViewer, TerminalsPanel, FilesPanelDrawer) manage their own
@@ -394,7 +466,7 @@
   /* -webkit- before unprefixed — see comment on the bg-card rule above. */
   -webkit-backdrop-filter: blur(24px) saturate(150%) !important;
   backdrop-filter: blur(24px) saturate(150%) !important;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--glass-border);
 }
 
 /* Electron desktop shell on macOS (AppShell sets data-electron-mac when the
@@ -485,11 +557,11 @@
      mid-drag — fully open the drawer covers the viewport, so its right edge (and
      the shadow) sit past the screen. iOS-only: the web overlay is unchanged. */
   [data-ios-native] .conversations-sidebar:not([data-collapsed]) {
-    box-shadow: 8px 0 28px -6px rgb(0 0 0 / 0.22);
+    box-shadow: 8px 0 28px -6px var(--shadow-color-soft);
   }
 
   .dark [data-ios-native] .conversations-sidebar:not([data-collapsed]) {
-    box-shadow: 8px 0 30px -4px rgb(0 0 0 / 0.55);
+    box-shadow: 8px 0 30px -4px var(--shadow-color-medium);
   }
 
   [data-ios-native] :is(input, textarea, select, [contenteditable="true"]) {
@@ -559,8 +631,8 @@
     -webkit-backdrop-filter: saturate(180%) blur(18px);
     backdrop-filter: saturate(180%) blur(18px);
     box-shadow:
-      0 12px 28px rgb(0 0 0 / 0.13),
-      0 1px 0 rgb(255 255 255 / 0.55) inset;
+      0 12px 28px var(--shadow-color-soft),
+      0 1px 0 var(--shadow-highlight) inset;
     font-size: 16px;
     line-height: 1;
   }
@@ -590,8 +662,8 @@
   [data-ios-native] .terminal-first-switcher-option[aria-pressed="true"] {
     background: color-mix(in srgb, var(--background) 82%, white 18%);
     box-shadow:
-      0 3px 10px rgb(0 0 0 / 0.1),
-      0 1px 0 rgb(255 255 255 / 0.72) inset;
+      0 3px 10px var(--shadow-color-soft),
+      0 1px 0 var(--shadow-highlight) inset;
   }
 
   [data-ios-native] .terminal-first-switcher-option svg {
@@ -603,15 +675,15 @@
     border-color: color-mix(in srgb, var(--border) 82%, transparent);
     background: color-mix(in srgb, var(--card) 78%, transparent);
     box-shadow:
-      0 14px 30px rgb(0 0 0 / 0.35),
-      0 1px 0 rgb(255 255 255 / 0.1) inset;
+      0 14px 30px var(--shadow-color-medium),
+      0 1px 0 var(--shadow-highlight) inset;
   }
 
   .dark [data-ios-native] .terminal-first-switcher-option[aria-pressed="true"] {
     background: color-mix(in srgb, var(--muted) 82%, white 6%);
     box-shadow:
-      0 3px 12px rgb(0 0 0 / 0.28),
-      0 1px 0 rgb(255 255 255 / 0.12) inset;
+      0 3px 12px var(--shadow-color-soft),
+      0 1px 0 var(--shadow-highlight) inset;
   }
 
   [data-ios-native]
@@ -640,28 +712,52 @@
  * the full emboss + dark depth shadow reads too heavy on the light
  * canvas. Dark mode: stronger emboss plus the grounding shadow. */
 .share-button-glassy {
-  background: linear-gradient(to bottom, #fa3d99 0%, #f22286 40%, #d51d74 100%);
+  background: linear-gradient(
+    to bottom,
+    var(--share-button-top) 0%,
+    var(--share-button-mid) 40%,
+    var(--share-button-bottom) 100%
+  );
   border: none;
   box-shadow: none;
-  color: #ffffff;
+  color: var(--share-button-foreground);
 }
 
 .share-button-glassy:hover {
   /* Darken the gradient slightly on hover */
-  background: linear-gradient(to bottom, #ec3790 0%, #e51b7d 40%, #c41a6b 100%);
+  background: linear-gradient(
+    to bottom,
+    var(--share-button-hover-top) 0%,
+    var(--share-button-hover-mid) 40%,
+    var(--share-button-hover-bottom) 100%
+  );
 }
 
 .dark .share-button-glassy {
-  background: linear-gradient(150deg, #ff4da6 0%, #f22286 40%, #b8185f 100%);
+  background: linear-gradient(
+    150deg,
+    var(--share-button-top) 0%,
+    var(--share-button-mid) 40%,
+    var(--share-button-bottom) 100%
+  );
   border: none;
   box-shadow:
-    0 4px 16px rgba(0, 0, 0, 0.5),
-    0 1px 3px rgba(0, 0, 0, 0.4);
-  color: #ffffff;
+    0 4px 16px var(--shadow-color-medium),
+    0 1px 3px var(--shadow-color-soft);
+  color: var(--share-button-foreground);
 }
 
 .dark .share-button-glassy:hover {
-  background: linear-gradient(150deg, #f0408f 0%, #e51b7d 40%, #a51455 100%);
+  background: linear-gradient(
+    150deg,
+    var(--share-button-hover-top) 0%,
+    var(--share-button-hover-mid) 40%,
+    var(--share-button-hover-bottom) 100%
+  );
+}
+
+.composer-card-shadow {
+  box-shadow: var(--shadow-composer-card);
 }
 
 @layer base {
@@ -691,12 +787,12 @@
   /* Text selection — brand pink highlight. Light: gentle wash + dark pink
    * text. Dark: solid brand pink background + white text. */
   ::selection {
-    background: color-mix(in srgb, #f22286 20%, transparent);
-    color: #f22286;
+    background: var(--selection-bg);
+    color: var(--selection-fg);
   }
   .dark ::selection {
-    background: #f22286;
-    color: #ffffff;
+    background: var(--selection-bg);
+    color: var(--selection-fg);
   }
 }
 
@@ -1183,40 +1279,24 @@
   -webkit-mask: var(--md-alert-icon) no-repeat center / contain;
 }
 .tiptap-md-content .ProseMirror blockquote[data-alert-type="note"] {
-  --md-alert-color: #0969da;
+  --md-alert-color: var(--md-alert-note);
   --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z'/%3E%3C/svg%3E");
 }
 .tiptap-md-content .ProseMirror blockquote[data-alert-type="tip"] {
-  --md-alert-color: #1a7f37;
+  --md-alert-color: var(--md-alert-tip);
   --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1.5c-2.363 0-4 1.69-4 3.75 0 .984.424 1.625.984 2.304l.214.253c.223.264.47.556.673.848.284.411.537.896.621 1.49a.75.75 0 0 1-1.484.211c-.04-.282-.163-.547-.37-.847a8.456 8.456 0 0 0-.542-.68c-.084-.1-.173-.205-.268-.32C3.201 7.75 2.5 6.766 2.5 5.25 2.5 2.31 4.863 0 8 0s5.5 2.31 5.5 5.25c0 1.516-.701 2.5-1.328 3.259-.095.115-.184.22-.268.319-.207.245-.383.453-.541.681-.208.3-.33.565-.37.847a.751.751 0 0 1-1.485-.212c.084-.593.337-1.078.621-1.489.203-.292.45-.584.673-.848.075-.088.147-.173.213-.253.561-.679.985-1.32.985-2.304 0-2.06-1.637-3.75-4-3.75ZM5.75 12h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5Zm.75 3.75a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5h-1.5a.75.75 0 0 1-.75-.75Z'/%3E%3C/svg%3E");
 }
 .tiptap-md-content .ProseMirror blockquote[data-alert-type="important"] {
-  --md-alert-color: #8250df;
+  --md-alert-color: var(--md-alert-important);
   --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M0 1.75C0 .784.784 0 1.75 0h12.5C15.216 0 16 .784 16 1.75v9.5A1.75 1.75 0 0 1 14.25 13H8.06l-2.573 2.573A1.458 1.458 0 0 1 3 14.543V13H1.75A1.75 1.75 0 0 1 0 11.25Zm1.75-.25a.25.25 0 0 0-.25.25v9.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h6.5a.25.25 0 0 0 .25-.25v-9.5a.25.25 0 0 0-.25-.25Zm7 2.25v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 9a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z'/%3E%3C/svg%3E");
 }
 .tiptap-md-content .ProseMirror blockquote[data-alert-type="warning"] {
-  --md-alert-color: #9a6700;
+  --md-alert-color: var(--md-alert-warning);
   --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z'/%3E%3C/svg%3E");
 }
 .tiptap-md-content .ProseMirror blockquote[data-alert-type="caution"] {
-  --md-alert-color: #cf222e;
+  --md-alert-color: var(--md-alert-caution);
   --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.47.22A.749.749 0 0 1 5 0h6c.199 0 .389.079.53.22l4.25 4.25c.141.14.22.331.22.53v6a.749.749 0 0 1-.22.53l-4.25 4.25a.749.749 0 0 1-.53.22H5a.749.749 0 0 1-.53-.22L.22 11.53A.749.749 0 0 1 0 11V5c0-.199.079-.389.22-.53Zm.84 1.28L1.5 5.31v5.38l3.81 3.81h5.38l3.81-3.81V5.31L10.69 1.5ZM8 4a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0v-3.5A.75.75 0 0 1 8 4Zm0 8a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z'/%3E%3C/svg%3E");
-}
-/* GitHub's dark-palette hues for the same five types. */
-.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="note"] {
-  --md-alert-color: #4493f8;
-}
-.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="tip"] {
-  --md-alert-color: #3fb950;
-}
-.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="important"] {
-  --md-alert-color: #ab7df8;
-}
-.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="warning"] {
-  --md-alert-color: #d29922;
-}
-.dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="caution"] {
-  --md-alert-color: #f85149;
 }
 .tiptap-md-content .ProseMirror code {
   font-family: var(--font-mono);

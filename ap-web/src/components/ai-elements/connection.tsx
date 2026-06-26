@@ -11,6 +11,13 @@ export const Connection: ConnectionLineComponent = ({ fromX, fromY, toX, toY }) 
       stroke="var(--color-ring)"
       strokeWidth={1}
     />
-    <circle cx={toX} cy={toY} fill="#fff" r={3} stroke="var(--color-ring)" strokeWidth={1} />
+    <circle
+      cx={toX}
+      cy={toY}
+      fill="var(--connection-end-fill)"
+      r={3}
+      stroke="var(--color-ring)"
+      strokeWidth={1}
+    />
   </g>
 );

@@ -87,10 +87,10 @@ function MarkdownPreview({ content }: { content: string }) {
 // against either light or dark backgrounds.
 const CHECKERBOARD_STYLE: React.CSSProperties = {
   backgroundImage:
-    "linear-gradient(45deg, rgba(128,128,128,0.15) 25%, transparent 25%)," +
-    "linear-gradient(-45deg, rgba(128,128,128,0.15) 25%, transparent 25%)," +
-    "linear-gradient(45deg, transparent 75%, rgba(128,128,128,0.15) 75%)," +
-    "linear-gradient(-45deg, transparent 75%, rgba(128,128,128,0.15) 75%)",
+    "linear-gradient(45deg, var(--image-checkerboard-color) 25%, transparent 25%)," +
+    "linear-gradient(-45deg, var(--image-checkerboard-color) 25%, transparent 25%)," +
+    "linear-gradient(45deg, transparent 75%, var(--image-checkerboard-color) 75%)," +
+    "linear-gradient(-45deg, transparent 75%, var(--image-checkerboard-color) 75%)",
   backgroundSize: "16px 16px",
   backgroundPosition: "0 0, 0 8px, 8px -8px, -8px 0",
 };
@@ -606,8 +606,8 @@ export function CodeViewer({
         </div>
       )}
 
-      {/* GitHub Light/Dark backgrounds match the shiki themes used by highlightCode */}
-      <div ref={codeContainerRef} className="font-mono text-xs bg-white dark:bg-[#0d1117]">
+      {/* Code surface is tokenized; Shiki token colors still come from the loaded theme. */}
+      <div ref={codeContainerRef} className="font-mono text-xs bg-code-viewer">
         {rawLines.map((rawLine, idx) => {
           const lineNum = idx + 1;
           const isMatchLine =
@@ -665,9 +665,9 @@ export function CodeViewer({
                     "relative w-12 shrink-0 select-none border-r border-border text-xs",
                     "flex items-center justify-end px-2 py-0.5 leading-5",
                     commentOnLine
-                      ? "cursor-pointer text-yellow-500 dark:text-yellow-400 hover:bg-muted/60"
+                      ? "cursor-pointer text-comment-marker hover:bg-muted/60"
                       : "text-muted-foreground/50",
-                    hasAnyHighlight && "bg-yellow-500/10 dark:bg-yellow-400/15",
+                    hasAnyHighlight && "bg-comment-highlight",
                   )}
                   onClick={() => {
                     if (commentOnLine) {
@@ -699,9 +699,7 @@ export function CodeViewer({
                       aria-hidden
                       className={cn(
                         "absolute inset-y-0 pointer-events-none",
-                        o.isSelected
-                          ? "bg-yellow-400/25 dark:bg-yellow-400/25"
-                          : "bg-yellow-200/40 dark:bg-yellow-400/20",
+                        o.isSelected ? "bg-comment-highlight-active" : "bg-comment-highlight",
                       )}
                       style={{
                         left: `calc(0.75rem + ${o.startCol}ch)`,
@@ -719,7 +717,7 @@ export function CodeViewer({
                     ) && (
                       <span
                         aria-hidden
-                        className="absolute inset-y-0 bg-yellow-400/25 dark:bg-yellow-400/25 pointer-events-none"
+                        className="absolute inset-y-0 bg-comment-highlight-active pointer-events-none"
                         style={{
                           left: `calc(0.75rem + ${selStartCol}ch)`,
                           width: `${selEndCol - selStartCol}ch`,

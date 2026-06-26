@@ -425,7 +425,7 @@ function MarkdownRichTextViewerInner({
         )}
         <EditorContent
           editor={editor}
-          className="outline-none max-w-none text-sm text-foreground [&_*::selection]:bg-blue-300/40 [&_*::selection]:text-foreground [&::selection]:bg-blue-300/40 [&::selection]:text-foreground tiptap-md-content"
+          className="outline-none max-w-none text-sm text-foreground [&_*::selection]:bg-[var(--selection-bg)] [&_*::selection]:text-[var(--selection-fg)] [&::selection]:bg-[var(--selection-bg)] [&::selection]:text-[var(--selection-fg)] tiptap-md-content"
         />
       </div>
       {canEdit && editor && (

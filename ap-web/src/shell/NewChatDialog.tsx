@@ -1485,17 +1485,20 @@ export function NewChatLandingScreen() {
       ? PENDING_AGENT_ID
       : ((agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ??
         null);
-  const selectedAgent =
-    effectiveAgentId === PENDING_AGENT_ID && pendingAgent
-      ? ({
-          id: PENDING_AGENT_ID,
-          name: pendingAgent.name,
-          display_name: pendingAgent.name,
-          description: pendingAgent.description ?? null,
-          harness: pendingAgent.harness ?? null,
-          skills: [],
-        } satisfies AvailableAgent)
-      : agentList.find((a) => a.id === effectiveAgentId);
+  const selectedAgent = useMemo(
+    () =>
+      effectiveAgentId === PENDING_AGENT_ID && pendingAgent
+        ? ({
+            id: PENDING_AGENT_ID,
+            name: pendingAgent.name,
+            display_name: pendingAgent.name,
+            description: pendingAgent.description ?? null,
+            harness: pendingAgent.harness ?? null,
+            skills: [],
+          } satisfies AvailableAgent)
+        : agentList.find((a) => a.id === effectiveAgentId),
+    [agentList, effectiveAgentId, pendingAgent],
+  );
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
@@ -2012,7 +2015,7 @@ export function NewChatLandingScreen() {
             // translucent card. Mirrors the chat composer card. Drag-over
             // lifts an inset ring (overlay below).
             className={cn(
-              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-[0_12px_20px_-20px_rgba(0,0,0,0.14),0_20px_28px_-28px_rgba(0,0,0,0.1)] transition-[border-color,box-shadow] duration-150 has-[textarea:focus]:border-foreground",
+              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid composer-card-shadow transition-[border-color,box-shadow] duration-150 has-[textarea:focus]:border-foreground",
               isDragActive && "ring-2 ring-ring ring-inset",
             )}
             data-testid="new-chat-landing-composer"

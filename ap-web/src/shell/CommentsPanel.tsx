@@ -11,7 +11,10 @@ import type { ActiveSelection } from "./codeViewerHelpers";
 function avatarStyle(name: string): { backgroundColor: string; color: string } {
   let hash = 0;
   for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
-  return { backgroundColor: `hsl(${hash % 360} 60% 50%)`, color: "white" };
+  return {
+    backgroundColor: `color-mix(in hsl longer hue, var(--brand-accent) ${hash % 100}%, var(--status-blue))`,
+    color: "var(--avatar-fg)",
+  };
 }
 
 function formatCommentTime(createdAt: number): string {
@@ -101,7 +104,7 @@ export function CommentsPanel({
   useEffect(() => {
     setBody("");
     if (pendingBodyRef) pendingBodyRef.current = "";
-  }, [activeSelection?.start_index, activeSelection?.end_index]);
+  }, [activeSelection?.start_index, activeSelection?.end_index, pendingBodyRef]);
 
   // Auto-focus the textarea when a new pending selection appears (no existing
   // comment at that range) so the user can start typing immediately.
@@ -116,7 +119,7 @@ export function CommentsPanel({
       const id = requestAnimationFrame(() => addCommentTextareaRef.current?.focus());
       return () => cancelAnimationFrame(id);
     }
-  }, [activeSelection?.start_index, activeSelection?.end_index, comments]);
+  }, [activeSelection, comments]);
 
   return (
     <div

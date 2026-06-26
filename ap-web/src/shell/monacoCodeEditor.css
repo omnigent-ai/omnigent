@@ -5,16 +5,16 @@
 
 /* Saved comment range — dim highlight. */
 .oa-comment {
-  background-color: rgba(250, 204, 21, 0.2);
+  background-color: var(--comment-highlight);
 }
 /* The active comment, or a not-yet-saved selection — stronger highlight. */
 .oa-comment-active {
-  background-color: rgba(250, 204, 21, 0.38);
+  background-color: var(--comment-highlight-active);
 }
 /* The dim highlight reads the same in dark mode, so only the active color
    needs a dark override (softer so it doesn't overpower the dark canvas). */
 .dark .oa-comment-active {
-  background-color: rgba(250, 204, 21, 0.3);
+  background-color: var(--comment-highlight-active);
 }
 
 /* In dark mode, paint the editor surface with the app's --card tone instead of

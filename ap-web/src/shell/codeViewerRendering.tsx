@@ -77,8 +77,8 @@ export function renderLineTokens(
               key={si}
               className={
                 isCurrentMatch
-                  ? "rounded-sm bg-orange-400 text-black"
-                  : "rounded-sm bg-yellow-300/80"
+                  ? "rounded-sm bg-search-highlight-current text-search-highlight-current-foreground"
+                  : "rounded-sm bg-search-highlight"
               }
             >
               {seg.text}
