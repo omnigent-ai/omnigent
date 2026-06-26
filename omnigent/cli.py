@@ -7985,10 +7985,7 @@ def _node_dependency_problem() -> str | None:
     """
     node = shutil.which("node")
     if node is None:
-        return (
-            "node not found on PATH — the Claude, Codex, and Pi harnesses need "
-            f"{_NODE_MIN_VERSION_HINT}."
-        )
+        return f"node not found — Claude, Codex, and Pi need {_NODE_MIN_VERSION_HINT}."
     # Probe the exact API the bundled undici calls. Exit 0 ⇒ capability
     # present; exit 1 ⇒ too old; we treat any other failure as inconclusive.
     probe = (
@@ -8008,11 +8005,7 @@ def _node_dependency_problem() -> str | None:
         return None
     version = _node_version(node)
     detected = f" (detected {version})" if version else ""
-    return (
-        f"Node.js is too old for the bundled harness CLIs{detected} — they need "
-        f"{_NODE_MIN_VERSION_HINT}. Symptom if unfixed: "
-        "'TypeError: webidl.util.markAsUncloneable is not a function'."
-    )
+    return f"Node.js is too old{detected} — Claude, Codex, and Pi need {_NODE_MIN_VERSION_HINT}."
 
 
 @contextlib.contextmanager
@@ -8183,20 +8176,15 @@ def _warn_missing_harness_dependencies() -> None:
         problems.append(node_problem)
     if shutil.which("tmux") is None:
         problems.append(
-            "tmux not found on PATH — `omnigent claude` and `omnigent codex` launch "
-            "the agent through a local tmux terminal and refuse to start without it "
-            "(macOS: `brew install tmux`)."
+            "tmux not found — native Claude/Codex need tmux (macOS: `brew install tmux`)."
         )
     if not problems:
         return
-    ui.err_console.print()
-    ui.warn("External tooling needed for some harnesses is missing or outdated:")
+    ui.warn("Some harnesses need external tools:")
     for problem in problems:
         ui.err_console.print(f"  • {problem}", style="omni.warning", markup=False)
     ui.err_console.print(
-        "You can still configure credentials — the pure-Python openai-agents harness "
-        "runs without these — but install them before `omnigent claude` / "
-        "`omnigent codex` or the Pi harness.\n",
+        "You can configure credentials now; install these before launching those harnesses.",
         style="omni.warning",
         markup=False,
     )
@@ -9136,6 +9124,9 @@ class _HarnessMenuRow:
     provider: str | None = None
 
 
+_SOFT_INSTALL_ABORT = "\x00soft-install-abort"
+
+
 def _credential_label(name: str, entry: ProviderEntry) -> str:
     """A friendly, jargon-free label for a configured credential.
 
@@ -9346,10 +9337,12 @@ def _prompt_install_cursor() -> str | None:
             return "✓ cursor-sdk installed"
         console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
         return "✗ Install failed — set the key anyway, or install by hand"
+    if choice < 0:
+        return _SOFT_INSTALL_ABORT
     if choice == 2:  # run it yourself
         console.print(f"  Install the cursor extra with:\n    [bold]{cmd_markup}[/bold]")
         return None
-    # choice == 1 (set key anyway) or Esc: fall through to the key menu silently.
+    # choice == 1 (set key anyway): fall through to the key menu silently.
     return None
 
 
@@ -9387,6 +9380,8 @@ def _manage_cursor_harness() -> None:
     status: str | None = None
     if not cursor_sdk_installed():
         status = _prompt_install_cursor()
+        if status == _SOFT_INSTALL_ABORT:
+            return
     while True:
         config = _load_global_config()
         key_set = cursor_api_key_configured(config)
@@ -9516,10 +9511,12 @@ def _prompt_install_antigravity() -> str | None:
             return "✓ google-antigravity installed"
         console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
         return "✗ Install failed — set the key anyway, or install by hand"
+    if choice < 0:
+        return _SOFT_INSTALL_ABORT
     if choice == 2:
         console.print(f"  Install the antigravity extra with:\n    [bold]{cmd_markup}[/bold]")
         return None
-    # choice == 1 (set key anyway) or Esc: fall through to the key menu silently.
+    # choice == 1 (set key anyway): fall through to the key menu silently.
     return None
 
 
@@ -9553,6 +9550,8 @@ def _manage_antigravity_harness() -> None:
     status: str | None = None
     if not antigravity_sdk_installed():
         status = _prompt_install_antigravity()
+        if status == _SOFT_INSTALL_ABORT:
+            return
     while True:
         config = _load_global_config()
         key_set = antigravity_api_key_configured(config)
@@ -10195,10 +10194,12 @@ def _prompt_install_copilot() -> str | None:
             return "✓ github-copilot-sdk installed"
         console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
         return "✗ Install failed — set the token anyway, or install by hand"
+    if choice < 0:
+        return _SOFT_INSTALL_ABORT
     if choice == 2:  # run it yourself
         console.print(f"  Install the copilot extra with:\n    [bold]{cmd_markup}[/bold]")
         return None
-    # choice == 1 (set token anyway) or Esc: fall through to the token menu silently.
+    # choice == 1 (set token anyway): fall through to the token menu silently.
     return None
 
 
@@ -10238,6 +10239,8 @@ def _manage_copilot_harness() -> None:
     status: str | None = None
     if not copilot_sdk_installed():
         status = _prompt_install_copilot()
+        if status == _SOFT_INSTALL_ABORT:
+            return
     while True:
         config = _load_global_config()
         token_set = copilot_github_token_configured(config)
@@ -10836,8 +10839,8 @@ def _run_configure_harnesses_interactive() -> None:
     newly auto-configured machine credentials in a callout — then loops on
     the level-1 harness overview. Every harness is shown on a single compact
     row — the harness name on the left, then an aligned ``✓``/``✗`` status
-    column (the configured credential, or "Not installed" / "No
-    credential") — in 0.3 priority order: Claude, Codex, Cursor, OpenCode,
+    column (the configured credential, or "Not installed" / "Not configured")
+    — in 0.3 priority order: Claude, Codex, Cursor, OpenCode,
     Hermes, Pi, then Antigravity, Qwen Code, Goose, Copilot, Kiro, Kimi Code.
     The actionable hint (install command / next step) renders only for the
     highlighted row, as the selector's description line, so the overview stays
@@ -10847,6 +10850,7 @@ def _run_configure_harnesses_interactive() -> None:
         the backfill/adopt steps and any add/set-default/remove the user
         performs while navigating.
     """
+    from rich.cells import cell_len
     from rich.markup import escape
 
     from omnigent.onboarding.antigravity_auth import (
@@ -10953,6 +10957,22 @@ def _run_configure_harnesses_interactive() -> None:
         # parsing as Rich markup.
         return f"Install with `{escape(command)}`"
 
+    def _truncate_cells(text: str, max_cells: int) -> str:
+        """Truncate *text* to a terminal-cell budget, adding an ellipsis if needed."""
+        if cell_len(text) <= max_cells:
+            return text
+        ellipsis = "…"
+        budget = max(0, max_cells - cell_len(ellipsis))
+        out: list[str] = []
+        used = 0
+        for ch in text:
+            width = cell_len(ch)
+            if used + width > budget:
+                break
+            out.append(ch)
+            used += width
+        return "".join(out) + ellipsis
+
     def _family_row(fam: str) -> tuple[str, str, str, str, str]:
         # Claude / Codex / Pi: a CLI binary plus a usable default credential.
         # Pi's default is its *effective* one (explicit pi scope, else the
@@ -11035,15 +11055,17 @@ def _run_configure_harnesses_interactive() -> None:
                 ),
             )
 
-        # Hermes — curl-installed, no Omnigent credential, so readiness is just
-        # the binary.
+        # Hermes — curl-installed, but provider/model config is opaque until
+        # `hermes model` has been run. Treat an installed binary as
+        # "not configured" rather than ready so setup does not overstate the
+        # state of a fresh install.
         if harness_cli_installed(HERMES_KEY):
             rows.append(
                 (
                     _HERMES,
                     "Hermes",
-                    "Installed",
-                    "ready",
+                    "Not configured",
+                    "warn",
                     "Open to configure with `hermes model`.",
                 ),
             )
@@ -11155,9 +11177,13 @@ def _run_configure_harnesses_interactive() -> None:
                 ),
             )
 
-        # Kiro — native CLI, own auth via `kiro-cli login`.
+        # Kiro — native CLI, own auth via `kiro-cli login`; there is no
+        # reliable local status probe, so an installed binary is still only
+        # "not configured" until the user signs in.
         if harness_cli_installed(KIRO_KEY):
-            rows.append((_KIRO, "Kiro", "Installed", "ready", "Sign in with `kiro-cli login`."))
+            rows.append(
+                (_KIRO, "Kiro", "Not configured", "warn", "Sign in with `kiro-cli login`.")
+            )
         else:
             kiro_spec = harness_install_spec(KIRO_KEY)
             kiro_hint = (
@@ -11167,37 +11193,41 @@ def _run_configure_harnesses_interactive() -> None:
             )
             rows.append((_KIRO, "Kiro", "Not installed", "missing", _install_hint(kiro_hint)))
 
-        # Kimi Code — native CLI, own auth via `kimi login`. Curl-installed
-        # (no npm package), so use its install_hint.
+        # Kimi Code — native CLI, own auth via `kimi login`; there is no local
+        # login status probe yet. Curl-installed (no npm package), so use its
+        # install_hint when absent and show "not configured" when present.
         if harness_cli_installed(KIMI_KEY):
-            rows.append((_KIMI, "Kimi Code", "Installed", "ready", "Sign in with `kimi login`."))
+            rows.append(
+                (_KIMI, "Kimi Code", "Not configured", "warn", "Sign in with `kimi login`.")
+            )
         else:
             kimi_spec = harness_install_spec(KIMI_KEY)
             kimi_hint = (kimi_spec.install_hint if kimi_spec else None) or "see Kimi Code docs"
             rows.append((_KIMI, "Kimi Code", "Not installed", "missing", _install_hint(kimi_hint)))
         return rows
 
-    # Cap the status text so one verbose row (e.g. an OpenCode summary listing
-    # several providers) can't run off a narrow terminal.
-    max_status_width = 30
-
     while True:
         config = _load_global_config()
         harness_rows = build_harness_rows()
-        # Left-align the status into a single column a fixed gutter right of the
-        # names, so every ✓/✗ glyph lines up vertically (a ragged right-aligned
+        # Place the status in a single column a fixed gutter right of the names,
+        # so every ✓/✗ glyph lines up vertically (the earlier right-aligned
         # status scattered the glyphs and read as messy). The name column is the
         # widest harness name + a 4-space gutter; the status is escaped when
         # interpolated into markup so a credential label containing a ``[`` can't
         # parse as a Rich tag (descriptions are escaped the same way).
         name_col = max(len(name) for _t, name, *_rest in harness_rows) + 4
+        term_width = max(40, shutil.get_terminal_size(fallback=(80, 24)).columns)
+        # _render_menu prefixes selected rows with ``"    ❯  "`` (7 cells).
+        # Cap the status text from the actual terminal width so verbose status
+        # rows (e.g. OpenCode's provider summary) do not wrap in the compact
+        # single-line overview.
+        max_status_width = max(8, min(30, term_width - 7 - name_col - len("✓ ")))
         options: list[str] = []
         selectable: list[bool] = []
         row_target: list[str | None] = []
         descriptions: list[str] = []
         for target, name, status_text, kind, desc in harness_rows:
-            if len(status_text) > max_status_width:
-                status_text = status_text[: max_status_width - 1] + "…"
+            status_text = _truncate_cells(status_text, max_status_width)
             glyph, color = status_styles[kind]
             options.append(f"{name.ljust(name_col)}[{color}]{glyph} {escape(status_text)}[/]")
             selectable.append(True)
@@ -11262,8 +11292,14 @@ def setup(internal_beta: bool) -> None:
     """
     from omnigent.inner import ui
 
-    # Brand lockup at the top of the first-run experience (TTY-gated).
-    ui.print_landing(tagline="all your agents, one cli")
+    # Brand the first-run experience without pushing the actual picker below a
+    # typical 80×24 terminal. The full lockup is great in roomy terminals, but
+    # on short terminals it combines with the missing-tool warning and scrolls
+    # the menu off the first screen.
+    if shutil.get_terminal_size(fallback=(80, 24)).lines >= 32:
+        ui.print_landing(tagline="all your agents, one cli")
+    else:
+        ui.print_brandmark("setup")
 
     if internal_beta:
         # The internal-beta workspace defaults are excluded from the public OSS
