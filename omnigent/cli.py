@@ -10951,12 +10951,15 @@ def _run_configure_harnesses_interactive() -> None:
     _KIMI = "\x00kimi"
     families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE]
 
-    # Status glyph + Rich color per readiness kind: "ready" is a configured,
-    # launchable harness (green ✓); "missing" is an absent CLI/SDK (red ✗);
-    # "warn" is installed-but-unconfigured (yellow ✗ — present, not usable
-    # yet). The glyph leads the status, which sits in a left-aligned column
-    # right of the names, so every ✓/✗ lines up in a single column.
-    status_styles = {"ready": ("✓", "green"), "missing": ("✗", "red"), "warn": ("✗", "yellow")}
+    # Status glyph, Rich color, taxonomy label, and detail label per readiness
+    # kind. The labels make the overview scannable without reading prose:
+    # ready rows show the credential/status they will use, while non-ready rows
+    # show the exact next action in a dedicated column.
+    status_styles = {
+        "ready": ("✓", "green", "READY", "using"),
+        "missing": ("!", "red", "NOT INSTALLED", "install"),
+        "warn": ("!", "yellow", "NOT CONFIGURED", "fix"),
+    }
 
     def _install_hint(command: str) -> str:
         # Selection-only tooltip. The command is escaped so a bracketed extra
@@ -11216,27 +11219,30 @@ def _run_configure_harnesses_interactive() -> None:
     while True:
         config = _load_global_config()
         harness_rows = build_harness_rows()
-        # Place the status in a single column a fixed gutter right of the names,
-        # so every ✓/✗ glyph lines up vertically (the earlier right-aligned
-        # status scattered the glyphs and read as messy). The name column is the
-        # widest harness name + a 4-space gutter; the status is escaped when
-        # interpolated into markup so a credential label containing a ``[`` can't
-        # parse as a Rich tag (descriptions are escaped the same way).
+        # The name, state, and action/detail columns are aligned so the user can
+        # answer "ready?" and "what next?" by scanning vertically.
         name_col = max(len(name) for _t, name, *_rest in harness_rows) + 4
+        state_col = max(len(label) for _, _, label, _ in status_styles.values()) + 3
         term_width = max(40, shutil.get_terminal_size(fallback=(80, 24)).columns)
         # _render_menu prefixes selected rows with ``"    ❯  "`` (7 cells).
-        # Cap the status text from the actual terminal width so verbose status
-        # rows (e.g. OpenCode's provider summary) do not wrap in the compact
-        # single-line overview.
-        max_status_width = max(8, min(30, term_width - 7 - name_col - len("✓ ")))
+        # Cap the detail text from the actual terminal width so verbose status
+        # rows do not wrap in the compact single-line overview.
+        detail_prefix_width = len("install: ")
+        max_detail_width = max(8, term_width - 7 - name_col - state_col - detail_prefix_width)
+
         options: list[str] = []
         selectable: list[bool] = []
         row_target: list[str | None] = []
         descriptions: list[str] = []
         for target, name, status_text, kind, desc in harness_rows:
-            status_text = _truncate_cells(status_text, max_status_width)
-            glyph, color = status_styles[kind]
-            options.append(f"{name.ljust(name_col)}[{color}]{glyph} {escape(status_text)}[/]")
+            glyph, color, label, detail_label = status_styles[kind]
+            detail_text = status_text if kind == "ready" else desc
+            detail_text = _truncate_cells(detail_text, max_detail_width)
+            state = f"{glyph} {label}"
+            state_str = f"[{color}]{state.ljust(state_col)}[/]"
+            detail = f"[{color}]{detail_label}:[/] {escape(detail_text)}"
+
+            options.append(f"{name.ljust(name_col)}{state_str}{detail}")
             selectable.append(True)
             row_target.append(target)
             descriptions.append(desc)
