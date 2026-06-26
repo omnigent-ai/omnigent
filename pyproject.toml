@@ -251,6 +251,19 @@ dev = [
 omnigent = "omnigent.cli:main"
 omni = "omnigent.cli:main"
 
+# Security floors for transitive dependencies that have an open advisory but
+# that Dependabot can't fix on this uv workspace (it does not regenerate
+# uv.lock). These constraints force the patched version during resolution
+# without adding a direct dependency. Drop an entry once the package is back
+# to a normal in-range transitive dependency.
+#   - cryptography      >=48.0.1: GHSA-537c-gmf6-5ccf (high)
+#   - pydantic-settings >=2.14.2: GHSA-4xgf-cpjx-pc3j (medium)
+[tool.uv]
+constraint-dependencies = [
+    "cryptography>=48.0.1",
+    "pydantic-settings>=2.14.2",
+]
+
 # uv path-deps for the sibling SDK packages (renamed in Stage 3).
 [tool.uv.sources]
 omnigent-client = { path = "sdks/python-client", editable = true }
