@@ -709,7 +709,7 @@ function LandingProjectPicker({
           <TagIcon className="size-4 shrink-0" />
           {/* Label collapses to icon-only on narrow viewports (mobile),
               matching the host/workspace/worktree chips. */}
-          <span className={`hidden max-w-20 truncate sm:block ${value ? "text-foreground" : ""}`}>
+          <span className={`hidden max-w-16 truncate sm:block ${value ? "text-foreground" : ""}`}>
             {value || "No project"}
           </span>
           <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
@@ -1966,7 +1966,7 @@ export function NewChatLandingScreen() {
           tight so a long working-directory path truncates instead of pushing
           the chip row onto a second line. */}
       <span
-        className={`hidden max-w-24 truncate sm:block ${workspaceTrimmed !== "" ? "text-foreground" : ""}`}
+        className={`hidden max-w-20 truncate sm:block ${workspaceTrimmed !== "" ? "text-foreground" : ""}`}
       >
         {workspaceLabel}
       </span>
@@ -2415,7 +2415,7 @@ export function NewChatLandingScreen() {
                     >
                       <GitBranchIcon className="size-4 shrink-0" />
                       <span
-                        className={`hidden max-w-24 truncate sm:block ${sandboxRepoName ? "text-foreground" : "text-muted-foreground"}`}
+                        className={`hidden max-w-20 truncate sm:block ${sandboxRepoName ? "text-foreground" : "text-muted-foreground"}`}
                       >
                         {sandboxRepoLabel}
                       </span>
@@ -2528,7 +2528,7 @@ export function NewChatLandingScreen() {
                     >
                       <GitBranchIcon className="size-4 shrink-0" />
                       <span
-                        className={`hidden max-w-20 truncate sm:block ${branchName.trim() ? "text-foreground" : ""}`}
+                        className={`hidden max-w-16 truncate sm:block ${branchName.trim() ? "text-foreground" : ""}`}
                       >
                         {worktreeLabel}
                       </span>
