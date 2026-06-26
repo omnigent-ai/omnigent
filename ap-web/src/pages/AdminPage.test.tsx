@@ -51,22 +51,25 @@ describe("AdminPage", () => {
 
   it("lists users for an admin, with role badges and a cost rollup", async () => {
     vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
-    vi.mocked(adminApi.listAllUsers).mockResolvedValue([
-      {
-        user_id: "boss@example.com",
-        is_admin: true,
-        cost_usd: 0,
-        total_tokens: 0,
-        session_count: 0,
-      },
-      {
-        user_id: "alice@example.com",
-        is_admin: false,
-        cost_usd: 2,
-        total_tokens: 1500,
-        session_count: 2,
-      },
-    ]);
+    vi.mocked(adminApi.listAllUsers).mockResolvedValue({
+      users: [
+        {
+          user_id: "boss@example.com",
+          is_admin: true,
+          cost_usd: 0,
+          total_tokens: 0,
+          session_count: 0,
+        },
+        {
+          user_id: "alice@example.com",
+          is_admin: false,
+          cost_usd: 2,
+          total_tokens: 1500,
+          session_count: 2,
+        },
+      ],
+      hidden: 1,
+    });
 
     renderPage();
 
@@ -82,19 +85,24 @@ describe("AdminPage", () => {
     expect(within(aliceRow).getByText("Member")).toBeTruthy();
     expect(within(aliceRow).getByText("$2.00")).toBeTruthy();
     expect(within(aliceRow).getByText("1.5K")).toBeTruthy();
+    // The hidden-phantom count is surfaced (singular wording for 1).
+    expect(screen.getByText(/1 invite-only account hidden/i)).toBeTruthy();
   });
 
   it("loads a user's sessions on selection, shows cost, and links into chat", async () => {
     vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
-    vi.mocked(adminApi.listAllUsers).mockResolvedValue([
-      {
-        user_id: "alice@example.com",
-        is_admin: false,
-        cost_usd: 2.5,
-        total_tokens: 4200,
-        session_count: 1,
-      },
-    ]);
+    vi.mocked(adminApi.listAllUsers).mockResolvedValue({
+      users: [
+        {
+          user_id: "alice@example.com",
+          is_admin: false,
+          cost_usd: 2.5,
+          total_tokens: 4200,
+          session_count: 1,
+        },
+      ],
+      hidden: 0,
+    });
     vi.mocked(adminApi.listUserSessions).mockResolvedValue({
       sessions: [
         {
@@ -132,15 +140,18 @@ describe("AdminPage", () => {
 
   it("marks an invited (non-owner) session with its role and owner", async () => {
     vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
-    vi.mocked(adminApi.listAllUsers).mockResolvedValue([
-      {
-        user_id: "btallman@example.com",
-        is_admin: false,
-        cost_usd: 0,
-        total_tokens: 0,
-        session_count: 0,
-      },
-    ]);
+    vi.mocked(adminApi.listAllUsers).mockResolvedValue({
+      users: [
+        {
+          user_id: "btallman@example.com",
+          is_admin: false,
+          cost_usd: 0,
+          total_tokens: 0,
+          session_count: 0,
+        },
+      ],
+      hidden: 0,
+    });
     vi.mocked(adminApi.listUserSessions).mockResolvedValue({
       sessions: [
         {

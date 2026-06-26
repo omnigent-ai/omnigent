@@ -32,6 +32,7 @@ export function AdminPage() {
   const [isAdmin, setIsAdmin] = useState<boolean | null>(null);
   const [meId, setMeId] = useState<string | null>(null);
   const [users, setUsers] = useState<AdminUser[] | null>(null);
+  const [hiddenCount, setHiddenCount] = useState(0);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [selectedUser, setSelectedUser] = useState<string | null>(null);
@@ -40,16 +41,18 @@ export function AdminPage() {
   const [sessionsLoading, setSessionsLoading] = useState(false);
 
   const refreshUsers = useCallback(async () => {
-    const list = await listAllUsers();
-    if (list === null) {
+    const result = await listAllUsers();
+    if (result === null) {
       setLoadError(
         "Could not load users. You may not have admin permission, or the server is unreachable.",
       );
       setUsers([]);
+      setHiddenCount(0);
       return;
     }
     setLoadError(null);
-    setUsers(list);
+    setUsers(result.users);
+    setHiddenCount(result.hidden);
   }, []);
 
   // Initial load: resolve identity to gate the page, then list users.
@@ -109,7 +112,17 @@ export function AdminPage() {
         </div>
       )}
 
-      <h2 className="mb-2 text-sm font-medium text-muted-foreground">Users</h2>
+      <div className="mb-2 flex items-baseline justify-between">
+        <h2 className="text-sm font-medium text-muted-foreground">Users</h2>
+        {hiddenCount > 0 && (
+          <span
+            className="text-xs text-muted-foreground"
+            title="Accounts that own no session and only have an invite (read/edit/manage) grant — created when a session was shared with them. Admins and logged-in users are never hidden."
+          >
+            {hiddenCount} invite-only {hiddenCount === 1 ? "account" : "accounts"} hidden
+          </span>
+        )}
+      </div>
       {users !== null && users.length > 0 && (
         <div className="overflow-hidden rounded-md border border-border">
           <table className="w-full text-sm">

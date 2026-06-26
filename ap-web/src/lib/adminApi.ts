@@ -20,6 +20,13 @@ export interface AdminUser {
   session_count: number;
 }
 
+/** Response of ``GET /v1/admin/users``. */
+export interface AdminUserList {
+  users: AdminUser[];
+  /** Count of invite-only phantom accounts filtered out of ``users``. */
+  hidden: number;
+}
+
 /** A session row from ``GET /v1/admin/users/{id}/sessions``. */
 export interface AdminSession {
   id: string;
@@ -50,16 +57,17 @@ export interface AdminUserSessions {
 }
 
 /**
- * GET /v1/admin/users — list every real user (admin only).
+ * GET /v1/admin/users — list every real user + the hidden-phantom count
+ * (admin only).
  *
- * :returns: The user list, or ``null`` on error / forbidden.
+ * :returns: ``{users, hidden}``, or ``null`` on error / forbidden.
  */
-export async function listAllUsers(): Promise<AdminUser[] | null> {
+export async function listAllUsers(): Promise<AdminUserList | null> {
   try {
     const res = await authenticatedFetch("/v1/admin/users");
     if (!res.ok) return null;
-    const data = (await res.json()) as { users: AdminUser[] };
-    return data.users;
+    const data = (await res.json()) as { users: AdminUser[]; hidden?: number };
+    return { users: data.users, hidden: data.hidden ?? 0 };
   } catch {
     return null;
   }
