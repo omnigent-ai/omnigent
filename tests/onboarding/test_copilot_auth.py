@@ -17,9 +17,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from omnigent.onboarding import copilot_auth
+from omnigent.onboarding import copilot_auth, extra_install
 from omnigent.onboarding import secrets as secret_store
-from omnigent.onboarding import extra_install
 from omnigent.onboarding.copilot_auth import (
     COPILOT_SECRET_NAME,
     copilot_github_token_configured,
@@ -206,7 +205,15 @@ def test_copilot_install_command_uv_tool(monkeypatch: pytest.MonkeyPatch) -> Non
     """Inside a ``uv tool`` venv, the install uses ``uv tool install --with``."""
     monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: True)
     cmd = copilot_install_command()
-    assert cmd == ["uv", "tool", "install", "--with", "omnigent[copilot]", "omnigent", "--force"]
+    assert cmd == [
+        "uv",
+        "tool",
+        "install",
+        "--with",
+        "omnigent[copilot]",
+        "omnigent",
+        "--force",
+    ]
 
 
 def test_install_copilot_sdk_runs_command_then_rechecks(
