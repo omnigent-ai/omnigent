@@ -69,7 +69,7 @@
     "react-router-dom": "6.30.4",
     "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.1",
-    "shadcn": "0.0.0-beta.9d3f70e54",
+    "shadcn": "4.11.0",
     "shiki": "^4.0.2",
     "streamdown": "^2.5.0",
     "tailwind-merge": "^3.5.0",
