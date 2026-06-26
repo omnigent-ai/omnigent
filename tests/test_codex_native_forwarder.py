@@ -674,6 +674,86 @@ async def test_elicitation_post_returns_none_when_budget_exhausted(
     assert len(client.posts) == 1
 
 
+class _StatusClient:
+    """httpx client stub whose ``post`` returns a fixed status code."""
+
+    def __init__(self, status_code: int) -> None:
+        """:param status_code: Status to return from every post, e.g. ``400``."""
+        self.status_code = status_code
+        self.posts = 0
+
+    async def post(self, url: str, *, json: dict) -> httpx.Response:
+        """Return the configured status; never raises."""
+        del json
+        self.posts += 1
+        return httpx.Response(self.status_code, request=httpx.Request("POST", url))
+
+
+def test_forward_failures_escalate_to_degraded_once() -> None:
+    """
+    Sustained forward failures flip the degraded latch exactly once (#1120).
+
+    Network drops previously surfaced only as scattered per-item warnings;
+    the latch turns a real outage into a single loud signal and does not
+    re-fire per dropped item.
+    """
+    fwd._reset_forward_health()
+
+    for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD - 1):
+        fwd._note_forward_failure("external_output_text_delta")
+    # Below threshold: not yet degraded.
+    assert fwd._forward_health.degraded_logged is False
+
+    fwd._note_forward_failure("external_output_text_delta")  # crosses threshold
+    assert fwd._forward_health.degraded_logged is True
+    assert fwd._forward_health.consecutive_failures == fwd._FORWARD_DEGRADED_THRESHOLD
+
+    # The latch holds — further failures keep counting but don't re-escalate.
+    fwd._note_forward_failure("external_output_text_delta")
+    assert fwd._forward_health.degraded_logged is True
+    assert fwd._forward_health.consecutive_failures == fwd._FORWARD_DEGRADED_THRESHOLD + 1
+
+
+def test_forward_success_resets_degraded_state() -> None:
+    """
+    A successful forward clears the failure count and degraded latch.
+
+    Recovery must re-arm the indicator so a later outage escalates again.
+    """
+    fwd._reset_forward_health()
+    for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD):
+        fwd._note_forward_failure("external_session_usage")
+    assert fwd._forward_health.degraded_logged is True
+
+    fwd._note_forward_success()
+
+    assert fwd._forward_health.consecutive_failures == 0
+    assert fwd._forward_health.degraded_logged is False
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_tracks_success_and_failure() -> None:
+    """
+    _post_session_event classifies each outcome into forward health (#1120).
+
+    A 2xx clears the failure run; a permanent 4xx counts as a failure so a
+    sustained outage can escalate.
+    """
+    fwd._reset_forward_health()
+
+    # A permanent 4xx is a failure.
+    await fwd._post_session_event(
+        _StatusClient(400), "conv_x", event_type="external_session_status", data={"status": "idle"}
+    )
+    assert fwd._forward_health.consecutive_failures == 1
+
+    # A 2xx resets the run.
+    await fwd._post_session_event(
+        _RecordingClient(), "conv_x", event_type="external_session_status", data={"status": "idle"}
+    )
+    assert fwd._forward_health.consecutive_failures == 0
+
+
 # ── #1108: turn-error "silent success" → surfaced failed ──────────────
 #
 # A failed Codex turn arrives as ``turn/completed`` (a clean success boundary)
