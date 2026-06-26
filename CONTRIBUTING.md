@@ -73,6 +73,72 @@ The host URL can also be passed positionally (`omnigent host
 http://localhost:6767`). See the [README](README.md) for more on hosts,
 harnesses, and credentials.
 
+### Backend-only validation (no secrets, no UI build)
+
+If you want to validate the API server without building `ap-web`, using 
+secrets, or running provider-backed sessions, this recipe starts a 
+backend-only server in an isolated environment.
+
+**Minimum uv version:** `0.11.8` or newer is required for current main. 
+If your global uv is older, this recipe installs a disposable newer uv 
+into a local toolchain virtualenv without touching your global install.
+
+```bash
+runtime_root="$(mktemp -d /tmp/omnigent_backend_XXXXXX)"
+mkdir -p "$runtime_root"/{home,tmp,logs,artifacts}
+mkdir -p "$runtime_root/config"/{xdg,omnigent}
+mkdir -p "$runtime_root/data"/{xdg,omnigent}
+mkdir -p "$runtime_root/cache"/{xdg,pip,uv}
+mkdir -p "$runtime_root/data/omnigent"
+
+python3 -m venv "$runtime_root/toolchain_venv"
+python3 -m venv "$runtime_root/project_venv"
+
+"$runtime_root/toolchain_venv/bin/python" -m pip install "uv>=0.11.8"
+
+cd /path/to/omnigent
+
+UV_PROJECT_ENVIRONMENT="$runtime_root/project_venv" \
+UV_PYTHON_DOWNLOAD=never \
+OMNIGENT_SKIP_WEB_UI=true \
+"$runtime_root/toolchain_venv/bin/uv" sync --frozen
+```
+
+Start the API-only server:
+
+```bash
+selected_port=18080
+
+nohup env \
+  HOME="$runtime_root/home" \
+  TMPDIR="$runtime_root/tmp" \
+  UV_PROJECT_ENVIRONMENT="$runtime_root/project_venv" \
+  UV_PYTHON_DOWNLOAD=never \
+  OMNIGENT_SKIP_WEB_UI=true \
+  OMNIGENT_DATABASE_URI="sqlite:///$runtime_root/data/omnigent/chat.db" \
+  "$runtime_root/project_venv/bin/omnigent" server \
+    --host 127.0.0.1 \
+    --port "$selected_port" \
+  < /dev/null > "$runtime_root/logs/omnigent_server.log" 2>&1 &
+
+server_pid="$!"
+echo "Server PID: $server_pid"
+```
+
+Confirm the endpoints are responding:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/health
+```
+
+Expected: `200`. No sessions, agents, or provider API calls are made.
+
+To stop the server:
+
+```bash
+kill "$server_pid"
+```
+
 ## Tests
 
 A change that alters behaviour under `omnigent/` should ship with a test, and a
