@@ -442,8 +442,14 @@ def record_llm_retry(
         "attempt": attempt,
         "max_attempts": max_attempts,
         "error.type": error_type,
-        "error.message": error_message,
     }
+    # Gate error.message behind the content-capture flag for parity with
+    # the rest of this module: provider error bodies can echo prompt
+    # fragments, request details, or response payloads, so they are
+    # treated as content. error.type is always recorded so operators can
+    # triage the retry-error class without needing message content.
+    if should_capture_content():
+        attrs["error.message"] = error_message
     if backoff_seconds is not None:
         attrs["backoff_seconds"] = backoff_seconds
     span.add_event(SpanEvent(name="gen_ai.retry", attributes=attrs))

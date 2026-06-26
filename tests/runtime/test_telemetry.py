@@ -659,15 +659,21 @@ def test_record_cancellation_sets_cancelled_error_type(
 
 def test_record_llm_retry_adds_event_with_expected_attributes(
     in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     ``record_llm_retry`` adds a ``gen_ai.retry`` event whose
     attributes carry the attempt counters, error class, error
-    message, and backoff duration. Operators reconstruct the retry
-    timeline from these events alone so every key must round-trip.
+    message (when content capture is on), and backoff duration.
+    Operators reconstruct the retry timeline from these events
+    alone so every key must round-trip.
     """
     import mlflow
     from mlflow.entities import SpanType
+
+    # _capture_content is module-level cached. Force ON so error.message
+    # is included in the assertion below.
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
 
     with telemetry.trace_context_for_response(response_id=_RESP_ID):
         with mlflow.start_span("llm_call", span_type=SpanType.CHAT_MODEL) as span:
