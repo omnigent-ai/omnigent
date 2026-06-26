@@ -23,9 +23,17 @@ launched in the same cwd never mirror the same row into two conversations. We th
 poll ``messages`` past a high-water ``id`` and POST new user/assistant rows as
 ``external_conversation_item`` events (which also seeds the session title).
 
-Status (``running``/``idle``) is intentionally NOT posted here: the runner's
-PTY-activity watcher owns those edges for hermes-native (see
-:mod:`omnigent.runner.app`), exactly as for goose-/cursor-native.
+The web-facing ``running``/``idle`` *spinner* edges are intentionally NOT posted
+here: the runner's PTY-activity watcher owns those ``session.status`` edges for
+hermes-native (see :mod:`omnigent.runner.app`), exactly as for goose-/cursor-native.
+That watcher drives only the web "Working…" spinner, though — it never wakes a
+parent orchestrator. So this forwarder additionally derives turn completion from
+the message log (an ``assistant`` row with no ``tool_calls`` is the agentic loop's
+terminal step) and POSTs an ``external_session_status: idle`` event once per
+completed turn — the SAME server contract claude-/codex-/opencode-/cursor-native
+use to mark a sub-agent turn terminal and wake its parent's inbox. The post is
+deduped against a persisted posted-count (:mod:`omnigent.hermes_native_status`) so
+a supervisor restart never re-wakes the parent for a turn it already reported.
 """
 
 from __future__ import annotations
@@ -42,6 +50,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+
+from omnigent import hermes_native_status
 
 _logger = logging.getLogger(__name__)
 
@@ -541,6 +551,72 @@ def _read_new_items(
     return items
 
 
+def _assistant_row_has_tool_calls(tool_calls: object) -> bool:
+    """Whether an assistant ``messages`` row carries a non-empty ``tool_calls`` list.
+
+    Hermes writes one ``messages`` row per agentic step (complete, append-only —
+    rows are never updated in place, which is why message mirroring keys off
+    ``id > last_id``). An assistant row with one or more tool calls means the loop
+    continues (a tool result + further assistant step follow); a row with no tool
+    calls is the loop's terminal step — the model returning its final answer.
+    Mirrors the ``tool_calls`` parsing in :func:`_message_to_items`.
+    """
+    if not isinstance(tool_calls, str) or not tool_calls.strip():
+        return False
+    try:
+        calls = json.loads(tool_calls)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(calls, list) and len(calls) > 0
+
+
+def _count_completed_turns(db_path: Path, hermes_session_id: str) -> int:
+    """Count completed turns for *hermes_session_id* (0 on unreadable/empty).
+
+    A completed turn is an ``assistant`` row with no ``tool_calls`` — the agentic
+    loop's terminal step (see :func:`_assistant_row_has_tool_calls`). Rows are
+    counted regardless of the ``active`` flag: Hermes soft-deletes on compaction
+    (sets ``active = 0``) rather than deleting rows, so ignoring it keeps the
+    count monotonic and append-only — the dedup baseline can then only grow, never
+    drop below the posted-count and falsely re-arm an idle post for an old turn.
+    """
+    con = _connect_ro(db_path)
+    if con is None:
+        return 0
+    try:
+        rows = con.execute(
+            "SELECT tool_calls FROM messages "
+            "WHERE session_id = ? AND role = 'assistant' ORDER BY id",
+            (hermes_session_id,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        _warn_sqlite_once("turn-end count", exc)
+        return 0
+    finally:
+        con.close()
+    return sum(1 for (tool_calls,) in rows if not _assistant_row_has_tool_calls(tool_calls))
+
+
+async def _post_external_session_status(
+    client: httpx.AsyncClient, *, session_id: str, status: str
+) -> None:
+    """POST one ``external_session_status`` event to the Sessions API.
+
+    For a sub-agent conversation the server maps an ``idle`` edge to a terminal
+    completion that wakes the parent orchestrator's inbox — the SAME contract
+    claude-/codex-/opencode-/cursor-native use. The runner's PTY-activity watcher
+    emits only a web-spinner ``session.status`` edge for hermes-native and never
+    wakes a parent, which is why this explicit post is required.
+
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": {"status": status}},
+    )
+    resp.raise_for_status()
+
+
 async def _post_conversation_item(
     client: httpx.AsyncClient, *, session_id: str, item: _MirrorItem
 ) -> None:
@@ -780,6 +856,31 @@ async def forward_hermes_store_to_session(
                                 launch_epoch_s=launch_epoch_s,
                             ),
                         )
+                        # Turn each newly-completed turn into an
+                        # ``external_session_status: idle`` edge — the signal that
+                        # wakes a parent orchestrator (the PTY watcher's spinner
+                        # status never does). A completed turn is an assistant row
+                        # with no tool_calls (the agentic loop's terminal step);
+                        # posted only AFTER its messages are mirrored above so the
+                        # parent sees the content before the completion. Deduped
+                        # against a persisted posted-count so a supervisor restart
+                        # never re-wakes the parent for a turn it already reported.
+                        # Best-effort: a failed post raises into the outer handler
+                        # and leaves the count unadvanced, so the next poll retries.
+                        completed_turns = await asyncio.to_thread(
+                            _count_completed_turns, db, hermes_session_id
+                        )
+                        if completed_turns > await asyncio.to_thread(
+                            hermes_native_status.read_posted_count, bridge_dir
+                        ):
+                            await _post_external_session_status(
+                                client, session_id=session_id, status="idle"
+                            )
+                            await asyncio.to_thread(
+                                hermes_native_status.write_posted_count,
+                                bridge_dir,
+                                completed_turns,
+                            )
             except asyncio.CancelledError:
                 raise
             except Exception:
