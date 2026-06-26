@@ -1036,7 +1036,7 @@ function ConversationRow({
         className={cn(
           "relative flex w-full flex-col gap-0.5 rounded-md px-4 py-2 text-left text-sm hover:bg-muted",
           !selectionMode &&
-            (sessionState?.kind === "awaiting" ? "pr-44 md:pr-28" : "pr-28 md:pr-16"),
+            (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-16"),
           selectionMode && "pr-10",
           isActive && "bg-muted",
           selectionMode && isSelected && "bg-primary/5",
@@ -1704,57 +1704,6 @@ function BulkActionBar({
           >
             Clear
           </Button>
-          <div className="flex items-center gap-1.5 md:hidden">
-            {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-7 gap-1.5 text-xs"
-                disabled={isBusy}
-                onClick={handleArchive}
-              >
-                {bulkArchive.isPending ? (
-                  <Loader2Icon className="size-3 animate-spin" />
-                ) : (
-                  <ArchiveIcon className="size-3" />
-                )}
-                Archive
-              </Button>
-            )}
-            {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-7 gap-1.5 text-xs"
-                disabled={isBusy}
-                onClick={handleUnarchive}
-              >
-                {bulkArchive.isPending ? (
-                  <Loader2Icon className="size-3 animate-spin" />
-                ) : (
-                  <ArchiveRestoreIcon className="size-3" />
-                )}
-                Unarchive
-              </Button>
-            )}
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className={cn("h-7 gap-1.5 text-xs", ownedSelected.length > 0 && "text-destructive")}
-              disabled={isBusy || ownedSelected.length === 0}
-              onClick={() => setConfirmDeleteOpen(true)}
-            >
-              {bulkDelete.isPending ? (
-                <Loader2Icon className="size-3 animate-spin" />
-              ) : (
-                <Trash2Icon className="size-3" />
-              )}
-              Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
-            </Button>
-          </div>
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
@@ -1773,7 +1722,7 @@ function BulkActionBar({
           </Tooltip>
         </div>
 
-        <div className="hidden items-center gap-1.5 px-2 md:flex">
+        <div className="flex items-center gap-1.5 px-2">
           {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
             <Button
               type="button"

@@ -6,6 +6,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckIcon,
   CopyIcon,
+  AlertTriangleIcon,
   PencilIcon,
   InfoIcon,
   PlusIcon,
@@ -57,6 +58,8 @@ import { agentRootName } from "@/lib/forkHarness";
 import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { copyText } from "@/lib/clipboard";
 import { useChatStore } from "@/store/chatStore";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useSessionHostVersion } from "@/hooks/RunnerHealthProvider";
 
 /**
  * Display label for an agent name: the wrapper alias when mapped, else
@@ -728,11 +731,15 @@ function McpServerManagerDialog({
   servers,
   open,
   onOpenChange,
+  dirty,
+  onDirty,
 }: {
   sessionId: string;
   servers: McpServerSummary[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  dirty: boolean;
+  onDirty: () => void;
 }) {
   const [form, setForm] = useState<McpFormState>(EMPTY_MCP_FORM);
   const [formError, setFormError] = useState<string | null>(null);
@@ -749,6 +756,7 @@ function McpServerManagerDialog({
   }
 
   function notifyRestart() {
+    onDirty();
     showToast(
       <span className="text-sm">MCP servers updated. Restart the session to apply changes.</span>,
     );
@@ -795,6 +803,12 @@ function McpServerManagerDialog({
           <DialogTitle>Manage MCP Servers</DialogTitle>
           <DialogDescription>Add, edit, or remove MCP servers for this session.</DialogDescription>
         </DialogHeader>
+        {dirty && (
+          <div className="flex items-center gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-700 dark:text-yellow-400">
+            <AlertTriangleIcon className="size-4 shrink-0" />
+            Restart the session to apply your changes.
+          </div>
+        )}
         <div className="grid gap-4 pt-1 md:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
           <div className="flex min-w-0 flex-col gap-1.5">
             <SectionLabel>Servers</SectionLabel>
@@ -957,6 +971,16 @@ function McpServersSection({
   editable: boolean;
 }) {
   const [managerOpen, setManagerOpen] = useState(false);
+  const [mcpDirty, setMcpDirty] = useState(false);
+  const sessionStatus = useChatStore((s) => s.sessionStatus);
+  // Clear the dirty flag when the session restarts (launching picks up
+  // the updated MCP config) or when the user navigates to another session.
+  useEffect(() => {
+    if (sessionStatus === "launching") setMcpDirty(false);
+  }, [sessionStatus]);
+  useEffect(() => {
+    setMcpDirty(false);
+  }, [sessionId]);
   const canEdit = !!(sessionId && editable);
   const deleteServer = useDeleteMcpServer(canEdit ? sessionId : "");
   const showSection = servers.length > 0 || canEdit;
@@ -978,6 +1002,12 @@ function McpServersSection({
           </button>
         )}
       </div>
+      {mcpDirty && (
+        <p className="flex items-center gap-1 text-xs text-yellow-700 dark:text-yellow-400">
+          <AlertTriangleIcon className="size-3 shrink-0" />
+          Restart to apply changes
+        </p>
+      )}
       {servers.length > 0 ? (
         <McpServerList
           servers={servers}
@@ -985,12 +1015,14 @@ function McpServersSection({
             canEdit
               ? (name) =>
                   deleteServer.mutate(name, {
-                    onSuccess: () =>
+                    onSuccess: () => {
+                      setMcpDirty(true);
                       showToast(
                         <span className="text-sm">
                           MCP servers updated. Restart the session to apply changes.
                         </span>,
-                      ),
+                      );
+                    },
                   })
               : undefined
           }
@@ -1004,6 +1036,8 @@ function McpServersSection({
           servers={servers}
           open={managerOpen}
           onOpenChange={setManagerOpen}
+          dirty={mcpDirty}
+          onDirty={() => setMcpDirty(true)}
         />
       )}
     </div>
@@ -1143,6 +1177,19 @@ export function AgentInfoContent({
   // popover renders it directly — the frontend derives any aggregate view
   // from this map rather than receiving flat token fields.
   const usageByModel = useChatStore((s) => s.sessionUsageByModel);
+  // Version footer: the server version (global, from the boot capabilities
+  // probe) and the bound host's version (per-session, from the health poll).
+  // Either may be absent — the footer renders whatever is known and hides
+  // entirely when neither is.
+  const serverInfo = useServerInfo();
+  const serverVersion = serverInfo !== "loading" ? serverInfo.server_version : null;
+  const hostVersion = useSessionHostVersion(sessionId ?? undefined);
+  const versionFooter = [
+    serverVersion ? `server ${serverVersion}` : null,
+    hostVersion ? `host ${hostVersion}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   // Session owner (the user_id granted LEVEL_OWNER), so a viewer can see whose
   // session this is — e.g. a chat shared into a workspace group. ``null`` /
   // undefined when permissions are off (single-user) or still loading, in
@@ -1238,6 +1285,16 @@ export function AgentInfoContent({
       {showIntelligentRouting && sessionId && <IntelligentRoutingSection sessionId={sessionId} />}
       <McpServersSection sessionId={sessionId} servers={servers} editable={mcpEditable} />
       {sessionId && <SessionPoliciesSection sessionId={sessionId} />}
+      {versionFooter && (
+        <div className="border-t border-border pt-2">
+          <span
+            className="font-mono text-[10px] text-muted-foreground/70"
+            data-testid="agent-info-versions"
+          >
+            {versionFooter}
+          </span>
+        </div>
+      )}
     </div>
   );
 }

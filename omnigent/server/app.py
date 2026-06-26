@@ -1423,6 +1423,31 @@ def create_app(
             return {h for h in host_ids if host_registry.get(h) is not None}
         return host_store.online_host_ids(host_ids)
 
+    def _bulk_host_versions(host_ids: list[str]) -> dict[str, str]:
+        """
+        Map each requested host_id to the version from its live hello frame.
+
+        Resolved from the in-memory host registry only: the host version
+        isn't persisted to the hosts table, so a host connected to another
+        replica (multi-replica ``host_store`` deploys) is absent here and
+        the caller reports ``host_version=None`` for that session — the info
+        popover then simply omits the host version. Single-server /
+        single-replica deploys (the common case) resolve it fully. The
+        registry lookup is an in-memory dict read, so this stays off the
+        DB hot path the surrounding bulk liveness query optimizes.
+
+        :param host_ids: Bound host identifiers to resolve, e.g.
+            ``["host_abc123"]``. Empty input returns an empty map.
+        :returns: ``{host_id: version}`` for every id with a live local
+            tunnel; ids without one are absent.
+        """
+        versions: dict[str, str] = {}
+        for host_id in set(host_ids):
+            host_conn = host_registry.get(host_id)
+            if host_conn is not None:
+                versions[host_id] = host_conn.hello.version
+        return versions
+
     def _session_liveness(sid: str) -> SessionLiveness:
         """
         Resolve strict runner + host liveness for one session.
@@ -1496,6 +1521,7 @@ def create_app(
             conn.host_id for conn in connectivity.values() if conn.host_id is not None
         }
         online_hosts = _bulk_hosts_online(list(host_ids_to_check))
+        host_versions = _bulk_host_versions(list(host_ids_to_check))
         result: dict[str, SessionLiveness] = {}
         for sid in ids:
             conn = connectivity.get(sid)
@@ -1506,8 +1532,10 @@ def create_app(
                 continue
             if conn.host_id is None:
                 host_online: bool | None = None
+                host_version: str | None = None
             else:
                 host_online = conn.host_id in online_hosts
+                host_version = host_versions.get(conn.host_id)
             if conn.runner_id is None:
                 # No runner binding: an in-process executor (or a session
                 # not yet dispatched) is reachable — EXCEPT an unbound fork
@@ -1520,7 +1548,11 @@ def create_app(
                 # Strict: reachable only if the runner tunnel is up. No
                 # host-relaunch optimism — host state lives in host_online.
                 runner_online = _runner_up(conn)
-            result[sid] = SessionLiveness(runner_online=runner_online, host_online=host_online)
+            result[sid] = SessionLiveness(
+                runner_online=runner_online,
+                host_online=host_online,
+                host_version=host_version,
+            )
         return result
 
     @app.get("/health")
@@ -1550,8 +1582,11 @@ def create_app(
             ``"conv_abc,conv_def,conv_ghi"``.
         :returns: ``{"status": "ok"}`` with optional ``session``
             and/or ``sessions`` fields. Each session object has shape
-            ``{"runner_online": bool, "host_online": bool | None}``
-            (the single ``session`` object also includes its ``id``).
+            ``{"runner_online": bool, "host_online": bool | None,
+            "host_version": str | None}`` (the single ``session``
+            object also includes its ``id``). ``host_version`` is the
+            bound host's reported version, or ``None`` when there's no
+            host binding / the version isn't resolvable on this replica.
         """
         result: dict[str, Any] = {"status": "ok"}
         batch_ids = [s.strip() for s in session_ids.split(",") if s.strip()] if session_ids else []
@@ -1575,12 +1610,14 @@ def create_app(
                 "id": session_id,
                 "runner_online": single.runner_online,
                 "host_online": single.host_online,
+                "host_version": single.host_version,
             }
         if session_ids is not None:
             result["sessions"] = {
                 sid: {
                     "runner_online": (sl := liveness.get(sid, _missing)).runner_online,
                     "host_online": sl.host_online,
+                    "host_version": sl.host_version,
                 }
                 for sid in batch_ids
             }
@@ -1620,9 +1657,10 @@ def create_app(
         source, the login URL, whether first-run admin setup is
         still pending (``needs_setup``), coarse capability
         booleans (``databricks_features``,
-        ``managed_sandboxes_enabled``), and the short sandbox
+        ``managed_sandboxes_enabled``), the short sandbox
         provider name (``sandbox_provider``) the web UI labels the
-        new-session sandbox option with.
+        new-session sandbox option with, and the installed
+        ``server_version`` (already public via ``/api/version``).
         """
         from omnigent.server.auth import UnifiedAuthProvider
 
@@ -1664,6 +1702,11 @@ def create_app(
         # actually offered; None when no provider is named (embedding
         # configs may leave it unset) so the UI keeps the generic label.
         sandbox_provider = sandbox_config.provider if managed_sandboxes_enabled else None
+        # server_version is the installed omnigent package version (same
+        # source as /api/version), surfaced so the web UI can show it in the
+        # session info popover alongside the per-session host version.
+        from importlib.metadata import version as _pkg_version
+
         # smart_routing_enabled: true when the server can route — either
         # a RoutingClient is explicitly configured (OMNIGENT_SMART_ROUTING=1
         # + llm: config) or the managed deployment registered a
@@ -1684,6 +1727,7 @@ def create_app(
             "databricks_features": databricks_features,
             "managed_sandboxes_enabled": managed_sandboxes_enabled,
             "sandbox_provider": sandbox_provider,
+            "server_version": _pkg_version("omnigent"),
             "smart_routing_enabled": smart_routing_enabled,
         }
 

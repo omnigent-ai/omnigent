@@ -5,6 +5,7 @@ import { BrowserRouter } from "react-router-dom";
 import App from "./App.tsx";
 import { ThemeProvider } from "./components/theme/ThemeProvider";
 import { TooltipProvider } from "./components/ui/tooltip";
+import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
@@ -58,6 +59,7 @@ const _bootProbe: Promise<ServerInfo> = Promise.race([
           databricks_features: false,
           managed_sandboxes_enabled: false,
           sandbox_provider: null,
+          server_version: null,
           smart_routing_enabled: false,
         }),
       1500,
@@ -72,13 +74,15 @@ void _bootProbe.then((info) => {
         <QueryClientProvider client={queryClient}>
           <ThemeProvider>
             <TooltipProvider>
-              <BrowserRouter>
-                <SessionUpdatesProvider>
-                  <RunnerHealthProvider>
-                    <App />
-                  </RunnerHealthProvider>
-                </SessionUpdatesProvider>
-              </BrowserRouter>
+              <ImageLightboxProvider>
+                <BrowserRouter>
+                  <SessionUpdatesProvider>
+                    <RunnerHealthProvider>
+                      <App />
+                    </RunnerHealthProvider>
+                  </SessionUpdatesProvider>
+                </BrowserRouter>
+              </ImageLightboxProvider>
             </TooltipProvider>
           </ThemeProvider>
         </QueryClientProvider>
