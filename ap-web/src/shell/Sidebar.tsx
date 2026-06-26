@@ -17,6 +17,7 @@ import {
   CircleStopIcon,
   GitBranchIcon,
   InboxIcon,
+  WorkflowIcon,
   ListChecksIcon,
   Loader2Icon,
   MoreHorizontalIcon,
@@ -120,13 +121,21 @@ interface SidebarProps {
  * which is `inbox` in both standalone and embedded modes. Conversation ids are
  * `conv_…`-prefixed, so a chat route's leaf can never collide with `inbox`.
  */
-function useActiveNavItem(): { isNewChatPage: boolean; isInboxPage: boolean } {
+function useActiveNavItem(): {
+  isNewChatPage: boolean;
+  isInboxPage: boolean;
+  isJobsPage: boolean;
+} {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
-  const isInboxPage = useLocation().pathname.split("/").filter(Boolean).at(-1) === "inbox";
-  // Exclude inbox: it also has no `:conversationId`, so it would otherwise
-  // light up the "New session" button.
-  const isNewChatPage = activeConversationId == null && !isInboxPage;
-  return { isNewChatPage, isInboxPage };
+  const segments = useLocation().pathname.split("/").filter(Boolean);
+  const isInboxPage = segments.at(-1) === "inbox";
+  // Jobs covers both the list (`/jobs`) and the flow builder
+  // (`/jobs/flow/:id`), so match the segment rather than only the last one.
+  const isJobsPage = segments.includes("jobs");
+  // Exclude inbox/jobs: they also have no `:conversationId`, so they would
+  // otherwise light up the "New session" button.
+  const isNewChatPage = activeConversationId == null && !isInboxPage && !isJobsPage;
+  return { isNewChatPage, isInboxPage, isJobsPage };
 }
 
 /**
@@ -233,7 +242,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   }
 
   // Which top-level nav button to highlight for the current route.
-  const { isNewChatPage, isInboxPage } = useActiveNavItem();
+  const { isNewChatPage, isInboxPage, isJobsPage } = useActiveNavItem();
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -377,6 +386,23 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom">Inbox</TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    asChild
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Jobs"
+                    className={cn("relative rounded-full", isJobsPage && "bg-muted")}
+                    data-testid="jobs-button"
+                  >
+                    <Link to="/jobs" onClick={onNavClick}>
+                      <WorkflowIcon className="size-4" />
+                    </Link>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Jobs</TooltipContent>
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
