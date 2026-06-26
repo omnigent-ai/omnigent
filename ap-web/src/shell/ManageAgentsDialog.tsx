@@ -1,19 +1,27 @@
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Bot, PlusIcon, TrashIcon } from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import type { AgentBundleInput } from "@/lib/agentBundle";
-import { type ManagedAgent, createAgent, deleteAgent, listMyAgents } from "@/lib/agentsApi";
+import {
+  MY_AGENTS_QUERY_KEY,
+  type ManagedAgent,
+  createAgent,
+  deleteAgent,
+  listMyAgents,
+} from "@/lib/agentsApi";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 
 /**
  * Manage standalone, owner-scoped agents — list / create / delete.
  *
- * Opened from the sidebar "Agents" button (below "New session"). Unlike the
- * new-chat custom-agent flow (which stages an agent into a single session),
- * agents created here are persisted via the agents CRUD API and reused across
- * sessions, surviving session deletion. Create reuses {@link CreateAgentDialog}
- * but writes straight to the backend instead of staging into a session.
+ * Opened from the sidebar "Agents" button (below "New session"). Agents
+ * created here are persisted via the agents CRUD API and reused across
+ * sessions, surviving session deletion. The list is a shared TanStack query
+ * ({@link MY_AGENTS_QUERY_KEY}) so creates/deletes here — and from the
+ * new-chat picker — keep both surfaces in sync; mutations also invalidate the
+ * picker's `["available-agents"]` query so a new agent shows up there too.
  */
 export function ManageAgentsDialog({
   open,
@@ -22,42 +30,46 @@ export function ManageAgentsDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const [agents, setAgents] = useState<ManagedAgent[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const queryClient = useQueryClient();
+  const agentsQuery = useQuery({
+    queryKey: MY_AGENTS_QUERY_KEY,
+    queryFn: listMyAgents,
+    enabled: open,
+  });
+  const [actionError, setActionError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
-    setError(null);
-    try {
-      setAgents(await listMyAgents());
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  }, []);
+  const agents = agentsQuery.isLoading ? null : (agentsQuery.data ?? []);
+  const error =
+    actionError ?? (agentsQuery.error instanceof Error ? agentsQuery.error.message : null);
 
-  useEffect(() => {
-    if (open) void refresh();
-  }, [open, refresh]);
+  async function invalidateAgents() {
+    // Refresh both this list and the new-chat picker catalog.
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: MY_AGENTS_QUERY_KEY }),
+      queryClient.invalidateQueries({ queryKey: ["available-agents"] }),
+    ]);
+  }
 
   async function handleCreate(input: AgentBundleInput) {
-    setError(null);
+    setActionError(null);
     try {
       await createAgent(input);
-      await refresh();
+      await invalidateAgents();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setActionError(e instanceof Error ? e.message : String(e));
     }
   }
 
   async function handleDelete(agent: ManagedAgent) {
     setBusyId(agent.id);
-    setError(null);
+    setActionError(null);
     try {
       await deleteAgent(agent.id);
-      await refresh();
+      await invalidateAgents();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setActionError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusyId(null);
     }

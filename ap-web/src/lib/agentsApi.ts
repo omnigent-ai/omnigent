@@ -10,6 +10,14 @@
 import { type AgentBundleInput, buildAgentBundle } from "@/lib/agentBundle";
 import { authenticatedFetch } from "@/lib/identity";
 
+/**
+ * TanStack Query key for the caller's standalone agents (`/v1/agents/mine`).
+ * Shared by the sidebar manage view and the new-chat picker so a create/delete
+ * in either surface invalidates both. The picker query (`["available-agents"]`)
+ * is invalidated alongside it.
+ */
+export const MY_AGENTS_QUERY_KEY = ["my-agents"] as const;
+
 /** Summary of an MCP server attached to an agent (mirrors the API shape). */
 export interface AgentMcpServer {
   name: string;
