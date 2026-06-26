@@ -325,7 +325,14 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
             ),
             {"target_session_id": "conv_new"},
         ),
-        ("PATCH", "http://127.0.0.1:8787/v1/sessions/conv_old", {"runner_id": ""}),
+        (
+            "PATCH",
+            "http://127.0.0.1:8787/v1/sessions/conv_old",
+            {
+                "runner_id": "",
+                "labels": {"omnigent.claude_native.bridge_id": "conv_old-cleared"},
+            },
+        ),
     ]
     recorded = (bridge_dir / "hooks.jsonl").read_text(encoding="utf-8")
     assert '"omnigent_clear_rotated_to":"conv_new"' in recorded

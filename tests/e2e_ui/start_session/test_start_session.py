@@ -3,15 +3,16 @@
 The landing composer (``NewChatLandingScreen`` in
 ``ap-web/src/shell/NewChatDialog.tsx``) owns session creation end to end:
 the textarea is the new session's first message and the footer chips —
-host, working directory, git worktree — plus the agent picker and its
-Advanced settings menu supply every create parameter. Hitting Send POSTs
-``/v1/sessions`` and navigates to the new session; there is no modal.
+host, working directory, git worktree — plus the agent picker and the
+composer's run-mode pill / harness picker supply every create parameter.
+Hitting Send POSTs ``/v1/sessions`` and navigates to the new session;
+there is no modal.
 
 These tests cover the three configuration affordances the user reaches
 before sending:
 
 1. **Permission mode** — Claude Code's ``--permission-mode`` choices, in
-   the agent picker's Advanced settings menu. A non-default pick rides
+   the composer's run-mode ("Mode:") pill. A non-default pick rides
    along as ``terminal_launch_args``.
 2. **Working directory** — the file-browser popover behind the working-
    directory chip. Browsing into a folder sets the session's
@@ -139,8 +140,8 @@ def _codex_native_agents_body() -> str:
 
     ``codex-native-ui`` + ``harness: "codex-native"`` is what the frontend
     maps (via ``nativeCodingAgents``) to the ``approvalMode`` capability,
-    gating the Codex approval-mode UI in the Advanced menu. Sole agent, so
-    it auto-selects and no explicit pick is needed.
+    gating the Codex approval-mode pill. Sole agent, so it auto-selects and
+    no explicit pick is needed.
     """
     return json.dumps(
         {
@@ -164,8 +165,9 @@ def _bundle_agents_body() -> str:
     Polly and Debby are multi-agent bundles, not native terminal wrappers, so
     their spec declares a brain harness (``harness: "claude-sdk"``) that lands
     them in ``BRAIN_HARNESS_LABELS``. That — and the fact that neither is named
-    ``claude-native-ui`` — is what makes the Advanced menu render the **Agent
-    Harness** radio group instead of Claude Code's permission modes. Polly is
+    ``claude-native-ui`` — is what makes the composer render the harness picker
+    (an **Agent Harness** radio group) instead of Claude Code's permission-mode
+    pill. Polly is
     ranked ahead of Debby by ``AGENT_DISPLAY_ORDER``, so it auto-selects and no
     explicit agent pick is needed. ``harness: null`` would suppress the section
     entirely, so it must be a real harness id here.
@@ -409,8 +411,8 @@ async def _register_common_routes(
 def test_start_session_select_permission_mode(seeded_session: tuple[str, str]) -> None:
     """Picking a non-default permission mode rides along to the create call.
 
-    Selecting "Accept edits" in the agent picker's Advanced settings menu
-    must (a) surface in the agent chip label as immediate feedback and
+    Selecting "Accept edits" in the composer's run-mode ("Mode:") pill
+    must (a) surface in the pill label as immediate feedback and
     (b) reach ``POST /v1/sessions`` as
     ``terminal_launch_args: ["--permission-mode", "acceptEdits"]``.
     """
@@ -443,8 +445,8 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
                 state="visible", timeout=30_000
             )
             # Claude Code auto-selects (only built-in, ranked first), so the
-            # Advanced chip — gated on the Claude-native agent — is present.
-            await page.get_by_test_id("new-chat-landing-advanced-chip").click()
+            # run-mode pill — gated on the Claude-native agent — is present.
+            await page.get_by_test_id("new-chat-landing-permission-pill").click()
             # All six Claude permission modes render as radio rows.
             for mode in ("default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"):
                 await expect(
@@ -452,8 +454,8 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
                 ).to_be_visible()
             await page.get_by_test_id("new-chat-landing-permission-acceptEdits").click()
 
-            # The chip label reflects the non-default pick immediately.
-            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
+            # The mode pill reflects the non-default pick immediately.
+            await expect(page.get_by_test_id("new-chat-landing-permission-pill")).to_contain_text(
                 "Accept edits"
             )
 
@@ -470,11 +472,76 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_select_model_and_effort(seeded_session: tuple[str, str]) -> None:
+    """Picking a model + reasoning effort rides along to the create call.
+
+    For the Claude-native agent the composer shows a model/effort picker
+    that defaults to Claude Code's own "Sonnet / Medium". Selecting "Opus"
+    and "High" must (a) surface on the trigger as immediate feedback and
+    (b) reach ``POST /v1/sessions`` as ``model_override: "opus"`` +
+    ``reasoning_effort: "high"`` (the runner reads them as ``--model`` /
+    ``--effort`` at terminal launch).
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_model_effort(base_url, session_id))
+
+
+async def _drive_model_effort(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            # Claude Code auto-selects, so its model/effort picker is present and
+            # shows Claude Code's effective defaults (Sonnet / Medium).
+            trigger = page.get_by_test_id("new-chat-landing-model-trigger")
+            await expect(trigger).to_contain_text("Sonnet")
+            await expect(trigger).to_contain_text("Medium")
+
+            # Model + effort are two radio groups in one menu; picking an item
+            # closes the menu, so reopen between the two picks. Selecting returns
+            # focus to the trigger, and a reopen click that races the close is
+            # swallowed — wait for the menu to fully close (the just-picked row
+            # detached) before reopening so the second click reliably reopens it.
+            await trigger.click()
+            await page.get_by_test_id("new-chat-landing-model-opus").click()
+            await expect(page.get_by_test_id("new-chat-landing-model-opus")).to_be_hidden()
+            await trigger.click()
+            await page.get_by_test_id("new-chat-landing-effort-high").click()
+            await expect(trigger).to_contain_text("Opus")
+            await expect(trigger).to_contain_text("High")
+
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_claude_e2e", body
+            assert body.get("model_override") == "opus", body
+            assert body.get("reasoning_effort") == "high", body
+        finally:
+            await browser.close()
+
+
 def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> None:
     """Picking a non-default approval preset rides along to the create call.
 
-    Selecting "Full access" in the agent picker's Advanced settings menu
-    must (a) surface in the agent chip label as immediate feedback and
+    Selecting "Full access" in the composer's run-mode ("Mode:") pill
+    must (a) surface in the pill label as immediate feedback and
     (b) reach ``POST /v1/sessions`` as
     ``terminal_launch_args: ["--sandbox", "danger-full-access",
     "--ask-for-approval", "never"]``.
@@ -518,9 +585,9 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Codex auto-selects (only built-in), so the Advanced chip —
+            # Codex auto-selects (only built-in), so the run-mode pill —
             # gated on the Codex-native agent — is present.
-            await page.get_by_test_id("new-chat-landing-advanced-chip").click()
+            await page.get_by_test_id("new-chat-landing-approval-pill").click()
             # All three Codex approval presets render as radio rows.
             for mode in ("default", "full-access", "read-only"):
                 await expect(
@@ -528,8 +595,8 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
                 ).to_be_visible()
             await page.get_by_test_id("new-chat-landing-approval-full-access").click()
 
-            # The chip label reflects the non-default pick immediately.
-            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
+            # The mode pill reflects the non-default pick immediately.
+            await expect(page.get_by_test_id("new-chat-landing-approval-pill")).to_contain_text(
                 "Full access"
             )
 
@@ -551,14 +618,110 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-def test_start_session_select_harness(seeded_session: tuple[str, str]) -> None:
-    """For a bundle agent (Polly/Debby), Advanced offers an agent-harness pick.
+def test_start_session_bypass_sandbox(seeded_session: tuple[str, str]) -> None:
+    """Arming the DANGEROUS Codex full-bypass toggle rides along to the create.
 
-    Unlike Claude Code — whose Advanced menu shows permission modes — Polly and
-    Debby declare a brain harness, so their Advanced menu renders an "Agent
-    Harness" radio group. Selecting a non-default harness ("Pi") must (a) show
-    all four harness options, (b) surface the pick in the agent chip label, and
-    (c) reach ``POST /v1/sessions`` as ``harness_override: "pi"``.
+    The bypass switch in the Codex run-mode pill's menu is the first-class
+    opt-in for Codex's ``--dangerously-bypass-approvals-and-sandbox`` stance. It
+    is deliberately hard to arm: the Switch stays **disabled** until the user
+    types the confirmation phrase *verbatim* (a click alone, or a near-miss
+    phrase, never arms it), and once on, a persistent red banner shows under the
+    composer — surviving the menu's close. When armed, the create
+    ``POST /v1/sessions`` must carry the
+    ``omnigent.codex_native.bypass_sandbox: "1"`` conversation label so the
+    runner launches Codex with the bypass flag.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_bypass_sandbox(base_url, session_id))
+
+
+async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_codex_native_agents_body(),
+            )
+
+            # Neutralize agent discovery so only the stubbed Codex agent
+            # feeds the picker.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            # Codex auto-selects (only built-in), so the run-mode pill is present;
+            # the bypass opt-in lives inside its menu below the approval presets.
+            await page.get_by_test_id("new-chat-landing-approval-pill").click()
+
+            # Guardrail: the bypass Switch is DISABLED until the verbatim phrase
+            # is typed — a click alone can never arm the dangerous mode.
+            switch = page.get_by_test_id("new-chat-landing-bypass-sandbox-switch")
+            await expect(switch).to_be_disabled()
+
+            # A near-miss phrase (different case) keeps it disabled — the match
+            # is verbatim, no case-folding or trimming.
+            confirm = page.get_by_test_id("new-chat-landing-bypass-sandbox-confirm")
+            await confirm.fill("Bypass Sandbox")
+            await expect(switch).to_be_disabled()
+
+            # The exact phrase arms the Switch; flip it on.
+            await confirm.fill("bypass sandbox")
+            await expect(switch).to_be_enabled()
+            await switch.click()
+
+            # Close the mode menu; the in-menu banner goes with it, but the
+            # persistent red banner under the composer must remain — proof the
+            # armed stance stays visible after the menu closes.
+            await page.keyboard.press("Escape")
+            await expect(
+                page.get_by_test_id("new-chat-landing-bypass-sandbox-active-banner")
+            ).to_be_visible()
+
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_codex_e2e", body
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/work/repo", body
+            # The dangerous opt-in rides along as the canonical conversation
+            # label alongside the codex-native wrapper labels.
+            labels = body.get("labels") or {}
+            assert labels.get("omnigent.codex_native.bypass_sandbox") == "1", body
+        finally:
+            await browser.close()
+
+
+def test_start_session_select_harness(seeded_session: tuple[str, str]) -> None:
+    """For a bundle agent (Polly/Debby), the composer offers an agent-harness pick.
+
+    Unlike Claude Code — which shows a permission-mode pill — Polly and Debby
+    declare a brain harness, so the composer renders a harness picker (an "Agent
+    Harness" radio group). Selecting a non-default harness ("Pi") must (a) show
+    all four harness options, (b) surface the pick on the harness picker's
+    trigger, and (c) reach ``POST /v1/sessions`` as ``harness_override: "pi"``.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_select_harness(base_url, session_id))
@@ -582,8 +745,8 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             # `/v1/agents` with agents found by scanning the caller's sessions
             # (`/v1/sessions?kind=any`); on the shared e2e_ui server, a native
             # fork another test left behind sorts ahead of bundle agents and
-            # auto-selects, so the Advanced chip would open permission modes
-            # (or nothing) instead of Polly's harness group. Registered after
+            # auto-selects, so the composer would show a permission-mode pill
+            # (or nothing) instead of Polly's harness picker. Registered after
             # _register_common_routes so it wins the kind=any scan.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
@@ -607,9 +770,9 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Polly auto-selects (ranked ahead of Debby), so the Advanced chip —
+            # Polly auto-selects (ranked ahead of Debby), so the harness picker —
             # present because Polly declares a harness — opens the harness group.
-            await page.get_by_test_id("new-chat-landing-advanced-chip").click()
+            await page.get_by_test_id("new-chat-landing-harness-trigger").click()
             # All four brain harnesses render as radio rows, in registry order.
             for harness in ("claude-sdk", "openai-agents", "codex", "pi"):
                 await expect(
@@ -617,9 +780,10 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
                 ).to_be_visible()
             await page.get_by_test_id("new-chat-landing-harness-pi").click()
 
-            # The chip label reflects the non-default harness immediately.
-            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
-                "Polly (Pi)"
+            # The harness picker's trigger reflects the non-default harness
+            # immediately (the agent label stays the bare agent name).
+            await expect(page.get_by_test_id("new-chat-landing-harness-trigger")).to_contain_text(
+                "Pi"
             )
 
             await page.get_by_test_id("new-chat-landing-input").fill("debate the design")

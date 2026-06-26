@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from "vitest";
 import { parseEvent } from "./sse";
-import type { TextDelta } from "./events";
+import type { SessionSupersededEvent, TextDelta } from "./events";
 
 describe("parseEvent — response.output_text.delta", () => {
   it("parses a plain delta with no streaming identifiers", () => {
@@ -58,5 +58,29 @@ describe("parseEvent — response.output_text.delta", () => {
 
   it("returns null when delta is not a string", () => {
     expect(parseEvent("response.output_text.delta", { delta: { text: "bad" } })).toBeNull();
+  });
+});
+
+describe("parseEvent — session.superseded", () => {
+  it("parses the carrier + redirect target", () => {
+    const ev = parseEvent("session.superseded", {
+      conversation_id: "conv_old",
+      target_conversation_id: "conv_new",
+      reason: "clear",
+    });
+    expect(ev).toEqual({
+      type: "session_superseded",
+      conversationId: "conv_old",
+      targetConversationId: "conv_new",
+      reason: "clear",
+    } satisfies SessionSupersededEvent);
+  });
+
+  it("returns null when the target conversation id is missing", () => {
+    expect(parseEvent("session.superseded", { conversation_id: "conv_old" })).toBeNull();
+  });
+
+  it("returns null when the carrier conversation id is missing", () => {
+    expect(parseEvent("session.superseded", { target_conversation_id: "conv_new" })).toBeNull();
   });
 });

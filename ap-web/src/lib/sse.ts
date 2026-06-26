@@ -41,6 +41,7 @@ import type {
   SessionResource,
   SessionResourceCreatedEvent,
   SessionResourceDeletedEvent,
+  SessionSupersededEvent,
   SessionSkillsEvent,
   SessionViewer,
   SessionTerminalActivityEvent,
@@ -641,6 +642,18 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       agentId: typeof data.agent_id === "string" ? data.agent_id : null,
       parentSessionId: typeof data.parent_session_id === "string" ? data.parent_session_id : null,
     } satisfies SessionCreatedEvent;
+  }
+  if (eventType === "session.superseded") {
+    const conversationId = data.conversation_id;
+    const targetConversationId = data.target_conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    if (typeof targetConversationId !== "string" || !targetConversationId) return null;
+    return {
+      type: "session_superseded",
+      conversationId,
+      targetConversationId,
+      reason: "clear",
+    } satisfies SessionSupersededEvent;
   }
   if (eventType === "session.resource.created") {
     const resource = parseSessionResource(data.resource);

@@ -57,6 +57,11 @@ describe("shouldShowModelPicker", () => {
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "cursor-native-ui" } })).toBe(
       true,
     );
+    // opencode mirrors its live TUI model into model_override (like cursor), so
+    // the model indicator surfaces it and reflects in-TUI switches.
+    expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "opencode-native-ui" } })).toBe(
+      true,
+    );
   });
 
   it("hides the picker for other wrappers and missing labels (fail closed)", () => {
@@ -88,6 +93,14 @@ describe("shouldShowEffortPicker", () => {
     // axis and a model switch resets it to that model's default, so a Web UI
     // dial would silently diverge from the TUI — dropped pending that fix.
     expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "cursor-native-ui" } })).toBe(
+      false,
+    );
+  });
+
+  it("hides effort controls for opencode-native (model indicator only)", () => {
+    // WHY: opencode surfaces its live model read-only (switching stays in the
+    // opencode TUI); there is no Web UI effort dial for it.
+    expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "opencode-native-ui" } })).toBe(
       false,
     );
   });

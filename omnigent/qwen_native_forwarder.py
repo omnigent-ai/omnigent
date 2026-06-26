@@ -29,6 +29,17 @@ Event shapes consumed (others are ignored defensively):
 Status (``running``/``idle``) is intentionally NOT posted here: the runner's
 PTY-activity watcher owns those edges for qwen-native (see
 :mod:`omnigent.runner.app`), exactly as for goose-/cursor-native.
+
+This module also hosts the **compaction mirror** (:func:`supervise_qwen_compaction_mirror`).
+qwen compaction (its *compression*) is invisible on the ``--json-file`` stream
+(``session_start``'s ``supported_events`` omits it — verified live, ``qwen``
+v0.18.2), but qwen writes a ``{"type":"system","subtype":"chat_compression",
+"systemPayload":{"info":{originalTokenCount,newTokenCount,compressionStatus}}}``
+record to its on-disk chat recording the instant compression finishes. The mirror
+tails that recording and POSTs ``external_compaction_status`` (``completed`` on
+success, ``failed`` otherwise) — the completion half of the web ``/compact`` →
+qwen ``/compress`` flow whose ``in_progress`` edge the runner raises on injection.
+It fires for both explicit ``/compress`` and auto-compaction.
 """
 
 from __future__ import annotations
@@ -383,3 +394,128 @@ async def supervise_qwen_forwarder(
             )
         await _supervisor_sleep(backoff_s)
         backoff_s = min(backoff_s * 2.0, _SUPERVISOR_MAX_BACKOFF_S)
+
+
+# --- Compaction mirror (chat-recording tail → external_compaction_status) ------
+
+#: qwen's CompressionStatus enum (verified, qwen v0.18.2): 1 = COMPRESSED (success),
+#: 2/3 = COMPRESSION_FAILED_*. 1 → completed; anything else → failed.
+_COMPRESSION_STATUS_OK = 1
+
+
+def _compaction_status_from_record(record: dict[str, object]) -> str | None:
+    """Map a chat-recording line to a compaction status, or ``None`` to skip it.
+
+    Returns ``"completed"`` for a successful ``chat_compression`` record,
+    ``"failed"`` for a failed one, and ``None`` for any other line.
+    """
+    if record.get("type") != "system" or record.get("subtype") != "chat_compression":
+        return None
+    payload = record.get("systemPayload")
+    info = payload.get("info") if isinstance(payload, dict) else None
+    status = info.get("compressionStatus") if isinstance(info, dict) else None
+    return "completed" if status == _COMPRESSION_STATUS_OK else "failed"
+
+
+def _read_new_compaction_statuses(recording: Path, offset: int) -> tuple[list[str], int]:
+    """Read NDJSON lines past *offset*, returning new compaction statuses + offset.
+
+    Same tail discipline as :func:`_read_new_events` (truncation rewind, only
+    newline-terminated lines consumed), but scoped to ``chat_compression`` records.
+    """
+    try:
+        size = recording.stat().st_size
+    except OSError:
+        return [], offset  # recording not created yet — retry next poll
+    if size < offset:
+        offset = 0  # truncated/recreated
+    if size == offset:
+        return [], offset
+    try:
+        with open(recording, "rb") as fh:
+            fh.seek(offset)
+            data = fh.read(size - offset)
+    except OSError:
+        return [], offset
+    last_nl = data.rfind(b"\n")
+    if last_nl == -1:
+        return [], offset
+    consumed = data[: last_nl + 1]
+    new_offset = offset + len(consumed)
+    statuses: list[str] = []
+    for raw in consumed.split(b"\n"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            record = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        status = _compaction_status_from_record(record)
+        if status is not None:
+            statuses.append(status)
+    return statuses, new_offset
+
+
+async def _post_external_compaction_status(
+    client: httpx.AsyncClient, *, session_id: str, status: str
+) -> None:
+    """POST one ``external_compaction_status`` event; the server republishes the SSE."""
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_compaction_status", "data": {"status": status}},
+    )
+    resp.raise_for_status()
+
+
+async def supervise_qwen_compaction_mirror(
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    recording_path: Path,
+    auth: httpx.Auth | None = None,
+    poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
+) -> None:
+    """Tail qwen's chat recording and mirror compaction completions to the session.
+
+    Seeds the read offset at the recording's current end of file so only
+    compactions that happen *after* launch are posted — a resumed session's
+    recording already holds prior ``chat_compression`` records, and re-posting them
+    would flash stale "Conversation compacted" dividers. Self-healing: any error is
+    logged and the loop continues (a transient blip never abandons the mirror);
+    cancellation propagates for clean teardown. Best-effort, like the approval
+    mirror — the offset is in-memory, so a forwarder restart may miss a compaction
+    that lands during the gap, which only drops one divider.
+
+    :param recording_path: qwen's chat recording for this session (see
+        :func:`omnigent.qwen_native_bridge.qwen_session_recording_path`).
+    """
+    try:
+        offset = recording_path.stat().st_size
+    except OSError:
+        offset = 0  # not created yet; first poll reads from the start
+    timeout = httpx.Timeout(_POST_TIMEOUT_S)
+    async with httpx.AsyncClient(
+        base_url=base_url, headers=headers, auth=auth, timeout=timeout
+    ) as client:
+        while True:
+            try:
+                statuses, offset = await asyncio.to_thread(
+                    _read_new_compaction_statuses, recording_path, offset
+                )
+                for status in statuses:
+                    await _post_external_compaction_status(
+                        client, session_id=session_id, status=status
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _logger.exception(
+                    "qwen compaction mirror poll failed; session=%s recording=%s",
+                    session_id,
+                    recording_path,
+                )
+            await asyncio.sleep(poll_interval_s)
