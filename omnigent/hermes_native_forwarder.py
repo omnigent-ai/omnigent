@@ -92,6 +92,17 @@ def _warn_sqlite_once(context: str, exc: sqlite3.Error) -> None:
 # an internal bridge detail).
 _ATTACHMENT_MARKER_RE = re.compile(r"\[Attached:[^\]]*\]")
 
+# Hermes injects skill content as a user message prefixed with this marker.
+# The full skill prompt is not useful in the web UI — replace it with a
+# short summary so the chat view stays clean.
+_SKILL_INVOKE_RE = re.compile(
+    r'^\[IMPORTANT: The user has invoked the "(?P<name>[^"]+)" skill',
+)
+
+#: Maximum characters for a tool output mirrored into the web UI chat view.
+#: Longer outputs are truncated so skill loads and other verbose results don't
+#: flood the conversation bubbles. The full output remains visible in the
+
 
 def _read_model_from_hermes_config(bridge_dir: Path) -> str | None:
     """Best-effort read of the model name from the per-session HERMES_HOME config.
@@ -418,6 +429,11 @@ def _message_to_items(
     if role == "user":
         if not text:
             return []
+        # Hermes injects skill content as a user message — replace with
+        # a short summary so the chat view stays readable.
+        skill_match = _SKILL_INVOKE_RE.match(text)
+        if skill_match:
+            text = f"/{skill_match.group('name')}"
         return [
             _MirrorItem(
                 msg_id=msg_id,
