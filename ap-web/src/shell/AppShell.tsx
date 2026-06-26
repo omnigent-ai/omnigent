@@ -5,6 +5,8 @@ import { useConversations } from "@/hooks/useConversations";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
+import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
+import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
@@ -64,6 +66,7 @@ import { TerminalsPanel } from "./TerminalsPanel";
 import { TodoPanel } from "./TodoPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
+import { CommandPalette } from "./CommandPalette";
 import { Toaster } from "@/components/ui/toast";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
@@ -758,6 +761,12 @@ export function AppShell() {
     onToggleRight: toggleRightPanel,
   });
 
+  // ⌘K (Ctrl+K) toggles the command palette. Disabled embedded, where ⌘K is the
+  // host page's. Bound here where the palette's open-state lives.
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const isEmbedded = useIsEmbedded();
+  useCommandPaletteHotkey(() => setCommandPaletteOpen((prev) => !prev), !isEmbedded);
+
   // Mobile back button: close the open file and return to the files/changes
   // list. On mobile the tab strip is hidden, so a "back" should fully drop the
   // file (remove it from openFiles) rather than leaving an orphan tab the user
@@ -1293,6 +1302,16 @@ export function AppShell() {
           {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
               ⌘/Ctrl+/ opener); ungated so it works on every route. */}
           <KeyboardShortcutsDialog />
+          {/* Global command palette (⌘K). Ungated so it works on every route;
+              the hotkey itself is disabled in embedded mode. */}
+          {!isEmbedded && (
+            <CommandPalette
+              open={commandPaletteOpen}
+              onOpenChange={setCommandPaletteOpen}
+              onToggleLeftSidebar={() => setSidebarOpen((prev) => !prev)}
+              onToggleRightSidebar={toggleRightPanel}
+            />
+          )}
           {/* Transient toasts (e.g. "session archived"). Mounted once here so
               any surface can fire one via showToast(). */}
           <Toaster />
