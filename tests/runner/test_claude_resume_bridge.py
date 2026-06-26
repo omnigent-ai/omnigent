@@ -1,14 +1,16 @@
 """Tests for claude-native resume bridge selection (post-/clear isolation).
 
-After a Claude ``/clear`` (or ``/fork``) the rotation hands the live terminal to
-the NEW session and leaves the OLD session's natural bridge dir
-(``D(session_id)``) with its on-disk ``active_session_id`` pointing at that
-sibling. A host relaunch then resumes the old session in a SEPARATE runner
-process; reusing the shared dir there puts a second forwarder on the live
-transcript (duplicate items) and trips the executor's "no longer active" guard.
-:func:`_resolve_claude_resume_bridge_id` detects the collision via the on-disk
-``active_session_id`` (the one signal visible across runner processes) and forks
-the old session onto an isolated bridge dir.
+``_resolve_claude_resume_bridge_id`` chooses which bridge dir a (re)started
+claude-native session should use, driven by the session's ``bridge_id`` LABEL
+and that dir's on-disk ``active_session_id`` (the one signal visible across
+runner processes):
+
+- ``active`` None / == session_id → use the labelled dir (fresh, reconnect, CLI
+  random bridge, the /clear rotation's NEW session whose inherited dir is its
+  own, and a prior resume's fork).
+- ``active`` == a different live session → a /clear handed the live pane to that
+  sibling; resuming on the shared dir would double-mirror the transcript and
+  trip the executor guard, so fork to an isolated dir and persist it.
 """
 
 from __future__ import annotations
@@ -38,13 +40,13 @@ def _seed_bridge(bridge_id: str, active: str, tmp_path: Path) -> None:
     write_active_session_id(bridge_dir, active)
 
 
-def _label_returning(label: str):
-    """A stand-in for ``_claude_native_bridge_id_for_session`` returning ``label``."""
+def _label(monkeypatch: pytest.MonkeyPatch, label: str) -> None:
+    """Make ``_claude_native_bridge_id_for_session`` report ``label``."""
 
     async def _inner(*, server_client: object, session_id: str) -> str:
         return label
 
-    return _inner
+    monkeypatch.setattr(runner_app, "_claude_native_bridge_id_for_session", _inner)
 
 
 class _RecordingClient:
@@ -59,78 +61,98 @@ class _RecordingClient:
 
 
 @pytest.mark.asyncio
-async def test_fresh_session_uses_session_id(tmp_path: Path) -> None:
-    """No bridge dir on disk yet → keep the natural session_id bridge."""
-    result = await _resolve_claude_resume_bridge_id(server_client=None, session_id="conv_a")
+async def test_fresh_session_uses_label(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """No bridge dir yet (label == session_id) → use it, no fork."""
+    _label(monkeypatch, "conv_a")
+    result = await _resolve_claude_resume_bridge_id(server_client=object(), session_id="conv_a")
     assert result == "conv_a"
 
 
 @pytest.mark.asyncio
-async def test_reconnect_reuses_own_bridge(tmp_path: Path) -> None:
-    """A plain reconnect (D(conv_a).active == conv_a) keeps session_id."""
-    _seed_bridge("conv_a", "conv_a", tmp_path)
-    result = await _resolve_claude_resume_bridge_id(server_client=None, session_id="conv_a")
-    assert result == "conv_a"
-
-
-@pytest.mark.asyncio
-async def test_collision_forks_to_fresh_bridge(
+async def test_reconnect_reuses_own_bridge(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """D(conv_a) owned by sibling conv_b, label still conv_a → mint + persist."""
-    _seed_bridge("conv_a", "conv_b", tmp_path)
-    monkeypatch.setattr(
-        runner_app, "_claude_native_bridge_id_for_session", _label_returning("conv_a")
-    )
+    """A plain reconnect (D(label).active == session_id) keeps the label."""
+    _label(monkeypatch, "conv_a")
+    _seed_bridge("conv_a", "conv_a", tmp_path)
+    result = await _resolve_claude_resume_bridge_id(server_client=object(), session_id="conv_a")
+    assert result == "conv_a"
+
+
+@pytest.mark.asyncio
+async def test_new_session_uses_inherited_bridge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The /clear rotation's NEW session keeps its inherited (shared) bridge.
+
+    Its label points at the old session's dir, whose ``active_session_id`` is the
+    NEW session itself (the live pane) — so it must use that dir, NOT its own
+    session_id dir (which is empty and has no tmux target). Regression guard for
+    the "tmux target not advertised" break.
+    """
+    _label(monkeypatch, "conv_shared")
+    _seed_bridge("conv_shared", "conv_new", tmp_path)
+    result = await _resolve_claude_resume_bridge_id(server_client=object(), session_id="conv_new")
+    assert result == "conv_shared"
+
+
+@pytest.mark.asyncio
+async def test_cli_random_bridge_is_kept(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A CLI session's random bridge_id (active == session_id) is preserved."""
+    _label(monkeypatch, "tok_random")
+    _seed_bridge("tok_random", "conv_a", tmp_path)
+    result = await _resolve_claude_resume_bridge_id(server_client=object(), session_id="conv_a")
+    assert result == "tok_random"
+
+
+@pytest.mark.asyncio
+async def test_collision_forks_and_persists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Old session whose labelled dir is owned by a live sibling → fork + persist."""
+    _label(monkeypatch, "conv_a")
+    _seed_bridge("conv_a", "conv_b", tmp_path)  # sibling conv_b owns it
     client = _RecordingClient()
     result = await _resolve_claude_resume_bridge_id(server_client=client, session_id="conv_a")
     assert result != "conv_a"
     assert result.startswith("conv_a-clr-")
-    # The fork is persisted to the bridge_id label so auto-create + the message
-    # executor converge on the same isolated dir.
+    # Persisted to the label so auto-create + the executor converge on it.
     assert client.patches == [
-        (
-            "/v1/sessions/conv_a",
-            {"labels": {"omnigent.claude_native.bridge_id": result}},
-        )
+        ("/v1/sessions/conv_a", {"labels": {"omnigent.claude_native.bridge_id": result}})
     ]
 
 
 @pytest.mark.asyncio
-async def test_collision_reuses_prior_fork(
+async def test_minted_fork_not_yet_prepared_converges(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A prior resume's forked dir that is still ours is reused (idempotent)."""
-    _seed_bridge("conv_a", "conv_b", tmp_path)  # natural dir taken by sibling
-    _seed_bridge("conv_a-clr-cafe", "conv_a", tmp_path)  # prior fork, still ours
-    monkeypatch.setattr(
-        runner_app,
-        "_claude_native_bridge_id_for_session",
-        _label_returning("conv_a-clr-cafe"),
-    )
+    """A just-minted fork (label set, dir not prepared yet) is reused, not re-forked.
+
+    This is the convergence between the session-init spawn_env (which mints +
+    persists) and auto-create (which then reads the label before the dir is
+    prepared, so its active is still None).
+    """
+    _label(monkeypatch, "conv_a-clr-cafe")  # label already points at the fork
+    # D(conv_a-clr-cafe) intentionally NOT seeded → active is None.
     result = await _resolve_claude_resume_bridge_id(server_client=object(), session_id="conv_a")
     assert result == "conv_a-clr-cafe"
 
 
 @pytest.mark.asyncio
-async def test_collision_prior_fork_taken_mints_fresh(
+async def test_prepared_fork_is_reused(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A prior resume's prepared fork (active == session_id) is reused."""
+    _label(monkeypatch, "conv_a-clr-cafe")
+    _seed_bridge("conv_a-clr-cafe", "conv_a", tmp_path)
+    result = await _resolve_claude_resume_bridge_id(server_client=object(), session_id="conv_a")
+    assert result == "conv_a-clr-cafe"
+
+
+@pytest.mark.asyncio
+async def test_stale_label_repairs_to_session_id(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """If the prior fork dir is now owned by yet another session, mint fresh."""
-    _seed_bridge("conv_a", "conv_b", tmp_path)  # natural taken by conv_b
-    _seed_bridge("conv_a-clr-cafe", "conv_d", tmp_path)  # prior fork taken by conv_d
-    monkeypatch.setattr(
-        runner_app,
-        "_claude_native_bridge_id_for_session",
-        _label_returning("conv_a-clr-cafe"),
-    )
-    client = _RecordingClient()
-    result = await _resolve_claude_resume_bridge_id(server_client=client, session_id="conv_a")
-    assert result.startswith("conv_a-clr-")
-    assert result != "conv_a-clr-cafe"
-    assert client.patches == [
-        (
-            "/v1/sessions/conv_a",
-            {"labels": {"omnigent.claude_native.bridge_id": result}},
-        )
-    ]
+    """A stale label (foreign id, dir absent) is repaired to the natural dir."""
+    _label(monkeypatch, "m0-bridge_from_prior_rotation")
+    # D(m0-bridge_from_prior_rotation) is absent → active None, not our fork.
+    result = await _resolve_claude_resume_bridge_id(server_client=object(), session_id="conv_a")
+    assert result == "conv_a"

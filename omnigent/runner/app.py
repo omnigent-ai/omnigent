@@ -4156,35 +4156,35 @@ async def _resolve_claude_resume_bridge_id(
     """
     Choose the bridge id a (re)started claude-native session should use.
 
-    Normally a session owns ``D(session_id)`` and this returns ``session_id``.
-    But after a ``/clear`` or ``/fork``, the rotation hands the live terminal to
-    the NEW session and leaves ``D(session_id)``'s on-disk ``active_session_id``
-    pointing at that sibling. When a host relaunch then resumes THIS (old)
-    session in a SEPARATE runner process, reusing ``D(session_id)`` would put a
-    second forwarder on the live transcript the sibling already mirrors — every
-    conversation item double-posts (external items have no server-side dedup) —
-    and the executor guard would reject the turn ("session no longer active
-    after /clear"). Per-process forwarder registries can't prevent this: the
-    sibling's forwarder lives in another process.
+    Resolution is driven by the session's ``bridge_id`` LABEL (its intended
+    bridge dir) and that dir's on-disk ``active_session_id`` — the one signal
+    visible across runner processes (unlike the in-memory registries):
 
-    So when ``D(session_id)`` is owned by a live sibling, return an isolated
-    bridge id: reuse the dir a prior resume already forked (named by the
-    session's current ``bridge_id`` label) when that dir is free or already
-    ours, so repeated resumes converge; otherwise mint a fresh, unique id and
-    PERSIST it to the bridge_id label. Persisting on mint is what makes every
-    resolver in this resume converge on the SAME dir: the executor spawn_env
-    (session-init), auto-create, and the message dispatch all call this, and the
-    later ones reuse the minted id via the label instead of each minting their
-    own. The decision is driven by the on-disk ``active_session_id``, which is
-    visible across runner processes (unlike the in-memory registries).
+    - ``active`` ``== session_id`` → use the labelled bridge. This covers a
+      reconnect, a CLI session (random ``bridge_id``), a ``/clear`` rotation's
+      NEW session (whose inherited dir's ``active`` is itself), and a fork a
+      prior resume already prepared for us. Returning the label (not
+      ``session_id``) is essential: the new session's live pane lives in the
+      INHERITED dir.
+    - ``active`` is ``None`` (unprepared dir) → ambiguous. If the label is the
+      natural ``session_id`` dir or our own ``-clr-`` fork namespace, use it (a
+      fresh session, or a just-minted fork not prepared yet — keeping it is what
+      lets the session-init spawn_env and auto-create converge). Otherwise the
+      label is STALE (e.g. left by a rotation that never completed); repair to
+      the natural ``session_id`` dir so all lookups stay consistent.
+    - ``active`` is a DIFFERENT, live session → a ``/clear``/``/fork`` handed the
+      live pane to that sibling and left it owning this dir. Resuming there would
+      put a second forwarder on the sibling's live transcript (duplicate items —
+      external items have no server-side dedup) and trip the executor guard
+      ("session no longer active after /clear"). Mint an isolated fork and
+      PERSIST it to the label so the other resolvers in this resume (auto-create,
+      the message executor) converge on the same dir via the label.
 
-    :param server_client: Omnigent server client — resolves the session's
-        current ``bridge_id`` label on the collision path and persists a freshly
-        minted fork.
+    :param server_client: Omnigent server client — resolves the ``bridge_id``
+        label and persists a freshly minted fork.
     :param session_id: The session being (re)started, e.g. ``"conv_old"``.
-    :returns: The bridge id to key this session's bridge dir on — ``session_id``
-        in the common case, otherwise an isolated ``f"{session_id}-clr-…"``
-        (or a previously-forked id when reusable).
+    :returns: The bridge id to key this session's bridge dir on — usually the
+        current label, otherwise an isolated ``f"{session_id}-clr-…"``.
     """
     import secrets
 
@@ -4194,22 +4194,21 @@ async def _resolve_claude_resume_bridge_id(
         read_active_session_id,
     )
 
-    natural_active = read_active_session_id(bridge_dir_for_bridge_id(session_id))
-    if natural_active is None or natural_active == session_id:
-        # Free, fresh, or a plain reconnect to our own bridge — no rotation
-        # sibling owns it, so keep the natural (session_id) bridge.
-        return session_id
-    prior_label = await _claude_native_bridge_id_for_session(
+    fork_prefix = f"{session_id}-clr-"
+    intended = await _claude_native_bridge_id_for_session(
         server_client=server_client,
         session_id=session_id,
     )
-    if prior_label != session_id:
-        prior_active = read_active_session_id(bridge_dir_for_bridge_id(prior_label))
-        if prior_active is None or prior_active == session_id:
-            # A prior resume already forked this session onto its own dir and it
-            # is still free/ours — reuse it so repeated resumes don't leak dirs.
-            return prior_label
-    chosen = f"{session_id}-clr-{secrets.token_hex(4)}"
+    active = read_active_session_id(bridge_dir_for_bridge_id(intended))
+    if active == session_id:
+        return intended
+    if active is None:
+        # Our natural dir or our own fork namespace → keep it; otherwise the
+        # label is stale, so repair to the natural session_id dir.
+        if intended == session_id or intended.startswith(fork_prefix):
+            return intended
+        return session_id
+    chosen = f"{fork_prefix}{secrets.token_hex(4)}"
     # Persist immediately so the other resolvers in this resume converge on it.
     try:
         await server_client.patch(
