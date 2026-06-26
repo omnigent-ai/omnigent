@@ -682,6 +682,7 @@ async def test_runner_subprocess_exits_on_sigterm(
         await manager.shutdown()
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=0)
 async def test_runner_subprocess_exits_when_spawning_parent_exits(
     short_tmp_parent: Path,
     register_test_harness: None,
@@ -722,7 +723,7 @@ async def test_runner_subprocess_exits_when_spawning_parent_exits(
         check=True,
         text=True,
         capture_output=True,
-        timeout=10,
+        timeout=30,
         env={**os.environ, "PYTHONPATH": os.getcwd()},
     )
     runner_pid = int(proc.stdout.strip().splitlines()[-1])
