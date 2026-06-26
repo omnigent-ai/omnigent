@@ -17,11 +17,13 @@
 import { useState } from "react";
 import type { ComponentType, SVGProps } from "react";
 import {
+  ArrowRightIcon,
   BookOpenIcon,
   BotIcon,
   Code2Icon,
   CompassIcon,
   CornerDownRightIcon,
+  CornerLeftUpIcon,
   FileTextIcon,
   FlaskConicalIcon,
   PlusIcon,
@@ -132,7 +134,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
       <ul className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-1">
         <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
         {children.map((child) => (
-          <SubagentRow key={child.id} child={child} depth={1} conversationId={conversationId} />
+          <SubagentRow key={child.id} child={child} depth={1} conversationId={conversationId} parentId={rootSessionId} />
         ))}
       </ul>
       {/* Mounted only while open so a closed rail issues no /v1/agents
@@ -557,12 +559,15 @@ function SubagentRow({
   child,
   depth,
   conversationId,
+  parentId,
 }: {
   child: ChildSessionInfo;
   /** Levels below the root, 1 = direct child of "main". */
   depth: number;
   /** The conversation currently rendered in main, for row highlighting. */
   conversationId: string;
+  /** The parent session ID for 'return to parent' navigation. */
+  parentId: string;
 }) {
   const status = childStatus(child);
   const search = railLinkSearch(useLocation().search);
@@ -586,7 +591,8 @@ function SubagentRow({
           // See MainRow: drop session-scoped params on rail navigation
           // (preserving global ones like ``?debug=1``) so a sticky
           // ``?file=`` from the previous session doesn't carry over.
-          to={{ pathname: `/c/${child.id}`, search }}
+          to={{ pathname: `/c/${isActive ? parentId : child.id}`, search }}
+          aria-label={isActive ? `Return to parent of ${primary}` : `Take over ${primary}`}
           data-testid="subagent-row"
           data-child-session-id={child.id}
           data-depth={depth}
@@ -594,7 +600,7 @@ function SubagentRow({
           // under its parent, signaling where it sits in the tree.
           style={{ paddingLeft: ROW_BASE_PADDING_PX + (depth - 1) * ROW_DEPTH_STEP_PX }}
           className={cn(
-            "flex w-full flex-col gap-0.5 py-2 pr-2.5 text-left hover:bg-accent/60",
+            "group flex w-full flex-col gap-0.5 py-2 pr-2.5 text-left hover:bg-accent/60",
             isActive && "bg-accent",
             dim && "opacity-60 hover:opacity-100",
           )}
@@ -609,7 +615,21 @@ function SubagentRow({
             <Icon className="size-3.5 shrink-0 text-muted-foreground" />
             <span className="shrink-0 truncate text-xs font-medium">{primary}</span>
             <span className="flex-1" />
-            <StatusIndicator {...status} />
+            
+            {isActive ? (
+              <span className="flex items-center gap-1 rounded bg-accent-foreground/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground transition-colors group-hover:bg-accent-foreground/20 group-hover:text-foreground group-focus-visible:bg-accent-foreground/20 group-focus-visible:text-foreground">
+                Return <CornerLeftUpIcon className="size-3" />
+              </span>
+            ) : (
+              <>
+                <div className="group-hover:hidden group-focus-visible:hidden">
+                  <StatusIndicator {...status} />
+                </div>
+                <span className="hidden items-center gap-1 rounded bg-accent-foreground/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground transition-colors group-hover:flex group-hover:bg-accent-foreground/20 group-hover:text-foreground group-focus-visible:flex group-focus-visible:bg-accent-foreground/20 group-focus-visible:text-foreground">
+                  Open <ArrowRightIcon className="size-3" />
+                </span>
+              </>
+            )}
           </div>
           {child.last_message_preview && (
             // Preview indented to align with the title text on the row
@@ -628,6 +648,7 @@ function SubagentRow({
           child={grandchild}
           depth={depth + 1}
           conversationId={conversationId}
+          parentId={child.id}
         />
       ))}
     </>
