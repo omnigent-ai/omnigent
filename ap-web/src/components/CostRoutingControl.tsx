@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { relativeTime } from "@/lib/relativeTime";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { Session } from "@/lib/types";
@@ -6,28 +7,17 @@ import type { Session } from "@/lib/types";
 /** Per-session cost-control switch value; `null` = unset (presents as off). */
 export type CostControlMode = "on" | "off" | null;
 
-/** Agent whose sessions carry the cost advisor (orchestrator only). */
-export const COST_ROUTING_AGENT_NAME = "polly";
-
 /**
- * Whether a session should surface the cost-routing control.
+ * Whether a session is eligible for smart routing (top-level, has agent).
  *
- * The advisor governs only the orchestrator's own brain, so the gate
- * must exclude sub-agent (child) sessions: workers spawned via
- * `sys_session_send` inherit the parent bundle's `agentName`
- * (`"polly"`), so an agent-name check alone wrongly matches them.
- * `parentSessionId` — set on every child snapshot, `null` for
- * top-level sessions — is the discriminator.
- *
- * @param session The session snapshot (or any subset carrying agent
- *   identity + parent linkage); `null`/`undefined` while loading or
- *   on the landing page.
- * @returns `true` only for a top-level (non-child) polly session.
+ * Callers must also check ``ServerInfo.smart_routing_enabled`` from
+ * the ``/v1/info`` probe to decide whether to show the toggle — this
+ * predicate only checks the session shape.
  */
 export function isCostRoutingSession(
   session: Pick<Session, "agentName" | "parentSessionId"> | null | undefined,
 ): boolean {
-  return session?.agentName === COST_ROUTING_AGENT_NAME && session.parentSessionId == null;
+  return session?.agentName != null && session.parentSessionId == null;
 }
 
 /** Conversation label the cost advisor persists its latest plan under. */
@@ -283,4 +273,11 @@ export function IntelligentModelControl({
       </Tooltip>
     </TooltipProvider>
   );
+}
+
+/** Relative display time for a verdict's turn anchor (null-safe, NaN-safe). */
+export function verdictRelativeTime(turnAnchor: string | null): string | null {
+  if (turnAnchor === null) return null;
+  const ms = Date.parse(turnAnchor);
+  return Number.isFinite(ms) ? relativeTime(ms) : null;
 }

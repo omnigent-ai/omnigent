@@ -4,9 +4,11 @@ name: Merge Ready
 # required branch-protection check, backed by the REQUIRED list inside
 # this workflow. Triggers: `/merge` comment (write-access commenter only),
 # `pull_request_target` labeled (acts only with `automerge`),
-# `workflow_run` on CI completion (same-repo and fork PRs -- ctx resolves the
-# PR from the head SHA), and `workflow_dispatch` (programmatic/manual
-# re-evaluation of one PR). Posted via the REST API (not the job's implicit
+# `workflow_run` on CI completion (re-evaluates same-repo PRs),
+# `check_suite` completion (re-evaluates fork PRs -- their CI does not deliver
+# a usable workflow_run to this base-repo workflow), and `workflow_dispatch`
+# (programmatic/manual re-evaluation of one PR). Both ctx-resolve the PR from
+# the head SHA. Posted via the REST API (not the job's implicit
 # check run) so the status lands on the PR head SHA, since these jobs run on
 # the default branch.
 #
@@ -20,14 +22,21 @@ name: Merge Ready
 # (branch protection has enforce_admins=false).
 
 on:
-  # `labeled` only; `workflow_run` re-evaluates on CI completion for all PRs
-  # (same-repo and fork -- ctx resolves the PR from the head SHA).
+  # `labeled` only; `workflow_run` re-evaluates same-repo PRs on CI completion.
   # pull_request_target (not pull_request) so this workflow always runs from
   # main -- a PR cannot modify the gate logic by editing this file.
   pull_request_target:
     types: [labeled]
   workflow_run:
     workflows: [PR Template, CI, Lint, E2E UI Tests, E2E Tests, Integration Tests]
+    types: [completed]
+  # Fork-PR CI does not deliver a usable workflow_run to this base-repo
+  # workflow, so the gate never re-evaluated when a fork's tests finished
+  # (#1004 retired the fork-e2e mirror that used to bridge this). The
+  # github-actions check_suite DOES complete in the base repo for fork PRs --
+  # once, when all the suite's workflows finish -- and ctx resolves the PR
+  # from its head SHA, so it is the fork equivalent of the workflow_run path.
+  check_suite:
     types: [completed]
   issue_comment:
     types: [created]
@@ -48,7 +57,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: merge-ready-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr || github.event.workflow_run.head_sha }}
+  group: merge-ready-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr || github.event.workflow_run.head_sha || github.event.check_suite.head_sha }}
   cancel-in-progress: true
 
 jobs:
@@ -71,6 +80,10 @@ jobs:
       (
         github.event_name == 'workflow_run' &&
         github.event.workflow_run.event == 'pull_request'
+      ) ||
+      (
+        github.event_name == 'check_suite' &&
+        github.event.check_suite.app.slug == 'github-actions'
       ) ||
       github.event_name == 'workflow_dispatch' ||
       (
@@ -139,11 +152,12 @@ jobs:
             PR="${{ github.event.issue.number }}"
             SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
           else
+            # workflow_run (same-repo) or check_suite (fork) completion.
             PR=$(echo "$WF_PRS" | jq -r '.[0].number // empty')
-            SHA="${{ github.event.workflow_run.head_sha }}"
+            SHA="${{ github.event.workflow_run.head_sha || github.event.check_suite.head_sha }}"
             [[ -z "$PR" ]] && PR=$(resolve_pr_from_sha "$SHA")
             if [[ -z "$PR" ]]; then
-              echo "::notice::Skipped: workflow_run has no associated PR (push to main, etc)"
+              echo "::notice::Skipped: CI completion has no associated open PR (push to main, etc)"
               echo "skip=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -275,6 +289,7 @@ jobs:
         if: >-
           (
             github.event_name == 'workflow_run' ||
+            github.event_name == 'check_suite' ||
             github.event_name == 'workflow_dispatch'
           ) &&
           steps.ctx.outputs.skip != 'true' &&

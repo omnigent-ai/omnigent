@@ -229,25 +229,55 @@ async def test_health_batch_reports_strict_runner_and_host_liveness(
     assert body["status"] == "ok"
     sessions = body["sessions"]
 
+    # host_version is None for every row here: the hosts are seeded in the
+    # host_store (DB) for the online gate but have no live tunnel in the
+    # in-memory host_registry, which is the only source of the version (the
+    # cross-replica / DB-only degradation path). The live-registry path is
+    # covered by test_health_reports_host_version_from_live_registry.
+    #
     # (a) Live runner tunnel ⇒ reachable. host_online None (no host_id).
     # A failure here means the strict _runner_up check stopped reading the
     # tunnel registry, or the registration path changed.
-    assert sessions[runner_up.id] == {"runner_online": True, "host_online": None}
+    assert sessions[runner_up.id] == {
+        "runner_online": True,
+        "host_online": None,
+        "host_version": None,
+    }
     # (b) Dead runner, live host: strict runner_online is False (no
     # host-relaunch optimism), but host_online surfaces the live host so
     # the open view can offer "send a message to wake the runner". A True
     # runner_online here would be the old conflated behavior regressing.
-    assert sessions[runner_down_host_up.id] == {"runner_online": False, "host_online": True}
+    assert sessions[runner_down_host_up.id] == {
+        "runner_online": False,
+        "host_online": True,
+        "host_version": None,
+    }
     # (c) Dead runner, offline host ⇒ both False.
-    assert sessions[runner_down_host_down.id] == {"runner_online": False, "host_online": False}
+    assert sessions[runner_down_host_down.id] == {
+        "runner_online": False,
+        "host_online": False,
+        "host_version": None,
+    }
     # (d) Dead runner, no host ⇒ runner_online False, host_online None.
-    assert sessions[runner_down_no_host.id] == {"runner_online": False, "host_online": None}
+    assert sessions[runner_down_no_host.id] == {
+        "runner_online": False,
+        "host_online": None,
+        "host_version": None,
+    }
     # Stopped + live host: NOT special-cased — reads exactly like (b). If
     # this regressed to False/True-with-stopped-collapse, the stopped marker
     # would still be leaking into liveness (it must not — WS-S2 retires it).
-    assert sessions[stopped.id] == {"runner_online": False, "host_online": True}
+    assert sessions[stopped.id] == {
+        "runner_online": False,
+        "host_online": True,
+        "host_version": None,
+    }
     # Unknown id (no conversation row) ⇒ reachable, no host.
-    assert sessions["conv_unknown"] == {"runner_online": True, "host_online": None}
+    assert sessions["conv_unknown"] == {
+        "runner_online": True,
+        "host_online": None,
+        "host_version": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -276,14 +306,80 @@ async def test_health_single_session_reports_both_liveness_fields(
 
     assert resp.status_code == 200
     body = resp.json()
-    # The single object echoes the id and both fields — strict runner_online
-    # False with host_online True. A missing host_online key would mean the
-    # single-id branch wasn't updated alongside the batch branch.
+    # The single object echoes the id and the liveness fields — strict
+    # runner_online False with host_online True. host_version is None: the
+    # host is online in the DB store but has no live tunnel in the in-memory
+    # registry the version is read from. A missing host_online/host_version
+    # key would mean the single-id branch wasn't updated with the batch one.
     assert body["session"] == {
         "id": conv.id,
         "runner_online": False,
         "host_online": True,
+        "host_version": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_health_reports_host_version_from_live_registry(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """
+    ``GET /health`` surfaces the bound host's version when that host has a
+    live tunnel on this replica.
+
+    ``host_version`` is read from the in-memory host registry (the host's
+    ``host.hello`` frame), not the hosts table — so a session bound to a
+    host with a live local tunnel reports that host's version, which the
+    session info popover renders next to the server version. This is the
+    non-``None`` counterpart to the DB-only rows in the batch test.
+    """
+    from omnigent.host.frames import HostHelloFrame
+
+    wired = _build_liveness_app(db_uri, tmp_path)
+    app = wired.app
+    # host_live is already online in the host_store (DB) via the builder;
+    # registering it in the in-memory registry is what carries the version.
+    app.state.host_registry.register(
+        "host_live",
+        _StubWebSocket(),
+        HostHelloFrame(version="9.9.9-test", frame_protocol_version=1, name="laptop"),
+        "alice@example.com",
+    )
+    conv = wired.conversation_store.create_conversation(
+        runner_id="rnr_dead", host_id="host_live", workspace="/tmp/ws"
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(f"/health?session_id={conv.id}")
+
+    assert resp.status_code == 200
+    # host_online True (DB store) AND host_version from the live registry.
+    assert resp.json()["session"] == {
+        "id": conv.id,
+        "runner_online": False,
+        "host_online": True,
+        "host_version": "9.9.9-test",
+    }
+
+
+@pytest.mark.asyncio
+async def test_info_includes_server_version(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``GET /v1/info`` includes ``server_version`` — the installed package
+    version (same source as ``/api/version``) — so the web UI can show it
+    in the session info popover's version footer without a second fetch.
+    """
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    body = resp.json()
+    # Exact match against the installed version confirms the handler reads
+    # importlib.metadata, not a constant — a stale constant would mislead
+    # anyone reading the version off the popover.
+    assert body["server_version"] == _pkg_version("omnigent")
 
 
 @pytest.mark.asyncio

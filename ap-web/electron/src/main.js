@@ -31,7 +31,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { registerLocalhostCors } = require("./localhost_cors");
-const { normalizeUrl, expandDatabricksWorkspaceUrl, WORKSPACE_UI_PATH } = require("./url");
+const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
+const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
@@ -597,29 +598,6 @@ function rememberRecentServer(settings, url) {
   ].slice(0, MAX_RECENT_SERVERS);
 }
 
-/**
- * CSS that hides the Databricks workspace navigation chrome around a
- * workspace-hosted Omnigent SPA.
- *
- * On a workspace the SPA is mounted as a workspace *page*, so Databricks wraps
- * it in its top-nav shell (the dark bar with the workspace switcher). In a
- * dedicated desktop window that chrome is just noise. We promote Omnigent's
- * own root — ``.omnigent-app``, the wrapper ap-web's embed entry sets
- * (``ap-web/src/embed.tsx``) — to a full-viewport overlay so it paints over
- * the workspace bar. Keying on Omnigent's wrapper (defined in THIS repo)
- * rather than the monolith-owned, unstable workspace nav markup keeps this
- * from silently breaking when Databricks reshuffles its chrome; on a
- * standalone (non-embed) build there is no ``.omnigent-app``, so the rule is
- * a harmless no-op.
- */
-const WORKSPACE_CHROME_HIDE_CSS = `
-  .omnigent-app {
-    position: fixed !important;
-    inset: 0 !important;
-    z-index: 2147483647 !important;
-  }
-`;
-
 // ---------------------------------------------------------------------------
 // Window + navigation
 // ---------------------------------------------------------------------------
@@ -858,20 +836,8 @@ function createWindow(targetUrl, opts = {}) {
   // Databricks workspace-hosted Omnigent renders inside the workspace's
   // top-nav chrome (the SPA is a workspace page). On a dedicated desktop
   // window, hide it by overlaying Omnigent's own root — see
-  // WORKSPACE_CHROME_HIDE_CSS. Re-applied on every full load (a server switch
-  // is a fresh document); the SPA's own client-side routing keeps the same
-  // document, so the injected stylesheet persists across in-app navigation.
-  win.webContents.on("did-finish-load", () => {
-    let pathname = "";
-    try {
-      pathname = new URL(win.webContents.getURL()).pathname;
-    } catch {
-      return;
-    }
-    if (pathname.startsWith(WORKSPACE_UI_PATH)) {
-      void win.webContents.insertCSS(WORKSPACE_CHROME_HIDE_CSS);
-    }
-  });
+  // registerWorkspaceChromeHide, which wires the inject-on-did-finish-load.
+  registerWorkspaceChromeHide(win.webContents);
 
   win.on("closed", () => {
     windows.delete(win);

@@ -1,4 +1,4 @@
-import { type DragEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type DragEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -20,6 +20,8 @@ import {
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -113,6 +115,47 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
   },
 ];
 
+// Cursor execution modes. "default" sends no flags; other values map to CLI
+// args passed via terminal_launch_args. Keep in sync with `cursor-agent --help`.
+const CURSOR_NATIVE_DEFAULT_EXEC_MODE = "default";
+const CURSOR_NATIVE_EXEC_MODES: {
+  value: string;
+  label: string;
+  description: string;
+  args: string[];
+}[] = [
+  {
+    value: "default",
+    label: "Default",
+    description: "Normal agent mode; prompts before running commands",
+    args: [],
+  },
+  {
+    value: "auto-review",
+    label: "Auto-review",
+    description: "Smart Auto: auto-runs safe tool calls and prompts for the rest",
+    args: ["--auto-review"],
+  },
+  {
+    value: "plan",
+    label: "Plan",
+    description: "Read-only planning; analyzes and proposes plans, no edits",
+    args: ["--mode", "plan"],
+  },
+  {
+    value: "ask",
+    label: "Ask",
+    description: "Q&A style; explains and answers questions (read-only)",
+    args: ["--mode", "ask"],
+  },
+  {
+    value: "yolo",
+    label: "Yolo",
+    description: "Runs everything without prompts or safety checks",
+    args: ["--yolo"],
+  },
+];
+
 // Codex approval presets matching the `/permissions` TUI popup.
 // Each preset bundles a sandbox profile + approval policy, mirroring
 // codex-rs/utils/approval-presets/src/lib.rs. "default" is the auto
@@ -146,6 +189,20 @@ const CODEX_NATIVE_APPROVAL_MODES: {
     args: ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
   },
 ];
+
+// Conversation-label key for the DANGEROUS codex full-bypass opt-in. When
+// set to "1" the runner launches Codex with
+// `--dangerously-bypass-approvals-and-sandbox` (no approval prompts, no
+// command sandbox) — see omnigent.stores.conversation_store
+// CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY. Stored as a label (cheap thread
+// metadata) so it survives reload. Mutually exclusive in spirit with the
+// approval-mode presets above: when bypass is on the runner strips any
+// `--sandbox` / `--ask-for-approval` flags those presets would emit.
+const CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox";
+// The exact phrase a user must TYPE (not just click) to arm full bypass.
+// A typed confirmation makes the dangerous mode impossible to enable by an
+// accidental click; the toggle stays off until this is entered verbatim.
+const CODEX_NATIVE_BYPASS_SANDBOX_CONFIRM_PHRASE = "bypass sandbox";
 
 function HostOption({ host }: { host: Host }) {
   const isOnline = host.status === "online";
@@ -373,8 +430,77 @@ export function harnessUnconfiguredOnHost(
   harness: string | null | undefined,
   host: Host | undefined | null,
 ): boolean {
-  if (!harness || !host?.configured_harnesses) return false;
-  return host.configured_harnesses[harness] === false;
+  return harnessUnavailableReasonOnHost(harness, host) !== null;
+}
+
+function isCodexHarness(harness: string): boolean {
+  return harness === "codex" || harness === "codex-native" || harness === "native-codex";
+}
+
+export function harnessUnavailableReasonOnHost(
+  harness: string | null | undefined,
+  host: Host | undefined | null,
+): string | null {
+  if (!harness || !host?.configured_harnesses) return null;
+  const availability = host.configured_harnesses[harness];
+  if (availability === false) return isCodexHarness(harness) ? "binary-missing" : "unconfigured";
+  if (
+    isCodexHarness(harness) &&
+    (availability === "binary-missing" || availability === "needs-auth")
+  ) {
+    return availability;
+  }
+  // Unknown future reason strings fall through to no warning until the UI knows their copy.
+  return null;
+}
+
+export function harnessWarningBadgeText(reason: string | null): string {
+  if (reason === "binary-missing") return "binary missing";
+  if (reason === "needs-auth") return "needs auth";
+  return "needs setup";
+}
+
+export function harnessWarningMessageText(
+  agentName: string | undefined,
+  hostName: string | undefined,
+  reason: string | null,
+): string {
+  if (reason === "needs-auth") {
+    return `${agentName} needs Codex authentication on ${hostName} — run codex login on that machine.`;
+  }
+  if (reason === "binary-missing") {
+    return `${agentName} is missing the Codex binary on ${hostName} — run omnigent setup on that machine.`;
+  }
+  return `${agentName} isn't configured on ${hostName} — run omnigent setup on that machine.`;
+}
+
+function harnessWarningMessage(
+  agentName: string | undefined,
+  hostName: string | undefined,
+  reason: string | null,
+): ReactNode {
+  if (reason === "needs-auth") {
+    return (
+      <>
+        {agentName} needs Codex authentication on {hostName} — run <code>codex login</code> on that
+        machine.
+      </>
+    );
+  }
+  if (reason === "binary-missing") {
+    return (
+      <>
+        {agentName} is missing the Codex binary on {hostName} — run <code>omnigent setup</code> on
+        that machine.
+      </>
+    );
+  }
+  return (
+    <>
+      {agentName} isn&apos;t configured on {hostName} — run <code>omnigent setup</code> on that
+      machine.
+    </>
+  );
 }
 
 /**
@@ -615,6 +741,140 @@ function ApprovalModeOptions({
 }
 
 /**
+ * DANGEROUS full-bypass opt-in for the Codex-native agent, rendered inside
+ * the Advanced settings menu in the composer footer below the approval-mode
+ * rows.
+ *
+ * Enabling this launches Codex with
+ * ``--dangerously-bypass-approvals-and-sandbox`` — no approval prompts and
+ * no command sandbox. To make that impossible to enable accidentally the
+ * Switch is disabled until the user TYPES the confirmation phrase verbatim;
+ * only then can it be flipped on. While on, a persistent red banner warns
+ * that approvals and the sandbox are disabled. Turning it off (or clearing
+ * the phrase) immediately disarms it.
+ *
+ * @param enabled Whether full bypass is currently armed.
+ * @param onEnabledChange Callback toggling the armed state.
+ */
+function BypassSandboxOption({
+  enabled,
+  onEnabledChange,
+}: {
+  enabled: boolean;
+  onEnabledChange: (enabled: boolean) => void;
+}) {
+  const [confirmText, setConfirmText] = useState<string>("");
+  // VERBATIM match — no trim, no case-folding. The user must type exactly the
+  // phrase we display (CODEX_NATIVE_BYPASS_SANDBOX_CONFIRM_PHRASE); a stray
+  // space or different case must NOT arm this dangerous mode.
+  const phraseMatches = confirmText === CODEX_NATIVE_BYPASS_SANDBOX_CONFIRM_PHRASE;
+  // The toggle can only be flipped ON once the phrase matches; it can always
+  // be flipped OFF. A click while unconfirmed is ignored (defense in depth on
+  // top of the disabled attribute).
+  const canToggleOn = phraseMatches || enabled;
+  return (
+    <div className="px-2 py-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 text-xs font-medium text-destructive">
+          <TriangleAlertIcon className="size-3.5 shrink-0" />
+          <span>Bypass approvals &amp; sandbox</span>
+        </div>
+        <Switch
+          size="sm"
+          checked={enabled}
+          disabled={!canToggleOn}
+          data-testid="new-chat-landing-bypass-sandbox-switch"
+          aria-label="Bypass approvals and sandbox"
+          onCheckedChange={(next) => {
+            // Guard: never let it arm without a verbatim confirmation.
+            if (next && !phraseMatches) return;
+            onEnabledChange(next);
+          }}
+        />
+      </div>
+      <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+        Runs Codex with no approval prompts and no command sandbox. To enable, type{" "}
+        <span className="font-semibold">{CODEX_NATIVE_BYPASS_SANDBOX_CONFIRM_PHRASE}</span> below.
+      </p>
+      {!enabled && (
+        <Input
+          value={confirmText}
+          onChange={(e) => setConfirmText(e.target.value)}
+          placeholder={CODEX_NATIVE_BYPASS_SANDBOX_CONFIRM_PHRASE}
+          spellCheck={false}
+          autoCapitalize="off"
+          autoCorrect="off"
+          className="mt-1.5 h-7 text-xs"
+          data-testid="new-chat-landing-bypass-sandbox-confirm"
+          aria-label="Type the confirmation phrase to enable bypass"
+          // Don't let typing here steer the menu's typeahead focus.
+          onKeyDown={(e) => e.stopPropagation()}
+        />
+      )}
+      {enabled && (
+        <div
+          role="alert"
+          data-testid="new-chat-landing-bypass-sandbox-banner"
+          className="mt-1.5 flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-[11px] font-medium leading-relaxed text-destructive"
+        >
+          <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+          <span>
+            Danger: this session runs Codex with approvals and the sandbox disabled. It can edit any
+            file and run any command without asking.
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Cursor execution-mode radio rows, rendered inside the Advanced settings
+ * menu in the composer footer. Mirror of {@link PermissionModeOptions}
+ * for the Cursor native agent.
+ *
+ * @param value Currently selected mode, e.g. ``"default"``.
+ * @param onValueChange Selection callback (receives the mode value).
+ */
+function CursorModeOptions({
+  value,
+  onValueChange,
+}: {
+  value: string;
+  onValueChange: (mode: string) => void;
+}) {
+  const [previewed, setPreviewed] = useState<string | null>(null);
+  const detail = CURSOR_NATIVE_EXEC_MODES.find(
+    (m) => m.value === (previewed ?? value),
+  )?.description;
+  return (
+    <>
+      <DropdownMenuRadioGroup value={value} onValueChange={onValueChange}>
+        {CURSOR_NATIVE_EXEC_MODES.map((mode) => (
+          <DropdownMenuRadioItem
+            key={mode.value}
+            value={mode.value}
+            data-testid={`new-chat-landing-cursor-mode-${mode.value}`}
+            onFocus={() => setPreviewed(mode.value)}
+            onPointerEnter={() => setPreviewed(mode.value)}
+            className="rounded-sm pl-2 py-1 text-xs"
+          >
+            {mode.label}
+          </DropdownMenuRadioItem>
+        ))}
+      </DropdownMenuRadioGroup>
+      <DropdownMenuSeparator />
+      <p
+        data-testid="new-chat-landing-cursor-mode-detail"
+        className="min-h-5 px-2 pt-0.5 pb-1 text-xs leading-relaxed text-muted-foreground"
+      >
+        {detail}
+      </p>
+    </>
+  );
+}
+
+/**
  * Brain-harness radio rows for an overridable bundle agent, rendered
  * inside the Advanced settings menu in the composer footer.
  *
@@ -655,7 +915,7 @@ function BrainHarnessOptions({
                 className="border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
                 data-testid={`new-chat-landing-harness-warning-${id}`}
               >
-                needs setup
+                {harnessWarningBadgeText(harnessUnavailableReasonOnHost(id, host))}
               </Badge>
             )}
           </DropdownMenuRadioItem>
@@ -762,6 +1022,7 @@ export function NewChatLandingScreen() {
   // fails closed (option hidden) until the boot probe resolves.
   const info = useServerInfo();
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
   // Provider-named label for the sandbox option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" when the server names no
   // provider.
@@ -803,6 +1064,15 @@ export function NewChatLandingScreen() {
   // the codex-native wrapper; ignored otherwise. Lives in the footer
   // tray's Advanced settings menu.
   const [approvalMode, setApprovalMode] = useState<string>(CODEX_NATIVE_DEFAULT_APPROVAL_MODE);
+  // DANGEROUS codex full-bypass opt-in (Codex only). OFF by default and only
+  // flippable on after the user types the confirmation phrase, so it can
+  // never be enabled by an accidental click. Persisted as a conversation
+  // label so it survives reload. When on, a persistent red banner warns and
+  // the runner ignores the approval-mode preset's flags.
+  const [bypassSandbox, setBypassSandbox] = useState<boolean>(false);
+  // Execution mode for Cursor (cursor-agent --mode / --yolo). Only meaningful
+  // for the cursor-native wrapper; ignored otherwise.
+  const [cursorExecMode, setCursorExecMode] = useState<string>(CURSOR_NATIVE_DEFAULT_EXEC_MODE);
   // Per-session brain-harness override for bundle agents (polly / debby).
   // null = the agent spec's declared harness (no override sent); cleared on
   // every agent switch so a pick never leaks across agents.
@@ -893,6 +1163,17 @@ export function NewChatLandingScreen() {
       : agentList.find((a) => a.id === effectiveAgentId);
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
+  const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
+  // Defense in depth for the DANGEROUS bypass toggle: never let an armed
+  // bypass carry across an agent change. Switching the picker to another
+  // agent — or away from Codex and back — must require the typed confirmation
+  // again, the same per-context re-opt-in the store enforces for fork /
+  // agent-switch (CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY is instance-scoped).
+  // Keyed on the effective agent id so it also fires when a persisted pick
+  // resolves to a different agent on mount.
+  useEffect(() => {
+    setBypassSandbox(false);
+  }, [effectiveAgentId]);
   // Native-terminal agents interpret slash commands inside their own CLI
   // (the runner injects the text verbatim), so the landing composer must
   // not intercept them — no skills menu, no slash_command routing.
@@ -904,6 +1185,10 @@ export function NewChatLandingScreen() {
   // call surfaces a specific error if the harness really can't run.
   const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
   const selectedAgentUnconfigured = harnessUnconfiguredOnHost(
+    selectedAgent?.harness,
+    harnessWarningHost,
+  );
+  const selectedAgentUnavailableReason = harnessUnavailableReasonOnHost(
     selectedAgent?.harness,
     harnessWarningHost,
   );
@@ -1044,6 +1329,8 @@ export function NewChatLandingScreen() {
     CLAUDE_NATIVE_PERMISSION_MODES.find((m) => m.value === permissionMode)?.label ?? permissionMode;
   const approvalModeLabel =
     CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ?? approvalMode;
+  const cursorExecModeLabel =
+    CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.label ?? cursorExecMode;
   // Effective brain harness for the selected agent: the user's pick, else
   // the spec's declared harness. null for non-overridable agents (native
   // wrappers, agents whose spec failed to load).
@@ -1060,9 +1347,11 @@ export function NewChatLandingScreen() {
       ? `${selectedAgent.display_name} (${permissionModeLabel})`
       : supportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
         ? `${selectedAgent.display_name} (${approvalModeLabel})`
-        : pickedHarness != null
-          ? `${selectedAgent.display_name} (${BRAIN_HARNESS_LABELS[pickedHarness] ?? pickedHarness})`
-          : selectedAgent.display_name
+        : supportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
+          ? `${selectedAgent.display_name} (${cursorExecModeLabel})`
+          : pickedHarness != null
+            ? `${selectedAgent.display_name} (${BRAIN_HARNESS_LABELS[pickedHarness] ?? pickedHarness})`
+            : selectedAgent.display_name
     : "Select agent";
 
   /**
@@ -1116,7 +1405,9 @@ export function NewChatLandingScreen() {
             className="ml-auto self-center border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
             data-testid={`new-chat-landing-agent-warning-${agent.id}`}
           >
-            needs setup
+            {harnessWarningBadgeText(
+              harnessUnavailableReasonOnHost(agent.harness, harnessWarningHost),
+            )}
           </Badge>
         )}
       </DropdownMenuItem>
@@ -1162,6 +1453,7 @@ export function NewChatLandingScreen() {
       const nativeLabels = nativeWrapperLabelsForAgent(agent);
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
+      const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
 
       let data: { id: string };
 
@@ -1195,11 +1487,6 @@ export function NewChatLandingScreen() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             agent_id: effectiveAgentId,
-            // Managed (cloud sandbox) creates let the server provision the
-            // host: the schema rejects host_id and path workspaces (and git
-            // needs a host_id). The optional repository inputs compose into
-            // the URL-form workspace the server clones; undefined (no repo)
-            // is dropped by JSON.stringify.
             ...(sandboxSelected
               ? {
                   host_type: "managed",
@@ -1217,8 +1504,15 @@ export function NewChatLandingScreen() {
             // `omnigent.wrapper` selects which CLI bridge the runner launches.
             // The values are the registered wrapper ids the runner keys off —
             // they must match the wrapper registry, not the agent display name.
-            labels: nativeLabels,
-            // Permission / approval mode → CLI flag pair, persisted as
+            // The DANGEROUS codex full-bypass opt-in rides along as an extra
+            // label (only when the toggle is armed for a codex-native agent)
+            // so the runner launches with --dangerously-bypass-approvals-and-
+            // sandbox and the choice survives reload.
+            labels:
+              agentSupportsApprovalMode && bypassSandbox
+                ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+                : nativeLabels,
+            // Permission / approval / cursor mode → CLI flag pair, persisted as
             // terminal_launch_args. Omitted for the default and non-native agents.
             terminal_launch_args:
               agentSupportsPermissionMode &&
@@ -1226,15 +1520,11 @@ export function NewChatLandingScreen() {
                 ? ["--permission-mode", permissionMode]
                 : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
                   ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
-                  : undefined,
-            // Cost-control switch from the "Cost Optimized" pill; polly-only
-            // (cost control is a polly feature) and omitted when unset so the
-            // session defers to the spec default.
-            cost_control_mode_override:
-              agent?.name === "polly" ? (costControlMode ?? undefined) : undefined,
-            // Brain-harness pick from the agent flyout. Omitted when the user
-            // kept the spec default (pickedHarness is null) so the session
-            // tracks the agent's declared harness.
+                  : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
+                    ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
+                    : undefined,
+            // Smart routing toggle — server-side, available for any agent.
+            cost_control_mode_override: costControlMode ?? undefined,
             harness_override: pickedHarness ?? undefined,
           }),
         });
@@ -1303,8 +1593,10 @@ export function NewChatLandingScreen() {
       data-testid="new-chat-landing"
     >
       {/* Padding lives inside the 840px cap, so the composer renders at
-          840 − 80 = 760px max. */}
-      <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-10 pt-8 pb-16">
+          840 − 80 = 760px max on desktop. px-4 on phones (16px gutters)
+          keeps the composer from feeling cramped against the viewport
+          edges; widens to the full px-10 at the md breakpoint and up. */}
+      <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:px-10">
         <div className="flex flex-col items-center gap-3.5 sm:flex-row">
           <OttoEyes className="h-18 w-auto shrink-0" />
           <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground sm:text-left">
@@ -1508,11 +1800,7 @@ export function NewChatLandingScreen() {
                 />
               </div>
               <div className="flex items-center gap-0.5">
-                {/* Polly-only surface — cost control is a polly feature, so
-                    the toggle is hidden unless the selected agent is polly. */}
-                {/* Temporarily hidden (#3021): re-enable by removing the false gate. */}
-                {false && selectedAgent?.name === "polly" && (
-                  // Mode-only variant: no verdict can exist before the session does.
+                {smartRoutingEnabled && selectedAgent && (
                   <IntelligentModelControl value={costControlMode} onChange={setCostControlMode} />
                 )}
                 {agentList.length > 0 ? (
@@ -1899,11 +2187,12 @@ export function NewChatLandingScreen() {
 
               {/* Advanced settings chip — per-agent knobs that don't warrant
                 their own chip: the brain-harness override (bundle agents),
-                Claude Code's permission mode, and Codex's approval mode.
-                Hidden when the selected agent has none. */}
+                Claude Code's permission mode, Codex's approval mode, and
+                Cursor's execution mode. Hidden when the selected agent has none. */}
               {(selectedAgentDefaultHarness != null ||
                 supportsPermissionMode ||
-                supportsApprovalMode) && (
+                supportsApprovalMode ||
+                supportsCursorMode) && (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <button
@@ -1958,6 +2247,28 @@ export function NewChatLandingScreen() {
                           Approval mode
                         </div>
                         <ApprovalModeOptions value={approvalMode} onValueChange={setApprovalMode} />
+                        <DropdownMenuSeparator />
+                        <BypassSandboxOption
+                          enabled={bypassSandbox}
+                          onEnabledChange={setBypassSandbox}
+                        />
+                      </>
+                    )}
+                    {/* Execution mode (Cursor only) — cursor-native has no
+                      overridable harness, so the two sections never co-render
+                      today; the separator covers a future agent with both. */}
+                    {supportsCursorMode && (
+                      <>
+                        {(selectedAgentDefaultHarness != null ||
+                          supportsPermissionMode ||
+                          supportsApprovalMode) && <DropdownMenuSeparator />}
+                        <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
+                          Execution mode
+                        </div>
+                        <CursorModeOptions
+                          value={cursorExecMode}
+                          onValueChange={setCursorExecMode}
+                        />
                       </>
                     )}
                   </DropdownMenuContent>
@@ -1978,8 +2289,30 @@ export function NewChatLandingScreen() {
             >
               <TriangleAlertIcon className="size-3.5 shrink-0" />
               <span>
-                {selectedAgent?.display_name} isn&apos;t configured on {harnessWarningHost?.name} —
-                run <code>omnigent setup</code> on that machine.
+                {harnessWarningMessage(
+                  selectedAgent?.display_name,
+                  harnessWarningHost?.name,
+                  selectedAgentUnavailableReason,
+                )}
+              </span>
+            </p>
+          )}
+
+          {/* Persistent danger banner — stays under the composer while full
+              bypass is armed (the in-menu banner vanishes when the Advanced
+              tray closes), so the dangerous stance is always visible before
+              the session is created. Gated on the codex-native capability so
+              a stale toggle from a since-switched agent can't show it. */}
+          {supportsApprovalMode && bypassSandbox && (
+            <p
+              role="alert"
+              className="flex items-center gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium text-destructive"
+              data-testid="new-chat-landing-bypass-sandbox-active-banner"
+            >
+              <TriangleAlertIcon className="size-3.5 shrink-0" />
+              <span>
+                Codex will run with approvals and the sandbox disabled — it can edit any file and
+                run any command without asking.
               </span>
             </p>
           )}

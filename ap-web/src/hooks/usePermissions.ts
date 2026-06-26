@@ -8,6 +8,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   type Permission,
   derivePermissionLevel,
+  getSessionOwner,
   grantPermission,
   listPermissions,
   revokePermission,
@@ -19,11 +20,32 @@ function permissionsKey(sessionId: string) {
   return ["permissions", sessionId] as const;
 }
 
+function sessionOwnerKey(sessionId: string) {
+  return ["sessionOwner", sessionId] as const;
+}
+
 /** Fetch all permission grants for a session. */
 export function usePermissions(sessionId: string | null) {
   return useQuery({
     queryKey: permissionsKey(sessionId ?? ""),
     queryFn: () => listPermissions(sessionId!),
+    enabled: !!sessionId,
+  });
+}
+
+/**
+ * Fetch the owner (the ``user_id`` granted ``LEVEL_OWNER``) of a session.
+ *
+ * Returns ``null`` when permissions are disabled (single-user mode), so the
+ * caller can omit any owner UI. Requires only read access, so it resolves for
+ * anyone a session is shared with — letting the info popover answer "whose
+ * session is this?" for chats shared into a workspace group. Disabled until a
+ * sessionId is known.
+ */
+export function useSessionOwner(sessionId: string | null) {
+  return useQuery({
+    queryKey: sessionOwnerKey(sessionId ?? ""),
+    queryFn: () => getSessionOwner(sessionId!),
     enabled: !!sessionId,
   });
 }

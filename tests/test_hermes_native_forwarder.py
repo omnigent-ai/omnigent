@@ -29,6 +29,9 @@ CREATE TABLE messages (
     session_id TEXT NOT NULL,
     role TEXT NOT NULL,
     content TEXT,
+    tool_call_id TEXT,
+    tool_calls TEXT,
+    tool_name TEXT,
     active INTEGER NOT NULL DEFAULT 1
 );
 """
@@ -41,15 +44,18 @@ def _seed_db(path: Path, *, cwd: str, started_at: float, session_id: str = "2026
         "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
         (session_id, "cli", cwd, started_at),
     )
+    # (session_id, role, content, tool_call_id, tool_calls, tool_name, active)
     rows = [
-        (session_id, "user", "hi [Attached: /x.png]", 1),
-        (session_id, "assistant", "hello", 1),
-        (session_id, "tool", "{tool-result}", 1),
-        (session_id, "assistant", "", 1),  # reasoning/tool-only: no prose -> skipped
-        (session_id, "user", "soft-deleted", 0),  # inactive -> skipped
+        (session_id, "user", "hi [Attached: /x.png]", None, None, None, 1),
+        (session_id, "assistant", "hello", None, None, None, 1),
+        (session_id, "tool", "{tool-result}", None, None, None, 1),  # no tool_call_id -> skipped
+        (session_id, "assistant", "", None, None, None, 1),  # no prose, no tool_calls -> skipped
+        (session_id, "user", "soft-deleted", None, None, None, 0),  # inactive -> skipped
     ]
     con.executemany(
-        "INSERT INTO messages(session_id, role, content, active) VALUES (?,?,?,?)",
+        "INSERT INTO messages"
+        "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+        " VALUES (?,?,?,?,?,?,?)",
         rows,
     )
     con.commit()
@@ -104,6 +110,51 @@ def test_read_new_items_maps_roles_and_strips_attachments(tmp_path: Path) -> Non
     assert posted[1].item_data["role"] == "assistant"
     assert posted[1].item_data["agent"] == "hermes-native-ui"
     assert posted[1].item_data["content"] == [{"type": "output_text", "text": "hello"}]
+
+
+def test_read_new_items_mirrors_tool_calls(tmp_path: Path) -> None:
+    """Tool calls on assistant rows become function_call items; tool rows become outputs."""
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.execute(
+        "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
+        ("s1", "cli", str(tmp_path), 1000.0),
+    )
+    import json
+
+    tool_calls_json = json.dumps(
+        [
+            {
+                "id": "call_abc",
+                "call_id": "call_abc",
+                "type": "function",
+                "function": {"name": "search_files", "arguments": '{"pattern": "*"}'},
+            }
+        ]
+    )
+    rows = [
+        ("s1", "assistant", "", None, tool_calls_json, None, 1),
+        ("s1", "tool", "found 3 files", "call_abc", None, "search_files", 1),
+    ]
+    con.executemany(
+        "INSERT INTO messages"
+        "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+        " VALUES (?,?,?,?,?,?,?)",
+        rows,
+    )
+    con.commit()
+    con.close()
+
+    items = f._read_new_items(db, "s1", 0, "agent")
+    posted = [i for i in items if i.item_type]
+    assert len(posted) == 2
+    assert posted[0].item_type == "function_call"
+    assert posted[0].item_data["name"] == "search_files"
+    assert posted[0].item_data["call_id"] == "call_abc"
+    assert posted[1].item_type == "function_call_output"
+    assert posted[1].item_data["call_id"] == "call_abc"
+    assert posted[1].item_data["output"] == "found 3 files"
 
 
 def test_read_new_items_idempotent_past_high_water(tmp_path: Path) -> None:
@@ -223,3 +274,64 @@ async def test_forward_loop_discovers_and_mirrors_new_messages(tmp_path, monkeyp
     assert roles == ["user", "assistant"]
     # High-water cursor persisted so a restart resumes without re-posting.
     assert f._read_state(tmp_path).hermes_session_id == "20260620_1"
+
+
+# --- Usage tracker tests ---------------------------------------------------
+
+
+async def test_usage_tracker_posts_model_on_first_flush(tmp_path, monkeypatch) -> None:
+    """The tracker reads the model from the bridge config and posts it."""
+    # Write a per-session config with a model.
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    import yaml
+
+    (hermes_home / "config.yaml").write_text(yaml.dump({"model": "claude-sonnet-4-20250514"}))
+
+    client = _FakeClient()
+    tracker = f._HermesUsageTracker(client, "conv_usage", tmp_path)
+    await tracker.flush()
+
+    assert len(client.posts) == 1
+    url, body = client.posts[0]
+    assert url == "/v1/sessions/conv_usage/events"
+    assert body["type"] == "external_session_usage"
+    assert body["data"]["model"] == "claude-sonnet-4-20250514"
+
+
+async def test_usage_tracker_deduplicates(tmp_path, monkeypatch) -> None:
+    """Consecutive flushes with the same model do not re-post."""
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    import yaml
+
+    (hermes_home / "config.yaml").write_text(yaml.dump({"model": "gpt-4o"}))
+
+    client = _FakeClient()
+    tracker = f._HermesUsageTracker(client, "conv_dedup", tmp_path)
+    await tracker.flush()
+    await tracker.flush()
+    await tracker.flush()
+
+    assert len(client.posts) == 1  # only the first flush posts
+
+
+async def test_usage_tracker_no_post_when_no_model(tmp_path) -> None:
+    """No config / no model -> nothing posted."""
+    client = _FakeClient()
+    tracker = f._HermesUsageTracker(client, "conv_none", tmp_path)
+    await tracker.flush()
+    assert len(client.posts) == 0
+
+
+async def test_read_model_from_hermes_config_fallback(tmp_path, monkeypatch) -> None:
+    """Falls back to ~/.hermes/config.yaml when no per-session config exists."""
+    user_hermes = tmp_path / ".hermes"
+    user_hermes.mkdir()
+    import yaml
+
+    (user_hermes / "config.yaml").write_text(yaml.dump({"model": "from-user-config"}))
+    monkeypatch.setattr(f.Path, "home", staticmethod(lambda: tmp_path))
+
+    model = f._read_model_from_hermes_config(tmp_path / "nonexistent")
+    assert model == "from-user-config"

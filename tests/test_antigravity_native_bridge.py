@@ -14,16 +14,21 @@ from omnigent.antigravity_native_bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR,
     ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     AntigravityNativeBridgeState,
+    agy_home_dir,
     build_antigravity_native_spawn_env,
+    build_mcp_config,
     clear_bridge_state,
     ensure_agy_onboarding_complete,
     inject_user_message_via_tui,
     prepare_bridge_dir,
     read_bridge_state,
     read_tmux_info,
+    seed_isolated_agy_home,
     send_interaction_keys_via_tui,
     update_conversation_id,
     write_bridge_state,
+    write_mcp_bridge_config,
+    write_mcp_config,
     write_tmux_target,
 )
 
@@ -1006,6 +1011,127 @@ def test_inject_user_message_via_tui_rejects_empty_content(tmp_path: Path) -> No
     """Empty content is a programming error, not something to type into the TUI."""
     with pytest.raises(RuntimeError, match="non-empty content"):
         inject_user_message_via_tui(tmp_path / "bridge", content="")
+
+
+# ---------------------------------------------------------------------------
+# Omnigent MCP relay wiring (sys_* tools) — #1194
+# ---------------------------------------------------------------------------
+
+
+def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
+    """build_mcp_config emits the shared serve-mcp relay command + enabledTools."""
+    config = build_mcp_config(tmp_path, python_executable="python-test")
+    server = config["mcpServers"]["omnigent"]
+    assert server["command"] == "python-test"
+    assert server["args"] == [
+        "-I",
+        "-m",
+        "omnigent.claude_native_bridge",
+        "serve-mcp",
+        "--bridge-dir",
+        str(tmp_path),
+    ]
+    # agy's auto-approve allowlist is the enabledTools key (not cursor's autoApprove).
+    assert "sys_session_send" in server["enabledTools"]
+    assert "sys_os_shell" in server["enabledTools"]
+    assert "sys_terminal_launch" in server["enabledTools"]
+    assert "sys_list_models" in server["enabledTools"]
+    assert server["enabledTools"] == sorted(server["enabledTools"])
+    assert server["env"]["TMPDIR"]
+    # The relay's HOME is pinned to the runner's real home so its bridge-root
+    # validation matches where the bridge dir lives — agy runs the relay under a
+    # per-session isolated HOME (a child of the bridge dir), which the relay must
+    # NOT inherit, or it would reject its own --bridge-dir.
+    assert server["env"]["HOME"] == str(Path.home())
+
+
+def test_build_mcp_config_defaults_python_to_current_interpreter(tmp_path: Path) -> None:
+    """Omitting python_executable uses sys.executable so the relay runs in our venv."""
+    import sys
+
+    server = build_mcp_config(tmp_path)["mcpServers"]["omnigent"]
+    assert server["command"] == sys.executable
+
+
+def test_write_mcp_config_targets_isolated_agy_home(tmp_path: Path) -> None:
+    """write_mcp_config writes into the per-session isolated agy HOME, not ~/.gemini."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    path = write_mcp_config(bridge_dir, python_executable="python-test")
+
+    # The config lands under the isolated HOME's ~/.gemini/config — the path agy
+    # actually loads MCP servers from — so the user's real ~/.gemini is untouched.
+    assert path == agy_home_dir(bridge_dir) / ".gemini" / "config" / "mcp_config.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
+    # The bridge token the shared relay requires is written into the bridge dir.
+    assert json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
+
+
+def test_write_mcp_bridge_config_is_idempotent(tmp_path: Path) -> None:
+    """A second write keeps the existing token so a live relay is not re-tokened."""
+    write_mcp_bridge_config(tmp_path)
+    first = (tmp_path / "bridge.json").read_text(encoding="utf-8")
+    write_mcp_bridge_config(tmp_path)
+    assert (tmp_path / "bridge.json").read_text(encoding="utf-8") == first
+
+
+def test_seed_isolated_agy_home_returns_home_override_and_seeds_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """seed_isolated_agy_home copies the OAuth token + markers and returns HOME."""
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    (fake_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").write_text(
+        "real-token", encoding="utf-8"
+    )
+    (fake_home / ".gemini" / "antigravity-cli" / "installation_id").write_text(
+        "install-id", encoding="utf-8"
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    env = seed_isolated_agy_home(bridge_dir)
+
+    iso = agy_home_dir(bridge_dir)
+    assert env == {"HOME": str(iso)}
+    # OAuth token is COPIED (never moved) into the isolated tree.
+    token = iso / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+    assert token.read_text(encoding="utf-8") == "real-token"
+    # The real token file is left in place.
+    assert (fake_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").read_text(
+        encoding="utf-8"
+    ) == "real-token"
+    # Onboarding + migration markers seeded so a headless launch never blocks.
+    onboarding = iso / ".gemini" / "antigravity-cli" / "cache" / "onboarding.json"
+    assert json.loads(onboarding.read_text(encoding="utf-8"))["onboardingComplete"] is True
+    assert (iso / ".gemini" / "config" / ".migrated").is_file()
+
+
+def test_seed_isolated_agy_home_tolerates_missing_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing OAuth token only means agy re-auths — never a hard failure."""
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    env = seed_isolated_agy_home(bridge_dir)
+
+    iso = agy_home_dir(bridge_dir)
+    assert env == {"HOME": str(iso)}
+    # No token copied (none existed), but the isolated HOME + markers still exist.
+    assert not (iso / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").exists()
+    assert (iso / ".gemini" / "antigravity-cli" / "cache" / "onboarding.json").is_file()
+
+
+def test_agy_home_dir_is_under_bridge_dir(tmp_path: Path) -> None:
+    """The isolated HOME is a child of the (hash-scoped, per-session) bridge dir."""
+    bridge_dir = tmp_path / "bridge"
+    assert agy_home_dir(bridge_dir).parent == bridge_dir
 
 
 # ---------------------------------------------------------------------------

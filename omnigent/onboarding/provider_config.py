@@ -80,11 +80,15 @@ _PI_FALLBACK_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
 # entry never carries a ``pi:`` block — but defaults are scoped per harness
 # surface, and pi consumes both families, so it gets its own scope name a
 # ``default:`` value may reference (``default: ["anthropic", "pi"]``).
-# Every provider kind except ``subscription`` can drive pi (a claude/codex
-# CLI login is unusable outside its own CLI), so only those kinds may claim
-# this scope. Resolution: an explicit pi default wins; otherwise pi falls
-# back to the anthropic then openai family default, skipping subscriptions
-# (see :func:`default_provider_for_harness`).
+# An inline key/gateway/local (with an anthropic/openai family) and a
+# databricks profile drive pi directly; a ``cli-config`` may claim the scope
+# too (a Databricks AI Gateway is pi-consumable — Pi speaks its Anthropic
+# surface), with the actual gateway capability validated at resolution time.
+# A ``subscription`` (CLI login, unusable outside its own CLI) and ``bedrock``
+# (native-``omnigent claude`` only) can never drive pi. Resolution: an
+# explicit pi default wins; otherwise pi falls back to the anthropic then
+# openai family default, skipping the non-pi kinds (see
+# :func:`default_provider_for_harness`).
 PI_SURFACE = "pi"
 
 # Accepted ``wire_api`` values. ``responses`` is the OpenAI Responses API;
@@ -822,9 +826,19 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             cli=cli_raw,
             model_provider=model_provider_raw,
             display_name=display_name_raw if isinstance(display_name_raw, str) else None,
-            # A codex cli-config provider serves the openai surface, like a
-            # codex subscription.
-            default_families=_parse_default_families(name, default_raw, {OPENAI_FAMILY}),
+            # A codex cli-config provider serves the openai surface, like a codex
+            # subscription. It may ALSO claim the pi scope (``default: [openai,
+            # pi]``) because a Databricks AI Gateway is pi-consumable (Pi speaks
+            # its Anthropic surface natively). This is allowed structurally —
+            # without reading the ambient ~/.codex/config.toml at parse — so a
+            # user can pin pi→Databricks; whether the pinned provider is a *real*
+            # Databricks gateway is validated at pi launch, which falls back to
+            # Pi's own login when it is not (see :func:`_cli_config_serves_pi`
+            # and ``resolve_pi_native_provider``). A codex subscription stays
+            # pi-incapable (its ``default: pi`` is still rejected at parse).
+            default_families=_parse_default_families(
+                name, default_raw, {OPENAI_FAMILY}, pi_capable=True
+            ),
         )
 
     if kind == DATABRICKS_KIND:
@@ -944,6 +958,34 @@ def harness_family(harness: str) -> str | None:
     return _HARNESS_FAMILY.get(harness)
 
 
+def _cli_config_serves_pi(entry: ProviderEntry) -> bool:
+    """Return whether a ``cli-config`` *entry* can drive the ``pi`` harness.
+
+    Most ``cli-config`` providers (a custom codex ``[model_providers.X]``) are
+    unusable outside their own CLI, so they never serve pi. The exception is a
+    Databricks AI Gateway: it exposes an Anthropic Messages surface Pi speaks
+    natively, and :func:`omnigent.pi_native_credentials._cli_config_pi_provider`
+    translates it into a Pi gateway config (and the gateway-harness pi path
+    routes it too — see ``configure_agent_harness_with_provider``). So a
+    cli-config provider serves pi *iff* it is a pi-consumable Databricks gateway.
+
+    The capability check lives in :mod:`omnigent.pi_native_credentials` (the
+    single source of truth, alongside the gateway-URL allowlist and the codex
+    transport reader). It is imported **lazily** here: ``pi_native_credentials``
+    imports this module at top level, so a top-level import back would cycle;
+    by call time both modules are fully loaded, so the lazy import is safe.
+
+    :param entry: The provider entry to classify.
+    :returns: ``True`` iff *entry* is a ``cli-config`` Databricks AI Gateway
+        Pi can route through.
+    """
+    if entry.kind != CLI_CONFIG_KIND:
+        return False
+    from omnigent.pi_native_credentials import cli_config_pi_provider_capable
+
+    return cli_config_pi_provider_capable(entry)
+
+
 def provider_families(entry: ProviderEntry) -> frozenset[str]:
     """Return the model families *entry* can serve.
 
@@ -999,6 +1041,21 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
         if entry.cli == "claude":
             return frozenset({ANTHROPIC_FAMILY})
         if entry.cli == "codex":
+            # A codex *cli-config* provider may ALSO serve pi: a Databricks AI
+            # Gateway exposes an Anthropic Messages surface Pi speaks natively
+            # (pi-native translates it via ``_cli_config_pi_provider``; the
+            # gateway-harness pi path routes it via
+            # ``configure_agent_harness_with_provider``). This is reported at the
+            # KIND level — structurally, without reading the ambient
+            # ~/.codex/config.toml — so ``provider_families`` stays pure (the
+            # setup menus / ``set_default_provider`` may offer/accept the pi
+            # scope for a codex cli-config). Whether the pinned provider is a
+            # *real* Databricks gateway is validated at resolution time
+            # (``default_provider_for_harness`` fallback + the pi launch), which
+            # falls back gracefully when it is not. A codex *subscription* never
+            # serves pi — a CLI login is unusable outside its own CLI.
+            if entry.kind == CLI_CONFIG_KIND:
+                return frozenset({OPENAI_FAMILY, PI_SURFACE})
             return frozenset({OPENAI_FAMILY})
         return frozenset()
     if entry.kind == DATABRICKS_KIND:
@@ -1038,6 +1095,31 @@ def get_default_provider(config: dict[str, object], family: str) -> ProviderEntr
     return candidates[0]
 
 
+def first_available_provider(config: dict[str, object], family: str) -> ProviderEntry | None:
+    """
+    Return the first configured provider that can serve *family*, or ``None``.
+
+    Unlike :func:`get_default_provider` (which requires an explicit
+    ``default:``), this returns the first provider whose served families
+    include *family* regardless of default status — the credential a launch
+    falls back to when no default is configured for the family. Shared by the
+    runtime spawn-env builders (so a head still launches) and the REPL startup
+    creds line (so the readout names exactly what the launch will use), keeping
+    the two provably in agreement.
+
+    :param config: The parsed config mapping, optionally merged with ambient
+        detections (:func:`effective_config_with_detected`).
+    :param family: The model family / surface, e.g. ``"openai"`` or
+        :data:`PI_SURFACE`.
+    :returns: The first :class:`ProviderEntry` serving *family*, in config
+        order, or ``None`` when none serves it.
+    """
+    for entry in load_providers(config).values():
+        if family in provider_families(entry):
+            return entry
+    return None
+
+
 def default_provider_for_harness(config: dict[str, object], harness: str) -> ProviderEntry | None:
     """Return the default provider for *harness* (resolving its family).
 
@@ -1046,13 +1128,15 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
     default. The ``pi`` harness (and any unmapped harness) consumes both
     families: an explicit :data:`PI_SURFACE` default wins; otherwise it
     falls back to the ``anthropic`` then ``openai`` family default,
-    skipping ``subscription``, ``cli-config``, and ``bedrock`` defaults —
-    the first two live in the claude/codex CLI's own files an unmapped
-    harness can't read, and ``bedrock`` is native-``omnigent claude`` only.
-    Routing pi to any of them fails: ``configure_agent_harness_with_provider``
-    no-ops on subscription (spawning pi authless) and raises on cli-config
-    (non-codex) and bedrock. This mirrors :func:`provider_families`, which
-    never reports the :data:`PI_SURFACE` scope for these kinds.
+    skipping ``subscription`` and ``bedrock`` defaults (a CLI login is
+    unusable outside its own CLI, and ``bedrock`` is native-``omnigent
+    claude`` only — routing pi to either fails). A ``cli-config`` default is
+    skipped UNLESS it is a pi-consumable Databricks AI Gateway (see
+    :func:`_cli_config_serves_pi`): such a gateway exposes an Anthropic
+    surface Pi speaks natively, so pi-native translates it
+    (``_cli_config_pi_provider``) and the gateway-harness pi path routes it
+    (``configure_agent_harness_with_provider``). A non-Databricks cli-config
+    still falls through (it can't serve pi).
 
     :param config: The parsed config mapping (``providers:`` block).
     :param harness: The canonical harness name, e.g. ``"claude-sdk"`` or
@@ -1074,18 +1158,26 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
     # excluded (a gemini key serves only the Gemini surface, never pi).
     for fam in _PI_FALLBACK_FAMILIES:
         provider = get_default_provider(config, fam)
-        # Subscription logins and cli-config provider pins live in the
-        # claude/codex CLI's own files, which an unmapped harness doesn't
-        # wrap; a bedrock provider is native-``omnigent claude`` only
-        # (configure_agent_harness_with_provider raises for it). None can
-        # serve pi, so skip them and fall through — otherwise a bedrock Claude
-        # default would turn a working pi run (own login) into a hard error.
-        if provider is not None and provider.kind not in (
-            SUBSCRIPTION_KIND,
-            CLI_CONFIG_KIND,
-            BEDROCK_KIND,
-        ):
-            return provider
+        if provider is None:
+            continue
+        # Subscription logins live in the claude/codex CLI's own login, which
+        # an unmapped harness doesn't wrap; a bedrock provider is
+        # native-``omnigent claude`` only (configure_agent_harness_with_provider
+        # raises for it). Neither can serve pi, so skip them and fall through —
+        # otherwise a bedrock Claude default would turn a working pi run (own
+        # login) into a hard error.
+        if provider.kind in (SUBSCRIPTION_KIND, BEDROCK_KIND):
+            continue
+        # A cli-config provider pins a model_provider in the codex CLI's own
+        # config.toml. Most such pins are unusable outside codex, BUT a
+        # Databricks AI Gateway exposes an Anthropic surface Pi speaks natively
+        # (translated by ``_cli_config_pi_provider`` for pi-native, and routed
+        # by ``configure_agent_harness_with_provider`` for the gateway-harness
+        # pi path). Route pi to it rather than skipping; a non-Databricks
+        # cli-config still falls through (it can't serve pi).
+        if provider.kind == CLI_CONFIG_KIND and not _cli_config_serves_pi(provider):
+            continue
+        return provider
     return None
 
 

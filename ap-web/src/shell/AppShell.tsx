@@ -4,6 +4,7 @@ import { Outlet, useParams, useSearchParams } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
+import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
@@ -40,6 +41,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { isNativeWrapper as isNativeWrapperLabel } from "@/lib/nativeCodingAgents";
+import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
@@ -326,6 +328,10 @@ export function AppShell() {
   // the server's parent-delegation path — so we hide the affordance.
   const canShare =
     !!conversationId && isKnownTopLevel && (permissionLevel === null || permissionLevel >= 3);
+  const shareDisabled = canShare && isCurrentServerLocal();
+  const shareDisabledReason = shareDisabled
+    ? "Sharing is unavailable from a local server."
+    : undefined;
   // Any viewer can fork a shared session; top-level only (the server
   // rejects forking a sub-agent). Surfaced as ForkDialogContext.canFork —
   // the per-message "Fork from here" action is the only fork entry point.
@@ -707,6 +713,51 @@ export function AppShell() {
     );
   }, [setSearchParams]);
 
+  // Toggle the right (Workspace) sidebar — shared by the header's collapse
+  // button and the ⌘⌥]/Ctrl+Alt+] hotkey so they can't drift. Beyond flipping the
+  // open-state it persists the choice and keeps the deep-link URL in sync:
+  // re-add ?file= on reopen (the FileViewer diff-sync race makes an effect
+  // unsafe here), and strip file/diff/comment on collapse so the URL never
+  // advertises a panel that isn't shown.
+  const toggleRightPanel = () => {
+    const next = !rightPanelOpen;
+    if (conversationId) writeSessionWorkspaceState(conversationId, { open: next });
+    if (next) {
+      if (selectedFilePath) {
+        // Reopening lands back on the file remembered in per-session
+        // state, so re-add ?file= to keep the URL shareable — mirroring
+        // how the scope-sync effect re-adds ?view= on reopen. diff and
+        // comment are URL-only ephemerals (not remembered), so they
+        // intentionally don't rehydrate. Imperative (not an effect) to
+        // avoid the FileViewer diff-sync race documented in that effect.
+
+        setSearchParams(
+          (prev) => {
+            const params = new URLSearchParams(prev);
+            params.set("file", selectedFilePath);
+            return params;
+          },
+          { replace: true },
+        );
+      }
+    } else {
+      // Collapsing the rail hides the workspace, so strip the deep-
+      // link params that point into it (file/diff/comment) — otherwise
+      // the URL advertises a file that isn't shown and a reload would
+      // re-open the rail. (?view= is dropped by the scope-sync effect,
+      // which is gated on rightPanelOpen.)
+      clearFileViewerUrl();
+    }
+    setRightPanelOpen(next);
+  };
+
+  // ⌘⌥[ / ⌘⌥] (Ctrl+Alt on Win/Linux) toggle the left and right sidebars. Bound
+  // here where both panels' open-state lives.
+  useSidebarToggleHotkeys({
+    onToggleLeft: () => setSidebarOpen((prev) => !prev),
+    onToggleRight: toggleRightPanel,
+  });
+
   // Mobile back button: close the open file and return to the files/changes
   // list. On mobile the tab strip is hidden, so a "back" should fully drop the
   // file (remove it from openFiles) rather than leaving an orphan tab the user
@@ -1026,6 +1077,8 @@ export function AppShell() {
                   conversationId={conversationId}
                   boundAgent={boundAgent}
                   canShare={canShare}
+                  shareDisabled={shareDisabled}
+                  shareDisabledReason={shareDisabledReason}
                   onShare={() => setShareOpen(true)}
                   hasAgentInfo={hasAgentInfo}
                   onAgentInfo={() => setAgentInfoOpen(true)}
@@ -1033,36 +1086,7 @@ export function AppShell() {
                   showFilesPanel={showFilesPanel}
                   hasRailContent={hasRailContent}
                   rightPanelOpen={rightPanelOpen}
-                  onToggleRightPanel={() => {
-                    const next = !rightPanelOpen;
-                    if (conversationId) writeSessionWorkspaceState(conversationId, { open: next });
-                    if (next) {
-                      // Reopening lands back on the file remembered in per-session
-                      // state, so re-add ?file= to keep the URL shareable — mirroring
-                      // how the scope-sync effect re-adds ?view= on reopen. diff and
-                      // comment are URL-only ephemerals (not remembered), so they
-                      // intentionally don't rehydrate. Imperative (not an effect) to
-                      // avoid the FileViewer diff-sync race documented in that effect.
-                      if (selectedFilePath) {
-                        setSearchParams(
-                          (prev) => {
-                            const params = new URLSearchParams(prev);
-                            params.set("file", selectedFilePath);
-                            return params;
-                          },
-                          { replace: true },
-                        );
-                      }
-                    } else {
-                      // Collapsing the rail hides the workspace, so strip the deep-
-                      // link params that point into it (file/diff/comment) — otherwise
-                      // the URL advertises a file that isn't shown and a reload would
-                      // re-open the rail. (?view= is dropped by the scope-sync effect,
-                      // which is gated on rightPanelOpen.)
-                      clearFileViewerUrl();
-                    }
-                    setRightPanelOpen(next);
-                  }}
+                  onToggleRightPanel={toggleRightPanel}
                   mobileMenu={{
                     fileViewerOpen,
                     panelOpen,
@@ -1258,7 +1282,11 @@ export function AppShell() {
                     Tools and policies configured for the active agent.
                   </DialogDescription>
                 </DialogHeader>
-                <AgentInfoContent agent={boundAgent} sessionId={conversationId} />
+                <AgentInfoContent
+                  agent={boundAgent}
+                  sessionId={conversationId}
+                  showIntelligentRouting
+                />
               </DialogContent>
             </Dialog>
           )}

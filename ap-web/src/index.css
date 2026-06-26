@@ -873,9 +873,9 @@
   opacity: 0;
   transform: scale(0.55) rotate(40deg);
 }
-/* Monochrome lit state: full foreground, no glow — color stays semantic. */
+/* Lit state: brand pink so on/off reads unmistakably at a glance. */
 .imc-toggle[data-mode="on"] {
-  color: var(--foreground);
+  color: var(--brand-accent);
 }
 .imc-toggle[data-mode="on"] .imc-layer-on {
   opacity: 1;
@@ -911,7 +911,7 @@
   border-radius: 9999px;
   background: radial-gradient(
     circle,
-    color-mix(in oklch, var(--foreground) 8%, transparent) 0%,
+    color-mix(in oklch, var(--brand-accent) 14%, transparent) 0%,
     transparent 70%
   );
   opacity: 0;
@@ -928,7 +928,7 @@
 .dark .imc-toggle[data-mode="on"] .imc-halo {
   background: radial-gradient(
     circle,
-    color-mix(in oklch, var(--foreground) 12%, transparent) 0%,
+    color-mix(in oklch, var(--brand-accent) 20%, transparent) 0%,
     transparent 70%
   );
 }
@@ -958,7 +958,7 @@
   height: 1.125rem;
   margin: -0.5625rem;
   border-radius: 9999px;
-  border: 1.5px solid color-mix(in oklch, var(--foreground) 35%, transparent);
+  border: 1.5px solid color-mix(in oklch, var(--brand-accent) 55%, transparent);
   opacity: 0;
   pointer-events: none;
   animation: imc-verdict-ping 650ms ease-out 1;

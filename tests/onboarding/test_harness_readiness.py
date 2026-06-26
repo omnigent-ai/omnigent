@@ -224,9 +224,6 @@ def test_configured_harness_map_gates_only_cli_harnesses(
     for cli in (
         "claude-native",
         "native-claude",
-        "codex",
-        "codex-native",
-        "native-codex",
         "pi",
         "kimi",
         "cursor-native",
@@ -241,6 +238,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "hermes",
     ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
+    for codex in ("codex", "codex-native", "native-codex"):
+        assert result[codex] == "binary-missing", f"{codex} should name the missing Codex binary"
 
 
 def test_configured_harness_map_all_true_with_clis(
@@ -258,6 +257,10 @@ def test_configured_harness_map_all_true_with_clis(
     import omnigent.onboarding.gemini_auth as _ga
 
     _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.codex_native._codex_auth_unavailable_reason",
+        lambda: None,
+    )
     monkeypatch.setenv("CURSOR_API_KEY", "crsr_ready")
     # antigravity-native also needs a credential (not just the ``agy`` binary).
     monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)

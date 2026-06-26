@@ -115,7 +115,11 @@ class AdvisorVerdict:
         turn (optimize mode, no user pin); ``False`` when the verdict was
         recorded but not applied (advise mode, or a user model pin won).
     :param rationale: One-sentence judge explanation, surfaced in the
-        UI and (optimize mode) in the in-turn system note.
+        UI and (optimize mode) in the in-turn system note. The judge
+        always produces a string (:mod:`omnigent.runner.cost_judge`
+        substitutes a fallback when the model returns none); ``None`` is
+        reserved for the serialize/parse round-trip's degenerate case,
+        where even an empty rationale would not fit the labels column.
     :param turn_anchor: Caller-supplied anchor tying the verdict to the
         turn that produced it (an item id or ISO timestamp), e.g.
         ``"2026-06-10T12:00:00+00:00"``. Callers sample the clock; this
@@ -126,18 +130,41 @@ class AdvisorVerdict:
     tier: str
     model: str
     applied: bool
-    rationale: str
+    rationale: str | None
     turn_anchor: str
+
+
+# Conversation labels persist into a varchar(256) column; values longer
+# than this are rejected wholesale by Postgres.
+_LABEL_VALUE_MAX_LEN = 256
+
+# Suffix marking a rationale trimmed to fit the labels column.
+_TRIM_MARKER = "..."
 
 
 def verdict_to_label_value(verdict: AdvisorVerdict) -> str:
     """
     Serialize a verdict into the :data:`COST_CONTROL_PLAN_LABEL` value.
 
+    Long judge rationales are trimmed so the value fits the labels
+    column (an oversized value fails the whole write, and the verdict
+    then never surfaces). The full rationale still reaches the UI via the
+    ``routing_decision`` transcript item.
+
+    Trimming measures SERIALIZED length, not raw character count.
+    :func:`json.dumps` defaults to ``ensure_ascii=True``, so a non-ASCII
+    char escapes to ``\\uXXXX`` (6 chars) and a quote/backslash to 2;
+    counting raw chars dropped a short non-ASCII rationale wholesale (to
+    ``null``) even with column budget to spare. The trim keeps the
+    longest rationale prefix that fits, then appends
+    :data:`_TRIM_MARKER`; only the degenerate case (the other fields
+    alone overflow the column) yields a ``null`` rationale.
+
     :param verdict: The verdict to serialize.
     :returns: Compact JSON, e.g. ``'{"applied":true,"model":
         "databricks-claude-opus-4-8","rationale":"...","tier":
-        "expensive","turn_anchor":"...","version":3}'``.
+        "expensive","turn_anchor":"...","version":3}'``, at most
+        :data:`_LABEL_VALUE_MAX_LEN` characters.
     """
     payload = {
         "version": verdict.version,
@@ -147,6 +174,34 @@ def verdict_to_label_value(verdict: AdvisorVerdict) -> str:
         "rationale": verdict.rationale,
         "turn_anchor": verdict.turn_anchor,
     }
+    serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    if len(serialized) <= _LABEL_VALUE_MAX_LEN or not verdict.rationale:
+        return serialized
+
+    # Serialized chars left for the rationale's escaped CONTENT, after the
+    # rest of the object and the trim marker take their share. base_len is
+    # measured with an empty rationale, so it already counts every other
+    # field's escaping plus the rationale value's two surrounding quotes.
+    base_payload = dict(payload)
+    base_payload["rationale"] = ""
+    base_len = len(json.dumps(base_payload, separators=(",", ":"), sort_keys=True))
+    budget = _LABEL_VALUE_MAX_LEN - base_len - len(_TRIM_MARKER)
+
+    kept = ""
+    if budget > 0:
+        # Largest prefix whose escaped content fits the budget. Escaped
+        # length is monotonic in prefix length, so binary-search it.
+        # ``json.dumps(s)`` wraps the value in quotes, hence the ``- 2``.
+        lo, hi = 0, len(verdict.rationale)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if len(json.dumps(verdict.rationale[:mid])) - 2 <= budget:
+                lo = mid
+            else:
+                hi = mid - 1
+        kept = verdict.rationale[:lo]
+
+    payload["rationale"] = (kept + _TRIM_MARKER) if kept else None
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
@@ -164,9 +219,13 @@ def parse_verdict(labels: Mapping[str, str]) -> AdvisorVerdict | None:
     :param labels: The conversation's labels, e.g.
         ``{"cost_control.plan": '{"version": 3, ...}'}``.
     :returns: The parsed v3 verdict; ``None`` when the label is absent
-        (no advised turn yet) or is a tolerated legacy v2 label.
+        (no advised turn yet) or is a tolerated legacy v2 label. A parsed
+        verdict's ``rationale`` is ``None`` when the writer had to drop it
+        to fit the column (see :func:`verdict_to_label_value`).
     :raises ValueError: When a v3-shaped label is malformed (bad JSON,
-        wrong field types, unknown tier).
+        wrong field types, unknown tier). A ``null`` rationale is NOT
+        malformed: the writer emits it in the degenerate case, so it
+        round-trips rather than raising.
     """
     raw = labels.get(COST_CONTROL_PLAN_LABEL)
     if raw is None:
@@ -195,8 +254,10 @@ def parse_verdict(labels: Mapping[str, str]) -> AdvisorVerdict | None:
     if not isinstance(applied, bool):
         raise ValueError(f"{COST_CONTROL_PLAN_LABEL} verdict needs a boolean applied field")
     rationale = payload.get("rationale")
-    if not isinstance(rationale, str):
-        raise ValueError(f"{COST_CONTROL_PLAN_LABEL} verdict needs a string rationale field")
+    if rationale is not None and not isinstance(rationale, str):
+        raise ValueError(
+            f"{COST_CONTROL_PLAN_LABEL} verdict needs a string or null rationale field"
+        )
     turn_anchor = payload.get("turn_anchor")
     if not isinstance(turn_anchor, str):
         raise ValueError(f"{COST_CONTROL_PLAN_LABEL} verdict needs a string turn_anchor field")
