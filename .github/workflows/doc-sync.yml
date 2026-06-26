@@ -1,45 +1,30 @@
-# When a PR merges, decide whether it needs a user-facing docs update and, if so,
-# draft that update as a PR to omnigent-ai/omnigent-site — tagging the original
-# PR author as reviewer.
+# Keep omnigent-site docs in sync with merged PRs: on push to main, resolve the
+# merged PR from the commit, classify its doc impact, label it, and — if it needs
+# docs — draft an omnigent-site PR tagging the author. Plan → classify
+# (doc-classifier) → label → draft (doc-drafter) → open site PR.
 #
-# Flow (one self-contained workflow):
-#   merged PR ─▶ plan ─▶ classify (doc-classifier) ─▶ label needs/no-doc-update
-#                                  └▶ if needs-doc ─▶ draft (doc-drafter, with a
-#                                     checkout of omnigent-site) ─▶ open site PR
+# Why push:[main], not pull_request_target: a fork PR's `closed` event is gated by
+# GitHub's fork-workflow rules and doesn't fire; a push to main always does, for
+# fork and internal PRs alike. It also only runs already-merged, trusted code (no
+# PR-event-with-secrets surface), and never pushes to main, so it can't self-trigger.
 #
-# Trigger semantics (per design):
-#   - needs-doc-update applied PRE-merge  -> drafts on merge (the `closed` event).
-#   - needs-doc-update applied POST-merge  -> drafts at apply time (`labeled` event).
-#   - unlabeled at merge                   -> the AI classifies and labels; if
-#                                             needs-doc it also drafts in the same run.
-#   - no-doc-update present                -> nothing to do.
+# The cross-repo PR uses the omnigent-ci App (already installed on omnigent-site;
+# sync-openapi-to-site.yml uses it too). If the App is unavailable the draft still
+# runs and prints its diff to the run summary but doesn't push (relies on
+# omnigent-site being public for the read-only checkout).
 #
-# Tokens: omnigent labels/comments use GITHUB_TOKEN (applying a label with it does
-# NOT recursively trigger this workflow, which is why classify+draft live in ONE
-# workflow). The cross-repo omnigent-site PR uses a token minted from the existing
-# `omnigent-ci` App, scoped to omnigent-site. That App is ALREADY installed on
-# omnigent-site with contents + PR write — the sync-openapi-to-site.yml workflow on
-# main uses it the same way. If the App is ever unavailable the draft still runs
-# and prints its diff to the run summary but does not push — this fail-open relies
-# on omnigent-site being PUBLIC so the github.token read-only checkout works.
-#
-# Safety: pull_request_target runs in the trusted base-repo context. We check out
-# the trusted DEFAULT branch and read the PR diff via the API; PR-authored code is
-# never executed. The drafter is unsandboxed like the examples/polly CI reviewer,
-# but only runs on already-merged PRs, the write-token is minted after it finishes
-# (never in its reach), and the agents are fed only the code diff (never the PR
-# title/description) to shrink the injection surface. The output/drafted-file
-# secret-scans catch a key written to stdout or a file — they do NOT cover network
-# exfiltration; see the residual-risk note in .github/agents/doc-drafter/config.yaml.
+# Security model + residual risk (unsandboxed drafter, secret-scan coverage) live
+# in .github/agents/doc-drafter/config.yaml.
 name: Doc sync
 
 on:
-  pull_request_target:
-    types: [closed, labeled]
+  # Every merge to main, incl. fork PRs (see top-of-file for why not pull_request_target).
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       pr:
-        description: "PR number to classify/draft (manual test)."
+        description: "PR number to classify/draft (manual run)."
         required: true
         type: string
 
@@ -49,7 +34,7 @@ permissions:
   issues: write  # labels + PR comments are served by the issues API
 
 concurrency:
-  group: doc-sync-${{ github.event.pull_request.number || inputs.pr }}
+  group: doc-sync-${{ inputs.pr || github.sha }}
   cancel-in-progress: false
 
 env:
@@ -62,17 +47,11 @@ env:
 jobs:
   doc-sync:
     name: Classify and draft docs
-    # Cheap pre-gate; the `plan` step refines (e.g. a no-doc-labeled merge → no-op).
+    # Cheap pre-gate; the `plan` step refines (no associated PR, or a
+    # no-doc-update-labeled merge → no-op).
     if: >-
-      github.repository == 'omnigent-ai/omnigent' && (
-        github.event_name == 'workflow_dispatch' ||
-        (
-          github.event.pull_request.merged == true && (
-            github.event.action == 'closed' ||
-            (github.event.action == 'labeled' && github.event.label.name == 'needs-doc-update')
-          )
-        )
-      )
+      github.repository == 'omnigent-ai/omnigent' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -92,33 +71,41 @@ jobs:
           classify = predraft = False
           pr = author = title = ""
 
+          repo = os.environ["CODE_REPO"]
           if event == "workflow_dispatch":
               pr = os.environ.get("INPUT_PR", "").strip()
               meta = json.loads(subprocess.run(
-                  ["gh", "pr", "view", pr, "--repo", os.environ["CODE_REPO"],
+                  ["gh", "pr", "view", pr, "--repo", repo,
                    "--json", "author,title"], capture_output=True, text=True).stdout or "{}")
               author = (meta.get("author") or {}).get("login", "")
               title = meta.get("title", "")
-              classify = True  # manual test: classify, and draft if needs-doc
-          elif event == "pull_request_target":
-              prj = payload["pull_request"]
-              pr = str(prj["number"]); author = (prj.get("user") or {}).get("login", "")
-              title = prj.get("title", "")
-              merged = bool(prj.get("merged"))
-              labels = [l["name"] for l in prj.get("labels", [])]
-              action = payload.get("action")
-              if not merged:
-                  pass
-              elif action == "labeled":
-                  if (payload.get("label") or {}).get("name") == NEEDS:
-                      predraft = True            # post-merge label → draft now
-              elif action == "closed":
-                  if NEEDS in labels:
-                      predraft = True            # pre-merge needs-doc → draft on merge
-                  elif NO in labels:
-                      pass                       # already decided: no docs
+              classify = True  # manual run: classify, and draft if needs-doc
+          elif event == "push":
+              # Resolve the merged PR from the push tip — works for fork and internal
+              # PRs (trusted main history, not a PR event). Single-tip assumption: a
+              # normal merge is one push whose tip is the merge commit; a push carrying
+              # MULTIPLE merges (merge queue / batched) only processes the tip's PR.
+              sha = os.environ.get("GITHUB_SHA", "")
+              out = subprocess.run(
+                  ["gh", "api", f"repos/{repo}/commits/{sha}/pulls", "--jq",
+                   "[.[] | {number, author: (.user.login // \"\"), title, labels: [.labels[].name]}]"],
+                  capture_output=True, text=True).stdout.strip()
+              prs = json.loads(out) if out else []
+              if not prs:
+                  print(f"::notice::commit {sha[:8]} has no associated PR (direct push?) — nothing to do.")
+              else:
+                  if len(prs) > 1:
+                      print(f"::warning::commit {sha[:8]} maps to {len(prs)} PRs "
+                            f"({[p['number'] for p in prs]}); processing #{prs[0]['number']} only.")
+                  p = prs[0]
+                  pr = str(p["number"]); author = p.get("author") or ""; title = p.get("title", "")
+                  labels = p.get("labels", [])
+                  if NO in labels:
+                      pass                       # human set no-doc-update → skip
+                  elif NEEDS in labels:
+                      predraft = True            # human set needs-doc-update → draft
                   else:
-                      classify = True            # unlabeled → classify
+                      classify = True            # unlabeled → let the classifier decide
 
           proceed = classify or predraft
           out = os.environ["GITHUB_OUTPUT"]
@@ -355,10 +342,8 @@ jobs:
           } > /tmp/label_comment.md
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/label_comment.md
 
-      # If the classifier produced no parseable verdict, don't leave the PR in
-      # limbo (the `closed` event won't re-fire): ask for a manual label. Adding
-      # `needs-doc-update` later re-triggers via the `labeled` event.
-      - name: Request manual label on classifier failure
+      # Classifier produced no parseable verdict — leave a recovery pointer.
+      - name: Note classifier failure
         if: steps.decide.outputs.failed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -371,16 +356,13 @@ jobs:
             echo "<!-- doc-sync-bot -->"
             echo "⚠️ Couldn't auto-classify this PR's documentation impact."
             echo ""
-            echo "Please add a \`needs-doc-update\` or \`no-doc-update\` label manually — adding \`needs-doc-update\` will trigger the docs draft. · [run](${RUN_URL})"
+            echo "A maintainer can re-run it from the **Doc sync** workflow → **Run workflow**, entering PR number \`${PR_NUMBER}\`. · [run](${RUN_URL})"
           } > /tmp/unclassified_comment.md
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/unclassified_comment.md
 
-      # --- Draft path: only when a doc update is needed ---
-      # The omnigent-site write-token is minted LATER (after the drafter runs), so
-      # it is never present while the PR-influenced drafter executes. Here we only
-      # need to READ omnigent-site (it is public) — github.token suffices, and we
-      # do NOT persist credentials so no token sits in omnigent-site/.git/config
-      # where the unsandboxed drafter could read it.
+      # --- Draft path ---
+      # Read-only checkout (omnigent-site is public), no persisted creds so no token
+      # sits in .git/config for the unsandboxed drafter. Write-token minted later.
       - name: Check out omnigent-site (docs)
         if: steps.decide.outputs.draft == 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -402,17 +384,12 @@ jobs:
           truncated = pathlib.Path("/tmp/diff_truncated").read_text().strip() == "true"
           trunc_note = ("\n> NOTE: the diff was truncated at 512 KB — document only what the visible "
                         "portion supports and flag the rest for manual review.\n" if truncated else "")
-          # Hand the FULL diff to the drafter via a file in its cwd, not inline in
-          # the prompt: a large diff (PR #881 was 162 KB) would exceed Linux's
-          # ~128 KiB single-argv limit (MAX_ARG_STRLEN) and `omnigent run -p`
-          # couldn't even execve. The drafter reads DIFF_FILE with sys_os_read.
-          # Re-encode through UTF-8 (errors="replace") so a byte-cap that split a
-          # multibyte codepoint can't leave an invalid tail that sys_os_read chokes on.
+          # Diff goes via a FILE the drafter reads (not inline): a large diff would
+          # blow Linux's ~128 KiB single-argv limit. Re-encode UTF-8 so a byte-cap
+          # split mid-codepoint can't leave a tail sys_os_read chokes on.
           diff = pathlib.Path("/tmp/pr_diff.txt").read_text(encoding="utf-8", errors="replace")
           (pathlib.Path(ws) / "_pr_diff.txt").write_text(diff, encoding="utf-8")
-          # Deliberately NO PR title or description: those are free-form,
-          # author-controlled prose (a prompt-injection surface). The drafter works
-          # from the code change in DIFF_FILE.
+          # No PR title/description by design — author-controlled prose / injection surface.
           prompt = f"""SITE_REPO={ws}/omnigent-site
           PR_NUMBER={os.environ['PR_NUMBER']}
           DIFF_FILE=./_pr_diff.txt
@@ -428,10 +405,8 @@ jobs:
       - name: Run drafter
         id: draft
         if: steps.decide.outputs.draft == 'true'
-        # cwd = the workspace root: it holds both the PR-diff file the drafter reads
-        # (_pr_diff.txt) and the omnigent-site checkout it writes into. The only
-        # secret in this step's env is LLM_API_KEY (the site write-token is minted
-        # later, after this step) — same exposure as the polly-review CI agent.
+        # cwd = workspace root (holds _pr_diff.txt + the omnigent-site checkout).
+        # Only LLM_API_KEY is in env — same exposure as polly-review.
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
@@ -474,9 +449,8 @@ jobs:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
           set -euo pipefail
-          # Defense in depth: a prompt-injected drafter could write the key INTO a
-          # doc file (the output-text scan wouldn't catch that). Scan the actual
-          # drafted content — tracked changes + new files — before it can be pushed.
+          # Defense in depth: scan the drafted content (tracked + new files) — a
+          # prompt-injected drafter could write the key into a doc file.
           if [ -n "${LLM_API_KEY:-}" ]; then
             leaked="$({ git diff HEAD; git ls-files --others --exclude-standard -z | xargs -0 cat 2>/dev/null; } | grep -F "$LLM_API_KEY" || true)"
             if [ -n "$leaked" ]; then
@@ -618,10 +592,8 @@ jobs:
           echo "### Doc-sync: drafted but not pushed" >> "$GITHUB_STEP_SUMMARY"
           { echo '```diff'; (cd omnigent-site && git --no-pager diff); echo '```'; } >> "$GITHUB_STEP_SUMMARY" || true
 
-      # ::add-mask:: only redacts rendered logs, not artifact file contents — and
-      # the stderr logs are uploaded but never secret-scanned mid-pipeline. Redact
-      # the literal key from every artifact file before upload so an error dump
-      # that echoed the key into stderr can't leave the runner unredacted.
+      # ::add-mask:: redacts rendered logs, not artifact files — scrub the key from
+      # the artifacts (incl. the otherwise-unscanned stderr logs) before upload.
       - name: Redact secrets from artifacts
         if: always() && steps.plan.outputs.proceed == 'true'
         env:
