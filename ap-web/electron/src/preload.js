@@ -70,8 +70,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   /**
    * This machine's host-connection status for the window's server, e.g.
    * `{cliInstalled, connected, process, hostStatus, sessions, ownedByDesktop,
-   * error}`. Read-only — hosting is enabled at connect time on the setup page.
-   * Resolves null on pages that aren't a connected server.
+   * error}`. Read-only — connecting this machine as a runner is done from the
+   * host menu via controlHost. Resolves null on pages that aren't a connected
+   * server.
    */
   getHostStatus: () => ipcRenderer.invoke("omnigent:host-get-status"),
   /**
@@ -117,17 +118,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
 contextBridge.exposeInMainWorld("omnigentSetup", {
   getServerUrl: () => ipcRenderer.invoke("omnigent:get-server-url"),
   /**
-   * Persist + navigate to a server URL. `opts.host` also registers this machine
-   * as a host for the server once it loads (the connect-time hosting choice).
+   * Persist + navigate to a server URL. Connecting this machine as a runner is
+   * a separate, explicit action from the host menu — not a connect-time choice.
    * @param {string} url
-   * @param {{ host?: boolean }} [opts]
    */
-  setServerUrl: (url, opts) =>
-    ipcRenderer.invoke("omnigent:set-server-url", url, { host: Boolean(opts && opts.host) }),
+  setServerUrl: (url) => ipcRenderer.invoke("omnigent:set-server-url", url),
   /** Recently-connected server URLs, most recent first. */
   getRecentServers: () => ipcRenderer.invoke("omnigent:get-recent-servers"),
-  /** The saved "host on connect" preference, to pre-set the toggle. */
-  getHostOnConnect: () => ipcRenderer.invoke("omnigent:get-host-on-connect"),
   /**
    * Whether the `omnigent` CLI is installed/runnable, e.g.
    * `{installed, path, version, source, installCommand}`.

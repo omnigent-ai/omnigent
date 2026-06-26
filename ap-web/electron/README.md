@@ -289,9 +289,10 @@ deliberately separate:
 
 - **Server** — the backend the webview talks to (local or remote).
 - **Host** — _this machine_ executing agent work for a server. Because hosting
-  runs agent code, it is **opt-in**: you choose it on the connect screen via a
-  "Host this machine on connect" toggle next to **Connect**, and the connected
-  app shows live host status in the sidebar.
+  runs agent code, it is **opt-in** and **explicit**: the shell never connects
+  this machine as a runner on its own — not on connect, not on launch. You
+  connect it from the **host selection menu** inside the app (when starting a
+  chat, pick this machine), which drives `controlHost` over the bridge.
 
 ### Detecting the CLI (setup page)
 
@@ -315,51 +316,33 @@ needs the CLI — only "Start locally" and hosting do.
 
 **"Start a server on this machine"** runs `omnigent server start` (idempotent —
 reuses a healthy one) and then connects this window to its
-`http://127.0.0.1:<port>` URL through the normal connect flow. The host toggle
-applies here too, so a local server can host this machine in one step.
+`http://127.0.0.1:<port>` URL through the normal connect flow. It does not
+connect this machine as a runner — that stays an explicit step in the app.
 
-### Hosting on connect
+### Connecting this machine as a runner
 
-The **"Host this machine on connect"** toggle on the setup page is the single
-place you opt into hosting (its last state is remembered in `settings.json` as
-`host_on_connect`). When you Connect (or Start locally) with it on, the shell —
-once the server actually responds — either adopts a daemon already serving that
-server (one you started by hand) or spawns `omnigent host --server <url>`. The
-toggle is disabled until the CLI resolves.
+There is **no** connect-time toggle and no sidebar status row: the shell never
+connects a runner automatically. Inside the connected app, the host selection
+menu (when starting a chat) tags this machine and offers to connect it. Choosing
+it calls `controlHost("start")` over the bridge, which — once the CLI is
+authenticated for the server (remote only; local needs none) — either adopts a
+daemon already serving that server (one you started by hand) or spawns
+`omnigent host --server <url>`. The same bridge exposes `stop` / `restart`.
 
-### Host / server controls in the sidebar
-
-Inside the connected app, the sidebar footer (next to Settings) shows a **Host
-Status** row — a label and a colored dot (green = connected, amber =
-connecting, muted = off / CLI missing) — that opens a **Start / Stop / Restart**
-menu for this machine's host daemon. When the server is a **local** one, a
-parallel **Local Server Status** row with the same Start / Stop / Restart menu
-appears for the local server itself. Menu items enable by current state (you
-can't Start something already running, or Stop something that's off).
-
-Status is read live from `omnigent host status --json` / `omnigent server status
---json` (host connected = a live daemon process **and** an online host tunnel;
-the shell never caches it). The whole surface goes through the JS bridge —
-`window.omnigentDesktop` → `getHostStatus` / `getServerStatus` /
-`onHostStatusChanged` (read + live) and `controlHost` / `controlServer`
-(start/stop/restart), typed in
-[`../src/lib/nativeBridge.ts`](../src/lib/nativeBridge.ts) and gated to the
-window's **pinned origin** like the badge/notification bridge. The rows are
-desktop-shell only and shown on the desktop (non-mobile) sidebar.
+Status is read live (host connected = a live daemon process **and** an online
+host tunnel; the shell never caches it). The host surface goes through the JS
+bridge — `window.omnigentDesktop` → `getHostStatus` / `getHostIdentity` /
+`onHostStatusChanged` (read + live) and `controlHost` (start/stop/restart),
+typed in [`../src/lib/nativeBridge.ts`](../src/lib/nativeBridge.ts) and gated to
+the window's **pinned origin** like the badge/notification bridge.
 
 ### Lifecycle
 
 The desktop **owns the host processes it starts**: quitting the app SIGTERMs
 them (and stops a local server it started), so closing the app disconnects this
 machine. A daemon the shell merely _adopted_ (you started it in a terminal) is
-left running on quit.
-
-**Restored on next launch.** Whether hosting was on is remembered per server
-(`settings.json` → `host_servers`), updated when you start or stop hosting and
-deliberately _not_ cleared by quit-time teardown. So if the daemon was running
-when you closed the app, it's reconnected automatically once the window reaches
-that server again — and a connect-time opt-out (or a sidebar Stop) clears the
-memory so it stays off.
+left running on quit. Hosting is **not** restored on the next launch — you
+reconnect this machine explicitly from the host menu when you want it.
 
 ## Passkeys (WebAuthn)
 

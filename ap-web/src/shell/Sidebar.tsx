@@ -34,7 +34,6 @@ import {
 } from "lucide-react";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
-import { HostStatusIndicator } from "./HostStatusIndicator";
 import {
   Dialog,
   DialogContent,
@@ -488,10 +487,6 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
           the conversation list as a compact icon instead of stealing a row's
           height from the scroll area. */}
           <div className="md:shrink-0 md:px-3 md:pb-3 max-md:absolute max-md:bottom-3 max-md:left-3 max-md:z-10">
-            {/* Desktop shell only, hidden on the mobile floating footer:
-                read-only host-connection status (hosting is enabled at connect
-                time on the shell's setup page). */}
-            <HostStatusIndicator />
             <Button
               asChild
               variant="ghost"

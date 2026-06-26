@@ -586,153 +586,10 @@ function followLocalServerMove(event, oldServerUrl, newUrl) {
     const settings = loadSettings();
     settings.server_url = newUrl;
     saveSettings(settings);
-    // Carry hosting to the new URL: drop the old (now-dead) host connection and
-    // mark the new URL host-enabled so the post-load restore reconnects there.
-    if (isHostServerEnabled(oldServerUrl)) {
-      setHostServerEnabled(oldServerUrl, false);
-      setHostServerEnabled(newUrl, true);
-      const cliPath = resolvedCliPath();
-      if (cliPath) void serverManager.disconnectHost(cliPath, oldServerUrl).catch(() => {});
-    }
   }
   pinWindow(win, newOrigin);
   setWindowServerUrl(win, newUrl);
   void win.loadURL(newUrl);
-}
-
-/**
- * Show a small, auto-dismissing toast inside the focused window's web page by
- * injecting a self-contained element built from real DOM nodes (text via
- * textContent, the command in a proper `<code>` chip — no markup parsing of
- * untrusted strings). Works regardless of the server's SPA version, isn't
- * suppressed like a notification for the frontmost app, and is lighter than a
- * modal dialog.
- *
- * @param {string} message
- * @param {{ kind?: "info" | "error", command?: string }} [opts]
- */
-function showRunnerToast(message, opts = {}) {
-  const win = activeWindow();
-  if (!win || win.isDestroyed()) return;
-  const arg = JSON.stringify({
-    message: String(message),
-    command: opts.command ? String(opts.command) : "",
-    error: opts.kind === "error",
-  });
-  // Self-contained IIFE: a blurred dark card with a status dot, the message,
-  // and an optional <code> chip. Slides up + fades; auto-dismisses.
-  const js = `(function(o){try{
-    var ID="omnigent-runner-toast";
-    var prev=document.getElementById(ID);if(prev)prev.remove();
-    var card=document.createElement("div");card.id=ID;
-    card.style.cssText=[
-      "position:fixed","z-index:2147483647","left:50%","bottom:28px",
-      "transform:translateX(-50%) translateY(10px)","display:flex","align-items:flex-start","gap:10px",
-      "max-width:min(92vw,460px)","padding:12px 14px","border-radius:12px",
-      "font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif","color:#f4f4f5",
-      "background:rgba(24,24,27,0.97)","border:1px solid rgba(255,255,255,0.08)",
-      "box-shadow:0 12px 40px rgba(0,0,0,0.45)","opacity:0",
-      "transition:opacity .2s ease,transform .2s ease",
-      "-webkit-backdrop-filter:blur(10px)","backdrop-filter:blur(10px)"
-    ].join(";");
-    var dot=document.createElement("span");
-    dot.style.cssText="flex:none;width:8px;height:8px;margin-top:5px;border-radius:50%;background:"
-      +(o.error?"#f87171":"#34d399");
-    card.appendChild(dot);
-    var col=document.createElement("div");
-    col.style.cssText="display:flex;flex-direction:column;gap:7px;min-width:0";
-    var msg=document.createElement("div");msg.style.cssText="font-size:13px;line-height:1.45";
-    msg.textContent=o.message;col.appendChild(msg);
-    if(o.command){
-      var code=document.createElement("code");code.textContent=o.command;
-      code.style.cssText=[
-        "font-family:ui-monospace,SFMono-Regular,Menlo,monospace","font-size:12px","color:#e5e7eb",
-        "background:rgba(255,255,255,0.10)","border:1px solid rgba(255,255,255,0.08)",
-        "padding:4px 8px","border-radius:6px","white-space:pre-wrap","word-break:break-all"
-      ].join(";");
-      col.appendChild(code);
-    }
-    card.appendChild(col);
-    document.body.appendChild(card);
-    requestAnimationFrame(function(){card.style.opacity="1";card.style.transform="translateX(-50%) translateY(0)"});
-    setTimeout(function(){
-      card.style.opacity="0";card.style.transform="translateX(-50%) translateY(10px)";
-      setTimeout(function(){card.remove()},260);
-    }, o.error?8000:4000);
-  }catch(_){} })(${arg})`;
-  win.webContents.executeJavaScript(js).catch(() => {});
-}
-
-/**
- * Connect this machine as a host for a server at connect time (the setup page's
- * "Connect this machine as a runner" toggle). Ensures CLI auth first (remote
- * servers; may open the browser), then connects. Reports outcome via an in-page
- * toast — auth failures get a friendly "sign in" message rather than a raw
- * error — and is logged. Never silently swallowed.
- *
- * @param {string} serverUrl
- * @returns {Promise<void>}
- */
-async function connectRunner(serverUrl) {
-  const cliPath = resolvedCliPath();
-  if (!cliPath) {
-    showRunnerToast("Omnigent CLI not found — install it or set its path in setup.", {
-      kind: "error",
-    });
-    return;
-  }
-  const auth = await serverManager.ensureServerAuth(cliPath, serverUrl);
-  if (!auth.ok) {
-    console.warn("[omnigent] runner connect (auth):", auth.error);
-    showRunnerToast("Sign in to run this machine as a runner:", {
-      kind: "error",
-      command: `omnigent login ${serverUrl}`,
-    });
-    broadcastHostStatus();
-    return;
-  }
-  const result = await serverManager.ensureHostConnected(cliPath, serverUrl);
-  broadcastHostStatus();
-  if (result.ok) {
-    showRunnerToast("This machine is now connected as a runner.");
-    return;
-  }
-  console.warn("[omnigent] runner connect failed:", result.error);
-  if (result.authError) {
-    showRunnerToast("Sign in to run this machine as a runner:", {
-      kind: "error",
-      command: `omnigent login ${serverUrl}`,
-    });
-  } else {
-    showRunnerToast("Couldn't connect this machine as a runner.", { kind: "error" });
-  }
-}
-
-/**
- * Reconnect this machine as a host on launch when it was host-enabled last
- * session. Unlike connectRunner this does NOT auto-launch an interactive login
- * (no surprise browser on startup): it just attempts the connection and, on an
- * auth failure, shows a gentle toast pointing at the host menu / `omnigent
- * login` rather than reconnecting forcefully.
- *
- * @param {string} serverUrl
- * @returns {Promise<void>}
- */
-async function restoreRunner(serverUrl) {
-  const cliPath = resolvedCliPath();
-  if (!cliPath) return;
-  const result = await serverManager.ensureHostConnected(cliPath, serverUrl);
-  broadcastHostStatus();
-  if (result.ok) return;
-  console.warn("[omnigent] runner restore failed:", result.error);
-  if (result.authError) {
-    showRunnerToast("Sign in to reconnect this machine as a runner:", {
-      kind: "error",
-      command: `omnigent login ${serverUrl}`,
-    });
-  } else {
-    showRunnerToast("Couldn't reconnect this machine as a runner.", { kind: "error" });
-  }
 }
 
 /**
@@ -820,46 +677,6 @@ function resolvedCliPath() {
   const resolved = omnigentCli.resolveCliPath(configured);
   cachedCli = { configuredPath: configured, path: resolved ? resolved.path : null };
   return cachedCli.path;
-}
-
-/**
- * Servers (normalized URLs) for which desktop-managed hosting was on. Persisted
- * so a host that was running when the app closed is restored on next launch —
- * the daemon is torn down on quit, but the *intent* survives here. Updated when
- * the user starts/stops hosting; quit-time teardown deliberately does NOT clear
- * it.
- *
- * @returns {string[]}
- */
-function loadHostServers() {
-  const list = loadSettings().host_servers;
-  return Array.isArray(list) ? list.filter((s) => typeof s === "string") : [];
-}
-
-/**
- * Record (or clear) whether desktop hosting should be active for a server.
- *
- * @param {string} serverUrl
- * @param {boolean} enabled
- */
-function setHostServerEnabled(serverUrl, enabled) {
-  const key = omnigentCli.normalizeServerUrl(serverUrl);
-  if (key === "") return;
-  const settings = loadSettings();
-  const without = loadHostServers().filter((s) => omnigentCli.normalizeServerUrl(s) !== key);
-  settings.host_servers = enabled ? [...without, key] : without;
-  saveSettings(settings);
-}
-
-/**
- * Whether a server is remembered as host-enabled (restore on launch).
- *
- * @param {string} serverUrl
- * @returns {boolean}
- */
-function isHostServerEnabled(serverUrl) {
-  const key = omnigentCli.normalizeServerUrl(serverUrl);
-  return loadHostServers().some((s) => omnigentCli.normalizeServerUrl(s) === key);
 }
 
 /** Maximum number of entries kept in the persisted recent-servers list. */
@@ -1151,9 +968,6 @@ function createWindow(targetUrl, opts = {}) {
   // WORKSPACE_CHROME_HIDE_CSS. Re-applied on every full load (a server switch
   // is a fresh document); the SPA's own client-side routing keeps the same
   // document, so the injected stylesheet persists across in-app navigation.
-  // Restore desktop hosting at most once per window, when it first lands on its
-  // pinned server (below).
-  let hostRestoreAttempted = false;
   win.webContents.on("did-finish-load", () => {
     const urlStr = win.webContents.getURL();
     let pathname = "";
@@ -1165,16 +979,8 @@ function createWindow(targetUrl, opts = {}) {
     if (pathname.startsWith(WORKSPACE_UI_PATH)) {
       void win.webContents.insertCSS(WORKSPACE_CHROME_HIDE_CSS);
     }
-    // If hosting was on for this server last session, reconnect the daemon now
-    // that the window has actually reached the server (not an auth redirect or
-    // the setup page). Once per window; ensureHostConnected dedups/adopts, so
-    // this is safe alongside the connect-time path.
-    const state = windows.get(win);
-    if (hostRestoreAttempted || !state || !state.origin || !state.serverUrl) return;
-    if (originOf(urlStr) !== state.origin) return;
-    hostRestoreAttempted = true;
-    if (!isHostServerEnabled(state.serverUrl)) return;
-    void restoreRunner(state.serverUrl);
+    // Note: the desktop never auto-connects this machine as a runner — on
+    // launch or on connect. Connecting is an explicit action from the host menu.
   });
 
   win.on("closed", () => {
@@ -1678,7 +1484,7 @@ function registerIpc() {
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
   // global, so connecting from one window doesn't hijack another.
-  ipcMain.handle("omnigent:set-server-url", async (event, url, opts) => {
+  ipcMain.handle("omnigent:set-server-url", async (event, url) => {
     if (!isSetupPageSender(event)) {
       // A server page must never be able to re-point which server is saved.
       throw new Error("set-server-url is only available to the setup page");
@@ -1688,9 +1494,6 @@ function registerIpc() {
     // the Omnigent UI mount so the user can paste just the workspace host.
     const target = await expandDatabricksWorkspaceUrl(normalized);
     const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
-    // Connect-time choice from the setup page: also register this machine as a
-    // host for the server. Persisted so the toggle stays sticky across launches.
-    const host = Boolean(opts && opts.host);
     // Multi-server windows connect without touching the saved server —
     // the connection lives and dies with the window.
     const ephemeral = Boolean(win && windows.get(win)?.ephemeral);
@@ -1699,11 +1502,7 @@ function registerIpc() {
       // The saved default persists immediately even if this load fails:
       // the failure fallback keeps it pre-filled so Connect retries it.
       settings.server_url = target;
-      settings.host_on_connect = host;
       saveSettings(settings);
-      // Explicit opt-out: connecting with the toggle off clears any remembered
-      // hosting for this server, so it isn't restored on the next launch.
-      if (!host) setHostServerEnabled(target, false);
     }
     if (win) {
       // The user explicitly chose this server — it becomes the window's
@@ -1721,29 +1520,14 @@ function registerIpc() {
             rememberRecentServer(settings, target);
             saveSettings(settings);
           }
-          // Start hosting only after the server actually responded, so we never
-          // spawn a host for a typo'd / unreachable URL. Ensures CLI auth first
-          // (remote servers) and reports failures via notification + log.
-          // Remembered (host_servers) so it's restored on the next launch —
-          // except for ephemeral windows, whose connections are never saved.
-          if (host) {
-            if (!ephemeral) setHostServerEnabled(target, true);
-            void connectRunner(target);
-          }
+          // The desktop does NOT auto-connect this machine as a runner on
+          // connect — that's an explicit action from the host menu.
         })
         .catch(() => {
           // Load failure is handled by the did-fail-load fallback (setup
           // page with the error); the URL is deliberately not recorded.
         });
     }
-  });
-
-  // Setup page → the saved "host on connect" preference, to pre-set the toggle.
-  ipcMain.handle("omnigent:get-host-on-connect", (event) => {
-    if (!isSetupPageSender(event)) {
-      throw new Error("get-host-on-connect is only available to the setup page");
-    }
-    return Boolean(loadSettings().host_on_connect);
   });
 
   // Setup page → pre-fill the input with any saved URL.
@@ -2050,7 +1834,7 @@ function registerIpc() {
   });
 
   // SPA → start / stop / restart this machine's host daemon for the window's
-  // own server (the sidebar host-status menu).
+  // own server (the host selection menu's "connect this machine" action).
   ipcMain.handle("omnigent:host-control", async (event, action) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("host-control is only available to a connected server page");
@@ -2075,10 +1859,6 @@ function registerIpc() {
     } else {
       result = { ok: false, error: `unknown host action '${action}'` };
     }
-    // Remember the intent so a running host is restored on next launch: a
-    // successful start/restart enables it; an explicit stop clears it.
-    if (action === "stop") setHostServerEnabled(serverUrl, false);
-    else if (result.ok) setHostServerEnabled(serverUrl, true);
     broadcastHostStatus();
     return result;
   });
