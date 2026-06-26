@@ -48,6 +48,7 @@ import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { BUILTIN_AGENTS, sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
 import {
@@ -116,6 +117,21 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
     label: "Bypass permissions",
     description: "Runs everything; no prompts or safety checks",
   },
+];
+
+// Claude-native model + reasoning-effort defaults for the new-session
+// model/effort picker. These are Claude Code's own effective defaults, so a
+// fresh session shows "Sonnet Medium" and rides along as `model_override` /
+// `reasoning_effort` on the create. Effort levels mirror CLAUDE_NATIVE_EFFORT
+// _LEVELS in ChatPage's in-session picker (ANTHROPIC_EFFORTS server-side).
+const CLAUDE_NATIVE_DEFAULT_MODEL = "sonnet";
+const CLAUDE_NATIVE_DEFAULT_EFFORT = "medium";
+const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "xHigh" },
+  { value: "max", label: "Max" },
 ];
 
 // Cursor execution modes. "default" sends no flags; other values map to CLI
@@ -1059,6 +1075,86 @@ function BrainHarnessOptions({
 }
 
 /**
+ * Composer-row model + reasoning-effort picker for claude-native agents.
+ * The trigger names the live selection ("Sonnet Medium") and the menu
+ * switches both; the pick rides along to the create as ``model_override``
+ * (the version-agnostic alias) and ``reasoning_effort``.
+ */
+function ModelEffortControl({
+  model,
+  effort,
+  onModelChange,
+  onEffortChange,
+}: {
+  model: string;
+  effort: string;
+  onModelChange: (model: string) => void;
+  onEffortChange: (effort: string) => void;
+}) {
+  const modelLabel = CLAUDE_NATIVE_MODELS.find((m) => m.id === model)?.label ?? model;
+  const effortLabel = CLAUDE_NATIVE_EFFORTS.find((e) => e.value === effort)?.label ?? effort;
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          data-testid="new-chat-landing-model-trigger"
+          // Drop the Button's focus-visible ring/border that otherwise shows
+          // when focus returns to the trigger after a pick.
+          className="h-8 gap-1.5 px-2.5 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0"
+        >
+          {/* text-xs / normal weight so the trigger matches the dropdown rows. */}
+          <span className="text-xs tabular-nums">
+            <span className="text-foreground">{modelLabel}</span>
+            <span className="text-muted-foreground"> {effortLabel}</span>
+          </span>
+          <ChevronDownIcon className="size-3.5 opacity-60" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="end"
+        side="bottom"
+        className="max-h-[var(--radix-dropdown-menu-content-available-height)] w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1"
+      >
+        <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
+          Model
+        </div>
+        <DropdownMenuRadioGroup value={model} onValueChange={onModelChange}>
+          {CLAUDE_NATIVE_MODELS.map((m) => (
+            <DropdownMenuRadioItem
+              key={m.id}
+              value={m.id}
+              data-testid={`new-chat-landing-model-${m.id}`}
+              className="rounded-sm py-1 pl-2 text-xs"
+            >
+              {m.label}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+        <DropdownMenuSeparator />
+        <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
+          Effort
+        </div>
+        <DropdownMenuRadioGroup value={effort} onValueChange={onEffortChange}>
+          {CLAUDE_NATIVE_EFFORTS.map((e) => (
+            <DropdownMenuRadioItem
+              key={e.value}
+              value={e.value}
+              data-testid={`new-chat-landing-effort-${e.value}`}
+              className="rounded-sm py-1 pl-2 text-xs"
+            >
+              {e.label}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/**
  * Composer-row harness picker for bundle agents (polly / debby). The
  * trigger names the effective harness and the menu switches it, reusing
  * {@link BrainHarnessOptions} for the rows + per-host "needs setup" badges.
@@ -1309,6 +1405,11 @@ export function NewChatLandingScreen() {
   // null = the agent spec's declared harness (no override sent); cleared on
   // every agent switch so a pick never leaks across agents.
   const [pickedHarness, setPickedHarness] = useState<string | null>(null);
+  // Per-session model + reasoning effort for the claude-native model picker.
+  // Default to Claude Code's own effective defaults (Sonnet / Medium); the
+  // pick rides along as `model_override` / `reasoning_effort` on the create.
+  const [pickedModel, setPickedModel] = useState<string>(CLAUDE_NATIVE_DEFAULT_MODEL);
+  const [pickedEffort, setPickedEffort] = useState<string>(CLAUDE_NATIVE_DEFAULT_EFFORT);
   // Per-session cost-control switch ("Cost Optimized" pill). Unset
   // (null) defers to the agent spec's default and is omitted from
   // the create body.
@@ -1745,6 +1846,12 @@ export function NewChatLandingScreen() {
                   : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
                     ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
                     : undefined,
+            // Model + reasoning effort, persisted on the session row before
+            // the runner launches. Only claude-native surfaces the picker, so
+            // only its agents carry the choice; the runner reads them as
+            // `--model` / `--effort` at terminal launch.
+            model_override: agentSupportsPermissionMode ? pickedModel : undefined,
+            reasoning_effort: agentSupportsPermissionMode ? pickedEffort : undefined,
             // Smart routing toggle — server-side, available for any agent.
             cost_control_mode_override: costControlMode ?? undefined,
             harness_override: pickedHarness ?? undefined,
@@ -2075,10 +2182,11 @@ export function NewChatLandingScreen() {
                 {smartRoutingEnabled && selectedAgent && (
                   <IntelligentModelControl value={costControlMode} onChange={setCostControlMode} />
                 )}
-                {/* Right-side harness override for bundle agents (polly /
-                  debby). Other agents expose their run-mode via the left pill
-                  above and have nothing here. */}
-                {selectedAgentDefaultHarness != null && (
+                {/* Right-side content control: bundle agents (polly / debby)
+                  pick their harness override; claude-native picks model +
+                  effort. Other native agents expose their run-mode via the
+                  left pill above and have nothing here. */}
+                {selectedAgentDefaultHarness != null ? (
                   <HarnessControl
                     value={pickedHarness ?? selectedAgentDefaultHarness}
                     onValueChange={(h) =>
@@ -2088,7 +2196,14 @@ export function NewChatLandingScreen() {
                     }
                     host={harnessWarningHost}
                   />
-                )}
+                ) : supportsPermissionMode ? (
+                  <ModelEffortControl
+                    model={pickedModel}
+                    effort={pickedEffort}
+                    onModelChange={setPickedModel}
+                    onEffortChange={setPickedEffort}
+                  />
+                ) : null}
                 <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger asChild>

@@ -1176,6 +1176,15 @@ class SessionCreateRequest(BaseModel):
         harness (native CLIs read it as ``--model`` at terminal launch;
         SDK harnesses via the spawn env). Validated server-side against
         a conservative model-id charset. ``None`` = harness default.
+    :param reasoning_effort: Optional per-session reasoning-effort
+        override to persist at create time, e.g. ``"high"``. Set by the
+        web UI's new-chat model/effort picker (claude-native today) so
+        the value is on the session row before the runner launches the
+        harness — native Claude Code reads it as ``--effort`` at terminal
+        launch; SDK harnesses via the spawn env. Validated server-side
+        against the shared effort vocabulary; provider-specific support
+        is enforced downstream at launch. ``None`` = harness default.
+        Mirrors the multipart create path (:class:`SessionCreateMetadata`).
     :param cost_control_mode_override: Optional per-session
         cost-control switch to persist at create time: ``"on"``
         activates the spec's configured cost-control mode, ``"off"``
@@ -1208,6 +1217,7 @@ class SessionCreateRequest(BaseModel):
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
     model_override: str | None = None
+    reasoning_effort: str | None = None
     cost_control_mode_override: str | None = None
     harness_override: str | None = None
 

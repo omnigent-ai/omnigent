@@ -565,6 +565,82 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.terminal_launch_args).toBeUndefined();
   });
 
+  it("rides the default model + effort along to create for claude-native", async () => {
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_native" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // The model/effort trigger shows Claude Code's effective defaults…
+    const trigger = screen.getByTestId("new-chat-landing-model-trigger");
+    expect(trigger.textContent).toContain("Sonnet");
+    expect(trigger.textContent).toContain("Medium");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    // …and they ride along on the create — the runner reads them as
+    // --model / --effort at terminal launch.
+    expect(body.model_override).toBe("sonnet");
+    expect(body.reasoning_effort).toBe("medium");
+  });
+
+  it("rides a picked model + effort along to create for claude-native", async () => {
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_native" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // Model + effort are two radio groups in one menu; selecting an item
+    // closes the menu, so reopen between the two picks.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-model-trigger"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-model-opus"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-model-trigger"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-effort-high"));
+    // The trigger reflects both picks immediately.
+    const trigger = screen.getByTestId("new-chat-landing-model-trigger");
+    expect(trigger.textContent).toContain("Opus");
+    expect(trigger.textContent).toContain("High");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBe("opus");
+    expect(body.reasoning_effort).toBe("high");
+  });
+
+  it("omits model_override / reasoning_effort for a non-claude-native agent", async () => {
+    // hello_world (harness null) has no permission-mode capability, so the
+    // model/effort picker never renders and the create carries no model/effort.
+    setAgents([agent()]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_x" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    expect(screen.queryByTestId("new-chat-landing-model-trigger")).toBeNull();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
   it("posts sandbox + approval args when a non-default preset is picked for codex-native", async () => {
     setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({

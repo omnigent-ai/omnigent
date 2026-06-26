@@ -11687,6 +11687,25 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    # Persisted effort reaches a native CLI as a ``--effort`` argv element
+    # at terminal launch (and SDK harnesses via the spawn env). Validate
+    # against the shared vocabulary before any row exists; provider-specific
+    # support (e.g. ANTHROPIC_EFFORTS) is enforced downstream at launch,
+    # mirroring the multipart metadata create path.
+    reasoning_effort: str | None = None
+    if body.reasoning_effort is not None:
+        try:
+            reasoning_effort = validate_effort(
+                body.reasoning_effort,
+                "session metadata",
+                EFFORT_VALUES,
+            )
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid reasoning_effort: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+
     # Validated before any row exists so a bad value never creates an
     # orphan session; None (unset) defers to the spec default.
     cost_control_mode_override = _validated_cost_control_mode_override(
@@ -11824,6 +11843,7 @@ async def _create_session_from_existing_agent(
         raise
     if (
         model_override is not None
+        or reasoning_effort is not None
         or cost_control_mode_override is not None
         or harness_override is not None
     ):
@@ -11835,6 +11855,7 @@ async def _create_session_from_existing_agent(
             conversation_store.update_conversation,
             conv.id,
             model_override=model_override,
+            reasoning_effort=reasoning_effort,
             cost_control_mode_override=cost_control_mode_override,
             harness_override=harness_override,
         )
