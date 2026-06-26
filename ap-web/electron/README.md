@@ -298,23 +298,35 @@ deliberately separate:
   confirmation** the page can't forge or auto-dismiss (persisted per server
   origin, so a trusted server is asked only once).
 
-### Detecting the CLI (setup page)
+### Detecting the CLI and customizing its path
 
-On the setup page the shell probes for the `omnigent` binary —
-`settings.omnigent_path` first, then `PATH`, then the well-known install
-locations (`~/.local/bin`, `~/.cargo/bin`, Homebrew, `/usr/local/bin`). A
-GUI-launched app inherits a minimal `PATH`, which is why the install locations
-are probed directly. When the CLI isn't found, the page shows the install
-one-liner
+The CLI ships under two names that resolve to the same entry point — `omnigent`
+(canonical) and `omni` (short alias) — and the shell probes **both**:
+`settings.omnigent_path` first, then `PATH` (`omnigent` then `omni`), then the
+well-known install locations (`~/.local/bin`, `~/.cargo/bin`, Homebrew,
+`/usr/local/bin`, each tried under both names). A GUI-launched app inherits a
+minimal `PATH`, which is why the install locations are probed directly. The path
+is resolved once at startup and cached in-memory for the session.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh
-```
+You can see and change which binary is used in two places:
 
-and a field to point the app at the binary (typed or via a native file picker).
+- **Setup page** — hidden by default behind a **gear icon** (top-right) that
+  opens a small modal. The resolved/auto-detected path shows as the field's
+  **placeholder** (the value stays empty until you type an override); set it via
+  free-text or a native file picker. When nothing is found the gear gets an
+  accent dot and the modal shows the install one-liner
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh
+  ```
+- **In-app** — **Settings → Local CLI** (desktop only): shows the resolved path
+  and version, a **Change…** button (native file picker) and **Reset to
+  auto-detected**. For safety the in-app surface exposes **no free-text setter**
+  — a connected server must not be able to silently repoint the CLI at an
+  arbitrary binary, so changing it requires a user-driven OS dialog.
+
 A configured path is saved to `settings.json` (`omnigent_path`) only once it
-validates as a runnable `omnigent`. Connecting to a **remote** server never
-needs the CLI — only "Start locally" and hosting do.
+validates as a runnable CLI; clearing it reverts to auto-detection. Connecting
+to a **remote** server never needs the CLI — only "Start locally" and hosting do.
 
 ### Start locally
 

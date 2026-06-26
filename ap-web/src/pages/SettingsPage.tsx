@@ -57,6 +57,7 @@ import { absoluteTime } from "@/lib/relativeTime";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { type ThemeMode, normalizeThemeMode } from "@/components/theme/themeMode";
 import { useIsEmbedded } from "@/lib/embedded";
+import { type CliStatus, getCliStatus, isElectronShell, resetCliPath } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
 /**
@@ -77,6 +78,7 @@ export function SettingsPage() {
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "account" && accountsEnabled && <AccountSection />}
       {section === "archived" && <ArchivedSection />}
+      {section === "cli" && isElectronShell() && <LocalCliSection />}
     </PageScroll>
   );
 }
@@ -151,6 +153,102 @@ function ShortcutsSection() {
   return (
     <Section title="Keyboard shortcuts" description="Speed up common actions with the keyboard.">
       <KeyboardShortcutsList />
+    </Section>
+  );
+}
+
+/**
+ * Desktop-only: shows which Omnigent CLI binary the shell resolved
+ * (auto-detected or a custom override). Read-only — setting a custom path is
+ * done on the connect/setup screen (the trusted surface that allows free-text
+ * entry); the SPA exposes no path setter. A safe "reset to auto-detected" stays
+ * here since it chooses no path.
+ */
+function LocalCliSection() {
+  const [status, setStatus] = useState<CliStatus | null | "loading">("loading");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    void getCliStatus().then(setStatus);
+  }, []);
+
+  const onReset = useCallback(async () => {
+    setBusy(true);
+    const next = await resetCliPath();
+    setBusy(false);
+    if (next) setStatus(next); // null only when the bridge is missing (old shell)
+  }, []);
+
+  if (status === "loading") {
+    return (
+      <Section title="Local CLI">
+        <p className="text-sm text-muted-foreground">Checking…</p>
+      </Section>
+    );
+  }
+
+  return (
+    <Section
+      title="Local CLI"
+      description="The Omnigent command-line tool this app uses to run a local server and connect this machine as a runner."
+    >
+      {status === null ? (
+        <p className="text-sm text-muted-foreground">CLI status is unavailable.</p>
+      ) : (
+        <div className="flex flex-col gap-4">
+          <div className="flex items-center gap-2 text-sm">
+            <span
+              aria-hidden
+              className={cn(
+                "size-2 rounded-full",
+                status.installed ? "bg-success" : "bg-muted-foreground/40",
+              )}
+            />
+            <span>
+              {status.installed
+                ? `Found${status.version ? ` · ${status.version}` : ""}`
+                : "Not found"}
+            </span>
+          </div>
+
+          {status.path ? (
+            <div className="flex flex-col gap-1">
+              <span className="text-xs text-muted-foreground">
+                {status.source === "configured" ? "Path (custom)" : "Path (auto-detected)"}
+              </span>
+              <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-xs">
+                {status.path}
+              </code>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2">
+              <p className="text-sm text-muted-foreground">
+                The Omnigent CLI wasn't found. Install it, then set its path from the connect
+                screen:
+              </p>
+              {status.installCommand && (
+                <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-xs">
+                  {status.installCommand}
+                </code>
+              )}
+            </div>
+          )}
+
+          <p className="text-xs text-muted-foreground">
+            For security, a custom path can only be set from the connect screen — this prevents a
+            connected server from pointing the app at a different binary. Open it from the Server
+            menu (Change Server…) and use the settings gear.
+          </p>
+
+          {status.source === "configured" && (
+            <div>
+              <Button variant="ghost" size="sm" disabled={busy} onClick={() => void onReset()}>
+                Reset to auto-detected
+              </Button>
+            </div>
+          )}
+        </div>
+      )}
     </Section>
   );
 }

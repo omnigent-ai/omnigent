@@ -92,6 +92,18 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("omnigent:host-status-changed", listener);
     return () => ipcRenderer.removeListener("omnigent:host-status-changed", listener);
   },
+  /**
+   * The local `omni` CLI status — `{ installed, path, version, source,
+   * installCommand }`. Read-only; lets the in-app Local CLI settings show which
+   * binary is in use.
+   */
+  getCliStatus: () => ipcRenderer.invoke("omnigent:cli-get-status"),
+  /**
+   * Clear the saved CLI-path override (revert to auto-detection). The SPA can
+   * reset but cannot SET a path: choosing a binary is restricted to the trusted
+   * setup page, so a connected server can't repoint the CLI at an arbitrary one.
+   */
+  resetCliPath: () => ipcRenderer.invoke("omnigent:cli-reset-path"),
 });
 
 // Setup-page bridge: persist + navigate to a server URL, and read the saved

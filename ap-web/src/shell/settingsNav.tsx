@@ -12,21 +12,24 @@ import {
   KeyboardIcon,
   PaletteIcon,
   PanelRightOpenIcon,
+  TerminalIcon,
   UserCogIcon,
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
-export type SettingsSectionId = "appearance" | "shortcuts" | "account" | "archived";
+export type SettingsSectionId = "appearance" | "shortcuts" | "account" | "archived" | "cli";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "shortcuts",
   "account",
   "archived",
+  "cli",
 ];
 
 interface SettingsNavItem {
@@ -42,8 +45,14 @@ interface SettingsNavGroup {
   items: SettingsNavItem[];
 }
 
-/** Nav groups for the current deploy — the Account section is auth-gated. */
-export function settingsNavGroups(accountsEnabled: boolean): SettingsNavGroup[] {
+/**
+ * Nav groups for the current deploy. The Account section is auth-gated; the
+ * Desktop group (Local CLI) appears only in the Electron shell.
+ */
+export function settingsNavGroups(
+  accountsEnabled: boolean,
+  isDesktop: boolean,
+): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
@@ -53,13 +62,23 @@ export function settingsNavGroups(accountsEnabled: boolean): SettingsNavGroup[] 
     // on accounts deploys.
     general.unshift({ id: "account", label: "Account", icon: UserCogIcon });
   }
-  return [
+  const groups: SettingsNavGroup[] = [];
+  // Desktop (Local CLI) leads when present — it's the shell-specific section a
+  // desktop user is most likely here to change.
+  if (isDesktop) {
+    groups.push({
+      title: "Desktop",
+      items: [{ id: "cli", label: "Local CLI", icon: TerminalIcon }],
+    });
+  }
+  groups.push(
     { title: "General", items: general },
     {
       title: "Archived",
       items: [{ id: "archived", label: "Archived sessions", icon: ArchiveIcon }],
     },
-  ];
+  );
+  return groups;
 }
 
 /**
@@ -100,7 +119,7 @@ export function SettingsSidebarBody({
   const info = useServerInfo();
   const accountsEnabled = info !== "loading" && info.accounts_enabled;
   const { section } = useSettingsRoute();
-  const groups = settingsNavGroups(accountsEnabled);
+  const groups = settingsNavGroups(accountsEnabled, isElectronShell());
 
   return (
     <>

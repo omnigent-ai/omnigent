@@ -13,6 +13,7 @@ const {
   isLoopbackServer,
   sameLoopbackServer,
   parseLocalServerPidfile,
+  candidatePaths,
   resolveCliPath,
   parseJsonLoose,
   matchesServer,
@@ -78,7 +79,35 @@ describe("parseLocalServerPidfile", () => {
   });
 });
 
+describe("candidatePaths", () => {
+  it("probes both the omnigent name and the omni alias in each location", () => {
+    const paths = candidatePaths();
+    // Every well-known dir contributes an `omnigent` and an `omni` entry.
+    assert.ok(paths.some((p) => p.endsWith("/.local/bin/omnigent")));
+    assert.ok(paths.some((p) => p.endsWith("/.local/bin/omni")));
+    assert.ok(paths.includes("/opt/homebrew/bin/omnigent"));
+    assert.ok(paths.includes("/opt/homebrew/bin/omni"));
+    assert.ok(paths.includes("/usr/local/bin/omni"));
+  });
+
+  it("lists the canonical omnigent name before the omni alias within a dir", () => {
+    const paths = candidatePaths();
+    const og = paths.indexOf("/opt/homebrew/bin/omnigent");
+    const omni = paths.indexOf("/opt/homebrew/bin/omni");
+    assert.ok(og !== -1 && omni !== -1 && og < omni);
+  });
+});
+
 describe("resolveCliPath", () => {
+  it("resolves the omni alias when only it is executable", () => {
+    const got = resolveCliPath(null, {
+      isExecutableFile: (p) => p === "/home/me/.local/bin/omni",
+      whichOmnigent: () => null,
+      candidatePaths: () => ["/home/me/.local/bin/omnigent", "/home/me/.local/bin/omni"],
+    });
+    assert.deepEqual(got, { path: "/home/me/.local/bin/omni", source: "candidate" });
+  });
+
   it("prefers a usable configured path", () => {
     const got = resolveCliPath("/custom/omnigent", {
       isExecutableFile: (p) => p === "/custom/omnigent",

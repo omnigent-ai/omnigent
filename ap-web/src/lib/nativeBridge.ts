@@ -126,10 +126,30 @@ interface ElectronDesktopApi extends NativeShellApi {
   controlHost?: (action: HostControlAction) => Promise<HostActionResult>;
   /** Subscribe to host status-change pings (re-read on fire); returns an unsubscribe. */
   onHostStatusChanged?: (callback: () => void) => () => void;
+  /** The local `omni` CLI status (installed, resolved path, version, source). */
+  getCliStatus?: () => Promise<CliStatus | null>;
+  /** Clear the CLI-path override (revert to auto-detection); resolves status. */
+  resetCliPath?: () => Promise<CliStatus | null>;
 }
 
 /** A lifecycle action for the host daemon. */
 export type HostControlAction = "start" | "stop" | "restart";
+
+/** Status of the local `omni` CLI, from the desktop shell. */
+export interface CliStatus {
+  /** Whether the CLI was found and is runnable. */
+  installed: boolean;
+  /** The resolved binary path (configured override or auto-detected), or null. */
+  path: string | null;
+  /** The CLI's reported version, or null. */
+  version: string | null;
+  /** How the path was resolved: an explicit override, PATH, or a known location. */
+  source: "configured" | "path" | "candidate" | null;
+  /** The install one-liner to show when the CLI is missing. */
+  installCommand: string;
+  /** Whether a just-submitted path was accepted (present on pick/set results). */
+  accepted?: boolean;
+}
 
 /** This machine's identity, read from local config (fast — no subprocess). */
 export interface HostIdentity {
@@ -489,5 +509,36 @@ export function onHostStatusChanged(callback: () => void): () => void {
   } catch (err) {
     console.warn("[nativeBridge] electron onHostStatusChanged failed:", err);
     return () => {};
+  }
+}
+
+/**
+ * Fetch the local `omni` CLI status from the desktop shell (installed, resolved
+ * path, version, source). Resolves `null` outside the Electron shell or under a
+ * shell too old to expose the CLI bridge.
+ */
+export async function getCliStatus(): Promise<CliStatus | null> {
+  const electron = electronApi();
+  if (!electron?.getCliStatus) return null;
+  try {
+    return await electron.getCliStatus();
+  } catch (err) {
+    console.warn("[nativeBridge] electron getCliStatus failed:", err);
+    return null;
+  }
+}
+
+/**
+ * Clear the saved CLI-path override so the shell reverts to auto-detection,
+ * then resolve the freshly-detected status. Resolves `null` outside the shell.
+ */
+export async function resetCliPath(): Promise<CliStatus | null> {
+  const electron = electronApi();
+  if (!electron?.resetCliPath) return null;
+  try {
+    return await electron.resetCliPath();
+  } catch (err) {
+    console.warn("[nativeBridge] electron resetCliPath failed:", err);
+    return null;
   }
 }

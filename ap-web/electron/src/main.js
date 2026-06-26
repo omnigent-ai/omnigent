@@ -653,6 +653,45 @@ function resolvedCliPath() {
   return cachedCli.path;
 }
 
+/**
+ * Validate `configuredPath` as a runnable CLI and persist it as the override
+ * when it checks out; an empty string clears the override (revert to PATH /
+ * candidates). A typo is NOT saved (so it can't mask a working PATH lookup).
+ * Returns the resulting CLI status plus whether the path was accepted. Shared
+ * by the setup page (free-text) and the in-app picker.
+ *
+ * @param {string} configuredPath
+ * @returns {Promise<Record<string, unknown> & { accepted: boolean }>}
+ */
+async function applyCliPath(configuredPath) {
+  const trimmed = String(configuredPath ?? "").trim();
+  const status = await omnigentCli.getCliStatus(trimmed || null);
+  const accepted = status.installed && status.source === "configured";
+  if (accepted) {
+    const settings = loadSettings();
+    settings.omnigent_path = trimmed;
+    saveSettings(settings);
+  } else if (trimmed === "") {
+    const settings = loadSettings();
+    delete settings.omnigent_path;
+    saveSettings(settings);
+  }
+  return { ...status, accepted };
+}
+
+/**
+ * Clear any saved CLI-path override so resolution falls back to PATH and the
+ * well-known install locations, then report the freshly-resolved status.
+ *
+ * @returns {Promise<Record<string, unknown>>}
+ */
+async function clearCliPath() {
+  const settings = loadSettings();
+  delete settings.omnigent_path;
+  saveSettings(settings);
+  return omnigentCli.getCliStatus(null);
+}
+
 /** Maximum number of entries kept in the persisted recent-servers list. */
 const MAX_RECENT_SERVERS = 5;
 
@@ -809,7 +848,9 @@ function createWindow(targetUrl, opts = {}) {
     // Without saved coordinates Electron centers the window.
     ...(savedBounds ? { x: savedBounds.x, y: savedBounds.y } : {}),
     minWidth: 720,
-    minHeight: 480,
+    // Tall enough that the bundled setup page (logo, Start-locally, divider,
+    // URL field, Connect, and a few recents) fits without overflowing.
+    minHeight: 600,
     title: "Omnigent",
     backgroundColor: "#0b0b0c",
     // macOS: hide the native title bar but keep the traffic lights, inset
@@ -1776,20 +1817,7 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("set-cli-path is only available to the setup page");
     }
-    const trimmed = String(configuredPath ?? "").trim();
-    const status = await omnigentCli.getCliStatus(trimmed || null);
-    const accepted = status.installed && status.source === "configured";
-    if (accepted) {
-      const settings = loadSettings();
-      settings.omnigent_path = trimmed;
-      saveSettings(settings);
-    } else if (trimmed === "") {
-      // Empty input clears any saved override (revert to PATH/candidates).
-      const settings = loadSettings();
-      delete settings.omnigent_path;
-      saveSettings(settings);
-    }
-    return { ...status, accepted };
+    return applyCliPath(configuredPath);
   });
 
   // Setup page → native file picker for the omnigent binary. Returns the chosen
@@ -1800,7 +1828,7 @@ function registerIpc() {
     }
     const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
     const result = await dialog.showOpenDialog(win ?? undefined, {
-      title: "Locate the omnigent binary",
+      title: "Locate the Omnigent CLI binary",
       properties: ["openFile"],
     });
     if (result.canceled || result.filePaths.length === 0) return null;
@@ -1830,6 +1858,29 @@ function registerIpc() {
       return null;
     }
     return { cliInstalled: Boolean(resolvedCliPath()), hostId: omnigentCli.localHostId() };
+  });
+
+  // SPA (in-app Settings → Local CLI) → is the CLI installed and runnable,
+  // plus the resolved path / version / source. Read-only; pinned-origin gated.
+  ipcMain.handle("omnigent:cli-get-status", async (event) => {
+    if (!isPinnedOriginSender(event)) {
+      console.warn("[omnigent] cli-get-status from untrusted sender dropped");
+      return null;
+    }
+    return omnigentCli.getCliStatus(loadSettings().omnigent_path);
+  });
+
+  // SPA → reset to auto-detected (clear the override). Chooses no path itself,
+  // so it's safe to expose to the SPA. SETTING a path is deliberately NOT
+  // exposed here: a connected (remote, semi-trusted) server could otherwise
+  // point the CLI at an arbitrary binary that host-control would later spawn
+  // (and validation runs `<path> --version`). Choosing a path stays on the
+  // bundled file:// setup page.
+  ipcMain.handle("omnigent:cli-reset-path", async (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("cli-reset-path is only available to a connected server page");
+    }
+    return clearCliPath();
   });
 
   // SPA → start / stop / restart this machine's host daemon for the window's
@@ -1908,6 +1959,10 @@ if (!gotLock) {
     registerWebAuthn();
     registerIpc();
     buildMenu();
+    // Resolve the CLI path once at startup so the first status/control call is
+    // instant (primes the in-memory cache in resolvedCliPath); also lets the
+    // setup page / Local CLI settings pre-fill the resolved path immediately.
+    resolvedCliPath();
     createWindow();
 
     app.on("activate", () => {

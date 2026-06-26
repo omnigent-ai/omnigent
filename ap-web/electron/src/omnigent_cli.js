@@ -252,7 +252,16 @@ async function localServerHealthy(timeoutMs = 1500) {
 }
 
 /**
- * Well-known install locations for the `omnigent` binary, in priority order.
+ * The CLI binary's two console-script names — both resolve to the same entry
+ * point (`omnigent.cli:main`); `omni` is the short alias. We probe `omnigent`
+ * first (canonical) but accept `omni` so a machine that only installed the
+ * alias still resolves. See pyproject.toml `[project.scripts]`.
+ */
+const CLI_NAMES = ["omnigent", "omni"];
+
+/**
+ * Well-known install locations for the CLI binary, in priority order. For each
+ * directory we list the `omnigent` name then the `omni` alias.
  * `uv tool install` (the documented installer) drops it in ~/.local/bin;
  * the rest cover Homebrew and source/cargo installs. Probing these matters
  * because a GUI-launched Electron app inherits a minimal PATH that usually
@@ -262,12 +271,13 @@ async function localServerHealthy(timeoutMs = 1500) {
  */
 function candidatePaths() {
   const home = os.homedir();
-  return [
-    path.join(home, ".local", "bin", "omnigent"),
-    path.join(home, ".cargo", "bin", "omnigent"),
-    "/opt/homebrew/bin/omnigent",
-    "/usr/local/bin/omnigent",
+  const dirs = [
+    path.join(home, ".local", "bin"),
+    path.join(home, ".cargo", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
   ];
+  return dirs.flatMap((dir) => CLI_NAMES.map((name) => path.join(dir, name)));
 }
 
 /**
@@ -287,25 +297,40 @@ function isExecutableFile(p) {
 }
 
 /**
- * Resolve `omnigent` on PATH (or the user's login shell PATH). Returns null
- * when not found. On POSIX we go through `command -v` so shell-managed PATHs
- * (uv shims) resolve; on Windows we use `where`.
+ * Resolve the CLI on PATH (or the user's login shell PATH) by name. Returns
+ * null when not found. On POSIX we go through `command -v` so shell-managed
+ * PATHs (uv shims) resolve; on Windows we use `where`.
  *
+ * @param {string} name e.g. "omnigent" or "omni"
  * @returns {string | null}
  */
-function whichOmnigent() {
+function whichName(name) {
   try {
     if (process.platform === "win32") {
-      const out = execFileSync("where", ["omnigent"], { encoding: "utf8" });
+      const out = execFileSync("where", [name], { encoding: "utf8" });
       return out.trim().split(/\r?\n/)[0] || null;
     }
-    const out = execFileSync("/bin/sh", ["-c", "command -v omnigent"], {
+    const out = execFileSync("/bin/sh", ["-c", `command -v ${name}`], {
       encoding: "utf8",
     });
     return out.trim() || null;
   } catch {
     return null;
   }
+}
+
+/**
+ * Resolve the CLI on PATH, trying `omnigent` then the `omni` alias. Returns the
+ * first hit, or null when neither is on PATH.
+ *
+ * @returns {string | null}
+ */
+function whichOmnigent() {
+  for (const name of CLI_NAMES) {
+    const found = whichName(name);
+    if (found) return found;
+  }
+  return null;
 }
 
 /**
@@ -467,11 +492,16 @@ async function getCliStatus(configuredPath) {
     };
   }
   const res = await runCli(resolved.path, ["--version"], { timeoutMs: 5000 });
-  const ok = res.code === 0;
+  const version = res.stdout.trim() || res.stderr.trim() || "";
+  // Must exit cleanly AND identify itself as omni — `omnigent --version` prints
+  // e.g. "omnigent 0.3.0.dev0 (…)". The exit-code alone isn't enough: an
+  // unrelated binary (e.g. /bin/echo) also exits 0 on `--version`, and we must
+  // not accept it as the CLI (it would later fail to run a server / host).
+  const ok = res.code === 0 && /\bomni/i.test(version);
   return {
     installed: ok,
     path: ok ? resolved.path : null,
-    version: ok ? res.stdout.trim() || res.stderr.trim() || null : null,
+    version: ok ? version || null : null,
     source: ok ? resolved.source : null,
     installCommand: INSTALL_COMMAND,
   };
