@@ -89,7 +89,7 @@ dependencies = [
     # (omnigent/update_check.py, omnigent/cli.py): compares the installed
     # version against the latest PyPI release. Previously only a
     # transitive dep; pinned here now that we import it directly.
-    "packaging>=23,<26",
+    "packaging>=23,<27",
 ]
 
 [project.optional-dependencies]
