@@ -689,7 +689,9 @@ function LandingProjectPicker({
           data-testid="new-chat-landing-project-chip"
         >
           <TagIcon className="size-4 shrink-0" />
-          <span className={`max-w-32 truncate ${value ? "text-foreground" : ""}`}>
+          {/* Label collapses to icon-only on narrow viewports (mobile),
+              matching the host/workspace/worktree chips. */}
+          <span className={`hidden max-w-32 truncate sm:block ${value ? "text-foreground" : ""}`}>
             {value || "No project"}
           </span>
           <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
