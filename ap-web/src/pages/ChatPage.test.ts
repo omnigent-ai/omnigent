@@ -3,6 +3,7 @@ import type { RenderItem } from "@/lib/renderItems";
 import type { ToolExecution } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
 import { BUILTIN_SLASH_COMMANDS, isSlashCommandText } from "@/components/SlashCommandMenu";
+import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
   buildPendingBubbles,
   buildSlashCommandMap,
@@ -13,7 +14,6 @@ import {
   computeShowsWorking,
   containsMarkdownTable,
   dispatchInitialPrompt,
-  isSessionSharedWithOthers,
   isUnboundCodingFork,
   mergePendingBubbles,
   readOnlyReasonForSessionLabels,

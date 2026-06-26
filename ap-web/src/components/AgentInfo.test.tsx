@@ -32,6 +32,10 @@ const registryData = { current: [] as unknown[] };
 // cost/id/usage tests untouched.
 const ownerData = { current: null as string | null | undefined };
 const viewerData = { current: null as string | null };
+// Grants the owner has handed out, returned by usePermissions. Only consulted
+// when the viewer owns the session; the owner row shows once it includes a
+// principal other than the viewer (a user or the __public__ sentinel).
+const grantsData = { current: undefined as { user_id: string }[] | undefined };
 vi.mock("@/hooks/usePolicies", () => ({
   usePolicies: () => ({ data: policiesData.current }),
   usePolicyRegistry: () => ({ data: registryData.current }),
@@ -45,6 +49,7 @@ vi.mock("@/hooks/useAgents", () => ({
 }));
 vi.mock("@/hooks/usePermissions", () => ({
   useSessionOwner: () => ({ data: ownerData.current }),
+  usePermissions: () => ({ data: grantsData.current }),
 }));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/identity")>()),
@@ -83,6 +88,7 @@ afterEach(() => {
   deleteMcpMutate.mockClear();
   ownerData.current = null;
   viewerData.current = null;
+  grantsData.current = undefined;
 });
 
 function renderButton(agent: Agent | undefined) {
@@ -288,24 +294,30 @@ describe("AgentInfoButton session id row", () => {
 });
 
 describe("AgentInfoButton session owner row", () => {
-  // The owner row lets a viewer see whose session a shared chat is. It reads
-  // the owner via useSessionOwner (mocked) and the viewer via getCurrentUserId
-  // (mocked); both reset to null in afterEach.
+  // The owner row lets a viewer see whose session a shared chat is, and is
+  // shown *only* when the session is actually shared. It reads the owner via
+  // useSessionOwner, the viewer via getCurrentUserId, and the owner's grants
+  // via usePermissions (all mocked); all reset between cases.
 
-  it("shows the session owner in the popover when one is known", () => {
+  it("shows the session owner when someone else owns the shared session", () => {
+    // A different owner means the session was shared with this viewer.
     ownerData.current = "alice@example.com";
+    viewerData.current = "bob@example.com";
     renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
     // Closed popover: the owner row is not mounted yet.
     expect(screen.queryByTestId("agent-info-session-owner")).toBeNull();
 
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
 
-    expect(screen.getByTestId("agent-info-session-owner")).toHaveTextContent("alice@example.com");
+    const row = screen.getByTestId("agent-info-session-owner");
+    expect(row).toHaveTextContent("alice@example.com");
+    expect(row).not.toHaveTextContent("(you)");
   });
 
-  it("appends (you) when the viewer owns the session", () => {
+  it("shows the owner with (you) when the viewer owns it and shared with another user", () => {
     ownerData.current = "alice@example.com";
     viewerData.current = "alice@example.com";
+    grantsData.current = [{ user_id: "alice@example.com" }, { user_id: "bob@example.com" }];
     renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
 
@@ -314,20 +326,29 @@ describe("AgentInfoButton session owner row", () => {
     expect(row).toHaveTextContent("(you)");
   });
 
-  it("omits (you) when someone else owns the session", () => {
+  it("shows the owner row when the viewer owns it and made it public", () => {
     ownerData.current = "alice@example.com";
-    viewerData.current = "bob@example.com";
+    viewerData.current = "alice@example.com";
+    grantsData.current = [{ user_id: "alice@example.com" }, { user_id: "__public__" }];
     renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
 
-    const row = screen.getByTestId("agent-info-session-owner");
-    expect(row).toHaveTextContent("alice@example.com");
-    expect(row).not.toHaveTextContent("(you)");
+    expect(screen.getByTestId("agent-info-session-owner")).toHaveTextContent("alice@example.com");
+  });
+
+  it("omits the owner row for a private solo session (owner viewing, no other grants)", () => {
+    ownerData.current = "alice@example.com";
+    viewerData.current = "alice@example.com";
+    grantsData.current = [{ user_id: "alice@example.com" }];
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+    // The rest of the popover still renders (agent name proves it opened).
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-info-session-owner")).toBeNull();
   });
 
   it("omits the owner row when no owner is known (permissions off / loading)", () => {
-    // owner null → no row at all, rather than an empty placeholder. The rest of
-    // the popover still renders (agent name proves it opened).
+    // owner null → no row at all, rather than an empty placeholder.
     renderButtonWithSession(AGENT_WITH_BOTH, "conv_owner");
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
     expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
