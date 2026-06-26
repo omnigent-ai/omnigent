@@ -335,3 +335,138 @@ async def test_read_model_from_hermes_config_fallback(tmp_path, monkeypatch) -> 
 
     model = f._read_model_from_hermes_config(tmp_path / "nonexistent")
     assert model == "from-user-config"
+
+
+# --- Compaction persistence tests -------------------------------------------
+
+_COMPACTION_SCHEMA = """
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    compacted INTEGER NOT NULL DEFAULT 0,
+    timestamp REAL,
+    tool_call_id TEXT,
+    tool_calls TEXT,
+    tool_name TEXT
+);
+"""
+
+
+def _make_compaction_db(path: Path) -> None:
+    """Create a messages-only DB with the compacted column."""
+    con = sqlite3.connect(path)
+    con.executescript(_COMPACTION_SCHEMA)
+    con.commit()
+    con.close()
+
+
+def test_has_new_compaction_returns_true_when_compacted_rows_exist(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    _make_compaction_db(db)
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO messages(session_id, role, content, active, compacted)"
+        " VALUES (?, ?, ?, 1, 1)",
+        (
+            "hermes_sess",
+            "assistant",
+            "compacted summary",
+        ),
+    )
+    con.commit()
+    con.close()
+    assert f._has_new_compaction(db, "hermes_sess") is True
+
+
+def test_has_new_compaction_returns_false_when_no_compacted_rows(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    _make_compaction_db(db)
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO messages(session_id, role, content, active, compacted)"
+        " VALUES (?, ?, ?, 1, 0)",
+        ("hermes_sess", "user", "hello"),
+    )
+    con.commit()
+    con.close()
+    assert f._has_new_compaction(db, "hermes_sess") is False
+
+
+async def test_persist_hermes_compaction_item_posts_with_messages(tmp_path: Path) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    db = tmp_path / "state.db"
+    _make_compaction_db(db)
+    con = sqlite3.connect(db)
+    con.executemany(
+        "INSERT INTO messages(session_id, role, content, active, compacted)"
+        " VALUES (?, ?, ?, ?, ?)",
+        [
+            ("hermes_sess", "user", "please help", 1, 0),
+            ("hermes_sess", "assistant", "sure thing", 1, 0),
+        ],
+    )
+    con.commit()
+    con.close()
+
+    get_resp = MagicMock()
+    get_resp.raise_for_status = MagicMock()
+    get_resp.json = MagicMock(return_value={"data": [{"id": "item_hermes"}]})
+
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+
+    client = AsyncMock()
+    client.get = AsyncMock(return_value=get_resp)
+    client.post = AsyncMock(return_value=post_resp)
+
+    await f._persist_hermes_compaction_item(
+        client,
+        session_id="conv_hermes",
+        db_path=db,
+        hermes_session_id="hermes_sess",
+    )
+
+    client.post.assert_called_once()
+    _url, kwargs = client.post.call_args
+    body = kwargs.get("json") or client.post.call_args[1]["json"]
+    assert body["type"] == "compaction"
+    assert body["data"]["last_item_id"] == "item_hermes"
+    assert len(body["data"]["compacted_messages"]) == 2
+    assert body["data"]["compacted_messages"][0]["role"] == "user"
+    assert body["data"]["compacted_messages"][1]["role"] == "assistant"
+
+
+async def test_persist_hermes_compaction_item_empty_db(tmp_path: Path) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    db = tmp_path / "state.db"
+    _make_compaction_db(db)
+
+    get_resp = MagicMock()
+    get_resp.raise_for_status = MagicMock()
+    get_resp.json = MagicMock(return_value={"data": []})
+
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+
+    client = AsyncMock()
+    client.get = AsyncMock(return_value=get_resp)
+    client.post = AsyncMock(return_value=post_resp)
+
+    await f._persist_hermes_compaction_item(
+        client,
+        session_id="conv_hermes",
+        db_path=db,
+        hermes_session_id="hermes_sess",
+    )
+
+    client.post.assert_called_once()
+    _url, kwargs = client.post.call_args
+    body = kwargs.get("json") or client.post.call_args[1]["json"]
+    assert body["type"] == "compaction"
+    assert body["data"]["last_item_id"].startswith("compact_boundary_")
+    assert "compacted_messages" not in body["data"]
