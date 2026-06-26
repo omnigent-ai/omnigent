@@ -369,45 +369,64 @@ describe("conversationDisplayLabel", () => {
 });
 
 // Drag-and-drop routing: dropping a session onto a project folder files it
-// there; onto the "remove from project" zone unfiles it. "Shared with me" is
-// never a drop target, so dropping there yields a null target → no-op.
+// there; onto the "Chats" / remove-from-project zone unfiles it; onto "Pinned"
+// pins it. "Shared with me" is never a drop target, so dropping there yields a
+// null target → no-op.
 describe("resolveSidebarDrop", () => {
+  // Source builder — defaults to an unfiled, unpinned session.
+  const src = (over: Partial<{ project: string | null; isPinned: boolean }> = {}) => ({
+    id: "c1",
+    project: null,
+    isPinned: false,
+    ...over,
+  });
+
   it("files an unfiled session into the project it's dropped on", () => {
-    expect(
-      resolveSidebarDrop({ id: "c1", project: null }, { type: "project", name: "Sprint 42" }),
-    ).toEqual({ kind: "move", project: "Sprint 42" });
+    expect(resolveSidebarDrop(src(), { type: "project", name: "Sprint 42" })).toEqual({
+      kind: "move",
+      project: "Sprint 42",
+    });
   });
 
   it("moves a filed session into a different project", () => {
     expect(
-      resolveSidebarDrop({ id: "c1", project: "Backlog" }, { type: "project", name: "Sprint 42" }),
+      resolveSidebarDrop(src({ project: "Backlog" }), { type: "project", name: "Sprint 42" }),
     ).toEqual({ kind: "move", project: "Sprint 42" });
   });
 
   it("is a no-op when dropped on its own project folder (no pointless PATCH)", () => {
     expect(
-      resolveSidebarDrop(
-        { id: "c1", project: "Sprint 42" },
-        { type: "project", name: "Sprint 42" },
-      ),
+      resolveSidebarDrop(src({ project: "Sprint 42" }), { type: "project", name: "Sprint 42" }),
     ).toEqual({ kind: "none" });
   });
 
   it("ungroups a filed session dropped on the remove-from-project zone", () => {
-    expect(resolveSidebarDrop({ id: "c1", project: "Sprint 42" }, { type: "ungroup" })).toEqual({
+    expect(resolveSidebarDrop(src({ project: "Sprint 42" }), { type: "ungroup" })).toEqual({
       kind: "ungroup",
       project: "Sprint 42",
     });
   });
 
   it("is a no-op when an already-unfiled session is dropped on the ungroup zone", () => {
-    expect(resolveSidebarDrop({ id: "c1", project: null }, { type: "ungroup" })).toEqual({
-      kind: "none",
+    expect(resolveSidebarDrop(src(), { type: "ungroup" })).toEqual({ kind: "none" });
+  });
+
+  it("pins an unpinned session dropped on the Pinned zone", () => {
+    expect(resolveSidebarDrop(src({ project: "Sprint 42" }), { type: "pin" })).toEqual({
+      kind: "pin",
     });
+    // Also pins an unfiled session (pinning is independent of project membership).
+    expect(resolveSidebarDrop(src(), { type: "pin" })).toEqual({ kind: "pin" });
+  });
+
+  it("is a no-op when an already-pinned session is dropped on the Pinned zone", () => {
+    expect(
+      resolveSidebarDrop(src({ project: "Sprint 42", isPinned: true }), { type: "pin" }),
+    ).toEqual({ kind: "none" });
   });
 
   it("is a no-op when dropped on nothing droppable (e.g. Shared with me)", () => {
-    expect(resolveSidebarDrop({ id: "c1", project: "Sprint 42" }, null)).toEqual({ kind: "none" });
-    expect(resolveSidebarDrop({ id: "c1", project: null }, null)).toEqual({ kind: "none" });
+    expect(resolveSidebarDrop(src({ project: "Sprint 42" }), null)).toEqual({ kind: "none" });
+    expect(resolveSidebarDrop(src(), null)).toEqual({ kind: "none" });
   });
 });
