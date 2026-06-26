@@ -5483,7 +5483,8 @@ def resume(
 # into a materialized copy of the spec before the server starts.
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
-    "'cursor', 'kimi', "
+    "'cursor', 'cursor-cloud' (Cursor Cloud / background agents — runs in "
+    "Cursor's cloud against a GitHub repo, opens a PR), 'kimi', "
     "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', 'goose', or 'copilot'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
@@ -5515,6 +5516,10 @@ _DEFAULT_HARNESS_PROMPTS = {
     ),
     "cursor": (
         "You are Cursor, running through Omnigent. Help the user with software engineering tasks."
+    ),
+    "cursor-cloud": (
+        "You are a Cursor Cloud background agent, running through Omnigent. "
+        "Help the user with software engineering tasks."
     ),
     "kimi": (
         "You are Kimi Code, running through Omnigent. "
@@ -11065,6 +11070,10 @@ def _run_configure_harnesses_interactive() -> None:
             options.append(f"  {cursor_sub}")
             selectable.append(False)
             row_target.append(None)
+        # NB: the ``cursor-cloud`` harness (Cursor Cloud / Background Agents)
+        # shares this same ``CURSOR_API_KEY`` and has no separate credential, so
+        # it intentionally has no row of its own here — configuring Cursor above
+        # configures it too. It remains selectable via ``--harness cursor-cloud``.
         # Antigravity (Gemini-native, no provider family): like Cursor, readiness
         # is just whether a Gemini key is configured (``antigravity:`` block or
         # ambient env); its drill-in manages that key. Vertex specs need no key,

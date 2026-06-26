@@ -31,6 +31,7 @@ import omnigent.onboarding.gemini_auth as _gemini_auth
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
 from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
+    CURSOR_CLOUD_KEY,
     CURSOR_KEY,
     GOOSE_KEY,
     HERMES_KEY,
@@ -229,6 +230,16 @@ def harness_is_configured(harness: str) -> bool:
         from omnigent.onboarding.cursor_auth import cursor_api_key_configured
 
         return cursor_api_key_configured() or bool(os.environ.get("CURSOR_API_KEY"))
+    if canonical == CURSOR_CLOUD_KEY:
+        # Cursor Cloud / Background Agents run in Cursor's cloud against a GitHub
+        # repo via the same ``cursor-sdk`` and the same ``CURSOR_API_KEY`` as the
+        # SDK ``cursor`` harness — no separate binary or secret. So readiness is
+        # identical: whether that shared Cursor key is resolvable (stored by
+        # ``omnigent setup`` or inherited from the env). A missing repo / bad key
+        # surfaces at run time.
+        from omnigent.onboarding.cursor_auth import cursor_api_key_configured
+
+        return cursor_api_key_configured() or bool(os.environ.get("CURSOR_API_KEY"))
     if canonical == COPILOT_KEY:
         # Copilot runs in-process via the ``github-copilot-sdk`` package (the
         # SDK bundles the CLI binary it drives, so there is no separate binary to
@@ -308,6 +319,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.update(_HERMES_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
+    spellings.add(CURSOR_CLOUD_KEY)  # Cursor Cloud — gates on the shared Cursor key
     spellings.add(KIMI_SURFACE)
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI

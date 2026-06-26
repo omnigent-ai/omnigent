@@ -87,6 +87,7 @@ OMNIGENT_HARNESSES = frozenset(
         "codex-native",
         "copilot",
         "cursor",
+        "cursor-cloud",
         "kimi",
         "kimi-native",
         "cursor-native",

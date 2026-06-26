@@ -57,6 +57,15 @@ QWEN_KEY = "qwen"
 # installer rather than npm — so it carries an ``install_hint``, not a ``package``.
 CURSOR_KEY = "cursor"
 
+# Cursor Cloud / Background Agents run in Cursor's cloud against a GitHub repo
+# via the same ``cursor-sdk`` package and the same ``CURSOR_API_KEY`` (the
+# ``crsr_`` key) as the SDK ``cursor`` harness — no separate binary or secret.
+# Like the SDK ``cursor`` harness it is deliberately absent from
+# ``_HARNESS_NAME_TO_KEY`` (it gates on the shared key, not a CLI on ``PATH``);
+# the key is kept here purely as the canonical harness id the readiness layer
+# shares.
+CURSOR_CLOUD_KEY = "cursor-cloud"
+
 # Kimi authenticates against Moonshot AI's backend (``kimi login`` OAuth or a
 # Moonshot API key), not via the ambient provider config; like Cursor it ships
 # via a curl installer rather than npm, so it carries an ``install_hint``.

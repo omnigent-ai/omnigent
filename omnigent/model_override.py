@@ -32,6 +32,7 @@ _SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
         "pi",
         "openai-agents",
         "cursor",
+        "cursor-cloud",
         "antigravity",
         "kimi",
         "qwen",

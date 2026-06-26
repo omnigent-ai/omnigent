@@ -49,7 +49,7 @@ resolved from the YAML file's directory.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, cursor-cloud, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
@@ -65,6 +65,18 @@ gateway / `auth.type: databricks` does not apply. Authenticate it with
 `CURSOR_API_KEY` (or a prior `cursor-agent login`), optionally pinned via
 `auth: {type: api_key, api_key: ${CURSOR_API_KEY}}`, and choose a Cursor model
 id (e.g. `auto`, `gpt-5`) rather than a `databricks-*` id.
+
+The `cursor-cloud` harness runs a **Cursor Cloud / Background Agent**: instead
+of editing the local working tree, it launches an agent in Cursor's cloud that
+clones a GitHub repository, works autonomously, and pushes a branch / opens a
+PR. It shares the `cursor` `CURSOR_API_KEY` auth and uses a cloud model id
+(default `composer-2.5`). The repository + starting ref default to the session
+directory's `origin` git remote and current branch (override with the
+`OMNIGENT_CURSOR_CLOUD_REPO` / `OMNIGENT_CURSOR_CLOUD_REF` env vars). One-time
+per-repo environment setup must be done in the Cursor dashboard first
+(`https://cursor.com/onboard?repository=<url>`) — there is no API to trigger it.
+v1 is launch + live stream + result/PR; follow-up, cancel, and multi-repo are
+not yet supported.
 
 The `kiro-native` harness is the native Kiro CLI terminal path used by
 `omnigent kiro`. It requires `kiro-cli` on `PATH` and Kiro's own login/auth; it

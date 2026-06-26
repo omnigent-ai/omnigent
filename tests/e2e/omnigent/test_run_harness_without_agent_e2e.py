@@ -227,6 +227,12 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "pi-native",
         "opencode-native",
         "cursor",
+        # ``cursor-cloud`` is excluded for the same reason as ``cursor`` (it
+        # authenticates to Cursor's own backend, not the Databricks gateway this
+        # matrix drives), and additionally requires a GitHub repo + one-time
+        # dashboard environment setup to launch a cloud run. Its coverage is the
+        # mocked-SDK cursor-cloud executor/harness/spawn-env unit tests.
+        "cursor-cloud",
         "cursor-native",
         "antigravity",
         "antigravity-native",
