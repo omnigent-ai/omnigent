@@ -7,7 +7,51 @@ import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.spec import AgentSpec, ExtractionError, load
+from omnigent.spec import AgentSpec, ExtractionError, ToolRuntime, load
+
+
+def _is_dotted_callable_path(path: str) -> bool:
+    """Whether a local-tool ``path`` is a dotted Python *import* path.
+
+    A server-side ``callable:`` tool carries a dotted import path such as
+    ``"subprocess.check_output"`` that the runner resolves with
+    ``importlib.import_module`` and then invokes (see
+    ``omnigent.runner.tool_dispatch._resolve_spec_callable``) — the
+    GHSA-756x runner-RCE sink. Bundled tool *files* instead carry a
+    bundle-relative filesystem path (``"tools/python/arxiv_search.py"``),
+    distinguished by a ``/`` separator or a source-file suffix; those run
+    the bundle's own shipped code rather than importing an arbitrary
+    server-installed module, so they are out of scope here.
+    """
+    return "/" not in path and not path.endswith((".py", ".ts")) and "." in path
+
+
+def _reject_uploaded_callable_tools(spec: AgentSpec) -> None:
+    """Reject server-side Python ``callable:`` tools in an untrusted upload.
+
+    Recurses into sub-agents — each is a full :class:`AgentSpec` with its
+    own ``local_tools`` — mirroring the handler-allowlist guard's sub-agent
+    coverage so a malicious callable can't hide in a child agent.
+
+    :param spec: The parsed (sub-)agent spec to scan.
+    :raises OmnigentError: If any (sub-)agent declares a server-runtime tool
+        whose ``path`` is a dotted import path.
+    """
+    for tool in spec.local_tools:
+        if (
+            tool.runtime == ToolRuntime.SERVER
+            and tool.path is not None
+            and _is_dotted_callable_path(tool.path)
+        ):
+            raise OmnigentError(
+                "uploaded agent bundle may not declare a server-side Python "
+                f"callable tool (tool {tool.name!r} -> {tool.path!r}); a "
+                "'callable:' tool imports and runs operator-trusted code on "
+                "the runner, so it is rejected from untrusted uploads",
+                code=ErrorCode.INVALID_INPUT,
+            )
+    for sub in spec.sub_agents:
+        _reject_uploaded_callable_tools(sub)
 
 
 def _cwd_escapes_workspace(spec_cwd: str) -> bool:
@@ -57,8 +101,8 @@ def validate_agent_bundle(
     :returns: The validated :class:`AgentSpec`.
     :raises OmnigentError: If the bundle is invalid, the spec is
         missing a name, or (when *enforce_handler_allowlist*) a policy
-        names an unregistered handler or ``os_env.cwd`` is an absolute
-        or escaping path.
+        names an unregistered handler, ``os_env.cwd`` is an absolute or
+        escaping path, or a tool declares a server-side Python ``callable:``.
     """
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -86,14 +130,17 @@ def validate_agent_bundle(
             code=ErrorCode.INVALID_INPUT,
         )
 
-    # Untrusted uploads may not pin an absolute or escaping os_env.cwd
-    # (GHSA-p8rw-8qj3-hf33). This is gated on the same trust signal as the
-    # handler allowlist: a trusted single-user/local server
+    # Both guards below apply only to untrusted uploads, gated on the same
+    # trust signal as the handler allowlist: a trusted single-user/local server
     # (enforce_handler_allowlist=False) uploads the operator's OWN bundle, and
-    # the operator legitimately controls cwd — matching the documented
-    # absolute-cwd behavior for direct/local runs in
-    # designs/SESSION_WORKSPACE_SELECTION.md.
+    # the operator legitimately controls cwd and Python callable tools (they
+    # already have code execution), so neither restriction applies there.
     if enforce_handler_allowlist:
+        # Untrusted uploads may not pin an absolute or escaping os_env.cwd
+        # (GHSA-p8rw-8qj3-hf33): on a runner without OMNIGENT_RUNNER_WORKSPACE
+        # it becomes the agent environment root and copytree source, exposing
+        # the host filesystem. (Trusted local runs keep the documented
+        # absolute-cwd behavior — designs/SESSION_WORKSPACE_SELECTION.md.)
         os_env = getattr(spec, "os_env", None)
         spec_cwd = getattr(os_env, "cwd", None) if os_env is not None else None
         if (
@@ -106,6 +153,14 @@ def validate_agent_bundle(
                 f"(no absolute paths or '..'); got {spec_cwd!r}",
                 code=ErrorCode.INVALID_INPUT,
             )
+
+        # Untrusted uploads may not declare server-side Python ``callable:``
+        # tools (GHSA-756x-9hf6-q4h4): the runner imports the dotted path and
+        # invokes it, so a bundle pointing one at e.g. ``subprocess.check_output``
+        # is authenticated RCE on shared runner infrastructure. Bundled tool
+        # *files* (``tools/python/*.py``) are unaffected: they ship the agent's
+        # own code, not an arbitrary server-installed module.
+        _reject_uploaded_callable_tools(spec)
 
     return spec
 

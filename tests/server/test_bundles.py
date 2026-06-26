@@ -346,3 +346,99 @@ def test_validate_agent_bundle_allows_absolute_cwd_for_trusted_local_server() ->
         _bundle_with_cwd("/abs/operator/path"), enforce_handler_allowlist=False
     )
     assert spec.name == "uploaded-agent"
+
+
+# ── no server-side `callable:` tools on the upload path (GHSA-756x) ──
+
+
+# A omnigent function tool whose ``callable:`` is a dotted import path the
+# runner resolves with ``importlib`` and invokes — the RCE gadget.
+_CALLABLE_TOOL_YAML = (
+    "name: {name}\n"
+    "prompt: hi\n"
+    "executor:\n"
+    "  harness: claude-sdk\n"
+    "tools:\n"
+    "  run_cmd:\n"
+    "    type: function\n"
+    "    description: run a shell command\n"
+    "    callable: subprocess.check_output\n"
+    "    parameters:\n"
+    "      type: object\n"
+    "      properties:\n"
+    "        cmd:\n"
+    "          type: string\n"
+    "      required: [cmd]\n"
+)
+
+
+def test_validate_bundle_rejects_server_callable_tool() -> None:
+    """An uploaded bundle may not declare a server-side Python ``callable:`` tool.
+
+    The runner imports the dotted path and invokes it (GHSA-756x), so a
+    tenant-uploaded ``callable: subprocess.check_output`` is authenticated
+    RCE on the shared runner. The upload boundary must refuse it.
+    """
+    bundle = _single_file_yaml_bundle(_CALLABLE_TOOL_YAML.format(name="rce_tool_agent"))
+    with pytest.raises(OmnigentError, match=r"may not declare a server-side Python callable tool"):
+        validate_agent_bundle(bundle)
+
+
+def test_validate_bundle_allows_server_callable_tool_when_not_enforced() -> None:
+    """``enforce_handler_allowlist=False`` accepts a server ``callable:`` tool.
+
+    The trusted single-user / local-server path uploads the operator's own
+    bundle through this same function; Python callable tools are the intended
+    operator feature there (the operator already has code execution), so the
+    guard must not block them — mirroring the handler-allowlist exemption.
+    """
+    spec = validate_agent_bundle(
+        _single_file_yaml_bundle(_CALLABLE_TOOL_YAML.format(name="local_tool_agent")),
+        enforce_handler_allowlist=False,
+    )
+    assert spec.name == "local_tool_agent"
+
+
+def test_validate_bundle_allows_bundled_python_tool_file() -> None:
+    """A bundled ``tools/python/*.py`` tool file is not a ``callable:`` and is allowed.
+
+    File tools ship the agent's own code (path ``tools/python/echo.py``), not a
+    dotted import of an arbitrary server-installed module, so the GHSA-756x
+    guard must not over-block them.
+    """
+    bundle = _make_bundle_bytes(
+        {
+            "config.yaml": _MIN_CONFIG.format(name="filetool_agent"),
+            "tools/python/echo.py": "def echo(text: str) -> str:\n    return text\n",
+        }
+    )
+    spec = validate_agent_bundle(bundle)
+    assert spec.name == "filetool_agent"
+    assert any(t.name == "echo" for t in spec.local_tools)
+
+
+def test_reject_uploaded_callable_tools_recurses_into_sub_agents() -> None:
+    """The callable-tool guard catches a malicious callable hidden in a sub-agent.
+
+    Exercised directly: the directory ``config.yaml`` sub-agent shape does not
+    surface YAML ``tools:`` callables through the parser, so this guards the
+    recursion itself — the defense-in-depth that any future surfacing path
+    relies on, matching the handler-allowlist guard's sub-agent coverage.
+    """
+    from omnigent.server.bundles import _reject_uploaded_callable_tools
+    from omnigent.spec import AgentSpec
+    from omnigent.spec.types import LocalToolInfo, ToolRuntime
+
+    sub = AgentSpec(name="evil_sub", spec_version=1)
+    sub.local_tools = [
+        LocalToolInfo(
+            name="run_cmd",
+            path="subprocess.check_output",
+            language="omnigent-python-callable",
+            runtime=ToolRuntime.SERVER,
+        )
+    ]
+    root = AgentSpec(name="root", spec_version=1)
+    root.sub_agents = [sub]
+    with pytest.raises(OmnigentError, match=r"may not declare a server-side Python callable tool"):
+        _reject_uploaded_callable_tools(root)
