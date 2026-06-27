@@ -541,7 +541,10 @@ def _validate_os_env(spec: AgentSpec, result: ValidationResult) -> None:
             "enforcement of the network allow-list. "
             f"Got sandbox.type={sandbox_type!r}; the rules would be "
             "inert decoration on the policy and the agent would have "
-            "unrestricted network access despite the YAML declaring otherwise.",
+            "unrestricted network access despite the YAML declaring otherwise. "
+            "Fix: set os_env.sandbox.type to linux_bwrap on Linux or "
+            "darwin_seatbelt on macOS; do not use sandbox.type=none with "
+            "egress_rules.",
         )
 
 
