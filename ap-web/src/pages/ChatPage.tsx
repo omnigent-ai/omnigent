@@ -3098,13 +3098,18 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
 export function formatStatusModelLabel(
   model: string | null,
   codexModelOptions: readonly CodexModelOption[] = [],
+  collapseClaudeNativeAliases = false,
 ): string | null {
   const raw = model?.trim();
   if (!raw) return null;
   const lower = raw.toLowerCase();
   const codexOption = findCodexModelOption(codexModelOptions, raw);
   if (codexOption) return codexOption.displayName ?? codexOption.id;
-  const known = CLAUDE_NATIVE_MODELS.find((m) => m.id === lower);
+  const known = CLAUDE_NATIVE_MODELS.find((m) =>
+    collapseClaudeNativeAliases
+      ? m.id === lower || lower.endsWith(`/${m.id}`) || lower.includes(m.id)
+      : m.id === lower,
+  );
   if (known) return known.label;
   return raw;
 }
@@ -3113,6 +3118,35 @@ function formatStatusEffortLabel(effort: string | null, raw = false): string | n
   if (!effort) return null;
   if (raw) return effort;
   return effort.toLowerCase() === "xhigh" ? "xHigh" : formatEffortLabel(effort);
+}
+
+function defaultModelForPicker(
+  modelPickerKind: NativeModelPickerKind | null,
+  modelOptions: ReadonlyArray<{ id: string }>,
+): string | null {
+  if (modelPickerKind === "claude") {
+    return modelOptions.some((m) => m.id === CLAUDE_NATIVE_DEFAULT_MODEL)
+      ? CLAUDE_NATIVE_DEFAULT_MODEL
+      : null;
+  }
+  return null;
+}
+
+function defaultEffortForPicker(
+  modelPickerKind: NativeModelPickerKind | null,
+  effectiveModel: string | null,
+  codexModelOptions: readonly CodexModelOption[],
+  effortLevels: readonly string[],
+): string | null {
+  if (modelPickerKind === "claude") {
+    return effortLevels.includes("medium") ? "medium" : (effortLevels[0] ?? null);
+  }
+  if (modelPickerKind === "codex" && effectiveModel) {
+    const option = findCodexModelOption(codexModelOptions, effectiveModel);
+    const defaultEffort = option?.defaultReasoningEffort ?? null;
+    return defaultEffort && effortLevels.includes(defaultEffort) ? defaultEffort : null;
+  }
+  return null;
 }
 
 /**
@@ -4455,6 +4489,9 @@ export function isUnboundCodingFork(params: {
 
 const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 
+/** Claude Code's effective default model for fresh claude-native sessions. */
+const CLAUDE_NATIVE_DEFAULT_MODEL = "sonnet";
+
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
@@ -4696,10 +4733,25 @@ function AgentPicker({
           (sessionModelOverride ?? llmModel)
         : null
     : nonNativeModel;
-  const modelLabel = formatStatusModelLabel(effectiveModel, codexModelOptions);
+  const effectiveModelForPicker =
+    effectiveModel ?? defaultModelForPicker(modelPickerKind, modelOptions);
+  const modelLabel = formatStatusModelLabel(
+    effectiveModelForPicker,
+    codexModelOptions,
+    modelPickerKind === "claude",
+  );
+  const effectiveEffort = showEffort
+    ? (selectedEffort ??
+      defaultEffortForPicker(
+        modelPickerKind,
+        effectiveModelForPicker,
+        codexModelOptions,
+        effortLevels,
+      ))
+    : null;
   const effortTriggerLabel =
-    showEffort && selectedEffort
-      ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
+    effectiveEffort != null
+      ? formatStatusEffortLabel(effectiveEffort, modelPickerKind === "codex")
       : null;
   const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort;
 
@@ -4789,8 +4841,8 @@ function AgentPicker({
               const isImplicit =
                 pickerSelectedModel === null &&
                 (usesServerModelOptions
-                  ? findCodexModelOption(codexModelOptions, llmModel)?.id === m.id
-                  : isModelImplicitlySelected(m.id, llmModel));
+                  ? findCodexModelOption(codexModelOptions, effectiveModelForPicker)?.id === m.id
+                  : isModelImplicitlySelected(m.id, effectiveModelForPicker));
               const isActive = isExplicit || isImplicit;
               return (
                 <DropdownMenuItem
@@ -4812,6 +4864,7 @@ function AgentPicker({
                   <span className="flex-1 truncate">
                     {usesServerModelOptions ? (m.displayName ?? m.id) : m.label}
                   </span>
+                  {isActive && <PickerCurrentMarker />}
                 </DropdownMenuItem>
               );
             })}
@@ -4828,7 +4881,7 @@ function AgentPicker({
                 key={level}
                 data-testid="effort-picker-item"
                 data-effort-level={level}
-                data-active={selectedEffort === level ? "true" : undefined}
+                data-active={effectiveEffort === level ? "true" : undefined}
                 onSelect={() =>
                   void useChatStore
                     .getState()
@@ -4842,6 +4895,7 @@ function AgentPicker({
                 )}
               >
                 <span className="flex-1 truncate">{level}</span>
+                {effectiveEffort === level && <PickerCurrentMarker />}
               </DropdownMenuItem>
             ))}
           </>
@@ -4860,5 +4914,14 @@ function PickerSectionHeader({ children }: { children: React.ReactNode }) {
     <div className="px-2 pt-2 pb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
       {children}
     </div>
+  );
+}
+
+function PickerCurrentMarker() {
+  return (
+    <span className="ml-2 inline-flex shrink-0 items-center gap-1 text-[10px] font-medium text-muted-foreground">
+      <CheckIcon className="size-3" aria-hidden="true" />
+      Current
+    </span>
   );
 }
