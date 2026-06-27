@@ -2621,3 +2621,32 @@ def _search_sub_agent_tree(
         if found is not None:
             return found
     return None
+
+def _build_vibe_spawn_env(
+    spec: AgentSpec,
+    *,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build the env-var dict the vibe harness wrap reads.
+
+    Maps ``spec.executor`` fields → the ``HARNESS_VIBE_*`` env vars.
+    """
+    if spec.executor.auth is not None:
+        raise OmnigentError(
+            "The 'vibe' harness does not support per-invocation provider / "
+            "auth injection. Configure auth through Vibe directly.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        # Note: Vibe doesn't support model overrides via programmatic CLI directly,
+        # but it does support selecting an agent. We map the spec's model field to
+        # HARNESS_VIBE_AGENT to allow users to specify a custom agent name (e.g. 'auto-approve').
+        env["HARNESS_VIBE_AGENT"] = model
+    if workdir is not None:
+        env["HARNESS_VIBE_CWD"] = str(workdir)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_VIBE_OS_ENV"] = os_env_payload
+    return env
