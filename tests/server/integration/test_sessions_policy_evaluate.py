@@ -149,6 +149,26 @@ def _ask_for_bash(event: dict[str, Any]) -> dict[str, Any]:
     return {"result": "ALLOW"}
 
 
+def _ask_for_sensitive_output(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Policy that requires human approval (ASK) for tool results with ``REVIEW``.
+
+    Exercises the TOOL_RESULT ASK gate: pi-native can intercept a result before
+    the model consumes it, so a result-phase ASK must park server-side and
+    collapse to ALLOW / DENY (return / suppress the result) — never a raw ASK.
+
+    :param event: V0 event dict.
+    :returns: ASK for tool results containing REVIEW, ALLOW otherwise.
+    """
+    if event.get("type") != "tool_result":
+        return {"result": "ALLOW"}
+    data = event.get("data")
+    result = data.get("result", "") if isinstance(data, dict) else str(data)
+    if isinstance(result, str) and "REVIEW" in result:
+        return {"result": "ASK", "reason": "Approve releasing this tool result?"}
+    return {"result": "ALLOW"}
+
+
 # ── Helpers ─────────────────────────────────────────────────
 
 
@@ -163,6 +183,25 @@ async def _create_session(client: httpx.AsyncClient, agent_id: str) -> str:
     resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
     assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
     return resp.json()["id"]
+
+
+async def _create_pi_native_agent(client: httpx.AsyncClient) -> dict[str, Any]:
+    """
+    Create a pi-native test agent.
+
+    The TOOL_RESULT ASK gate parks only for the pi-native harness (whose
+    ``tool_result`` extension hook can intercept the result before the model
+    consumes it). The default ``create_test_agent`` harness is ``claude-sdk``,
+    which would NOT park a result-phase ASK, so result-gate tests must bind a
+    pi-native agent.
+
+    :param client: Test HTTP client.
+    :returns: Parsed agent response body.
+    """
+    return await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "pi-native"}},
+    )
 
 
 def _tool_call_request(
@@ -636,6 +675,120 @@ async def test_tool_call_ask_returns_deny_on_decline(
     resp = await evaluate
     assert resp.status_code == 200, resp.text
     assert resp.json()["result"] == "POLICY_ACTION_DENY"
+
+
+async def test_tool_result_ask_holds_gate_and_returns_allow_on_accept(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pi-native TOOL_RESULT ASK parks server-side and collapses to ALLOW on accept.
+
+    pi-native's ``tool_result`` extension hook can replace/suppress a result
+    before the model consumes it, so the result checkpoint is a real gate.
+    Its only ASK primitive is this same URL-based elicitation, so the endpoint
+    must park a result-phase ASK (publish a card, hold the connection) and
+    return a hard ALLOW when the human accepts — never a raw ASK. ALLOW means
+    the extension returns the real result to the model. The result gate parks
+    ONLY for the pi-native harness, so this test binds a pi-native agent.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._ask_for_sensitive_output")
+    agent = await _create_pi_native_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    await asyncio.sleep(0.05)
+    evaluate = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_result_request("please REVIEW this output"),
+        )
+    )
+
+    elicitation_id = await drain
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "accept"},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await evaluate
+    assert resp.status_code == 200, resp.text
+    # Parked and collapsed to a hard verdict — NOT a raw ASK.
+    assert resp.json()["result"] == "POLICY_ACTION_ALLOW"
+
+
+async def test_tool_result_ask_returns_deny_on_decline(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A declined pi-native TOOL_RESULT ASK collapses to DENY so the extension suppresses it.
+
+    If the human refuses at the approve URL, the result must be withheld from
+    the model — the DENY verdict drives the extension's result-suppression
+    (replace output with a policy error). The result gate parks ONLY for the
+    pi-native harness, so this test binds a pi-native agent.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._ask_for_sensitive_output")
+    agent = await _create_pi_native_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    await asyncio.sleep(0.05)
+    evaluate = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_result_request("please REVIEW this output"),
+        )
+    )
+
+    elicitation_id = await drain
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "decline"},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await evaluate
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["result"] == "POLICY_ACTION_DENY"
+
+
+async def test_tool_result_ask_returns_raw_ask_for_non_pi_native_harness(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A TOOL_RESULT ASK does NOT park for a non-pi-native harness.
+
+    Claude / Codex / Cursor post a *committed* tool result via PostToolUse
+    (which maps to PHASE_TOOL_RESULT). They cannot suppress that result — they
+    can only annotate it — so parking their result-phase ASK would stall the
+    PostToolUse hook on an approval that can never change the output. The
+    endpoint must therefore return the raw ASK immediately (no elicitation
+    card, no held connection) for any non-pi-native session, exactly as it did
+    before the result gate existed; ``evaluation_response_to_hook_output``
+    discards it as a no-op on PostToolUse. This guards the regression where
+    adding TOOL_RESULT to the ASK-gate phases unconditionally would hang
+    Claude/Codex turns.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._ask_for_sensitive_output")
+    # Default harness is claude-sdk (NOT pi-native).
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    # No elicitation should ever be published; the POST returns immediately.
+    resp = await asyncio.wait_for(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_result_request("please REVIEW this output"),
+        ),
+        timeout=5.0,
+    )
+    assert resp.status_code == 200, resp.text
+    # Raw ASK returned to the caller — the gate did NOT park.
+    assert resp.json()["result"] == "POLICY_ACTION_ASK"
 
 
 async def test_tool_call_ask_forwards_popup_event_to_runner(

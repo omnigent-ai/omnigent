@@ -18,20 +18,25 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _prepare_bridge(tmp_path: Path) -> tuple[Path, Path, Path]:
+def _prepare_bridge(tmp_path: Path, *, server_url: str = "") -> tuple[Path, Path, Path]:
     """
     Prepare a real pi-native bridge directory and generated extension files.
 
     This uses the same bridge helpers the runner uses for native Pi sessions, so
     the test covers the Python enqueue contract, generated config, extension
     loading, and the JS inbox poller together.
+
+    :param server_url: Omnigent server base URL to write into the generated
+        config. Default ``""`` (no server → policy gates short-circuit to a
+        no-op); pass a real-looking URL to make the result-policy gate attempt
+        an HTTP evaluate so a scenario can prove it is (or is not) reached.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     extension_path, config_path = pi_native_bridge.write_extension_files(
         bridge_dir,
         session_id="conv_f18_e2e",
-        server_url="",
+        server_url=server_url,
         conversation_url="",
     )
     return bridge_dir, extension_path, config_path
@@ -108,6 +113,17 @@ def _run_extension_scenario(
 
             require(extensionPath)(pi);
 
+            // Record any /policies/evaluate POSTs so a scenario can prove the
+            // result-policy gate was (or was NOT) reached. Other endpoints
+            // (the conversation mirror) just succeed silently.
+            const evaluateUrls = [];
+            global.fetch = async (url, _request) => {
+              if (typeof url === "string" && url.includes("/policies/evaluate")) {
+                evaluateUrls.push(url);
+              }
+              return { ok: true, status: 200, json: async () => ({}) };
+            };
+
             try {
               if (scenario === "idle_interrupt_then_next_turn") {
                 const idleCtx = makeCtx(true);
@@ -170,6 +186,43 @@ def _run_extension_scenario(
                 assert(
                   toolResult && toolResult.block === true,
                   `mid-turn interrupt did not replay/block: ${JSON.stringify(toolResult)}`,
+                );
+              } else if (scenario === "mid_turn_interrupt_skips_result_gate") {
+                // A mid-turn interrupt must short-circuit the TOOL_RESULT gate
+                // BEFORE it can park: the result-policy fetch is not bound to
+                // ctx.abort(), so without the guard a parked result-phase ASK
+                // would hold the agent loop despite the user's interrupt.
+                const turnCtx = makeCtx(false);
+                await handlers.session_start({}, turnCtx);
+                await handlers.agent_start({}, turnCtx);
+                await handlers.turn_start({ turnIndex: 1 }, turnCtx);
+                await waitForInboxEmpty();
+                assert(
+                  turnCtx.abortCount >= 1,
+                  `mid-turn interrupt did not abort live turn (${turnCtx.abortCount})`,
+                );
+
+                const toolResult = await handlers.tool_result(
+                  {
+                    type: "tool_result",
+                    toolCallId: "t1",
+                    toolName: "do_thing",
+                    input: {},
+                    content: [{ type: "text", text: "real output" }],
+                    isError: false,
+                  },
+                  turnCtx,
+                );
+                // The handler returns nothing (no suppression block) and did
+                // NOT hit the evaluate endpoint — it short-circuited on the
+                // pending interrupt instead of parking the result gate.
+                assert(
+                  toolResult === undefined,
+                  `interrupted result gate did not short-circuit: ${JSON.stringify(toolResult)}`,
+                );
+                assert(
+                  evaluateUrls.length === 0,
+                  `interrupted result gate still evaluated policy: ${evaluateUrls.join(",")}`,
                 );
               } else {
                 throw new Error(`unknown scenario: ${scenario}`);
@@ -238,6 +291,33 @@ def test_python_bridge_mid_turn_interrupt_still_replays(tmp_path: Path) -> None:
         extension_path=extension_path,
         config_path=config_path,
         scenario="mid_turn_interrupt_replays",
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_python_bridge_mid_turn_interrupt_skips_result_gate(tmp_path: Path) -> None:
+    """
+    A mid-turn interrupt short-circuits the pi-native TOOL_RESULT policy gate.
+
+    Parity with the tool_call gate (which returns on a pending interrupt before
+    evaluating policy). The result gate can PARK server-side awaiting a human
+    approval, and that fetch is not bound to ``ctx.abort()``; without the guard
+    a user interrupt arriving while the gate is parked would be swallowed and
+    the agent loop held. With a real server_url configured, this asserts the
+    interrupted ``tool_result`` handler returns nothing AND never POSTs to
+    ``/policies/evaluate`` — proving it short-circuited before parking.
+    """
+    bridge_dir, extension_path, config_path = _prepare_bridge(
+        tmp_path, server_url="http://omnigent.test"
+    )
+    pi_native_bridge.enqueue_interrupt(bridge_dir)
+
+    result = _run_extension_scenario(
+        tmp_path,
+        extension_path=extension_path,
+        config_path=config_path,
+        scenario="mid_turn_interrupt_skips_result_gate",
     )
 
     assert result.returncode == 0, result.stderr

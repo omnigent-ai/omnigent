@@ -2112,6 +2112,59 @@ async function runToolCall() {
     ctx,
   );
 }
+
+// Captured external_conversation_item events posted to the /events endpoint
+// (the conversation mirror). Lets a tool_result test assert the mirrored
+// output reflects what the model actually consumed (suppressed on DENY).
+const mirroredItems = [];
+const _baseFetch = global.fetch;
+global.fetch = async (url, request) => {
+  if (typeof url === "string" && url.includes("/events")) {
+    try {
+      mirroredItems.push(JSON.parse(request.body));
+    } catch (_e) {}
+    return { ok: true, status: 200, json: async () => ({}) };
+  }
+  return _baseFetch(url, request);
+};
+
+// Fire the tool_result handler with a realistic Pi ToolResultEvent: a content
+// array (TextContent blocks), the original tool input, and the tool name. The
+// returned value is what Pi applies to the finalized tool result the model
+// sees (undefined = unchanged; {content, isError} = replaced/suppressed).
+async function runToolResult(resultText) {
+  assert.equal(typeof handlers.tool_result, "function");
+  return handlers.tool_result(
+    {
+      type: "tool_result",
+      toolCallId: "call-1",
+      toolName: "Bash",
+      input: { command: "cat secrets.txt" },
+      content: [{ type: "text", text: resultText }],
+      isError: false,
+    },
+    ctx,
+  );
+}
+
+// Fire the tool_execution_end backstop with the same callId as the tool_result
+// event, carrying the (already-finalized) result content. Used to prove the
+// backstop mirror is a no-op after the tool_result handler already mirrored
+// the suppressed text on DENY (it must NOT re-mirror the real output).
+async function runToolExecutionEnd(resultText) {
+  assert.equal(typeof handlers.tool_execution_end, "function");
+  return handlers.tool_execution_end(
+    {
+      type: "tool_execution_end",
+      toolCallId: "call-1",
+      toolName: "Bash",
+      input: { command: "cat secrets.txt" },
+      content: [{ type: "text", text: resultText }],
+      isError: false,
+    },
+    ctx,
+  );
+}
 """
 
 
@@ -2512,6 +2565,263 @@ def test_policy_fast_error_racing_abort_is_bounded_fails_closed(
   // Retried a few times (transient budget) but nowhere near unbounded.
   assert.ok(evalBodies.length >= 2, "expected transient retries, got " + evalBodies.length);
   assert.ok(evalBodies.length < 200, "must be bounded, got " + evalBodies.length);
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    _run_policy_node_script(_extension_path(), tmp_path, body)
+
+
+# ── TOOL_RESULT policy evaluation (ALLOW / DENY / ASK / fail-open) ────────
+#
+# These drive the extension's tool_result handler (the second enforcement
+# checkpoint, SKILL.md #6). Unlike tool_call, the result handler returns a Pi
+# ToolResultEventResult ({content, isError}) that REPLACES what the model sees:
+#   - ALLOW  → returns undefined (model gets the real output), result mirrored.
+#   - DENY   → returns {content:[policy error], isError:true} (model gets the
+#              policy error, real output suppressed), suppressed text mirrored.
+#   - ASK    → parked server-side, collapses to ALLOW/DENY (same as tool_call).
+#   - server unreachable → fail OPEN (result returned unchanged), because the
+#              tool already executed (PHASE_TOOL_RESULT is NOT fail-closed).
+
+
+def test_tool_result_allow_returns_unchanged(tmp_path: Path) -> None:
+    """An ALLOW TOOL_RESULT verdict returns the real output to the model.
+
+    The handler returns undefined (no replacement) so Pi hands the model the
+    unmodified result, and the result is mirrored once with its real output.
+    The evaluate body must be a PHASE_TOOL_RESULT carrying the result text and
+    the originating tool name in request_data.
+    """
+    body = r"""
+(async () => {
+  responders = [(_b) => makeJsonResponse({ result: "POLICY_ACTION_ALLOW" })];
+  const out = await runToolResult("normal safe output");
+  // ALLOW → no replacement object (model keeps the real result).
+  assert.ok(out === undefined || out === null, JSON.stringify(out));
+  assert.equal(evalBodies.length, 1);
+  assert.equal(evalBodies[0].event.type, "PHASE_TOOL_RESULT");
+  assert.equal(evalBodies[0].event.data.result, "normal safe output");
+  assert.equal(evalBodies[0].event.request_data.name, "Bash");
+  assert.match(evalBodies[0]._omnigent_elicitation_id, /^elicit_evaluate_[0-9a-f]{32}$/);
+  // Mirrored once with the REAL output.
+  const mirror = mirroredItems.find(
+    (e) => e.data && e.data.item_type === "function_call_output",
+  );
+  assert.ok(mirror, JSON.stringify(mirroredItems));
+  assert.equal(mirror.data.item_data.output, "normal safe output");
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    _run_policy_node_script(_extension_path(), tmp_path, body)
+
+
+def test_tool_result_deny_suppresses_and_returns_policy_error(
+    tmp_path: Path,
+) -> None:
+    """A DENY TOOL_RESULT verdict suppresses the result and errors to the model.
+
+    The handler must return {content:[<policy error>], isError:true} so Pi
+    replaces the real output with the policy error before the model consumes
+    it. The real (sensitive) output must NOT appear in the replacement, and the
+    mirror must show the SAME suppressed text (what the model actually saw).
+    """
+    body = r"""
+(async () => {
+  responders = [
+    (_b) =>
+      makeJsonResponse({ result: "POLICY_ACTION_DENY", reason: "leaked SECRET" }),
+  ];
+  const out = await runToolResult("here is the SECRET api key sk-123");
+  // DENY → replacement content + isError so the model gets the policy error.
+  assert.ok(out && Array.isArray(out.content), JSON.stringify(out));
+  assert.equal(out.isError, true);
+  const replaced = out.content.map((c) => c.text).join("");
+  assert.match(replaced, /policy/i);
+  assert.match(replaced, /leaked SECRET/);
+  // The real sensitive output must be GONE from what the model receives.
+  assert.equal(replaced.includes("sk-123"), false, replaced);
+  assert.equal(evalBodies.length, 1);
+  assert.equal(evalBodies[0].event.type, "PHASE_TOOL_RESULT");
+  // The mirror reflects the suppressed text, not the real output.
+  const mirror = mirroredItems.find(
+    (e) => e.data && e.data.item_type === "function_call_output",
+  );
+  assert.ok(mirror, JSON.stringify(mirroredItems));
+  assert.equal(mirror.data.item_data.output.includes("sk-123"), false);
+  assert.match(mirror.data.item_data.output, /policy/i);
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    _run_policy_node_script(_extension_path(), tmp_path, body)
+
+
+def test_tool_execution_end_after_deny_does_not_remirror_real_output(
+    tmp_path: Path,
+) -> None:
+    """The tool_execution_end backstop must NOT re-mirror the real output after a DENY.
+
+    The tool_result handler runs first and, on DENY, mirrors the SUPPRESSED
+    text (dedup keyed on response_id:call_id). The later tool_execution_end
+    backstop carries the (real) finalized result; it must dedup to a no-op so
+    the sensitive output never leaks into the conversation mirror. This guards
+    the leak Polly flagged: a backstop that re-mirrors after a DENY.
+    """
+    body = r"""
+(async () => {
+  responders = [
+    (_b) =>
+      makeJsonResponse({ result: "POLICY_ACTION_DENY", reason: "leaked SECRET" }),
+  ];
+  const out = await runToolResult("here is the SECRET api key sk-123");
+  assert.equal(out.isError, true);
+  // Now fire the backstop with the REAL output, same callId. It must NOT
+  // produce a second mirror, and the real output must never appear anywhere.
+  const beforeCount = mirroredItems.filter(
+    (e) => e.data && e.data.item_type === "function_call_output",
+  ).length;
+  await runToolExecutionEnd("here is the SECRET api key sk-123");
+  const outputs = mirroredItems.filter(
+    (e) => e.data && e.data.item_type === "function_call_output",
+  );
+  assert.equal(outputs.length, beforeCount, "backstop re-mirrored after DENY");
+  assert.equal(outputs.length, 1, JSON.stringify(outputs));
+  // No mirrored output ever contains the real sensitive text.
+  for (const m of outputs) {
+    assert.equal(
+      m.data.item_data.output.includes("sk-123"),
+      false,
+      m.data.item_data.output,
+    );
+  }
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    _run_policy_node_script(_extension_path(), tmp_path, body)
+
+
+def test_tool_result_ask_parks_then_resolves_allow(tmp_path: Path) -> None:
+    """A raw TOOL_RESULT ASK re-attaches until it resolves to ALLOW.
+
+    Mirrors the tool-call gate: the server normally parks a result-phase ASK
+    and returns a hard verdict, but if a raw ASK comes back the extension
+    re-POSTs the SAME elicitation id and an eventual ALLOW returns the result
+    to the model unchanged.
+    """
+    body = r"""
+(async () => {
+  responders = [
+    (_b) => makeJsonResponse({ result: "POLICY_ACTION_ASK", reason: "review?" }),
+    (_b) => makeJsonResponse({ result: "POLICY_ACTION_ALLOW" }),
+  ];
+  const out = await runToolResult("output pending review");
+  assert.ok(out === undefined || out === null, JSON.stringify(out));
+  assert.equal(evalBodies.length, 2, "expected park-then-resolve = 2 evaluates");
+  assert.equal(
+    evalBodies[0]._omnigent_elicitation_id,
+    evalBodies[1]._omnigent_elicitation_id,
+  );
+  assert.equal(evalBodies[0].event.type, "PHASE_TOOL_RESULT");
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    _run_policy_node_script(_extension_path(), tmp_path, body)
+
+
+def test_tool_result_ask_parks_then_resolves_deny_suppresses(
+    tmp_path: Path,
+) -> None:
+    """A TOOL_RESULT ASK that resolves to DENY suppresses the result.
+
+    The parked ASK collapses to DENY (the human declined); the handler must
+    then suppress the output and return the policy error to the model.
+    """
+    body = r"""
+(async () => {
+  responders = [
+    (_b) => makeJsonResponse({ result: "POLICY_ACTION_ASK", reason: "review?" }),
+    (_b) => makeJsonResponse({ result: "POLICY_ACTION_DENY", reason: "declined" }),
+  ];
+  const out = await runToolResult("sensitive output");
+  assert.ok(out && Array.isArray(out.content), JSON.stringify(out));
+  assert.equal(out.isError, true);
+  const replaced = out.content.map((c) => c.text).join("");
+  assert.match(replaced, /declined/);
+  assert.equal(replaced.includes("sensitive output"), false, replaced);
+  assert.equal(evalBodies.length, 2);
+  assert.equal(
+    evalBodies[0]._omnigent_elicitation_id,
+    evalBodies[1]._omnigent_elicitation_id,
+  );
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    _run_policy_node_script(_extension_path(), tmp_path, body)
+
+
+def test_tool_result_transport_error_fails_open(tmp_path: Path) -> None:
+    """A persistent transport error on TOOL_RESULT fails OPEN, not closed.
+
+    PHASE_TOOL_RESULT is NOT in FAIL_CLOSED_PHASES: by the result phase the
+    tool already executed, so an unevaluable policy must return the result
+    (fail open) rather than suppress a legitimately-produced output on a
+    transient outage. The handler must return undefined (no suppression) even
+    though the server was unreachable, and still mirror the real output.
+    """
+    body = r"""
+(async () => {
+  // Always throw a transport error; with fake timers collapsing the backoff
+  // the transient budget elapses quickly. TOOL_RESULT must fail OPEN.
+  responders = new Array(64).fill("THROW");
+  const out = await runToolResult("real output survives outage");
+  // Fail OPEN → no replacement; the model keeps the real result.
+  assert.ok(out === undefined || out === null, JSON.stringify(out));
+  // It actually retried before giving up (not one-shot).
+  assert.ok(evalBodies.length >= 2, "expected retries, got " + evalBodies.length);
+  // The real output is still mirrored (not suppressed).
+  const mirror = mirroredItems.find(
+    (e) => e.data && e.data.item_type === "function_call_output",
+  );
+  assert.ok(mirror, JSON.stringify(mirroredItems));
+  assert.equal(mirror.data.item_data.output, "real output survives outage");
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    _run_policy_node_script(_extension_path(), tmp_path, body)
+
+
+def test_tool_result_raw_ask_never_collapses_fails_open(tmp_path: Path) -> None:
+    """A raw TOOL_RESULT ASK that never collapses fails OPEN after the cap.
+
+    Bounded re-attach like the tool-call gate, but because PHASE_TOOL_RESULT
+    fails open the bounded give-up returns the result unchanged rather than
+    suppressing it.
+    """
+    body = r"""
+(async () => {
+  const askForever = (_b) =>
+    makeJsonResponse({ result: "POLICY_ACTION_ASK", reason: "review?" });
+  responders = new Array(256).fill(askForever);
+  const out = await runToolResult("output that never gets reviewed");
+  // Fail OPEN → no suppression.
+  assert.ok(out === undefined || out === null, JSON.stringify(out));
+  assert.ok(evalBodies.length >= 2, "expected re-evaluation, got " + evalBodies.length);
+  assert.ok(evalBodies.length <= 50, "raw ASK rounds must be capped, got " + evalBodies.length);
+  const ids = new Set(evalBodies.map((b) => b._omnigent_elicitation_id));
+  assert.equal(ids.size, 1, "all raw-ASK rounds must reuse one elicitation id");
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exit(1);
