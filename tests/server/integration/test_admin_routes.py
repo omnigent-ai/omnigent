@@ -23,6 +23,7 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.conftest import ControllableMockClient
 
@@ -48,6 +49,7 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         artifact_store=artifact_store,
         agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
         permission_store=SqlAlchemyPermissionStore(db_uri),
+        host_store=HostStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header"),
     )
 
@@ -197,6 +199,33 @@ async def test_list_users_includes_cost_rollup(
     assert alice["cost_usd"] == pytest.approx(2.0)
     assert alice["total_tokens"] == 1500
     assert alice["session_count"] == 2
+
+
+async def test_list_users_includes_host_counts(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Each user row carries owned host counts (total + the live subset)."""
+    _make_user(db_uri, "boss@example.com", is_admin=True)
+    # A real (logged-in) user row; with no grants she stays visible, and her
+    # owned hosts are counted even though she owns no session.
+    _make_user(db_uri, "alice@example.com")
+    hosts = HostStore(db_uri)
+    # upsert_on_connect registers a fresh, online host.
+    hosts.upsert_on_connect("host_a1", "alice-laptop", "alice@example.com")
+    hosts.upsert_on_connect("host_a2", "alice-desktop", "alice@example.com")
+    # Mark one offline so online_host_count < host_count.
+    hosts.set_offline("host_a2")
+
+    resp = await auth_client.get("/v1/admin/users", headers=_headers("boss@example.com"))
+
+    assert resp.status_code == 200
+    by_id = {u["user_id"]: u for u in resp.json()["users"]}
+    alice = by_id["alice@example.com"]
+    assert alice["host_count"] == 2
+    assert alice["online_host_count"] == 1
+    # A user with no hosts reports zero, not a missing field.
+    assert by_id["boss@example.com"]["host_count"] == 0
+    assert by_id["boss@example.com"]["online_host_count"] == 0
 
 
 async def test_list_users_forbidden_for_non_admin(

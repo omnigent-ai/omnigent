@@ -18,6 +18,10 @@ export interface AdminUser {
   cost_usd: number;
   total_tokens: number;
   session_count: number;
+  /** Hosts this user owns (all registered). */
+  host_count: number;
+  /** The live subset of ``host_count``. */
+  online_host_count: number;
 }
 
 /** Response of ``GET /v1/admin/users``. */

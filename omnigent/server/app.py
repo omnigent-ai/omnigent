@@ -1869,6 +1869,7 @@ def create_app(
                 permission_store,
                 conversation_store,
                 auth_provider=auth_provider,
+                host_store=host_store,
             ),
             prefix="/v1",
             tags=["admin"],

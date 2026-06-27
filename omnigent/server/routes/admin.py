@@ -25,6 +25,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id
 from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ def create_admin_router(
     permission_store: PermissionStore,
     conversation_store: ConversationStore,
     auth_provider: AuthProvider | None = None,
+    host_store: HostStore | None = None,
 ) -> APIRouter:
     """Build the admin router (mounted under ``/v1``).
 
@@ -61,6 +63,9 @@ def create_admin_router(
     :param auth_provider: Resolves the caller identity from the
         request. ``None`` in single-user mode (admin routes are then
         effectively unreachable — there is no multi-user surface).
+    :param host_store: Backs the per-user host counts on the user list.
+        ``None`` when host support is not wired — host counts are then
+        reported as zero rather than failing the request.
     :returns: An :class:`APIRouter` with the admin discovery routes.
     """
     router = APIRouter()
@@ -97,8 +102,13 @@ def create_admin_router(
         reports how many were filtered. A real user who logged in but has
         not created anything (no grants at all) is kept, as are admins.
 
+        ``host_count`` / ``online_host_count`` are the hosts the user
+        owns (all registered, and the live subset) — zero when host
+        support is not wired.
+
         :returns: ``{"users": [{"user_id", "is_admin", "cost_usd",
-            "total_tokens", "session_count"}, ...], "hidden": N}``.
+            "total_tokens", "session_count", "host_count",
+            "online_host_count"}, ...], "hidden": N}``.
         """
         await _require_admin(request)
 
@@ -117,6 +127,14 @@ def create_admin_router(
                     if not owns and invited:
                         hidden += 1
                         continue
+                # Per-user host inventory (cheap at admin-list scale; the
+                # online subset reuses the same liveness gate as the sidebar).
+                hosts = host_store.list_hosts(u.user_id) if host_store is not None else []
+                online = (
+                    host_store.online_host_ids([h.host_id for h in hosts])
+                    if host_store is not None and hosts
+                    else set()
+                )
                 out.append(
                     {
                         "user_id": u.user_id,
@@ -124,6 +142,8 @@ def create_admin_router(
                         "cost_usd": totals.cost_usd,
                         "total_tokens": totals.total_tokens,
                         "session_count": totals.session_count,
+                        "host_count": len(hosts),
+                        "online_host_count": len(online),
                     }
                 )
             return {"users": out, "hidden": hidden}

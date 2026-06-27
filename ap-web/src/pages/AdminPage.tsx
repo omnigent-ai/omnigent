@@ -133,6 +133,12 @@ export function AdminPage() {
                 <th className="px-3 py-2 text-right font-medium" title="Sessions this user owns">
                   Owned
                 </th>
+                <th
+                  className="px-3 py-2 text-right font-medium"
+                  title="Hosts this user owns (live subset shown)"
+                >
+                  Hosts
+                </th>
                 <th className="px-3 py-2 text-right font-medium">Tokens</th>
                 <th
                   className="px-3 py-2 text-right font-medium"
@@ -165,6 +171,9 @@ export function AdminPage() {
                   </td>
                   <td className="px-3 py-2 text-right align-middle tabular-nums text-muted-foreground">
                     {u.session_count}
+                  </td>
+                  <td className="px-3 py-2 text-right align-middle tabular-nums text-muted-foreground">
+                    {formatHosts(u.host_count, u.online_host_count)}
                   </td>
                   <td className="px-3 py-2 text-right align-middle tabular-nums text-muted-foreground">
                     {formatTokens(u.total_tokens)}
@@ -288,6 +297,13 @@ function formatEpoch(epoch: number): string {
  */
 function formatUsd(cost: number): string {
   return `$${cost.toFixed(2)}`;
+}
+
+/** Host count with a live-subset hint: 0 → "—", 2 with 1 live → "2 · 1 online". */
+function formatHosts(total: number, online: number): string {
+  if (total === 0) return "—";
+  if (online > 0) return `${total} · ${online} online`;
+  return String(total);
 }
 
 /** Compact token count: 1234 → "1.2K", 1500000 → "1.5M". */

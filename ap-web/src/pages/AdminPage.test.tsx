@@ -59,6 +59,8 @@ describe("AdminPage", () => {
           cost_usd: 0,
           total_tokens: 0,
           session_count: 0,
+          host_count: 0,
+          online_host_count: 0,
         },
         {
           user_id: "alice@example.com",
@@ -66,6 +68,8 @@ describe("AdminPage", () => {
           cost_usd: 2,
           total_tokens: 1500,
           session_count: 2,
+          host_count: 3,
+          online_host_count: 1,
         },
       ],
       hidden: 1,
@@ -85,6 +89,8 @@ describe("AdminPage", () => {
     expect(within(aliceRow).getByText("Member")).toBeTruthy();
     expect(within(aliceRow).getByText("$2.00")).toBeTruthy();
     expect(within(aliceRow).getByText("1.5K")).toBeTruthy();
+    // Host count with the live-subset hint.
+    expect(within(aliceRow).getByText("3 · 1 online")).toBeTruthy();
     // The hidden-phantom count is surfaced (singular wording for 1).
     expect(screen.getByText(/1 invite-only account hidden/i)).toBeTruthy();
   });
@@ -99,6 +105,8 @@ describe("AdminPage", () => {
           cost_usd: 2.5,
           total_tokens: 4200,
           session_count: 1,
+          host_count: 0,
+          online_host_count: 0,
         },
       ],
       hidden: 0,
@@ -148,6 +156,8 @@ describe("AdminPage", () => {
           cost_usd: 0,
           total_tokens: 0,
           session_count: 0,
+          host_count: 0,
+          online_host_count: 0,
         },
       ],
       hidden: 0,
