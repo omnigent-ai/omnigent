@@ -84,6 +84,13 @@ ToolExecutor: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[Any]]  # typ
 # ``None``).
 _DEFAULT_CURSOR_MODEL = "auto"
 
+# Cursor-facing UI surfaces can expose human labels while the SDK only accepts
+# catalog ids. Keep the small compatibility map here so stale session overrides
+# and CLI/web free-text paths converge before agent creation.
+_CURSOR_MODEL_ALIASES: dict[str, str] = {
+    "composer": "composer-2.5",
+}
+
 # Upper bound (seconds) on one bridged-tool call: generous (sub-agent dispatches
 # can run for minutes) but finite, so a wedged tool surfaces a timeout error
 # instead of blocking the SDK's daemon callback thread forever.
@@ -98,12 +105,22 @@ _HOOK_APPROVAL_TIMEOUT_S = 86400
 def _resolve_model(model: str | None) -> str:
     """Resolve the cursor model id, dropping ids cursor can't honor.
 
-    cursor-sdk accepts only Cursor model ids (``auto``, ``gpt-5``,
+    cursor-sdk accepts only Cursor model ids (``auto``, ``default``,
     ``composer-2.5``, ...), so a gateway-routed model id (carried by a spec
-    authored for another harness) falls back to cursor's auto-select. ``None``
-    likewise resolves to ``auto`` (the SDK requires a model).
+    authored for another harness) falls back to cursor's auto-select. Known
+    display labels from UI/free-text switchers are translated to SDK ids before
+    agent creation. ``None`` likewise resolves to ``auto`` (the SDK requires a
+    model).
     """
-    if not model or model.startswith(("databricks-", "databricks/")):
+    requested = (model or "").strip()
+    if not requested:
+        return _DEFAULT_CURSOR_MODEL
+
+    alias = _CURSOR_MODEL_ALIASES.get(requested.lower())
+    if alias is not None:
+        return alias
+
+    if requested.startswith(("databricks-", "databricks/")):
         if model:
             # Warn, not debug: the requested model is silently NOT honored, and
             # a debug line is invisible in the harness subprocess — so a user who
@@ -111,11 +128,11 @@ def _resolve_model(model: str | None) -> str:
             logger.warning(
                 "CursorExecutor: requested model %r is not a Cursor model id; "
                 "falling back to %r auto-select.",
-                model,
+                requested,
                 _DEFAULT_CURSOR_MODEL,
             )
         return _DEFAULT_CURSOR_MODEL
-    return model
+    return requested
 
 
 def _first_of(d: dict[str, Any], *keys: str, default: int = 0) -> int:
