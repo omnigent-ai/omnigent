@@ -29,6 +29,11 @@ const InboxPage = lazy(() => import("@/pages/InboxPage").then((m) => ({ default:
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
+// Admin surface (user list + per-user session browser). Unlike the
+// accounts Members page, this is NOT gated on accounts_enabled — it must
+// work under OIDC/SSO. The route is always registered; the page and the
+// server both gate on the caller's is_admin flag.
+const AdminPage = lazy(() => import("@/pages/AdminPage").then((m) => ({ default: m.AdminPage })));
 
 interface AppProps {
   /**
@@ -130,6 +135,9 @@ function App({ basename }: AppProps = {}) {
               defaults to Appearance. */}
           <Route path={`${prefix}/settings`} element={<SettingsPage />} />
           <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
+          {/* Admin: registered in every mode (incl. OIDC). The page renders
+              a "no access" state for non-admins; the server 403s regardless. */}
+          <Route path={`${prefix}/admin`} element={<AdminPage />} />
           {info.accounts_enabled && (
             <>
               <Route path={`${prefix}/members`} element={<MembersPage />} />

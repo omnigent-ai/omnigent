@@ -23,6 +23,10 @@ import { getOmnigentHostConfig, hostFetch } from "./host";
 const RESERVED_USER_LOCAL = "local";
 
 let _currentUserId: string | null = null;
+// Whether the current user holds the admin flag, from `GET /v1/me`.
+// Drives the admin chrome (user list / session browser) — which must
+// work under OIDC, where the accounts Members page never mounts.
+let _currentIsAdmin = false;
 let _resolved = false;
 let _resolvePromise: Promise<string | null> | null = null;
 // Cache the server-provided login URL on the first /v1/me probe so
@@ -87,8 +91,12 @@ export async function resolveIdentity(): Promise<string | null> {
         }
       }
       if (res.ok) {
-        const data = (await res.json()) as { user_id: string | null };
+        const data = (await res.json()) as {
+          user_id: string | null;
+          is_admin?: boolean;
+        };
         _currentUserId = data.user_id;
+        _currentIsAdmin = data.is_admin === true;
       }
     } catch {
       // Server unreachable — leave as null.
@@ -102,6 +110,14 @@ export async function resolveIdentity(): Promise<string | null> {
 /** Return the cached user ID (null before resolveIdentity completes). */
 export function getCurrentUserId(): string | null {
   return _currentUserId;
+}
+
+/**
+ * Whether the current user is an admin (false before resolveIdentity
+ * completes or when permissions are disabled). Gates the admin chrome.
+ */
+export function getCurrentIsAdmin(): boolean {
+  return _currentIsAdmin;
 }
 
 /**

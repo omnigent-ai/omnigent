@@ -22,6 +22,24 @@ _ATTACHMENT_MARKER_RE = re.compile(r"^\[Attached(?: file)?: .+\]$")
 # ── Conversation ──────────────────────────────────────
 
 
+@dataclass(frozen=True)
+class UsageTotals:
+    """Aggregate LLM usage across a set of sessions.
+
+    Summed from each conversation's ``session_usage`` JSON. Used by the
+    admin views to show a per-user rollup and the running total above a
+    user's session list.
+
+    :param cost_usd: Total USD spend.
+    :param total_tokens: Total tokens (input + output, across models).
+    :param session_count: Number of sessions summed.
+    """
+
+    cost_usd: float
+    total_tokens: int
+    session_count: int
+
+
 @dataclass
 class Conversation:
     """

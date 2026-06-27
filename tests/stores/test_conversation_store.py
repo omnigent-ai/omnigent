@@ -4448,3 +4448,71 @@ def test_list_conversations_project_none_disables_filter(
 
     ids = {c.id for c in conversation_store.list_conversations().data}
     assert ids >= {filed.id, unfiled.id}
+
+
+# ── usage_totals_for_user ─────────────────────────────
+
+
+def test_usage_totals_for_user_sums_only_owned_sessions(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Totals sum only sessions the user OWNS — invited sessions don't count."""
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user("alice@example.com")
+    perms.ensure_user("bob@example.com")
+
+    a1 = conversation_store.create_conversation()
+    a2 = conversation_store.create_conversation()
+    b1 = conversation_store.create_conversation()
+    conversation_store.set_session_usage(a1.id, {"total_cost_usd": 1.5, "total_tokens": 1000})
+    conversation_store.set_session_usage(a2.id, {"total_cost_usd": 0.5, "total_tokens": 250})
+    conversation_store.set_session_usage(b1.id, {"total_cost_usd": 9.0, "total_tokens": 9999})
+    perms.grant("alice@example.com", a1.id, 4)  # owner
+    perms.grant("alice@example.com", a2.id, 4)  # owner
+    perms.grant("bob@example.com", b1.id, 4)  # bob owns b1
+    perms.grant("alice@example.com", b1.id, 1)  # alice merely INVITED to b1 (read)
+
+    totals = conversation_store.usage_totals_for_user("alice@example.com")
+
+    # Only the two sessions alice owns — bob's session (where alice is just a
+    # read-level invitee) must not be charged to alice.
+    assert totals.cost_usd == pytest.approx(2.0)
+    assert totals.total_tokens == 1250
+    assert totals.session_count == 2
+
+    # b1's cost is attributed to bob, its owner.
+    bob_totals = conversation_store.usage_totals_for_user("bob@example.com")
+    assert bob_totals.cost_usd == pytest.approx(9.0)
+    assert bob_totals.session_count == 1
+
+
+def test_usage_totals_for_user_empty(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A user with no sessions totals to zero."""
+    totals = conversation_store.usage_totals_for_user("nobody@example.com")
+    assert totals.cost_usd == 0.0
+    assert totals.total_tokens == 0
+    assert totals.session_count == 0
+
+
+def test_usage_totals_for_user_handles_missing_usage(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Sessions with no recorded usage contribute zero but are still counted."""
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user("alice@example.com")
+    conv = conversation_store.create_conversation()  # no set_session_usage
+    perms.grant("alice@example.com", conv.id, 4)
+
+    totals = conversation_store.usage_totals_for_user("alice@example.com")
+
+    assert totals.cost_usd == 0.0
+    assert totals.total_tokens == 0
+    assert totals.session_count == 1

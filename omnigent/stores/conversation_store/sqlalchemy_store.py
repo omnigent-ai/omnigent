@@ -49,6 +49,7 @@ from omnigent.entities import (
     ConversationItem,
     NewConversationItem,
     PagedList,
+    UsageTotals,
     parse_item_data,
 )
 from omnigent.stores.conversation_store import (
@@ -1961,6 +1962,44 @@ class SqlAlchemyConversationStore(ConversationStore):
             row.runner_id = None
             row.updated_at = now_epoch()
             return _to_conversation(row, _fetch_labels(session, conversation_id))
+
+    def usage_totals_for_user(self, user_id: str) -> UsageTotals:
+        """Sum session_usage across the user's OWNED top-level sessions.
+
+        Cost is attributed to the owner (the ``LEVEL_OWNER`` grantee), so
+        a user merely invited to a session is not charged for it. See
+        base class.
+        """
+        from omnigent.db.db_models import SqlSessionPermission
+        from omnigent.server.auth import LEVEL_OWNER
+
+        with self._session() as session:
+            owned_ids = select(SqlSessionPermission.conversation_id).where(
+                SqlSessionPermission.user_id == user_id,
+                SqlSessionPermission.level >= LEVEL_OWNER,
+            )
+            rows = (
+                session.execute(
+                    select(SqlConversation.session_usage).where(
+                        SqlConversation.id.in_(owned_ids),
+                        SqlConversation.kind == "default",
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        cost = 0.0
+        tokens = 0
+        for raw in rows:
+            if not raw:
+                continue
+            try:
+                usage = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            cost += float(usage.get("total_cost_usd") or 0.0)
+            tokens += int(usage.get("total_tokens") or 0)
+        return UsageTotals(cost_usd=cost, total_tokens=tokens, session_count=len(rows))
 
     def list_conversations_by_host_id(
         self,

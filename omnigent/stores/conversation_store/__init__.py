@@ -10,6 +10,7 @@ from omnigent.entities import (
     ConversationItem,
     NewConversationItem,
     PagedList,
+    UsageTotals,
 )
 
 # Label set on a fork of a session that had a working directory. Its
@@ -951,6 +952,23 @@ class ConversationStore(ABC):
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
+        """
+        ...
+
+    @abstractmethod
+    def usage_totals_for_user(self, user_id: str) -> UsageTotals:
+        """Sum LLM usage across the user's OWNED top-level sessions.
+
+        Aggregates each ``kind="default"`` conversation the user OWNS (a
+        ``LEVEL_OWNER`` grant) — ``total_cost_usd`` and ``total_tokens``
+        from ``session_usage`` — so the admin user list shows a per-user
+        cost rollup. Cost is attributed to the owner: a user merely
+        invited to (granted read/edit/manage on) a session is not
+        charged for it, so a shared session's cost is counted once,
+        against its owner.
+
+        :param user_id: The user to total, e.g. ``"alice@example.com"``.
+        :returns: A :class:`UsageTotals` (cost, tokens, owned-session count).
         """
         ...
 
