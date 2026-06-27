@@ -299,26 +299,54 @@ omnigent host  https://your-host    # new sessions can now run on this machine
 ```
 
 > [!TIP]
-> On your own network you don't need a deploy. Open your machine's LAN
-> address on your phone (e.g. `http://192.168.x.x:6767`).
+> **Reach it from your phone on the same network — no deploy needed.** The
+> default local server binds loopback (`127.0.0.1`), and `omnigent server
+> start` (the background daemon) is loopback-only by design, so a LAN
+> address won't connect to either. Instead run the **foreground** server
+> bound to your machine's LAN IP, with auth turned on (otherwise a
+> non-loopback bind rejects every request with 401):
+>
+> ```bash
+> OMNIGENT_AUTH_ENABLED=1 omnigent server --host 192.168.x.x --port 6767
+> ```
+>
+> The accounts cookie secret auto-generates on first boot. You then claim the
+> admin account by choosing a username + password: at the terminal prompt when
+> you launch the server on a TTY, or from a **Create admin** form on the first
+> web visit when it runs headless. No password is ever printed or
+> auto-generated. Once the admin exists, open `http://192.168.x.x:6767` on your
+> phone and sign in.
+>
+> "Real auth" for a network-exposed server means one of: built-in
+> **accounts** (`OMNIGENT_AUTH_ENABLED=1`), **OIDC**
+> (`OMNIGENT_AUTH_ENABLED=1` with `OMNIGENT_OIDC_ISSUER=...`), or a trusted
+> reverse proxy that injects the
+> `X-Forwarded-Email` header. Plain header mode with none of these is the
+> proxy-only posture and 401s direct clients.
 
 ### 5. Collaborate with your team
 
 Omnigent supports **multi-user accounts**, controlled by one environment
-variable:
+variable. For a server other devices can reach (your LAN, a teammate on the
+network), turn accounts on and bind the **foreground** server to your LAN IP:
 
 ```bash
-OMNIGENT_AUTH_ENABLED=1 omnigent server start
+OMNIGENT_AUTH_ENABLED=1 omnigent server --host 192.168.x.x --port 6767
 ```
 
-The **Docker deploy in [step 4](#4-deploy-a-server-and-use-it-from-your-phone)
-turns it on for you** (`OMNIGENT_AUTH_ENABLED` defaults to `1` there).
+`omnigent server start` (the background daemon) also honors
+`OMNIGENT_AUTH_ENABLED=1`, but it binds loopback only — fine for accounts on
+this machine, not reachable from the network. The **Docker deploy in
+[step 4](#4-deploy-a-server-and-use-it-from-your-phone) turns accounts on for
+you** (`OMNIGENT_AUTH_ENABLED` defaults to `1` there).
 
 #### Invite your teammates
 
-Open the web UI (`http://localhost:6767` locally, or your host's URL) and
-sign in as `admin`; first run prints the password and saves it locally. Then
-open **Admin → Members → Invite** to create a single-use invite link, no
+Open the web UI (`http://localhost:6767` locally, or your host's URL). On a
+fresh instance the first visit shows a **Create admin** form to choose the
+admin username + password (no password is ever printed or auto-generated).
+Signed in as that admin, open **Admin → Members → Invite** to create a
+single-use invite link, no
 email server needed. Send it over; your teammate opens it, sets a password,
 and they're in. Signup is invite-only.
 
