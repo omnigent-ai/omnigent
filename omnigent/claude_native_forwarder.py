@@ -224,6 +224,14 @@ _HTTP_POST_MAX_PERMANENT_FAILURES = 3
 _HTTP_POST_RETRY_BASE_DELAY_S = 1.0
 _HTTP_POST_RETRY_MAX_DELAY_S = 30.0
 _HTTP_TRANSIENT_STATUS_CODES = {408, 409, 425, 429}
+# A 503 ``subagent_delivery_not_confirmed`` means the runner could not deliver a
+# terminal sub-agent result to the parent inbox. It is retried (the work entry can
+# be created slightly after the child reports terminal — a short dispatch race), but
+# UNLIKE a generic 5xx it must NOT retry forever: when the parent host is gone the
+# condition is permanent. Bounded so a single orphaned sub-agent cannot flood the
+# shared server. The budget spans the backoff schedule (capped at 30 s) ⇒ a few
+# minutes, comfortably covering the dispatch race.
+_SUBAGENT_DELIVERY_NOT_CONFIRMED_MAX_ATTEMPTS = 12
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
 _SUPERVISOR_MAX_BACKOFF_S = 30.0
 _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
@@ -509,6 +517,7 @@ class _PostRetryTracker:
         self,
         *,
         max_permanent_attempts: int = _HTTP_POST_MAX_PERMANENT_FAILURES,
+        max_not_confirmed_attempts: int = _SUBAGENT_DELIVERY_NOT_CONFIRMED_MAX_ATTEMPTS,
         base_delay_s: float = _HTTP_POST_RETRY_BASE_DELAY_S,
         max_delay_s: float = _HTTP_POST_RETRY_MAX_DELAY_S,
     ) -> None:
@@ -517,11 +526,14 @@ class _PostRetryTracker:
 
         :param max_permanent_attempts: Attempts before a permanent
             failure is exhausted.
+        :param max_not_confirmed_attempts: Attempts before a
+            ``subagent_delivery_not_confirmed`` 503 is exhausted.
         :param base_delay_s: Initial retry delay in seconds.
         :param max_delay_s: Maximum retry delay in seconds.
         :returns: None.
         """
         self._max_permanent_attempts = max(1, max_permanent_attempts)
+        self._max_not_confirmed_attempts = max(1, max_not_confirmed_attempts)
         self._base_delay_s = max(0.0, base_delay_s)
         self._max_delay_s = max(0.0, max_delay_s)
         self._entries: dict[str, _PostRetryEntry] = {}
@@ -565,13 +577,17 @@ class _PostRetryTracker:
             self._entries[key] = entry
         entry.attempts += 1
         permanent = _is_permanent_http_error(exc)
-        if permanent and entry.attempts >= self._max_permanent_attempts:
+        not_confirmed = _is_subagent_delivery_not_confirmed(exc)
+        give_up = (permanent and entry.attempts >= self._max_permanent_attempts) or (
+            not_confirmed and entry.attempts >= self._max_not_confirmed_attempts
+        )
+        if give_up:
             self._entries.pop(key, None)
             return _PostRetryDecision(
                 attempts=entry.attempts,
                 delay_s=0.0,
                 exhausted=True,
-                permanent=True,
+                permanent=permanent,
             )
         delay_s = min(
             self._base_delay_s * (2 ** max(0, entry.attempts - 1)),
@@ -3806,6 +3822,29 @@ def _is_permanent_http_error(exc: httpx.HTTPError) -> bool:
         return False
     status_code = exc.response.status_code
     return 400 <= status_code < 500 and status_code not in _HTTP_TRANSIENT_STATUS_CODES
+
+
+def _is_subagent_delivery_not_confirmed(exc: httpx.HTTPError) -> bool:
+    """
+    Return whether ``exc`` is a runner ``subagent_delivery_not_confirmed`` 503.
+
+    The runner returns this application-level 503 when a terminal sub-agent
+    payload could not be delivered to the parent inbox (no work entry / inbox).
+    It is a bounded-retry class, distinct from a generic transient 5xx.
+
+    :param exc: HTTP exception raised while posting an Omnigent event.
+    :returns: ``True`` only for a 503 whose JSON body carries
+        ``error == "subagent_delivery_not_confirmed"``.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return False
+    if exc.response.status_code != 503:
+        return False
+    try:
+        body = exc.response.json()
+    except Exception:  # noqa: BLE001 — best-effort body parse
+        return False
+    return isinstance(body, dict) and body.get("error") == "subagent_delivery_not_confirmed"
 
 
 def _http_status_for_log(exc: httpx.HTTPError) -> int | None:
