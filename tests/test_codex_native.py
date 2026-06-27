@@ -5509,6 +5509,350 @@ def test_forwarder_drops_codex_tool_item_missing_required_field(
     assert "Codex commandExecution missing command" in caplog.text
 
 
+def test_forwarder_posts_codex_image_view_tool_call() -> None:
+    """
+    A completed Codex ``imageView`` becomes a view_image tool card.
+
+    Codex emits an ``imageView`` item when the model opens a local image
+    to look at it. Before this was handled the item was silently dropped,
+    so the web transcript skipped a step the native TUI shows. The only
+    datum is the path, so it is both the argument and the output (the web
+    UI cannot fetch a runner-local path).
+    """
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "imageView",
+                "id": "img_view_1",
+                "path": "/repo/screenshot.png",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted == [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call",
+                "item_data": {
+                    "agent": "codex-native-ui",
+                    "name": "view_image",
+                    "arguments": '{"path": "/repo/screenshot.png"}',
+                    "call_id": "img_view_1",
+                },
+                "response_id": "codex_turn_123",
+            },
+        },
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call_output",
+                "item_data": {
+                    "call_id": "img_view_1",
+                    "output": "/repo/screenshot.png",
+                },
+                "response_id": "codex_turn_123",
+            },
+        },
+    ]
+
+
+def test_forwarder_posts_codex_image_generation_tool_call() -> None:
+    """
+    A completed Codex ``imageGeneration`` becomes a generate_image tool card.
+
+    The raw ``result`` (base64 image bytes) is deliberately NOT mirrored —
+    the web UI has no assistant-side image rendering and the base64 blob
+    would only bloat the transcript. The card carries the revised prompt as
+    the argument and the status plus on-disk save path as the output.
+    """
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "imageGeneration",
+                "id": "img_gen_1",
+                "status": "completed",
+                "revisedPrompt": "a red bicycle on a beach",
+                "result": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+                "savedPath": "/repo/out.png",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert [p["data"]["item_type"] for p in posted] == [
+        "function_call",
+        "function_call_output",
+    ]
+    call = posted[0]["data"]["item_data"]
+    assert call["name"] == "generate_image"
+    assert call["call_id"] == "img_gen_1"
+    # The revised prompt is surfaced; the base64 result is never echoed.
+    assert json.loads(call["arguments"]) == {"revised_prompt": "a red bicycle on a beach"}
+    assert "iVBORw0KGgo" not in call["arguments"]
+    output = posted[1]["data"]["item_data"]["output"]
+    assert output == "status: completed\nsaved to /repo/out.png"
+    assert "iVBORw0KGgo" not in output
+
+
+def test_forwarder_drops_codex_image_generation_missing_status(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    An ``imageGeneration`` with no status is dropped, not mirrored blank.
+
+    ``status`` is a required protocol field; its absence means a malformed
+    item, which is logged and skipped rather than mirrored as an empty card.
+    """
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "imageGeneration",
+                "id": "img_gen_bad",
+                "revisedPrompt": "x",
+                "result": "y",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted == []
+    assert "Codex imageGeneration missing status" in caplog.text
+
+
+def test_forwarder_posts_codex_entered_review_mode_marker() -> None:
+    """
+    Codex ``enteredReviewMode`` surfaces a visible review-mode marker.
+
+    Codex ``/review`` brackets a turn with enter/exit thread items. The web
+    UI has no review affordance, so the transition is mirrored as a short
+    assistant-message marker (the same rail used for plan updates), carrying
+    the review subject so the web user sees what is under review.
+    """
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "enteredReviewMode",
+                "id": "review_1",
+                "review": "review the auth changes",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted == [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "codex-native-ui",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Entered review mode: review the auth changes",
+                        }
+                    ],
+                },
+                "response_id": "codex_turn_123",
+            },
+        }
+    ]
+
+
+def test_forwarder_posts_codex_exited_review_mode_marker() -> None:
+    """
+    Codex ``exitedReviewMode`` surfaces a visible exit marker.
+
+    With no review subject the marker is just the header — a terse divider
+    that tells the web user the session left review mode.
+    """
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "exitedReviewMode",
+                "id": "review_2",
+                "review": "",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted == [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "codex-native-ui",
+                    "content": [{"type": "output_text", "text": "Exited review mode"}],
+                },
+                "response_id": "codex_turn_123",
+            },
+        }
+    ]
+
+
+def _turn_diff_event(turn_id: str, diff: str, *, thread_id: str = "thread_123") -> dict[str, Any]:
+    """
+    Build a Codex ``turn/diff/updated`` notification.
+
+    :param turn_id: Codex turn id, e.g. ``"turn_123"``.
+    :param diff: Aggregated unified diff for the turn so far.
+    :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+    :returns: App-server event payload.
+    """
+    return {
+        "method": "turn/diff/updated",
+        "params": {"threadId": thread_id, "turnId": turn_id, "diff": diff},
+    }
+
+
+def test_forwarder_coalesces_and_flushes_turn_diff(tmp_path: Path) -> None:
+    """
+    ``turn/diff/updated`` is coalesced and flushed once at turn end.
+
+    Codex streams the aggregated working-tree diff repeatedly as edits land.
+    Posting each update would spam the transcript with a growing diff, so the
+    forwarder stores only the newest diff and mirrors it once, at the
+    terminal boundary, as a single ``turn_diff`` function-call pair — after
+    the turn's other items and before the idle status edge.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    posted: list[dict[str, Any]] = []
+    forwarder_state = codex_native_forwarder._CodexForwarderState()
+    latest_diff = "--- a/x.py\n+++ b/x.py\n@@\n-old\n+new\n"
+
+    async def run() -> None:
+        """
+        Replay two diff updates followed by the terminal boundary.
+
+        :returns: None.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_capture_handler(posted)),
+        ) as client:
+            for event in [
+                _turn_diff_event("turn_123", "--- a/x.py\n+++ b/x.py\n@@\n-old\n"),
+                _turn_diff_event("turn_123", latest_diff),
+                _completed_event("turn_123", thread_id="thread_123"),
+            ]:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    forwarder_state=forwarder_state,
+                )
+
+    asyncio.run(run())
+
+    # The two diff updates post nothing; only the terminal boundary flushes a
+    # single turn_diff pair (carrying the LATEST diff), then the idle edge.
+    assert posted == [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call",
+                "item_data": {
+                    "agent": "codex-native-ui",
+                    "name": "turn_diff",
+                    "arguments": "{}",
+                    "call_id": "codex_turn_diff_turn_123",
+                },
+                "response_id": "codex_turn_123",
+            },
+        },
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call_output",
+                "item_data": {
+                    "call_id": "codex_turn_diff_turn_123",
+                    "output": latest_diff,
+                },
+                "response_id": "codex_turn_123",
+            },
+        },
+        {
+            "type": "external_session_status",
+            "data": _expected_status_data("idle", "turn_123"),
+        },
+    ]
+    # The stored diff is consumed on flush — no leak into the next turn.
+    assert forwarder_state.turn_diff_by_turn == {}
+
+
+def test_forwarder_skips_turn_diff_when_none_captured(tmp_path: Path) -> None:
+    """
+    A turn with no ``turn/diff/updated`` posts no turn_diff card.
+
+    Read-only turns never receive a diff notification, so the terminal
+    boundary must emit only the idle status edge — no empty diff artifact.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    posted: list[dict[str, Any]] = []
+    forwarder_state = codex_native_forwarder._CodexForwarderState()
+
+    async def run() -> None:
+        """
+        Replay a terminal boundary with no preceding diff update.
+
+        :returns: None.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_capture_handler(posted)),
+        ) as client:
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                usage_coalescer=_usage_coalescer(client),
+                elicitation_tracker=_elicitation_tracker(),
+                event=_completed_event("turn_123", thread_id="thread_123"),
+                forwarder_state=forwarder_state,
+            )
+
+    asyncio.run(run())
+
+    assert posted == [
+        {
+            "type": "external_session_status",
+            "data": _expected_status_data("idle", "turn_123"),
+        },
+    ]
+
+
 def test_forwarder_skips_item_retry_on_ambiguous_transport_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
