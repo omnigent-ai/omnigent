@@ -90,6 +90,42 @@ describe("useAvailableAgents", () => {
     expect(urls).toContain(SCAN_URL);
   });
 
+  it("paginates built-ins so defaults pushed past fork rows are still listed", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "ag_codex_fork", name: "codex-native-ui (fork ag_old)", harness: "codex-native" },
+        ],
+        has_more: true,
+        last_id: "ag_codex_fork",
+      }),
+      "/v1/agents?after=ag_codex_fork": mockResponse({
+        object: "list",
+        data: [{ id: "ag_codex", name: "codex-native-ui", harness: "codex-native" }],
+        has_more: false,
+      }),
+      [SCAN_URL]: EMPTY_SCAN,
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual([
+      {
+        id: "ag_codex",
+        name: "codex-native-ui",
+        display_name: "Codex",
+        description: null,
+        harness: "codex-native",
+        skills: [],
+      },
+    ]);
+    const urls = fetchMock.mock.calls.map((c) => c[0] as string);
+    expect(urls).toContain("/v1/agents");
+    expect(urls).toContain("/v1/agents?after=ag_codex_fork");
+  });
+
   it("maps rows into AvailableAgent and applies native, nessie, and debby display names", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({
@@ -384,8 +420,16 @@ describe("useAvailableAgents", () => {
       [BUILTINS_URL]: mockResponse({
         object: "list",
         data: [
-          // Stale/non-canonical native row from older local state; it
-          // resolves by harness but must not compete with the seeded row.
+          // Stale/non-canonical native rows from older local state; they
+          // resolve by harness but must not compete with the seeded rows.
+          { id: "ag_stale_codex", name: "codex-native-ui (fork ag_old)", harness: "codex-native" },
+          { id: "ag_codex", name: "codex-native-ui", harness: "codex-native" },
+          {
+            id: "ag_stale_claude",
+            name: "claude-native-ui (fork ag_old)",
+            harness: "claude-native",
+          },
+          { id: "ag_claude", name: "claude-native-ui", harness: "claude-native" },
           { id: "ag_stale_kiro", name: "kiro-naitive", harness: "kiro-native" },
           { id: "ag_kiro", name: "kiro-native-ui", harness: "kiro-native" },
         ],
@@ -415,6 +459,22 @@ describe("useAvailableAgents", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     expect(result.current.data).toEqual([
+      {
+        id: "ag_codex",
+        name: "codex-native-ui",
+        display_name: "Codex",
+        description: null,
+        harness: "codex-native",
+        skills: [],
+      },
+      {
+        id: "ag_claude",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
       {
         id: "ag_kiro",
         name: "kiro-native-ui",

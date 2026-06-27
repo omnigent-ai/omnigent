@@ -159,6 +159,58 @@ def _codex_native_agents_body() -> str:
     )
 
 
+def _forked_codex_first_page_body() -> str:
+    """First ``GET /v1/agents`` page with stale Codex forks only.
+
+    Mirrors an older deployment where fork clones leaked into the built-in
+    catalog before the server-side forward fix. The canonical Codex row is on
+    page 2, so the picker must paginate before deduping native rows.
+    """
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_codex_fork_1",
+                    "name": "codex-native-ui (fork ag_old1)",
+                    "display_name": "Codex",
+                    "description": "Stale Codex fork",
+                    "harness": "codex-native",
+                    "skills": [],
+                },
+                {
+                    "id": "ag_codex_fork_2",
+                    "name": "codex-native-ui (fork ag_old2)",
+                    "display_name": "Codex",
+                    "description": "Another stale Codex fork",
+                    "harness": "codex-native",
+                    "skills": [],
+                },
+            ],
+            "has_more": True,
+            "last_id": "ag_codex_fork_2",
+        }
+    )
+
+
+def _canonical_codex_second_page_body() -> str:
+    """Second ``GET /v1/agents`` page containing canonical Codex."""
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_codex_e2e",
+                    "name": "codex-native-ui",
+                    "display_name": "Codex",
+                    "description": "OpenAI's coding agent",
+                    "harness": "codex-native",
+                    "skills": [],
+                }
+            ],
+            "has_more": False,
+        }
+    )
+
+
 def _bundle_agents_body() -> str:
     """Stub body for ``GET /v1/agents``: the two harness-overridable bundle agents.
 
@@ -548,6 +600,87 @@ def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> 
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_approval_mode(base_url, session_id))
+
+
+def test_start_session_agent_picker_paginates_and_dedupes_native_forks(
+    seeded_session: tuple[str, str],
+) -> None:
+    """The new-session picker recovers canonical Codex from page 2.
+
+    Older servers leaked fork clones into ``GET /v1/agents``. New servers stop
+    creating those rows, but existing databases can still have enough stale
+    forked native agents to push canonical built-ins off page 1. The picker must
+    follow pagination and then collapse all ``codex-native`` rows to the
+    canonical ``codex-native-ui`` row, so users see one top-level Codex choice.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_agent_picker_pagination_dedupe(base_url, session_id))
+
+
+async def _drive_agent_picker_pagination_dedupe(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_forked_codex_first_page_body(),
+            )
+
+            async def handle_agents_page_2(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=_canonical_codex_second_page_body(),
+                )
+
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route("**/v1/agents?after=ag_codex_fork_2", handle_agents_page_2)
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            picker = page.get_by_test_id("new-chat-landing-agent-select")
+            await expect(picker).to_contain_text("Codex")
+            await picker.click()
+
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e")
+            ).to_be_visible()
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_codex_fork_1")
+            ).to_have_count(0)
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_codex_fork_2")
+            ).to_have_count(0)
+
+            await page.keyboard.press("Escape")
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_codex_e2e", body
+        finally:
+            await browser.close()
 
 
 async def _drive_approval_mode(base_url: str, session_id: str) -> None:

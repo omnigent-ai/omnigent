@@ -62,7 +62,7 @@ function dedupeNativeAgents(agents: AvailableAgent[]): AvailableAgent[] {
   const nativeIndex = new Map<string, number>();
   for (const agent of agents) {
     const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
-    if (nativeAgent?.key !== "kiro") {
+    if (nativeAgent === undefined) {
       result.push(agent);
       continue;
     }
@@ -93,6 +93,12 @@ interface BuiltinAgentWire {
   created_at?: number | null;
 }
 
+interface BuiltinAgentsListWire {
+  data: BuiltinAgentWire[];
+  has_more?: boolean;
+  last_id?: string | null;
+}
+
 /** Wire row of the sessions scan, GET /v1/sessions?kind=any. */
 interface SessionListItemWire {
   id: string;
@@ -108,24 +114,30 @@ interface SessionListItemWire {
  * (see designs/BUILTIN_AGENTS.md).
  */
 async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
-  const res = await authenticatedFetch("/v1/agents");
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const body = (await res.json()) as { data: BuiltinAgentWire[] };
-  return dedupeNativeAgents(
-    body.data.map((a) => ({
-      id: a.id,
-      name: a.name,
-      display_name: displayNameForAgent(a.name, a.harness),
-      description: a.description ?? null,
-      harness: a.harness ?? null,
-      skills: a.skills ?? [],
-      // Raw passthrough (not coerced): an absent value stays undefined so
-      // older servers degrade to "protected" and existing strict-equality
-      // tests (which ignore undefined props) are unaffected.
-      builtin: a.builtin,
-      created_at: a.created_at,
-    })),
-  );
+  const rows: BuiltinAgentWire[] = [];
+  let after: string | null = null;
+  do {
+    const url = after == null ? "/v1/agents" : `/v1/agents?after=${encodeURIComponent(after)}`;
+    const res = await authenticatedFetch(url);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    const body = (await res.json()) as BuiltinAgentsListWire;
+    rows.push(...body.data);
+    after = body.has_more === true && body.last_id ? body.last_id : null;
+  } while (after != null);
+
+  return rows.map((a) => ({
+    id: a.id,
+    name: a.name,
+    display_name: displayNameForAgent(a.name, a.harness),
+    description: a.description ?? null,
+    harness: a.harness ?? null,
+    skills: a.skills ?? [],
+    // Raw passthrough (not coerced): an absent value stays undefined so
+    // older servers degrade to "protected" and existing strict-equality
+    // tests (which ignore undefined props) are unaffected.
+    builtin: a.builtin,
+    created_at: a.created_at,
+  }));
 }
 
 /**
@@ -264,10 +276,10 @@ async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
   // `builtin !== false` keeps both true (seeded) and undefined (older server,
   // no flag) protected — only an explicit false marks a supersedable
   // user-registered template.
-  const seeded = catalog.filter((a) => a.builtin !== false);
+  const seeded = dedupeNativeAgents(catalog.filter((a) => a.builtin !== false));
   const userTemplates = catalog.filter((a) => a.builtin === false);
   const catalogIds = new Set(catalog.map((a) => a.id));
-  const seededNames = new Set(seeded.map((a) => a.name));
+  const seededNames = new Set(seeded.map((a) => agentRootName(a.name)));
   const hasKiroBuiltin = seeded.some((a) => nativeCodingAgentForAvailableAgent(a)?.key === "kiro");
   const kiroLegacyNames = new Set(["kiro"]);
 
@@ -284,7 +296,8 @@ async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
 
   // Seed with user-registered templates. A template name is globally unique
   // among catalog rows, so it cannot collide with a seeded built-in; guard
-  // defensively anyway.
+  // defensively anyway. Rooting seeded names also drops stale fork rows from
+  // older catalogs once their canonical built-in is present.
   for (const t of userTemplates) {
     const base = agentRootName(t.name);
     if (seededNames.has(base)) continue;
