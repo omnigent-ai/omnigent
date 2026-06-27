@@ -1984,6 +1984,7 @@ async def _auto_create_cursor_terminal(
         write_mcp_config,
     )
     from omnigent.cursor_native_forwarder import clear_cursor_bridge_state, preseed_resume_state
+    from omnigent.cursor_native_status import clear_cursor_status_state
     from omnigent.cursor_native_usage import clear_cursor_usage_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
@@ -2033,6 +2034,10 @@ async def _auto_create_cursor_terminal(
         # the cumulative count clean. Preserved across a preseeded resume (the
         # accumulator's generation-id dedup makes re-reading the log safe).
         clear_cursor_usage_state(bridge_dir)
+        # Likewise drop the turn-end marker + idle poster state so a stale count
+        # from a prior terminal can't make the new forwarder skip (or re-fire)
+        # the ``external_session_status: idle`` parent-wake edge.
+        clear_cursor_status_state(bridge_dir)
         if resume_chat_id is not None:
             _logger.warning(
                 "cursor-native: could not pre-seed prior chat store for %r; "
@@ -2412,9 +2417,14 @@ async def _auto_create_hermes_terminal(
         write_tmux_target,
     )
     from omnigent.hermes_native_forwarder import clear_hermes_bridge_state
+    from omnigent.hermes_native_status import clear_hermes_status_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
     clear_hermes_bridge_state(bridge_dir)
+    # Likewise drop the idle poster state so a stale posted-count from a prior
+    # terminal can't make the new forwarder skip (or re-fire) the
+    # ``external_session_status: idle`` parent-wake edge.
+    clear_hermes_status_state(bridge_dir)
 
     # Write a per-session HERMES_HOME with the Omnigent policy hook so the
     # native TUI evaluates tool calls against Omnigent policies.
