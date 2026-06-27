@@ -473,6 +473,66 @@ def test_pick_local_port_falls_back_when_preferred_taken() -> None:
             verify.bind(("127.0.0.1", chosen))
 
 
+def test_pinned_local_port_env_over_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``OMNIGENT_LOCAL_PORT`` wins over ``local_server_port`` in config.yaml."""
+    (tmp_path / "config.yaml").write_text("local_server_port: 51835\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+
+    monkeypatch.delenv("OMNIGENT_LOCAL_PORT", raising=False)
+    assert local_server.pinned_local_port() == 51835
+
+    monkeypatch.setenv("OMNIGENT_LOCAL_PORT", "60123")
+    assert local_server.pinned_local_port() == 60123
+
+
+def test_pinned_local_port_ignores_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Non-numeric / out-of-range pins are treated as unpinned (``None``)."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))  # no config.yaml
+    for bad in ("notaport", "0", "99999", "-1"):
+        monkeypatch.setenv("OMNIGENT_LOCAL_PORT", bad)
+        assert local_server.pinned_local_port() is None, bad
+
+
+def test_pick_local_port_pinned_returns_when_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a pin set and free, ``pick_local_port()`` returns exactly it."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        free_port = int(probe.getsockname()[1])
+    monkeypatch.setenv("OMNIGENT_LOCAL_PORT", str(free_port))
+
+    assert local_server.pick_local_port() == free_port
+
+
+def test_pick_local_port_pinned_but_busy_raises_no_random(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A busy pinned port fails loud rather than wandering to a random one.
+
+    This is the contract the user asked for: a stable URL or a clear error,
+    never a silent fallback that breaks bookmarks.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        busy_port = int(taken.getsockname()[1])
+        monkeypatch.setenv("OMNIGENT_LOCAL_PORT", str(busy_port))
+
+        with pytest.raises(click.ClickException, match="refusing to start"):
+            local_server.pick_local_port()
+
+
 def test_register_then_clear_local_server_round_trip(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
