@@ -2833,6 +2833,12 @@ def _assert_server_port_bindable(host: str, port: int) -> None:
         "ignored with a warning if an admin already exists."
     ),
 )
+@click.option(
+    "--reload",
+    is_flag=True,
+    default=False,
+    help="Enable auto-reload on code changes (development only).",
+)
 @click.pass_context
 def server(
     ctx: click.Context,
@@ -2845,6 +2851,7 @@ def server(
     agent_dirs: tuple[str, ...],
     auto_open: bool,
     admin_password: str | None,
+    reload: bool,
 ) -> None:
     """Start the Omnigent server in the foreground, or manage the background server.
 
@@ -2875,6 +2882,9 @@ def server(
         from ``--admin-password``, e.g. ``"hunter2"``. Folded into the
         ``OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`` env var that
         bootstrap reads; ``None`` leaves the env var untouched.
+    :param reload: When ``True``, run uvicorn with hot-reload enabled.
+        The app is passed as an import-string factory so uvicorn can
+        re-import it on each code change. Development only.
     :returns: None.
     """
     if ctx.invoked_subcommand is not None:
@@ -3174,6 +3184,8 @@ def server(
     click.echo(f"Starting omnigent server on {host}:{port}")
     click.echo(f"  database:  {db_uri}")
     click.echo(f"  artifacts: {art_loc}")
+    if reload:
+        click.echo("  reload:    enabled (watching for code changes)")
     # A foreground server streams uvicorn logs to this terminal, but the
     # always-on diagnostics (omnigent.* loggers, captured warnings) also land
     # in a persistent per-invocation file — point at it so there's a concrete
@@ -3223,14 +3235,46 @@ def server(
         # sig mismatch.
         register_local_server(port)
     try:
-        uvicorn.run(
-            app,
-            host=host,
-            port=port,
-            log_config=_server_uvicorn_log_config(),
-            ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-            timeout_graceful_shutdown=_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
-        )
+        if reload:
+            import json as _json
+
+            # Serialize resolved config into an env var so the reload
+            # factory (omnigent.server._reload_entry:create_app) can
+            # reconstruct the app without re-parsing CLI flags.
+            _reload_cfg = {
+                "db_uri": db_uri,
+                "artifact_location": art_loc,
+                "execution_timeout": effective_timeout,
+                "agent_dirs": list(agent_dirs),
+                "runner_tunnel_token": _tunnel_token,
+                "config": cfg,
+            }
+            os.environ["_OMNIGENT_RELOAD_CONFIG"] = _json.dumps(_reload_cfg)
+
+            # Point reload_dirs at the omnigent package so file edits
+            # anywhere in the source tree trigger a restart.
+            _omnigent_pkg_dir = str(Path(__file__).resolve().parent)
+
+            uvicorn.run(
+                "omnigent.server._reload_entry:create_app",
+                factory=True,
+                host=host,
+                port=port,
+                reload=True,
+                reload_dirs=[_omnigent_pkg_dir],
+                log_config=_server_uvicorn_log_config(),
+                ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+                timeout_graceful_shutdown=_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+            )
+        else:
+            uvicorn.run(
+                app,
+                host=host,
+                port=port,
+                log_config=_server_uvicorn_log_config(),
+                ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+                timeout_graceful_shutdown=_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+            )
     finally:
         if _is_canonical_local_server:
             clear_local_server_record()
