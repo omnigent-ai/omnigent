@@ -157,6 +157,70 @@ describe("BlockRenderer dispatch", () => {
     expect(screen.queryByText("Thinking...")).toBeNull();
   });
 
+  it("adds subtle separation between adjacent assistant text items", async () => {
+    const items: RenderItem[] = [
+      { kind: "text", itemId: "t1", text: "First message.", final: true },
+      { kind: "text", itemId: "t2", text: "Second **markdown** message.", final: true },
+    ];
+
+    const { container } = render(
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BlockRenderer items={items} sessionStatus="idle" />
+      </FileViewerContext.Provider>,
+    );
+
+    const sections = container.querySelectorAll<HTMLElement>(
+      '[data-testid="assistant-text-section"]',
+    );
+    expect(sections).toHaveLength(2);
+    expect(sections[0]!).not.toHaveClass("mt-2");
+    expect(sections[1]!).toHaveClass("mt-2");
+    expect(screen.getByText("First message.")).toBeDefined();
+    expect(screen.getByText(/Second/)).toBeDefined();
+
+    const strong = await screen.findByText("markdown", {
+      selector: '[data-streamdown="strong"]',
+    });
+    expect(sections[1]!.contains(strong)).toBe(true);
+  });
+
+  it("does not add adjacent-text spacing across tool items", () => {
+    const items: RenderItem[] = [
+      { kind: "text", itemId: "t1", text: "Before tool.", final: true },
+      {
+        kind: "tool",
+        itemId: "fc_1",
+        execution: {
+          name: "read_file",
+          arguments: {},
+          argsSummary: "",
+          callId: "call_1",
+          agentName: "test",
+          executedBy: "server",
+          output: "ok",
+        },
+        output: "ok",
+        state: "output-available",
+        startedAt: null,
+        duration: undefined,
+      },
+      { kind: "text", itemId: "t2", text: "After tool.", final: true },
+    ];
+
+    const { container } = render(
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BlockRenderer items={items} sessionStatus="idle" />
+      </FileViewerContext.Provider>,
+    );
+
+    const sections = container.querySelectorAll<HTMLElement>(
+      '[data-testid="assistant-text-section"]',
+    );
+    expect(sections).toHaveLength(2);
+    expect(sections[0]!).not.toHaveClass("mt-2");
+    expect(sections[1]!).not.toHaveClass("mt-2");
+  });
+
   it("'See N steps' counts the whole tool run, including the streaming tail", () => {
     // While streaming, the most-recent tools render as a visible tail
     // OUTSIDE the fold. The "See N steps" label must count the whole run
