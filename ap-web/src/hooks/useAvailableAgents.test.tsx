@@ -538,9 +538,7 @@ describe("useAvailableAgents", () => {
       }),
     });
 
-    const { result } = renderHook(() => useAvailableAgents({ supersedeTemplates: true }), {
-      wrapper,
-    });
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     // Exactly one "agent-a", bound to the newer upload (ag_upload_v2). The
@@ -581,9 +579,7 @@ describe("useAvailableAgents", () => {
       }),
     });
 
-    const { result } = renderHook(() => useAvailableAgents({ supersedeTemplates: true }), {
-      wrapper,
-    });
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     // One agent-a (the template), carried with its full catalog info. No
@@ -618,57 +614,12 @@ describe("useAvailableAgents", () => {
       }),
     });
 
-    const { result } = renderHook(() => useAvailableAgents({ supersedeTemplates: true }), {
-      wrapper,
-    });
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     // Only the seeded debby; the same-named upload is shadowed (Option 1) and
     // never enriched, even though it is newer than the built-in.
     expect(result.current.data?.map((a) => a.id)).toEqual(["ag_debby"]);
-    const enrichCalls = fetchMock.mock.calls
-      .map((c) => c[0] as string)
-      .filter((u) => u.endsWith("/agent"));
-    expect(enrichCalls).toEqual([]);
-  });
-
-  it("default mode protects a user-registered template from a same-named upload", async () => {
-    // Without supersedeTemplates (the default), a user-registered template is
-    // protected just like a seeded built-in: a same-named session upload is
-    // shadowed, not surfaced. This is what Add-Subagent / Fork / Switch use so
-    // they bind the canonical registered agent (regression guard for
-    // test_add_subagent_from_dialog).
-    routeFetch({
-      [BUILTINS_URL]: mockResponse({
-        object: "list",
-        data: [
-          {
-            id: "ag_template",
-            name: "agent-a",
-            description: "the template",
-            harness: "claude-sdk",
-            builtin: false,
-            created_at: 200,
-          },
-        ],
-        has_more: false,
-      }),
-      [SCAN_URL]: mockResponse({
-        object: "list",
-        data: [
-          // A newer same-named upload — must be shadowed in the default mode.
-          { id: "conv_b", agent_id: "ag_upload_v2", agent_name: "agent-a", created_at: 300 },
-        ],
-        has_more: false,
-      }),
-    });
-
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-
-    // Only the registered template; the newer upload is dropped (protected),
-    // and never enriched.
-    expect(result.current.data?.map((a) => a.id)).toEqual(["ag_template"]);
     const enrichCalls = fetchMock.mock.calls
       .map((c) => c[0] as string)
       .filter((u) => u.endsWith("/agent"));

@@ -1247,11 +1247,7 @@ export function NewChatLandingScreen() {
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const serverUrl = getCliServerUrl();
-  // Starting a fresh session binds the NEWEST version of an agent the user has
-  // run: a same-named `omnigent run` upload supersedes a stale user-registered
-  // template. Other surfaces (Add-Subagent / Fork / Switch) keep the protected
-  // catalog and bind the canonical registered agent.
-  const { data: agents } = useAvailableAgents({ supersedeTemplates: true });
+  const { data: agents } = useAvailableAgents();
   const { data: hosts } = useHosts();
   // Sessions the caller can access, to warn when a new session would share a
   // working directory with a live one (see the conflict tooltip below).
