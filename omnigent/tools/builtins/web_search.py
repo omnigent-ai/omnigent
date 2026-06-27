@@ -4,10 +4,11 @@ Backend selection is fully determined by the agent spec:
 
 - **OpenAI model** → passthrough to OpenAI's native
   ``web_search_preview`` (server-side, uses the LLM API key).
-- **Other models** → requires ``search_provider`` in config
-  (``"google"``, ``"perplexity"``, or ``"nimble"``) with the
-  appropriate credentials. No env var fallbacks — the spec is
-  self-contained.
+- **Other models** → defaults to a **keyless DuckDuckGo** search so
+  ``web_search`` works with no configuration. For a sturdier / higher-rate
+  backend, set ``search_provider`` to ``"google"``, ``"perplexity"``, or
+  ``"nimble"`` with the appropriate credentials. No env var fallbacks — the
+  spec is self-contained.
 
 Usage in config.yaml::
 
@@ -194,21 +195,14 @@ def _search(query: str, config: dict[str, str]) -> str:
     if backend == "nimble":
         return _run_nimble(query, config)
 
-    return (
-        "web_search requires configuration for non-OpenAI models. "
-        "(For OpenAI models, web_search works automatically with no "
-        "config needed.)\n\n"
-        "Set search_provider and credentials in config.yaml:\n"
-        "  tools:\n"
-        "    builtins:\n"
-        "      - name: web_search\n"
-        "        search_provider: perplexity  # or google, nimble\n"
-        "        api_key: ${PERPLEXITY_API_KEY}\n\n"
-        "Supported backends:\n"
-        "  - google (requires api_key + engine_id)\n"
-        "  - perplexity (requires api_key)\n"
-        "  - nimble (requires api_key)"
-    )
+    if backend == "duckduckgo":
+        return _run_duckduckgo(query, config)
+
+    # No (or unrecognized) search_provider → keyless DuckDuckGo so web_search
+    # works out of the box with no credentials. Agents that want a sturdier,
+    # higher-rate backend set search_provider to google / perplexity / nimble
+    # with credentials.
+    return _run_duckduckgo(query, config)
 
 
 def _run_google(query: str, config: dict[str, str]) -> str:
@@ -267,3 +261,22 @@ def _run_nimble(query: str, config: dict[str, str]) -> str:
         return "Nimble web search requires api_key in the web_search config."
 
     return _search_nimble(query, config)
+
+
+def _run_duckduckgo(query: str, config: dict[str, str]) -> str:
+    """
+    Run a keyless DuckDuckGo HTML search.
+
+    The zero-credential default backend, so ``web_search`` works with no
+    configuration. Best-effort (the public HTML endpoint can rate-limit) —
+    for robust/high-volume search, configure a keyed backend instead.
+
+    :param query: The search query.
+    :param config: Spec-level config (unused; DuckDuckGo needs no credentials).
+    :returns: Formatted results or an error message.
+    """
+    from omnigent.tools.builtins.web_search_duckduckgo import (
+        _search_duckduckgo,
+    )
+
+    return _search_duckduckgo(query, config)
