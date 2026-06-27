@@ -187,6 +187,41 @@ describe("buildAgentBundle", () => {
     expect(yaml).toContain("      Authorization: Bearer tok_123");
   });
 
+  it("emits executor.config.profile when a profile is provided", async () => {
+    const input: AgentBundleInput = {
+      name: "db-agent",
+      harness: "claude-sdk",
+      model: "databricks-claude-opus-4-8",
+      profile: "DEFAULT",
+    };
+    const yaml = await extractConfigYaml(await buildAgentBundle(input));
+    // Nested under config: (4-space indent) — where the omnigent executor reads it.
+    expect(yaml).toContain("  config:");
+    expect(yaml).toContain("    profile: DEFAULT");
+    expect(yaml).toContain("model: databricks-claude-opus-4-8");
+  });
+
+  it("quotes a profile with special characters", async () => {
+    const input: AgentBundleInput = {
+      name: "db-agent",
+      harness: "claude-sdk",
+      model: "databricks-claude-opus-4-8",
+      profile: "my:profile",
+    };
+    const yaml = await extractConfigYaml(await buildAgentBundle(input));
+    expect(yaml).toContain('    profile: "my:profile"');
+  });
+
+  it("omits profile when not provided", async () => {
+    const input: AgentBundleInput = {
+      name: "plain-agent",
+      harness: "claude-sdk",
+      model: "claude-sonnet-4-20250514",
+    };
+    const yaml = await extractConfigYaml(await buildAgentBundle(input));
+    expect(yaml).not.toContain("profile:");
+  });
+
   it("uses different harness and model values", async () => {
     const input: AgentBundleInput = {
       name: "oai-agent",

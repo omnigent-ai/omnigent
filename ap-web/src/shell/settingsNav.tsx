@@ -6,28 +6,55 @@
 // selection is URL-driven (/settings/<section>) so the nav (in the sidebar)
 // and the content (in the outlet) stay in sync without shared state.
 
+import { useEffect, useState } from "react";
 import {
   ArchiveIcon,
   ArrowLeftIcon,
   KeyboardIcon,
   PaletteIcon,
   PanelRightOpenIcon,
+  ShieldCheckIcon,
   UserCogIcon,
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { getControlPlaneMe } from "@/lib/controlPlaneApi";
 import { cn } from "@/lib/utils";
 
-export type SettingsSectionId = "appearance" | "shortcuts" | "account" | "archived";
+export type SettingsSectionId = "appearance" | "shortcuts" | "account" | "archived" | "admin";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "shortcuts",
   "account",
   "archived",
+  "admin",
 ];
+
+/**
+ * Whether to surface the control-plane Admin nav entry. Probes
+ * ``GET /v1/control-plane/me`` once: shown only for admin / contributor
+ * (consumers — and every non-control-plane deploy, where the probe 404s
+ * — get ``false``, so the entry stays hidden). The Admin PAGE itself is
+ * always routable and self-gates; this only governs the nav affordance.
+ */
+function useShowAdminNav(): boolean {
+  const [show, setShow] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const result = await getControlPlaneMe();
+      if (cancelled) return;
+      setShow(result.ok && (result.me.role === "admin" || result.me.role === "contributor"));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return show;
+}
 
 interface SettingsNavItem {
   id: SettingsSectionId;
@@ -35,6 +62,12 @@ interface SettingsNavItem {
   icon: typeof PaletteIcon;
   /** Hide this item on mobile (e.g. keyboard shortcuts on a touch device). */
   hideOnMobile?: boolean;
+  /**
+   * Override the navigation target. Settings sections route to
+   * ``/settings/<id>``; the Admin entry instead links to the top-level
+   * ``/admin`` route (it's a full page outside the settings outlet).
+   */
+  to?: string;
 }
 
 interface SettingsNavGroup {
@@ -42,8 +75,14 @@ interface SettingsNavGroup {
   items: SettingsNavItem[];
 }
 
-/** Nav groups for the current deploy — the Account section is auth-gated. */
-export function settingsNavGroups(accountsEnabled: boolean): SettingsNavGroup[] {
+/**
+ * Nav groups for the current deploy — the Account section is auth-gated,
+ * and the Admin entry is gated on the control-plane probe (``showAdmin``).
+ */
+export function settingsNavGroups(
+  accountsEnabled: boolean,
+  showAdmin: boolean,
+): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
@@ -53,13 +92,22 @@ export function settingsNavGroups(accountsEnabled: boolean): SettingsNavGroup[] 
     // on accounts deploys.
     general.unshift({ id: "account", label: "Account", icon: UserCogIcon });
   }
-  return [
+  const groups: SettingsNavGroup[] = [
     { title: "General", items: general },
     {
       title: "Archived",
       items: [{ id: "archived", label: "Archived sessions", icon: ArchiveIcon }],
     },
   ];
+  if (showAdmin) {
+    // Admin is its own group with a link out to the /admin page (the GTM
+    // control-plane surface), shown only for admin / contributor.
+    groups.push({
+      title: "Admin",
+      items: [{ id: "admin", label: "Admin", icon: ShieldCheckIcon, to: "/admin" }],
+    });
+  }
+  return groups;
 }
 
 /**
@@ -99,8 +147,10 @@ export function SettingsSidebarBody({
 }) {
   const info = useServerInfo();
   const accountsEnabled = info !== "loading" && info.accounts_enabled;
+  const showAdmin = useShowAdminNav();
   const { section } = useSettingsRoute();
-  const groups = settingsNavGroups(accountsEnabled);
+  const pathname = useLocation().pathname;
+  const groups = settingsNavGroups(accountsEnabled, showAdmin);
 
   return (
     <>
@@ -141,7 +191,10 @@ export function SettingsSidebarBody({
             </h2>
             {group.items.map((item) => {
               const Icon = item.icon;
-              const selected = section === item.id;
+              // Items with an explicit `to` (e.g. Admin → /admin) live outside
+              // the /settings/<section> space, so match on the pathname; the
+              // rest are section-driven.
+              const selected = item.to ? pathname === item.to : section === item.id;
               return (
                 <Button
                   key={item.id}
@@ -154,7 +207,7 @@ export function SettingsSidebarBody({
                   )}
                 >
                   <Link
-                    to={`/settings/${item.id}`}
+                    to={item.to ?? `/settings/${item.id}`}
                     onClick={onNavClick}
                     data-testid={`settings-nav-${item.id}`}
                     aria-current={selected ? "page" : undefined}

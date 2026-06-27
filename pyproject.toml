@@ -305,7 +305,10 @@ timeout_method = "thread"
 # with ``ModuleNotFoundError: No module named 'omnigent_client'``
 # unless the SDKs are installed editable into the venv. Listing
 # both relative paths here keeps the test suite self-contained.
-pythonpath = [".", "sdks/python-client", "sdks/ui"]
+# ``deploy/databricks/src`` is on the path so the control-plane tests
+# (``tests/control_plane/``) can import the ``control_plane`` package
+# that ships in the Databricks Apps source bundle.
+pythonpath = [".", "sdks/python-client", "sdks/ui", "deploy/databricks/src"]
 markers = [
     "live: end-to-end tests requiring real LLM API key (run with --llm-api-key)",
     "live_app: end-to-end tests requiring a deployed Databricks App server",
@@ -408,7 +411,10 @@ ignore = [
 # omnigent.onboarding.internal_beta) would be reclassified as third-party
 # there, demanding a different import order per checkout. Pinning the
 # package name keeps one canonical order everywhere.
-known-first-party = ["omnigent"]
+# ``control_plane`` is the deploy/databricks self-managed governance
+# package (deploy/databricks/src/control_plane); pin it first-party so its
+# imports sort with omnigent's, not as third-party.
+known-first-party = ["omnigent", "control_plane"]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests legitimately accept parameters they don't use (pytest fixtures,

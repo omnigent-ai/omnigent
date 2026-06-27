@@ -521,9 +521,12 @@ function mockHosts(hosts: Host[]) {
   } as unknown as ReturnType<typeof useHosts>);
 }
 
-function mockAgents(agents: AvailableAgent[]) {
+// Accept fixtures without the `origin` field (these tests predate it) and
+// default it to "builtin" so existing fixtures don't each need editing.
+type AgentFixture = Omit<AvailableAgent, "origin"> & { origin?: AvailableAgent["origin"] };
+function mockAgents(agents: AgentFixture[]) {
   useAvailableAgentsMock.mockReturnValue({
-    data: agents,
+    data: agents.map((a) => ({ origin: "builtin", ...a })),
   } as unknown as ReturnType<typeof useAvailableAgents>);
 }
 
@@ -714,6 +717,53 @@ describe("NewChatLandingScreen", () => {
     expect(cursor.compareDocumentPosition(pi) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(pi.compareDocumentPosition(kiro) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(kiro.compareDocumentPosition(polly) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("shows a Remove button only for custom agents, and removing deletes the owning session", async () => {
+    mockAgents([
+      // A built-in: no Remove affordance.
+      {
+        id: "a_builtin",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+        origin: "builtin",
+      },
+      // A custom (session-scoped) agent the caller created: removable.
+      {
+        id: "a_custom",
+        name: "my-custom",
+        display_name: "my-custom",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+        origin: "custom",
+        sessionId: "conv_src_1",
+      },
+    ]);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    try {
+      renderLanding();
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+      // Built-in has no remove button; custom does.
+      expect(screen.queryByTestId("new-chat-landing-agent-remove-a_builtin")).toBeNull();
+      const removeBtn = screen.getByTestId("new-chat-landing-agent-remove-a_custom");
+
+      authenticatedFetchMock.mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      fireEvent.click(removeBtn);
+
+      // Deletes the owning session via DELETE /v1/sessions/{sessionId}.
+      await waitFor(() =>
+        expect(authenticatedFetchMock).toHaveBeenCalledWith(
+          expect.stringContaining("/v1/sessions/conv_src_1"),
+          expect.objectContaining({ method: "DELETE" }),
+        ),
+      );
+    } finally {
+      confirmSpy.mockRestore();
+    }
   });
 
   it("seeds the working directory from the host's most-recent path", async () => {
@@ -1381,7 +1431,7 @@ describe("NewChatLandingScreen skills menu", () => {
   });
 
   /** A non-native agent carrying two bundled skills. */
-  function skilledAgent(): AvailableAgent {
+  function skilledAgent(): AgentFixture {
     return {
       id: "ag_skilled",
       name: "skilled-agent",
@@ -1487,7 +1537,7 @@ describe("NewChatLandingScreen skill pills", () => {
   });
 
   /** Debby — allowlisted for pills, carrying two bundled skills. */
-  function debbyAgent(): AvailableAgent {
+  function debbyAgent(): AgentFixture {
     return {
       id: "ag_debby",
       name: "debby",

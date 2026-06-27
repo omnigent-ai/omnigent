@@ -29,6 +29,12 @@ const InboxPage = lazy(() => import("@/pages/InboxPage").then((m) => ({ default:
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
+// Admin route is ALWAYS registered (unlike the accounts pages), regardless of
+// the /v1/info probe — the GTM control plane is a separate deploy-layer wrapper,
+// not gated by accounts auth. The page itself probes GET /v1/control-plane/me
+// and renders a graceful "not available" / consumer state when the control
+// plane isn't present, so the OSS build is unaffected.
+const AdminPage = lazy(() => import("@/pages/AdminPage").then((m) => ({ default: m.AdminPage })));
 
 interface AppProps {
   /**
@@ -130,6 +136,10 @@ function App({ basename }: AppProps = {}) {
               defaults to Appearance. */}
           <Route path={`${prefix}/settings`} element={<SettingsPage />} />
           <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
+          {/* Admin: always registered (the page self-gates on the control-plane
+              /me probe), so a Databricks Apps deploy surfaces it while every
+              other build shows the graceful "not available" state. */}
+          <Route path={`${prefix}/admin`} element={<AdminPage />} />
           {info.accounts_enabled && (
             <>
               <Route path={`${prefix}/members`} element={<MembersPage />} />

@@ -33,6 +33,7 @@ function agent(overrides: Partial<AvailableAgent> = {}): AvailableAgent {
     description: null,
     harness: null,
     skills: [],
+    origin: "builtin",
     ...overrides,
   };
 }

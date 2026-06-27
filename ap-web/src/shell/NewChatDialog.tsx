@@ -16,6 +16,7 @@ import {
   PlusIcon,
   SearchIcon,
   TagIcon,
+  Trash2Icon,
   TriangleAlertIcon,
   XIcon,
 } from "lucide-react";
@@ -67,7 +68,7 @@ import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { Conversation } from "@/hooks/useConversations";
-import { useProjects, PROJECT_LABEL_KEY } from "@/hooks/useConversations";
+import { useProjects, PROJECT_LABEL_KEY, deleteConversation } from "@/hooks/useConversations";
 import { OttoEyes } from "@/components/OttoEyes";
 import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
@@ -1494,6 +1495,9 @@ export function NewChatLandingScreen() {
           description: pendingAgent.description ?? null,
           harness: pendingAgent.harness ?? null,
           skills: [],
+          // A pending custom agent isn't persisted yet — no sessionId, so the
+          // picker's Remove affordance won't show for it.
+          origin: "custom",
         } satisfies AvailableAgent)
       : agentList.find((a) => a.id === effectiveAgentId);
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
@@ -1723,8 +1727,37 @@ export function NewChatLandingScreen() {
    * surfaces on hover via AgentRowTooltip, and the closed-state button
    * label (agentLabel) shows only the name.
    */
+  /**
+   * Remove a custom (session-scoped) agent the caller created by deleting its
+   * owning session — the safe path (hard-deleting the agent row would
+   * cascade-delete session history). If the removed agent was selected, fall
+   * back to no selection. Refreshes the picker on success.
+   */
+  const removeCustomAgent = async (agent: AvailableAgent) => {
+    if (!agent.sessionId) return;
+    if (
+      !window.confirm(
+        `Remove the custom agent "${agent.display_name}"? This deletes the session it was created in and cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+    try {
+      await deleteConversation(agent.sessionId);
+      if (pickedAgentId === agent.id) setPickedAgentId(null);
+      await queryClient.invalidateQueries({ queryKey: ["available-agents"] });
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    } catch {
+      setCreateError(`Couldn't remove "${agent.display_name}". Try again.`);
+    }
+  };
+
   const renderAgentRow = (agent: AvailableAgent) => {
     const blurb = AGENT_PICKER_DESCRIPTIONS[agent.name];
+    // Custom (session-scoped) agents the caller created can be removed from
+    // here. "Remove" deletes the owning session — the safe path; hard-deleting
+    // the agent row would cascade-delete session history.
+    const canRemove = agent.origin === "custom" && !!agent.sessionId;
     return (
       <DropdownMenuItem
         key={agent.id}
@@ -1768,6 +1801,23 @@ export function NewChatLandingScreen() {
               harnessUnavailableReasonOnHost(agent.harness, harnessWarningHost),
             )}
           </Badge>
+        )}
+        {canRemove && (
+          <button
+            type="button"
+            data-testid={`new-chat-landing-agent-remove-${agent.id}`}
+            aria-label={`Remove ${agent.display_name}`}
+            title="Remove this custom agent"
+            className="ml-auto self-center rounded p-1 text-muted-foreground/60 hover:bg-destructive/10 hover:text-destructive"
+            onClick={(e) => {
+              // Don't let the click select the row / close the menu.
+              e.preventDefault();
+              e.stopPropagation();
+              void removeCustomAgent(agent);
+            }}
+          >
+            <Trash2Icon className="size-3.5" />
+          </button>
         )}
       </DropdownMenuItem>
     );
@@ -1927,6 +1977,11 @@ export function NewChatLandingScreen() {
       // loads from the session id and never reads the sidebar cache.
       void queryClient.refetchQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
+      // A just-created custom agent mints a new session-scoped agent row; drop
+      // the picker's agent cache so it's immediately discoverable for reuse
+      // (otherwise the 30s staleTime hides it). Cheap and fixes "can't reuse
+      // the agent I just created".
+      void queryClient.invalidateQueries({ queryKey: ["available-agents"] });
       const initialPrompt = sanitizeInitialPrompt(message);
       // A first message matching one of the agent's bundled skills is
       // handed off as a structured invocation so ChatPage auto-sends it

@@ -171,6 +171,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "claude-native",
         skills: [],
+        origin: "builtin",
       },
       {
         id: "ag_pi_native",
@@ -179,6 +180,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "pi-native",
         skills: [],
+        origin: "builtin",
       },
       {
         id: "ag_kiro_native",
@@ -187,6 +189,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "kiro-native",
         skills: [],
+        origin: "builtin",
       },
       {
         id: "ag_agy_native",
@@ -195,6 +198,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "antigravity-native",
         skills: [],
+        origin: "builtin",
       },
       {
         id: "ag_opencode_native",
@@ -203,6 +207,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "opencode-native",
         skills: [],
+        origin: "builtin",
       },
       {
         id: "ag_nessie",
@@ -211,6 +216,7 @@ describe("useAvailableAgents", () => {
         description: "Multi-agent coding orchestrator.",
         harness: "nessie",
         skills: [{ name: "review-pr", description: "Review a pull request" }],
+        origin: "builtin",
       },
       {
         id: "ag_debby",
@@ -219,6 +225,7 @@ describe("useAvailableAgents", () => {
         description: "A two-headed brainstorming partner.",
         harness: "claude-sdk",
         skills: [],
+        origin: "builtin",
       },
       {
         id: "ag_yaml",
@@ -227,6 +234,7 @@ describe("useAvailableAgents", () => {
         description: "A coding agent",
         harness: "codex",
         skills: [],
+        origin: "builtin",
       },
     ]);
   });
@@ -360,6 +368,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "claude-native",
         skills: [],
+        origin: "builtin",
       },
       {
         id: "ag_doc",
@@ -368,6 +377,8 @@ describe("useAvailableAgents", () => {
         description: "Documentation specialist",
         harness: "claude-sdk",
         skills: [{ name: "humanizer", description: "Remove AI writing patterns" }],
+        origin: "custom",
+        sessionId: "conv_3",
       },
     ]);
     // The enrich fetch ran once, against the newest session the agent
@@ -422,6 +433,7 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "kiro-native",
         skills: [],
+        origin: "builtin",
       },
     ]);
   });
@@ -483,6 +495,8 @@ describe("useAvailableAgents", () => {
         description: "Elise's agent",
         harness: "claude-sdk",
         skills: [],
+        origin: "custom",
+        sessionId: "conv_new",
       },
       {
         id: "ag_doc",
@@ -491,6 +505,8 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "codex",
         skills: [],
+        origin: "custom",
+        sessionId: "conv_doc",
       },
     ]);
   });
@@ -538,6 +554,8 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: null,
         skills: [],
+        origin: "custom",
+        sessionId: "conv_3",
       },
     ]);
   });

@@ -215,6 +215,29 @@ try:
         auth_provider=auth_provider,
     )
 
+    # ── GTM control plane ─────────────────────────────────────
+    #
+    # Layer the self-managed governance plane (three-tier roles,
+    # per-agent visibility, delegated registration, single
+    # request-layer enforcement point, per-agent usage) IN FRONT OF
+    # the upstream server — no fork of omnigent/. This adds one HTTP
+    # middleware (outermost, so every request passes through it) and
+    # mounts the /v1/control-plane router. New tables are additive
+    # (created idempotently on the same Lakebase DB); the upstream
+    # Alembic chain is untouched. See deploy/databricks/src/control_plane/.
+    from control_plane.wiring import attach_control_plane
+
+    attach_control_plane(
+        app,
+        db_uri=DB_URI,
+        agent_store=agent_store,
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+        auth_provider=auth_provider,
+        agent_cache=agent_cache,
+        artifact_store=artifact_store,
+    )
+
     if __name__ == "__main__":
         logger.info("Starting omnigent on 0.0.0.0:%d", PORT)
         uvicorn.run(app, host="0.0.0.0", port=PORT)

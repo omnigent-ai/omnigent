@@ -569,11 +569,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--target",
-        default="prod",
+        required=True,
         help=(
             "DAB target from databricks.yml selecting the destination "
-            "workspace, e.g. 'prod'. The authenticating identity "
-            "(--profile or env) must belong to the target's workspace."
+            "workspace, e.g. 'prod'. Required — the 'prod' target "
+            "ships a placeholder host, so defaulting to it would deploy nowhere. "
+            "The authenticating identity (--profile or env) must belong to the "
+            "target's workspace."
         ),
     )
     parser.add_argument(
@@ -798,6 +800,71 @@ def _ensure_app_sp_uc_traversal(
         )
 
 
+def _ensure_app_sp_workspace_admin(
+    args: argparse.Namespace,
+    app_sp_application_id: str | None,
+) -> None:
+    """Add the app service principal to the workspace ``admins`` group.
+
+    The control plane resolves a caller's SCIM groups via the app SP's
+    ``WorkspaceClient().users.list(...)``. Databricks only returns the
+    ``groups`` sub-attribute of *other* users to a workspace-ADMIN caller, so
+    without this grant group-derived roles silently fall back to ``consumer``
+    (only ``OMNIGENT_CP_ADMIN_USERS`` would confer admin). Adding the SP to
+    ``admins`` gives it the directory read it needs. Idempotent — re-adding an
+    existing member is a no-op.
+
+    Requires the deployer to be a workspace admin. Skipped (with a warning)
+    if the SP isn't resolved or the grant can't be applied, so a non-admin
+    deploy still succeeds — group resolution just stays inert until granted.
+    """
+    if not app_sp_application_id:
+        _log("app SP not resolved yet; skipping workspace-admin grant")
+        return
+    try:
+        from databricks.sdk import WorkspaceClient
+        from databricks.sdk.service import iam
+
+        wc = WorkspaceClient(profile=args.profile) if args.profile else WorkspaceClient()
+        sps = list(
+            wc.service_principals.list(filter=f'applicationId eq "{app_sp_application_id}"')
+        )
+        if not sps or not sps[0].id:
+            _log(f"could not resolve SCIM id for app SP {app_sp_application_id}; skipping")
+            return
+        sp_scim_id = sps[0].id
+        groups = list(wc.groups.list(filter='displayName eq "admins"'))
+        if not groups or not groups[0].id:
+            _log("workspace 'admins' group not found; skipping SP admin grant")
+            return
+        admins_gid = groups[0].id
+        # Idempotent: if already a member, skip the PATCH. groups.list does not
+        # expand the members attribute, so fetch the full group to check.
+        admins_group = wc.groups.get(admins_gid)
+        already = any((m.value == sp_scim_id) for m in (admins_group.members or []))
+        if already:
+            _log(f"app SP {app_sp_application_id} already in workspace 'admins'; ok")
+            return
+        _log(f"adding app SP {app_sp_application_id} to workspace 'admins' (SCIM group-read)")
+        wc.groups.patch(
+            id=admins_gid,
+            operations=[
+                iam.Patch(
+                    op=iam.PatchOp.ADD,
+                    path="members",
+                    value=[{"value": sp_scim_id}],
+                )
+            ],
+            schemas=[iam.PatchSchema.URN_IETF_PARAMS_SCIM_API_MESSAGES_2_0_PATCH_OP],
+        )
+    except Exception as exc:  # noqa: BLE001 — non-fatal: deploy still works, groups stay inert
+        _log(
+            f"WARNING: could not add app SP to workspace 'admins' ({exc}). "
+            "Group-derived roles will be inert until the SP has workspace-admin "
+            "SCIM read; OMNIGENT_CP_ADMIN_USERS still bootstraps admins."
+        )
+
+
 def main() -> int:
     args = _parse_args()
     _clear_env_vars()
@@ -920,6 +987,11 @@ def main() -> int:
     # 7) Grant the app SP USE_CATALOG + USE_SCHEMA on the volume's
     # parents (Apps' uc_securable resource only grants the leaf).
     _ensure_app_sp_uc_traversal(args, app.service_principal_client_id)
+
+    # 8) Add the app SP to the workspace 'admins' group so it can read SCIM
+    # group membership (control-plane group-derived roles). Idempotent;
+    # non-fatal if the deployer lacks rights.
+    _ensure_app_sp_workspace_admin(args, app.service_principal_client_id)
 
     if not args.no_smoke_check:
         if not app_url:

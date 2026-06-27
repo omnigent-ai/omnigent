@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { PlusIcon, TrashIcon } from "lucide-react";
+import { CheckIcon, PlugZapIcon, PlusIcon, TrashIcon, XIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -18,7 +18,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
-import type { AgentBundleInput, MCPServerInput } from "@/lib/agentBundle";
+import { buildAgentBundle, type AgentBundleInput, type MCPServerInput } from "@/lib/agentBundle";
+import { validateAgentBundle, type AgentTestResult } from "@/lib/controlPlaneApi";
 
 /**
  * Harness options for the picker. "default" uses the server's default
@@ -126,8 +127,13 @@ export function CreateAgentDialog({
   const [instructions, setInstructions] = useState("");
   const [harness, setHarness] = useState(HARNESS_OPTIONS[0].value);
   const [model, setModel] = useState("");
+  const [profile, setProfile] = useState("");
   const [mcpEntries, setMcpEntries] = useState<MCPFormEntry[]>([]);
   const [nextKey, setNextKey] = useState(0);
+  // Smoke-test (dry-run bundle validation) state.
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<AgentTestResult | null>(null);
+  const [testError, setTestError] = useState<string | null>(null);
 
   function reset() {
     setName("");
@@ -135,8 +141,46 @@ export function CreateAgentDialog({
     setInstructions("");
     setHarness(HARNESS_OPTIONS[0].value);
     setModel("");
+    setProfile("");
     setMcpEntries([]);
     setNextKey(0);
+    setTesting(false);
+    setTestResult(null);
+    setTestError(null);
+  }
+
+  /** Build the bundle input from the current form (shared by Test + Create). */
+  function currentInput(): AgentBundleInput {
+    return {
+      name: name.trim(),
+      description: description.trim() || undefined,
+      instructions: instructions.trim() || undefined,
+      harness,
+      model: model.trim(),
+      profile: profile.trim() || undefined,
+      mcpServers: toMCPInputs(mcpEntries),
+    };
+  }
+
+  /** Dry-run preflight: build the bundle and validate it server-side without
+   *  creating anything. Advisory — does not block Create. */
+  async function handleTest() {
+    setTesting(true);
+    setTestResult(null);
+    setTestError(null);
+    try {
+      const bundle = await buildAgentBundle(currentInput());
+      const res = await validateAgentBundle(bundle);
+      if (res.ok) setTestResult(res.result);
+      else if (res.status === 404) {
+        // Control plane absent (OSS / non-Apps deploy) — validation is optional.
+        setTestError("Bundle test isn't available in this deployment.");
+      } else setTestError(res.error);
+    } catch {
+      setTestError("Could not build or test the agent bundle.");
+    } finally {
+      setTesting(false);
+    }
   }
 
   function handleOpenChange(next: boolean) {
@@ -161,14 +205,7 @@ export function CreateAgentDialog({
     const trimmedName = name.trim();
     if (!trimmedName) return;
 
-    onCreate({
-      name: trimmedName,
-      description: description.trim() || undefined,
-      instructions: instructions.trim() || undefined,
-      harness,
-      model: model.trim(),
-      mcpServers: toMCPInputs(mcpEntries),
-    });
+    onCreate(currentInput());
     reset();
     onOpenChange(false);
   }
@@ -257,6 +294,32 @@ export function CreateAgentDialog({
             />
           </div>
 
+          {/* Databricks profile — routes a databricks-* model through the
+              gateway. Required for databricks-* models; optional otherwise. */}
+          <div className="flex flex-col gap-1.5">
+            <label
+              htmlFor="create-agent-profile"
+              className="text-xs font-medium text-muted-foreground"
+            >
+              Databricks profile
+              {model.trim().startsWith("databricks-") && (
+                <span className="text-destructive"> *</span>
+              )}
+            </label>
+            <Input
+              id="create-agent-profile"
+              data-testid="create-agent-profile"
+              value={profile}
+              onChange={(e) => setProfile(e.target.value)}
+              placeholder="e.g. DEFAULT"
+            />
+            <span className="text-[11px] text-muted-foreground">
+              {model.trim().startsWith("databricks-")
+                ? "Required: a databricks-* model routes through the Databricks gateway. Use a ~/.databrickscfg profile name (leave blank to use the deployment's ambient credentials)."
+                : "Optional. Databricks CLI profile (~/.databrickscfg) for gateway-routed models. Leave blank for non-databricks models."}
+            </span>
+          </div>
+
           {/* Instructions / System Prompt */}
           <div className="flex flex-col gap-1.5">
             <label
@@ -302,9 +365,61 @@ export function CreateAgentDialog({
           </div>
         </div>
 
+        {/* Smoke-test result (dry-run bundle validation). Advisory: shown
+            above the footer; Create stays enabled regardless. */}
+        {(testResult !== null || testError !== null) && (
+          <div
+            data-testid="create-agent-test-result"
+            className="rounded-md border border-border px-3 py-2 text-sm"
+          >
+            {testError !== null ? (
+              <div className="flex items-start gap-2 text-destructive">
+                <XIcon className="mt-0.5 size-4 shrink-0" />
+                <span>{testError}</span>
+              </div>
+            ) : testResult ? (
+              <div className="flex flex-col gap-1">
+                <div className="font-medium">
+                  {testResult.ok ? "✓ Bundle looks valid." : "✗ Bundle has problems."}
+                </div>
+                {(testResult.harness || testResult.model) && (
+                  <div className="text-xs text-muted-foreground">
+                    harness: {testResult.harness ?? "—"} · model: {testResult.model ?? "unset"}
+                  </div>
+                )}
+                <ul className="flex flex-col gap-1">
+                  {testResult.checks.map((c) => (
+                    <li key={c.name} className="flex items-start gap-2">
+                      {c.ok ? (
+                        <CheckIcon className="mt-0.5 size-4 shrink-0 text-green-600" />
+                      ) : (
+                        <XIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
+                      )}
+                      <span>
+                        <span className="font-medium">{c.name}</span>
+                        {c.detail ? (
+                          <span className="text-muted-foreground"> — {c.detail}</span>
+                        ) : null}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+          </div>
+        )}
+
         <DialogFooter>
           <Button variant="ghost" onClick={() => handleOpenChange(false)}>
             Cancel
+          </Button>
+          <Button
+            variant="outline"
+            data-testid="create-agent-test"
+            onClick={() => void handleTest()}
+            disabled={!canSubmit || testing}
+          >
+            <PlugZapIcon /> {testing ? "Testing…" : "Test"}
           </Button>
           <Button data-testid="create-agent-submit" onClick={handleSubmit} disabled={!canSubmit}>
             Create

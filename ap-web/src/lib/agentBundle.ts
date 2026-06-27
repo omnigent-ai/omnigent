@@ -31,6 +31,14 @@ export interface AgentBundleInput {
   harness: string;
   /** Model identifier, e.g. "claude-sonnet-4-20250514". Required by the omnigent executor. */
   model: string;
+  /**
+   * Databricks CLI profile (a `~/.databrickscfg` section name) routing the
+   * model through the Databricks gateway. Required for a `databricks-*` model
+   * — without it the claude-sdk executor fails ("gateway routing is
+   * disabled"). Emitted as `executor.config.profile`. Leave unset to use the
+   * deployment's ambient credentials (a non-`databricks-*` model needs none).
+   */
+  profile?: string;
   /** MCP server declarations to include as inline tools entries. */
   mcpServers?: MCPServerInput[];
 }
@@ -56,6 +64,13 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
   lines.push(`  model: ${input.model}`);
   lines.push("  config:");
   lines.push(`    harness: ${input.harness}`);
+  // Databricks workspace profile (~/.databrickscfg section) → the omnigent
+  // executor reads executor.config.profile to route through the gateway.
+  // 4-space indent nests it under `config:`. Conditional so specs without a
+  // profile stay byte-for-byte unchanged.
+  if (input.profile) {
+    lines.push(`    profile: ${yamlQuote(input.profile)}`);
+  }
   lines.push("");
 
   lines.push("tools:");

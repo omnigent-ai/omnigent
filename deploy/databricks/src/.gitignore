@@ -1,0 +1,5 @@
+# Deploy build artifacts — regenerated (version-stamped) by deploy.py on every
+# deploy; never committed. Only app.py / app.yaml / control_plane/ are source.
+*.whl
+pyproject.toml
+uv.lock

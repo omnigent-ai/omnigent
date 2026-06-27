@@ -23,6 +23,14 @@ export interface AvailableAgent {
   // host-discovered skills only resolve once a runner is bound, so
   // they're absent here. Empty on older servers without the field.
   skills: { name: string; description: string }[];
+  // "builtin" = from the shared catalog (GET /v1/agents); "custom" = a
+  // session-scoped agent the caller created, discovered via the session
+  // scan. Drives the picker's per-row "Remove" affordance (custom only).
+  origin: "builtin" | "custom";
+  // For custom agents: one session that binds this agent. "Removing" the
+  // custom agent deletes its owning session(s) (the safe path — hard-
+  // deleting the agent row would cascade-delete session history).
+  sessionId?: string;
 }
 
 const DISPLAY_NAMES: Record<string, string> = {
@@ -96,6 +104,7 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
       description: a.description ?? null,
       harness: a.harness ?? null,
       skills: a.skills ?? [],
+      origin: "builtin" as const,
     })),
   );
 }
@@ -165,6 +174,8 @@ async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<Availab
     description: null,
     harness: null,
     skills: [],
+    origin: "custom",
+    sessionId: scanned.sessionId,
   };
   try {
     const res = await authenticatedFetch(

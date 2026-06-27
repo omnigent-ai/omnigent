@@ -16,6 +16,13 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({ accounts_enabled: mocks.accountsEnabled }),
 }));
 
+// The Admin nav entry probes GET /v1/control-plane/me. Default to a
+// "control plane absent" failure so the entry stays hidden in these tests
+// (matching every non-Databricks-Apps deploy). A controllable mock lets the
+// active-state test resolve it to admin so the entry renders.
+const cpMe = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/controlPlaneApi", () => ({ getControlPlaneMe: cpMe }));
+
 import { SettingsSidebarBody, settingsNavGroups } from "./settingsNav";
 
 function renderBody(opts: { onNavClick?: () => void; onClose?: () => void } = {}) {
@@ -33,12 +40,14 @@ function renderBody(opts: { onNavClick?: () => void; onClose?: () => void } = {}
 
 beforeEach(() => {
   mocks.accountsEnabled = false;
+  cpMe.mockReset();
+  cpMe.mockResolvedValue({ ok: false, error: "Not found.", status: 404 });
 });
 afterEach(cleanup);
 
 describe("settingsNavGroups", () => {
   it("flags Keyboard shortcuts as hidden on mobile, but not the other items", () => {
-    const items = settingsNavGroups(false).flatMap((g) => g.items);
+    const items = settingsNavGroups(false, false).flatMap((g) => g.items);
     const shortcuts = items.find((i) => i.id === "shortcuts");
     expect(shortcuts?.hideOnMobile).toBe(true);
     for (const item of items) {
@@ -48,16 +57,28 @@ describe("settingsNavGroups", () => {
 
   it("includes Account (leading) only when accounts auth is enabled", () => {
     expect(
-      settingsNavGroups(false)
+      settingsNavGroups(false, false)
         .flatMap((g) => g.items)
         .map((i) => i.id),
     ).not.toContain("account");
-    const withAccounts = settingsNavGroups(true)
+    const withAccounts = settingsNavGroups(true, false)
       .flatMap((g) => g.items)
       .map((i) => i.id);
     expect(withAccounts).toContain("account");
     // Account leads its group — it's the most-visited section on accounts deploys.
     expect(withAccounts[0]).toBe("account");
+  });
+
+  it("includes the Admin entry (linking to /admin) only when showAdmin is true", () => {
+    expect(
+      settingsNavGroups(false, false)
+        .flatMap((g) => g.items)
+        .map((i) => i.id),
+    ).not.toContain("admin");
+    const admin = settingsNavGroups(false, true)
+      .flatMap((g) => g.items)
+      .find((i) => i.id === "admin");
+    expect(admin?.to).toBe("/admin");
   });
 });
 
@@ -83,5 +104,24 @@ describe("SettingsSidebarBody", () => {
     const { onNavClick } = renderBody();
     fireEvent.click(screen.getByTestId("settings-nav-appearance"));
     expect(onNavClick).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks the Admin nav entry active when on /admin (top-level route, not /settings/admin)", async () => {
+    // Make the control-plane probe resolve to admin so the Admin entry renders.
+    cpMe.mockResolvedValueOnce({
+      ok: true,
+      me: { user_id: "a@db.com", role: "admin", groups: [], is_platform_admin: false, capabilities: {} },
+    });
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={["/admin"]}>
+          <SettingsSidebarBody onNavClick={vi.fn()} onClose={vi.fn()} />
+        </MemoryRouter>
+      </TooltipProvider>,
+    );
+    // Entry appears after the async probe; it must be marked active on /admin
+    // (the bug was that section-only matching never highlighted /admin).
+    const admin = await screen.findByTestId("settings-nav-admin");
+    expect(admin.getAttribute("aria-current")).toBe("page");
   });
 });

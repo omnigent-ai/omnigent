@@ -26,6 +26,7 @@ const AGENTS: AvailableAgent[] = [
     description: "Claude Code agent",
     harness: "claude-native",
     skills: [],
+    origin: "builtin",
   },
   {
     id: "ag_codex",
@@ -34,6 +35,7 @@ const AGENTS: AvailableAgent[] = [
     description: null,
     harness: "codex",
     skills: [],
+    origin: "builtin",
   },
 ];
 
