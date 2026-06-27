@@ -1076,6 +1076,13 @@ class _ReaderState:
         committed ``message`` is posted (stream path only).
     :param turn_active: Whether a turn is currently considered open (a RUNNING
         edge fired and no closing IDLE edge yet).
+    :param turn_execution_id: The CURRENT turn's ``executionId`` — set from each
+        USER_INPUT step (its per-turn uuid) and held for every following step in
+        the turn. The mapper stamps it on each committed item's response_id so a
+        whole narrate→tool-call→answer turn groups into ONE assistant bubble
+        (#9). ``""`` until the first USER_INPUT is observed (e.g. a resumed
+        mid-turn snapshot whose opening USER_INPUT predates this run); the
+        mapper still produces a stable per-conversation id from it then.
     :param posted_model_enum: The last model enum already mirrored via
         ``external_model_change``. ``None`` = none posted yet.  Tracks the raw
         enum (NOT the displayName) so de-dup comparison is enum-stable.
@@ -1113,6 +1120,7 @@ class _ReaderState:
     prefixes: dict[int, str] = field(default_factory=dict)
     reasoning_prefixes: dict[int, str] = field(default_factory=dict)
     turn_active: bool = False
+    turn_execution_id: str = ""
     posted_model_enum: str | None = None
     model_catalog: dict[str, object] | None = None
     port: int = 0
@@ -1336,13 +1344,14 @@ async def _process_committed_step(
     if key not in state.seen:
         if _is_settled(step):
             state.seen.add(key)
-        state.turn_active = await _emit_step(
+        state.turn_active, state.turn_execution_id = await _emit_step(
             step,
             client=client,
             session_id=session_id,
             cascade_id=cascade_id,
             allocator=state.allocator,
             turn_active=state.turn_active,
+            turn_execution_id=state.turn_execution_id,
         )
         # Telemetry: model-change detection on USER_INPUT (design §10.4).
         await _maybe_emit_model_change(
@@ -1644,7 +1653,8 @@ async def _emit_step(
     cascade_id: str,
     allocator: _ToolCallIdAllocator,
     turn_active: bool,
-) -> bool:
+    turn_execution_id: str,
+) -> tuple[bool, str]:
     """
     Emit one new step's status edges + mapped conversation items.
 
@@ -1653,19 +1663,39 @@ async def _emit_step(
     this step closes the turn) AFTER them. Status edges fire only on a real
     transition, deduped via the ``turn_active`` flag threaded through the loop.
 
+    The turn's ``executionId`` is likewise threaded: a USER_INPUT step rebinds it
+    to that turn's per-turn uuid (:func:`_execution_discriminator`), and every
+    following step in the turn maps with it so all of a turn's committed items
+    carry ONE response_id and the SPA renders them in a single bubble (#9). A
+    USER_INPUT whose execution discriminator cannot be resolved keeps the prior
+    id rather than dropping to ``""`` mid-conversation.
+
     :param step: One new (not-yet-seen) RPC step dict.
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id to mirror into.
     :param cascade_id: agy cascade id (namespaces response/call ids).
     :param allocator: Per-run tool-call id allocator (fallback ids only).
     :param turn_active: Whether a turn is currently considered open on entry.
-    :returns: The updated ``turn_active`` flag after this step.
+    :param turn_execution_id: The current turn's ``executionId`` on entry (``""``
+        before the first USER_INPUT of the run).
+    :returns: The updated ``(turn_active, turn_execution_id)`` after this step.
     """
-    if _is_user_turn_step(step) and not turn_active:
-        turn_active = True
-        await _post_event(client, session_id, _status_event(_STATUS_RUNNING))
+    if _is_user_turn_step(step):
+        # A new user turn opens the turn-scoped response_id namespace: rebind the
+        # id to this turn so the following planner/tool steps group under it.
+        new_turn_id = _execution_discriminator(step)
+        if new_turn_id is not None:
+            turn_execution_id = new_turn_id
+        if not turn_active:
+            turn_active = True
+            await _post_event(client, session_id, _status_event(_STATUS_RUNNING))
 
-    for event in map_step_to_events(step, conversation_id=cascade_id, allocator=allocator):
+    for event in map_step_to_events(
+        step,
+        conversation_id=cascade_id,
+        turn_execution_id=turn_execution_id,
+        allocator=allocator,
+    ):
         await _post_event(client, session_id, event)
 
     if _is_turn_close_step(step) and turn_active:
@@ -1677,7 +1707,7 @@ async def _emit_step(
         close_status = _STATUS_FAILED if _step_is_error_planner(step) else _STATUS_IDLE
         await _post_event(client, session_id, _status_event(close_status))
 
-    return turn_active
+    return turn_active, turn_execution_id
 
 
 def _step_is_error_planner(step: dict[str, object]) -> bool:

@@ -40,6 +40,10 @@ from omnigent.antigravity_native_steps import (
 
 _FIXTURES = Path(__file__).parent / "fixtures" / "antigravity" / "steps"
 _CID = "test-conversation-id"
+# The current turn's ``executionId`` (the USER_INPUT step's per-turn uuid). The
+# mapper scopes every committed item's response_id to this turn id (#9), so the
+# tests drive it explicitly and assert ids of the form ``agy_<cid>_<turn>``.
+_TURN = "test-turn-exec-id"
 
 
 def _load(name: str) -> dict[str, Any]:
@@ -90,7 +94,9 @@ class TestUserInputCommitted:
     def test_user_input_commits_user_message(self) -> None:
         """USER_INPUT step → exactly one committed user ``message`` item."""
         step = _load("user_input")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
         ev = events[0]
         assert ev.event_type == "external_conversation_item"
@@ -105,13 +111,17 @@ class TestUserInputCommitted:
     def test_user_input_no_delta(self) -> None:
         """USER_INPUT commits a message but emits no streaming delta events."""
         step = _load("user_input")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         _assert_no_delta(events)
 
     def test_user_input_without_text_is_skipped(self) -> None:
         """A USER_INPUT step with no recoverable text emits nothing (no empty bubble)."""
         step = {"type": "CORTEX_STEP_TYPE_USER_INPUT", "userInput": {}}
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert events == []
 
 
@@ -131,25 +141,33 @@ class TestPlannerResponseText:
         message); the new mapper emits 1.
         """
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
 
     def test_event_type_is_conversation_item(self) -> None:
         """The single event has type ``external_conversation_item``."""
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert events[0].event_type == "external_conversation_item"
 
     def test_item_type_is_message(self) -> None:
         """The event's ``item_type`` is ``"message"``."""
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert events[0].data["item_type"] == "message"
 
     def test_message_role_is_assistant(self) -> None:
         """The ``message`` item has role ``"assistant"``."""
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
         assert item_data["role"] == "assistant"
@@ -160,7 +178,9 @@ class TestPlannerResponseText:
         fixture's ``plannerResponse.response`` text.
         """
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
         content = item_data["content"]
@@ -180,21 +200,31 @@ class TestPlannerResponseText:
         event before the message; the new mapper drops it entirely.
         """
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         _assert_no_delta(events)
 
     def test_step_index_from_fixture(self) -> None:
         """step_index on the event matches the fixture's sourceTrajectoryStepInfo.stepIndex."""
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         # planner_response_text.json has stepIndex=2
         assert events[0].step_index == 2
 
-    def test_response_id_stable(self) -> None:
-        """response_id is deterministic: ``agy_<conversation_id>_<stepIndex>``."""
+    def test_response_id_is_turn_scoped(self) -> None:
+        """response_id is turn-scoped: ``agy_<conversation_id>_<turn_execution_id>``.
+
+        Keyed on the turn's ``executionId``, NOT the step's ``stepIndex`` (#9),
+        so every item in a turn shares one id and renders as a single bubble.
+        """
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        assert events[0].data["response_id"] == f"agy_{_CID}_2"
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
+        assert events[0].data["response_id"] == f"agy_{_CID}_{_TURN}"
 
 
 class TestPlannerResponseError:
@@ -210,7 +240,9 @@ class TestPlannerResponseError:
         step = _load("planner_response_text")
         step["status"] = "CORTEX_STEP_STATUS_ERROR"
         step["plannerResponse"] = {}  # no text/error detail -> generic marker
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
         ev = events[0]
         assert ev.event_type == "external_conversation_item"
@@ -226,7 +258,9 @@ class TestPlannerResponseError:
         step = _load("planner_response_text")
         step["status"] = "CORTEX_STEP_STATUS_ERROR"
         step["plannerResponse"] = {"error": "model overloaded (503)"}
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert "model overloaded (503)" in events[0].data["item_data"]["content"][0]["text"]
 
 
@@ -241,14 +275,18 @@ class TestPlannerResponseToolCallRunCommand:
     def test_returns_one_function_call(self) -> None:
         """One tool call → one ``function_call`` event."""
         step = _load("planner_response_tool_call_run_command")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
         assert events[0].data["item_type"] == "function_call"
 
     def test_function_call_name(self) -> None:
         """The function_call name matches the fixture's toolCall name."""
         step = _load("planner_response_tool_call_run_command")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
         assert item_data["name"] == "run_command"
@@ -262,7 +300,9 @@ class TestPlannerResponseToolCallRunCommand:
         """
         alloc = _allocator()
         step = _load("planner_response_tool_call_run_command")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=alloc)
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=alloc
+        )
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
         # Real agy id from the fixture
@@ -276,7 +316,9 @@ class TestPlannerResponseToolCallRunCommand:
         arguments; the real command args remain.
         """
         step = _load("planner_response_tool_call_run_command")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
         args_text = item_data["arguments"]
@@ -290,13 +332,17 @@ class TestPlannerResponseToolCallRunCommand:
     def test_no_delta_event(self) -> None:
         """No delta event is emitted for a tool-call-only PLANNER_RESPONSE."""
         step = _load("planner_response_tool_call_run_command")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         _assert_no_delta(events)
 
     def test_step_index(self) -> None:
         """step_index matches fixture stepIndex=5."""
         step = _load("planner_response_tool_call_run_command")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert events[0].step_index == 5
 
 
@@ -306,14 +352,18 @@ class TestPlannerResponseToolCallAskQuestion:
     def test_returns_one_function_call(self) -> None:
         """One ask_question tool call → one ``function_call`` event."""
         step = _load("planner_response_tool_call_ask_question")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
         assert events[0].data["item_type"] == "function_call"
 
     def test_function_call_name(self) -> None:
         """The function_call name is ``ask_question``."""
         step = _load("planner_response_tool_call_ask_question")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
         assert item_data["name"] == "ask_question"
@@ -326,7 +376,9 @@ class TestPlannerResponseToolCallAskQuestion:
         """
         alloc = _allocator()
         step = _load("planner_response_tool_call_ask_question")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=alloc)
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=alloc
+        )
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
         assert item_data["call_id"] == "jfizoalt"
@@ -344,19 +396,25 @@ class TestRunCommandDone:
     def test_returns_one_event(self) -> None:
         """One DONE run_command → one event."""
         step = _load("run_command_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
 
     def test_event_type_is_conversation_item(self) -> None:
         """event_type is ``external_conversation_item``."""
         step = _load("run_command_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert events[0].event_type == "external_conversation_item"
 
     def test_item_type_is_function_call_output(self) -> None:
         """item_type is ``function_call_output``."""
         step = _load("run_command_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert events[0].data["item_type"] == "function_call_output"
 
     def test_output_from_combined_output_full(self) -> None:
@@ -366,7 +424,9 @@ class TestRunCommandDone:
         The fixture has ``combinedOutput.full = '/Users/bryanli/...scratch\\n'``.
         """
         step = _load("run_command_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
         assert item_data["output"] == "/Users/bryanli/.gemini/antigravity-cli/scratch\n"
@@ -381,7 +441,9 @@ class TestRunCommandDone:
         """
         step = _load("run_command_done")
         alloc = _allocator()
-        events = map_step_to_events(step, conversation_id=_CID, allocator=alloc)
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=alloc
+        )
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
         assert item_data["call_id"] == "cbawg2v8"
@@ -391,7 +453,9 @@ class TestRunCommandDone:
     def test_step_index(self) -> None:
         """step_index matches fixture stepIndex=6."""
         step = _load("run_command_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert events[0].step_index == 6
 
 
@@ -412,13 +476,17 @@ class TestRunCommandWaiting:
     def test_waiting_emits_no_output_event(self) -> None:
         """WAITING run_command → empty list (no function_call_output)."""
         step = _load("run_command_waiting")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert events == []
 
     def test_waiting_no_delta(self) -> None:
         """No delta event from a WAITING run_command."""
         step = _load("run_command_waiting")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         _assert_no_delta(events)
 
 
@@ -439,14 +507,18 @@ class TestRunCommandError:
     def test_error_emits_one_output_event(self) -> None:
         """A failed (ERROR-status) run_command emits one function_call_output."""
         step = _load("run_command_error")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
         assert events[0].data["item_type"] == "function_call_output"
 
     def test_error_output_keyed_on_real_id(self) -> None:
         """The error output pairs by the real agy id (matches the invocation)."""
         step = _load("run_command_error")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         item_data = cast(dict[str, Any], events[0].data["item_data"])
         # Fixture carries toolCall.id="cbawg2v8" — the same id the planner
         # invocation emits, so the pair correlates.
@@ -455,7 +527,9 @@ class TestRunCommandError:
     def test_error_output_text_is_nonempty_marker(self) -> None:
         """The output is a non-empty error marker mentioning the ERROR status."""
         step = _load("run_command_error")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         item_data = cast(dict[str, Any], events[0].data["item_data"])
         output = item_data["output"]
         assert isinstance(output, str) and output
@@ -464,7 +538,9 @@ class TestRunCommandError:
     def test_error_step_index(self) -> None:
         """step_index matches fixture stepIndex=6."""
         step = _load("run_command_error")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert events[0].step_index == 6
 
 
@@ -489,7 +565,9 @@ class TestToolResultClosure:
         # Proto3 omits empty scalars: drop combinedOutput to simulate a
         # ``cd`` / ``mkdir`` / redirect that produced no captured output.
         step["runCommand"].pop("combinedOutput", None)
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
         assert events[0].data["item_type"] == "function_call_output"
         item_data = cast(dict[str, Any], events[0].data["item_data"])
@@ -503,7 +581,9 @@ class TestToolResultClosure:
         # real toolCall.id so the pair still correlates.
         step["type"] = "CORTEX_STEP_TYPE_VIEW_FILE"
         step.pop("runCommand", None)
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
         assert events[0].data["item_type"] == "function_call_output"
         item_data = cast(dict[str, Any], events[0].data["item_data"])
@@ -513,7 +593,9 @@ class TestToolResultClosure:
     def test_system_step_without_tool_id_is_skipped(self) -> None:
         """A non-tool step with no toolCall.id is NOT treated as a tool result."""
         step = _load("checkpoint")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert events == []
 
 
@@ -528,14 +610,18 @@ class TestListDirectoryDone:
     def test_returns_one_function_call_output(self) -> None:
         """DONE list_directory → one function_call_output event."""
         step = _load("list_directory_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
         assert events[0].data["item_type"] == "function_call_output"
 
     def test_call_id_is_real_agy_id(self) -> None:
         """call_id is the real agy-assigned id from metadata.toolCall.id."""
         step = _load("list_directory_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
         # Fixture carries toolCall.id="h510vxi0"
@@ -544,7 +630,9 @@ class TestListDirectoryDone:
     def test_step_index(self) -> None:
         """step_index matches fixture stepIndex=10."""
         step = _load("list_directory_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert events[0].step_index == 10
 
 
@@ -564,7 +652,9 @@ class TestAskQuestionWaiting:
     def test_waiting_emits_no_event(self) -> None:
         """WAITING ask_question → empty list."""
         step = _load("ask_question_waiting")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert events == []
 
 
@@ -579,14 +669,18 @@ class TestAskQuestionDone:
     def test_returns_function_call_output(self) -> None:
         """DONE ask_question → one function_call_output event."""
         step = _load("ask_question_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
         assert events[0].data["item_type"] == "function_call_output"
 
     def test_call_id_is_real_agy_id(self) -> None:
         """call_id is the real agy-assigned id from metadata.toolCall.id."""
         step = _load("ask_question_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
         # Fixture carries toolCall.id="jfizoalt", matching the planner invocation
@@ -595,7 +689,9 @@ class TestAskQuestionDone:
     def test_step_index(self) -> None:
         """step_index matches fixture stepIndex=12."""
         step = _load("ask_question_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert events[0].step_index == 12
 
 
@@ -610,13 +706,17 @@ class TestSystemStepsSkipped:
     def test_checkpoint_returns_empty(self) -> None:
         """CHECKPOINT step → ``[]``."""
         step = _load("checkpoint")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert events == []
 
     def test_conversation_history_returns_empty(self) -> None:
         """CONVERSATION_HISTORY step → ``[]``."""
         step = _load("conversation_history")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert events == []
 
 
@@ -643,7 +743,9 @@ class TestSlotZeroStepIndex:
         assert isinstance(traj_info, dict)
         traj_info.pop("stepIndex", None)
 
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
         assert events[0].step_index == 0
 
@@ -657,7 +759,9 @@ class TestSlotZeroStepIndex:
         assert isinstance(traj_info, dict)
         traj_info["stepIndex"] = "2"  # String form
 
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
         assert events[0].step_index == 2
 
@@ -691,7 +795,9 @@ class TestModifiedResponsePrecedence:
         planner["response"] = "Original text."
         planner["modifiedResponse"] = "Post-moderation text."
 
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
@@ -711,7 +817,9 @@ class TestModifiedResponsePrecedence:
         planner.pop("modifiedResponse", None)
         planner["response"] = "Fallback text."
 
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
@@ -730,7 +838,9 @@ class TestModifiedResponsePrecedence:
         planner["modifiedResponse"] = ""
         planner["response"] = "Non-empty response."
 
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
         assert len(events) == 1
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
@@ -763,7 +873,9 @@ class TestRealIdPairing:
         """
         alloc = _allocator()
         planner_step = _load("planner_response_tool_call_run_command")
-        planner_events = map_step_to_events(planner_step, conversation_id=_CID, allocator=alloc)
+        planner_events = map_step_to_events(
+            planner_step, conversation_id=_CID, turn_execution_id=_TURN, allocator=alloc
+        )
         assert len(planner_events) == 1
         planner_item_data = planner_events[0].data["item_data"]
         assert isinstance(planner_item_data, dict)
@@ -771,7 +883,9 @@ class TestRealIdPairing:
         assert invocation_call_id == "cbawg2v8"
 
         result_step = _load("run_command_done")
-        result_events = map_step_to_events(result_step, conversation_id=_CID, allocator=alloc)
+        result_events = map_step_to_events(
+            result_step, conversation_id=_CID, turn_execution_id=_TURN, allocator=alloc
+        )
         assert len(result_events) == 1
         result_item = result_events[0].data["item_data"]
         assert isinstance(result_item, dict)
@@ -797,7 +911,9 @@ class TestRealIdPairing:
 
         # Emit PLANNER_RESPONSE for run_command (id="cbawg2v8")
         rc_planner = _load("planner_response_tool_call_run_command")
-        rc_planner_events = map_step_to_events(rc_planner, conversation_id=_CID, allocator=alloc)
+        rc_planner_events = map_step_to_events(
+            rc_planner, conversation_id=_CID, turn_execution_id=_TURN, allocator=alloc
+        )
         assert len(rc_planner_events) == 1
         rc_item = rc_planner_events[0].data["item_data"]
         assert isinstance(rc_item, dict)
@@ -805,7 +921,9 @@ class TestRealIdPairing:
 
         # Emit PLANNER_RESPONSE for ask_question (id="jfizoalt")
         aq_planner = _load("planner_response_tool_call_ask_question")
-        aq_planner_events = map_step_to_events(aq_planner, conversation_id=_CID, allocator=alloc)
+        aq_planner_events = map_step_to_events(
+            aq_planner, conversation_id=_CID, turn_execution_id=_TURN, allocator=alloc
+        )
         assert len(aq_planner_events) == 1
         aq_item = aq_planner_events[0].data["item_data"]
         assert isinstance(aq_item, dict)
@@ -813,7 +931,9 @@ class TestRealIdPairing:
 
         # Now deliver ask_question DONE result FIRST (out of order vs run_command)
         aq_done = _load("ask_question_done")
-        aq_result_events = map_step_to_events(aq_done, conversation_id=_CID, allocator=alloc)
+        aq_result_events = map_step_to_events(
+            aq_done, conversation_id=_CID, turn_execution_id=_TURN, allocator=alloc
+        )
         assert len(aq_result_events) == 1
         aq_result_item = aq_result_events[0].data["item_data"]
         assert isinstance(aq_result_item, dict)
@@ -822,7 +942,9 @@ class TestRealIdPairing:
 
         # Then deliver run_command DONE result
         rc_done = _load("run_command_done")
-        rc_result_events = map_step_to_events(rc_done, conversation_id=_CID, allocator=alloc)
+        rc_result_events = map_step_to_events(
+            rc_done, conversation_id=_CID, turn_execution_id=_TURN, allocator=alloc
+        )
         assert len(rc_result_events) == 1
         rc_result_item = rc_result_events[0].data["item_data"]
         assert isinstance(rc_result_item, dict)
@@ -832,6 +954,74 @@ class TestRealIdPairing:
         # Allocator must not have been used at all (all ids were real)
         assert alloc.invocation_count == 0
         assert alloc.orphan_output_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Turn-scoped response_id: one bubble per turn (#9)
+# ---------------------------------------------------------------------------
+
+
+class TestTurnScopedResponseId:
+    """
+    Every committed item in ONE turn shares ONE response_id; a new turn differs.
+
+    Bug #9: the response_id used to be keyed on the conversation-monotonic
+    ``stepIndex``, so a narrate→call-tool→answer turn (three different step
+    indices) fragmented into three assistant bubbles. Keying on the turn's
+    ``executionId`` instead groups the whole turn under one id (parity with
+    codex ``codex_<turnId>`` / claude's per-turn ``current_response_id``).
+    """
+
+    def _response_ids(self, events: list[OutboundEvent]) -> list[str]:
+        """Collect the ``response_id`` from every committed item (skip user/edges)."""
+        ids: list[str] = []
+        for ev in events:
+            rid = ev.data.get("response_id")
+            if isinstance(rid, str):
+                ids.append(rid)
+        return ids
+
+    def test_multi_step_turn_shares_one_response_id(self) -> None:
+        """text planner → tool call → tool result, same turn → ONE response_id.
+
+        The three steps carry DIFFERENT ``stepIndex`` values (2 / 5 / the
+        result's), so a stepIndex-keyed id would yield three distinct ids
+        (the #9 fragmentation). With a turn-scoped id they must all match.
+        """
+        alloc = _allocator()
+        text = _load("planner_response_text")  # stepIndex 2
+        tool_call = _load("planner_response_tool_call_run_command")  # stepIndex 5
+        result = _load("run_command_done")
+
+        ids: list[str] = []
+        for step in (text, tool_call, result):
+            events = map_step_to_events(
+                step, conversation_id=_CID, turn_execution_id=_TURN, allocator=alloc
+            )
+            ids.extend(self._response_ids(events))
+
+        # message + function_call + function_call_output all carry a response_id.
+        assert len(ids) == 3
+        # All three share the SINGLE turn-scoped id (not three stepIndex ids).
+        assert set(ids) == {f"agy_{_CID}_{_TURN}"}
+
+    def test_new_turn_gets_a_different_response_id(self) -> None:
+        """A second turn (new ``executionId``) yields a DIFFERENT response_id."""
+        alloc = _allocator()
+        text = _load("planner_response_text")
+
+        turn1 = map_step_to_events(
+            text, conversation_id=_CID, turn_execution_id="exec-turn-1", allocator=alloc
+        )
+        turn2 = map_step_to_events(
+            text, conversation_id=_CID, turn_execution_id="exec-turn-2", allocator=alloc
+        )
+
+        id1 = turn1[0].data["response_id"]
+        id2 = turn2[0].data["response_id"]
+        assert id1 == f"agy_{_CID}_exec-turn-1"
+        assert id2 == f"agy_{_CID}_exec-turn-2"
+        assert id1 != id2
 
 
 # ---------------------------------------------------------------------------
@@ -1207,7 +1397,9 @@ class TestMapStepEmitsNoReasoning:
         """
         step = _load("planner_response_text")
         cast(dict[str, Any], step["plannerResponse"])["thinking"] = "internal chain of thought"
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(
+            step, conversation_id=_CID, turn_execution_id=_TURN, allocator=_allocator()
+        )
 
         for event in events:
             assert event.event_type != "external_output_reasoning_delta"
