@@ -295,6 +295,7 @@ interface BlockRendererProps {
 
 export function BlockRenderer({ items, sessionStatus }: BlockRendererProps) {
   const rendered: ReactNode[] = [];
+  let previousRenderedItemWasText = false;
   const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
   const streamingRunStart = isAgentActive ? findStreamingRunStart(items) : -1;
   // Reasoning is "currently streaming" iff the agent is live AND this
@@ -342,10 +343,13 @@ export function BlockRenderer({ items, sessionStatus }: BlockRendererProps) {
           rendered.push(renderItem(tool, runStart, false));
         }
       }
+      previousRenderedItemWasText = false;
       continue;
     }
 
-    rendered.push(renderItem(item, i, i === reasoningStreamingIdx));
+    const followsText = item.kind === "text" && previousRenderedItemWasText;
+    rendered.push(renderItem(item, i, i === reasoningStreamingIdx, followsText));
+    previousRenderedItemWasText = item.kind === "text";
   }
 
   return <>{rendered}</>;
@@ -403,11 +407,24 @@ function isInProgressTool(item: RenderItem): boolean {
   return item.kind === "tool" && item.state === "input-available";
 }
 
-function renderItem(item: RenderItem, index: number, isReasoningStreaming: boolean): ReactNode {
+function renderItem(
+  item: RenderItem,
+  index: number,
+  isReasoningStreaming: boolean,
+  followsText = false,
+): ReactNode {
   const key = keyFor(item, index);
   switch (item.kind) {
     case "text":
-      return <FilePathAwareMessageResponse key={key}>{item.text}</FilePathAwareMessageResponse>;
+      return (
+        <div
+          key={key}
+          data-testid="assistant-text-section"
+          className={cn("min-w-0", followsText && "mt-2")}
+        >
+          <FilePathAwareMessageResponse>{item.text}</FilePathAwareMessageResponse>
+        </div>
+      );
     case "reasoning":
       return (
         <ReasoningView
