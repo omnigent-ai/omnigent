@@ -4993,6 +4993,98 @@ def _require_external_status_forward(
         )
 
 
+# How long the terminal sub-agent-status forward waits for the parent's
+# runner tunnel to (re)connect before giving up. A relaunch/redeploy
+# reconnect gap is normally sub-second; a few seconds bridges it without
+# holding the POST open long. The runner re-posts on a 503 regardless, so
+# this is a best-effort fast path, not the only delivery chance.
+_SUBAGENT_FORWARD_RECONNECT_WAIT_S = 5.0
+
+
+async def _recover_subagent_status_forward_via_parent(
+    child_conv: Conversation,
+    runner_router: RunnerRouter | None,
+    tunnel_registry: TunnelRegistry | None,
+    conversation_store: ConversationStore,
+    forward_body: dict[str, Any],
+) -> _RunnerForwardResult | None:
+    """
+    Re-deliver a sub-agent terminal status through the parent's live runner.
+
+    A native sub-agent child copies its parent's ``runner_id`` once, at
+    creation (``create_conversation(..., runner_id=parent_conv.runner_id)`` —
+    see :func:`_persist_external_subagent_start`). It is never repointed when
+    the runner is later relaunched under a freshly minted ``runner_id`` (a host
+    relaunch after a tunnel drop / server redeploy / crash mints a new binding
+    token; only the *parent* conversation is rebound, via the PATCH path on its
+    next message). The child then points at a permanently offline ``runner_id``,
+    so its terminal ``idle``/``failed`` forward resolves no runner client and
+    503s forever (``_forward_session_change_to_runner`` → ``None`` →
+    :func:`_require_external_status_forward`). The parent never receives the
+    child's inbox result and hangs with no timeout.
+
+    A child always runs on its parent's runner, so the live binding is the
+    parent's. This re-resolves the forward through the parent/root
+    conversation's *current* ``runner_id``: it waits briefly for that runner's
+    tunnel to (re)connect (covering the reconnect gap right after a relaunch),
+    heals the child's stale ``runner_id`` so future forwards and
+    ``_on_runner_connect`` resolve it correctly, and retries the forward.
+
+    :param child_conv: The sub-agent child conversation whose terminal-status
+        forward could not reach its pinned runner.
+    :param runner_router: Router used to resolve the bound runner client, or
+        ``None`` in in-process setups.
+    :param tunnel_registry: Runner-tunnel registry used to await the parent
+        runner's (re)connect, or ``None`` in setups without runner tunnels.
+    :param conversation_store: Store used to look up the parent and persist the
+        child's healed ``runner_id``.
+    :param forward_body: The ``external_session_status`` event body to re-POST.
+    :returns: The retry's :class:`_RunnerForwardResult` when a live parent
+        runner was resolved, or ``None`` when none could be (the caller then
+        fails the forward as before).
+    """
+    parent_id = child_conv.parent_conversation_id or child_conv.root_conversation_id
+    if not parent_id or parent_id == child_conv.id:
+        return None
+    parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
+    if parent is None or parent.runner_id is None:
+        return None
+    parent_runner_id = parent.runner_id
+    # Wait for the parent's runner tunnel to be live before re-resolving. When
+    # no registry is wired (in-process / tests) skip the wait and retry
+    # best-effort against whatever the router resolves.
+    if tunnel_registry is not None:
+        client = await _wait_for_runner_client(
+            parent_id,
+            runner_router,
+            tunnel_registry,
+            runner_id=parent_runner_id,
+            timeout_s=_SUBAGENT_FORWARD_RECONNECT_WAIT_S,
+        )
+        if client is None:
+            return None
+    if parent_runner_id != child_conv.runner_id:
+        # Heal the divergence so this child's id matches the live runner: the
+        # next forward resolves directly and a future ``_on_runner_connect``
+        # (which rebinds by matching runner_id) can recover it.
+        try:
+            await asyncio.to_thread(
+                conversation_store.replace_runner_id, child_conv.id, parent_runner_id
+            )
+        except ConversationNotFoundError:
+            # The child was deleted between ``post_event`` reading it and this
+            # heal (e.g. the session was removed mid-teardown). Recovery is
+            # strictly best-effort — degrade to ``None`` so the caller falls
+            # through to the existing 503/no-op rather than surfacing this
+            # benign race as an unhandled 500.
+            return None
+    return await _forward_session_change_to_runner(
+        child_conv.id,
+        runner_router,
+        forward_body,
+    )
+
+
 def _require_collaboration_mode_forward(
     session_id: str,
     enabled: bool,
@@ -18181,6 +18273,23 @@ def create_sessions_router(
                 # Codex-internal children are tracked inside the same
                 # app-server thread tree; they have no runner inbox entry
                 # to forward terminal status to.
+                if runner_result is None:
+                    # The child's pinned runner_id is stale — its runner was
+                    # relaunched under a new id and only the parent was
+                    # rebound, so the child points at a dead runner forever and
+                    # this terminal status would 503 indefinitely while the
+                    # parent hangs waiting for the child's inbox result. Heal
+                    # the binding and re-deliver through the parent's live
+                    # runner before failing.
+                    recovered = await _recover_subagent_status_forward_via_parent(
+                        conv,
+                        runner_router,
+                        getattr(request.app.state, "tunnel_registry", None),
+                        conversation_store,
+                        forward_body,
+                    )
+                    if recovered is not None:
+                        runner_result = recovered
                 _require_external_status_forward(
                     session_id,
                     status,
