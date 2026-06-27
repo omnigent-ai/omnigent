@@ -578,9 +578,8 @@ class _PostRetryTracker:
         entry.attempts += 1
         permanent = _is_permanent_http_error(exc)
         not_confirmed = _is_subagent_delivery_not_confirmed(exc)
-        give_up = (
-            (permanent and entry.attempts >= self._max_permanent_attempts)
-            or (not_confirmed and entry.attempts >= self._max_not_confirmed_attempts)
+        give_up = (permanent and entry.attempts >= self._max_permanent_attempts) or (
+            not_confirmed and entry.attempts >= self._max_not_confirmed_attempts
         )
         if give_up:
             self._entries.pop(key, None)

@@ -6371,6 +6371,8 @@ async def test_compaction_in_progress_does_not_persist(tmp_path: Path) -> None:
     assert request["body"]["data"]["status"] == "in_progress"
     # _persist_native_compaction_item must NOT be called for in_progress.
     persist_mock.assert_not_called()
+
+
 # _PostRetryTracker: bounded subagent_delivery_not_confirmed retries (L2)
 # ---------------------------------------------------------------------------
 
@@ -6385,7 +6387,9 @@ def _http_status_error(status_code: int, body: object) -> httpx.HTTPStatusError:
 
 def test_subagent_delivery_not_confirmed_503_exhausts_after_budget() -> None:
     tracker = forwarder._PostRetryTracker(max_not_confirmed_attempts=3)
-    exc = _http_status_error(503, {"error": "subagent_delivery_not_confirmed", "reason": "missing_work_entry"})
+    exc = _http_status_error(
+        503, {"error": "subagent_delivery_not_confirmed", "reason": "missing_work_entry"}
+    )
     # Attempts 1 and 2 keep retrying...
     assert tracker.record_failure("k", exc).exhausted is False
     assert tracker.record_failure("k", exc).exhausted is False
