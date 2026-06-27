@@ -470,3 +470,51 @@ def test_session_created_event_payload_shape() -> None:
     assert parsed.conversation_id == "conv_parent"
     assert parsed.child_session_id == "conv_child"
     assert parsed.agent_id == "agent_xyz"
+
+
+class _FakeConnectedRequest:
+    """Minimal Request stub: never reports the client as disconnected."""
+
+    async def is_disconnected(self) -> bool:
+        """:returns: ``False`` — the client stays connected for the test."""
+        return False
+
+
+async def test_stream_live_events_aclose_during_yield_does_not_orphan_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forced ``aclose()`` mid-stream tears down without a RuntimeError.
+
+    Regression for issue #1117: on a hard client disconnect the ASGI server
+    calls ``aclose()`` on the SSE generator, which throws ``GeneratorExit``
+    into the suspended live-tail ``yield``. When the ``[DONE]`` sentinel sat
+    in the ``finally`` block, that ``yield`` ran during ``GeneratorExit``
+    teardown and raised ``RuntimeError: async generator ignored
+    GeneratorExit``, orphaning the ``athrow`` task. The sentinel now lives
+    after the loop (graceful close only), so the forced teardown unwinds
+    cleanly.
+
+    Fails on the unfixed generator (``aclose()`` re-raises the RuntimeError);
+    passes once the sentinel is moved out of ``finally``.
+    """
+    import asyncio
+
+    from omnigent.server.routes import sessions as sessions_routes
+
+    async def _fake_subscribe(conversation_id: str, **kwargs: Any) -> Any:
+        """Yield one valid event, then block so the generator suspends mid-tail."""
+        del conversation_id, kwargs
+        yield {"type": "session.heartbeat"}
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(sessions_routes.session_stream, "subscribe", _fake_subscribe)
+
+    gen = sessions_routes._stream_live_events(_FakeConnectedRequest(), "conv_x")
+    # Advance to the first live-tail event; the generator is now suspended at
+    # the ``yield _format_sse(...)`` inside the ``try`` — the exact point a
+    # client-disconnect ``aclose()`` injects ``GeneratorExit``.
+    first = await gen.__anext__()
+    assert "session.heartbeat" in first
+
+    # Must not raise ``RuntimeError: async generator ignored GeneratorExit``.
+    await gen.aclose()
