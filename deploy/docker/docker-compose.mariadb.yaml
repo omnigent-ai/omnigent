@@ -1,0 +1,100 @@
+# Omnigent server + MariaDB (external-runner mode).
+#
+# Quickstart (single-user dev):
+#
+#   cd deploy/docker
+#   cp .env.example .env
+#   # Edit .env — set at minimum:
+#   #   MARIADB_PASSWORD=<choose a password>
+#   #   MARIADB_ROOT_PASSWORD=<choose a root password>
+#   docker compose -f docker-compose.mariadb.yaml up -d --build
+#   open http://localhost:8000   # first boot prints admin credentials to logs
+#
+# Auth: built-in accounts mode by default (same as the Postgres compose).
+# See docker-compose.yaml comments for OIDC / header / single-user options.
+#
+# Runner: after the server is up, open http://localhost:8000 — the UI
+# will prompt you with a command to start a local runner that connects
+# back to this server via WebSocket.
+#
+# See MARIADB.md in this directory for full details and known limitations.
+
+name: omnigent-mariadb
+
+services:
+  mariadb:
+    image: mariadb:11
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: ${MARIADB_DB:-omnigent}
+      MARIADB_USER: ${MARIADB_USER:-omnigent}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:?set MARIADB_PASSWORD in .env}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?set MARIADB_ROOT_PASSWORD in .env}
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost",
+             "-u", "${MARIADB_USER:-omnigent}",
+             "-p${MARIADB_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  omnigent:
+    # Pre-built image published to GHCR on every main-branch merge.
+    # `docker compose pull` fetches the latest; pin OMNIGENT_IMAGE_TAG
+    # to a sha-<short> or vX.Y.Z tag for reproducible deploys.
+    image: ${OMNIGENT_IMAGE:-ghcr.io/omnigent-ai/omnigent-server}:${OMNIGENT_IMAGE_TAG:-latest}
+    # Local-build fallback: used when the image isn't already pulled AND
+    # you run `docker compose up --build` explicitly.
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        PYPI_INDEX_URL: ${PYPI_INDEX_URL:-https://pypi.org/simple}
+    restart: unless-stopped
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      # mysql+pymysql:// tells SQLAlchemy to use the PyMySQL driver.
+      # charset=utf8mb4 is required for full Unicode + emoji support.
+      DATABASE_URL: mysql+pymysql://${MARIADB_USER:-omnigent}:${MARIADB_PASSWORD}@mariadb:3306/${MARIADB_DB:-omnigent}?charset=utf8mb4
+      ARTIFACT_DIR: /data/artifacts
+      HOST: 0.0.0.0
+      PORT: "8000"
+      # Pin to the persistent volume so admin credentials survive restarts.
+      OMNIGENT_ADMIN_CREDENTIALS_PATH: /data/admin-credentials
+
+      # ── Auth ─────────────────────────────────────────
+      OMNIGENT_AUTH_ENABLED: "${OMNIGENT_AUTH_ENABLED:-1}"
+      OMNIGENT_AUTH_PROVIDER: "${OMNIGENT_AUTH_PROVIDER:-}"
+
+      # OIDC (leave unset to use built-in accounts mode)
+      OMNIGENT_OIDC_ISSUER: "${OMNIGENT_OIDC_ISSUER:-}"
+      OMNIGENT_OIDC_CLIENT_ID: "${OMNIGENT_OIDC_CLIENT_ID:-}"
+      OMNIGENT_OIDC_CLIENT_SECRET: "${OMNIGENT_OIDC_CLIENT_SECRET:-}"
+      OMNIGENT_OIDC_COOKIE_SECRET: "${OMNIGENT_OIDC_COOKIE_SECRET:-}"
+      OMNIGENT_OIDC_SCOPES: "${OMNIGENT_OIDC_SCOPES:-}"
+      OMNIGENT_OIDC_SESSION_TTL_HOURS: "${OMNIGENT_OIDC_SESSION_TTL_HOURS:-8}"
+      OMNIGENT_OIDC_ALLOWED_DOMAINS: "${OMNIGENT_OIDC_ALLOWED_DOMAINS:-}"
+      OMNIGENT_OIDC_LOGOUT_REDIRECT_URI: "${OMNIGENT_OIDC_LOGOUT_REDIRECT_URI:-}"
+      OMNIGENT_OIDC_ALLOW_INVITES: "${OMNIGENT_OIDC_ALLOW_INVITES:-}"
+      OMNIGENT_DOMAIN: "${OMNIGENT_DOMAIN:-}"
+
+      # Built-in accounts (default when no OIDC issuer is set)
+      OMNIGENT_ACCOUNTS_COOKIE_SECRET: "${OMNIGENT_ACCOUNTS_COOKIE_SECRET:-}"
+      OMNIGENT_ACCOUNTS_BASE_URL: "${OMNIGENT_ACCOUNTS_BASE_URL:-}"
+      OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD: "${OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD:-}"
+      OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS: "${OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS:-8}"
+      OMNIGENT_ACCOUNTS_INVITE_TTL_HOURS: "${OMNIGENT_ACCOUNTS_INVITE_TTL_HOURS:-72}"
+      OMNIGENT_ACCOUNTS_MAGIC_TTL_MINUTES: "${OMNIGENT_ACCOUNTS_MAGIC_TTL_MINUTES:-10}"
+      OMNIGENT_ACCOUNTS_AUTO_OPEN: "${OMNIGENT_ACCOUNTS_AUTO_OPEN:-0}"
+    volumes:
+      - artifact-data:/data
+    ports:
+      - "${OMNIGENT_PORT:-8000}:8000"
+
+volumes:
+  mariadb-data:
+  artifact-data:

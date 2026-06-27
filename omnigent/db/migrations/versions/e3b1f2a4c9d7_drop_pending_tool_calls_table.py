@@ -25,6 +25,14 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    if bind.dialect.name in ("mysql", "mariadb"):
+        # MySQL/MariaDB: cannot drop an index that supports a foreign key
+        # constraint while the constraint still exists. Since we're dropping
+        # the whole table anyway, skip straight to DROP TABLE — MySQL removes
+        # all indexes and FK constraints with the table automatically.
+        op.drop_table("pending_tool_calls")
+        return
     op.drop_index("ix_pending_tool_calls_task_id", table_name="pending_tool_calls")
     op.drop_index("ix_pending_tool_calls_root_task_id", table_name="pending_tool_calls")
     op.drop_table("pending_tool_calls")

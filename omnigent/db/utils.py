@@ -261,6 +261,7 @@ def _create_engine(db_uri: str) -> Engine:
     pool_recycle = (
         _LAKEBASE_POOL_RECYCLE_SECONDS if token_provider else _SERVER_POOL_RECYCLE_SECONDS
     )
+    is_mysql = db_uri.startswith("mysql")
     engine = create_engine(
         db_uri,
         # Verify connections are alive before checking them out
@@ -283,6 +284,11 @@ def _create_engine(db_uri: str) -> Engine:
         # blocking indefinitely; surfaces real saturation as an
         # error rather than a hang.
         pool_timeout=10,
+        # MySQL/MariaDB default isolation is REPEATABLE READ, which raises
+        # error 1020 ("Record has changed since last read") when concurrent
+        # transactions update the same row. READ COMMITTED matches
+        # PostgreSQL's default and eliminates this false conflict.
+        **({"isolation_level": "READ COMMITTED"} if is_mysql else {}),
     )
     if token_provider:
         _install_lakebase_token_refresh(engine, token_provider)

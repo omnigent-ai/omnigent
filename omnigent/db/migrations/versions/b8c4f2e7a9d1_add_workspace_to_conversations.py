@@ -43,12 +43,18 @@ def upgrade() -> None:
     in place — alembic copies the table, applies the column + check
     in one shot, and renames it back.
     """
+    bind = op.get_bind()
     with op.batch_alter_table("conversations") as batch_op:
         batch_op.add_column(sa.Column("workspace", sa.String(length=2048), nullable=True))
-        batch_op.create_check_constraint(
-            "ck_conversations_workspace_required_for_host",
-            "host_id IS NULL OR workspace IS NOT NULL",
-        )
+        if bind.dialect.name not in ("mysql", "mariadb"):
+            # MySQL/MariaDB: Alembic's batch_alter_table emits a CHECK
+            # constraint syntax that MariaDB 11 rejects (error 1901).
+            # The constraint is a data-integrity guard; the application
+            # enforces it, so skipping it here is safe.
+            batch_op.create_check_constraint(
+                "ck_conversations_workspace_required_for_host",
+                "host_id IS NULL OR workspace IS NOT NULL",
+            )
         # Index + FK on host_id, folded into this batch since it already
         # recreates the table (avoids a second rebuild). FK targets
         # hosts.host_id (its uq_hosts_host_id unique column); ON DELETE

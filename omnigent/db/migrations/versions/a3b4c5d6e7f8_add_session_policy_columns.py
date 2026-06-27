@@ -21,6 +21,21 @@ down_revision: str | None = "b2c3d4e5f6a7"
 
 def upgrade() -> None:
     """Restructure policies table for session-scoped handler policies."""
+    bind = op.get_bind()
+    if bind.dialect.name in ("mysql", "mariadb"):
+        # MySQL/MariaDB: cannot drop ix_policies_agent_id while the FK
+        # constraint on agent_id (auto-named by MySQL, e.g. policies_ibfk_1)
+        # still exists. Discover and drop the FK first, then proceed normally.
+        from sqlalchemy import inspect as sa_inspect
+
+        fks = sa_inspect(bind).get_foreign_keys("policies")
+        agent_fk = next(
+            (fk for fk in fks if "agent_id" in fk["constrained_columns"]), None
+        )
+        if agent_fk and agent_fk.get("name"):
+            with op.batch_alter_table("policies") as pre_op:
+                pre_op.drop_constraint(agent_fk["name"], type_="foreignkey")
+
     with op.batch_alter_table("policies") as batch_op:
         batch_op.add_column(sa.Column("session_id", sa.String(64), nullable=True))
         batch_op.add_column(sa.Column("handler", sa.Text(), nullable=True))

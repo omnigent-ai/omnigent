@@ -145,6 +145,11 @@ RUN test -f ./omnigent/server/static/web-ui/index.html \
 # [databricks] extra in pyproject — so add it explicitly here.
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
 
+# PyMySQL: pure-Python MySQL/MariaDB driver. Installed unconditionally so
+# the server image supports both Postgres (psycopg above) and MariaDB
+# (deploy/docker/docker-compose.mariadb.yaml) without a separate build.
+RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'PyMySQL>=1.1,<2'
+
 # Optional managed-sandbox provider extras for the SERVER (the launcher imports
 # the provider SDK — e.g. the kubernetes client for `sandbox.provider:
 # kubernetes`). Off by default; the runner host image needs none of these. Build

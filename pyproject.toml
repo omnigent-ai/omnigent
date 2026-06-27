@@ -177,6 +177,9 @@ databricks = [
     # (bare OSS installs get it via the `tracing` extra instead).
     "mlflow>=3,<4",
 ]
+# MySQL/MariaDB driver. Pure-Python; works with MySQL 8+ and MariaDB 10+.
+# Use with DATABASE_URL = mysql+pymysql://user:pass@host:3306/db?charset=utf8mb4
+mysql = ["PyMySQL>=1.1,<2"]
 dev = [
     "pytest>=7.0",
     # mlflow is now opt-in (the `tracing` / `databricks` extras), but the
