@@ -291,6 +291,155 @@ async def test_create_with_retry_timeout_then_success(
     assert mock_adapter.call_count == 2
 
 
+@pytest.fixture
+def _otel_in_memory_exporter():
+    """
+    Production-path fixture for asserting gen_ai.retry events.
+
+    Installs a fresh OTel TracerProvider with an in-memory exporter,
+    yields it, then restores every global it mutated. OTel only
+    allows the TracerProvider to be set once per process, so leaving
+    a test-installed provider in place silently misroutes spans for
+    every later test in the same process.
+    """
+    import os
+
+    import mlflow
+    import mlflow.tracing
+    from mlflow.tracing.provider import provider as mlflow_provider_wrapper
+    from mlflow.tracing.trace_manager import InMemoryTraceManager
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from omnigent.runtime import telemetry as runtime_telemetry
+
+    original_provider = otel_trace._TRACER_PROVIDER  # type: ignore[attr-defined]
+    original_set_once_done = otel_trace._TRACER_PROVIDER_SET_ONCE._done  # type: ignore[attr-defined]
+    original_mlflow_once_done = mlflow_provider_wrapper._global_provider_init_once._done  # type: ignore[attr-defined]
+    original_telemetry_initialized = runtime_telemetry._initialized  # type: ignore[attr-defined]
+    original_env_value = os.environ.get("MLFLOW_USE_DEFAULT_TRACER_PROVIDER")
+
+    os.environ["MLFLOW_USE_DEFAULT_TRACER_PROVIDER"] = "false"
+    runtime_telemetry._initialized = False  # type: ignore[attr-defined]
+
+    trace_manager_instance = getattr(InMemoryTraceManager, "_instance", None)
+    if trace_manager_instance is not None:
+        trace_manager_instance._traces.clear()  # type: ignore[attr-defined]
+        trace_manager_instance._otel_id_to_mlflow_trace_id.clear()  # type: ignore[attr-defined]
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
+    mlflow_provider_wrapper._global_provider_init_once._done = False  # type: ignore[attr-defined]
+    mlflow.tracing.enable()
+
+    try:
+        yield exporter
+    finally:
+        exporter.clear()
+        otel_trace._TRACER_PROVIDER = original_provider  # type: ignore[attr-defined]
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = original_set_once_done  # type: ignore[attr-defined]
+        mlflow_provider_wrapper._global_provider_init_once._done = original_mlflow_once_done  # type: ignore[attr-defined]
+        runtime_telemetry._initialized = original_telemetry_initialized  # type: ignore[attr-defined]
+        if original_env_value is None:
+            os.environ.pop("MLFLOW_USE_DEFAULT_TRACER_PROVIDER", None)
+        else:
+            os.environ["MLFLOW_USE_DEFAULT_TRACER_PROVIDER"] = original_env_value
+        if trace_manager_instance is not None:
+            trace_manager_instance._traces.clear()  # type: ignore[attr-defined]
+            trace_manager_instance._otel_id_to_mlflow_trace_id.clear()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_create_with_retry_records_gen_ai_retry_on_active_span(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryPolicy,
+    _otel_in_memory_exporter,
+) -> None:
+    """
+    Production path: ``Client().responses.create(retry=...)`` records
+    ``gen_ai.retry`` events on whatever span is active in the OTel
+    current context. Verifies the async retry path is actually
+    instrumented (the sync helper used to be instrumented but had no
+    production callers — see PR #1071 review).
+    """
+    import mlflow
+    from mlflow.entities import SpanType
+
+    # _capture_content is a module-level cached value (read once at
+    # module load). Patch it directly so the gen_ai.retry event records
+    # error.message for the assertion below.
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
+
+    # Two timeouts then success on the third attempt. retry_config
+    # allows max_retries=2 -> 3 total attempts.
+    mock_adapter = _MockAdapter(
+        side_effect=[
+            httpx.TimeoutException("first timeout"),
+            httpx.TimeoutException("second timeout"),
+            {"id": "test"},
+        ],
+    )
+    _patch_client_deps(monkeypatch, mock_adapter)
+
+    with mlflow.start_span("agent_turn", span_type=SpanType.CHAIN):
+        result = await Client().responses.create(
+            **_default_create_kwargs(),
+            retry=retry_config,
+        )
+
+    assert isinstance(result, Response)
+    assert mock_adapter.call_count == 3
+
+    spans = _otel_in_memory_exporter.get_finished_spans()
+    # The parent span is the one we opened above.
+    agent_spans = [s for s in spans if s.name == "agent_turn"]
+    assert len(agent_spans) == 1
+    events = [e for e in agent_spans[0].events if e.name == "gen_ai.retry"]
+    # Two failures -> two retry events on the production async path.
+    assert len(events) == 2
+    attrs_by_attempt = {int(e.attributes["attempt"]): dict(e.attributes or {}) for e in events}
+    assert set(attrs_by_attempt.keys()) == {1, 2}
+    for _attempt, attrs in attrs_by_attempt.items():
+        assert attrs["max_attempts"] == retry_config.max_retries + 1
+        assert attrs["error.type"] == "RetryableLLMError"
+        assert "timed out" in attrs["error.message"]
+        assert attrs["backoff_seconds"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_create_with_retry_no_active_span_is_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryPolicy,
+) -> None:
+    """
+    When no OTel span is active, the retry instrumentation no-ops
+    silently. ``get_current_span()`` returns a non-recording span and
+    ``add_event`` is skipped. The retry itself still works.
+    """
+    mock_adapter = _MockAdapter(
+        side_effect=[
+            httpx.TimeoutException("timeout"),
+            {"id": "test"},
+        ],
+    )
+    _patch_client_deps(monkeypatch, mock_adapter)
+
+    # No span context here. The call must not raise.
+    result = await Client().responses.create(
+        **_default_create_kwargs(),
+        retry=retry_config,
+    )
+    assert isinstance(result, Response)
+    assert mock_adapter.call_count == 2
+
+
 @pytest.mark.asyncio
 async def test_create_with_retry_http_429_then_success(
     monkeypatch: pytest.MonkeyPatch,

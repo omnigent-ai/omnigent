@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -443,6 +444,182 @@ def test_detail_to_dict_with_none() -> None:
     # None input must produce None output, not an empty dict.
     # Failure would mean the SSE payload contains a spurious empty dict.
     assert result is None
+
+
+@pytest.fixture
+def _otel_in_memory_exporter():
+    """
+    Install a fresh OTel TracerProvider with an in-memory exporter,
+    yield it, and restore the original provider / set-once state on
+    teardown.
+
+    OTel only allows the TracerProvider to be set once per process.
+    Leaving the test-installed provider in place after the test
+    silently misroutes or drops spans in any later test in the same
+    process, producing order-dependent flakiness that does not
+    reproduce in isolation. This fixture snapshots every global it
+    mutates and restores them in a finally block.
+    """
+    import mlflow
+    import mlflow.tracing
+    from mlflow.tracing.provider import provider as mlflow_provider_wrapper
+    from mlflow.tracing.trace_manager import InMemoryTraceManager
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from omnigent.runtime import telemetry as runtime_telemetry
+
+    original_provider = otel_trace._TRACER_PROVIDER  # type: ignore[attr-defined]
+    original_set_once_done = otel_trace._TRACER_PROVIDER_SET_ONCE._done  # type: ignore[attr-defined]
+    original_mlflow_once_done = mlflow_provider_wrapper._global_provider_init_once._done  # type: ignore[attr-defined]
+    original_telemetry_initialized = runtime_telemetry._initialized  # type: ignore[attr-defined]
+    original_env_value = os.environ.get("MLFLOW_USE_DEFAULT_TRACER_PROVIDER")
+
+    os.environ["MLFLOW_USE_DEFAULT_TRACER_PROVIDER"] = "false"
+    runtime_telemetry._initialized = False  # type: ignore[attr-defined]
+
+    trace_manager_instance = getattr(InMemoryTraceManager, "_instance", None)
+    if trace_manager_instance is not None:
+        trace_manager_instance._traces.clear()  # type: ignore[attr-defined]
+        trace_manager_instance._otel_id_to_mlflow_trace_id.clear()  # type: ignore[attr-defined]
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
+    mlflow_provider_wrapper._global_provider_init_once._done = False  # type: ignore[attr-defined]
+    mlflow.tracing.enable()
+
+    try:
+        yield exporter
+    finally:
+        exporter.clear()
+        otel_trace._TRACER_PROVIDER = original_provider  # type: ignore[attr-defined]
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = original_set_once_done  # type: ignore[attr-defined]
+        mlflow_provider_wrapper._global_provider_init_once._done = original_mlflow_once_done  # type: ignore[attr-defined]
+        runtime_telemetry._initialized = original_telemetry_initialized  # type: ignore[attr-defined]
+        if original_env_value is None:
+            os.environ.pop("MLFLOW_USE_DEFAULT_TRACER_PROVIDER", None)
+        else:
+            os.environ["MLFLOW_USE_DEFAULT_TRACER_PROVIDER"] = original_env_value
+        if trace_manager_instance is not None:
+            trace_manager_instance._traces.clear()  # type: ignore[attr-defined]
+            trace_manager_instance._otel_id_to_mlflow_trace_id.clear()  # type: ignore[attr-defined]
+
+
+def test_execute_with_retry_records_gen_ai_retry_events_on_span(
+    retry_config_fast: RetryPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+    _otel_in_memory_exporter,
+) -> None:
+    # Patch time.sleep so the test does not actually sleep.
+    monkeypatch.setattr("omnigent.runtime.llm_retry.time.sleep", lambda _: None)
+    # _capture_content is a module-level cached value. Patch it
+    # directly so record_llm_retry includes error.message.
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
+
+    import mlflow
+    from mlflow.entities import SpanType
+
+    from omnigent.runtime.llm_retry import execute_with_retry
+
+    # Fail twice, succeed on the third attempt. With max_retries=3
+    # the policy allows 4 total tries, so 2 failures result in 2
+    # retry events recorded on the span.
+    call_fn = MagicMock(
+        side_effect=[
+            httpx.TimeoutException("first timeout"),
+            httpx.TimeoutException("second timeout"),
+            "recovered",
+        ]
+    )
+    on_retry = MagicMock()
+
+    with mlflow.start_span("llm_call", span_type=SpanType.CHAT_MODEL) as span:
+        result = execute_with_retry(
+            call_fn,
+            retry_config_fast,
+            on_retry,
+            llm_span=span,
+        )
+
+    assert result == "recovered"
+    assert call_fn.call_count == 3
+    assert on_retry.call_count == 2
+
+    spans = _otel_in_memory_exporter.get_finished_spans()
+    assert len(spans) == 1
+    events = [e for e in spans[0].events if e.name == "gen_ai.retry"]
+    assert len(events) == 2
+    attrs_by_attempt = {int(e.attributes["attempt"]): dict(e.attributes or {}) for e in events}
+    assert set(attrs_by_attempt.keys()) == {1, 2}
+    for _attempt, attrs in attrs_by_attempt.items():
+        assert attrs["max_attempts"] == retry_config_fast.max_retries + 1
+        assert attrs["error.type"] == "RetryableLLMError"
+        assert "timed out" in attrs["error.message"]
+        assert attrs["backoff_seconds"] > 0
+
+
+def test_execute_with_retry_error_message_gated_by_content_capture(
+    retry_config_fast: RetryPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+    _otel_in_memory_exporter,
+) -> None:
+    # OMNIGENT_OTEL_CAPTURE_CONTENT is OFF (default). error.message
+    # must not appear; error.type still does.
+    monkeypatch.setattr("omnigent.runtime.llm_retry.time.sleep", lambda _: None)
+    # Force cache OFF (default state) so error.message is NOT captured.
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", False)
+
+    import mlflow
+    from mlflow.entities import SpanType
+
+    from omnigent.runtime.llm_retry import execute_with_retry
+
+    call_fn = MagicMock(
+        side_effect=[
+            httpx.TimeoutException("with PII: user@example.com"),
+            "recovered",
+        ]
+    )
+    with mlflow.start_span("llm_call", span_type=SpanType.CHAT_MODEL) as span:
+        execute_with_retry(call_fn, retry_config_fast, MagicMock(), llm_span=span)
+
+    spans = _otel_in_memory_exporter.get_finished_spans()
+    events = [e for e in spans[0].events if e.name == "gen_ai.retry"]
+    assert len(events) == 1
+    attrs = dict(events[0].attributes or {})
+    assert attrs["error.type"] == "RetryableLLMError"
+    assert "error.message" not in attrs
+    # And the PII string must not leak via any other attribute key.
+    for v in attrs.values():
+        assert "user@example.com" not in str(v)
+
+
+def test_execute_with_retry_without_span_is_safe(
+    retry_config_fast: RetryPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Omitting ``llm_span`` keeps the original behavior intact.
+    Retries happen, on_retry fires, and no span events get recorded
+    because no span exists.
+    """
+    monkeypatch.setattr("omnigent.runtime.llm_retry.time.sleep", lambda _: None)
+
+    call_fn = MagicMock(side_effect=[httpx.TimeoutException("t"), "ok"])
+    on_retry = MagicMock()
+
+    result = execute_with_retry(call_fn, retry_config_fast, on_retry)
+
+    assert result == "ok"
+    assert call_fn.call_count == 2
+    assert on_retry.call_count == 1
 
 
 def test_detail_to_dict_with_empty_detail() -> None:

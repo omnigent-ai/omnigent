@@ -11,6 +11,8 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, TypeVar
 
+from opentelemetry import trace as otel_trace
+
 from omnigent.llms._responses_to_chat import (
     chat_response_to_response,
     chat_stream_to_response_events,
@@ -31,6 +33,7 @@ from omnigent.llms.types import (
 )
 from omnigent.reasoning_effort import OPENAI_EFFORTS, validate_effort_or_llm_error
 from omnigent.runtime.llm_retry import classify_llm_error
+from omnigent.runtime.telemetry import should_capture_content
 from omnigent.spec.types import RetryPolicy
 
 _logger = logging.getLogger(__name__)
@@ -293,6 +296,12 @@ async def _execute_with_retry(
                 raise classified from exc
             last_error = classified
             if attempt + 1 < total_tries:
+                _record_retry_event_on_active_span(
+                    attempt=attempt + 1,
+                    max_attempts=total_tries,
+                    error=classified,
+                    backoff_seconds=retry_config.compute_backoff_delay(retry_index=attempt + 1),
+                )
                 await _backoff_sleep(attempt, retry_config)
 
     assert last_error is not None
@@ -358,3 +367,38 @@ class Client:
     def __init__(self) -> None:
         """Initialize the client with a responses namespace."""
         self.responses = _ResponsesNamespace(self)
+
+
+def _record_retry_event_on_active_span(
+    *,
+    attempt: int,
+    max_attempts: int,
+    error: RetryableLLMError,
+    backoff_seconds: float,
+) -> None:
+    """
+    Record a ``gen_ai.retry`` event on the currently-active OTel span.
+
+    No-ops when no span is active (background jobs, smoke tests, etc.)
+    via ``get_current_span()`` returning a non-recording span. Reads
+    from the OTel current context so the retry event lands on whatever
+    span wraps the LLM call, without plumbing a span handle through
+    ``Client.create()`` or the policy code.
+
+    ``error.message`` is captured only when
+    ``OMNIGENT_OTEL_CAPTURE_CONTENT`` is on, matching the module's
+    PII posture. ``error.type`` is always recorded so operators can
+    triage the retry-error class without needing message content.
+    """
+    span = otel_trace.get_current_span()
+    if not span.is_recording():
+        return
+    attrs: dict[str, Any] = {
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "error.type": type(error).__name__,
+        "backoff_seconds": backoff_seconds,
+    }
+    if should_capture_content():
+        attrs["error.message"] = str(error)
+    span.add_event("gen_ai.retry", attributes=attrs)

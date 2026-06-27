@@ -654,6 +654,114 @@ def test_record_cancellation_sets_cancelled_error_type(
     assert spans[0].status.status_code == StatusCode.ERROR
 
 
+# ── record_llm_retry ───────────────────────────────────
+
+
+def test_record_llm_retry_adds_event_with_expected_attributes(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``record_llm_retry`` adds a ``gen_ai.retry`` event whose
+    attributes carry the attempt counters, error class, error
+    message (when content capture is on), and backoff duration.
+    Operators reconstruct the retry timeline from these events
+    alone so every key must round-trip.
+    """
+    import mlflow
+    from mlflow.entities import SpanType
+
+    # _capture_content is module-level cached. Force ON so error.message
+    # is included in the assertion below.
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
+
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with mlflow.start_span("llm_call", span_type=SpanType.CHAT_MODEL) as span:
+            telemetry.record_llm_retry(
+                span,
+                attempt=1,
+                max_attempts=3,
+                error_type="TimeoutException",
+                error_message="LLM request timed out",
+                backoff_seconds=0.25,
+            )
+
+    spans = in_memory_exporter.get_finished_spans()
+    assert len(spans) == 1, (
+        f"expected 1 span, got {len(spans)}. Extra spans indicate "
+        "leakage from a previous test or unexpected MLflow emission."
+    )
+    events = list(spans[0].events)
+    assert len(events) == 1, (
+        f"expected exactly 1 span event, got {len(events)}. "
+        "record_llm_retry must add a single gen_ai.retry event."
+    )
+    event = events[0]
+    assert event.name == "gen_ai.retry", (
+        f"event name {event.name!r} must be 'gen_ai.retry' so OTel "
+        "collectors and dashboards can filter on the standard name."
+    )
+    attrs = dict(event.attributes or {})
+    assert attrs == {
+        "attempt": 1,
+        "max_attempts": 3,
+        "error.type": "TimeoutException",
+        "error.message": "LLM request timed out",
+        "backoff_seconds": 0.25,
+    }, f"unexpected event attributes: {attrs!r}"
+
+
+def test_record_llm_retry_omits_backoff_when_none(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    When ``backoff_seconds`` is ``None``, the attribute is not set.
+    A missing key is meaningful (no backoff applied for this
+    attempt) and must not be masked with a zero value.
+    """
+    import mlflow
+    from mlflow.entities import SpanType
+
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with mlflow.start_span("llm_call", span_type=SpanType.CHAT_MODEL) as span:
+            telemetry.record_llm_retry(
+                span,
+                attempt=2,
+                max_attempts=2,
+                error_type="HTTPStatusError",
+                error_message="HTTP 503",
+            )
+
+    spans = in_memory_exporter.get_finished_spans()
+    events = list(spans[0].events)
+    assert len(events) == 1
+    attrs = dict(events[0].attributes or {})
+    assert "backoff_seconds" not in attrs, (
+        f"backoff_seconds must be absent when None, got {attrs!r}"
+    )
+    assert attrs["attempt"] == 2
+    assert attrs["max_attempts"] == 2
+    assert attrs["error.type"] == "HTTPStatusError"
+
+
+def test_record_llm_retry_no_op_when_span_is_none() -> None:
+    """
+    Passing ``span=None`` is a no-op so retry sites outside an
+    active tracing context can call the helper unconditionally
+    without guarding the call themselves.
+    """
+    # No exporter needed because no span is created. The point
+    # of the test is that the call returns cleanly.
+    telemetry.record_llm_retry(
+        None,
+        attempt=1,
+        max_attempts=3,
+        error_type="TimeoutException",
+        error_message="timed out",
+        backoff_seconds=0.5,
+    )
+
+
 # ── init() ──────────────────────────────────────────────
 
 
