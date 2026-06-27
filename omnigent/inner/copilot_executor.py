@@ -794,6 +794,7 @@ def _accumulate_usage(acc: dict[str, int], data: dict[str, Any]) -> None:  # typ
         "inputTokens": "input_tokens",
         "outputTokens": "output_tokens",
         "cacheReadTokens": "cache_read_input_tokens",
+        "cacheWriteTokens": "cache_creation_input_tokens",
     }
     for wire_key, usage_key in mapping.items():
         value = data.get(wire_key)

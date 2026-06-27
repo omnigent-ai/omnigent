@@ -241,13 +241,17 @@ def test_event_data_reads_to_dict() -> None:
 
 def test_usage_accumulation_and_finalize() -> None:
     acc: dict[str, int] = {}
-    _accumulate_usage(acc, {"inputTokens": 10, "outputTokens": 5, "cacheReadTokens": 2})
+    _accumulate_usage(
+        acc,
+        {"inputTokens": 10, "outputTokens": 5, "cacheReadTokens": 2, "cacheWriteTokens": 7},
+    )
     _accumulate_usage(acc, {"inputTokens": 3, "outputTokens": 1})
     usage = _finalize_usage(acc)
     assert usage == {
         "input_tokens": 13,
         "output_tokens": 6,
         "cache_read_input_tokens": 2,
+        "cache_creation_input_tokens": 7,
         "total_tokens": 19,
     }
     assert _finalize_usage({}) is None
@@ -850,11 +854,12 @@ async def test_paragraph_break_between_pre_and_post_tool_text(
 
 
 @pytest.mark.asyncio
-async def test_run_turn_usage_accumulates_cache_read_through_events(
+async def test_run_turn_usage_accumulates_cache_read_write_through_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Two ASSISTANT_USAGE events (one per model call) accumulate end-to-end,
-    # including cacheReadTokens, and total_tokens excludes the cache count.
+    # including cacheReadTokens / cacheWriteTokens, and total_tokens excludes
+    # the cache counts.
     _install_fake_copilot(
         monkeypatch,
         [
@@ -865,6 +870,7 @@ async def test_run_turn_usage_accumulates_cache_read_through_events(
                     inputTokens=10,
                     outputTokens=2,
                     cacheReadTokens=5,
+                    cacheWriteTokens=8,
                 ),
                 _ev("ASSISTANT_USAGE", inputTokens=3, outputTokens=1, cacheReadTokens=4),
                 _ev("ASSISTANT_MESSAGE", content="ok"),
@@ -878,6 +884,7 @@ async def test_run_turn_usage_accumulates_cache_read_through_events(
         "input_tokens": 13,
         "output_tokens": 3,
         "cache_read_input_tokens": 9,
+        "cache_creation_input_tokens": 8,
         "total_tokens": 16,
     }
     await ex.close()
