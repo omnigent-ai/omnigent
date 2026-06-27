@@ -35,6 +35,38 @@ from typing import Any
 
 _logger = logging.getLogger(__name__)
 
+# `git status --untracked-files=all` walks the whole working tree.  On a large
+# monorepo, run cold from a freshly spawned runner (no warm fsmonitor /
+# untracked-cache), it can take many seconds.  A 5s cap meant the command was
+# routinely killed by ``TimeoutExpired`` and silently swallowed to an empty
+# result, so the Files panel showed "No workspace changes yet" even with real
+# uncommitted modifications.  Give git enough room to finish.
+_GIT_STATUS_TIMEOUT_S = 30
+
+# Extra `git` flags for the changed-files reads, prepended to every invocation:
+#   -c safe.directory=*  — a runner spawned under a different uid than the
+#       checkout owner otherwise gets a "detected dubious ownership" refusal
+#       (non-zero exit), which used to be swallowed to an empty list.
+#   --no-optional-locks  — never take the index lock, so reading status can't
+#       contend with (or be tripped up by) the agent writing the worktree.
+_GIT_HARDENING_FLAGS: tuple[str, ...] = ("-c", "safe.directory=*", "--no-optional-locks")
+
+
+class GitStatusUnavailable(RuntimeError):
+    """A ``git`` invocation backing the changed-files view could not complete.
+
+    Raised on timeout, non-zero exit, or spawn error.  This deliberately
+    distinguishes "could not read the working-tree state" from "there are no
+    changes": the former must surface as an error so the UI shows a failure
+    state, instead of being swallowed to an empty list that looks identical to
+    a clean tree.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 # Filename patterns for ephemeral process artifacts that should never appear in
 # the Files panel regardless of .gitignore rules.  These are write-temp files
 # produced by editors, package managers, and system tools (not real source
@@ -688,19 +720,39 @@ class GitFilesystemRegistry(FilesystemRegistry):
             # line, so the UI would show the directory (stat'd as ~96 B) instead
             # of the added file.
             result = subprocess.run(
-                ["git", "status", "--porcelain", "--untracked-files=all"],
+                ["git", *_GIT_HARDENING_FLAGS, "status", "--porcelain", "--untracked-files=all"],
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_GIT_STATUS_TIMEOUT_S,
             )
-        except Exception:
-            _logger.debug(
-                "GitFilesystemRegistry.list_changed_files: git status failed", exc_info=True
+        except subprocess.TimeoutExpired as exc:
+            _logger.warning(
+                "GitFilesystemRegistry.list_changed_files: git status timed out after %ss in %s",
+                _GIT_STATUS_TIMEOUT_S,
+                self._git_root,
             )
-            return []
+            raise GitStatusUnavailable(
+                f"git status timed out after {_GIT_STATUS_TIMEOUT_S}s"
+            ) from exc
+        except OSError as exc:
+            _logger.warning(
+                "GitFilesystemRegistry.list_changed_files: git status could not run in %s: %s",
+                self._git_root,
+                exc,
+            )
+            raise GitStatusUnavailable(f"git status could not run: {exc}") from exc
 
         if result.returncode != 0:
-            return []
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            _logger.warning(
+                "GitFilesystemRegistry.list_changed_files: git status exited %d in %s: %s",
+                result.returncode,
+                self._git_root,
+                stderr,
+            )
+            raise GitStatusUnavailable(
+                f"git status exited {result.returncode}" + (f": {stderr}" if stderr else "")
+            )
 
         records: list[dict[str, Any]] = []
         for line in result.stdout.decode("utf-8", errors="replace").splitlines():
@@ -747,10 +799,10 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
         try:
             result = subprocess.run(
-                ["git", "status", "--porcelain", "--", git_path],
+                ["git", *_GIT_HARDENING_FLAGS, "status", "--porcelain", "--", git_path],
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_GIT_STATUS_TIMEOUT_S,
             )
         except Exception:
             _logger.debug(
@@ -789,10 +841,10 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
         try:
             result = subprocess.run(
-                ["git", "show", f"HEAD:{git_path}"],
+                ["git", *_GIT_HARDENING_FLAGS, "show", f"HEAD:{git_path}"],
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_GIT_STATUS_TIMEOUT_S,
             )
             if result.returncode == 0:
                 return result.stdout.decode("utf-8", errors="replace")
