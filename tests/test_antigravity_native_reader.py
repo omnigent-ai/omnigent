@@ -697,9 +697,12 @@ async def test_single_in_flight_guard_skips_second_interaction() -> None:
 
 
 @pytest.mark.asyncio
-async def test_interaction_done_callback_clears_slot() -> None:
+async def test_interaction_done_callback_clears_slot(monkeypatch: pytest.MonkeyPatch) -> None:
     """When an interaction task completes, the slot clears so a later distinct
     interaction can fire."""
+    # The clear now ALSO re-scans the freshest steps (#1472); keep that a no-op here
+    # so this test stays focused on slot-clearing + the manual re-fire.
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda _port, _cascade_id: [])
     state = reader._ReaderState(
         allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
         seen=set(),
@@ -736,6 +739,106 @@ async def test_interaction_done_callback_clears_slot() -> None:
     assert second is not None
     await second
     assert len(fired) == 2  # the slot cleared, so the second interaction fired
+    await _drain_interactions(state)  # settle the no-op re-scans both clears scheduled
+
+
+async def _drain_interactions(state: reader._ReaderState) -> None:
+    """Await the interaction bridge + any chained re-scan tasks to quiescence.
+
+    A cleared bridge schedules a re-scan (#1472) that may spawn the next bridge,
+    whose clear re-scans again; this awaits each link (letting done-callbacks run
+    between rounds) so a test ends with no pending interaction tasks. Bounded so a
+    bug that keeps respawning surfaces as a test hang in CI rather than an infinite
+    loop here.
+    """
+    for _ in range(10):
+        inflight = [
+            task
+            for task in (state.interaction_task, *state.interaction_rescans)
+            if task is not None and not task.done()
+        ]
+        if not inflight:
+            return
+        await asyncio.gather(*inflight, return_exceptions=True)
+        await asyncio.sleep(0)  # let each done-callback schedule the next link
+
+
+@pytest.mark.asyncio
+async def test_clear_slot_resurfaces_deferred_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bridge clearing re-scans and surfaces a gate the guard DEFERRED (#1472).
+
+    Models a chained ``a && b`` command where each segment is permission-gated: the
+    first gate surfaces and is answered; the second arrives while the first bridge
+    is still finishing and is skipped by the single-in-flight guard. On the stream
+    path no further frame carries it, so the clear's re-scan is what surfaces it.
+    """
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    gate1 = _load("run_command_waiting")  # stepIndex 6 (the `pwd` segment)
+    gate2 = copy.deepcopy(gate1)  # a distinct later gate (the `ls` segment)
+    gate2["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = 8
+    gate2["runCommand"]["commandLine"] = "ls"
+    # The freshest snapshot the re-scan re-reads: gate1 is still present (already
+    # surfaced → must NOT re-fire) and gate2 is the newly-arrived, deferred gate.
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda _port, _cascade_id: [gate1, gate2])
+
+    fired: list[int] = []
+
+    async def _quick(_cascade_id: str, _port: int, pending: PendingInteraction) -> None:
+        fired.append(pending["step_index"])
+
+    reader._maybe_handle_interaction(
+        gate1,
+        key=reader._step_key(gate1),
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _quick),
+    )
+    first = state.interaction_task
+    assert first is not None
+    await first
+    await asyncio.sleep(0)  # let _clear_slot run → schedule the re-scan
+    await _drain_interactions(state)  # re-scan surfaces gate2 → its bridge fires
+
+    assert fired == [6, 8]  # gate1 directly; gate2 via the clear's re-scan
+    assert reader._step_key(gate1) in state.interacted  # gate1 was not re-surfaced
+    assert reader._step_key(gate2) in state.interacted
+
+
+@pytest.mark.asyncio
+async def test_resurface_pending_interaction_swallows_poll_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-scan whose steps re-read fails is logged and swallowed, not raised."""
+
+    def _boom(_port: int, _cascade_id: str) -> list[dict[str, Any]]:
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(reader, "get_trajectory_steps", _boom)
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    fired: list[int] = []
+
+    async def _quick(_cascade_id: str, _port: int, pending: PendingInteraction) -> None:
+        fired.append(pending["step_index"])
+
+    # Must not raise despite the read failing.
+    await reader._resurface_pending_interaction(
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _quick),
+    )
+
+    assert fired == []  # no gate surfaced
+    assert state.interaction_task is None  # no bridge spawned
 
 
 @pytest.mark.asyncio
