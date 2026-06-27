@@ -69,6 +69,24 @@ async def test_add_comment_end_before_start(client: httpx.AsyncClient, session_i
     assert resp.status_code == 422
 
 
+async def test_add_comment_nonexistent_session(client: httpx.AsyncClient) -> None:
+    """Posting to a session that does not exist returns 404 and persists nothing.
+
+    Regression test for #1401: in single-user mode (no permission store) the
+    handler skipped its only existence guard and stored an orphan comment for a
+    session that ``GET /v1/sessions`` never lists.
+    """
+    resp = await client.post(
+        "/v1/sessions/nonexistent_session/comments",
+        json=_comment_payload(),
+    )
+    assert resp.status_code == 404
+
+    # No orphan row may be persisted for the nonexistent session.
+    list_resp = await client.get("/v1/sessions/nonexistent_session/comments")
+    assert list_resp.json() == []
+
+
 # ── GET /sessions/{id}/comments ──────────────────────────────────────
 
 

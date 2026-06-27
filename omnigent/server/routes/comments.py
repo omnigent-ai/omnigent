@@ -208,6 +208,17 @@ def create_comments_router(
             await require_access(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
             )
+        elif conversation_store is not None:
+            # Single-user mode skips require_access, which is the only path
+            # that would otherwise reject a nonexistent session. Verify the
+            # session exists here so we don't persist an orphan comment for an
+            # id that ``GET /v1/sessions`` never lists (#1401).
+            conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conversation is None:
+                raise OmnigentError(
+                    f"Session not found: {session_id!r}",
+                    code=ErrorCode.NOT_FOUND,
+                )
         comment = store.add(
             conversation_id=session_id,
             path=body.path,
