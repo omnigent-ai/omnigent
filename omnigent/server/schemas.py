@@ -780,6 +780,12 @@ class Usage(BaseModel):
         (e.g. supervisors that delegate / use the harness default).
         ``None`` when the executor doesn't report it; the cost path
         then falls back to the session override / spec model.
+    :param cost_usd: Authoritative per-turn cost in USD reported
+        directly by the harness/provider (e.g. GitHub Copilot's
+        AI-credit total). When present, the server-side cost path uses
+        it in preference to the catalog token-price estimate; ``None``
+        when the harness doesn't report a cost (the common case, where
+        cost is computed from token counts x catalog pricing).
     """
 
     input_tokens: int = 0
@@ -790,6 +796,7 @@ class Usage(BaseModel):
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     model: str | None = None
+    cost_usd: float | None = None
 
 
 class ErrorDetail(BaseModel):
