@@ -3058,9 +3058,9 @@ async def _auto_create_kimi_terminal(
     # The hook subprocess replays these static headers from its config (no
     # refresh-capable httpx.Auth of its own); the helper pairs the bearer with
     # the workspace-routing header so neither is dropped.
-    from omnigent.cli_auth import databricks_auth_headers
+    from omnigent.cli_auth import databricks_request_headers
 
-    _runner_headers = databricks_auth_headers(server_url, _auth_token)
+    _runner_headers = databricks_request_headers(server_url, bearer_token=_auth_token)
     write_hook_config(
         bridge_dir,
         server_url=server_url,
@@ -3421,9 +3421,11 @@ async def _auto_create_codex_terminal(
     # The codex policy hook subprocess replays these static headers from its
     # config (no refresh-capable auth of its own); the helper pairs the bearer
     # with the workspace-routing header so neither is dropped.
-    from omnigent.cli_auth import databricks_auth_headers
+    from omnigent.cli_auth import databricks_request_headers
 
-    policy_headers = databricks_auth_headers(launch_config.policy_server_url, _policy_auth_token)
+    policy_headers = databricks_request_headers(
+        launch_config.policy_server_url, bearer_token=_policy_auth_token
+    )
 
     app_server = build_codex_native_server(
         socket_path=socket_path,
@@ -5145,9 +5147,9 @@ async def _auto_create_claude_terminal(
     # The hook subprocess replays these static headers from its config (no
     # refresh-capable auth of its own); the helper pairs the bearer with the
     # workspace-routing header so neither is dropped.
-    from omnigent.cli_auth import databricks_auth_headers
+    from omnigent.cli_auth import databricks_request_headers
 
-    _runner_headers = databricks_auth_headers(server_url, _auth_token)
+    _runner_headers = databricks_request_headers(server_url, bearer_token=_auth_token)
     _runner_auth = _RunnerDatabricksAuth(_auth_factory)
 
     from omnigent.claude_launcher import resolve_claude_launch
@@ -12024,7 +12026,7 @@ def create_runner_app(
             # the routing header already). The popup subprocess replays these
             # static headers, so pair the bearer with the workspace-routing
             # header — bearer alone misroutes the popup's POST to the account.
-            from omnigent.cli_auth import databricks_auth_headers
+            from omnigent.cli_auth import databricks_request_headers
             from omnigent.opencode_native_bridge import (
                 bridge_dir_for_bridge_id as _oc_bridge_dir,
             )
@@ -12040,7 +12042,7 @@ def create_runner_app(
                 write_cost_popup_config,
                 _oc_bridge_dir(conv_id),
                 ap_server_url=_server_url,
-                ap_auth_headers=databricks_auth_headers(_server_url, _token),
+                ap_auth_headers=databricks_request_headers(_server_url, bearer_token=_token),
             )
         from omnigent import codex_native_bridge as _cxb
 
