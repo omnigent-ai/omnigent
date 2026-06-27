@@ -149,7 +149,31 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
 // ``busy`` + ``current_task_status``). Drives the dot tone, whether the
 // label word shows, and whether the row is de-emphasized. ``awaiting`` =
 // parked on an approval / input prompt and needs the user's attention.
-type AgentActivity = "launching" | "working" | "awaiting" | "done" | "failed" | "idle" | "other";
+// ``disconnected`` = the runner dropped its tunnel or exited; the task did
+// NOT genuinely fail, so it renders a non-destructive (amber) pill rather
+// than the red "Failed" one.
+type AgentActivity =
+  | "launching"
+  | "working"
+  | "awaiting"
+  | "done"
+  | "failed"
+  | "disconnected"
+  | "idle"
+  | "other";
+
+// Error codes that mean "the runner went away", not "the task failed".
+// ``runner_disconnected`` is published when the SSE relay's tunnel drops
+// mid-stream; ``runner_failed_to_start`` when a bound runner reports an
+// unexpected exit. Both are surfaced via ``last_task_error.code`` (child
+// rows) / the session snapshot's ``lastTaskError.code`` (main row). A
+// genuine task failure carries any other code (or none), so it still
+// renders the red "Failed" pill.
+const RUNNER_DISCONNECT_CODES = new Set(["runner_disconnected", "runner_failed_to_start"]);
+
+function isRunnerDisconnectCode(code: string | null | undefined): boolean {
+  return code != null && RUNNER_DISCONNECT_CODES.has(code);
+}
 
 interface AgentStatus {
   activity: AgentActivity;
@@ -189,6 +213,18 @@ function childStatus(child: ChildSessionInfo): AgentStatus {
     return { activity: "launching", label: "Launching" };
   }
   if (child.busy) return { activity: "working", label: "Working" };
+  // A runner disconnect/exit is NOT a task failure — branch on the error
+  // code before the generic failed paths so it renders the amber
+  // "Disconnected" pill instead of the red "Failed" one.
+  if (isRunnerDisconnectCode(child.last_task_error?.code)) {
+    return {
+      activity: "disconnected",
+      label: "Disconnected",
+      details: child.last_task_error
+        ? firstErrorLine(child.last_task_error.message)
+        : undefined,
+    };
+  }
   if (child.last_task_error) {
     return {
       activity: "failed",
@@ -209,12 +245,31 @@ function childStatus(child: ChildSessionInfo): AgentStatus {
  *
  * @param status - ``session.status`` from the snapshot, e.g. ``"running"``,
  *   or ``undefined`` while the snapshot is still loading.
+ * @param lastTaskError - The snapshot's ``lastTaskError`` (code + message),
+ *   used to tell a benign runner disconnect/exit apart from a real failure
+ *   when ``status === "failed"``.
  * @returns The collapsed activity + its label.
  */
-function sessionStatus(status: string | undefined): AgentStatus {
+function sessionStatus(
+  status: string | undefined,
+  lastTaskError?: { code: string; message: string } | null,
+): AgentStatus {
   if (status === "launching") return { activity: "launching", label: "Launching" };
   if (status === "running") return { activity: "working", label: "Working" };
-  if (status === "failed") return { activity: "failed", label: "Failed" };
+  if (status === "failed") {
+    // A runner disconnect/exit collapses the snapshot to ``failed`` but
+    // preserves the cause in ``lastTaskError.code`` — branch on it before
+    // the generic failed path so it reads as "Disconnected", not a real
+    // failure.
+    if (isRunnerDisconnectCode(lastTaskError?.code)) {
+      return {
+        activity: "disconnected",
+        label: "Disconnected",
+        details: lastTaskError ? firstErrorLine(lastTaskError.message) : undefined,
+      };
+    }
+    return { activity: "failed", label: "Failed" };
+  }
   return { activity: "idle", label: "Idle" };
 }
 
@@ -225,6 +280,9 @@ function sessionStatus(status: string | undefined): AgentStatus {
 const DOT_TONE: Record<Exclude<AgentActivity, "working" | "awaiting">, string> = {
   done: "bg-muted-foreground/55",
   failed: "bg-destructive",
+  // Amber, not destructive — a disconnect is a transient liveness loss,
+  // not a task failure, so it must read distinctly from the red "Failed".
+  disconnected: "bg-warning",
   idle: "bg-muted-foreground/55",
   launching: "bg-muted-foreground/70",
   other: "bg-muted-foreground/55",
@@ -239,6 +297,9 @@ const QUIET_STATE: Record<AgentActivity, boolean> = {
   working: true,
   awaiting: false,
   failed: false,
+  // Show the "Disconnected" word — the user needs to know the runner
+  // went away, the same way "Failed" keeps its word.
+  disconnected: false,
   other: false,
   done: true,
   idle: true,
@@ -252,6 +313,9 @@ const SETTLED_STATE: Record<AgentActivity, boolean> = {
   working: false,
   awaiting: false,
   failed: false,
+  // Not dimmed — a disconnected runner is something the user may want to
+  // notice and act on (retry/reconnect), so it stays full-strength.
+  disconnected: false,
   other: false,
   done: true,
   idle: true,
@@ -362,6 +426,21 @@ function StatusIndicator({ activity, label, details }: AgentStatus) {
       >
         <span>{label}</span>
         <span className={cn("inline-block size-2 shrink-0 rounded-full", DOT_TONE.failed)} />
+      </span>
+    );
+  }
+  if (activity === "disconnected") {
+    // Amber, non-destructive — a runner disconnect/exit is a liveness loss,
+    // not a task failure, so it must read distinctly from the red "Failed".
+    return (
+      <span
+        aria-label={title}
+        title={title}
+        data-testid="subagent-status-dot"
+        className="inline-flex shrink-0 items-center gap-1 text-warning text-xs"
+      >
+        <span>{label}</span>
+        <span className={cn("inline-block size-2 shrink-0 rounded-full", DOT_TONE.disconnected)} />
       </span>
     );
   }
@@ -526,7 +605,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
           <Icon className="size-3.5 shrink-0 text-muted-foreground" />
           <span className="shrink-0 truncate text-xs font-medium">{label}</span>
           <span className="flex-1" />
-          <StatusIndicator {...sessionStatus(session?.status)} />
+          <StatusIndicator {...sessionStatus(session?.status, session?.lastTaskError)} />
         </div>
         {preview && (
           // Indented to align with the title text above: 14px icon + 4px gap.

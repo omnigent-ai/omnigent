@@ -776,6 +776,144 @@ describe("SubagentsPanel", () => {
     );
   });
 
+  it.each([
+    ["runner_disconnected", "Runner disconnected unexpectedly."],
+    ["runner_failed_to_start", "runner exited before the first turn"],
+  ])(
+    "renders 'Disconnected' (amber, not red 'Failed') for the runner-disconnect code %s",
+    (code, message) => {
+      // Option B: a runner that merely disconnected/exited is NOT a task
+      // failure. The child summary still collapses to current_task_status
+      // "failed", but last_task_error.code carries the disconnect cause, so
+      // the row must branch to the amber "Disconnected" pill before the red
+      // "Failed" one.
+      mockChildTree({
+        conv_parent: [
+          childInfo({
+            id: "conv_child",
+            title: "researcher:auth",
+            tool: "researcher",
+            session_name: "auth",
+            current_task_status: "failed",
+            last_task_error: { code, message },
+          }),
+        ],
+      });
+
+      const { container } = renderPanel();
+
+      const row = childRow(container, "conv_child");
+      const indicator = within(row).getByTestId("subagent-status-dot");
+      expect(row).toHaveTextContent(/Disconnected/);
+      expect(row).not.toHaveTextContent(/Failed/);
+      // Non-destructive amber tone — distinct from the red failure pill.
+      expect(indicator).toHaveClass("text-warning");
+      expect(indicator).not.toHaveClass("text-destructive");
+      expect(indicator.querySelector(".bg-warning")).not.toBeNull();
+      expect(indicator.querySelector(".bg-destructive")).toBeNull();
+      // The cause is still surfaced in the accessible label / tooltip.
+      expect(indicator).toHaveAttribute("aria-label", `Disconnected: ${message}`);
+    },
+  );
+
+  it("keeps rendering red 'Failed' for a genuine task failure (non-disconnect code)", () => {
+    // Guard the hard constraint: only runner-disconnect/exit codes become
+    // "Disconnected"; any other error code is a real failure and stays red.
+    mockChildTree({
+      conv_parent: [
+        childInfo({
+          id: "conv_child",
+          title: "researcher:auth",
+          tool: "researcher",
+          session_name: "auth",
+          current_task_status: "failed",
+          last_task_error: { code: "tool_error", message: "Tool raised ValueError" },
+        }),
+      ],
+    });
+
+    const { container } = renderPanel();
+
+    const row = childRow(container, "conv_child");
+    const indicator = within(row).getByTestId("subagent-status-dot");
+    expect(row).toHaveTextContent(/Failed/);
+    expect(row).not.toHaveTextContent(/Disconnected/);
+    expect(indicator).toHaveClass("text-destructive");
+    expect(indicator.querySelector(".bg-destructive")).not.toBeNull();
+  });
+
+  it("renders 'Disconnected' on the main row when the parent failed with a runner-disconnect code", () => {
+    // The session snapshot collapses a runner exit to status "failed" but
+    // preserves the cause in lastTaskError.code (runner_failed_to_start /
+    // runner_disconnected). The main row must branch on it to render the
+    // amber "Disconnected" pill rather than the red "Failed" one.
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_root",
+        agentId: "ag_root",
+        agentName: null,
+        runnerId: null,
+        status: "failed",
+        lastTaskError: {
+          code: "runner_failed_to_start",
+          message: "runner exited before the first turn",
+        },
+        createdAt: 0,
+        title: null,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+        subAgentName: null,
+      },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    const mainRow = screen.getByTestId("subagent-main-row");
+    const indicator = within(mainRow).getByTestId("subagent-status-dot");
+    expect(mainRow).toHaveTextContent(/Disconnected/);
+    expect(mainRow).not.toHaveTextContent(/Failed/);
+    expect(indicator).toHaveClass("text-warning");
+    expect(indicator).not.toHaveClass("text-destructive");
+  });
+
+  it("renders red 'Failed' on the main row for a genuine parent failure (non-disconnect code)", () => {
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_root",
+        agentId: "ag_root",
+        agentName: null,
+        runnerId: null,
+        status: "failed",
+        lastTaskError: { code: "turn_error", message: "turn setup failed" },
+        createdAt: 0,
+        title: null,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+        subAgentName: null,
+      },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    const mainRow = screen.getByTestId("subagent-main-row");
+    const indicator = within(mainRow).getByTestId("subagent-status-dot");
+    expect(mainRow).toHaveTextContent(/Failed/);
+    expect(mainRow).not.toHaveTextContent(/Disconnected/);
+    expect(indicator).toHaveClass("text-destructive");
+  });
+
   it("shows the pulsing working dot (no redundant 'Working' word) on the main row when the parent session is running", () => {
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
     useSessionMock.mockReturnValue({
