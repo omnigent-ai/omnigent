@@ -8,14 +8,11 @@ import type { SVGProps } from "react";
 // symmetry, so the two snakes open the caduceus' twin lens loops.
 export function HermesIcon(props: SVGProps<SVGSVGElement>) {
   // One wing (two feathers) spreading from the top of the staff.
-  const wing =
-    "M11.5 5.9 C 9 4.7 6.4 4.7 4.8 5.7 " +
-    "M11.5 7.3 C 9.4 6.6 7.2 6.8 5.8 7.9";
+  const wing = "M11.5 5.9 C 9 4.7 6.4 4.7 4.8 5.7 " + "M11.5 7.3 C 9.4 6.6 7.2 6.8 5.8 7.9";
   // One serpent weaving down the staff: it bows out, crosses the centre, bows
   // back the other way, and converges at the foot. Mirrored, the two snakes
   // weave the entwined caduceus.
-  const snake =
-    "M12 8.2 C 8.9 9 8.6 11 12 12 C 15.4 13 15.1 15 12 16 C 9.9 16.7 9.6 17.6 12 18.2";
+  const snake = "M12 8.2 C 8.9 9 8.6 11 12 12 C 15.4 13 15.1 15 12 16 C 9.9 16.7 9.6 17.6 12 18.2";
   return (
     <svg
       viewBox="0 0 24 24"
@@ -25,6 +22,7 @@ export function HermesIcon(props: SVGProps<SVGSVGElement>) {
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden="true"
+      data-testid="hermes-icon"
       {...props}
     >
       {/* staff */}

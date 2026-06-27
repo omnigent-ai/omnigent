@@ -201,6 +201,26 @@ os_env:
     type: none
 """
 
+# A native Hermes coding agent, seeded as a BUILT-IN (via
+# ``OMNIGENT_BUILTIN_AGENT_DIRS``) so it appears in the ``GET /v1/agents``
+# catalog the Add-agent picker renders — that endpoint lists built-ins only
+# (``session_id IS NULL``), so a session-scoped upload would never reach the
+# picker. No runner bind or live Hermes CLI is needed to assert which glyph
+# the card shows; the catalog reports ``harness == "hermes-native"`` (from the
+# ``executor.harness`` shorthand the single-file omnigent loader accepts —
+# the ``executor.config.harness`` form is only valid for ``config.yaml``
+# bundles), which the SPA's ``iconForAgent`` resolves to the Hermes glyph.
+# Consumed by ``tests/e2e_ui/agents/test_hermes_icon.py``. The registered name
+# is the spec file's stem.
+_HERMES_AGENT_NAME = "hermes-native-ui"
+_HERMES_AGENT_YAML = f"""\
+name: {_HERMES_AGENT_NAME}
+prompt: Hermes native coding agent.
+
+executor:
+  harness: hermes-native
+"""
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     """Register UI-only CLI flags.
@@ -780,6 +800,7 @@ def live_server(
     for probe_name, probe_yaml in (
         (_FILES_PROBE_NO_ENV_AGENT_NAME, _FILES_PROBE_NO_ENV_AGENT_YAML),
         (_FILES_PROBE_ENV_AGENT_NAME, _FILES_PROBE_ENV_AGENT_YAML),
+        (_HERMES_AGENT_NAME, _HERMES_AGENT_YAML),
     ):
         probe_path = server_tmp / f"{probe_name}.yaml"
         probe_path.write_text(probe_yaml)
