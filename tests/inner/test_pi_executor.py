@@ -2074,6 +2074,80 @@ class TestRunTurn(unittest.TestCase):
 
         _run(_test())
 
+    def test_recovers_post_tool_json_parse_error(self):
+        async def _test():
+            executor = self._make_executor()
+
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            fake_rpc.process.stdin = _FakeStreamWriter()
+            fake_rpc._stderr_lines = []
+
+            tool_text = json.dumps(
+                {
+                    "stdout": "/root\nPI_PIEXEC_PATCH_OK\n",
+                    "stderr": "",
+                    "exit_code": 0,
+                    "timed_out": False,
+                    "shell": "/usr/bin/bash",
+                    "cwd": "/root",
+                },
+                separators=(",", ":"),
+            )
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "sys_os_shell",
+                        "isError": False,
+                        "result": {"content": [{"type": "text", "text": tool_text}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": {
+                            "stopReason": "error",
+                            "errorMessage": (
+                                "Expected property name or '}' in JSON "
+                                "at position 1 (line 1 column 2)"
+                            ),
+                        },
+                    }
+                ),
+            ]
+            for line in lines:
+                fake_rpc._line_queue.put_nowait(line)
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "run smoke"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
+            self.assertEqual(len(tool_completes), 1)
+            self.assertEqual(tool_completes[0].status, ToolCallStatus.SUCCESS)
+            self.assertFalse(any(isinstance(e, ExecutorError) for e in events))
+            text_chunks = [e for e in events if isinstance(e, TextChunk)]
+            self.assertEqual([e.text for e in text_chunks], [tool_text])
+            turn_complete = [e for e in events if isinstance(e, TurnComplete)]
+            self.assertEqual(len(turn_complete), 1)
+            self.assertEqual(turn_complete[0].response, tool_text)
+
+        _run(_test())
+
 
 # ---------------------------------------------------------------------------
 # Pi thinking-delta → ReasoningChunk tests — function-based per the
