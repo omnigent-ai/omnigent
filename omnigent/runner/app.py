@@ -3928,9 +3928,20 @@ async def _auto_create_antigravity_terminal(
         raise RuntimeError(f"Invalid external_session_id for Antigravity session {session_id!r}.")
     resume = bool(external_session_id)
 
-    # agy model label from the session's model_override (None lets agy default).
+    # agy model id from the session's model_override (None lets agy default).
     _model_override = snapshot.get("model_override")
     model = _model_override if isinstance(_model_override, str) and _model_override else None
+    if model is not None:
+        # Defense-in-depth: re-validate the persisted override at the runner
+        # boundary so a value that somehow bypassed server-side validation can
+        # never reach the agy ``--model`` argv as shell- or flag-shaped input
+        # (mirrors the Codex spawn-boundary re-validation above).
+        try:
+            validate_model_override(model)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid model_override for Antigravity session {session_id!r}: {exc}"
+            ) from exc
 
     # Bridge id mirrors the CLI/harness derivation: the session's bridge-id
     # label when present (so the spawn env built by

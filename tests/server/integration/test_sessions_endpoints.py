@@ -4997,6 +4997,35 @@ async def test_post_external_model_change_rejects_empty_model(
     assert "external_model_change" in resp.text
 
 
+@pytest.mark.asyncio
+async def test_post_external_model_change_rejects_displayname(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A human displayName (``"Gemini 2.5 Flash"``) 400s and is NOT persisted.
+
+    The persisted ``model_override`` crosses the spawn boundary as a
+    ``--model`` argv element, so it must be a valid (slug-shaped) model id.
+    The displayName has spaces, which ``validate_model_override`` rejects —
+    guarding against an external harness mistakenly reporting the dropdown
+    label (the antigravity-native pricing/resume bug) and poisoning the
+    override with a value ``agy --model`` cannot faithfully resume.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_model_change", "data": {"model": "Gemini 2.5 Flash"}},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "external_model_change" in resp.text
+
+    # The override was not persisted.
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["model_override"] is None
+
+
 async def test_post_external_model_change_does_not_forward_to_runner(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
