@@ -73,11 +73,29 @@ _LLM_NAME_TOKENS = ("claude", "gpt", "codex", "gemini", "llama", "qwen", "kimi")
 # Chat-capable endpoint tasks ("llm/v1/chat"); embeddings/rerankers don't match.
 _LLM_TASK_TOKENS = ("chat", "completion")
 
-# Subscription CLIs expose no listing API: curated ids matching the bundled
-# catalog pin (claude) and the codex ids the codebase already references.
+# Curated static model ids for providers with no enumerable listing API at
+# resolve time. The claude/codex entries are subscription CLI logins; the
+# cursor entry is the cursor-native harness (Cursor SDK), which talks only to
+# Cursor's own backend (no Databricks gateway / OpenAI-compatible /v1/models)
+# and whose ``cursor-agent models`` listing is account-scoped + needs auth — so
+# we pin a stable representative subset of Cursor's base model families
+# (sourced from ``cursor-agent models``) rather than gate the row on a key.
 _SUBSCRIPTION_STATIC_MODELS: dict[str, tuple[str, ...]] = {
     "claude": ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"),
     "codex": ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
+    "cursor": (
+        "auto",
+        "composer-2.5",
+        "gpt-5.5",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "gpt-5.3-codex",
+        "claude-opus-4-8",
+        "claude-4.6-sonnet",
+        "claude-haiku-4-5",
+        "gemini-3.1-pro",
+        "gemini-3.5-flash",
+    ),
 }
 
 # Harness spellings -> the workflow harness whose provider resolution they
@@ -114,6 +132,13 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
     "antigravity-native": "antigravity",
     "native-antigravity": "antigravity",
 }
+
+# cursor-native has no AgentHarnessType sibling to resolve through (the Cursor
+# SDK talks only to Cursor's backend — no Databricks gateway / OpenAI-compatible
+# /v1/models — so cursor is deliberately excluded from the shared provider
+# machinery). It enumerates from the same curated static path as the
+# subscription CLIs instead (see resolve_model_provider).
+_CURSOR_HARNESSES = frozenset({"cursor", "cursor-native", "native-cursor"})
 
 # Preferred inline family per single-family harness (pi consumes both).
 _KEY_AUTH_FAMILY: dict[str, str] = {
@@ -342,6 +367,11 @@ def _resolve_model_provider_unsafe(spec: Any, harness: str | None) -> ResolvedMo
     # consumed from the runner's dispatch path.
     from omnigent.runtime.workflow import _resolve_provider_for_build
 
+    if (harness or "") in _CURSOR_HARNESSES:
+        # cursor enumerates from the curated static path (its model set is
+        # SDK-determined and not auth-gated); it has no AgentHarnessType sibling
+        # to feed _resolve_provider_for_build.
+        return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="cursor", detail="cursor-native")
     harness_type = _PROVIDER_RESOLUTION_HARNESS.get(harness or "")
     if harness_type is None:
         return ResolvedModelProvider(
@@ -754,21 +784,35 @@ def _listing_for_provider(
 
 
 def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListing:
-    """Build the curated static listing for a subscription CLI login.
+    """Build the curated static listing for a no-listing-API provider.
+
+    Covers the subscription CLI logins (claude / codex) and cursor. The
+    subscription CLIs expose no model-listing API at all, whereas cursor is
+    an SDK harness whose ``cursor-agent models`` command does exist but is
+    account-scoped/auth-gated and is not enumerated here — so each gets a
+    note that states the correct reason its listing is static.
 
     :param provider: A ``kind="subscription"`` provider descriptor.
     :returns: A ``source="static"`` listing with ``verified=False``.
     """
     ids = _SUBSCRIPTION_STATIC_MODELS.get(provider.cli or "", ())
+    if provider.cli == "cursor":
+        note = (
+            "curated static model set for the cursor-native SDK harness "
+            "(no listing API is enumerated here; availability depends on "
+            "the logged-in Cursor plan)"
+        )
+    else:
+        note = (
+            f"curated aliases for the {provider.cli or 'unknown'} CLI login "
+            "(subscription logins expose no model-listing API; availability "
+            "depends on the logged-in plan)"
+        )
     return ModelListing(
         source="static",
         verified=False,
         models=tuple(ModelEntry(id=i, family=model_family_token(i)) for i in ids),
-        note=(
-            f"curated aliases for the {provider.cli or 'unknown'} CLI login "
-            "(subscription logins expose no model-listing API; availability "
-            "depends on the logged-in plan)"
-        ),
+        note=note,
     )
 
 
