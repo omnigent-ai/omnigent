@@ -85,6 +85,45 @@ def build_opencode_model_default_config(model: str) -> dict[str, object]:
     return {"$schema": "https://opencode.ai/config.json", "model": model}
 
 
+# OpenCode tools to hard-deny for a read-only session. These are opencode's
+# own native mutating/network tools (verified against the opencode.json
+# ``permission`` schema, which keys on tool name and accepts
+# ``ask``/``allow``/``deny``). Reads (``read``/``grep``/``glob``/``list``) are
+# left unset so they keep opencode's default-allow, giving an explore-only
+# session.
+_OPENCODE_READ_ONLY_DENIED_TOOLS = ("edit", "bash", "webfetch", "websearch")
+
+# The Omnigent builtin-tool relay's workspace-mutating tools, which MUST also be
+# denied in a read-only session — otherwise the agent could route around the
+# native-tool deny above by writing/editing/shelling through the relay's MCP
+# surface (``sys_os_write``/``sys_os_edit``/``sys_os_shell``). opencode exposes
+# MCP tools as ``<server>_<tool>``; the relay's server name is
+# ``claude_native_bridge._MCP_SERVER_NAME`` (imported below so the prefix can't
+# drift). The policy engine remains the server-side authority on these; denying
+# them here is a belt-and-suspenders block at opencode's own permission layer.
+_OPENCODE_RELAY_WRITE_TOOLS = ("sys_os_write", "sys_os_edit", "sys_os_shell")
+
+
+def build_opencode_read_only_permission() -> dict[str, str]:
+    """
+    Build opencode.json's ``permission`` block for a read-only session.
+
+    Hard-denies opencode's native edit / shell / network tools AND the Omnigent
+    relay's workspace-mutating MCP tools (``<server>_sys_os_write`` etc.) so the
+    TUI can read and reason but never mutate the workspace or reach the network;
+    reads stay at opencode's default-allow. Used by the runner when a session
+    carries ``OPENCODE_NATIVE_PERMISSION_MODE_LABEL_KEY`` == ``"read-only"``.
+
+    :returns: A ``{tool: "deny"}`` mapping for the denied native + relay tools.
+    """
+    from omnigent.claude_native_bridge import _MCP_SERVER_NAME
+
+    denied = dict.fromkeys(_OPENCODE_READ_ONLY_DENIED_TOOLS, "deny")
+    for tool in _OPENCODE_RELAY_WRITE_TOOLS:
+        denied[f"{_MCP_SERVER_NAME}_{tool}"] = "deny"
+    return denied
+
+
 def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dict[str, object]:
     """
     Build the ``opencode.json`` declaring a custom OpenAI-compatible provider.

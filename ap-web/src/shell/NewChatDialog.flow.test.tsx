@@ -628,12 +628,11 @@ describe("NewChatLandingScreen create flow", () => {
     expect(screen.queryByTestId("new-chat-landing-approval-full-access")).toBeNull();
   });
 
-  it("resets the shared approval mode to default when switching codex-native → opencode-native", async () => {
-    // codex-native and opencode-native share a single approvalMode state. A
-    // codex pick must NOT linger after switching to OpenCode (which has no
-    // stored pick) — otherwise a more-permissive mode would silently flow
-    // into the OpenCode launch args. Regression test for the seeding effect's
-    // reset-on-no-stored-value branch.
+  it("keeps Codex's approval preset out of OpenCode's submenu (no cross-harness bleed)", async () => {
+    // codex-native uses approvalMode (CLI-flag presets); opencode-native uses
+    // its own opencodeMode (a session label — `opencode attach` has no
+    // permission CLI flag). A codex pick must NOT bleed into OpenCode's launch:
+    // OpenCode's submenu has its own modes, and its default posts no flags.
     setAgents([
       agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" }),
       agent({ id: "ag_opencode", name: "opencode-native-ui", display_name: "OpenCode" }),
@@ -649,17 +648,46 @@ describe("NewChatLandingScreen create flow", () => {
     openAgentConfig("ag_codex");
     fireEvent.click(screen.getByTestId("new-chat-landing-approval-full-access"));
 
-    // Switch the picker to OpenCode by clicking its row (commits the pick).
-    selectAgent("ag_opencode");
+    // Open OpenCode's submenu: it shows the opencode permission modes, and
+    // Codex's "Full access" approval preset doesn't exist here.
+    openAgentConfig("ag_opencode");
+    expect(screen.getByTestId("new-chat-landing-opencode-mode-read-only")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-approval-full-access")).toBeNull();
 
-    // OpenCode has no stored pick → the shared approval knob must reset to
-    // Default, not keep Codex's "Full access". Proven by the launch args:
-    // a default preset posts no sandbox/approval flags.
+    // Commit OpenCode at its default and submit: no codex sandbox/approval
+    // flags, and no opencode mode label (default needs no label).
+    selectAgent("ag_opencode");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string);
+    expect(body.labels?.["omnigent.wrapper"]).toBe("opencode-native-ui");
+    expect(body.labels?.["omnigent.opencode_native.permission_mode"]).toBeUndefined();
+    expect(body.terminal_launch_args).toBeUndefined();
+  });
+
+  it("posts the read-only label (no CLI flags) when read-only is picked for opencode-native", async () => {
+    setAgents([agent({ id: "ag_opencode", name: "opencode-native-ui", display_name: "OpenCode" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_opencode" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // Open OpenCode's submenu and pick "Read only".
+    openAgentConfig("ag_opencode");
+    fireEvent.click(screen.getByTestId("new-chat-landing-opencode-mode-read-only"));
+
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    // The mode rides as a label, NOT terminal_launch_args (opencode attach has
+    // no permission CLI flag — that was the original terminal-crash bug).
+    expect(body.labels?.["omnigent.opencode_native.permission_mode"]).toBe("read-only");
     expect(body.labels?.["omnigent.wrapper"]).toBe("opencode-native-ui");
     expect(body.terminal_launch_args).toBeUndefined();
   });

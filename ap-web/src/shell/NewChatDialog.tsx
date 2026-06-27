@@ -194,6 +194,33 @@ const CURSOR_NATIVE_EXEC_MODES: {
 // runner uses Codex's built-in default.
 // Keep in sync with `codex --help` and
 // https://developers.openai.com/codex/agent-approvals-security
+
+// OpenCode permission modes. Unlike Codex/Cursor these are NOT
+// terminal_launch_args: `opencode attach` has no permission/sandbox CLI flag,
+// so the mode rides as a conversation label the runner reads to synthesize
+// opencode.json's `permission` block. "default" routes every sensitive tool
+// through the Omnigent policy engine ("ask"); "read-only" hard-denies edits,
+// commands, and network so the agent can explore but never mutate.
+const OPENCODE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
+const OPENCODE_NATIVE_PERMISSION_MODES: { value: string; label: string; description: string }[] = [
+  {
+    value: "default",
+    label: "Default",
+    description: "Edits, commands, and fetches route through policy approval",
+  },
+  {
+    value: "read-only",
+    label: "Read only",
+    description: "Reads only; edits, commands, and network are blocked",
+  },
+];
+// Conversation-label key mirroring the server's
+// OPENCODE_NATIVE_PERMISSION_MODE_LABEL_KEY. The runner reads it at launch to
+// pick opencode.json's permission stance (there is no CLI flag for it). Stored
+// as a plain label so it survives reload; absent/"default" leaves the normal
+// policy-routed stance.
+const OPENCODE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.opencode_native.permission_mode";
+
 const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = "default";
 const CODEX_NATIVE_APPROVAL_MODES: {
   value: string;
@@ -1047,6 +1074,51 @@ function CursorModeOptions({
 }
 
 /**
+ * OpenCode permission-mode radio rows, rendered inside the agent picker's
+ * per-entry submenu. Mirror of {@link PermissionModeOptions} for OpenCode.
+ *
+ * @param value Currently selected mode, e.g. ``"read-only"``.
+ * @param onValueChange Selection callback (receives the mode value).
+ */
+function OpenCodeModeOptions({
+  value,
+  onValueChange,
+}: {
+  value: string;
+  onValueChange: (mode: string) => void;
+}) {
+  const [previewed, setPreviewed] = useState<string | null>(null);
+  const detail = OPENCODE_NATIVE_PERMISSION_MODES.find(
+    (m) => m.value === (previewed ?? value),
+  )?.description;
+  return (
+    <>
+      <DropdownMenuRadioGroup value={value} onValueChange={onValueChange}>
+        {OPENCODE_NATIVE_PERMISSION_MODES.map((mode) => (
+          <DropdownMenuRadioItem
+            key={mode.value}
+            value={mode.value}
+            data-testid={`new-chat-landing-opencode-mode-${mode.value}`}
+            onFocus={() => setPreviewed(mode.value)}
+            onPointerEnter={() => setPreviewed(mode.value)}
+            className="rounded-sm pl-2 py-1 text-xs"
+          >
+            {mode.label}
+          </DropdownMenuRadioItem>
+        ))}
+      </DropdownMenuRadioGroup>
+      <DropdownMenuSeparator />
+      <p
+        data-testid="new-chat-landing-opencode-mode-detail"
+        className="min-h-5 px-2 pt-0.5 pb-1 text-xs leading-relaxed text-muted-foreground"
+      >
+        {detail}
+      </p>
+    </>
+  );
+}
+
+/**
  * Brain-harness radio rows for an overridable bundle agent, rendered
  * inside the Advanced settings menu in the composer footer.
  *
@@ -1197,6 +1269,7 @@ function AgentHarnessPicker({
   permissionMode,
   approvalMode,
   cursorExecMode,
+  opencodeMode,
   bypassSandbox,
   pickedModel,
   pickedEffort,
@@ -1204,6 +1277,7 @@ function AgentHarnessPicker({
   setPermissionMode,
   setApprovalMode,
   setCursorExecMode,
+  setOpencodeMode,
   setBypassSandbox,
   setPickedModel,
   setPickedEffort,
@@ -1223,6 +1297,7 @@ function AgentHarnessPicker({
   permissionMode: string;
   approvalMode: string;
   cursorExecMode: string;
+  opencodeMode: string;
   bypassSandbox: boolean;
   pickedModel: string;
   pickedEffort: string;
@@ -1230,6 +1305,7 @@ function AgentHarnessPicker({
   setPermissionMode: (mode: string) => void;
   setApprovalMode: (mode: string) => void;
   setCursorExecMode: (mode: string) => void;
+  setOpencodeMode: (mode: string) => void;
   setBypassSandbox: (enabled: boolean) => void;
   setPickedModel: (model: string) => void;
   setPickedEffort: (effort: string) => void;
@@ -1243,6 +1319,7 @@ function AgentHarnessPicker({
     nativeAgentHasCapability(agent, "permissionMode") ||
     nativeAgentHasCapability(agent, "approvalMode") ||
     nativeAgentHasCapability(agent, "cursorMode") ||
+    nativeAgentHasCapability(agent, "opencodeMode") ||
     (agent.harness != null && agent.harness in BRAIN_HARNESS_LABELS);
 
   // The agent name + optional short blurb, shared by leaf rows and
@@ -1358,6 +1435,21 @@ function AgentHarnessPicker({
           )}
           onValueChange={onModeChange(setCursorExecMode)}
         />
+      );
+    }
+    if (nativeAgentHasCapability(agent, "opencodeMode")) {
+      return (
+        <>
+          <PickerSectionHeader>Permission Mode</PickerSectionHeader>
+          <OpenCodeModeOptions
+            value={modeValue(
+              OPENCODE_NATIVE_PERMISSION_MODES,
+              OPENCODE_NATIVE_DEFAULT_PERMISSION_MODE,
+              opencodeMode,
+            )}
+            onValueChange={onModeChange(setOpencodeMode)}
+          />
+        </>
       );
     }
     // Bundle / custom agent with an overridable brain harness.
@@ -1647,6 +1739,10 @@ export function NewChatLandingScreen() {
   // the codex-native wrapper; ignored otherwise. Lives in the footer
   // tray's Advanced settings menu.
   const [approvalMode, setApprovalMode] = useState<string>(CODEX_NATIVE_DEFAULT_APPROVAL_MODE);
+  // Permission mode for OpenCode. Only meaningful for the opencode-native
+  // wrapper; ignored otherwise. Rides as a conversation label (not a CLI flag)
+  // the runner reads to build opencode.json's permission stance.
+  const [opencodeMode, setOpencodeMode] = useState<string>(OPENCODE_NATIVE_DEFAULT_PERMISSION_MODE);
   // DANGEROUS codex full-bypass opt-in (Codex only). OFF by default and only
   // flippable on after the user types the confirmation phrase, so it can
   // never be enabled by an accidental click. Persisted as a conversation
@@ -1779,6 +1875,7 @@ export function NewChatLandingScreen() {
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
+  const supportsOpencodeMode = nativeAgentHasCapability(selectedAgent, "opencodeMode");
   // Defense in depth for the DANGEROUS bypass toggle: never let an armed
   // bypass carry across an agent change. Switching the picker to another
   // agent — or away from Codex and back — must require the typed confirmation
@@ -1803,11 +1900,10 @@ export function NewChatLandingScreen() {
     const stored = readLastModeForHarness(selectedNativeHarness);
     // Resolve to the stored value when it's still valid for this harness,
     // else the harness default. The else branch must RESET (not early-return)
-    // because codex-native and opencode-native share the single approvalMode
-    // state: returning early would leave the previously-selected harness's
-    // mode in place — e.g. codex's "full-access" carried onto OpenCode — and
-    // flow into the launch args unchanged. A stale value not in the current
-    // list resolves to the default for the same reason.
+    // because each capability's mode lives in its own shared state slot:
+    // returning early would leave the previously-selected harness's mode in
+    // place and flow it into the next launch unchanged. A stale value not in
+    // the current list resolves to the default for the same reason.
     const resolve = (modes: readonly { value: string }[], dflt: string) =>
       stored != null && modes.some((m) => m.value === stored) ? stored : dflt;
     if (supportsPermissionMode) {
@@ -1818,6 +1914,10 @@ export function NewChatLandingScreen() {
       setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
     } else if (supportsCursorMode) {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
+    } else if (supportsOpencodeMode) {
+      setOpencodeMode(
+        resolve(OPENCODE_NATIVE_PERMISSION_MODES, OPENCODE_NATIVE_DEFAULT_PERMISSION_MODE),
+      );
     }
     // Reseed only on harness change; capability flags are derived from the
     // same harness so they don't need to be deps.
@@ -2050,6 +2150,25 @@ export function NewChatLandingScreen() {
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
+      const agentSupportsOpencodeMode = nativeAgentHasCapability(agent, "opencodeMode");
+      // Native wrapper labels + per-session opt-ins that ride as conversation
+      // labels the runner reads at launch: the DANGEROUS codex full-bypass
+      // (typed-confirm gated) and the SAFE opencode permission mode (no CLI
+      // flag exists for it, so it can't go through terminal_launch_args).
+      // undefined for non-native agents (no wrapper labels to carry).
+      let sessionLabels = nativeLabels;
+      if (agentSupportsApprovalMode && bypassSandbox) {
+        sessionLabels = {
+          ...(sessionLabels ?? {}),
+          [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1",
+        };
+      }
+      if (agentSupportsOpencodeMode && opencodeMode !== OPENCODE_NATIVE_DEFAULT_PERMISSION_MODE) {
+        sessionLabels = {
+          ...(sessionLabels ?? {}),
+          [OPENCODE_NATIVE_PERMISSION_MODE_LABEL_KEY]: opencodeMode,
+        };
+      }
 
       let data: { id: string };
 
@@ -2100,16 +2219,13 @@ export function NewChatLandingScreen() {
             // `omnigent.wrapper` selects which CLI bridge the runner launches.
             // The values are the registered wrapper ids the runner keys off —
             // they must match the wrapper registry, not the agent display name.
-            // The DANGEROUS codex full-bypass opt-in rides along as an extra
-            // label (only when the toggle is armed for a codex-native agent)
-            // so the runner launches with --dangerously-bypass-approvals-and-
-            // sandbox and the choice survives reload.
-            labels:
-              agentSupportsApprovalMode && bypassSandbox
-                ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
-                : nativeLabels,
+            // Per-session opt-ins (codex bypass, opencode permission mode) ride
+            // along as extra labels — see sessionLabels above.
+            labels: sessionLabels,
             // Permission / approval / cursor mode → CLI flag pair, persisted as
             // terminal_launch_args. Omitted for the default and non-native agents.
+            // (OpenCode's mode is NOT here — it has no CLI flag, so it rides as
+            // a label in sessionLabels above.)
             terminal_launch_args:
               agentSupportsPermissionMode &&
               permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
@@ -2447,6 +2563,7 @@ export function NewChatLandingScreen() {
                   permissionMode={permissionMode}
                   approvalMode={approvalMode}
                   cursorExecMode={cursorExecMode}
+                  opencodeMode={opencodeMode}
                   bypassSandbox={bypassSandbox}
                   pickedModel={pickedModel}
                   pickedEffort={pickedEffort}
@@ -2454,6 +2571,7 @@ export function NewChatLandingScreen() {
                   setPermissionMode={setPermissionMode}
                   setApprovalMode={setApprovalMode}
                   setCursorExecMode={setCursorExecMode}
+                  setOpencodeMode={setOpencodeMode}
                   setBypassSandbox={setBypassSandbox}
                   setPickedModel={setPickedModel}
                   setPickedEffort={setPickedEffort}

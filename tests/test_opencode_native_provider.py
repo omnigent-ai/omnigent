@@ -17,9 +17,28 @@ from omnigent.opencode_native_provider import (
     build_opencode_model_default_config,
     build_opencode_omnigent_mcp_server,
     build_opencode_provider_config,
+    build_opencode_read_only_permission,
     resolve_databricks_gateway,
     write_opencode_provider_config,
 )
+
+
+def test_build_read_only_permission_denies_native_and_relay_write_tools() -> None:
+    from omnigent.claude_native_bridge import _MCP_SERVER_NAME
+
+    perm = build_opencode_read_only_permission()
+    # opencode's own native mutating/network tools are hard-denied.
+    for tool in ("edit", "bash", "webfetch", "websearch"):
+        assert perm[tool] == "deny"
+    # The relay's workspace-mutating MCP tools are denied too, under opencode's
+    # ``<server>_<tool>`` naming — else the agent could write via the relay.
+    for tool in ("sys_os_write", "sys_os_edit", "sys_os_shell"):
+        assert perm[f"{_MCP_SERVER_NAME}_{tool}"] == "deny"
+    # Reads are NOT listed (they keep opencode's default-allow); sys_os_read is
+    # likewise not denied, so the relay's read path stays usable.
+    assert "read" not in perm
+    assert f"{_MCP_SERVER_NAME}_sys_os_read" not in perm
+    assert all(level == "deny" for level in perm.values())
 
 
 def test_build_omnigent_mcp_server_points_serve_mcp_at_bridge_dir() -> None:
