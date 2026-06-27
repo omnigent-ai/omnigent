@@ -16,7 +16,11 @@ export type NativeCodingAgentIconKind =
   | "antigravity"
   | "kimi"
   | "hermes";
-export type NativeCodingAgentCapability = "permissionMode" | "approvalMode" | "cursorMode";
+export type NativeCodingAgentCapability =
+  | "permissionMode"
+  | "approvalMode"
+  | "cursorMode"
+  | "opencodeMode";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
@@ -58,7 +62,11 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "OpenCode",
     iconKind: "opencode",
     sortRank: 25,
-    capabilities: ["approvalMode"],
+    // OpenCode's own permission model (NOT Codex's approvalMode — its preset
+    // CLI flags like `--sandbox`/`--ask-for-approval` aren't understood by
+    // `opencode attach` and crash the TUI). opencodeMode rides as a session
+    // label the runner reads to synthesize opencode.json's `permission` block.
+    capabilities: ["opencodeMode"],
   },
   {
     key: "cursor",

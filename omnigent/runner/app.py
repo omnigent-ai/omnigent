@@ -893,6 +893,9 @@ class _OpenCodeNativeLaunchConfig:
         transcript should be seeded as a text preamble
         (``omnigent.fork.carry_history``); opencode has no native session to
         clone, so the runner rehydrates from the copied Omnigent transcript.
+    :param permission_mode: The session's opencode permission stance from the
+        ``OPENCODE_NATIVE_PERMISSION_MODE_LABEL_KEY`` label (e.g.
+        ``"read-only"``), or ``None`` for the default policy-routed stance.
     """
 
     workspace: Path
@@ -901,6 +904,7 @@ class _OpenCodeNativeLaunchConfig:
     model_override: str | None
     external_session_id: str | None
     fork_carry_history: bool = False
+    permission_mode: str | None = None
 
 
 async def _opencode_native_launch_config(
@@ -970,12 +974,23 @@ async def _opencode_native_launch_config(
     # On a forked clone, the server stamps carry-history (opencode has no native
     # session to clone, so the runner rehydrates the copied transcript as a
     # noReply preamble — same path as a lost-session resume).
-    from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
+    from omnigent.stores.conversation_store import (
+        FORK_CARRY_HISTORY_LABEL_KEY,
+        OPENCODE_NATIVE_PERMISSION_MODE_LABEL_KEY,
+    )
 
     labels = snapshot.get("labels")
     fork_carry_history = (
         isinstance(labels, dict) and labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
     )
+    # Permission stance, set by the new-session UI as a plain label (no CLI flag
+    # exists; opencode reads it from opencode.json synthesized below). Any
+    # non-string / absent value leaves the default policy-routed stance.
+    permission_mode: str | None = None
+    if isinstance(labels, dict):
+        raw_mode = labels.get(OPENCODE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+        if isinstance(raw_mode, str) and raw_mode:
+            permission_mode = raw_mode
     return _OpenCodeNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
         policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
@@ -983,6 +998,7 @@ async def _opencode_native_launch_config(
         model_override=model_override,
         external_session_id=external_session_id,
         fork_carry_history=fork_carry_history,
+        permission_mode=permission_mode,
     )
 
 
@@ -1068,6 +1084,7 @@ async def _auto_create_opencode_terminal(
         build_opencode_model_default_config,
         build_opencode_omnigent_mcp_server,
         build_opencode_provider_config,
+        build_opencode_read_only_permission,
         resolve_databricks_gateway,
         write_opencode_provider_config,
     )
@@ -1107,6 +1124,17 @@ async def _auto_create_opencode_terminal(
     if mcp_block:
         config.setdefault("$schema", "https://opencode.ai/config.json")
         config["mcp"] = mcp_block
+    # Permission stance. Read-only hard-denies opencode's native edit/shell/
+    # network tools (the session picked it in the new-chat dialog; `opencode
+    # attach` has no CLI flag for this, so it lives in opencode.json). The
+    # DEFAULT stance forces every sensitive tool to prompt ("ask") so it routes
+    # through Omnigent's policy engine via the forwarder's permission gate —
+    # opencode's enforcement is reactive (no pre-tool hook), so "ask" is what
+    # makes the policy verdicts apply to MCP (and other) tools.
+    if launch_config.permission_mode == "read-only":
+        config.setdefault("$schema", "https://opencode.ai/config.json")
+        config["permission"] = build_opencode_read_only_permission()
+    elif mcp_block:
         config["permission"] = "ask"
 
     # Load the Omnigent policy-bridge plugin so opencode's lifecycle hooks reach

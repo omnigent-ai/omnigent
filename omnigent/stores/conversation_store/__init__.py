@@ -74,6 +74,20 @@ SWITCH_PREVIOUS_BUILTIN_LABEL_KEY = "omnigent.switch.previous_builtin_id"
 # normal approval/sandbox stance. See issue #657.
 CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 
+# Per-session permission stance for an opencode-native session. ``opencode
+# attach`` has no permission/sandbox CLI flag (unlike Codex's
+# ``--ask-for-approval``/``--sandbox``), so the mode cannot ride as a
+# ``terminal_launch_args`` pair — the runner instead reads this label at launch
+# and synthesizes opencode.json's ``permission`` block from it (see
+# ``omnigent.runner.app._opencode_native_launch_config`` and
+# ``opencode_native_provider.build_opencode_read_only_permission``). Currently
+# ``"read-only"`` (hard-deny edits/commands/network) vs. absent/``"default"``
+# (every sensitive tool routes through the Omnigent policy engine). Stored as a
+# plain conversation label so it survives reload. A SAFE preference (unlike the
+# dangerous codex bypass above), so it is NOT instance-scoped: it carries into
+# forks and survives an agent switch.
+OPENCODE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.opencode_native.permission_mode"
+
 # Reserved label key that stores a session's sidebar "project" membership
 # (implicit collections — a project exists while ≥1 session carries this key).
 # Namespaced so it never collides with the user-facing "project" term or other

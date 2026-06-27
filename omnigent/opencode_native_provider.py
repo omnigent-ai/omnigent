@@ -85,6 +85,59 @@ def build_opencode_model_default_config(model: str) -> dict[str, object]:
     return {"$schema": "https://opencode.ai/config.json", "model": model}
 
 
+# OpenCode native tools to hard-deny for a read-only session: its own
+# mutating/network tools. Verified against opencode's permission engine
+# (``packages/opencode/src/permission`` @ 1.17.x): denying ``edit`` also covers
+# ``write`` and ``apply_patch`` (both map to the ``edit`` permission in
+# ``Permission.disabled``), and a tool denied with the ``"*"`` pattern is dropped
+# from the model's toolset entirely (``resolveTools``), not merely refused at
+# call time. ``read``/``grep``/``glob``/``list`` are intentionally not denied.
+_OPENCODE_READ_ONLY_DENIED_TOOLS = ("edit", "bash", "webfetch", "websearch")
+
+# The Omnigent builtin-tool relay's workspace-mutating tools, which MUST also be
+# denied in a read-only session — otherwise the agent could route around the
+# native-tool deny by writing/editing/shelling through the relay's MCP surface.
+# opencode keys an MCP tool's permission by its tool id ``<server>_<tool>``
+# (``mcp/catalog.ts``'s ``toolName`` + the call-time ``ctx.ask({permission: key})``
+# in ``session/tools.ts``); the relay's server name is
+# ``claude_native_bridge._MCP_SERVER_NAME`` (imported below so the prefix can't
+# drift). The policy engine remains the server-side authority; denying them here
+# is a belt-and-suspenders block at opencode's own permission layer.
+_OPENCODE_RELAY_WRITE_TOOLS = ("sys_os_write", "sys_os_edit", "sys_os_shell")
+
+
+def build_opencode_read_only_permission() -> dict[str, str]:
+    """
+    Build opencode.json's ``permission`` block for a read-only session.
+
+    Starts from the SAME ``"*": "ask"`` baseline as the default stance — so every
+    tool not explicitly denied still routes through the Omnigent policy engine
+    (the forwarder's permission gate) rather than silently auto-allowing. This
+    matters because opencode's built-in agent default is ``"*": "allow"``: a
+    read-only block that listed only specific denies would let any unlisted tool
+    (other relay tools, ``task``, …) run un-gated. On top of that baseline it
+    hard-denies opencode's native edit/shell/network tools AND the relay's
+    workspace-mutating MCP tools, so the TUI can read and reason but never mutate
+    the workspace or reach the network. Used by the runner when a session carries
+    ``OPENCODE_NATIVE_PERMISSION_MODE_LABEL_KEY`` == ``"read-only"``.
+
+    Dict order matters: opencode's ``evaluate`` resolves a tool to its
+    last-matching rule, so the specific denies MUST follow the ``"*"`` baseline.
+
+    :returns: A ``{permission: action}`` map: ``"*": "ask"`` then the denied
+        native + relay tools.
+    """
+    from omnigent.claude_native_bridge import _MCP_SERVER_NAME
+
+    # "*" first (baseline), then the hard denies — later rules win in opencode.
+    permission: dict[str, str] = {"*": "ask"}
+    for tool in _OPENCODE_READ_ONLY_DENIED_TOOLS:
+        permission[tool] = "deny"
+    for tool in _OPENCODE_RELAY_WRITE_TOOLS:
+        permission[f"{_MCP_SERVER_NAME}_{tool}"] = "deny"
+    return permission
+
+
 def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dict[str, object]:
     """
     Build the ``opencode.json`` declaring a custom OpenAI-compatible provider.
