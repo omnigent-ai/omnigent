@@ -1057,6 +1057,51 @@ def _normalize_subagent_model(
     return normalized
 
 
+def _child_spec_model(sub_spec: Any | None) -> str | None:
+    """Return a sub-agent spec's own declared model, if any.
+
+    Mirrors ``_resolve_spec_model`` (``executor.model``) with a fallback to
+    ``executor.config["model"]`` for the AP-style sub-spec shape.
+
+    :param sub_spec: The sub-agent's spec, or ``None``.
+    :returns: The declared model id, or ``None``.
+    """
+    executor = getattr(sub_spec, "executor", None)
+    if executor is None:
+        return None
+    model = getattr(executor, "model", None)
+    if model:
+        return str(model)
+    config = getattr(executor, "config", None)
+    if isinstance(config, dict):
+        cfg_model = config.get("model")
+        if cfg_model:
+            return str(cfg_model)
+    return None
+
+
+async def _parent_resolved_model(server_client: Any, parent_session_id: str) -> str | None:
+    """Read the parent session's resolved model from its snapshot.
+
+    The orchestrator's per-session ``/model`` override (or, failing that, its
+    spec model) is the model a spec-less sub-agent should inherit (issue
+    #1128) rather than silently falling back to the Databricks Opus default.
+    Mirrors the ``model_override or llm_model`` precedence used elsewhere.
+
+    :param server_client: HTTP client for the Omnigent server.
+    :param parent_session_id: The orchestrator's session id.
+    :returns: The parent's resolved model id, or ``None`` when unavailable.
+    """
+    try:
+        resp = await server_client.get(f"/v1/sessions/{parent_session_id}", timeout=10.0)
+        if resp.status_code >= 400:
+            return None
+        snap = resp.json()
+    except (httpx.HTTPError, ConnectionError, ValueError):
+        return None
+    return snap.get("model_override") or snap.get("llm_model")
+
+
 async def _execute_list_models_tool(*, agent_spec: Any | None) -> str:
     """
     Dispatch ``sys_list_models``: per-worker model availability.
@@ -1346,6 +1391,30 @@ async def _execute_subagent_tool(
                 agent_spec=agent_spec,
                 harness=child_harness,
             )
+        elif child_harness and harness_supports_model_override(child_harness):
+            # No explicit spawn model: inherit the parent's resolved model when
+            # the child declares none of its own, so an orchestrator on Sonnet
+            # doesn't spawn sub-agents that silently fall back to the Databricks
+            # Opus default (issue #1128). Precedence: explicit spawn 'model'
+            # (above) > child spec model > inherited parent. Inheritance is
+            # best-effort: an incompatible parent id (wrong family for the child
+            # harness) is dropped, not forced — only an explicit selection
+            # surfaces a hard error.
+            sub_spec = _find_subagent_spec(str(sub_agent_name), agent_spec)
+            if _child_spec_model(sub_spec) is None:
+                inherited = await _parent_resolved_model(server_client, conversation_id)
+                if inherited and model_family_mismatch(child_harness, inherited) is None:
+                    create_body["model_override"] = _normalize_subagent_model(
+                        inherited,
+                        sub_agent_name=str(sub_agent_name),
+                        agent_spec=agent_spec,
+                        harness=child_harness,
+                    )
+                    _logger.info(
+                        "sys_session_send: sub-agent %r inheriting parent model %r",
+                        sub_agent_name,
+                        inherited,
+                    )
         resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
         if resp.status_code >= 400:
             return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
@@ -1625,6 +1694,13 @@ def _build_session_create_body(
     top-level or sibling session). A non-empty ``title`` and ``message``
     are included when provided; the message becomes the child's first
     queued user turn via ``initial_items``.
+
+    Unlike ``sys_session_send`` (which spawns a spec-less worker that should
+    inherit the parent's model, see issue #1128), ``sys_session_create``
+    launches a pre-existing, independently-configured agent by ``agent_id``.
+    That agent resolves its own spec/configured model, so parent-model
+    inheritance is deliberately NOT applied here — overriding a first-class
+    agent's configured model from its launcher would be wrong.
 
     :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
     :param conversation_id: The caller's session id — the forced parent.

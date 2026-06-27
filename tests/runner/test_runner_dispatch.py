@@ -1379,6 +1379,11 @@ def test_build_spawn_env_applies_model_override(
     assert base["HARNESS_CLAUDE_SDK_MODEL"] != "claude-sonnet-4-6"
     # … and the override wins, landing in the model env var the SDK reads.
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+    # Issue #1128: the override is threaded into the builder with a source tag
+    # (not a bare post-build overlay) so the inner executor can fail closed on
+    # a lost selection. The requested model is recorded for the error message.
+    assert overridden["HARNESS_CLAUDE_SDK_MODEL_SOURCE"] == "session-override"
+    assert overridden["HARNESS_CLAUDE_SDK_REQUESTED_MODEL"] == "claude-sonnet-4-6"
 
 
 @pytest.mark.asyncio
@@ -1487,7 +1492,9 @@ async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
             executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
         )
 
-    def _raising_build(spec: object, *, workdir: object = None) -> dict[str, str]:
+    def _raising_build(
+        spec: object, *, workdir: object = None, **_kwargs: object
+    ) -> dict[str, str]:
         """
         Stand in for ``_build_claude_sdk_spawn_env`` and fail the way the
         no-model generic-provider path does.
@@ -1581,7 +1588,9 @@ async def test_runner_failed_status_carries_setup_error_message(
             executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
         )
 
-    def _raising_build(spec: object, *, workdir: object = None) -> dict[str, str]:
+    def _raising_build(
+        spec: object, *, workdir: object = None, **_kwargs: object
+    ) -> dict[str, str]:
         """
         Fail the spawn-env build the way the no-model provider path does.
 
@@ -7036,3 +7045,177 @@ async def test_approval_event_without_content_flattened() -> None:
     assert resp.status_code == 204
     assert captured["body"] == {"type": "approval", "elicitation_id": "e2", "action": "decline"}
     ApprovalEvent.model_validate(captured["body"])
+
+
+def _spec_with_subagent(harness: str, *, child_model: str | None = None) -> SimpleNamespace:
+    """Parent-spec stub with one ``worker`` sub-agent, optionally with a model."""
+    config: dict[str, Any] = {"harness": harness}
+    if child_model is not None:
+        config["model"] = child_model
+    return SimpleNamespace(
+        sub_agents=[
+            SimpleNamespace(
+                name="worker",
+                executor=SimpleNamespace(type="omnigent", config=config),
+            )
+        ]
+    )
+
+
+async def _dispatch_send_capture_create(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    agent_spec: SimpleNamespace,
+    parent_snapshot: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Dispatch a model-less ``sys_session_send`` and capture child create bodies.
+
+    Serves the parent snapshot GET so ``_parent_resolved_model`` can read the
+    orchestrator's resolved model (issue #1128 inheritance).
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_bodies: list[dict[str, Any]] = []
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_parent/child_sessions":
+            return httpx.Response(200, json={"data": []})
+        if request.method == "GET" and path == "/v1/sessions/conv_parent":
+            return httpx.Response(200, json=parent_snapshot)
+        if request.method == "POST" and path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child"})
+        if request.method == "POST" and path == "/v1/sessions/conv_child/events":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {"agent": "worker", "title": "task", "args": {"input": "go"}}
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent",
+                agent_spec=agent_spec,
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child")
+            runner_app._session_inboxes_ref.pop("conv_parent", None)
+    return create_bodies
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_inherits_parent_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spec-less sub-agent inherits the parent's resolved model (#1128)."""
+    bodies = await _dispatch_send_capture_create(
+        monkeypatch,
+        agent_spec=_spec_with_subagent("claude-sdk"),
+        parent_snapshot={"model_override": "databricks-claude-sonnet-4-6"},
+    )
+    assert len(bodies) == 1
+    assert bodies[0]["model_override"] == "databricks-claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_child_spec_model_beats_inheritance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child's own spec model wins over the inherited parent model (#1128 P1-4)."""
+    bodies = await _dispatch_send_capture_create(
+        monkeypatch,
+        agent_spec=_spec_with_subagent("claude-sdk", child_model="databricks-claude-haiku"),
+        parent_snapshot={"model_override": "databricks-claude-sonnet-4-6"},
+    )
+    assert len(bodies) == 1
+    # No inherited override forced — the child resolves its own spec model.
+    assert "model_override" not in bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_drops_incompatible_inherited_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent Claude model is dropped (not forced) into a Codex child (#1128 P1-5)."""
+    bodies = await _dispatch_send_capture_create(
+        monkeypatch,
+        agent_spec=_spec_with_subagent("codex-native"),
+        parent_snapshot={"model_override": "databricks-claude-sonnet-4-6"},
+    )
+    assert len(bodies) == 1
+    assert "model_override" not in bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_no_inherit_when_parent_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No parent model anywhere → child stays unconfigured (no regression)."""
+    bodies = await _dispatch_send_capture_create(
+        monkeypatch,
+        agent_spec=_spec_with_subagent("claude-sdk"),
+        parent_snapshot={},
+    )
+    assert len(bodies) == 1
+    assert "model_override" not in bodies[0]
+
+
+def test_resolve_session_model_override_normal_turn_sets_cache() -> None:
+    """A normal turn with an override is authoritative and seeds the cache."""
+    from omnigent.runner.app import _resolve_session_model_override
+
+    cache: dict[str, str] = {}
+    eff = _resolve_session_model_override(
+        {"model_override": "databricks-claude-sonnet-4-6"}, "conv_a", cache
+    )
+    assert eff == "databricks-claude-sonnet-4-6"
+    assert cache["conv_a"] == "databricks-claude-sonnet-4-6"
+
+
+def test_resolve_session_model_override_clear_drops_cache() -> None:
+    """`/model default` (override absent) clears a previously-cached value.
+
+    Regression for codex review P2: a blanket `body or cache` fallback would
+    resurrect the old selection after a clear. A normal turn is authoritative —
+    absence means cleared, so the cache must be dropped and None returned.
+    """
+    from omnigent.runner.app import _resolve_session_model_override
+
+    cache = {"conv_a": "databricks-claude-sonnet-4-6"}
+    eff = _resolve_session_model_override({"agent_id": "ag"}, "conv_a", cache)
+    assert eff is None
+    assert "conv_a" not in cache
+
+
+def test_resolve_session_model_override_catchup_uses_cache() -> None:
+    """A flagged synthetic catch-up turn falls back to the cached selection."""
+    from omnigent.runner.app import _resolve_session_model_override
+
+    cache = {"conv_a": "databricks-claude-sonnet-4-6"}
+    eff = _resolve_session_model_override(
+        {"agent_id": "ag", "_model_override_from_cache": True}, "conv_a", cache
+    )
+    assert eff == "databricks-claude-sonnet-4-6"
+    # Read-only on the synthetic path — does not mutate the cache.
+    assert cache["conv_a"] == "databricks-claude-sonnet-4-6"
+
+
+def test_resolve_session_model_override_catchup_empty_cache_returns_none() -> None:
+    """Catch-up with nothing cached resolves to None (unconfigured, no crash)."""
+    from omnigent.runner.app import _resolve_session_model_override
+
+    cache: dict[str, str] = {}
+    eff = _resolve_session_model_override({"_model_override_from_cache": True}, "conv_a", cache)
+    assert eff is None

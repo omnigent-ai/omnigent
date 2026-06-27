@@ -557,6 +557,13 @@ def _best_effort_close(resource: _Stream | _Process) -> None:
 # path the Omnigent producer resolves the model instead (see workflow.py).
 _DATABRICKS_CLAUDE_DEFAULT_MODEL = DATABRICKS_CLAUDE_DEFAULT_MODEL
 
+# Model-source tag (issue #1128) under which the Databricks Opus default may be
+# used. Any other non-empty tag (session-override / inherited / spec / ucode)
+# means a real selection existed; if it failed to resolve we fail closed rather
+# than silently substitute Opus. An absent tag is treated as unconfigured for
+# back-compat with callers that predate the contract.
+_MODEL_SOURCE_UNCONFIGURED_DEFAULT = "unconfigured-default"
+
 _CLAUDE_API_KEY_HELPER_ENV_KEY = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 
 
@@ -1084,6 +1091,8 @@ class ClaudeSDKExecutor(Executor):
         cwd: str | None = None,
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
+        model_source: str | None = None,
+        requested_model: str | None = None,
         permission_mode: str = "auto",
         gateway: bool = False,
         databricks_profile: str | None = None,
@@ -1183,6 +1192,14 @@ class ClaudeSDKExecutor(Executor):
         self._os_env_spec = os_env
         self._os_env = os_env is not None
         self._model_override = model
+        # Model-resolution intent (issue #1128). ``model_source`` is one of
+        # ``session-override`` / ``inherited`` / ``spec`` / ``ucode`` /
+        # ``unconfigured-default``; only ``unconfigured-default`` (or an absent
+        # tag, for back-compat) permits the Databricks Opus fallback in
+        # :meth:`run_turn`. ``requested_model`` names the model a lost selection
+        # asked for, so a fail-closed error can report it.
+        self._model_source = model_source
+        self._requested_model = requested_model
         self._permission_mode = permission_mode
         self._gateway = gateway
         self._databricks_profile = databricks_profile
@@ -1812,6 +1829,53 @@ class ClaudeSDKExecutor(Executor):
             return PermissionResultAllow()
         return await self._can_use_tool_for_permission(tool_name, tool_input, perm_ctx)
 
+    def _resolve_turn_model(self, cfg_model: str | None) -> str | None:
+        """Resolve the model for a turn, failing closed on a lost selection.
+
+        Precedence: per-turn ``cfg.model`` > construction-time
+        ``self._model_override`` > Databricks default (profile gateway only,
+        and only when genuinely unconfigured) > ``None`` (the SDK picks its own
+        default on the neutral generic-provider path).
+
+        Issue #1128: when the gateway is a Databricks profile and nothing
+        resolved, fall back to Opus ONLY for a genuinely-unconfigured agent. If
+        a real selection was recorded (``model_source`` names an intent) but did
+        not survive to here, raise rather than silently route to Opus.
+
+        :param cfg_model: The per-turn model override from the request.
+        :returns: The resolved model id, or ``None`` to let the SDK default.
+        :raises ValueError: A recorded selection could not be resolved on the
+            Databricks gateway path.
+        """
+        model = cfg_model or self._model_override
+        if model is None and self._gateway_uses_databricks_profile:
+            intent_existed = self._model_source not in (
+                None,
+                _MODEL_SOURCE_UNCONFIGURED_DEFAULT,
+            )
+            if intent_existed:
+                requested = self._requested_model or "(unknown)"
+                raise ValueError(
+                    f"Requested model {requested!r} (source={self._model_source}) "
+                    "could not be resolved for the Databricks gateway turn. "
+                    "Refusing to silently fall back to "
+                    f"{_DATABRICKS_CLAUDE_DEFAULT_MODEL!r}. This indicates the "
+                    "selected model was lost in the spawn/dispatch path; check "
+                    "model_override forwarding."
+                )
+            model = _DATABRICKS_CLAUDE_DEFAULT_MODEL
+
+        # Routing visibility: requested vs resolved model and the real gateway
+        # endpoint (known now via _resolve_gateway_env → self._extra_env).
+        logger.info(
+            "claude-sdk model resolution: requested=%s resolved=%s source=%s gateway=%s",
+            self._requested_model or cfg_model,
+            model,
+            self._model_source,
+            self._extra_env.get("ANTHROPIC_BASE_URL") or "anthropic-direct",
+        )
+        return model
+
     async def run_turn(
         self,
         messages: list[Message],
@@ -1899,15 +1963,7 @@ class ClaudeSDKExecutor(Executor):
                     continue
                 allowed_tools.append(f"mcp__omnigent__{raw_tname}")
 
-        # cfg.model > spec model > Databricks default (only on the
-        # Databricks-profile gateway path) > None (lets the SDK pick its own
-        # default). The neutral generic-provider gateway path never falls back
-        # to a ``databricks-*`` model: the Omnigent producer always resolves a
-        # concrete model (spec > provider default > catalog default) before
-        # spawning, so no ``databricks-*`` default is injected there.
-        model = cfg.model or self._model_override
-        if model is None and self._gateway_uses_databricks_profile:
-            model = _DATABRICKS_CLAUDE_DEFAULT_MODEL
+        model = self._resolve_turn_model(cfg.model)
 
         # Build env: Databricks gateway settings derived from profile-backed
         # creds. CLAUDECODE removal happens around the subprocess spawn in

@@ -104,6 +104,11 @@ _logger = logging.getLogger(__name__)
 # the module docstring for semantics. Centralizing as constants
 # so misconfigurations surface as a single grep target.
 _ENV_MODEL = "HARNESS_CLAUDE_SDK_MODEL"
+# Model-resolution contract (issue #1128): the source tag lets the executor
+# tell a genuinely-unconfigured agent (keep the Databricks default) from a lost
+# selection (fail closed), and the requested model lets the error name it.
+_ENV_MODEL_SOURCE = "HARNESS_CLAUDE_SDK_MODEL_SOURCE"
+_ENV_REQUESTED_MODEL = "HARNESS_CLAUDE_SDK_REQUESTED_MODEL"
 _ENV_GATEWAY = "HARNESS_CLAUDE_SDK_GATEWAY"
 _ENV_DATABRICKS_PROFILE = "HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE"
 _ENV_GATEWAY_HOST = "HARNESS_CLAUDE_SDK_GATEWAY_HOST"
@@ -275,6 +280,8 @@ def _build_claude_sdk_executor() -> Executor:
         cwd=os.environ.get(_ENV_CWD),
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
+        model_source=os.environ.get(_ENV_MODEL_SOURCE) or None,
+        requested_model=os.environ.get(_ENV_REQUESTED_MODEL) or None,
         permission_mode=os.environ.get(_ENV_PERMISSION_MODE, _DEFAULT_PERMISSION_MODE),
         gateway=gateway,
         databricks_profile=os.environ.get(_ENV_DATABRICKS_PROFILE),

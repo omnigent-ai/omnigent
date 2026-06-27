@@ -681,3 +681,40 @@ async def test_per_event_model_override_wins_over_persisted(
         f"Per-event model_override should win; runner body had "
         f"{captured.get('body', {}).get('model_override')!r}."
     )
+
+
+# ── Runner-init handshake body (issue #1128) ────────────────────────────
+# The shared builder all six runner-init POST sites route through. A unit
+# test here guards the chokepoint so no site can silently drop the override.
+
+
+def test_runner_session_init_body_includes_override() -> None:
+    """The handshake body carries model_override when one is persisted."""
+    from omnigent.server.routes.sessions import _runner_session_init_body
+
+    body = _runner_session_init_body(
+        session_id="conv_1",
+        agent_id="ag_1",
+        sub_agent_name="Polly",
+        model_override="databricks-claude-sonnet-4-6",
+    )
+    assert body == {
+        "session_id": "conv_1",
+        "agent_id": "ag_1",
+        "sub_agent_name": "Polly",
+        "model_override": "databricks-claude-sonnet-4-6",
+    }
+
+
+def test_runner_session_init_body_omits_override_when_none() -> None:
+    """No model_override key when nothing was selected (no invented default)."""
+    from omnigent.server.routes.sessions import _runner_session_init_body
+
+    body = _runner_session_init_body(
+        session_id="conv_1",
+        agent_id="ag_1",
+        sub_agent_name=None,
+        model_override=None,
+    )
+    assert "model_override" not in body
+    assert body["sub_agent_name"] is None

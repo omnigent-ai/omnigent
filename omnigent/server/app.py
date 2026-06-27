@@ -1994,13 +1994,23 @@ def create_app(
                     conv.id,
                 )
             else:
+                # Issue #1128: route through the shared init-body builder so
+                # reconnect carries the persisted /model override (and the
+                # sub_agent_name this path used to drop) and never drifts from
+                # the contract the other five init sites use.
+                from omnigent.server.routes.sessions import (
+                    _runner_session_init_body,
+                )
+
                 try:
                     await routed.client.post(
                         "/v1/sessions",
-                        json={
-                            "session_id": conv.id,
-                            "agent_id": conv.agent_id,
-                        },
+                        json=_runner_session_init_body(
+                            session_id=conv.id,
+                            agent_id=conv.agent_id,
+                            sub_agent_name=conv.sub_agent_name,
+                            model_override=conv.model_override,
+                        ),
                         timeout=10.0,
                     )
                 except Exception:

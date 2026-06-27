@@ -243,3 +243,109 @@ def test_ucode_state_with_model_is_not_overridden_by_default(
     env = _build_claude_sdk_spawn_env(spec, workdir=None)
 
     assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-sonnet-4-6"
+
+
+# ── Model-resolution env contract (issue #1128) ─────────────────────────
+
+
+def test_spec_model_tags_source_spec() -> None:
+    """A spec model sets ``HARNESS_CLAUDE_SDK_MODEL`` + ``source=spec``."""
+    spec = _make_spec(model="databricks-claude-sonnet-4-6")
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-sonnet-4-6"
+    assert env["HARNESS_CLAUDE_SDK_MODEL_SOURCE"] == "spec"
+    assert env["HARNESS_CLAUDE_SDK_REQUESTED_MODEL"] == "databricks-claude-sonnet-4-6"
+
+
+def test_resolved_model_overrides_spec_and_records_source() -> None:
+    """A caller-resolved override wins over the spec model and is tagged."""
+    spec = _make_spec(model="databricks-claude-sonnet-4-6")
+    env = _build_claude_sdk_spawn_env(
+        spec,
+        workdir=None,
+        resolved_model="databricks-claude-haiku",
+        model_source="session-override",
+    )
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-haiku"
+    assert env["HARNESS_CLAUDE_SDK_MODEL_SOURCE"] == "session-override"
+    assert env["HARNESS_CLAUDE_SDK_REQUESTED_MODEL"] == "databricks-claude-haiku"
+
+
+def test_resolved_model_defaults_source_to_session_override() -> None:
+    """A resolved model without an explicit source defaults to override."""
+    spec = _make_spec(model=None)
+    env = _build_claude_sdk_spawn_env(
+        spec, workdir=None, resolved_model="databricks-claude-sonnet-4-6"
+    )
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL_SOURCE"] == "session-override"
+
+
+def test_inherited_source_is_recorded() -> None:
+    """A model inherited from a parent agent is tagged ``inherited``."""
+    spec = _make_spec(model=None)
+    env = _build_claude_sdk_spawn_env(
+        spec,
+        workdir=None,
+        resolved_model="databricks-claude-sonnet-4-6",
+        model_source="inherited",
+    )
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL_SOURCE"] == "inherited"
+
+
+def test_resolved_model_suppresses_ucode_opus_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A session override beats the ucode Databricks Opus default (#1128 core).
+
+    Without this, a modelless profile-backed agent that the user pointed at
+    Sonnet would still spawn against Opus because the ucode default fired
+    before the override was applied.
+    """
+    _ucode_state_without_model(monkeypatch, model=None)
+
+    spec = _make_spec(model=None, profile="oss")
+    env = _build_claude_sdk_spawn_env(
+        spec,
+        workdir=None,
+        resolved_model="databricks-claude-sonnet-4-6",
+        model_source="session-override",
+    )
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-sonnet-4-6"
+    assert env["HARNESS_CLAUDE_SDK_MODEL_SOURCE"] == "session-override"
+
+
+def test_unconfigured_databricks_default_is_tagged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The Opus default fires only when genuinely unconfigured, tagged so the
+    executor knows it may keep it. No requested model is recorded.
+    """
+    _ucode_state_without_model(monkeypatch, model=None)
+
+    spec = _make_spec(model=None, profile="oss")
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-opus-4-8"
+    assert env["HARNESS_CLAUDE_SDK_MODEL_SOURCE"] == "unconfigured-default"
+    assert "HARNESS_CLAUDE_SDK_REQUESTED_MODEL" not in env
+
+
+def test_ucode_cached_model_is_tagged_ucode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ucode-cached model is a real (lower-precedence) choice, tagged ``ucode``."""
+    _ucode_state_without_model(monkeypatch, model="databricks-claude-sonnet-4-6")
+
+    spec = _make_spec(model=None, profile="oss")
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-sonnet-4-6"
+    assert env["HARNESS_CLAUDE_SDK_MODEL_SOURCE"] == "ucode"
+    assert env["HARNESS_CLAUDE_SDK_REQUESTED_MODEL"] == "databricks-claude-sonnet-4-6"

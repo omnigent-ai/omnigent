@@ -7407,6 +7407,13 @@ _session_agent_ids_ref: dict[str, str] = {}
 # create_runner_app; used by tests to inspect in-memory history.
 _session_histories_ref: dict[str, list[dict[str, Any]]] = {}
 
+# Module-level ref to the per-session ``/model`` override (issue #1128).
+# Seeded from the create handshake body and refreshed on every per-turn
+# event that carries one, so background turn paths that have no request body
+# (catch-up scan, crash-recovery) can still spawn with the selected model
+# instead of falling back to the provider/Databricks default.
+_session_model_overrides_ref: dict[str, str] = {}
+
 # Module-level ref to _session_event_queues. Populated inside
 # create_runner_app; used by tests to inspect the queue an SSE
 # subscriber would have read (events published synchronously by
@@ -7555,6 +7562,7 @@ def create_runner_app(
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_agent_ids = _session_agent_ids_ref  # shared with module-level get_session_agent_id
+    _session_model_overrides = _session_model_overrides_ref  # per-session /model (issue #1128)
     # Sub-agent name per session. Set from POST /v1/sessions body
     # for child sessions. _run_turn_bg uses this to resolve the
     # sub-spec from the parent's spec tree.
@@ -8452,7 +8460,21 @@ def create_runner_app(
                 harness_name,
                 workdir=_resolved_spec_workdir(spec_entry),
                 cwd=await _session_runtime_cwd(session_id),
+                # Issue #1128: forward the persisted /model override at session
+                # start so the harness spawns with the selected model. Without
+                # this, only the per-turn path carried it — leaving a brief
+                # Opus spawn (and, on recovery/sub-agent paths, a lasting one).
+                model_override=body.get("model_override"),
             )
+            # Cache it (authoritatively: the create/reconnect handshake carries
+            # the current persisted value — present means a selection, absent
+            # means cleared) so background turn paths with no request body
+            # (catch-up scan) resolve the right model and never resurrect a
+            # stale one.
+            if body.get("model_override"):
+                _session_model_overrides[session_id] = body["model_override"]
+            else:
+                _session_model_overrides.pop(session_id, None)
             if harness_name == "claude-native" and spawn_env is None:
                 from omnigent.claude_native_bridge import (
                     build_claude_native_spawn_env,
@@ -9242,6 +9264,12 @@ def create_runner_app(
                     "agent_id": agent_id,
                     "model": body.get("model", agent_id),
                 }
+                # Issue #1128: carry the persisted /model override into the
+                # recovered turn so a crash-recovery respawn doesn't drop the
+                # selection and fall back to the Databricks Opus default.
+                _recover_override = body.get("model_override")
+                if _recover_override:
+                    msg_body["model_override"] = _recover_override
                 _turn_task = asyncio.create_task(
                     _run_turn_bg(msg_body, session_id),
                     name=f"turn-recover-{session_id}",
@@ -9474,6 +9502,7 @@ def create_runner_app(
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
+        _session_model_overrides.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
         if _relay := _session_comment_relays.pop(session_id, None):
             _relay.close()
@@ -13114,6 +13143,19 @@ def create_runner_app(
                 or cached_spec.executor.type
             )
             harness_name = canonicalize_harness(h) or h
+            # Issue #1128: resolve the per-session /model override for this turn.
+            # Normal turns (and crash-recovery, which is seeded from the
+            # authoritative create body) carry the persisted value: present
+            # means a selection, ABSENT means cleared (`/model default`) — the
+            # server omits the key on clear. So a normal turn is authoritative:
+            # use its value verbatim and keep the runner cache in sync (set on
+            # select, drop on clear) so a stale override can't be resurrected.
+            # Only a synthetic background turn (the reconnect catch-up scan,
+            # flagged below) has no forwarded value and falls back to the cache —
+            # otherwise it would respawn against the Databricks default.
+            _eff_override = _resolve_session_model_override(
+                msg_body, conv, _session_model_overrides
+            )
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
                 harness_name,
@@ -13122,7 +13164,7 @@ def create_runner_app(
                 # Apply the per-session /model override so it actually
                 # changes the model on the SDK harnesses (not just the
                 # readout). Forwarded by the Omnigent server in the message body.
-                model_override=msg_body.get("model_override"),
+                model_override=_eff_override,
             )
             from omnigent.runtime.prompt import (
                 build_instructions,
@@ -17816,6 +17858,11 @@ def create_runner_app(
                     msg_body = {
                         "agent_id": agent_id,
                         "model": agent_id or "",
+                        # Issue #1128: synthetic background turn with no
+                        # server-forwarded override — let _run_turn_bg fall back
+                        # to the cached per-session /model selection rather than
+                        # spawning against the provider/Databricks default.
+                        "_model_override_from_cache": True,
                     }
                     _turn_task = asyncio.create_task(
                         _run_turn_bg(msg_body, session_id),
@@ -17958,6 +18005,38 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
 }
 
 
+def _resolve_session_model_override(
+    msg_body: dict[str, Any],
+    session_id: str,
+    cache: dict[str, str],
+) -> str | None:
+    """Resolve the per-session ``/model`` override for a turn (issue #1128).
+
+    Normal turns — and crash-recovery, seeded from the authoritative create
+    body — carry the persisted value: present means a selection, ABSENT means
+    cleared (``/model default``; the server omits the key on clear). Such a
+    turn is authoritative: its value is used verbatim and the runner cache is
+    kept in sync (set on select, dropped on clear) so a stale override can't be
+    resurrected. A synthetic background turn (the reconnect catch-up scan,
+    flagged ``_model_override_from_cache``) has no forwarded value and falls
+    back to the cache, so it does not respawn against the provider/Databricks
+    default.
+
+    :param msg_body: The turn's message body.
+    :param session_id: Conversation id (cache key).
+    :param cache: The per-session override cache, mutated in place.
+    :returns: The effective override id, or ``None``.
+    """
+    turn_override = msg_body.get("model_override")
+    if msg_body.get("_model_override_from_cache"):
+        return turn_override or cache.get(session_id)
+    if turn_override:
+        cache[session_id] = turn_override
+    else:
+        cache.pop(session_id, None)
+    return turn_override
+
+
 def _build_spawn_env_from_spec(
     spec: Any,
     harness: str,
@@ -17997,7 +18076,18 @@ def _build_spawn_env_from_spec(
         )
 
         if harness == "claude-sdk":
-            env = _build_claude_sdk_spawn_env(spec, workdir=workdir)
+            # Issue #1128: thread the override INTO the builder (as
+            # resolved_model) so it sets HARNESS_CLAUDE_SDK_MODEL before the
+            # ucode Databricks default could fire, and records the source so the
+            # inner executor fails closed on a lost selection rather than
+            # silently routing to Opus. The post-build overlay below is for the
+            # other env-keyed harnesses, which this PR does not touch.
+            env = _build_claude_sdk_spawn_env(
+                spec,
+                workdir=workdir,
+                resolved_model=model_override or None,
+                model_source="session-override" if model_override else None,
+            )
         elif harness == "codex":
             env = _build_codex_spawn_env(spec, workdir=workdir)
         elif harness == "pi":
@@ -18024,8 +18114,10 @@ def _build_spawn_env_from_spec(
 
     # Per-session ``/model`` override wins over everything the builder baked
     # into HARNESS_<H>_MODEL. Without this, `/model` is recorded in the
-    # readout but the turn still uses the provider/catalog default.
-    if model_override:
+    # readout but the turn still uses the provider/catalog default. claude-sdk
+    # threads the override into its builder above (with a source tag), so skip
+    # the bare overlay here to avoid clobbering the recorded source contract.
+    if model_override and harness != "claude-sdk":
         model_key = _HARNESS_MODEL_ENV_KEY.get(harness)
         if model_key is not None:
             env[model_key] = model_override

@@ -1148,10 +1148,27 @@ def _add_claude_sdk_skills_env(
         env["HARNESS_CLAUDE_SDK_BUNDLE_DIR"] = str(workdir)
 
 
+# ── claude-sdk model-resolution env contract (issue #1128) ──────────────
+# These siblings of ``HARNESS_CLAUDE_SDK_MODEL`` let the inner executor tell
+# "user/agent never picked a model" (keep the Databricks default) from
+# "a selection existed but was lost in transit" (fail closed, naming it).
+_CLAUDE_SDK_MODEL_SOURCE_ENV = "HARNESS_CLAUDE_SDK_MODEL_SOURCE"
+_CLAUDE_SDK_REQUESTED_MODEL_ENV = "HARNESS_CLAUDE_SDK_REQUESTED_MODEL"
+# Source tags, highest-intent first. ``unconfigured-default`` is the only tag
+# under which the executor may fall back to the Databricks Opus default.
+_MODEL_SOURCE_SESSION_OVERRIDE = "session-override"
+_MODEL_SOURCE_INHERITED = "inherited"
+_MODEL_SOURCE_SPEC = "spec"
+_MODEL_SOURCE_UCODE = "ucode"
+_MODEL_SOURCE_UNCONFIGURED_DEFAULT = "unconfigured-default"
+
+
 def _build_claude_sdk_spawn_env(
     spec: AgentSpec,
     *,
     workdir: Path | None = None,
+    resolved_model: str | None = None,
+    model_source: str | None = None,
 ) -> dict[str, str]:
     """
     Build the env-var dict the claude-sdk harness wrap reads.
@@ -1168,13 +1185,32 @@ def _build_claude_sdk_spawn_env(
         agent cache). Threaded through as
         ``HARNESS_CLAUDE_SDK_BUNDLE_DIR`` so the harness wrap can
         wire the SDK ``--plugin-dir`` for agent-bundled skills.
+    :param resolved_model: A concrete model the caller resolved with
+        higher precedence than the spec (a per-session ``/model``
+        override or a model inherited from a parent agent). When
+        provided it sets ``HARNESS_CLAUDE_SDK_MODEL`` *before* the
+        ucode Databricks default could fire, so a real selection is
+        never silently replaced by Opus (issue #1128).
+    :param model_source: The origin of ``resolved_model`` — one of
+        ``session-override`` / ``inherited``. Recorded so the inner
+        executor can fail closed (naming the lost model) rather than
+        defaulting when resolution still comes up empty.
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
     env: dict[str, str] = {}
-    model = _resolve_spec_model(spec)
+    # Precedence: caller-resolved model (override / inherited) > spec model.
+    # The ucode Databricks default only fires later when neither exists.
+    spec_model = _resolve_spec_model(spec)
+    model = resolved_model or spec_model
     if model is not None:
         env["HARNESS_CLAUDE_SDK_MODEL"] = model
+        env[_CLAUDE_SDK_REQUESTED_MODEL_ENV] = model
+        env[_CLAUDE_SDK_MODEL_SOURCE_ENV] = (
+            (model_source or _MODEL_SOURCE_SESSION_OVERRIDE)
+            if resolved_model is not None
+            else _MODEL_SOURCE_SPEC
+        )
 
     # ── Auth resolution ────────────────────────────────────────────────
     # Priority (highest first):
@@ -1249,6 +1285,19 @@ def _build_claude_sdk_spawn_env(
     permission_mode = spec.executor.config.get("permission_mode")
     if permission_mode is not None:
         env["HARNESS_CLAUDE_SDK_PERMISSION_MODE"] = str(permission_mode)
+    # Source reconciliation (issue #1128): if no concrete model was set above
+    # but ucode injection wrote one (a cached model, or the Databricks Opus
+    # default at ``configure_agent_harness_with_ucode``), tag its origin so the
+    # executor knows whether a real selection existed. The Databricks default is
+    # the ONLY source under which the executor may keep Opus when resolution is
+    # otherwise empty; a ucode-cached model is a real (lower-precedence) choice.
+    if _CLAUDE_SDK_MODEL_SOURCE_ENV not in env and "HARNESS_CLAUDE_SDK_MODEL" in env:
+        injected = env["HARNESS_CLAUDE_SDK_MODEL"]
+        if injected == DATABRICKS_CLAUDE_DEFAULT_MODEL:
+            env[_CLAUDE_SDK_MODEL_SOURCE_ENV] = _MODEL_SOURCE_UNCONFIGURED_DEFAULT
+        else:
+            env[_CLAUDE_SDK_MODEL_SOURCE_ENV] = _MODEL_SOURCE_UCODE
+            env[_CLAUDE_SDK_REQUESTED_MODEL_ENV] = injected
     return env
 
 
