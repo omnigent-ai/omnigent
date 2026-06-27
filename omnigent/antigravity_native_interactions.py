@@ -272,6 +272,40 @@ def _freshest_waiting(
     return same_kind
 
 
+def _waiting_step_at(
+    steps: list[dict[str, object]],
+    *,
+    trajectory_id: str,
+    step_index: int,
+) -> PendingInteraction | None:
+    """
+    Return the WAITING interaction at an EXACT ``(trajectory_id, step_index)``.
+
+    Used to PIN delivery to the step the elicitation was surfaced for: when that
+    step is still WAITING at verdict time, the verdict must go to IT — never to a
+    *different*, higher-index gate that appeared meanwhile (which
+    :func:`_freshest_waiting` would wrongly pick, mis-delivering verdict-A to
+    gate-B). Returns ``None`` when that exact step is no longer WAITING — it timed
+    out (→ ERROR) or was answered — so the caller falls back to the freshest
+    WAITING, which is agy's genuine same-gate timeout-retry at a higher index
+    (§2.1). agy gates sequentially today (one WAITING step of a kind at a time), so
+    this only ever differs from ``_freshest_waiting`` if agy were to expose two
+    distinct same-kind gates at once; the pin makes delivery correct even then.
+
+    :param steps: A trajectory steps snapshot (from ``get_steps``).
+    :param trajectory_id: The surfaced step's trajectory id.
+    :param step_index: The surfaced step's index.
+    :returns: The matching WAITING :class:`PendingInteraction`, or ``None``.
+    """
+    for step in steps:
+        pending = pending_interaction(step)
+        if pending is None:
+            continue
+        if pending["trajectory_id"] == trajectory_id and pending["step_index"] == step_index:
+            return pending
+    return None
+
+
 async def bridge_interaction(
     cascade_id: str,
     pending: PendingInteraction,
@@ -351,9 +385,16 @@ async def bridge_interaction(
             )
             return
 
-        # Re-read the freshest WAITING step BEFORE delivering: the captured ids
-        # may be stale if agy timed out + retried while the human deliberated.
-        fresh = _freshest_waiting(await get_steps(), kind=current["kind"])
+        # Re-read the steps BEFORE delivering: the captured ids may be stale if agy
+        # timed out + retried while the human deliberated. PIN to the step we
+        # surfaced if it is STILL WAITING — deliver THIS verdict to THAT gate, never
+        # to a different higher-index gate that appeared meanwhile (#1472 review).
+        # Only when our captured step is gone (timed out → ERROR) do we fall back to
+        # the freshest WAITING, which is agy's same-gate timeout-retry (§2.1).
+        steps = await get_steps()
+        fresh = _waiting_step_at(
+            steps, trajectory_id=current["trajectory_id"], step_index=current["step_index"]
+        ) or _freshest_waiting(steps, kind=current["kind"])
         if fresh is None:
             _logger.warning(
                 "agy elicitation %s resolved but no WAITING step remains to "

@@ -782,8 +782,10 @@ async def test_clear_slot_resurfaces_deferred_gate(monkeypatch: pytest.MonkeyPat
     gate2 = copy.deepcopy(gate1)  # a distinct later gate (the `ls` segment)
     gate2["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = 8
     gate2["runCommand"]["commandLine"] = "ls"
-    # The freshest snapshot the re-scan re-reads: gate1 is still present (already
-    # surfaced → must NOT re-fire) and gate2 is the newly-arrived, deferred gate.
+    # The freshest snapshot the re-scan re-reads. gate1 still reads WAITING here —
+    # the dedup-race case: its verdict landed but the DONE transition has not yet
+    # propagated to the snapshot, so ``state.interacted`` (not status) is what stops
+    # it re-firing. gate2 is the newly-arrived, deferred gate.
     monkeypatch.setattr(reader, "get_trajectory_steps", lambda _port, _cascade_id: [gate1, gate2])
 
     fired: list[int] = []
@@ -807,6 +809,123 @@ async def test_clear_slot_resurfaces_deferred_gate(monkeypatch: pytest.MonkeyPat
     assert fired == [6, 8]  # gate1 directly; gate2 via the clear's re-scan
     assert reader._step_key(gate1) in state.interacted  # gate1 was not re-surfaced
     assert reader._step_key(gate2) in state.interacted
+
+
+@pytest.mark.asyncio
+async def test_clear_slot_rescan_empty_then_stream_frame_surfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case B (#1472 review): the clear's re-scan finds NOTHING because gate-2 is
+    not WAITING yet (agy must run segment 1 first). The re-scan must then leave the
+    slot OPEN so gate-2's later live stream frame surfaces it directly — proving the
+    single-shot re-scan does not strand a gate that arrives after it runs.
+    """
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    gate1 = _load("run_command_waiting")  # stepIndex 6
+    gate1_done = copy.deepcopy(gate1)  # answered → DONE, no longer WAITING
+    gate1_done["status"] = "CORTEX_STEP_STATUS_DONE"
+    gate1_done.pop("requestedInteraction", None)
+    gate2 = copy.deepcopy(gate1)  # the next segment — arrives only LATER
+    gate2["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = 8
+    gate2["runCommand"]["commandLine"] = "ls"
+    # Re-scan snapshot: gate-1 resolved (DONE), gate-2 not present yet → the re-scan
+    # surfaces nothing and must leave the slot open.
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda _port, _cascade_id: [gate1_done])
+
+    fired: list[int] = []
+
+    async def _quick(_cascade_id: str, _port: int, pending: PendingInteraction) -> None:
+        fired.append(pending["step_index"])
+
+    reader._maybe_handle_interaction(
+        gate1,
+        key=reader._step_key(gate1),
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _quick),
+    )
+    first = state.interaction_task
+    assert first is not None
+    await first
+    await _drain_interactions(state)  # re-scan runs, finds no pending gate
+
+    assert fired == [6]  # only gate-1 so far
+    assert state.interaction_task is None  # slot OPEN — re-scan neither hung nor held it
+
+    # gate-2 now arrives as a live stream frame: with the slot open the guard passes
+    # and it surfaces directly (the backstop that makes the single-shot re-scan safe).
+    reader._maybe_handle_interaction(
+        gate2,
+        key=reader._step_key(gate2),
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _quick),
+    )
+    second = state.interaction_task
+    assert second is not None
+    await second
+    await _drain_interactions(state)
+
+    assert fired == [6, 8]  # gate-2 surfaced via the live frame, not lost
+
+
+@pytest.mark.asyncio
+async def test_rescan_skips_auto_allowed_step_and_surfaces_next_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ALREADY-ALLOWED segment in a chain (e.g. ``rm a && echo hi && rm b`` with
+    ``echo`` auto-allowed) runs WITHOUT a gate — a DONE step with no
+    ``requestedInteraction`` — so it must be transparent to the re-scan: skipped (not
+    surfaced), and the NEXT real gate after it still surfaces. Guards the edge case
+    where not every chained command is permission-gated.
+    """
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    gate1 = _load("run_command_waiting")  # stepIndex 6 — the `rm a` gate
+    gate1_done = copy.deepcopy(gate1)
+    gate1_done["status"] = "CORTEX_STEP_STATUS_DONE"
+    gate1_done.pop("requestedInteraction", None)
+    allowed = copy.deepcopy(gate1)  # the auto-allowed `echo hi` — ran, NEVER gated
+    allowed["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = 7
+    allowed["runCommand"]["commandLine"] = "echo hi"
+    allowed["status"] = "CORTEX_STEP_STATUS_DONE"
+    allowed.pop("requestedInteraction", None)  # no interaction → never a delivery target
+    gate2 = copy.deepcopy(gate1)  # the next real gate `rm b`
+    gate2["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = 8
+    gate2["runCommand"]["commandLine"] = "rm b"
+    # Re-scan snapshot: gate-1 resolved, the allowed command DONE (no gate), gate-2 WAITING.
+    monkeypatch.setattr(
+        reader, "get_trajectory_steps", lambda _port, _cascade_id: [gate1_done, allowed, gate2]
+    )
+
+    fired: list[int] = []
+
+    async def _quick(_cascade_id: str, _port: int, pending: PendingInteraction) -> None:
+        fired.append(pending["step_index"])
+
+    reader._maybe_handle_interaction(
+        gate1,
+        key=reader._step_key(gate1),
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _quick),
+    )
+    first = state.interaction_task
+    assert first is not None
+    await first
+    await _drain_interactions(state)
+
+    assert fired == [6, 8]  # gate-1, then gate-2 — the allowed step (7) was NEVER surfaced
+    assert reader._step_key(allowed) not in state.interacted  # not an interaction at all
 
 
 @pytest.mark.asyncio
