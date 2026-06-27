@@ -114,9 +114,19 @@ def _version_supports_waiting_status(server_version: str) -> bool:
     :returns: ``True`` iff the server's PEP 440 release tuple is ``>= 0.3.0``
         (the release that added "waiting" to the session-status model).
     """
-    from packaging.version import Version
+    from packaging.version import InvalidVersion, Version
 
-    return Version(server_version).release >= Version(_WAITING_STATUS_MIN_SERVER_VERSION).release
+    try:
+        return (
+            Version(server_version).release
+            >= Version(_WAITING_STATUS_MIN_SERVER_VERSION).release
+        )
+    except InvalidVersion:
+        _logger.warning(
+            "server version %r is not PEP 440; treating waiting status support as unknown",
+            server_version,
+        )
+        return False
 
 
 async def _get_server_version(server_client: httpx.AsyncClient) -> str | None:
