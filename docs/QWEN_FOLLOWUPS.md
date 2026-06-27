@@ -267,6 +267,9 @@ comments; this is the *what*, not the *how*.)
   still unsupported are binary documents (PDF, etc.) and audio input.
 - [ ] **Session resilience:** cancel a turn mid-flight, recover when the `qwen`
   subprocess crashes, and resume a session across separate runs.
+  - *Done in this pass:* dead qwen-native terminals now recreate on attach
+    instead of failing 4404, so the embedded pane recovers after a crash or
+    deferred-start failure.
 - [ ] **Vision/audio quality** depends on the model: text-only routes (e.g.
   `qwen3-coder:free`) can't see forwarded images. Worth surfacing model
   capability to users picking an agent.
