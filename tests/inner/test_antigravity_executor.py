@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import enum
+import json
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -294,6 +295,23 @@ async def _drain(
     ):
         events.append(event)
     return events
+
+
+def _sdk_advertised_schema(sdk_tool: Any) -> dict[str, Any]:
+    """Return the JSON Schema the REAL SDK advertises for *sdk_tool* to the model.
+
+    Pins the actual SDK contract rather than a hand-rolled mirror: feeds the
+    executor's registered tool (a ``ToolWithSchema``) through the same
+    ``callable_to_tool_proto`` the local connection uses to build the model-facing
+    tool proto, and parses the ``parameters_json_schema`` it emits. For a
+    ``ToolWithSchema`` this is ``json.dumps(fn.input_schema)`` verbatim, so the
+    optional/required split, enums, nested objects, and array item types survive
+    intact — exactly what the model sees.
+    """
+    from google.antigravity.connections.local.local_connection import callable_to_tool_proto
+
+    proto = callable_to_tool_proto(sdk_tool)
+    return json.loads(proto.parameters_json_schema)
 
 
 def _text_step(delta: str) -> _YieldStep:
@@ -698,6 +716,7 @@ async def test_sys_tools_exposed_as_callables_routing_through_executor(
     This is what lets an Antigravity agent drive Omnigent's sys / sub-agent
     tools under policy (needed to run Polly / Debby).
     """
+    pytest.importorskip("google.antigravity")  # opt-in SDK extra; absent in default CI lanes
     captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("done")]])
     executor = AntigravityExecutor()
 
@@ -723,19 +742,143 @@ async def test_sys_tools_exposed_as_callables_routing_through_executor(
     sdk_tools = captured["configs"][0].tools
     assert sdk_tools is not None and len(sdk_tools) == 1
     sdk_tool = sdk_tools[0]
-    # LocalAgentConfig.tools is list[Callable]; the SDK reads __name__/__doc__.
+    # Each tool is a ToolWithSchema wrapper; the SDK reads __name__/__doc__ off it
+    # and dispatches via __call__(**kwargs) -> fn(**kwargs).
     assert callable(sdk_tool)
     assert sdk_tool.__name__ == "sys_shell"
     assert sdk_tool.__doc__ == "Run a shell command"
 
-    # Invoking the callable (kwargs form) routes back through the bridge.
+    # Invoking the wrapper (kwargs form, the SDK's call convention) routes back
+    # through the bridge. ToolWithSchema.__call__ returns the inner coroutine.
     assert await sdk_tool(cmd="ls") == {"ok": True}
-    # Single-dict argument form also works (SDK arg-shape tolerance).
-    assert await sdk_tool({"cmd": "pwd"}) == {"ok": True}
+    # The underlying bridge callable also tolerates a single positional dict /
+    # JSON string (defensive against arg-shape drift), reached via .fn.
+    assert await sdk_tool.fn({"cmd": "pwd"}) == {"ok": True}
     assert calls == [
         {"name": "sys_shell", "args": {"cmd": "ls"}},
         {"name": "sys_shell", "args": {"cmd": "pwd"}},
     ]
+
+
+@pytest.mark.asyncio
+async def test_sys_tool_schema_reaches_sdk_proto_losslessly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ToolSpec ``parameters`` schema reaches the SDK proto VERBATIM.
+
+    Registering each tool as a ``ToolWithSchema`` makes
+    ``callable_to_tool_proto`` emit ``json.dumps(input_schema)`` directly, so the
+    schema the model sees is byte-for-byte what Omnigent advertised. This pins
+    the real SDK contract (not a hand-rolled signature mirror) and proves the
+    two bugs the prior signature-synthesis path had are fixed:
+
+    * **Optional params stay optional.** ``timeout`` has no default and is NOT in
+      ``required``; the synthesis path wrongly advertised every optional primitive
+      as required.
+    * **Enums and nested objects survive.** Both were silently dropped (flattened
+      to a bare ``{"type": ...}``) by the synthesis path.
+    """
+    pytest.importorskip("google.antigravity")  # opt-in SDK extra; absent in default CI lanes
+    captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("done")]])
+    executor = AntigravityExecutor()
+
+    async def _fake_tool_executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True}
+
+    executor._tool_executor = _fake_tool_executor
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "cmd": {"type": "string", "description": "the command"},
+            "timeout": {"type": "integer"},
+            "mode": {"type": "string", "enum": ["fast", "safe"]},
+            "env": {
+                "type": "object",
+                "properties": {"KEY": {"type": "string"}},
+                "required": ["KEY"],
+            },
+            "paths": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["cmd"],
+    }
+    tool_specs = [
+        {"name": "sys_shell", "description": "Run a shell command", "parameters": schema}
+    ]
+
+    await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}], tool_specs)
+
+    sdk_tools = captured["configs"][0].tools
+    assert sdk_tools is not None and len(sdk_tools) == 1
+    sdk_tool = sdk_tools[0]
+
+    # The real SDK proto carries the schema verbatim — the whole point.
+    advertised = _sdk_advertised_schema(sdk_tool)
+    assert advertised == schema
+    # Spell out the load-bearing properties the synthesis path got wrong.
+    assert advertised["required"] == ["cmd"]  # timeout/mode/env/paths NOT required
+    assert advertised["properties"]["mode"]["enum"] == ["fast", "safe"]  # enum kept
+    assert advertised["properties"]["env"] == {  # nested object kept whole
+        "type": "object",
+        "properties": {"KEY": {"type": "string"}},
+        "required": ["KEY"],
+    }
+    assert advertised["properties"]["paths"]["items"] == {"type": "string"}  # array items kept
+
+    # Schema is advertising only — the wrapper still routes calls through the bridge.
+    assert await sdk_tool(cmd="ls") == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_tool_schema_passed_verbatim_and_empty_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ToolSpec ``parameters`` are wrapped verbatim; a missing schema falls back.
+
+    The executor no longer rewrites the schema (the old synthesis path mangled
+    types/required/enums). It hands ``parameters`` straight to
+    ``ToolWithSchema.input_schema``, so an arbitrarily rich schema survives
+    untouched. When a spec omits (or mis-types) ``parameters``, the executor
+    substitutes an empty-object schema — mirroring ``cursor_executor``.
+    """
+    pytest.importorskip("google.antigravity")  # opt-in SDK extra; absent in default CI lanes
+    _install_fake_sdk(monkeypatch, scripts=[[_text_step("done")]])
+    executor = AntigravityExecutor()
+
+    async def _fake_tool_executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True}
+
+    executor._tool_executor = _fake_tool_executor
+    rich_schema = {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string"},
+            "count": {"type": "integer", "minimum": 0},
+            "ratio": {"type": "number"},
+            "enabled": {"type": "boolean"},
+            "payload": {"type": "object", "properties": {"k": {"type": "string"}}},
+            "items": {"type": "array", "items": {"type": "integer"}},
+            "mode": {"type": "string", "enum": ["a", "b"]},
+        },
+        "required": ["text", "count"],
+    }
+    sdk_tools = executor._build_sdk_tools(
+        [
+            {"name": "sys_rich", "description": "rich args", "parameters": rich_schema},
+            {"name": "sys_no_params", "description": "no schema"},  # parameters omitted
+        ]
+    )
+
+    # Rich schema: identical on the wrapper AND in the SDK-emitted proto — nothing
+    # is rewritten, narrowed, or dropped (formats, enums, nesting, minimum kept).
+    assert sdk_tools[0].input_schema == rich_schema
+    assert _sdk_advertised_schema(sdk_tools[0]) == rich_schema
+
+    # Omitted parameters → empty-object schema (advertises a no-arg tool), the
+    # same fallback cursor_executor uses.
+    empty_fallback = {"type": "object", "properties": {}}
+    assert sdk_tools[1].input_schema == empty_fallback
+    assert _sdk_advertised_schema(sdk_tools[1]) == empty_fallback
 
 
 @pytest.mark.asyncio
@@ -768,6 +911,56 @@ async def test_agent_reused_across_turns_same_session(monkeypatch: pytest.Monkey
     # the cached agent (and its SDK conversation state) was reused.
     assert len(captured["agents"]) == 1
     assert captured["agents"][0].conversation.sends == ["one", "two"]
+
+
+@pytest.mark.asyncio
+async def test_tool_schema_change_rebuilds_agent_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A schema-only ToolSpec change must reopen the SDK agent for re-registration."""
+    pytest.importorskip("google.antigravity")  # opt-in SDK extra; absent in default CI lanes
+    captured = _install_fake_sdk(
+        monkeypatch, scripts=[[_text_step("one-reply")], [_text_step("two-reply")]]
+    )
+    executor = AntigravityExecutor()
+
+    async def _fake_tool_executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True}
+
+    executor._tool_executor = _fake_tool_executor
+    first_tools = [
+        {
+            "name": "sys_shell",
+            "description": "Run a shell command",
+            "parameters": {
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"],
+            },
+        }
+    ]
+    second_tools = [
+        {
+            "name": "sys_shell",
+            "description": "Run a shell command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        }
+    ]
+
+    await _drain(executor, [{"role": "user", "content": "one", "session_id": "s1"}], first_tools)
+    await _drain(executor, [{"role": "user", "content": "two", "session_id": "s1"}], second_tools)
+
+    assert len(captured["agents"]) == 2
+    # The rebuilt agent re-registers the tool with the NEW schema — the cache key
+    # widening (description + parameters) makes a schema-only change rebuild.
+    first_tool = captured["configs"][0].tools[0]
+    second_tool = captured["configs"][1].tools[0]
+    assert list(first_tool.input_schema["properties"]) == ["cmd"]
+    assert list(second_tool.input_schema["properties"]) == ["command"]
 
 
 @pytest.mark.asyncio
