@@ -45,6 +45,11 @@ export interface AdminSession {
   owner: string | null;
   /** Whether this user is the session's owner. */
   is_owner: boolean;
+  /** Friendly name of the host the session is bound to (raw id if the host
+   * was deleted, null if unbound). */
+  host: string | null;
+  /** Whether that host is currently live. */
+  host_online: boolean;
 }
 
 /** Aggregate usage across a user's sessions. */

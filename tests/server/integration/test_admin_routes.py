@@ -262,6 +262,31 @@ async def test_list_user_sessions_as_admin(auth_client: httpx.AsyncClient, db_ur
     assert conv_id in ids
 
 
+async def test_list_user_sessions_includes_host(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Each session row reports its bound host: friendly name + liveness."""
+    _make_user(db_uri, "boss@example.com", is_admin=True)
+    bound = _make_session_for(db_uri, "alice@example.com")
+    unbound = _make_session_for(db_uri, "alice@example.com")
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect("host_a1", "alice-laptop", "alice@example.com")
+    SqlAlchemyConversationStore(db_uri).set_host_id(bound, "host_a1", workspace="/w")
+
+    resp = await auth_client.get(
+        "/v1/admin/users/alice@example.com/sessions",
+        headers=_headers("boss@example.com"),
+    )
+
+    assert resp.status_code == 200
+    by_id = {s["id"]: s for s in resp.json()["sessions"]}
+    assert by_id[bound]["host"] == "alice-laptop"
+    assert by_id[bound]["host_online"] is True
+    # An unbound session reports no host.
+    assert by_id[unbound]["host"] is None
+    assert by_id[unbound]["host_online"] is False
+
+
 async def test_list_user_sessions_includes_cost(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:

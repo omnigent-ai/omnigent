@@ -235,6 +235,7 @@ export function AdminPage() {
                     <th className="px-3 py-2 font-medium">Title</th>
                     <th className="px-3 py-2 font-medium">Role</th>
                     <th className="px-3 py-2 font-medium">Owner</th>
+                    <th className="px-3 py-2 font-medium">Host</th>
                     <th className="px-3 py-2 font-medium">Updated</th>
                     <th className="px-3 py-2 text-right font-medium">Tokens</th>
                     <th className="px-3 py-2 text-right font-medium">Cost</th>
@@ -263,6 +264,22 @@ export function AdminPage() {
                           <span className="text-xs">—</span>
                         ) : (
                           (s.owner ?? <span className="text-xs">—</span>)
+                        )}
+                      </td>
+                      <td className="px-3 py-2 align-middle text-muted-foreground">
+                        {s.host ? (
+                          <span className="inline-flex items-center gap-1.5">
+                            <span
+                              className={
+                                "size-1.5 shrink-0 rounded-full " +
+                                (s.host_online ? "bg-emerald-500" : "bg-muted-foreground/40")
+                              }
+                              aria-label={s.host_online ? "online" : "offline"}
+                            />
+                            {s.host}
+                          </span>
+                        ) : (
+                          <span className="text-xs">—</span>
                         )}
                       </td>
                       <td className="px-3 py-2 align-middle text-muted-foreground">

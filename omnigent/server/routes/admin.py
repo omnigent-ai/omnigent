@@ -167,12 +167,15 @@ def create_admin_router(
         :param limit: Maximum sessions to return (1–500).
         :returns: ``{"user_id", "totals": {...}, "sessions": [{"id",
             "title", "created_at", "updated_at", "cost_usd",
-            "total_tokens", "role", "owner", "is_owner"}, ...]}``.
-            ``role`` is the user's level on that session (owner / manage
-            / edit / read); ``owner`` is the session's owner. Per-session
-            cost/tokens are the session's; ``totals`` is the user's
-            OWNED-session rollup (cost attributed to the owner), so a
-            session the user was merely invited to does not count toward
+            "total_tokens", "role", "owner", "is_owner", "host",
+            "host_online"}, ...]}``. ``role`` is the user's level on that
+            session (owner / manage / edit / read); ``owner`` is the
+            session's owner. ``host`` is the friendly name of the host the
+            session is bound to (the raw id if that host was deleted,
+            ``None`` if unbound); ``host_online`` is its liveness.
+            Per-session cost/tokens are the session's; ``totals`` is the
+            user's OWNED-session rollup (cost attributed to the owner), so
+            a session the user was merely invited to does not count toward
             their total.
         """
         await _require_admin(request)
@@ -181,10 +184,28 @@ def create_admin_router(
             paged = conversation_store.list_conversations(accessible_by=user_id, limit=limit)
             totals = conversation_store.usage_totals_for_user(user_id)
             grants_by_conv = permission_store.list_for_sessions([c.id for c in paged.data])
+            # Resolve each session's bound host to a name + liveness. Distinct
+            # host ids are few (a user has few hosts), so a small map over the
+            # distinct set avoids a per-session lookup.
+            host_ids = {c.host_id for c in paged.data if c.host_id}
+            hosts_by_id = {}
+            online_hosts: set[str] = set()
+            if host_store is not None and host_ids:
+                for hid in host_ids:
+                    host = host_store.get_host(hid)
+                    if host is not None:
+                        hosts_by_id[hid] = host
+                online_hosts = host_store.online_host_ids(list(host_ids))
             sessions = []
             for c in paged.data:
                 grants = grants_by_conv.get(c.id, [])
                 owner = _owner_of(grants)
+                # Prefer the host's friendly name; fall back to the raw id for a
+                # host that's been deleted but still bound on the session.
+                host_label = None
+                if c.host_id:
+                    known = hosts_by_id.get(c.host_id)
+                    host_label = known.name if known is not None else c.host_id
                 sessions.append(
                     {
                         "id": c.id,
@@ -196,6 +217,8 @@ def create_admin_router(
                         "role": _role_for(grants, user_id),
                         "owner": owner,
                         "is_owner": owner == user_id,
+                        "host": host_label,
+                        "host_online": c.host_id in online_hosts if c.host_id else False,
                     }
                 )
             return {

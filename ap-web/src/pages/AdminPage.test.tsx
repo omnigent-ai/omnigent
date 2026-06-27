@@ -123,6 +123,8 @@ describe("AdminPage", () => {
           role: "owner",
           owner: "alice@example.com",
           is_owner: true,
+          host: "alice-laptop",
+          host_online: true,
         },
       ],
       totals: { cost_usd: 2.5, total_tokens: 4200, session_count: 1 },
@@ -144,6 +146,9 @@ describe("AdminPage", () => {
     const sessionRow = screen.getByTestId("admin-session-row");
     expect(within(sessionRow).getByText("$2.50")).toBeTruthy();
     expect(within(sessionRow).getByText("Owner")).toBeTruthy();
+    // The bound host is shown, with an online indicator.
+    expect(within(sessionRow).getByText("alice-laptop")).toBeTruthy();
+    expect(within(sessionRow).getByLabelText("online")).toBeTruthy();
   });
 
   it("marks an invited (non-owner) session with its role and owner", async () => {
@@ -174,6 +179,8 @@ describe("AdminPage", () => {
           role: "read",
           owner: "alice@example.com",
           is_owner: false,
+          host: null,
+          host_online: false,
         },
       ],
       // Invitee owns nothing → $0 rollup even though the session has cost.
