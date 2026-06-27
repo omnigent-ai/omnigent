@@ -480,18 +480,20 @@ export function FlowchartPage() {
   const onRun = useCallback(async () => {
     if (!jobId || running) return;
     setRunning(true);
+    // Surface the run in the Runs tab but DON'T navigate into its session —
+    // the run executes in the background; the user opens it from the Runs tab
+    // when they choose to.
     setTab("runs");
     try {
       // Persist the on-screen tree first so the run uses the current flow.
       await updateJob(jobId, { tree });
-      const run = await runJob(jobId);
-      if (run?.sessionId) navigate(`/c/${run.sessionId}`);
+      await runJob(jobId);
     } catch (err) {
       window.alert(err instanceof Error ? err.message : "Failed to run job");
     } finally {
       setRunning(false);
     }
-  }, [jobId, tree, running, navigate]);
+  }, [jobId, tree, running]);
 
   const copyOutput = useCallback(() => {
     const text =
@@ -682,17 +684,31 @@ function RunsList({ runs }: { runs: Run[] }) {
             ? `${((run.finishedAt - run.startedAt) / 1000).toFixed(1)}s`
             : "…";
         return (
-          <details key={run.id} className="rounded-md border border-border bg-background/40 p-2.5">
-            <summary className="flex cursor-pointer list-none items-center gap-2 text-sm">
-              <RunStatusIcon status={run.status} />
-              <span className="font-medium">Run #{run.number}</span>
-              <span className="text-xs text-muted-foreground capitalize">{run.status}</span>
-              <span className="ml-auto text-xs text-muted-foreground tabular-nums">{duration}</span>
-            </summary>
-            <pre className="mt-2 border-t border-border pt-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-muted-foreground">
-              {run.logs.join("\n")}
-            </pre>
-          </details>
+          <div key={run.id} className="rounded-md border border-border bg-background/40 p-2.5">
+            <details>
+              <summary className="flex cursor-pointer list-none items-center gap-2 text-sm">
+                <RunStatusIcon status={run.status} />
+                <span className="font-medium">Run #{run.number}</span>
+                <span className="text-xs text-muted-foreground capitalize">{run.status}</span>
+                <span className="ml-auto text-xs text-muted-foreground tabular-nums">
+                  {duration}
+                </span>
+              </summary>
+              <pre className="mt-2 border-t border-border pt-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-muted-foreground">
+                {run.logs.join("\n")}
+              </pre>
+            </details>
+            {/* The run executes in its own session in the background; opening
+                it is always one explicit click away (never auto-navigated). */}
+            {run.sessionId ? (
+              <Link
+                to={`/c/${run.sessionId}`}
+                className="mt-2 inline-block text-xs font-medium text-primary hover:underline"
+              >
+                Open session →
+              </Link>
+            ) : null}
+          </div>
         );
       })}
     </div>
