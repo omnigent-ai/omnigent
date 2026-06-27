@@ -1861,23 +1861,16 @@ def create_app(
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
     async def _on_runner_disconnect(runner_id: str) -> None:
-        """Mark sessions pinned to *this* runner as offline.
+        """Let liveness report sessions pinned to *this* runner offline.
 
         Filters by ``runner_id`` against ``conversation_store`` so a
-        disconnect on one runner does not flip every cached session
-        (e.g. sessions owned by other runners on the same server, or
-        sessions left in the module-level cache by earlier tests on
-        the same xdist worker) to ``"failed"``. The cache is updated
-        in lockstep with the publish so the list endpoint stays
-        coherent.
+        disconnect on one runner does not affect sessions owned by other
+        runners on the same server. A runner disconnect is liveness, not a
+        task failure, so this callback intentionally leaves the session
+        status cache untouched.
 
         :param runner_id: The disconnected runner's id.
         """
-        from omnigent.server.routes.sessions import (
-            _publish_status,
-            _session_status_cache,
-        )
-
         # Direct by-runner lookup: read-after-write consistent (the
         # listing path may be served from an eventually-consistent
         # search index in alternate store backends) and
@@ -1892,35 +1885,25 @@ def create_app(
             )
         ]
         _logger.warning(
-            "Runner %s disconnected; marking %d session(s) offline",
+            "Runner %s disconnected; %d session(s) now offline via liveness",
             runner_id,
             len(affected),
         )
-        for session_id in affected:
-            _session_status_cache[session_id] = "failed"
-            _publish_status(session_id, "failed")
 
     async def _on_runner_exited(runner_id: str, error: str) -> None:
-        """Mark a crashed runner's session(s) failed and push the cause.
+        """Record a crashed runner without marking sessions failed.
 
         Fired by the host tunnel when a daemon reports
-        ``host.runner_exited`` — the only failure signal for a runner
-        that died before connecting its tunnel (so ``_on_runner_disconnect``
-        never fires for it). Mirrors that callback's by-runner lookup,
-        but carries the daemon-composed error onto the ``session.status:
-        failed`` event so the open view surfaces the cause immediately
-        instead of spinning on "starting" until a timeout.
+        ``host.runner_exited`` — the only signal for a runner that died
+        before connecting its tunnel (so ``_on_runner_disconnect`` never
+        fires for it). Runner reachability is surfaced separately via
+        runner_online/liveness; publishing ``session.status: failed`` here
+        makes a runner lifecycle event indistinguishable from a task error.
 
         :param runner_id: The crashed runner's id.
         :param error: Human-readable cause from the daemon (exit code +
             log tail), e.g. ``"runner process exited with code 1 ..."``.
         """
-        from omnigent.server.routes.sessions import (
-            _publish_status,
-            _session_status_cache,
-        )
-        from omnigent.server.schemas import ErrorDetail
-
         affected = [
             c.id
             for c in await asyncio.to_thread(
@@ -1928,15 +1911,11 @@ def create_app(
             )
         ]
         _logger.warning(
-            "Runner %s reported crashed; marking %d session(s) failed: %s",
+            "Runner %s reported exited; %d session(s) now offline via liveness: %s",
             runner_id,
             len(affected),
             error,
         )
-        detail = ErrorDetail(code="runner_failed_to_start", message=error)
-        for session_id in affected:
-            _session_status_cache[session_id] = "failed"
-            _publish_status(session_id, "failed", error=detail)
 
     async def _on_runner_connect(runner_id: str) -> None:
         """Re-assign sessions and restart SSE relays on reconnect.

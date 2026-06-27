@@ -12,6 +12,7 @@ from omnigent.entities import Conversation, ConversationItem, MessageData, Paged
 from omnigent.server.routes import sessions as _sessions_mod
 from omnigent.server.routes.sessions import (
     SessionLiveness,
+    _child_session_summary_from_conversation,
     _get_session_snapshot,
     _publish_subtree_cost_to_ancestors,
 )
@@ -209,17 +210,10 @@ async def test_session_snapshot_populates_runner_online_from_session_lookup() ->
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_surfaces_runner_exit_report_as_failed() -> None:
-    """A crashed runner's exit report surfaces as failed + last_task_error.
-
-    This is the reload-durability leg: the live ``session.status:failed``
-    push is gone by the time a page reloads, so the snapshot must read the
-    cause from ``RunnerExitReports`` (keyed by the session's runner_id) and
-    project it as ``status="failed"`` + ``last_task_error`` — exactly what
-    the web's synthetic-error path renders. Without this, a reload after a
-    runner crash shows no error.
-    """
+async def test_session_snapshot_runner_exit_report_does_not_force_failed() -> None:
+    """Runner exit reports are liveness, not session task failures."""
     from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
 
     conv = Conversation(
         id="conv_crashed",
@@ -237,19 +231,17 @@ async def test_session_snapshot_surfaces_runner_exit_report_as_failed() -> None:
     daemon_error = "runner process exited with code 1\n--- runner log tail ---\nboom"
     reports.record("runner_dead", daemon_error, owner=None)
 
-    snapshot = await _get_session_snapshot(
-        conv_store,  # type: ignore[arg-type]
-        "conv_crashed",
-        runner_exit_reports=reports,
-    )
+    sessions_module._session_status_cache.pop("conv_crashed", None)
+    try:
+        snapshot = await _get_session_snapshot(
+            conv_store,  # type: ignore[arg-type]
+            "conv_crashed",
+        )
+    finally:
+        sessions_module._session_status_cache.pop("conv_crashed", None)
 
-    # Forced to failed by the exit report even though no task ran and the
-    # status cache is empty (a fresh crash before any turn).
-    assert snapshot.status == "failed"
-    assert snapshot.last_task_error is not None
-    assert snapshot.last_task_error["code"] == "runner_failed_to_start"
-    # The daemon's full cause (incl. log tail) rides through verbatim.
-    assert snapshot.last_task_error["message"] == daemon_error
+    assert snapshot.status == "idle"
+    assert snapshot.last_task_error is None
 
 
 @pytest.mark.asyncio
@@ -278,26 +270,70 @@ async def test_session_snapshot_surfaces_status_error_labels_as_last_task_error(
         conversations={"conv_failed_terminal": conv},
     )
 
-    snapshot = await _get_session_snapshot(  # type: ignore[arg-type]
-        conv_store,
-        "conv_failed_terminal",
-    )
+    _sessions_mod._session_status_cache["conv_failed_terminal"] = "failed"
+    try:
+        snapshot = await _get_session_snapshot(  # type: ignore[arg-type]
+            conv_store,
+            "conv_failed_terminal",
+        )
+    finally:
+        _sessions_mod._session_status_cache.pop("conv_failed_terminal", None)
 
     assert snapshot.last_task_error == {
         "code": "required_terminal_exited",
         "message": "Required terminal exited unexpectedly",
     }
+    assert snapshot.status == "failed"
+
+
+def test_child_summary_uses_cache_for_failure_but_disconnect_leaves_prior_status() -> None:
+    """Child summary reports real failed cache values, not runner disconnects."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    conv = Conversation(
+        id="conv_child_summary",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_parent_summary",
+        parent_conversation_id="conv_parent_summary",
+        kind="sub_agent",
+        title="codex:impl",
+    )
+    cache = sessions_module._session_status_cache
+    cache.pop(conv.id, None)
+    try:
+        summary = _child_session_summary_from_conversation(
+            conv,
+            "conv_parent_summary",
+            last_message_preview=None,
+        )
+        assert summary.current_task_status is None
+        assert summary.busy is False
+
+        cache[conv.id] = "running"
+        summary = _child_session_summary_from_conversation(
+            conv,
+            "conv_parent_summary",
+            last_message_preview=None,
+        )
+        assert summary.current_task_status is None
+        assert summary.busy is True
+
+        cache[conv.id] = "failed"
+        summary = _child_session_summary_from_conversation(
+            conv,
+            "conv_parent_summary",
+            last_message_preview=None,
+        )
+        assert summary.current_task_status == "failed"
+        assert summary.busy is False
+    finally:
+        cache.pop(conv.id, None)
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
-    """A session whose runner has no exit report is not marked failed.
-
-    Guards the override from firing for healthy/idle sessions — only a
-    recorded crash for THIS session's runner should flip it.
-    """
-    from omnigent.server.host_registry import RunnerExitReports
-
+async def test_session_snapshot_runner_bound_session_stays_unfailed() -> None:
+    """A runner-bound session is not marked failed without task failure state."""
     conv = Conversation(
         id="conv_ok",
         created_at=1,
@@ -310,15 +346,12 @@ async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
         [_message_item("item_1", "hi")],
         conversations={"conv_ok": conv},
     )
-    reports = RunnerExitReports()  # empty — no crash recorded
 
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
         "conv_ok",
-        runner_exit_reports=reports,
     )
 
-    # No report for runner_live → no forced failure, no synthetic error.
     assert snapshot.status != "failed"
     assert snapshot.last_task_error is None
 
