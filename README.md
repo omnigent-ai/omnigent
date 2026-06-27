@@ -264,6 +264,7 @@ and a key. The base URL depends on which agent you point it at:
 |---|---|---|---|
 | **OpenRouter** | Claude Code | `https://openrouter.ai/api` | your OpenRouter key (`sk-or-…`) |
 | **OpenRouter** | Codex / OpenAI agents | `https://openrouter.ai/api/v1` | your OpenRouter key (`sk-or-…`) |
+| **Tuning Engines** | Codex / OpenAI agents | `https://api.tuningengines.com/v1` | your Tuning Engines inference key (`sk-te-…`) |
 | **Ollama** (local) | Codex / OpenAI agents | `http://localhost:11434/v1` | any value (Ollama ignores it) |
 
 For Claude Code, point at OpenRouter's Anthropic-compatible endpoint
