@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from functools import partial
 
@@ -121,6 +121,7 @@ def _tunnel_route_app(
     *,
     allowed_tunnel_tokens: frozenset[str] | None = None,
     auth_provider: AuthProvider | None = None,
+    resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
 ) -> TunnelRouteApp:
     """Create a minimal app containing only the runner tunnel route.
 
@@ -129,6 +130,9 @@ def _tunnel_route_app(
     :param auth_provider: Optional auth provider wired into the route.
         ``None`` keeps the no-auth single-user posture; a provider
         activates owner recording and the fail-closed gate.
+    :param resolve_managed_runner_owner: Optional ``runner_id -> owner``
+        resolver for server-managed sandbox runners (binding-token auth,
+        no user session). ``None`` disables the managed-runner lookup.
     :returns: The FastAPI app and registry owned by its route.
     """
     registry = TunnelRegistry()
@@ -139,6 +143,7 @@ def _tunnel_route_app(
             registry,
             allowed_tunnel_tokens=allowed_tunnel_tokens,
             auth_provider=auth_provider,
+            resolve_managed_runner_owner=resolve_managed_runner_owner,
         ),
         prefix="/v1",
     )
@@ -851,6 +856,99 @@ async def test_ws_tunnel_registers_authenticated_non_loopback_owner() -> None:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
             await communicator.wait(timeout=1.0)
+
+
+async def test_ws_tunnel_managed_runner_resolves_owner_from_binding_token() -> None:
+    """A managed-sandbox runner registers under its launch owner.
+
+    Server-managed sandboxes authenticate with a server-minted binding
+    token, not an OIDC cookie/Bearer, so ``auth_provider.get_user_id``
+    returns ``None`` for the runner handshake. Rather than rejecting it
+    (which would make server-managed sandboxes impossible on an
+    auth-enabled server), the route resolves the owner the server
+    recorded for this runner at launch via ``resolve_managed_runner_owner``
+    — the runner-side analog of the host tunnel's ``resolve_launch_token``.
+
+    The peer still had to present the real binding token to clear the
+    token-binding gate (``token_bound_runner_id(token) == runner_id``),
+    so this path is unreachable with an attacker-chosen token mapped to a
+    victim's runner id.
+
+    Reverting the fix turns this red: the route refuses the handshake
+    (``_connect_route`` asserts ``websocket.accept`` and would instead see
+    a ``websocket.close``).
+
+    :returns: None.
+    """
+    token = "managed-runner-binding-token"
+    runner_id = token_bound_runner_id(token)
+    route_app = _tunnel_route_app(
+        auth_provider=_CredentialHeaderAuthProvider(),
+        resolve_managed_runner_owner=(
+            lambda rid: "owner@example.com" if rid == runner_id else None
+        ),
+    )
+    communicator = await _connect_route(
+        route_app.app,
+        f"/v1/runners/{runner_id}/tunnel",
+        headers=[
+            (RUNNER_TUNNEL_TOKEN_HEADER.lower().encode("ascii"), token.encode("ascii")),
+        ],
+        client_host="203.0.113.7",
+    )
+
+    await _send_hello(communicator, route_app.registry, runner_id=runner_id)
+    try:
+        assert route_app.registry.online_runner_ids() == [runner_id]
+        # Registered under the launch owner the resolver returned — not
+        # rejected, and not the owner-less registration the gate forbids.
+        assert route_app.registry.runner_owner(runner_id) == "owner@example.com"
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await communicator.wait(timeout=1.0)
+
+
+async def test_ws_tunnel_managed_resolver_none_still_rejects() -> None:
+    """Wiring the managed resolver must not weaken the fail-closed gate.
+
+    A non-loopback peer with a token but no authenticated identity AND no
+    managed-launch record (the resolver returns ``None``) is still refused
+    with 4004 *before* ``accept()`` — never registered owner-less. This
+    locks in that the new resolver path only rescues genuine
+    server-launched runners, not an attacker-chosen token.
+
+    :returns: None.
+    """
+    route_app = _tunnel_route_app(
+        auth_provider=_CredentialHeaderAuthProvider(),
+        resolve_managed_runner_owner=lambda rid: None,
+    )
+
+    attacker_token = "attacker-chosen-token"
+    derived_runner_id = token_bound_runner_id(attacker_token)
+    communicator = ApplicationCommunicator(
+        route_app.app,
+        _websocket_scope(
+            f"/v1/runners/{derived_runner_id}/tunnel",
+            headers=[
+                (
+                    RUNNER_TUNNEL_TOKEN_HEADER.lower().encode("ascii"),
+                    attacker_token.encode("ascii"),
+                )
+            ],
+            client_host="203.0.113.7",
+        ),
+    )
+
+    await communicator.send_input({"type": "websocket.connect"})
+    closed = await communicator.receive_output(timeout=1.0)
+    assert closed == {
+        "type": "websocket.close",
+        "code": 4004,
+        "reason": "unauthenticated",
+    }
+    assert route_app.registry.online_runner_ids() == []
 
 
 async def test_ws_tunnel_loopback_unauthenticated_registers_as_local() -> None:

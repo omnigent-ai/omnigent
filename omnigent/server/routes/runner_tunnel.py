@@ -151,6 +151,7 @@ def create_runner_tunnel_router(
     on_runner_connect: Callable[[str], Awaitable[None]] | None = None,
     auth_provider: AuthProvider | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
+    resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/runners/{id}/tunnel`` WS endpoint.
 
@@ -180,6 +181,15 @@ def create_runner_tunnel_router(
         before (or after) connecting, so waiting clients fail fast
         instead of polling to a timeout. ``None`` (e.g. minimal test
         wiring, or a server without host support) omits the field.
+    :param resolve_managed_runner_owner: Optional ``runner_id -> owner``
+        resolver for server-managed sandbox runners. A managed runner
+        authenticates with a server-minted binding token (not a user
+        session), so ``auth_provider.get_user_id`` cannot resolve it;
+        this looks up the owner the server recorded for the runner at
+        launch (the conversation bound to ``runner_id``) — the
+        runner-side analog of the host tunnel's ``resolve_launch_token``.
+        ``None`` disables the lookup (an unauthenticated non-loopback
+        peer is then rejected, the prior behavior).
     :returns: A FastAPI router with the tunnel endpoint.
     """
     router = APIRouter()
@@ -341,11 +351,26 @@ def create_runner_tunnel_router(
             is_loopback=is_loopback,
         )
         if tunnel_owner is None and auth_provider is not None:
-            # Auth is enabled but this non-loopback peer presented no
-            # authenticated identity (no cookie / Bearer). Refuse the
-            # handshake instead of registering an owner-less runner.
-            await ws.close(code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="unauthenticated")
-            return
+            # A server-managed sandbox runner authenticates with a
+            # server-minted binding token (the token-binding gate above
+            # already proved ``token_bound_runner_id(token) == runner_id``),
+            # not a user cookie / Bearer — so ``get_user_id`` returns None
+            # here even though the peer is legitimate. Resolve the owner the
+            # server recorded for this runner at launch (the conversation
+            # bound to ``runner_id``), mirroring the host tunnel's
+            # ``resolve_launch_token`` path. Only a peer holding the real
+            # 32-byte binding token reaches this branch, so an
+            # attacker-chosen token cannot map to a victim's runner_id.
+            if resolve_managed_runner_owner is not None:
+                tunnel_owner = await asyncio.to_thread(
+                    resolve_managed_runner_owner, runner_id
+                )
+            if tunnel_owner is None:
+                # No managed-launch record either: a genuinely
+                # unauthenticated non-loopback peer. Refuse the handshake
+                # instead of registering an owner-less runner.
+                await ws.close(code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="unauthenticated")
+                return
 
         await ws.accept()
         session: RunnerSession | None = None
