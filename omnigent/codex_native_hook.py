@@ -26,6 +26,7 @@ from omnigent.native_policy_hook import (
     evaluation_response_to_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
+    policy_hook_reauth,
     post_evaluate_with_retry,
 )
 
@@ -160,7 +161,13 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     session_component = urllib.parse.quote(session_id, safe="")
     url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
     resp = post_evaluate_with_retry(
-        url, headers, eval_request, _EVALUATE_POLICY_TIMEOUT_S, "codex evaluate-policy hook"
+        url,
+        headers,
+        eval_request,
+        _EVALUATE_POLICY_TIMEOUT_S,
+        "codex evaluate-policy hook",
+        # Re-mint the baked one-shot token if it lapses mid-session.
+        reauth=policy_hook_reauth(ap_server_url, headers),
     )
     if resp is None:
         return _fail_closed()

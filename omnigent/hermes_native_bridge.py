@@ -323,15 +323,14 @@ def write_policy_hook_config(
 
     hook_script_path = str(Path(__file__).resolve().parent / "inner" / "hermes_policy_hook.py")
 
-    # Wrapper shell script: sets env vars and execs the Python hook.
+    # Wrapper shell script: sets env vars and execs the Python hook. It bakes a
+    # one-shot auth token + workspace-routing header, so it is owner-only
+    # (0o700) — the secret is never world-readable.
+    from omnigent.native_policy_hook import policy_hook_wrapper_script
+
     wrapper = hermes_home / "omnigent-policy-hook.sh"
-    wrapper.write_text(
-        f"#!/bin/sh\n"
-        f"export _OMNIGENT_SERVER_URL='{server_url}'\n"
-        f"export _OMNIGENT_SESSION_ID='{session_id}'\n"
-        f"exec '{sys.executable}' '{hook_script_path}'\n"
-    )
-    wrapper.chmod(0o755)
+    wrapper.write_text(policy_hook_wrapper_script(server_url, session_id, hook_script_path))
+    wrapper.chmod(0o700)
 
     # Write bridge.json with an auth token for serve-mcp (idempotent).
     _write_mcp_bridge_config(bridge_dir)

@@ -21,7 +21,9 @@ model sees it).
 from __future__ import annotations
 
 import json
+import os
 import secrets
+import shlex
 import sys
 import time
 from collections.abc import Callable
@@ -59,6 +61,107 @@ _EVAL_UNAVAILABLE_REASON = (
     "Omnigent policy evaluation unavailable (could not reach or authenticate to the "
     "Omnigent server); failing closed for this tool call."
 )
+
+
+# Env var carrying the one-shot auth + workspace-routing headers from the
+# executor (which writes the hook wrapper) to the hook subprocess. The hook
+# is import-free of the runner, so the headers are passed in rather than
+# resolved in-process — the same reason ``ap_auth_headers`` is baked for the
+# claude/codex/kimi hooks.
+_AUTH_HEADERS_ENV = "_OMNIGENT_AUTH_HEADERS"
+
+
+def policy_hook_request_headers() -> dict[str, str]:
+    """Build the headers for a policy-hook subprocess's POST to the server.
+
+    Always carries ``Content-Type``, and merges the one-shot auth +
+    workspace-routing headers the executor baked into :data:`_AUTH_HEADERS_ENV`
+    at launch (see :func:`policy_hook_wrapper_script`). Without them the POST
+    is unauthenticated and unrouted — it 401s on an authenticated server and
+    misroutes to the account on a unified-account workspace. Missing or
+    malformed env → just ``Content-Type`` (a local unauthenticated server
+    needs no auth).
+
+    :returns: Request headers for ``post_evaluate_with_retry``.
+    """
+    headers = {"Content-Type": "application/json"}
+    raw = os.environ.get(_AUTH_HEADERS_ENV, "")
+    if raw:
+        try:
+            extra = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            extra = None
+        if isinstance(extra, dict):
+            headers.update({str(k): str(v) for k, v in extra.items()})
+    return headers
+
+
+def policy_hook_wrapper_script(server_url: str, session_id: str, hook_script_path: str) -> str:
+    """Build the ``/bin/sh`` wrapper a native policy hook is launched as.
+
+    Resolves a one-shot Omnigent-server token and bakes the auth +
+    workspace-routing headers (via
+    :func:`omnigent.cli_auth.databricks_request_headers`) into
+    :data:`_AUTH_HEADERS_ENV`, so the hook's POST authenticates and routes to
+    the workspace. The token is a secret, so callers MUST write the returned
+    wrapper ``0o700`` (owner-only) — it is never world-readable.
+
+    :param server_url: Omnigent server base URL the hook posts to.
+    :param session_id: Session / conversation id for policy evaluation.
+    :param hook_script_path: Absolute path to the hook's Python entrypoint.
+    :returns: Shell-script text for the wrapper (write it ``0o700``).
+    """
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.runner._entry import _make_auth_token_factory
+
+    factory = _make_auth_token_factory(server_url=server_url)
+    token = factory() if factory is not None else None
+    auth_headers = databricks_request_headers(server_url, bearer_token=token)
+    return (
+        "#!/bin/sh\n"
+        f"export _OMNIGENT_SERVER_URL={shlex.quote(server_url)}\n"
+        f"export _OMNIGENT_SESSION_ID={shlex.quote(session_id)}\n"
+        f"export {_AUTH_HEADERS_ENV}={shlex.quote(json.dumps(auth_headers))}\n"
+        f"exec {shlex.quote(sys.executable)} {shlex.quote(hook_script_path)}\n"
+    )
+
+
+def policy_hook_reauth(
+    server_url: str, headers: dict[str, str]
+) -> Callable[[], dict[str, str] | None]:
+    """Build a callable that re-mints the Omnigent bearer for *server_url*.
+
+    The baked one-shot token dies with the ~1h Databricks OAuth lifetime; on a
+    lapsed-token signal (401 or Apps ``302→/oidc/``) ``post_evaluate_with_retry``
+    calls this once to mint a fresh bearer through the same factory the
+    refresh-capable runtime auth uses, keeping the other headers (e.g.
+    ``X-Databricks-Org-Id``) so routing survives. Returns ``None`` when no
+    refresh mechanism is available, so the caller fails closed.
+
+    :param server_url: Omnigent server base URL the hook POSTs to.
+    :param headers: Current (lapsed) headers; the fresh bearer is merged over
+        a copy so routing headers survive.
+    :returns: A zero-arg callable returning fresh headers, or ``None``.
+    """
+
+    def _reauth() -> dict[str, str] | None:
+        # Lazy import: paid only on the rare re-auth path, off the hot path.
+        try:
+            from omnigent.runner._entry import _make_auth_token_factory
+        except Exception:  # noqa: BLE001 — best-effort; fail closed if unavailable
+            return None
+        factory = _make_auth_token_factory(server_url)
+        if factory is None:
+            return None
+        try:
+            token = factory()
+        except Exception:  # noqa: BLE001 — transient mint failure; fail closed
+            return None
+        if not token:
+            return None
+        return {**headers, "Authorization": f"Bearer {token}"}
+
+    return _reauth
 
 
 def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:

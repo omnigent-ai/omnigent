@@ -1413,9 +1413,9 @@ class HostProcess:
         # Workspace routing: the tunnel handshake must name the workspace or
         # it routes to the account. Empty for single-workspace and managed
         # hosts (no recorded selector), so neither is affected.
-        from omnigent.cli_auth import databricks_org_id_headers
+        from omnigent.cli_auth import databricks_request_headers
 
-        headers.update(databricks_org_id_headers(self._server_url))
+        headers.update(databricks_request_headers(self._server_url))
 
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:
