@@ -499,6 +499,8 @@ _LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
 # by. Empty string clears a stale value because labels are upsert-only.
 _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
+# Hard limit matching the ``String(256)`` column in ``db_models.py``.
+_LABEL_VALUE_MAX_LEN: int = 256
 
 # Todo-list update from the claude-native forwarder. Carries the raw
 # todo items captured from PostToolUse/TodoWrite hook events. Payload
@@ -5220,6 +5222,18 @@ def _publish_status(
     session_stream.publish(session_id, payload)
 
 
+def _truncate_label(value: str) -> str:
+    """Truncate a label value to fit the ``String(256)`` DB column.
+
+    Long failure messages (tracebacks, 5xx bodies) overflow the column and
+    cause a ``DataError`` that silently drops the error reason.
+
+    :param value: The raw string to truncate.
+    :returns: ``value`` unchanged if short enough, else the first 256 chars.
+    """
+    return value[:_LABEL_VALUE_MAX_LEN]
+
+
 async def _persist_session_status_error_labels(
     session_id: str,
     error: ErrorDetail | None,
@@ -5241,8 +5255,8 @@ async def _persist_session_status_error_labels(
     """
     updates = (
         {
-            _LAST_TASK_ERROR_CODE_LABEL_KEY: error.code,
-            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: error.message,
+            _LAST_TASK_ERROR_CODE_LABEL_KEY: _truncate_label(error.code),
+            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: _truncate_label(error.message),
         }
         if error is not None
         else {

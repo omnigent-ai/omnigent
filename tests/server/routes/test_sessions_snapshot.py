@@ -11,9 +11,12 @@ import pytest
 from omnigent.entities import Conversation, ConversationItem, MessageData, PagedList
 from omnigent.server.routes import sessions as _sessions_mod
 from omnigent.server.routes.sessions import (
+    _LABEL_VALUE_MAX_LEN,
     SessionLiveness,
     _get_session_snapshot,
+    _persist_session_status_error_labels,
     _publish_subtree_cost_to_ancestors,
+    _truncate_label,
 )
 
 
@@ -1517,3 +1520,68 @@ def test_publish_subtree_cost_to_ancestors_publishes_each_ancestor_subtree(
     assert by_conv["conv_g"]["usage_by_model"]["model-a"]["input_tokens"] == 70
     # The payload is a session.usage broadcast the web client renders as the badge.
     assert by_conv["conv_p"]["type"] == "session.usage"
+
+
+# ── _truncate_label ──────────────────────────────────────────────────────────
+
+
+def test_truncate_label_short_value_unchanged() -> None:
+    """Values at or below the column limit pass through unmodified."""
+    value = "x" * _LABEL_VALUE_MAX_LEN
+    assert _truncate_label(value) == value
+
+
+def test_truncate_label_long_value_fits_column() -> None:
+    """Truncated output never exceeds the column limit."""
+    long_value = "a" * (_LABEL_VALUE_MAX_LEN + 100)
+    result = _truncate_label(long_value)
+    assert len(result) <= _LABEL_VALUE_MAX_LEN
+
+
+
+def test_truncate_label_empty_string() -> None:
+    """Empty string is returned unchanged (no off-by-one crash)."""
+    assert _truncate_label("") == ""
+
+
+# ── _persist_session_status_error_labels ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_persist_error_labels_truncates_long_message() -> None:
+    """A failure message longer than 256 chars is truncated before the store
+    write, preventing the ``DataError`` that silently dropped the reason."""
+    from omnigent.server.schemas import ErrorDetail
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    long_message = "Runner MCP execute failed: " + "x" * 300
+    error = ErrorDetail(code="mcp_error", message=long_message)
+
+    await _persist_session_status_error_labels("conv_123", error, _MockStore())  # type: ignore[arg-type]
+
+    stored = captured["conv_123"]
+    assert len(stored["omnigent.last_task_error_message"]) <= _LABEL_VALUE_MAX_LEN
+
+
+@pytest.mark.asyncio
+async def test_persist_error_labels_short_message_stored_verbatim() -> None:
+    """A short failure message is stored without modification."""
+    from omnigent.server.schemas import ErrorDetail
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    error = ErrorDetail(code="runner_error", message="Process exited with code 1")
+
+    await _persist_session_status_error_labels("conv_456", error, _MockStore())  # type: ignore[arg-type]
+
+    assert captured["conv_456"]["omnigent.last_task_error_message"] == "Process exited with code 1"
+    assert captured["conv_456"]["omnigent.last_task_error_code"] == "runner_error"
