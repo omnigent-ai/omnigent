@@ -43,6 +43,7 @@ def test_canonical_native_harnesses_resolve() -> None:
         "cursor-native",
         "kimi-native",
         "kiro-native",
+        "cline-native",
     ):
         assert native_coding_agent_for_harness(harness) is not None
 
@@ -74,6 +75,20 @@ def test_kiro_native_agent_metadata_and_aliases() -> None:
         native_coding_agent_for_wrapper_label(KIRO_NATIVE_WRAPPER_VALUE)
         is KIRO_NATIVE_CODING_AGENT
     )
+
+
+def test_native_cline_alias_resolves_like_canonical() -> None:
+    """``native-cline`` resolves to the same native agent as ``cline-native``.
+
+    Mirrors the ``native-pi`` / ``native-kimi`` fold: ``canonicalize_harness``
+    maps the reversed spelling to the canonical id so a forked/switched
+    cline-native agent keeps its terminal-first presentation labels.
+    """
+    agent = native_coding_agent_for_harness("native-cline")
+    assert agent is not None
+    assert agent is native_coding_agent_for_harness("cline-native")
+    assert agent.terminal_name == "cline"
+    assert agent.display_name == "Cline"
 
 
 def test_unknown_harness_returns_none() -> None:

@@ -89,6 +89,12 @@ COPILOT_KEY = "copilot"
 # Omnigent-managed credentials). The ``hermes`` binary must be on PATH.
 HERMES_KEY = "hermes"
 
+# The standalone Cline CLI ships via npm (``npm install -g cline``) and
+# authenticates through its own ``cline auth`` interactive flow against the
+# selected provider (auth stored under ``$HOME/.cline``), so it carries no
+# Omnigent-managed credential. The ``cline`` binary must be on PATH.
+CLINE_KEY = "cline"
+
 
 @dataclass(frozen=True)
 class HarnessInstallSpec:
@@ -242,6 +248,19 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         package=None,
         install_hint="curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
     ),
+    # Cline ships its ``cline`` binary via the ``cline`` npm package
+    # (``npm install -g cline``). ``cline auth`` is the interactive provider
+    # login (auth stored under ``$HOME/.cline``). ``status_args`` is
+    # intentionally ``None``: cline has no first-class exit-code "am I logged
+    # in?" probe — login state is configured interactively — so the login path
+    # runs every time the operator asks for it (they can cancel if already
+    # authenticated).
+    CLINE_KEY: HarnessInstallSpec(
+        "Cline",
+        "cline",
+        "cline",
+        login_args=("auth",),
+    ),
 }
 
 
@@ -306,6 +325,10 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary.
     "hermes-native": HERMES_KEY,
     "native-hermes": HERMES_KEY,
+    # Native Cline TUI (``cline-native``, via ``omni cline``) wraps the ``cline``
+    # CLI; the ``native-cline`` reversed spelling gates on the same binary.
+    "cline-native": CLINE_KEY,
+    "native-cline": CLINE_KEY,
 }
 
 

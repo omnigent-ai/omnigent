@@ -24,6 +24,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native_coding_agents import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
     CLAUDE_NATIVE_CODING_AGENT,
+    CLINE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
     KIMI_NATIVE_CODING_AGENT,
@@ -119,6 +120,7 @@ _KIRO_NATIVE_AGENT_NAME = KIRO_NATIVE_CODING_AGENT.agent_name
 _ANTIGRAVITY_NATIVE_AGENT_NAME = ANTIGRAVITY_NATIVE_CODING_AGENT.agent_name
 _QWEN_NATIVE_AGENT_NAME = QWEN_NATIVE_CODING_AGENT.agent_name
 _KIMI_NATIVE_AGENT_NAME = KIMI_NATIVE_CODING_AGENT.agent_name
+_CLINE_NATIVE_AGENT_NAME = CLINE_NATIVE_CODING_AGENT.agent_name
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
@@ -401,6 +403,7 @@ def _ensure_default_agents(
     _ensure_default_antigravity_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_qwen_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_kimi_native_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_cline_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
@@ -846,6 +849,49 @@ def _ensure_default_kimi_native_agent(
         agent_cache,
         name=_KIMI_NATIVE_AGENT_NAME,
         bundle_bytes=_build_kimi_native_bundle(),
+    )
+
+
+def _build_cline_native_bundle() -> bytes:
+    """
+    Build a gzipped tarball of the cline-native-ui agent spec.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    from omnigent.cline_native import _materialize_cline_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_cline_agent_spec(Path(tmpdir))
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_cline_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register or refresh the cline-native-ui agent.
+
+    Called during server lifespan startup so the Web UI offers Cline as a
+    built-in native-terminal agent on every deployment (not only after the
+    ``omnigent cline`` CLI first registers it). Content-aware via
+    :func:`_ensure_builtin_agent`.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_CLINE_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_cline_native_bundle(),
     )
 
 

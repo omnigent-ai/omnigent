@@ -42,6 +42,10 @@ HARNESS_ALIASES: dict[str, str] = {
     # User-facing spelling for the GitHub Copilot SDK harness; the canonical id
     # is "copilot" (matches the registry / workflow type).
     "github-copilot": "copilot",
+    # User-facing reversed spelling for the Cline native-CLI (TUI) harness;
+    # canonical id is "cline-native" (the standalone ``cline`` CLI, like
+    # cursor-native — there is no separate SDK ``cline`` harness yet).
+    "native-cline": "cline-native",
 }
 
 # Canonical native-CLI harness spellings. These harnesses type messages into
@@ -80,6 +84,11 @@ NATIVE_HARNESSES: frozenset[str] = frozenset(
         # HARNESS_ALIASES / runtime/harnesses/__init__.py).
         "hermes-native",
         "native-hermes",
+        # Native Cline (TUI) bridge used by ``omnigent cline``; the standalone
+        # ``cline`` CLI is wrapped like cursor-native (there is no separate
+        # headless ``cline`` SDK harness yet).
+        "cline-native",
+        "native-cline",
     }
 )
 
