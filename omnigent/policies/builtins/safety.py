@@ -82,9 +82,15 @@ def max_tool_calls_per_session(limit: int = 100) -> PolicyCallable:
     each tool call.
 
     :param limit: Maximum tool calls allowed across the entire
-        session. Defaults to ``100``.
+        session. Must be ``>= 1``. Defaults to ``100``.
     :returns: A policy callable that DENYs after the limit.
+    :raises ValueError: If *limit* is less than ``1`` — a ``0`` or
+        negative limit would DENY every tool call from the first one,
+        silently bricking the session, so fail loud at spec load
+        rather than ship a gate that can never allow anything.
     """
+    if limit < 1:
+        raise ValueError(f"limit must be >= 1, got {limit!r}")
 
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate the session-wide rate limit.
@@ -565,6 +571,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
             "properties": {
                 "limit": {
                     "type": "integer",
+                    "minimum": 1,
                     "description": "Maximum tool calls allowed across the session",
                     "default": 100,
                 },
