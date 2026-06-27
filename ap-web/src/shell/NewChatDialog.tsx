@@ -2276,7 +2276,15 @@ export function NewChatLandingScreen() {
                 isComposingRef.current = true;
               }}
               onCompositionEnd={() => {
-                isComposingRef.current = false;
+                // Safari dispatches compositionend BEFORE the confirming
+                // Enter's keydown (isComposing=false, keyCode=13, not 229),
+                // so a synchronous reset would let that Enter slip past the
+                // IME guard and create the session mid-composition. Defer the
+                // reset to the next macrotask so the confirming keydown still
+                // observes composition active. #433
+                setTimeout(() => {
+                  isComposingRef.current = false;
+                }, 0);
               }}
               onKeyDown={(e) => {
                 if (isImeCompositionKeyEvent(e, isComposingRef.current)) {

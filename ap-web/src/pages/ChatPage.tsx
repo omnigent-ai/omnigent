@@ -4091,7 +4091,18 @@ export function Composer({
               isComposingRef.current = true;
             }}
             onCompositionEnd={() => {
-              isComposingRef.current = false;
+              // Safari dispatches compositionend BEFORE the keydown of the
+              // Enter that confirmed the composition, and that keydown reports
+              // isComposing=false / keyCode=13 (not the 229 IME fallback) — so
+              // the #132 IME guard in handleKeyDown would let it through and
+              // submit the message. Defer the reset to the next macrotask so
+              // the confirming keydown still observes composition active and is
+              // ignored. The deferred reset flushes well before a user's next
+              // deliberate Enter (or a click-to-confirm), so neither regresses.
+              // #433
+              setTimeout(() => {
+                isComposingRef.current = false;
+              }, 0);
             }}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
