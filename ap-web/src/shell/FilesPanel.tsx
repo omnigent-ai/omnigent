@@ -546,6 +546,8 @@ export function FilesPanel({
                 sort={changedSort}
                 conversationId={conversationId}
                 runnerWentOffline={runnerWentOffline}
+                trackingComplete={changedQuery.data?.trackingComplete ?? true}
+                trackingReason={changedQuery.data?.trackingReason ?? null}
               />
             ) : (
               <FolderTree

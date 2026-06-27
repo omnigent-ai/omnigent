@@ -1,5 +1,10 @@
 import { FileIcon } from "lucide-react";
-import { RunnerOfflineError, type WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  RunnerOfflineError,
+  type WorkspaceChangedFile,
+  type WorkspaceChangesTrackingReason,
+} from "@/hooks/useWorkspaceChangedFiles";
+import { LimitedTrackingNotice } from "./LimitedTrackingNotice";
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { cn } from "@/lib/utils";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -141,6 +146,8 @@ export function FlatFileList({
   sort,
   conversationId,
   runnerWentOffline = false,
+  trackingComplete = true,
+  trackingReason = null,
 }: {
   files: WorkspaceChangedFile[] | undefined;
   isLoading: boolean;
@@ -160,7 +167,22 @@ export function FlatFileList({
    * false and we fall through to the normal empty state instead.
    */
   runnerWentOffline?: boolean;
+  /**
+   * Whether change tracking captures every edit. `false` for non-git
+   * workspaces (only the agent's file-tool edits are recorded), which shows a
+   * notice so a partial — often empty — list doesn't read as "no changes".
+   */
+  trackingComplete?: boolean;
+  /** Why tracking is limited; drives the notice copy. */
+  trackingReason?: WorkspaceChangesTrackingReason | null;
 }) {
+  // Rendered above the list (or in place of the empty state) whenever the
+  // runner reports incomplete tracking. Suppressed while loading/erroring,
+  // where a more specific state already shows.
+  const limitedNotice =
+    !isLoading && !isError && !trackingComplete ? (
+      <LimitedTrackingNotice reason={trackingReason} />
+    ) : null;
   if (isLoading) {
     return <p className="px-2 py-1 text-muted-foreground text-xs">Loading…</p>;
   }
@@ -180,7 +202,14 @@ export function FlatFileList({
     );
   }
   if (!files || files.length === 0) {
-    return <p className="px-2 py-1 text-muted-foreground text-xs">No workspace changes yet</p>;
+    // With limited tracking, the notice explains the (expected) emptiness;
+    // it replaces the generic "no changes yet" so the panel doesn't read as a
+    // definitive "nothing changed".
+    return (
+      limitedNotice ?? (
+        <p className="px-2 py-1 text-muted-foreground text-xs">No workspace changes yet</p>
+      )
+    );
   }
   const normalizedSearchQuery = normalizeSearchQuery(searchQuery);
   const visibleFiles = files.filter(
@@ -197,27 +226,34 @@ export function FlatFileList({
   const hiddenCount = files.length - visibleFiles.length;
   if (visibleFiles.length === 0) {
     return (
-      <p className="px-2 py-1 text-muted-foreground text-xs">
-        All changes are in hidden files.{" "}
-        <button
-          type="button"
-          className="cursor-pointer underline hover:text-foreground"
-          onClick={onShowHidden}
-        >
-          Click to show
-        </button>
-      </p>
+      <>
+        {limitedNotice}
+        <p className="px-2 py-1 text-muted-foreground text-xs">
+          All changes are in hidden files.{" "}
+          <button
+            type="button"
+            className="cursor-pointer underline hover:text-foreground"
+            onClick={onShowHidden}
+          >
+            Click to show
+          </button>
+        </p>
+      </>
     );
   }
   if (sorted.length === 0) {
     return (
-      <p className="px-2 py-1 text-muted-foreground text-xs">
-        No changed files match "{searchQuery.trim()}"
-      </p>
+      <>
+        {limitedNotice}
+        <p className="px-2 py-1 text-muted-foreground text-xs">
+          No changed files match "{searchQuery.trim()}"
+        </p>
+      </>
     );
   }
   return (
     <>
+      {limitedNotice}
       {hiddenCount > 0 && (
         <p className="px-2 py-1 text-muted-foreground text-xs">
           {hiddenCount} file{hiddenCount === 1 ? "" : "s"} hidden.{" "}
