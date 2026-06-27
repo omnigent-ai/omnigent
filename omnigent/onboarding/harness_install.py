@@ -123,6 +123,16 @@ class HarnessInstallSpec:
         once — appended after the install hint, e.g. ``"run `agy` once and
         complete the browser sign-in"``; ``None`` when ``login_args`` (or
         nothing) already covers sign-in.
+    :param native_install: The harness's official native-installer shell
+        one-liner, e.g. ``"curl -fsSL https://claude.ai/install.sh | bash"`` for
+        Claude. When set it is **preferred over** ``package``: the install
+        command and the auto-installer run the native installer instead of
+        ``npm install -g``. Claude carries one because Anthropic recommends the
+        native installer (it writes to a user-writable ``~/.local/bin`` and
+        self-updates, sidestepping ``npm install -g`` global-prefix permission
+        errors) — see
+        https://code.claude.com/docs/en/setup#native-install-recommended.
+        ``None`` for harnesses installed via npm (Codex, Pi, Qwen, OpenCode).
     """
 
     display: str
@@ -134,6 +144,7 @@ class HarnessInstallSpec:
     install_hint: str | None = None
     login_status_key: str | None = None
     auth_hint: str | None = None
+    native_install: str | None = None
 
 
 # Keyed by harness family (Claude=anthropic, Codex=openai) plus the pi
@@ -150,6 +161,11 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         logout_args=("auth", "logout"),
         status_args=("auth", "status"),
         login_status_key="loggedIn",
+        # Anthropic's recommended install path (writes to ~/.local/bin and
+        # self-updates), so setup never shells `npm install -g` for Claude and
+        # Omnigent doesn't own npm global-prefix / PATH edge cases. Codex/Pi/
+        # Qwen/OpenCode keep npm (they have no first-party native installer).
+        native_install="curl -fsSL https://claude.ai/install.sh | bash",
     ),
     OPENAI_FAMILY: HarnessInstallSpec(
         "Codex",
@@ -408,40 +424,85 @@ def harness_cli_installed(key: str) -> bool:
 
 
 def harness_install_command(key: str) -> list[str]:
-    """Return the argv that installs the harness CLI, e.g. ``npm install -g …``.
+    """Return the argv that installs the harness CLI, ready for ``subprocess.run``.
+
+    Prefers the harness's official ``native_install`` script when it has one
+    (Claude → Anthropic's native installer), wrapped as ``["bash", "-c",
+    <script>]`` because the installer is a ``curl … | bash`` pipeline rather than
+    a plain argv. Every other harness installs via ``npm install -g``. For a
+    human-readable form (no ``bash -c`` wrapper) use
+    :func:`harness_install_display`.
 
     :param key: A harness family or :data:`PI_KEY`.
     :returns: The install command, e.g.
-        ``["npm", "install", "-g", "@anthropic-ai/claude-code"]``.
+        ``["bash", "-c", "curl -fsSL https://claude.ai/install.sh | bash"]`` for
+        Claude or ``["npm", "install", "-g", "@openai/codex"]`` for Codex.
     :raises KeyError: If *key* has no install spec (caller should gate on
         :func:`harness_install_spec`).
-    :raises ValueError: If *key* has a spec but no npm ``package`` (a CLI
-        installed out-of-band, e.g. cursor-agent); show its ``install_hint``.
+    :raises ValueError: If *key* has a spec but neither a ``native_install`` nor
+        an npm ``package`` (a CLI installed out-of-band, e.g. cursor-agent); show
+        its ``install_hint`` instead.
     """
-    package = _HARNESS_INSTALL[key].package
-    if package is None:
-        raise ValueError(f"{key!r} has no npm package; show its install_hint instead")
-    return ["npm", "install", "-g", package]
+    spec = _HARNESS_INSTALL[key]
+    if spec.native_install is not None:
+        return ["bash", "-c", spec.native_install]
+    if spec.package is None:
+        raise ValueError(f"{key!r} has no native or npm installer; show its install_hint instead")
+    return ["npm", "install", "-g", spec.package]
+
+
+def harness_install_display(key: str) -> str:
+    """Return the human-readable install command for *key* (no ``bash -c`` wrapper).
+
+    The string shown in setup menus and "run it yourself" hints. Mirrors the
+    method :func:`install_harness_cli` actually runs: the ``native_install``
+    one-liner for Claude, or ``npm install -g <package>`` for an npm harness.
+
+    :param key: A harness family or :data:`PI_KEY`.
+    :returns: e.g. ``"curl -fsSL https://claude.ai/install.sh | bash"`` (Claude)
+        or ``"npm install -g @openai/codex"`` (Codex).
+    :raises KeyError: If *key* has no install spec.
+    :raises ValueError: If *key* has neither a ``native_install`` nor a ``package``.
+    """
+    spec = _HARNESS_INSTALL[key]
+    if spec.native_install is not None:
+        return spec.native_install
+    if spec.package is None:
+        raise ValueError(f"{key!r} has no native or npm installer; show its install_hint instead")
+    return f"npm install -g {spec.package}"
 
 
 def install_harness_cli(key: str) -> bool:
-    """Install the harness CLI via npm; return whether it landed on ``PATH``.
+    """Install the harness CLI; return whether it landed on ``PATH``.
 
-    Shells out to :func:`harness_install_command` and re-checks
-    :func:`harness_cli_installed`. Surfaces npm's own output (no capture) so a
-    failing install is visible. Requires ``npm`` on ``PATH``.
+    Runs the harness's official native installer when it has one (Claude →
+    Anthropic's ``curl … | bash`` installer, which writes to a user-writable
+    ``~/.local/bin`` and self-updates); every other harness installs via ``npm
+    install -g``. Shells out to :func:`harness_install_command` and re-checks
+    :func:`harness_cli_installed`. Surfaces the installer's own output (no
+    capture) so a failing install is visible.
 
     :param key: A harness family or :data:`PI_KEY`.
     :returns: ``True`` when the CLI is on ``PATH`` after the install attempt
-        (including the no-op case where npm reports success but the binary is
-        present), ``False`` if npm is missing or the install failed.
+        (including the no-op case where the installer reports success but the
+        binary is already present); ``False`` if the required tooling is missing
+        (``curl``/``bash`` for the native installer, ``npm`` otherwise), the CLI
+        has no auto-installer (cursor-agent), or the install failed.
     :raises KeyError: If *key* has no install spec.
     """
     spec = _HARNESS_INSTALL.get(key)
-    if spec is not None and spec.package is None:
-        # Non-npm CLI (e.g. cursor-agent): no auto-install; caller shows install_hint.
+    if spec is None:
         return False
-    if shutil.which("npm") is None:
+    if spec.native_install is not None:
+        # The installer is a `curl … | bash` pipeline, so it needs both tools.
+        if shutil.which("curl") is None or shutil.which("bash") is None:
+            return False
+    elif spec.package is not None:
+        if shutil.which("npm") is None:
+            return False
+    else:
+        # Non-npm, non-native CLI (e.g. cursor-agent): no auto-install; caller
+        # shows install_hint.
         return False
     cmd = harness_install_command(key)
     try:

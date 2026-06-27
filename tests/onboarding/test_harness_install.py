@@ -19,7 +19,7 @@ from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY,
         (hi.QWEN_KEY, "qwen", "@qwen-code/qwen-code"),
     ],
 )
-def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
+def test_install_spec_maps_binary_and_package(key: str, binary: str, package: str) -> None:
     """Each known harness maps to the ucode-matching binary + npm package.
 
     A drift in binary/package (e.g. a wrong npm name) would install the wrong
@@ -29,7 +29,48 @@ def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
     assert spec is not None
     assert spec.binary == binary
     assert spec.package == package
+
+
+@pytest.mark.parametrize(
+    "key,package",
+    [
+        (OPENAI_FAMILY, "@openai/codex"),
+        (hi.PI_KEY, "@earendil-works/pi-coding-agent"),
+        (hi.QWEN_KEY, "@qwen-code/qwen-code"),
+    ],
+)
+def test_npm_harness_install_command_and_display(key: str, package: str) -> None:
+    """The npm harnesses (Codex, Pi, Qwen) install via ``npm install -g``.
+
+    Both the exec argv and the human-readable display string name the npm global
+    install — a drift would shell the wrong command or mislabel the setup menu.
+    """
     assert hi.harness_install_command(key) == ["npm", "install", "-g", package]
+    assert hi.harness_install_display(key) == f"npm install -g {package}"
+
+
+def test_claude_install_uses_native_installer_not_npm_global() -> None:
+    """Claude installs via Anthropic's recommended native installer, not ``npm
+    install -g``.
+
+    Per maintainer guidance: Claude carries a ``native_install`` so setup runs
+    Anthropic's ``curl … | bash`` installer (writes to a user-writable
+    ~/.local/bin, self-updates) rather than ``npm install -g`` — keeping Omnigent
+    out of npm global-prefix / PATH edge cases. The exec argv wraps the pipeline
+    in ``bash -c``; the display string shows the bare one-liner. A regression to
+    ``npm install -g`` here is exactly what this change reverses.
+    """
+    spec = hi.harness_install_spec(ANTHROPIC_FAMILY)
+    assert spec is not None
+    assert spec.native_install == "curl -fsSL https://claude.ai/install.sh | bash"
+    assert hi.harness_install_command(ANTHROPIC_FAMILY) == [
+        "bash",
+        "-c",
+        "curl -fsSL https://claude.ai/install.sh | bash",
+    ]
+    display = hi.harness_install_display(ANTHROPIC_FAMILY)
+    assert display == "curl -fsSL https://claude.ai/install.sh | bash"
+    assert "npm install -g" not in display
 
 
 def test_kimi_install_spec_is_login_only_no_npm() -> None:
@@ -306,12 +347,63 @@ def test_cli_installed_reflects_which(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_install_harness_cli_requires_npm(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No npm on PATH → install short-circuits to False without shelling out."""
+    """An npm harness with no npm on PATH → False without shelling out."""
     monkeypatch.setattr(hi.shutil, "which", lambda name: None)
 
     def _explode(*a: object, **k: object) -> None:
         raise AssertionError("subprocess.run reached despite missing npm")
 
+    monkeypatch.setattr(hi.subprocess, "run", _explode)
+    assert hi.install_harness_cli(OPENAI_FAMILY) is False
+
+
+def test_install_harness_cli_runs_native_installer_for_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude installs via Anthropic's native ``curl … | bash`` installer (not npm)
+    and resolves once the binary appears.
+
+    End-to-end proof that the native installer actually drives the Claude
+    install, wrapped in ``bash -c`` for the subprocess.
+    """
+    calls: list[list[str]] = []
+    state = {"installed": False}
+
+    def _which(name: str) -> str | None:
+        if name in ("curl", "bash"):
+            return f"/usr/bin/{name}"
+        if name == "claude":
+            return "/home/u/.local/bin/claude" if state["installed"] else None
+        return None
+
+    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
+        calls.append(argv)
+        state["installed"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+
+    assert hi.install_harness_cli(ANTHROPIC_FAMILY) is True
+    assert calls == [["bash", "-c", "curl -fsSL https://claude.ai/install.sh | bash"]]
+
+
+@pytest.mark.parametrize("missing", ["curl", "bash"])
+def test_install_harness_cli_native_requires_curl_and_bash(
+    monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    """The native installer needs both curl and bash; either missing → False
+    without spawning (and never falls back to ``npm install -g`` for Claude)."""
+
+    def _which(name: str) -> str | None:
+        if name == missing:
+            return None
+        return f"/usr/bin/{name}"
+
+    def _explode(*a: object, **k: object) -> None:
+        raise AssertionError("installer spawned despite missing curl/bash")
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
     monkeypatch.setattr(hi.subprocess, "run", _explode)
     assert hi.install_harness_cli(ANTHROPIC_FAMILY) is False
 

@@ -9239,8 +9239,8 @@ def _prompt_install_harness(family: str) -> bool:
     """Offer to install an uninstalled harness CLI; return whether to proceed.
 
     Shown when the user drills into a harness whose CLI isn't on PATH. Offers
-    three choices: install it now (``npm install -g …``), go back, or print the
-    command to run manually.
+    three choices: install it now (Claude's native installer, or ``npm install
+    -g …`` for the npm harnesses), go back, or print the command to run manually.
 
     :param family: The harness surface being configured (``"anthropic"`` /
         ``"openai"`` / ``"pi"``).
@@ -9252,13 +9252,13 @@ def _prompt_install_harness(family: str) -> bool:
     """
     from omnigent.onboarding.configure_models import family_label
     from omnigent.onboarding.harness_install import (
-        harness_install_command,
+        harness_install_display,
         install_harness_cli,
     )
     from omnigent.onboarding.interactive import console, select
 
     label = family_label(family)
-    cmd = " ".join(harness_install_command(family))
+    cmd = harness_install_display(family)
     choice = select(
         f"{label}'s CLI isn't installed. Install it now?",
         [
@@ -9267,7 +9267,7 @@ def _prompt_install_harness(family: str) -> bool:
             "I'll run it myself (show the command)",
         ],
         descriptions=[
-            f"Runs `{cmd}` (needs npm), then continues to credential setup.",
+            f"Runs `{cmd}`, then continues to credential setup.",
             "Return to the harness picker without installing.",
             "Print the command so you can install it yourself, then return.",
         ],
