@@ -280,6 +280,14 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``).
         # Safe to propagate: not a secret.
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX",
+        # Native-Claude launcher plugin selector (``module.path:callable``).
+        # Read by omnigent.claude_launcher.resolve_claude_launch in the
+        # managed-host runner (``_auto_create_claude_terminal``) to wrap the
+        # Claude launch through a downstream binary (e.g. Databricks' isaac).
+        # The daemon→runner env strip would otherwise drop it, leaving the
+        # runner on the default launch. Safe to propagate: not a secret, just a
+        # plugin reference string.
+        "OMNIGENT_CLAUDE_LAUNCHER",
         # Testing knob: override the context window size for compaction
         # trigger threshold. Not a secret — a plain integer.
         "AP_CONTEXT_WINDOW_OVERRIDE",

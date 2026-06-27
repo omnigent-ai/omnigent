@@ -5141,6 +5141,7 @@ async def _auto_create_claude_terminal(
     _runner_headers = databricks_auth_headers(server_url, _auth_token)
     _runner_auth = _RunnerDatabricksAuth(_auth_factory)
 
+    from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.claude_native import (
         ClaudeNativeUcodeConfig,
         augment_claude_args,
@@ -5438,6 +5439,11 @@ async def _auto_create_claude_terminal(
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
     )
 
+    # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
+    # command/args to wrap the same fully-augmented Claude launch on this
+    # managed-host path. Identity by default. See omnigent.claude_launcher.
+    launch_command, launch_args = resolve_claude_launch("claude", list(claude_args))
+
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_terminal falls back to
@@ -5449,8 +5455,8 @@ async def _auto_create_claude_terminal(
             cwd=workspace,
             sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
         ),
-        command="claude",
-        args=list(claude_args),
+        command=launch_command,
+        args=launch_args,
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
