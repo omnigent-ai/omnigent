@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { PlusIcon, TrashIcon } from "lucide-react";
 import {
   Dialog,
@@ -18,6 +19,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import { showToast } from "@/components/ui/toast";
+import {
+  MY_MCP_SERVERS_QUERY_KEY,
+  getMcpServerConfig,
+  listMyMcpServers,
+  type McpServerFullConfig,
+} from "@/lib/mcpApi";
 import type { AgentBundleInput, MCPServerInput } from "@/lib/agentBundle";
 
 /**
@@ -104,6 +112,25 @@ function toMCPInputs(entries: MCPFormEntry[]): MCPServerInput[] | undefined {
   return result.length > 0 ? result : undefined;
 }
 
+/** Convert a stored MCP server's full config to the bundle input shape. */
+function fullConfigToMCPInput(config: McpServerFullConfig): MCPServerInput {
+  if (config.transport === "stdio") {
+    return {
+      name: config.name,
+      transport: "stdio",
+      command: config.command ?? "",
+      args: config.args,
+      env: Object.keys(config.env).length > 0 ? config.env : undefined,
+    };
+  }
+  return {
+    name: config.name,
+    transport: "http",
+    url: config.url ?? "",
+    headers: Object.keys(config.headers).length > 0 ? config.headers : undefined,
+  };
+}
+
 /**
  * Dialog for creating a custom agent from the new-session picker.
  *
@@ -128,6 +155,15 @@ export function CreateAgentDialog({
   const [model, setModel] = useState("");
   const [mcpEntries, setMcpEntries] = useState<MCPFormEntry[]>([]);
   const [nextKey, setNextKey] = useState(0);
+  const [selectedMcpIds, setSelectedMcpIds] = useState<Set<string>>(new Set());
+  const [submitting, setSubmitting] = useState(false);
+
+  // The caller's preconfigured MCP servers, selectable instead of typed.
+  const mcpServersQuery = useQuery({
+    queryKey: MY_MCP_SERVERS_QUERY_KEY,
+    queryFn: listMyMcpServers,
+    enabled: open,
+  });
 
   function reset() {
     setName("");
@@ -137,6 +173,16 @@ export function CreateAgentDialog({
     setModel("");
     setMcpEntries([]);
     setNextKey(0);
+    setSelectedMcpIds(new Set());
+  }
+
+  function toggleSelectedMcp(id: string) {
+    setSelectedMcpIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   }
 
   function handleOpenChange(next: boolean) {
@@ -157,23 +203,46 @@ export function CreateAgentDialog({
     setMcpEntries((prev) => prev.map((e) => (e.key === key ? { ...e, ...patch } : e)));
   }
 
-  function handleSubmit() {
+  async function handleSubmit() {
     const trimmedName = name.trim();
     if (!trimmedName) return;
 
-    onCreate({
-      name: trimmedName,
-      description: description.trim() || undefined,
-      instructions: instructions.trim() || undefined,
-      harness,
-      model: model.trim(),
-      mcpServers: toMCPInputs(mcpEntries),
-    });
-    reset();
-    onOpenChange(false);
+    setSubmitting(true);
+    try {
+      // Resolve selected preconfigured servers (incl. secrets) and merge
+      // with the manually-entered rows. A manual entry with the same name
+      // wins, so the inline form can override a preconfigured server.
+      let preconfigured: MCPServerInput[] = [];
+      if (selectedMcpIds.size > 0) {
+        const configs = await Promise.all(
+          Array.from(selectedMcpIds).map(getMcpServerConfig),
+        );
+        preconfigured = configs.map(fullConfigToMCPInput);
+      }
+      const manual = toMCPInputs(mcpEntries) ?? [];
+      const manualNames = new Set(manual.map((m) => m.name));
+      const merged = [...preconfigured.filter((p) => !manualNames.has(p.name)), ...manual];
+
+      onCreate({
+        name: trimmedName,
+        description: description.trim() || undefined,
+        instructions: instructions.trim() || undefined,
+        harness,
+        model: model.trim(),
+        mcpServers: merged.length > 0 ? merged : undefined,
+      });
+      reset();
+      onOpenChange(false);
+    } catch (err) {
+      showToast(
+        `Could not load selected MCP servers: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setSubmitting(false);
+    }
   }
 
-  const canSubmit = name.trim().length > 0 && model.trim().length > 0;
+  const canSubmit = name.trim().length > 0 && model.trim().length > 0 && !submitting;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -275,6 +344,36 @@ export function CreateAgentDialog({
             />
           </div>
 
+          {/* Preconfigured MCP servers — select from the user's registered
+          servers instead of re-typing url/headers. */}
+          {(mcpServersQuery.data?.length ?? 0) > 0 && (
+            <div className="flex flex-col gap-1.5">
+              <span className="text-xs font-medium text-muted-foreground">
+                Preconfigured MCP servers
+              </span>
+              <div className="flex flex-col gap-1 rounded-md border border-border p-2">
+                {mcpServersQuery.data?.map((server) => (
+                  <label
+                    key={server.id}
+                    className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-sm hover:bg-muted"
+                    data-testid="create-agent-preconfigured-mcp"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedMcpIds.has(server.id)}
+                      onChange={() => toggleSelectedMcp(server.id)}
+                      className="size-3.5 accent-primary"
+                    />
+                    <span className="truncate">{server.name}</span>
+                    <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                      {server.transport}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* MCP Servers */}
           <div className="flex flex-col gap-2">
             <div className="flex items-center justify-between">
@@ -306,7 +405,11 @@ export function CreateAgentDialog({
           <Button variant="ghost" onClick={() => handleOpenChange(false)}>
             Cancel
           </Button>
-          <Button data-testid="create-agent-submit" onClick={handleSubmit} disabled={!canSubmit}>
+          <Button
+            data-testid="create-agent-submit"
+            onClick={() => void handleSubmit()}
+            disabled={!canSubmit}
+          >
             Create
           </Button>
         </DialogFooter>
