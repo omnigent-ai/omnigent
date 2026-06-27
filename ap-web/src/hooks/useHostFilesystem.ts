@@ -110,7 +110,10 @@ const MAX_PAGES = 50;
  *   when the page cap was hit with more entries still pending.
  * @throws FetchError carrying the HTTP status on a non-OK response.
  */
-async function fetchHostFilesystem(hostId: string, path: string): Promise<HostDirectoryListing> {
+export async function fetchHostFilesystem(
+  hostId: string,
+  path: string,
+): Promise<HostDirectoryListing> {
   const baseUrl = buildHostFilesystemUrl(hostId, path);
   const entries: HostFilesystemEntry[] = [];
   let after: string | null = null;
