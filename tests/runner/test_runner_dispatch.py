@@ -37,7 +37,7 @@ import logging
 import os
 import tempfile
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
@@ -171,6 +171,7 @@ async def _await_bg_turn_task(conv: str, *, timeout: float = 10.0) -> None:
 
 
 async def _drain_published_statuses(
+    queues: dict[str, Any],
     conv: str,
     *,
     until: str,
@@ -178,15 +179,16 @@ async def _drain_published_statuses(
 ) -> list[str]:
     """Collect ``session.status`` values a runner published for a session.
 
-    Reads the runner's module-level per-session event queue
-    (``omnigent.runner.app._session_event_queues_ref``) — the same queue
-    the SSE ``/stream`` endpoint drains — and returns the ordered list of
-    ``session.status`` values seen, stopping once *until* is published. This
-    polls the in-process queue rather than a concurrent SSE ``GET`` because
-    ``httpx.ASGITransport`` does not interleave a streaming response with a
-    concurrent ``POST`` on the same client, so a live SSE subscriber would
-    never observe the background turn's events.
+    Reads the runner's per-session event queue (``app.state.session_event_queues``)
+    — the same queue the SSE ``/stream`` endpoint drains — and returns the
+    ordered list of ``session.status`` values seen, stopping once *until* is
+    published. This polls the in-process queue rather than a concurrent SSE
+    ``GET`` because ``httpx.ASGITransport`` does not interleave a streaming
+    response with a concurrent ``POST`` on the same client, so a live SSE
+    subscriber would never observe the background turn's events.
 
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
     :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param until: Stop once this ``session.status`` value is observed,
         e.g. ``"failed"``.
@@ -195,12 +197,10 @@ async def _drain_published_statuses(
         assertion instead of spinning forever.
     :returns: Ordered ``session.status`` values published for *conv*.
     """
-    from omnigent.runner.app import _session_event_queues_ref
-
     statuses: list[str] = []
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        queue = _session_event_queues_ref.get(conv)
+        queue = queues.get(conv)
         drained = False
         while queue is not None and not queue.empty():
             event = queue.get_nowait()
@@ -218,6 +218,7 @@ async def _drain_published_statuses(
 
 
 async def _drain_failed_status_event(
+    queues: dict[str, Any],
     conv: str,
     *,
     timeout: float,
@@ -229,17 +230,17 @@ async def _drain_failed_status_event(
     ``error`` payload. Used to prove a SETUP-phase failure forwards its
     error message on the terminal ``failed`` event instead of dropping it.
 
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
     :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param timeout: Hard cap in seconds; returns ``None`` if no failed
         event arrives so a regression fails the assertion rather than
         hanging.
     :returns: The ``session.status: failed`` event dict, or ``None``.
     """
-    from omnigent.runner.app import _session_event_queues_ref
-
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        queue = _session_event_queues_ref.get(conv)
+        queue = queues.get(conv)
         drained = False
         while queue is not None and not queue.empty():
             event = queue.get_nowait()
@@ -1533,8 +1534,12 @@ async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
             },
         )
         assert response.status_code == 202
+        # Await the background turn task (main's helper) before draining, then
+        # read the runner's per-session queue via the ``app.state`` test seam.
         await _await_bg_turn_task(conv)
-        statuses = await _drain_published_statuses(conv, until="failed", timeout=2.0)
+        statuses = await _drain_published_statuses(
+            app.state.session_event_queues, conv, until="failed", timeout=2.0
+        )
 
     # The turn published "running" then "failed" — it reached a terminal
     # state and cleared. Without the fix, the setup-phase OmnigentError is
@@ -1619,8 +1624,12 @@ async def test_runner_failed_status_carries_setup_error_message(
             },
         )
         assert response.status_code == 202
+        # Await the background turn task (main's helper) before draining, then
+        # read the runner's per-session queue via the ``app.state`` test seam.
         await _await_bg_turn_task(conv)
-        failed_event = await _drain_failed_status_event(conv, timeout=2.0)
+        failed_event = await _drain_failed_status_event(
+            app.state.session_event_queues, conv, timeout=2.0
+        )
 
     # The failed event must carry the real setup error message — not a
     # bare status. Without the fix ``error`` is absent and the REPL
@@ -1639,6 +1648,7 @@ async def test_runner_failed_status_carries_setup_error_message(
 
 
 async def _drain_status_events(
+    queues: dict[str, Any],
     conv: str,
     *,
     until: str,
@@ -1650,6 +1660,8 @@ async def _drain_status_events(
     so one drain can assert both the status order and the carried ``error``
     payload — the queue is consumed by reading, so a test cannot drain twice.
 
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
     :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param until: Stop once this ``session.status`` value is observed,
         e.g. ``"failed"``.
@@ -1658,12 +1670,10 @@ async def _drain_status_events(
         assertion instead of spinning forever.
     :returns: Ordered ``session.status`` event dicts published for *conv*.
     """
-    from omnigent.runner.app import _session_event_queues_ref
-
     events: list[dict[str, Any]] = []
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        queue = _session_event_queues_ref.get(conv)
+        queue = queues.get(conv)
         drained = False
         while queue is not None and not queue.empty():
             event = queue.get_nowait()
@@ -1800,11 +1810,13 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
             },
         )
         assert response.status_code == 202
-        # Await the background turn task directly so we know it has completed
-        # (and published its terminal status) before draining — the same race
-        # guard the sibling failed-status tests use.
+        # Await the background turn task (main's helper) before draining — the
+        # same race guard the sibling failed-status tests use — then read the
+        # runner's per-session queue via the ``app.state`` test seam.
         await _await_bg_turn_task(conv)
-        events = await _drain_status_events(conv, until=until, timeout=2.0)
+        events = await _drain_status_events(
+            app.state.session_event_queues, conv, until=until, timeout=2.0
+        )
 
     statuses = [event.get("status") for event in events]
     # The turn must reach the parametrized terminal state. Without the fix,
@@ -7036,3 +7048,183 @@ async def test_approval_event_without_content_flattened() -> None:
     assert resp.status_code == 204
     assert captured["body"] == {"type": "approval", "elicitation_id": "e2", "action": "decline"}
     ApprovalEvent.model_validate(captured["body"])
+
+
+# ── #1026: cross-process lifecycle desync recovery ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_setup_cancel_does_not_leave_active_turn() -> None:
+    """P0.5: a cancel during SETUP must not leave ``_active_turns`` stale.
+
+    A ``CancelledError`` raised before the streaming phase escapes
+    ``_run_turn_bg``'s ``except Exception``; without the dedicated
+    ``except asyncio.CancelledError`` clause nothing pops ``_active_turns``
+    and every later message buffers forever (the permanent-wedge mode).
+    """
+    conv = "conv_setup_cancel"
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        started.set()
+        # Park the turn in the SETUP phase (before the streaming phase).
+        await release.wait()
+        return AgentSpec(
+            spec_version=1,
+            name="claude-sdk-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 202
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+
+        active = app.state.active_turns
+        task = active.get(conv)
+        assert isinstance(task, asyncio.Task)
+
+        # Cancel during SETUP.
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+        # The slot was cleared via the P0.5 terminal-cleanup path, not stale.
+        assert conv not in active
+
+
+@pytest.mark.asyncio
+async def test_desync_emits_user_visible_error() -> None:
+    """P2.11: a recovered desync surfaces a distinct, non-retryable error code.
+
+    With no buffered continuation, ``_resync_turn_state`` publishes a
+    ``session.status: failed`` carrying ``runner_turn_context_desync`` — a
+    code intentionally absent from AP's retryable allowlist so the L2
+    classifier treats it as terminal instead of retry-looping.
+    """
+    conv = "conv_desync_visible"
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app):
+        # Drive the recovery entry directly (no live turn, no buffer).
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+        failed_event = await _drain_failed_status_event(
+            app.state.session_event_queues, conv, timeout=5.0
+        )
+
+    assert conv in app.state.desynced_sessions
+    assert failed_event is not None
+    error = failed_event.get("error")
+    assert isinstance(error, dict)
+    assert error["code"] == "runner_turn_context_desync"
+    assert error["message"]
+
+
+class _SetupBoom(BaseException):
+    """A non-``Exception`` ``BaseException`` to exercise the P0.5 finally floor."""
+
+
+@pytest.mark.asyncio
+async def test_setup_base_exception_does_not_leave_active_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0.5: a BaseException during SETUP must not leave ``_active_turns`` stale.
+
+    A non-``Exception`` ``BaseException`` raised in the BACKGROUND setup phase
+    (here the spawn-env build, the same background-only step the
+    spawn-env-failure test drives) escapes ``_run_turn_bg``'s
+    ``except Exception``. The real ``finally`` floor must still pop the slot —
+    otherwise every later message buffers forever (the permanent-wedge mode).
+    """
+    conv = "conv_setup_base_exc"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="claude-sdk-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    def _raising_build(spec: object, *, workdir: object = None) -> dict[str, str]:
+        del spec, workdir
+        # A BaseException that is NOT an Exception subclass, raised inside the
+        # background setup phase (after the 202).
+        raise _SetupBoom("spawn-env aborted")
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._build_claude_sdk_spawn_env",
+        _raising_build,
+    )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 202
+
+        active = app.state.active_turns
+        # Wait for the background turn task to bind, then finish unwinding
+        # through the finally floor (the BaseException propagates out).
+        deadline = asyncio.get_running_loop().time() + 5.0
+        task: asyncio.Task[None] | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            candidate = active.get(conv)
+            if isinstance(candidate, asyncio.Task):
+                task = candidate
+                if task.done():
+                    break
+            elif task is not None:
+                # Slot already cleared by the finally floor.
+                break
+            await asyncio.sleep(0.02)
+
+        # The finally floor popped the slot despite the BaseException — never
+        # left stale (the permanent-wedge failure mode).
+        assert conv not in active
+        # The BaseException propagated out of the task (finally did not swallow).
+        assert task is not None
+        assert task.done() and not task.cancelled()
+        assert isinstance(task.exception(), _SetupBoom)

@@ -621,8 +621,6 @@ async def test_reset_state_closes_terminals_and_publishes_deleted(tmp_path: Path
     dead terminal, and attaching to it failed with "terminal resource
     not found or not running".
     """
-    from omnigent.runner.app import _session_event_queues_ref
-
     conv_id = "conv_switch_term_teardown"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -662,7 +660,7 @@ async def test_reset_state_closes_terminals_and_publishes_deleted(tmp_path: Path
         assert reset.status_code == 200, reset.text
         assert reset.json()["reset"] is True
 
-        queue = _session_event_queues_ref.get(conv_id)
+        queue = app.state.session_event_queues.get(conv_id)
         queued_events: list[dict[str, Any]] = []
         while queue is not None and not queue.empty():
             item = queue.get_nowait()

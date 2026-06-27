@@ -3760,13 +3760,12 @@ async def test_create_session_preserves_existing_event_queue() -> None:
     "working". Init must PRESERVE an existing queue — assert the
     pre-attached queue object survives init unchanged.
     """
-    from omnigent.runner.app import _session_event_queues_ref
 
     app, _pm, _hc = _build_lifecycle_app()
     # Simulate the relay's GET /stream having already attached (lazily
     # created the queue) before init runs.
     sentinel: asyncio.Queue[Any] = asyncio.Queue()
-    _session_event_queues_ref["conv_pre"] = sentinel
+    app.state.session_event_queues["conv_pre"] = sentinel
     try:
         async with _runner_client(app) as client:
             resp = await client.post(
@@ -3776,9 +3775,9 @@ async def test_create_session_preserves_existing_event_queue() -> None:
         assert resp.status_code == 201
         # Same object → a relay already blocked on it keeps receiving
         # events that ``_publish_event`` enqueues after init.
-        assert _session_event_queues_ref.get("conv_pre") is sentinel
+        assert app.state.session_event_queues.get("conv_pre") is sentinel
     finally:
-        _session_event_queues_ref.pop("conv_pre", None)
+        app.state.session_event_queues.pop("conv_pre", None)
 
 
 @pytest.mark.asyncio
@@ -6641,8 +6640,8 @@ async def test_external_session_status_running_fans_out_child_busy_to_parent() -
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
-    runner_app._session_event_queues_ref.pop(parent_id, None)
-    runner_app._session_event_queues_ref.pop(child_id, None)
+    app.state.session_event_queues.pop(parent_id, None)
+    app.state.session_event_queues.pop(child_id, None)
     runner_app.register_child_session(
         child_id,
         parent_session_id=parent_id,
@@ -6671,12 +6670,12 @@ async def test_external_session_status_running_fans_out_child_busy_to_parent() -
         assert entry is not None
         assert entry.status == "running"
 
-        events = _drain_session_event_queue(runner_app._session_event_queues_ref.get(parent_id))
+        events = _drain_session_event_queue(app.state.session_event_queues.get(parent_id))
     finally:
         runner_app.unregister_subagent_work(child_id)
         runner_app.unregister_child_session(child_id)
-        runner_app._session_event_queues_ref.pop(parent_id, None)
-        runner_app._session_event_queues_ref.pop(child_id, None)
+        app.state.session_event_queues.pop(parent_id, None)
+        app.state.session_event_queues.pop(child_id, None)
 
     assert events == [
         {
@@ -6717,8 +6716,8 @@ async def test_external_status_sequence_coalesces_duplicates_but_emits_task_stat
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
-    runner_app._session_event_queues_ref.pop(parent_id, None)
-    runner_app._session_event_queues_ref.pop(child_id, None)
+    app.state.session_event_queues.pop(parent_id, None)
+    app.state.session_event_queues.pop(child_id, None)
     runner_app.register_child_session(
         child_id,
         parent_session_id=parent_id,
@@ -6744,11 +6743,11 @@ async def test_external_status_sequence_coalesces_duplicates_but_emits_task_stat
                 )
                 assert resp.status_code == 204, resp.text
 
-        events = _drain_session_event_queue(runner_app._session_event_queues_ref.get(parent_id))
+        events = _drain_session_event_queue(app.state.session_event_queues.get(parent_id))
     finally:
         runner_app.unregister_child_session(child_id)
-        runner_app._session_event_queues_ref.pop(parent_id, None)
-        runner_app._session_event_queues_ref.pop(child_id, None)
+        app.state.session_event_queues.pop(parent_id, None)
+        app.state.session_event_queues.pop(child_id, None)
 
     assert events == [
         {
@@ -6816,8 +6815,8 @@ async def test_external_status_idle_fans_out_forwarded_output_preview_to_parent(
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
-    runner_app._session_event_queues_ref.pop(parent_id, None)
-    runner_app._session_event_queues_ref.pop(child_id, None)
+    app.state.session_event_queues.pop(parent_id, None)
+    app.state.session_event_queues.pop(child_id, None)
     runner_app._session_histories_ref[child_id] = [
         {
             "type": "message",
@@ -6844,11 +6843,11 @@ async def test_external_status_idle_fans_out_forwarded_output_preview_to_parent(
             )
         assert resp.status_code == 204, resp.text
 
-        events = _drain_session_event_queue(runner_app._session_event_queues_ref.get(parent_id))
+        events = _drain_session_event_queue(app.state.session_event_queues.get(parent_id))
     finally:
         runner_app.unregister_child_session(child_id)
-        runner_app._session_event_queues_ref.pop(parent_id, None)
-        runner_app._session_event_queues_ref.pop(child_id, None)
+        app.state.session_event_queues.pop(parent_id, None)
+        app.state.session_event_queues.pop(child_id, None)
         runner_app._session_histories_ref.pop(child_id, None)
 
     assert events == [
@@ -6892,8 +6891,8 @@ async def test_external_status_idle_without_output_omits_stale_history_preview()
         server_client=server_client,  # type: ignore[arg-type]
     )
 
-    runner_app._session_event_queues_ref.pop(parent_id, None)
-    runner_app._session_event_queues_ref.pop(child_id, None)
+    app.state.session_event_queues.pop(parent_id, None)
+    app.state.session_event_queues.pop(child_id, None)
     runner_app._session_inboxes_ref[parent_id] = session_inbox
     runner_app._session_histories_ref[child_id] = [
         {
@@ -6925,12 +6924,12 @@ async def test_external_status_idle_without_output_omits_stale_history_preview()
         assert resp.status_code == 204, resp.text
         await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
 
-        events = _drain_session_event_queue(runner_app._session_event_queues_ref.get(parent_id))
+        events = _drain_session_event_queue(app.state.session_event_queues.get(parent_id))
     finally:
         runner_app.unregister_child_session(child_id)
         runner_app.unregister_subagent_work(child_id)
-        runner_app._session_event_queues_ref.pop(parent_id, None)
-        runner_app._session_event_queues_ref.pop(child_id, None)
+        app.state.session_event_queues.pop(parent_id, None)
+        app.state.session_event_queues.pop(child_id, None)
         runner_app._session_inboxes_ref.pop(parent_id, None)
         runner_app._session_histories_ref.pop(child_id, None)
 
@@ -8147,7 +8146,7 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
     user bubble is back; if a synthesized idle reappears in 3, the
     watcher desync bug is back.
     """
-    from omnigent.runner.app import _session_event_queues_ref, _session_histories_ref
+    from omnigent.runner.app import _session_histories_ref
     from omnigent.spec.types import ExecutorSpec
 
     captured_inject: list[Any] = []
@@ -8205,10 +8204,10 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
         # ``_session_event_queues``, so reading after delete would
         # always see empty.
         captured_history = list(_session_histories_ref.get("conv_native_int", []))
-        queue = _session_event_queues_ref.get("conv_native_int")
+        queue = app.state.session_event_queues.get("conv_native_int")
         assert queue is not None, (
             "Session creation should have initialized the event queue "
-            "for ``conv_native_int``; ``_session_event_queues_ref`` is "
+            "for ``conv_native_int``; ``app.state.session_event_queues`` is "
             "missing the entry, so we couldn't drain it to verify the "
             "interrupt handler did not enqueue a synthesized idle."
         )
@@ -8323,7 +8322,6 @@ async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harn
         on the session stream, e.g. ``["running", "idle"]``.
     :returns: None.
     """
-    from omnigent.runner.app import _session_event_queues_ref
 
     session_id = f"conv_ts_{harness.replace('-', '_')}"
     spec = AgentSpec(
@@ -8356,7 +8354,7 @@ async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harn
         # that setup path can enqueue ``session.status: failed`` before the
         # message turn under test. Drain creation-time events so the assertion
         # below isolates only the runner turn lifecycle around POST /events.
-        queue = _session_event_queues_ref.get(session_id)
+        queue = app.state.session_event_queues.get(session_id)
         assert queue is not None, (
             f"session creation must initialize the per-session event queue "
             f"for {session_id!r}; missing means the turn-status publish had "
@@ -8429,7 +8427,7 @@ async def test_events_interrupt_on_native_session_503_skips_cleanup_when_inject_
     refactor the responsibility lives on the runner, so the
     invariant is pinned here.
     """
-    from omnigent.runner.app import _session_event_queues_ref, _session_histories_ref
+    from omnigent.runner.app import _session_histories_ref
     from omnigent.spec.types import ExecutorSpec
 
     def _fake_inject(bridge_dir: Any, *, timeout_s: float) -> None:
@@ -8470,7 +8468,7 @@ async def test_events_interrupt_on_native_session_503_skips_cleanup_when_inject_
         )
 
         captured_history = list(_session_histories_ref.get("conv_native_int_fail", []))
-        queue = _session_event_queues_ref.get("conv_native_int_fail")
+        queue = app.state.session_event_queues.get("conv_native_int_fail")
         assert queue is not None, (
             "Session creation should have initialized the event queue; "
             "the failure path still needs the queue to exist so we can "
@@ -9484,7 +9482,7 @@ async def test_events_stop_session_on_native_kills_tmux_and_publishes_idle(
        being torn down, not interrupted mid-turn. A stray marker would
        be the interrupt handler leaking into the stop path.
     """
-    from omnigent.runner.app import _session_event_queues_ref, _session_histories_ref
+    from omnigent.runner.app import _session_histories_ref
     from omnigent.spec.types import ExecutorSpec
 
     captured_kill: list[Any] = []
@@ -9526,7 +9524,7 @@ async def test_events_stop_session_on_native_kills_tmux_and_publishes_idle(
         )
 
         captured_history = list(_session_histories_ref.get("conv_native_stop", []))
-        queue = _session_event_queues_ref.get("conv_native_stop")
+        queue = app.state.session_event_queues.get("conv_native_stop")
         assert queue is not None, (
             "Session creation should have initialized the event queue "
             "for ``conv_native_stop``; without it ``_publish_event`` had "
@@ -9748,7 +9746,6 @@ async def test_events_stop_session_on_native_returns_503_when_kill_fails(
     surface a 503 rather than lie to the web UI with a 204 + idle
     that says "stopped" while the session may still be alive.
     """
-    from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
 
     def _fake_kill(bridge_dir: Any, *, timeout_s: float) -> None:
@@ -9788,7 +9785,7 @@ async def test_events_stop_session_on_native_returns_503_when_kill_fails(
             json={"type": "stop_session"},
         )
 
-        queue = _session_event_queues_ref.get("conv_native_stop_fail")
+        queue = app.state.session_event_queues.get("conv_native_stop_fail")
         assert queue is not None
         queued_events: list[dict[str, Any]] = []
         while not queue.empty():
@@ -9894,7 +9891,6 @@ async def test_events_stop_session_closes_terminal_and_publishes_deleted(
     stop handler must therefore close each of the session's terminals and
     publish ``session.resource.deleted`` so connected clients drop them.
     """
-    from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
     from tests.runner.helpers import make_test_terminal_instance
 
@@ -9949,7 +9945,7 @@ async def test_events_stop_session_closes_terminal_and_publishes_deleted(
             json={"type": "stop_session"},
         )
 
-        queue = _session_event_queues_ref.get(conv_id)
+        queue = app.state.session_event_queues.get(conv_id)
         queued_events: list[dict[str, Any]] = []
         while queue is not None and not queue.empty():
             item = queue.get_nowait()
@@ -9993,7 +9989,6 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Pat
     :param tmp_path: Temporary directory for fake terminal paths.
     """
     from omnigent.runner import app as runner_app
-    from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
     parent_id = f"conv_parent_required_exit_{uuid.uuid4().hex[:12]}"
@@ -10047,7 +10042,7 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Pat
 
     async def _collect_exit_events() -> list[dict[str, Any]]:
         while True:
-            queue = _session_event_queues_ref.get(conv_id)
+            queue = app.state.session_event_queues.get(conv_id)
             if queue is not None and queue.qsize() >= 2:
                 events: list[dict[str, Any]] = []
                 while not queue.empty():
@@ -10072,10 +10067,10 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Pat
             if pm.released:
                 break
             await asyncio.sleep(0)
-        parent_events = _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
+        parent_events = _drain_session_event_queue(app.state.session_event_queues.get(parent_id))
     finally:
-        _session_event_queues_ref.pop(conv_id, None)
-        _session_event_queues_ref.pop(parent_id, None)
+        app.state.session_event_queues.pop(conv_id, None)
+        app.state.session_event_queues.pop(parent_id, None)
         runner_app.unregister_subagent_work(conv_id)
         runner_app.unregister_child_session(conv_id)
         runner_app._session_inboxes_ref.pop(parent_id, None)
@@ -10136,7 +10131,6 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
     :param tmp_path: Temporary directory for fake terminal paths.
     """
     from omnigent.runner import app as runner_app
-    from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
     parent_id = f"conv_parent_idle_exit_{uuid.uuid4().hex[:12]}"
@@ -10214,17 +10208,17 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
         parent_events: list[dict[str, Any]] = []
         for _ in range(1000):
             queued_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+                _drain_session_event_queue(app.state.session_event_queues.get(conv_id))
             )
             parent_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
+                _drain_session_event_queue(app.state.session_event_queues.get(parent_id))
             )
             if pm.released and deleted_event in queued_events:
                 break
             await asyncio.sleep(0)
     finally:
-        _session_event_queues_ref.pop(conv_id, None)
-        _session_event_queues_ref.pop(parent_id, None)
+        app.state.session_event_queues.pop(conv_id, None)
+        app.state.session_event_queues.pop(parent_id, None)
         runner_app.unregister_subagent_work(conv_id)
         runner_app.unregister_child_session(conv_id)
         runner_app._session_inboxes_ref.pop(parent_id, None)
@@ -10263,7 +10257,6 @@ async def test_required_terminal_clean_quit_publishes_idle_not_failed(
     :param terminal_name: The native terminal that the user quit cleanly.
     """
     from omnigent.runner import app as runner_app
-    from omnigent.runner.app import _session_event_queues_ref
     from omnigent.runner.resource_registry import (
         TerminalExitEvent,
         TerminalLifecycle,
@@ -10298,13 +10291,13 @@ async def test_required_terminal_clean_quit_publishes_idle_not_failed(
         queued_events: list[dict[str, Any]] = []
         for _ in range(1000):
             queued_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+                _drain_session_event_queue(app.state.session_event_queues.get(conv_id))
             )
             if pm.released:
                 break
             await asyncio.sleep(0)
     finally:
-        _session_event_queues_ref.pop(conv_id, None)
+        app.state.session_event_queues.pop(conv_id, None)
         runner_app.unregister_child_session(conv_id)
 
     # The terminal resource is removed and a final idle clears the spinner...
@@ -10338,7 +10331,6 @@ async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path:
 
     :param tmp_path: Temporary directory for fake terminal paths.
     """
-    from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
     conv_id = f"conv_kiro_external_idle_exit_{uuid.uuid4().hex[:12]}"
@@ -10397,13 +10389,13 @@ async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path:
         queued_events: list[dict[str, Any]] = []
         for _ in range(1000):
             queued_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+                _drain_session_event_queue(app.state.session_event_queues.get(conv_id))
             )
             if pm.released and deleted_event in queued_events:
                 break
             await asyncio.sleep(0)
     finally:
-        _session_event_queues_ref.pop(conv_id, None)
+        app.state.session_event_queues.pop(conv_id, None)
 
     assert terminal_registry.get(conv_id, "kiro", "main") is None
     assert deleted_event in queued_events
@@ -10434,7 +10426,6 @@ async def test_events_effort_change_on_native_session_types_slash_command(
     would fall through to the generic harness-forward and 404, leaving
     the dropdown click silently ineffective.
     """
-    from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
 
     captured: list[Any] = []
@@ -10479,7 +10470,7 @@ async def test_events_effort_change_on_native_session_types_slash_command(
         # Drain creation-time events (the claude-native auto-create path
         # enqueues session.terminal_pending) so the post-effort_change
         # drain below isolates only what the control event emits.
-        _drain_session_event_queue(_session_event_queues_ref.get("conv_native_effort"))
+        _drain_session_event_queue(app.state.session_event_queues.get("conv_native_effort"))
 
         resp = await client.post(
             "/v1/sessions/conv_native_effort/events",
@@ -10489,7 +10480,7 @@ async def test_events_effort_change_on_native_session_types_slash_command(
         # Drain the event queue before delete clears it, so we can
         # assert that effort_change does NOT enqueue spurious events
         # (it's a control signal, not a session-state change).
-        queue = _session_event_queues_ref.get("conv_native_effort")
+        queue = app.state.session_event_queues.get("conv_native_effort")
         queued_events: list[dict[str, Any]] = []
         if queue is not None:
             while not queue.empty():
@@ -10779,7 +10770,6 @@ async def test_events_compact_on_native_session_types_slash_command(
     the Omnigent server fall through to ``_run_compact_locked``, which 400s
     on the LLM-less claude-native pseudo-agent — the original bug.
     """
-    from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
 
     captured: list[Any] = []
@@ -10823,7 +10813,7 @@ async def test_events_compact_on_native_session_types_slash_command(
         # Drain creation-time events (claude-native auto-create enqueues
         # session.terminal_pending) so the drain below isolates only
         # what /compact emits.
-        _drain_session_event_queue(_session_event_queues_ref.get("conv_native_compact"))
+        _drain_session_event_queue(app.state.session_event_queues.get("conv_native_compact"))
 
         resp = await client.post(
             "/v1/sessions/conv_native_compact/events",
@@ -10832,7 +10822,7 @@ async def test_events_compact_on_native_session_types_slash_command(
 
         # Drain the event queue: /compact is a control signal and must
         # not enqueue session.status events.
-        queue = _session_event_queues_ref.get("conv_native_compact")
+        queue = app.state.session_event_queues.get("conv_native_compact")
         queued_events: list[dict[str, Any]] = []
         if queue is not None:
             while not queue.empty():
@@ -10954,7 +10944,6 @@ async def test_events_compact_on_codex_native_injects_slash_command(
     load-bearing: the Omnigent server reads it to skip its own
     AP-side compaction.
     """
-    from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
     captured: list[tuple[str, list[str]]] = []
@@ -10995,7 +10984,7 @@ async def test_events_compact_on_codex_native_injects_slash_command(
             json={"session_id": conv_id, "agent_id": "ag_1"},
         )
         assert create_resp.status_code == 201, create_resp.text
-        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+        _drain_session_event_queue(app.state.session_event_queues.get(conv_id))
 
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
@@ -11004,7 +10993,7 @@ async def test_events_compact_on_codex_native_injects_slash_command(
 
         # Drain the event queue: /compact is a control signal and must
         # not enqueue session.status events.
-        queue = _session_event_queues_ref.get(conv_id)
+        queue = app.state.session_event_queues.get(conv_id)
         queued_events: list[dict[str, Any]] = []
         if queue is not None:
             while not queue.empty():
@@ -11190,7 +11179,6 @@ async def test_events_compact_on_cursor_native_pastes_summarize_and_raises_spinn
        the cursor forwarder when it observes the summary blob (covered by
        ``tests/test_cursor_native_forwarder.py``).
     """
-    from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
 
     monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
@@ -11230,14 +11218,14 @@ async def test_events_compact_on_cursor_native_pastes_summarize_and_raises_spinn
         assert create_resp.status_code == 201, create_resp.text
         # Drain creation-time events so the drain below isolates only what
         # /compact emits.
-        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+        _drain_session_event_queue(app.state.session_event_queues.get(conv_id))
 
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={"type": "compact"},
         )
 
-        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+        queued_events = _drain_session_event_queue(app.state.session_event_queues.get(conv_id))
 
     # 200 = cursor-native dispatch routed to the compact handler and the paste
     # succeeded. 204 would mean the dispatch fell through to the in-process
@@ -11310,7 +11298,6 @@ async def test_events_compact_on_cursor_native_503_dismisses_spinner_on_inject_f
     both the tmux ``RuntimeError`` and the tempfile ``OSError`` surfaces; the
     latter is unique to cursor's bracketed-paste path.
     """
-    from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
 
     monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
@@ -11347,14 +11334,14 @@ async def test_events_compact_on_cursor_native_503_dismisses_spinner_on_inject_f
             json={"session_id": conv_id, "agent_id": "ag_1"},
         )
         assert create_resp.status_code == 201, create_resp.text
-        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+        _drain_session_event_queue(app.state.session_event_queues.get(conv_id))
 
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={"type": "compact"},
         )
 
-        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+        queued_events = _drain_session_event_queue(app.state.session_event_queues.get(conv_id))
 
     assert resp.status_code == 503, (
         f"Cursor-native compact with no live pane must return 503; "
@@ -11896,7 +11883,6 @@ async def test_events_model_change_on_native_session_types_slash_command(
     runner dispatch routes model_change to the native handler and
     assembles the right slash command.
     """
-    from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
 
     captured: list[Any] = []
@@ -11940,7 +11926,7 @@ async def test_events_model_change_on_native_session_types_slash_command(
         # Drain creation-time events (claude-native auto-create enqueues
         # session.terminal_pending) so the drain below isolates only
         # what model_change emits.
-        _drain_session_event_queue(_session_event_queues_ref.get("conv_native_model"))
+        _drain_session_event_queue(app.state.session_event_queues.get("conv_native_model"))
 
         resp = await client.post(
             "/v1/sessions/conv_native_model/events",
@@ -11950,7 +11936,7 @@ async def test_events_model_change_on_native_session_types_slash_command(
         # Drain the event queue before delete clears it. model_change
         # is a control signal, not a state change — no events should
         # land on the SSE queue.
-        queue = _session_event_queues_ref.get("conv_native_model")
+        queue = app.state.session_event_queues.get("conv_native_model")
         queued_events: list[dict[str, Any]] = []
         if queue is not None:
             while not queue.empty():
@@ -13528,7 +13514,7 @@ def _drain_session_event_queue(queue: asyncio.Queue[Any] | None) -> list[dict[st
     a specific control signal produced.
 
     :param queue: The per-session event queue from
-        ``_session_event_queues_ref``, or ``None`` when the session has
+        ``app.state.session_event_queues``, or ``None`` when the session has
         no queue (already deleted / never created).
     :returns: The dict items drained, in FIFO order. Empty when the
         queue is ``None`` or held only non-dict sentinels.
@@ -16638,3 +16624,304 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         await _drain_forwarder_runs(runs)
+
+
+# ── #1026 P1.7: desync recovery (single ordered entry + desync flag) ─────────
+
+
+@pytest.mark.asyncio
+async def test_desynced_session_releases_and_recovers() -> None:
+    """A desync with a buffered message releases the wedged turn promptly.
+
+    Simulates a turn parked on the 24h policy-evaluation future (its verdict-
+    delivery channel died). ``_resync_turn_state`` must release it in
+    milliseconds — NOT wait ``_POLICY_EVAL_TIMEOUT_S`` — flag the conversation
+    desynced, and let the buffered continuation bind a fresh turn (which clears
+    the flag). With a continuation queued it stays silent: no user-visible
+    ``runner_turn_context_desync`` ``failed`` edge is published.
+    """
+    conv = "conv_desync_recover"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    forever = asyncio.Event()
+
+    async def _wedged_turn() -> None:
+        # Stand in for a turn parked on the 24h policy-evaluation future.
+        await forever.wait()
+
+    async with _runner_client(app) as http:
+        # Bind a live (wedged) turn into the single active-turn slot.
+        task = asyncio.create_task(_wedged_turn())
+        app.state.active_turns[conv] = task
+        try:
+            # A message arriving mid-turn buffers (single-active-turn gate).
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "follow up"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+            elapsed = loop.time() - t0
+
+            # Released in ms — nowhere near the 24h policy-eval timeout.
+            assert elapsed < 2.0, elapsed
+            # The wedged turn was cancelled, not left parked.
+            assert task.cancelled() or task.done()
+            # Flagged desynced; the buffered continuation has not bound yet.
+            assert conv in app.state.desynced_sessions
+
+            # The buffered continuation binds a fresh turn, which clears the
+            # desynced flag at turn start (recovery).
+            deadline = loop.time() + 3.0
+            while loop.time() < deadline and conv in app.state.desynced_sessions:
+                await asyncio.sleep(0.02)
+            assert conv not in app.state.desynced_sessions
+        finally:
+            forever.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    # Silent recovery: no user-visible desync `failed` edge was published while
+    # a continuation was queued (that surfaces only when nothing will continue).
+
+    queue = app.state.session_event_queues.get(conv)
+    desync_failed = []
+    while queue is not None and not queue.empty():
+        event = queue.get_nowait()
+        if (
+            isinstance(event, dict)
+            and event.get("type") == "session.status"
+            and event.get("status") == "failed"
+            and isinstance(event.get("error"), dict)
+            and event["error"].get("code") == "runner_turn_context_desync"
+        ):
+            desync_failed.append(event)
+    assert desync_failed == []
+
+
+@pytest.mark.asyncio
+async def test_desync_drains_buffer_when_turn_pops_active_slot() -> None:
+    """Review-1: a desync drains the buffer even when the cancelled turn self-pops.
+
+    A background turn cancelled while blocked in ``_drain_streaming_response``
+    pops ``_active_turns`` itself and re-raises WITHOUT routing through
+    ``_on_proxy_stream_end`` — so ``_cancel_active_turn``'s ``is turn_task``
+    guard fails and NO continuation drain is scheduled. ``_resync_turn_state``
+    must kick the drain explicitly, or the buffered message strands while the
+    session shows idle. This stub reproduces the self-pop and asserts recovery.
+    """
+    conv = "conv_desync_selfpop"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    forever = asyncio.Event()
+
+    async def _wedged_turn() -> None:
+        # Mimic _drain_streaming_response: on cancel, pop _active_turns and
+        # re-raise WITHOUT _on_proxy_stream_end (so no continuation is kicked).
+        try:
+            await forever.wait()
+        except asyncio.CancelledError:
+            app.state.active_turns.pop(conv, None)
+            raise
+
+    async with _runner_client(app) as http:
+        task = asyncio.create_task(_wedged_turn())
+        app.state.active_turns[conv] = task
+        try:
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "follow up"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+
+            loop = asyncio.get_running_loop()
+            await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+            assert task.cancelled() or task.done()
+
+            # The explicit continuation kick started a fresh turn, which clears
+            # the desynced flag at ``_run_turn_bg`` start. Without the kick this
+            # would never clear (the buffer would strand and the session idle).
+            deadline = loop.time() + 3.0
+            while loop.time() < deadline and conv in app.state.desynced_sessions:
+                await asyncio.sleep(0.02)
+            assert conv not in app.state.desynced_sessions
+        finally:
+            forever.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.asyncio
+async def test_desync_stream_mode_forwards_interrupt() -> None:
+    """Review-4: stream-mode (None-sentinel) desync clears the gate + forwards interrupt.
+
+    A ``stream=true`` turn parks ``_active_turns[conv] = None`` (no runner Task
+    — the AP request drives ``proxy_stream``). Recovery must GUARANTEE the
+    sentinel is cleared (so the active-turn gate cannot stay stuck) and forward
+    a best-effort interrupt so the harness unwinds.
+    """
+    conv = "conv_desync_streammode"
+    harness = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app):
+        # Stream-mode active turn: the None sentinel, not an asyncio.Task.
+        app.state.active_turns[conv] = None
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    # The sentinel was popped deterministically (gate cleared) and the interrupt
+    # was forwarded — neither happened before the fix.
+    assert conv not in app.state.active_turns
+    assert {"type": "interrupt"} in harness.patched_events
+
+
+class _DeadInterruptHarnessClient(_ScriptedHarnessClient):
+    """Scripted harness whose interrupt POST always raises (wedged/dead harness)."""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        # Model a dead/wedged harness: the interrupt forward never lands and
+        # never ends proxy_stream.
+        raise httpx.ConnectError("harness gone")
+
+
+@pytest.mark.asyncio
+async def test_desync_stream_mode_clears_gate_even_when_interrupt_fails() -> None:
+    """Review-4 (blocking): stream-mode sentinel clears + buffer drains on dead interrupt.
+
+    The pathological wedge: ``stream=true`` (None sentinel) + dead verdict
+    channel + a failing/no-op interrupt that never ends ``proxy_stream``.
+    Recovery must STILL pop the sentinel (gate cleared, not contingent on the
+    interrupt or proxy_stream) and drain a buffered follow-up — otherwise the
+    session is stuck idle in the active-turn gate forever (the #1026 wedge in
+    stream mode).
+    """
+    conv = "conv_desync_streammode_dead"
+    harness = _DeadInterruptHarnessClient([])
+    pm = _FakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as http:
+        # Stream-mode active turn parked as the None sentinel.
+        app.state.active_turns[conv] = None
+        # A follow-up arrives mid-turn and buffers behind the active-turn gate.
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag",
+                "model": "x",
+                "content": [{"role": "user", "content": "follow up"}],
+            },
+        )
+        assert resp.status_code == 202, resp.text
+
+        loop = asyncio.get_running_loop()
+        # Recovery runs even though the interrupt forward raises (dead harness).
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+        # The buffered follow-up drained: the sentinel was popped
+        # deterministically (gate cleared, NOT contingent on the failed
+        # interrupt or on proxy_stream ending) and the continuation kick bound a
+        # fresh turn, which clears the desynced flag at ``_run_turn_bg`` start.
+        # Without the deterministic pop, the gate stays stuck on the None
+        # sentinel, no continuation ever runs, and the flag never clears.
+        deadline = loop.time() + 3.0
+        while loop.time() < deadline and conv in app.state.desynced_sessions:
+            await asyncio.sleep(0.02)
+        assert conv not in app.state.desynced_sessions
+
+
+class _InterruptEndsStreamHarnessClient(_ScriptedHarnessClient):
+    """Interrupt POST succeeds AND drives proxy_stream's terminal bookkeeping.
+
+    Reproduces the race the publish-once guard must close: a SUCCESSFUL
+    interrupt ends ``proxy_stream``, so its ``_on_proxy_stream_end`` runs
+    DURING ``_resync_turn_state`` (mid-recovery), competing with the desync
+    ``failed`` publish.
+    """
+
+    app: Any = None
+    conv: str = ""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            # Successful interrupt → proxy_stream reaches its terminal
+            # bookkeeping right here, mid-resync.
+            self.app.state.on_proxy_stream_end(self.conv)
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_desync_stream_mode_publishes_single_terminal_status() -> None:
+    """Review (blocking race): stream-mode no-buffer desync publishes ONE terminal.
+
+    Stream-mode None sentinel + no buffer + interrupt SUCCEEDS, so
+    ``proxy_stream`` reaches ``_on_proxy_stream_end`` while ``_resync_turn_state``
+    also runs the no-buffer desync ``failed``. The publish-once token must
+    dedupe: the client sees exactly ONE terminal status — the desync ``failed``
+    — never an ``idle``+``failed`` pair (P2.11 made ``failed`` terminal /
+    non-retryable, so a competing ``idle`` is a correctness bug).
+    """
+    conv = "conv_desync_single_terminal"
+    harness = _InterruptEndsStreamHarnessClient([])
+    pm = _FakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _runner_client(app):
+        # Stream-mode sentinel, no buffered follow-up.
+        app.state.active_turns[conv] = None
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    # Collect every session.status edge published for the conv.
+
+    queue = app.state.session_event_queues.get(conv)
+    statuses: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if isinstance(ev, dict) and ev.get("type") == "session.status":
+            statuses.append(ev)
+
+    # Exactly ONE terminal status, and it is the desync failed — no idle.
+    assert len(statuses) == 1, statuses
+    assert statuses[0]["status"] == "failed"
+    assert statuses[0]["error"]["code"] == "runner_turn_context_desync"
+    # The interrupt was actually forwarded (so the race window was real).
+    assert {"type": "interrupt"} in harness.patched_events
