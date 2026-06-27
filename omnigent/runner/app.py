@@ -15894,6 +15894,67 @@ def create_runner_app(
                     return None
         return resolve_terminal_entry_by_resource_id(session_id, terminal_id, registry)
 
+    async def _recreate_qwen_terminal(
+        session_id: str, terminal_id: str
+    ) -> TerminalListEntry | None:
+        """Re-create a dead qwen-native terminal for attach.
+
+        The qwen terminal is the runner-owned TUI behind the web UI's
+        native chat view. Like the REPL pane, it can die underneath the
+        registry while the resource id still resolves to a stale entry.
+        Recreating the pane on attach keeps the qwen-native session
+        usable after a subprocess crash or a bad deferred start instead
+        of leaving the web view on a permanent 4404.
+
+        Serialized per session on ``_qwen_terminal_ensure_locks``
+        against the session-create bootstrap and concurrent attaches;
+        liveness is re-checked under the lock so a racer's fresh
+        terminal is reused rather than killed.
+
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param terminal_id: The qwen terminal's resource id
+            (``"terminal_qwen_main"``), passed through for the stale
+            close + final resolve.
+        :returns: The live ``TerminalListEntry``, or ``None`` when
+            recreation failed (the attach then closes 4404 as before).
+        """
+        if resource_registry is None or resource_registry.terminal_registry is None:
+            return None
+        registry = resource_registry.terminal_registry
+        lock = _qwen_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            existing = registry.get(session_id, "qwen", "main")
+            if existing is None or not existing.running or not await existing.is_alive():
+                # Low-level registry close, not ``close_terminal``: the
+                # resource-level scan skips entries whose ``running`` flag
+                # is already False (the liveness probe above flips it),
+                # which would leave the dead instance's activity watcher
+                # and scratch dir behind. ``TerminalRegistry.close``
+                # pops the entry unconditionally and tears the instance
+                # down.
+                await registry.close(session_id, "qwen", "main")
+                try:
+                    await _auto_create_qwen_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        server_client=server_client,
+                        ensure_comment_relay=_ensure_comment_relay_started,
+                    )
+                except Exception:
+                    # Broad catch, same rationale as the session-create
+                    # bootstrap: a failed relaunch (tmux spawn error,
+                    # label PATCH failure) must degrade to the
+                    # pre-existing 4404 close on this attach - never
+                    # crash the WS route.
+                    _logger.exception(
+                        "Failed to recreate omnigent qwen terminal for %s",
+                        session_id,
+                    )
+                    return None
+        return resolve_terminal_entry_by_resource_id(session_id, terminal_id, registry)
+
     @app.websocket("/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach")
     async def terminal_resource_attach_ws(
         websocket: WebSocket,
@@ -15909,12 +15970,14 @@ def create_runner_app(
         and bridges the tmux PTY.
 
         The embedded Omnigent REPL terminal (role
-        :data:`OMNIGENT_REPL_TERMINAL_ROLE`) gets recreate-on-attach
+        :data:`OMNIGENT_REPL_TERMINAL_ROLE`) and qwen-native terminal
+        (role :data:`QWEN_NATIVE_TERMINAL_ROLE`) get recreate-on-attach
         semantics: a dead pane is torn down and relaunched instead of
         rejected, so the web Terminal view always opens onto a live
-        REPL (see :func:`_recreate_repl_terminal`). Other terminals
-        keep the strict 4404 contract — a dead agent-created terminal
-        is meaningful state, not plumbing to resurrect.
+        shell (see :func:`_recreate_repl_terminal` and
+        :func:`_recreate_qwen_terminal`). Other terminals keep the
+        strict 4404 contract - a dead agent-created terminal is
+        meaningful state, not plumbing to resurrect.
 
         :param websocket: Accepted FastAPI WebSocket.
         :param session_id: Session/conversation identifier.
@@ -15928,13 +15991,16 @@ def create_runner_app(
             terminal_id,
             terminal_registry,
         )
+        terminal_role = (
+            resource_registry.terminal_resource_role(session_id, terminal_id)
+            if resource_registry is not None
+            else None
+        )
         if entry is None or not entry.instance.running or not await entry.instance.is_alive():
-            if (
-                resource_registry is not None
-                and resource_registry.terminal_resource_role(session_id, terminal_id)
-                == OMNIGENT_REPL_TERMINAL_ROLE
-            ):
+            if terminal_role == OMNIGENT_REPL_TERMINAL_ROLE:
                 entry = await _recreate_repl_terminal(session_id, terminal_id)
+            elif terminal_role == QWEN_NATIVE_TERMINAL_ROLE:
+                entry = await _recreate_qwen_terminal(session_id, terminal_id)
             else:
                 entry = None
             if entry is None:
