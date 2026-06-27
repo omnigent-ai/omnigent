@@ -1260,6 +1260,11 @@ def create_app(
     app.state.host_registry = host_registry
     app.state.host_store = host_store
     app.state.sandbox_config = sandbox_config
+    # Exposed so the managed-launch runner-spawn path can mint a
+    # short-lived owner JWT for the sandbox runner's tunnel auth when
+    # accounts/OIDC auth is enabled (managed runners carry no user
+    # credential of their own). ``None`` in single-user / no-auth mode.
+    app.state.auth_provider = auth_provider
     # Tracks in-flight background managed-host launches (POST
     # /v1/sessions returns before the sandbox exists) so a message
     # racing the provision can rendezvous instead of failing with

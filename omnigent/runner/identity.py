@@ -20,6 +20,12 @@ RUNNER_ADOPT_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
 RUNNER_WORKSPACE_ENV_VAR = "OMNIGENT_RUNNER_WORKSPACE"
 RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
+# Bearer token the runner presents on its tunnel handshake so the server
+# resolves the session owner when accounts/OIDC auth is enabled. A managed
+# sandbox runner has no logged-in user credential, so the server mints a
+# short-lived owner JWT at launch and the host seeds it here. Unset for
+# single-user / no-auth deployments (the binding token alone authenticates).
+RUNNER_AUTH_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_AUTH_TOKEN"
 # Sentinel ``Origin`` header that the project's own non-browser WebSocket
 # clients (runner -> server tunnel, host/daemon -> server tunnel,
 # terminal-attach) set on their handshakes so the server's CSWSH origin
@@ -48,11 +54,14 @@ OMNIGENT_SESSION_ENV_VALUE = "1"
 
 # Env vars carrying the runner's control-plane auth secret. The tunnel
 # binding token is seeded into the runner process by the launcher and
-# reused as the runner-side request auth token, but must never reach a
-# spawned child: the agent payload there could use it to impersonate the
-# runner. Stripped at every runner→child spawn boundary via
-# :func:`strip_runner_auth_secrets`.
-RUNNER_AUTH_SECRET_ENV_VARS: frozenset[str] = frozenset({RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR})
+# reused as the runner-side request auth token, and the managed-runner
+# owner JWT (when present) likewise authenticates the tunnel — neither
+# must ever reach a spawned child: the agent payload there could use it to
+# impersonate the runner or its owner. Stripped at every runner→child
+# spawn boundary via :func:`strip_runner_auth_secrets`.
+RUNNER_AUTH_SECRET_ENV_VARS: frozenset[str] = frozenset(
+    {RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, RUNNER_AUTH_TOKEN_ENV_VAR}
+)
 
 
 def strip_runner_auth_secrets(env: Mapping[str, str]) -> dict[str, str]:

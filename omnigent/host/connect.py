@@ -55,6 +55,7 @@ from omnigent.onboarding.harness_readiness import (
     harness_is_configured,
 )
 from omnigent.runner.identity import (
+    RUNNER_AUTH_TOKEN_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -396,6 +397,7 @@ def _build_runner_env(
     binding_token: str,
     workspace: str,
     parent_pid: int,
+    auth_token: str | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -419,6 +421,10 @@ def _build_runner_env(
     :param workspace: Absolute runner cwd on the host, e.g.
         ``"/Users/alice/proj"``.
     :param parent_pid: Host process pid, for orphan detection.
+    :param auth_token: Owner-bearer token the runner presents on its
+        tunnel handshake (server-minted at managed launch when
+        accounts/OIDC auth is enabled). ``None`` omits it — the runner
+        falls back to binding-token-only auth (single-user / no-auth).
     :returns: The runner subprocess environment.
     """
     extra_names = {
@@ -439,6 +445,8 @@ def _build_runner_env(
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
+    if auth_token:
+        env[RUNNER_AUTH_TOKEN_ENV_VAR] = auth_token
     return env
 
 
@@ -760,6 +768,7 @@ class HostProcess:
             binding_token=frame.binding_token,
             workspace=str(workspace),
             parent_pid=os.getpid(),
+            auth_token=frame.auth_token,
         )
 
         try:

@@ -38,6 +38,7 @@ from omnigent.host.frames import (
 )
 from omnigent.host.identity import HostIdentity
 from omnigent.runner.identity import (
+    RUNNER_AUTH_TOKEN_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -1108,6 +1109,31 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] == "tok"
     assert env[RUNNER_WORKSPACE_ENV_VAR] == "/ws"
     assert env[RUNNER_PARENT_PID_ENV_VAR] == "42"
+    # No managed owner JWT supplied → the var is omitted (single-user / no-auth).
+    assert RUNNER_AUTH_TOKEN_ENV_VAR not in env
+
+
+def test_build_runner_env_seeds_managed_auth_token_when_provided() -> None:
+    """
+    A managed launch's server-minted owner JWT is seeded into the runner
+    env so the runner can present it as ``Authorization: Bearer`` on its
+    tunnel handshake (accounts/OIDC auth). It is a control-plane secret,
+    so it is registered in ``RUNNER_AUTH_SECRET_ENV_VARS`` and never
+    forwarded to a spawned harness child.
+    """
+    from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
+
+    env = _build_runner_env(
+        {"PATH": "/usr/bin"},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+        auth_token="jwt.owner.token",
+    )
+    assert env[RUNNER_AUTH_TOKEN_ENV_VAR] == "jwt.owner.token"
+    assert RUNNER_AUTH_TOKEN_ENV_VAR in RUNNER_AUTH_SECRET_ENV_VARS
 
 
 def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:

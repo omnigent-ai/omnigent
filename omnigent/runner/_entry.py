@@ -301,6 +301,21 @@ def _make_auth_token_factory(
     :returns: A sync callable returning a bearer token string, or
         ``None`` when no refresh mechanism is available.
     """
+    # Managed-sandbox runner: the server mints a short-lived owner JWT at launch
+    # and the host seeds it as RUNNER_AUTH_TOKEN_ENV_VAR. It is the only
+    # credential such a runner has (no stored OIDC token, no Databricks config),
+    # so return it as the highest-priority source. Because EVERY runner→server
+    # auth path funnels through this factory — the WS tunnel, the HTTP
+    # server_client, and every native transcript forwarder (_runner_auth =
+    # _RunnerDatabricksAuth(_make_auth_token_factory())) — handling it here
+    # authenticates all of them uniformly.
+    from omnigent.runner.identity import RUNNER_AUTH_TOKEN_ENV_VAR
+
+    _managed_owner_jwt = os.environ.get(RUNNER_AUTH_TOKEN_ENV_VAR)
+    if _managed_owner_jwt and _managed_owner_jwt.strip():
+        _jwt = _managed_owner_jwt.strip()
+        return lambda: _jwt
+
     from omnigent.inner.databricks_executor import (
         DatabricksAuthError,
         _DatabricksBearerAuth,
@@ -873,6 +888,9 @@ async def _run_tunnel_from_env() -> None:
     from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel
 
     server_url = _server_url_from_env()
+    # In a managed sandbox this factory returns the server-minted owner JWT (see
+    # _make_auth_token_factory) — the single source every runner→server auth path
+    # uses (this tunnel, the HTTP server_client, and the native forwarders).
     auth_token_factory = _make_auth_token_factory()
     auth_token = auth_token_factory() if auth_token_factory is not None else None
     binding_token = _runner_tunnel_binding_token_from_env()

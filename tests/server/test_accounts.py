@@ -37,6 +37,7 @@ from omnigent.server.accounts_bootstrap import (
 from omnigent.server.accounts_config import AccountsConfig
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.auth import (
+    AuthProvider,
     UnifiedAuthProvider,
     create_auth_provider,
     resolve_auth_source,
@@ -287,6 +288,49 @@ def test_accounts_source_reads_valid_cookie() -> None:
     request = _FakeReq(cookies={cfg.session_cookie_name: token})
 
     assert provider.get_user_id(request) == "admin"
+
+
+def test_mint_runner_bearer_round_trips_to_get_user_id() -> None:
+    """A managed runner's server-minted bearer resolves back to the owner.
+
+    This is the managed-sandbox fix: the sandbox runner has no login of
+    its own, so the server mints an owner JWT it presents as
+    ``Authorization: Bearer`` on its tunnel handshake — ``get_user_id``
+    (the same check the runner tunnel applies) must resolve it to the
+    owner, otherwise the runner tunnel 403s.
+    """
+    cfg = _make_accounts_config()
+    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
+
+    token = provider.mint_runner_bearer("alice@example.com")
+    assert token is not None
+
+    request = _FakeReq(headers={"Authorization": f"Bearer {token}"})
+    assert provider.get_user_id(request) == "alice@example.com"
+
+
+def test_mint_runner_bearer_rejects_empty_and_reserved_owner() -> None:
+    """No token for an empty or reserved owner — never mint admin-equivalent creds."""
+    cfg = _make_accounts_config()
+    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
+    assert provider.mint_runner_bearer("") is None
+    assert provider.mint_runner_bearer("local") is None
+
+
+def test_mint_runner_bearer_returns_none_for_header_source() -> None:
+    """Header/proxy auth can't be minted server-side, so it returns None.
+
+    Identity there is asserted by the upstream proxy; a managed runner
+    can't synthesize it. The base ``AuthProvider`` default is also None.
+    """
+    header_provider = UnifiedAuthProvider(source="header")
+    assert header_provider.mint_runner_bearer("alice@example.com") is None
+
+    class _Base(AuthProvider):
+        def get_user_id(self, request: object) -> str | None:  # type: ignore[override]
+            return None
+
+    assert _Base().mint_runner_bearer("alice@example.com") is None
 
 
 def test_accounts_source_rejects_reserved_user_in_cookie() -> None:
