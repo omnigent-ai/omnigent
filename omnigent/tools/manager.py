@@ -831,11 +831,28 @@ class ToolManager:
         Return OpenAI-format tool schemas for all registered
         tools.
 
+        Each tool's schema is built independently. If a single tool's
+        ``get_schema()`` raises — e.g. a ``type: function`` tool whose
+        dotted ``callable`` path is unimportable — that one tool is
+        skipped with a warning rather than aborting the whole list. This
+        keeps one bad tool from silently dropping the agent's entire tool
+        surface (#378); the remaining, valid tools are still advertised.
+
         :returns: A list of OpenAI tool schema dicts, each
             with ``"type": "function"`` and a ``"function"``
             sub-dict describing the tool.
         """
-        return [tool.get_schema() for tool in self._tools.values()]
+        schemas: list[dict[str, Any]] = []
+        for name, tool in self._tools.items():
+            try:
+                schemas.append(tool.get_schema())
+            except Exception:
+                _logger.warning(
+                    "Skipping tool %r: schema build failed; other tools are unaffected.",
+                    name,
+                    exc_info=True,
+                )
+        return schemas
 
     def get_tool(self, name: str) -> Tool | None:
         """

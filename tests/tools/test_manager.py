@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -293,6 +294,39 @@ def test_schemas_empty_when_no_skills() -> None:
     """
     mgr = ToolManager(_make_spec([]))
     assert _non_lifecycle_schemas(mgr) == []
+
+
+def test_schemas_isolate_a_failing_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A tool whose ``get_schema`` raises is skipped, not allowed to drop
+    the entire toolset: every other tool's schema is still returned and
+    a warning names the offending tool.
+
+    Regression test for the silent total-toolset drop in #378. A single
+    unimportable ``type: function`` tool (dotted ``callable`` path that
+    fails to import) used to abort the whole list comprehension, leaving
+    the model with zero declared tools and only a swallowed WARNING.
+    """
+
+    class _BoomTool:
+        def get_schema(self) -> dict[str, Any]:
+            raise ImportError("No module named 'boom'")
+
+    mgr = ToolManager(_make_spec([]))
+    healthy = {s["function"]["name"] for s in mgr.get_tool_schemas()}
+    assert healthy  # sanity: always-present lifecycle tools exist
+
+    mgr._tools["boom"] = _BoomTool()  # type: ignore[assignment]
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        schemas = mgr.get_tool_schemas()
+
+    names = {s["function"]["name"] for s in schemas}
+    assert "boom" not in names
+    assert names == healthy  # every healthy tool survived the bad one
+    assert any("boom" in record.getMessage() for record in caplog.records)
 
 
 def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
