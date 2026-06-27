@@ -29,9 +29,32 @@ import pytest
 
 # Private helpers from the parent conftest — same import pattern the
 # sibling chat tests use for ``open_right_rail`` / ``TwoAgentChatSession``.
-from tests.e2e_ui.conftest import _ensure_runner_online, _server_state
+from tests.e2e_ui.conftest import _HERMES_AGENT_NAME, _ensure_runner_online, _server_state
 
 _JOKE_DIRECTOR_NAME = "joke_director"
+
+
+@pytest.fixture
+def hermes_agent(live_server: str) -> str:
+    """Resolve the built-in ``hermes-native`` agent's catalog id.
+
+    The agent is seeded as a built-in at server startup (see
+    ``_HERMES_AGENT_YAML`` / ``OMNIGENT_BUILTIN_AGENT_DIRS`` in the parent
+    conftest) because the Add-agent picker's ``GET /v1/agents`` catalog lists
+    built-ins only — a session-scoped upload would never reach the picker.
+    Yields the agent id so the test can scope to ``agent-card-<id>`` in the
+    rendered card.
+
+    :param live_server: Spawned server fixture from the parent conftest.
+    :returns: The Hermes agent's catalog id.
+    """
+    resp = httpx.get(f"{live_server}/v1/agents", timeout=10.0)
+    resp.raise_for_status()
+    agents = resp.json().get("data", resp.json())
+    for agent in agents:
+        if agent.get("name") == _HERMES_AGENT_NAME:
+            return str(agent["id"])
+    raise AssertionError(f"{_HERMES_AGENT_NAME} not in agent catalog: {agents}")
 
 
 @dataclass(frozen=True)

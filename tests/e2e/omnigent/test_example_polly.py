@@ -68,24 +68,35 @@ def test_orchestrator_executor(polly_spec: AgentSpec) -> None:
 
 def test_coding_subagents(polly_spec: AgentSpec) -> None:
     """
-    The bundle has exactly three coding sub-agents: ``claude_code`` (Claude
-    Code, claude-native) and ``codex`` (Codex, codex-native) on the native
-    terminal harnesses, plus ``pi`` (Pi, pi) as the headless multi-model
-    third worker. All implement, review, and explore. The native harnesses
-    make claude_code / codex render terminal-first (Chat / Terminal pill) so
-    the human can watch or take over.
+    The bundle has exactly six coding sub-agents: ``claude_code``
+    (claude-native), ``codex`` (codex-native), ``cursor`` (cursor-native),
+    ``hermes`` (hermes-native), and ``opencode`` (opencode-native) on the
+    native terminal harnesses, plus ``pi`` (Pi, pi) as the headless
+    multi-model worker. All implement, review, and explore. The native
+    harnesses make their workers render terminal-first (Chat / Terminal pill)
+    so the human can watch or take over.
 
     A missing/renamed agent means no implementers, and same-vendor harnesses
     would break cross-vendor review — polly's differentiator.
     """
     fam = {a.name: a.executor.config.get("harness") for a in polly_spec.sub_agents}
-    assert sorted(polly_spec.tools.agents) == ["claude_code", "codex", "pi"]
+    assert sorted(polly_spec.tools.agents) == [
+        "claude_code",
+        "codex",
+        "cursor",
+        "hermes",
+        "opencode",
+        "pi",
+    ]
     assert fam["claude_code"] == "claude-native"
     assert fam["codex"] == "codex-native"
+    assert fam["cursor"] == "cursor-native"
+    assert fam["hermes"] == "hermes-native"
+    assert fam["opencode"] == "opencode-native"
     assert fam["pi"] == "pi"
-    # Three distinct vendors → any implementer's diff is reviewable by another.
-    assert len(set(fam.values())) == 3
-    for name in ("claude_code", "codex", "pi"):
+    # Six distinct vendors → any implementer's diff is reviewable by another.
+    assert len(set(fam.values())) == 6
+    for name in ("claude_code", "codex", "cursor", "hermes", "opencode", "pi"):
         prompt = (_POLLY_BUNDLE / "agents" / name / "config.yaml").read_text(encoding="utf-8")
         assert "IMPLEMENT — write real product code" in prompt
         assert "REVIEW — verify another agent's diff" in prompt
@@ -310,9 +321,11 @@ def test_subagent_cancellation_guidance_present() -> None:
 
     ``sys_session_send`` returns the child ``conversation_id`` as the task
     handle, and the runner's ``sys_cancel_task`` path hard-stops
-    ``claude_code`` native workers while ``codex`` remains best-effort. If
-    this guidance disappears, polly can abandon or re-dispatch work while the
-    old worker keeps consuming resources in the background.
+    ``claude_code`` native workers, ``pi`` workers honor the interrupt, and
+    ``codex`` plus the other terminal workers (``cursor``, ``hermes``,
+    ``opencode``) cancel best-effort. If this guidance disappears, polly can
+    abandon or re-dispatch work while the old worker keeps consuming resources
+    in the background.
     """
     config = (_POLLY_BUNDLE / "config.yaml").read_text(encoding="utf-8")
     fanout = (_POLLY_BUNDLE / "skills" / "fanout" / "SKILL.md").read_text(encoding="utf-8")
@@ -324,7 +337,11 @@ def test_subagent_cancellation_guidance_present() -> None:
         "`sys_cancel_task` with `task_id` set to that sub-agent's recorded `conversation_id`"
     ) in config_compact
     assert "`claude_code` workers are hard-stopped" in config_compact
-    assert "`codex` cancellation is currently best-effort" in config_compact
+    assert "`pi` workers honor the interrupt and stop" in config_compact
+    assert (
+        "`codex` and the other terminal workers (`cursor`, `hermes`, `opencode`) "
+        "cancel best-effort"
+    ) in config_compact
 
     assert (
         "`sys_cancel_task` with `task_id` set to the recorded `conversation_id`"
@@ -388,6 +405,6 @@ def test_function_policies_have_nonempty_arguments(polly_spec: AgentSpec) -> Non
             )
             checked += 1
     # orchestrator: blast_radius + spawn_bounds + headless_subagent_purpose_guard
-    # = 3; sub-agents: blast_radius x3 (claude_code, codex, pi) = 3
-    # -> 6 total. Fewer = a policy dropped.
-    assert checked == 6, f"expected 6 function policies in the bundle, inspected {checked}"
+    # = 3; sub-agents: blast_radius x6 (claude_code, codex, pi, cursor, hermes,
+    # opencode) = 6 -> 9 total. Fewer = a policy dropped.
+    assert checked == 9, f"expected 9 function policies in the bundle, inspected {checked}"

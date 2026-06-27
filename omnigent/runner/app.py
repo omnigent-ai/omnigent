@@ -10096,6 +10096,7 @@ def create_runner_app(
             "qwen-native",
             "kimi-native",
             "hermes-native",
+            "opencode-native",
         }:
             return
         if status == "idle" and harness in {"codex-native", "antigravity-native"}:
