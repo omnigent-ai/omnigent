@@ -25,12 +25,9 @@ from __future__ import annotations
 
 import contextlib
 import json
-import logging
 import os
 import time
 from pathlib import Path
-
-_logger = logging.getLogger(__name__)
 
 #: Append-only log of per-turn completion markers written by the cursor ``stop``
 #: hook (one JSON object per completed turn) and tailed by the forwarder.

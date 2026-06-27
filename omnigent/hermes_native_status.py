@@ -29,11 +29,8 @@ from __future__ import annotations
 
 import contextlib
 import json
-import logging
 import os
 from pathlib import Path
-
-_logger = logging.getLogger(__name__)
 
 #: Durable poster state: how many completed turns the forwarder has already
 #: turned into an ``external_session_status: idle`` post. Persisted so a
