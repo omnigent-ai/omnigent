@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Callable
 
 from fastapi import APIRouter, Request
@@ -34,6 +35,11 @@ from omnigent.entities import (
     Run,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harness_aliases import canonicalize_harness
+from omnigent.native_coding_agents import (
+    CLAUDE_NATIVE_CODING_AGENT,
+    CODEX_NATIVE_CODING_AGENT,
+)
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_OWNER, AuthProvider
@@ -64,6 +70,8 @@ from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.job_store import JobStore
 from omnigent.stores.permission_store import PermissionStore
+
+_logger = logging.getLogger(__name__)
 
 
 def _job_to_response(job: Job) -> JobResponse:
@@ -240,6 +248,32 @@ async def _resolve_host_home(host_registry: object, host_conn: object) -> str | 
     return first_path[:slash] if slash > 0 else "/"
 
 
+def _auto_approve_launch_args(harness: str | None) -> list[str] | None:
+    """Terminal launch args that auto-approve every action for a native harness.
+
+    A job run is unattended — there's no human to answer an ApprovalCard — so a
+    native harness that launches in its default (prompt-on-action) mode would
+    stall on the first Edit/Write/Bash. Force full bypass per harness, matching
+    the headless seam polly's native workers use:
+
+    - ``claude-native`` → ``--permission-mode bypassPermissions``
+    - ``codex-native``  → ``--dangerously-bypass-approvals-and-sandbox``
+
+    SDK harnesses (e.g. ``claude-sdk``) already default to ``bypassPermissions``
+    at spawn, so they need nothing here. Returns ``None`` for any non-native /
+    unknown harness (no terminal args set).
+
+    :param harness: The run agent's canonical harness, or ``None``.
+    :returns: A flat CLI-arg list, or ``None`` when nothing should be set.
+    """
+    canonical = canonicalize_harness(harness) or harness
+    if canonical == CLAUDE_NATIVE_CODING_AGENT.harness:
+        return ["--permission-mode", "bypassPermissions"]
+    if canonical == CODEX_NATIVE_CODING_AGENT.harness:
+        return ["--dangerously-bypass-approvals-and-sandbox"]
+    return None
+
+
 async def _execute_job_run(
     job: Job,
     request: Request,
@@ -300,6 +334,26 @@ async def _execute_job_run(
         if workspace is None:
             host_id = None
 
+    # Auto-approve mode: a job run is unattended, so no human can answer an
+    # approval prompt. Force full bypass for native harnesses (SDK harnesses
+    # already default to bypass). Harness = the job's override, else the spec's.
+    harness = job.harness_override
+    if harness is None and agent_cache is not None:
+        try:
+            agent = await asyncio.to_thread(agent_store.get, agent_id)
+            if agent is not None:
+                loaded = await asyncio.to_thread(
+                    agent_cache.load,
+                    agent.id,
+                    agent.bundle_location,
+                    expand_env=agent.session_id is None,
+                )
+                harness = loaded.spec.executor.harness_kind
+        except Exception:  # noqa: BLE001 - spec load is best-effort for approval mode
+            _logger.warning("job-run harness resolve failed for agent %s", agent_id, exc_info=True)
+            harness = None
+    terminal_launch_args = _auto_approve_launch_args(harness)
+
     # Create the session WITHOUT initial items — we dispatch the narrative as a
     # real event below so it executes.
     body = SessionCreateRequest(
@@ -310,6 +364,7 @@ async def _execute_job_run(
         host_type="external",
         host_id=host_id,
         workspace=workspace,
+        terminal_launch_args=terminal_launch_args,
     )
     session = await _create_session_from_existing_agent(
         conversation_store,
@@ -337,9 +392,7 @@ async def _execute_job_run(
         conn = host_registry.get(host_id)
         conv = await asyncio.to_thread(conversation_store.get_conversation, session.id)
         if conn is not None and conv is not None:
-            attempt = await _launch_runner_on_host(
-                conv, conversation_store, host_registry, conn
-            )
+            attempt = await _launch_runner_on_host(conv, conversation_store, host_registry, conn)
             runner_id = attempt.runner_id
             # Wait for the launched runner to connect before forwarding.
             await _wait_for_runner_client(
@@ -361,9 +414,7 @@ async def _execute_job_run(
     if runner_client is not None and conv is not None:
         # Subscribe to runner output BEFORE forwarding (the stream has no
         # replay buffer), then dispatch the user message.
-        await _ensure_runner_relay_ready(
-            session.id, runner_id, runner_client, conversation_store
-        )
+        await _ensure_runner_relay_ready(session.id, runner_id, runner_client, conversation_store)
         await _dispatch_session_event_to_runner(
             session.id,
             conv,
@@ -540,8 +591,7 @@ def create_jobs_router(
         await _load_owned_job(job_id, user_id)
         runs = await asyncio.to_thread(job_store.list_runs, job_id=job_id, status=status)
         reconciled = [
-            await asyncio.to_thread(_reconcile_run, r, job_store, conversation_store)
-            for r in runs
+            await asyncio.to_thread(_reconcile_run, r, job_store, conversation_store) for r in runs
         ]
         # Re-apply the status filter post-reconcile so a now-finished run
         # doesn't linger in a ``?status=running`` view.
