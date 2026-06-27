@@ -38,11 +38,17 @@ from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_OWNER, AuthProvider
 from omnigent.server.routes._auth_helpers import attribution_user, require_user
+from omnigent.server.routes.hosts import _proxy_list_dir
 from omnigent.server.routes.sessions import (
     SessionLiveness,
     _announce_session_added,
     _create_session_from_existing_agent,
+    _dispatch_session_event_to_runner,
+    _ensure_runner_relay_ready,
+    _get_runner_client,
+    _launch_runner_on_host,
     _session_status_from_cache,
+    _wait_for_runner_client,
 )
 from omnigent.server.schemas import (
     JobCreateRequest,
@@ -133,6 +139,77 @@ def _reconcile_run(run: Run, job_store: JobStore) -> Run:
     return run
 
 
+def _pick_online_host(
+    request: Request,
+    *,
+    user_id: str | None,
+) -> str | None:
+    """Pick an online host to launch the job-run's runner on.
+
+    Runners are spawned on demand by a host (the web "New Chat" flow triggers
+    this by creating the session with a ``host_id``). We do the same: find an
+    online host the caller owns. Returns ``None`` when no host registry is wired
+    (in-process tests) or none is online — the caller then seeds the narrative
+    as history instead of dispatching.
+
+    :param request: The originating request, carrying ``app.state``.
+    :param user_id: Authenticated caller; ``None`` in single-user mode.
+    :returns: An online ``host_id``, or ``None``.
+    """
+    host_registry = getattr(request.app.state, "host_registry", None)
+    host_store = getattr(request.app.state, "host_store", None)
+    if host_registry is None:
+        return None
+    online = host_registry.online_host_ids()
+    if not online:
+        return None
+    # When auth + a host store are wired, prefer a host the caller owns.
+    if user_id is not None and host_store is not None:
+        owned = {h.host_id for h in host_store.list_hosts(user_id)}
+        for host_id in online:
+            if host_id in owned:
+                return host_id
+        return None
+    return online[0]
+
+
+async def _resolve_host_home(host_registry: object, host_conn: object) -> str | None:
+    """Resolve a host's absolute home directory.
+
+    A session bound to a host needs an absolute ``workspace``; the server can't
+    expand ``~`` (only the host knows its ``HOME``). Mirroring the web client's
+    ``deriveHomeDir``, we list the host's home (``~``) — whose entries carry
+    absolute paths — and take the parent of the first entry. Returns ``None``
+    when the listing fails or home is empty (then the run falls back to a seed).
+
+    :param host_registry: The server-side ``HostRegistry``.
+    :param host_conn: The live ``HostConnection`` for the host.
+    :returns: Absolute home path, e.g. ``"/Users/alice"``, or ``None``.
+    """
+    try:
+        result = await _proxy_list_dir(
+            host_registry=host_registry,
+            host_conn=host_conn,
+            path="~",
+            limit=1,
+            after=None,
+            before=None,
+        )
+    except Exception:  # noqa: BLE001 - any host/listing failure → seed fallback
+        return None
+    if result.get("status") != "ok":
+        return None
+    entries = result.get("entries") or []
+    if not entries:
+        return None
+    first_path = entries[0].get("path")
+    if not isinstance(first_path, str):
+        return None
+    slash = first_path.rfind("/")
+    # Parent of the first entry is home; "/x" → "/", deeper → the dir.
+    return first_path[:slash] if slash > 0 else "/"
+
+
 async def _execute_job_run(
     job: Job,
     request: Request,
@@ -149,13 +226,18 @@ async def _execute_job_run(
     artifact_store: ArtifactStore | None,
     default_run_agent_id: str | None,
 ) -> Run:
-    """Run a job: create a session from its narrative and record a run.
+    """Run a job: create a session, bind a runner, dispatch the narrative.
+
+    Mirrors the web "New Chat" flow so the run actually executes rather than
+    just seeding history: create the session (no initial items), auto-bind an
+    online runner, ready its relay, then dispatch the job's narrative as a user
+    message that triggers an agent turn. When no runner is available (e.g. no
+    host is registered), the narrative is persisted as a history-only seed so
+    the session opens with the prompt ready to send.
 
     This is the single execution path shared by the HTTP "Run now" handler and
-    any future scheduler — both build a session from the job's stored narrative
-    and bound agent, then persist a run row. A scheduler would load jobs with a
-    non-null ``schedule_config`` and call this with ``user_id`` set to the job
-    owner.
+    any future scheduler — a scheduler would load jobs with a non-null
+    ``schedule_config`` and call this with ``user_id`` set to the job owner.
 
     :param job: The job to run.
     :param request: The originating request (forwarded to session creation).
@@ -171,24 +253,33 @@ async def _execute_job_run(
             code=ErrorCode.INVALID_INPUT,
         )
 
+    # Pick an online host to launch the run's runner on. Runners are spawned on
+    # demand by a host, so without one the narrative can only be seeded (the
+    # session opens with the prompt ready to send manually).
+    host_id = _pick_online_host(request, user_id=user_id)
+
+    # A host-bound session needs an absolute workspace, and only the host knows
+    # its HOME — resolve it via a list_dir round-trip. If that fails, drop the
+    # host binding and fall back to seeding rather than failing the run.
+    workspace: str | None = None
+    host_registry = getattr(request.app.state, "host_registry", None)
+    if host_id is not None and host_registry is not None:
+        conn = host_registry.get(host_id)
+        if conn is not None:
+            workspace = await _resolve_host_home(host_registry, conn)
+        if workspace is None:
+            host_id = None
+
+    # Create the session WITHOUT initial items — we dispatch the narrative as a
+    # real event below so it executes.
     body = SessionCreateRequest(
         agent_id=agent_id,
         title=f"Run: {job.name}",
         harness_override=job.harness_override,
         model_override=job.model_override,
-        # No host is required: with host_type="external" and no bound runner,
-        # the narrative is persisted as a seed item and the session is created
-        # idle, ready to run when opened (or by a bound runner).
         host_type="external",
-        initial_items=[
-            SessionEventInput(
-                type="message",
-                data={
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": job.narrative}],
-                },
-            )
-        ],
+        host_id=host_id,
+        workspace=workspace,
     )
     session = await _create_session_from_existing_agent(
         conversation_store,
@@ -209,6 +300,69 @@ async def _execute_job_run(
         await asyncio.to_thread(permission_store.ensure_user, user_id)
         await asyncio.to_thread(permission_store.grant, user_id, session.id, LEVEL_OWNER)
     _announce_session_added(user_id, session.id)
+
+    # Launch a runner on the host and wait for it to connect, then dispatch.
+    runner_id: str | None = None
+    if host_id is not None and host_registry is not None:
+        conn = host_registry.get(host_id)
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session.id)
+        if conn is not None and conv is not None:
+            attempt = await _launch_runner_on_host(
+                conv, conversation_store, host_registry, conn
+            )
+            runner_id = attempt.runner_id
+            # Wait for the launched runner to connect before forwarding.
+            await _wait_for_runner_client(
+                session.id,
+                runner_router,
+                getattr(request.app.state, "tunnel_registry", None),
+                runner_id=runner_id,
+                timeout_s=30.0,
+            )
+
+    # Dispatch the narrative. With a connected runner this persists + forwards
+    # the message and starts a turn; otherwise fall back to a history seed.
+    narrative_event = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": job.narrative}]},
+    )
+    runner_client = await _get_runner_client(session.id, runner_router)
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session.id)
+    if runner_client is not None and conv is not None:
+        # Subscribe to runner output BEFORE forwarding (the stream has no
+        # replay buffer), then dispatch the user message.
+        await _ensure_runner_relay_ready(
+            session.id, runner_id, runner_client, conversation_store
+        )
+        await _dispatch_session_event_to_runner(
+            session.id,
+            conv,
+            narrative_event,
+            conversation_store,
+            runner_client,
+            agent_name=agent_id,
+            file_store=file_store,
+            artifact_store=artifact_store,
+            created_by=attribution_user(user_id),
+            runner_router=runner_router,
+        )
+    else:
+        # No runner available — seed the narrative as history so the session
+        # opens with the prompt ready to send manually.
+        from omnigent.entities import NewConversationItem, parse_item_data
+
+        await asyncio.to_thread(
+            conversation_store.append,
+            session.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="seed",
+                    data=parse_item_data("message", narrative_event.data),
+                    created_by=attribution_user(user_id),
+                )
+            ],
+        )
 
     return await asyncio.to_thread(
         job_store.create_run,
