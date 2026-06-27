@@ -79,6 +79,85 @@ from omnigent.stores.policy_store import PolicyStore
 _logger = logging.getLogger(__name__)
 
 
+def _is_pep440_version(version: str) -> bool:
+    """Return whether *version* can be parsed as a PEP 440 version."""
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        Version(version)
+    except InvalidVersion:
+        return False
+    return True
+
+
+def _metadata_omnigent_version() -> str:
+    """Return the omnigent version recorded in installed package metadata."""
+    from importlib.metadata import version as _pkg_version
+
+    return _pkg_version("omnigent")
+
+
+def _source_pyproject_version(start: Path | None = None) -> str | None:
+    """Return ``[project].version`` from a source checkout's ``pyproject.toml``."""
+    import tomllib
+
+    current = start or Path(__file__).resolve()
+    for parent in (current, *current.parents):
+        pyproject = parent / "pyproject.toml"
+        if not pyproject.is_file():
+            continue
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+            _logger.warning(
+                "could not read %s for server version fallback (%s)",
+                pyproject,
+                exc,
+            )
+            return None
+        project = data.get("project")
+        if not isinstance(project, dict) or project.get("name") != "omnigent":
+            continue
+        version = project.get("version")
+        if not isinstance(version, str) or not version:
+            return None
+        if not _is_pep440_version(version):
+            _logger.warning(
+                "pyproject version %r from %s is not PEP 440",
+                version,
+                pyproject,
+            )
+            return None
+        return version
+    return None
+
+
+def _server_version() -> str:
+    """Return the server version exposed to clients.
+
+    Source/editable installs can have placeholder package metadata such as
+    ``source``. Prefer the installed metadata when it is parseable, but fall
+    back to the source checkout's ``pyproject.toml`` version so local developer
+    servers still report a PEP 440 version.
+    """
+    version = _metadata_omnigent_version()
+    if _is_pep440_version(version):
+        return version
+    fallback = _source_pyproject_version()
+    if fallback is not None:
+        _logger.info(
+            "installed omnigent version %r is not PEP 440; using pyproject version %s",
+            version,
+            fallback,
+        )
+        return fallback
+    _logger.warning(
+        "installed omnigent version %r is not PEP 440 and no pyproject fallback was found",
+        version,
+    )
+    return version
+
+
 def _register_web_mimetypes() -> None:
     """Pin Content-Type for web UI assets regardless of the OS MIME registry.
 
@@ -1633,9 +1712,7 @@ def create_app(
         :returns: ``{"version": "<semver string>"}``,
             e.g. ``{"version": "0.1.0"}``.
         """
-        from importlib.metadata import version as _pkg_version
-
-        return {"version": _pkg_version("omnigent")}
+        return {"version": _server_version()}
 
     @app.get("/v1/info")
     async def info() -> dict[str, bool | str | None]:
@@ -1705,8 +1782,6 @@ def create_app(
         # server_version is the installed omnigent package version (same
         # source as /api/version), surfaced so the web UI can show it in the
         # session info popover alongside the per-session host version.
-        from importlib.metadata import version as _pkg_version
-
         # smart_routing_enabled: true when the server can route — either
         # a RoutingClient is explicitly configured (OMNIGENT_SMART_ROUTING=1
         # + llm: config) or the managed deployment registered a
@@ -1727,7 +1802,7 @@ def create_app(
             "databricks_features": databricks_features,
             "managed_sandboxes_enabled": managed_sandboxes_enabled,
             "sandbox_provider": sandbox_provider,
-            "server_version": _pkg_version("omnigent"),
+            "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
         }
 

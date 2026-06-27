@@ -61,6 +61,40 @@ async def test_version_returns_installed_package_version(
     )
 
 
+def test_server_version_uses_metadata_when_pep440(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid installed package version is the server version source of truth."""
+    monkeypatch.setattr(server_app, "_metadata_omnigent_version", lambda: "0.3.1")
+    monkeypatch.setattr(server_app, "_source_pyproject_version", lambda: "0.3.0.dev0")
+
+    assert server_app._server_version() == "0.3.1"
+
+
+def test_server_version_falls_back_to_pyproject_for_source_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source/editable installs can report ``source``; use pyproject's version."""
+    monkeypatch.setattr(server_app, "_metadata_omnigent_version", lambda: "source")
+    monkeypatch.setattr(server_app, "_source_pyproject_version", lambda: "0.3.0.dev0")
+
+    assert server_app._server_version() == "0.3.0.dev0"
+
+
+def test_source_pyproject_version_reads_project_version(tmp_path: Path) -> None:
+    """The pyproject fallback reads the source checkout's ``[project].version``."""
+    repo = tmp_path / "repo"
+    package_file = repo / "omnigent" / "server" / "app.py"
+    package_file.parent.mkdir(parents=True)
+    package_file.write_text("", encoding="utf-8")
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "omnigent"\nversion = "0.3.0.dev0"\n',
+        encoding="utf-8",
+    )
+
+    assert server_app._source_pyproject_version(package_file) == "0.3.0.dev0"
+
+
 class _StubWebSocket:
     """
     Minimal real ``WebSocketLike`` for registering a runner tunnel.
