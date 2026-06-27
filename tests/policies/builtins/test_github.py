@@ -627,6 +627,77 @@ def test_shell_gh_unlock_unpin_classified_as_write(command: str) -> None:
     assert result is not None and result["result"] == "DENY"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh cache delete --all --repo octo/secret",
+        "gh codespace create --repo octo/secret",
+        "gh codespace delete --repo octo/secret",
+        "gh codespace stop --repo octo/secret",
+        "gh codespace rebuild --repo octo/secret",
+        "gh project create --repo octo/secret",
+        "gh project delete --repo octo/secret",
+        "gh project edit --repo octo/secret",
+        "gh project close --repo octo/secret",
+        "gh project item-add --repo octo/secret",
+        "gh project item-delete --repo octo/secret",
+        "gh variable set FOO --repo octo/secret",
+        "gh variable delete FOO --repo octo/secret",
+        "gh ssh-key add key.pub --repo octo/secret",
+        "gh ssh-key delete 123 --repo octo/secret",
+        "gh gpg-key add key.asc --repo octo/secret",
+        "gh gpg-key delete 123 --repo octo/secret",
+    ],
+)
+def test_shell_gh_extended_groups_classified_as_write(command: str) -> None:
+    """Write actions under cache/codespace/project/variable/ssh-key/gpg-key groups
+    are denied for non-allowlisted repos.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    result = policy(_sh(command))
+    assert result is not None and result["result"] == "DENY"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh cache list --repo octo/secret",
+        "gh codespace list",
+        "gh project list --repo octo/secret",
+        "gh project view --repo octo/secret",
+        "gh variable list --repo octo/secret",
+        "gh ssh-key list",
+        "gh gpg-key list",
+    ],
+)
+def test_shell_gh_extended_groups_read_actions_are_reads(command: str) -> None:
+    """Non-write actions under extended groups are reads, not writes.
+
+    With read_all=True (default) they abstain; they must NOT be wrongly denied as
+    writes.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    assert policy(_sh(command)) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh browse --repo octo/secret",
+        "gh copilot explain 'what is git'",
+        "gh licenses list",
+        "gh search repos omnigent",
+        "gh status",
+    ],
+)
+def test_shell_gh_ignore_groups_abstain(command: str) -> None:
+    """Groups in _GH_IGNORE_GROUPS (browse/copilot/licenses/search/status) are
+    abstained on — they touch no repo content and gating them would be noisy.
+    """
+    policy = github_policy(read_all=False, read_repos=[_REPO], write_repos=[_REPO])
+    assert policy(_sh(command)) is None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Layer 2 — spec resolution through resolve_function_policy
 # ══════════════════════════════════════════════════════════════════════════════
