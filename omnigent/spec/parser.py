@@ -112,6 +112,49 @@ _ConfigYamlLoader.add_implicit_resolver(  # type: ignore[no-untyped-call]
 )
 
 
+def _parse_int_field(raw: object, field_name: str) -> int:
+    """
+    Coerce an integer config field while rejecting YAML booleans.
+
+    Python treats ``bool`` as a subclass of ``int``. Without this guard,
+    values like ``false`` silently become ``0`` for fields such as
+    ``executor.max_iterations``.
+    """
+    if isinstance(raw, bool):
+        raise OmnigentError(
+            f"{field_name} must be an integer, got boolean {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise OmnigentError(
+            f"{field_name} must be an integer, got {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+
+
+def _parse_float_field(raw: object, field_name: str) -> float:
+    """
+    Coerce a numeric config field while rejecting YAML booleans.
+
+    ``float(True)`` becomes ``1.0`` in Python, which is not a useful
+    interpretation for timing and threshold fields.
+    """
+    if isinstance(raw, bool):
+        raise OmnigentError(
+            f"{field_name} must be a number, got boolean {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        return float(raw)
+    except (TypeError, ValueError) as exc:
+        raise OmnigentError(
+            f"{field_name} must be a number, got {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+
+
 def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     """
     Parse an agent image directory into an :class:`AgentSpec`.
@@ -299,7 +342,11 @@ def _parse_llm(
         connection = expand_env_vars(raw_dict) if expand_env else raw_dict
     profile_raw = raw.get("profile")
     profile = str(profile_raw) if profile_raw is not None else None
-    request_timeout = int(raw["request_timeout"]) if "request_timeout" in raw else 300
+    request_timeout = (
+        _parse_int_field(raw["request_timeout"], "llm.request_timeout")
+        if "request_timeout" in raw
+        else 300
+    )
     retry = _parse_retry(raw.get("retry"))
     reserved = {"model", "connection", "profile", "request_timeout", "retry"}
     extra = {k: v for k, v in raw.items() if k not in reserved}
@@ -360,7 +407,7 @@ def _parse_tools_config(
     """
     if raw is None:
         return ToolsConfig()
-    timeout = int(raw["timeout"]) if "timeout" in raw else 60
+    timeout = _parse_int_field(raw["timeout"], "tools.timeout") if "timeout" in raw else 60
     retry = _parse_retry(raw.get("retry"))
     builtins = _parse_builtin_tools(raw.get("builtins", []))
     sandbox = _parse_sandbox_config(raw.get("sandbox"))
@@ -469,17 +516,27 @@ def _parse_retry(
         return RetryPolicy()
     defaults = RetryPolicy()
     return RetryPolicy(
-        max_retries=int(raw.get("max_retries", defaults.max_retries)),
-        backoff_base_s=float(raw.get("backoff_base_s", defaults.backoff_base_s)),
-        backoff_max_s=float(raw.get("backoff_max_s", defaults.backoff_max_s)),
+        max_retries=_parse_int_field(
+            raw.get("max_retries", defaults.max_retries),
+            "retry.max_retries",
+        ),
+        backoff_base_s=_parse_float_field(
+            raw.get("backoff_base_s", defaults.backoff_base_s),
+            "retry.backoff_base_s",
+        ),
+        backoff_max_s=_parse_float_field(
+            raw.get("backoff_max_s", defaults.backoff_max_s),
+            "retry.backoff_max_s",
+        ),
         jitter=bool(raw.get("jitter", defaults.jitter)),
         timeout_per_request_s=(
-            float(raw["timeout_per_request_s"])
+            _parse_float_field(raw["timeout_per_request_s"], "retry.timeout_per_request_s")
             if raw.get("timeout_per_request_s") is not None
             else defaults.timeout_per_request_s
         ),
         retryable_status_codes=tuple(
-            int(c) for c in raw.get("retryable_status_codes", defaults.retryable_status_codes)
+            _parse_int_field(c, "retry.retryable_status_codes")
+            for c in raw.get("retryable_status_codes", defaults.retryable_status_codes)
         ),
     )
 
@@ -534,7 +591,9 @@ def _parse_executor(
     if etype == "omnigent" and profile is not None and "profile" not in config:
         config["profile"] = profile
     raw_cw = raw.get("context_window")
-    context_window: int | None = int(raw_cw) if raw_cw is not None else None
+    context_window: int | None = (
+        _parse_int_field(raw_cw, "executor.context_window") if raw_cw is not None else None
+    )
     raw_model = raw.get("model")
     model: str | None = str(raw_model) if raw_model is not None else None
     # Parse ``executor.connection:`` — same shape as ``llm.connection:``
@@ -549,8 +608,11 @@ def _parse_executor(
     auth = _parse_executor_auth(raw, expand_env=expand_env)
     return ExecutorSpec(
         type=etype,
-        timeout=int(raw.get("timeout", 3600)),
-        max_iterations=int(raw.get("max_iterations", 1000)),
+        timeout=_parse_int_field(raw.get("timeout", 3600), "executor.timeout"),
+        max_iterations=_parse_int_field(
+            raw.get("max_iterations", 1000),
+            "executor.max_iterations",
+        ),
         profile=profile,
         config=config,
         model=model,
@@ -761,7 +823,10 @@ def _parse_terminals(
             allow_cwd_override=bool(entry.get("allow_cwd_override", False)),
             allow_sandbox_override=bool(entry.get("allow_sandbox_override", False)),
             log_file=entry.get("log_file"),
-            scrollback=int(entry.get("scrollback", 10000)),
+            scrollback=_parse_int_field(
+                entry.get("scrollback", 10000),
+                f"terminals.{name}.scrollback",
+            ),
             session_prefix=str(entry.get("session_prefix", "omni_")),
             tmux_allow_passthrough=bool(entry.get("tmux_allow_passthrough", False)),
             tmux_start_on_attach=bool(entry.get("tmux_start_on_attach", False)),
@@ -1666,8 +1731,14 @@ def _parse_compaction(
     if raw is None:
         return None
     return CompactionConfig(
-        trigger_threshold=float(raw.get("trigger_threshold", 0.8)),
-        recent_window=int(raw.get("recent_window", 5)),
+        trigger_threshold=_parse_float_field(
+            raw.get("trigger_threshold", 0.8),
+            "compaction.trigger_threshold",
+        ),
+        recent_window=_parse_int_field(
+            raw.get("recent_window", 5),
+            "compaction.recent_window",
+        ),
     )
 
 
@@ -2355,7 +2426,11 @@ def _parse_http_mcp_server(
             expand_env_vars(raw.get("headers", {})) if expand_env else raw.get("headers", {})
         ),
         description=raw.get("description"),
-        timeout=int(raw["timeout"]) if "timeout" in raw else None,
+        timeout=(
+            _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
+            if "timeout" in raw
+            else None
+        ),
         retry=_parse_retry(raw["retry"]) if "retry" in raw else None,
     )
 
@@ -2447,7 +2522,11 @@ def _parse_stdio_mcp_server(
         args=[str(a) for a in raw_args],
         env={str(k): str(v) for k, v in env.items()},
         description=raw.get("description"),
-        timeout=int(raw["timeout"]) if "timeout" in raw else None,
+        timeout=(
+            _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
+            if "timeout" in raw
+            else None
+        ),
         retry=_parse_retry(raw["retry"]) if "retry" in raw else None,
     )
 
@@ -2621,13 +2700,7 @@ def _parse_guardrails_ask_timeout(raw: Any) -> int:
     :raises OmnigentError: On non-integer or non-positive
         values.
     """
-    try:
-        value = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise OmnigentError(
-            f"guardrails.ask_timeout must be an integer, got {raw!r}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
+    value = _parse_int_field(raw, "guardrails.ask_timeout")
     if value <= 0:
         raise OmnigentError(
             "guardrails.ask_timeout must be > 0 "
@@ -3293,13 +3366,7 @@ def _parse_policy_ask_timeout(
     """
     if raw is None:
         return None
-    try:
-        value = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise OmnigentError(
-            f"policy {policy_name!r}: `ask_timeout` must be an integer, got {raw!r}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
+    value = _parse_int_field(raw, f"policy {policy_name!r}: `ask_timeout`")
     if value <= 0:
         raise OmnigentError(
             f"policy {policy_name!r}: `ask_timeout` must be > 0 "

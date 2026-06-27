@@ -2071,6 +2071,90 @@ def test_parse_executor_defaults(tmp_path: Path) -> None:
     assert spec.executor.type == "omnigent"
 
 
+@pytest.mark.parametrize(
+    ("config", "match"),
+    [
+        (
+            {"llm": {"model": "openai/gpt-4o", "request_timeout": True}},
+            r"llm\.request_timeout must be an integer",
+        ),
+        (
+            {"tools": {"timeout": False}},
+            r"tools\.timeout must be an integer",
+        ),
+        (
+            {"llm": {"model": "openai/gpt-4o", "retry": {"max_retries": True}}},
+            r"retry\.max_retries must be an integer",
+        ),
+        (
+            {"llm": {"model": "openai/gpt-4o", "retry": {"backoff_base_s": False}}},
+            r"retry\.backoff_base_s must be a number",
+        ),
+        (
+            {
+                "llm": {
+                    "model": "openai/gpt-4o",
+                    "retry": {"retryable_status_codes": [429, True]},
+                }
+            },
+            r"retry\.retryable_status_codes must be an integer",
+        ),
+        (
+            {"executor": {"timeout": True}},
+            r"executor\.timeout must be an integer",
+        ),
+        (
+            {"executor": {"max_iterations": False}},
+            r"executor\.max_iterations must be an integer",
+        ),
+        (
+            {"executor": {"context_window": True}},
+            r"executor\.context_window must be an integer",
+        ),
+        (
+            {"compaction": {"recent_window": False}},
+            r"compaction\.recent_window must be an integer",
+        ),
+        (
+            {"compaction": {"trigger_threshold": True}},
+            r"compaction\.trigger_threshold must be a number",
+        ),
+        (
+            {"guardrails": {"ask_timeout": True}},
+            r"guardrails\.ask_timeout must be an integer",
+        ),
+    ],
+)
+def test_parse_rejects_boolean_values_for_numeric_config_fields(
+    tmp_path: Path,
+    config: dict[str, object],
+    match: str,
+) -> None:
+    """Boolean YAML values must not be accepted as numeric config."""
+    config = {"spec_version": 1, **config}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    with pytest.raises(OmnigentError, match=match):
+        parse(tmp_path)
+
+
+def test_parse_rejects_boolean_terminal_scrollback(tmp_path: Path) -> None:
+    """Terminal scrollback is a line count, not a boolean flag."""
+    config = {
+        "spec_version": 1,
+        "terminals": {
+            "main": {
+                "command": "bash",
+                "scrollback": False,
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    with pytest.raises(OmnigentError, match=r"terminals\.main\.scrollback must be an integer"):
+        parse(tmp_path)
+
+
 def test_parse_executor_config_field(tmp_path: Path) -> None:
     """Executor block with a ``config`` sub-block parses string values.
 
@@ -2146,6 +2230,22 @@ def test_parse_mcp_server_with_timeout_and_retry(
     # Retry max_retries should match the YAML value.
     # Failure means MCP retry fields are not forwarded correctly.
     assert mcp.retry.max_retries == 7
+
+
+def test_parse_rejects_boolean_mcp_timeout(agent_dir: Path) -> None:
+    """MCP timeout is a duration in seconds, not a boolean flag."""
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "slow-service",
+        "transport": "http",
+        "url": "http://localhost:9000/mcp",
+        "timeout": True,
+    }
+    (mcp_dir / "slow.yaml").write_text(yaml.dump(mcp_config))
+
+    with pytest.raises(OmnigentError, match=r"MCP server 'slow-service'\.timeout"):
+        parse(agent_dir)
 
 
 def test_parse_mcp_stdio_minimal(agent_dir: Path) -> None:
