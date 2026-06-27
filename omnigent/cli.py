@@ -4650,20 +4650,36 @@ def _ensure_bundled_agent_brain_credential(name: str) -> None:
         if not isinstance(disk_block, dict):
             return
         # Skip ambient-detected entries (not on disk) — auto-defaulted upstream.
-        for entry_name, entry in load_providers(config).items():
-            if family not in provider_families(entry) or entry_name not in disk_block:
-                continue
-            _save_global_config(
-                {"providers": set_default_provider(disk_block, entry_name, family)}
-            )
-            # Announce: this mutates the user's config on a launch command.
-            click.echo(
-                f"No default {family_label(family)} credential set — "
-                f"using {_credential_label(entry_name, entry)} and saving it as "
-                f"the default (change anytime with: omnigent /model).",
-                err=True,
-            )
+        candidates = [
+            (entry_name, entry)
+            for entry_name, entry in load_providers(config).items()
+            if family in provider_families(entry) and entry_name in disk_block
+        ]
+        if not candidates:
             return
+        entry_name, entry = candidates[0]
+        _save_global_config({"providers": set_default_provider(disk_block, entry_name, family)})
+        family_name = family_label(family)
+        credential_name = _credential_label(entry_name, entry)
+        # Announce: this mutates the user's config on a launch command.
+        if len(candidates) > 1:
+            message = (
+                f"No default {family_name} credential set — "
+                f"using {credential_name} "
+                f"({len(candidates)} {family_name} credentials found; "
+                "pick another with: omnigent /model) and saving it as the default."
+            )
+        else:
+            message = (
+                f"No default {family_name} credential set — "
+                f"using {credential_name} and saving it as the default "
+                "(change anytime with: omnigent /model)."
+            )
+        click.echo(
+            message,
+            err=True,
+        )
+        return
     except (OSError, yaml.YAMLError, OmnigentError):
         return
 

@@ -787,10 +787,71 @@ def test_bundled_agent_launches_with_first_available_credential(
     provider = saved["providers"]["anthropic_key"]
     assert provider.get("default") is True
     # The silent config mutation is announced (mirrors setup / /model).
-    assert "saving it as the default" in result.output
+    assert (
+        "No default Claude credential set — using Anthropic API Key and saving "
+        "it as the default (change anytime with: omnigent /model)." in result.output
+    )
+    assert "credentials found" not in result.output
     # And the launch proceeded (the brain credential resolved).
     dispatch.assert_called_once()
     assert dispatch.call_args.kwargs["target"] == _bundled_example_path(shorthand)
+
+
+def test_bundled_agent_multiple_credentials_notice_preserves_first_pick(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Multiple matching credentials still launch non-interactively with context.
+
+    When two Claude-family credentials exist and neither is default, the
+    shorthand remains headless-safe: it promotes the first configured
+    credential, reports the ambiguity, and tells the user where to change it.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+
+    def _fail_prompt(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("bundled launch must not prompt")
+
+    monkeypatch.setattr("omnigent.cli.click.prompt", _fail_prompt)
+    monkeypatch.setattr("omnigent.cli.click.confirm", _fail_prompt)
+    _write_isolated_provider_config(
+        tmp_path,
+        {
+            "anthropic_first": {
+                "kind": "key",
+                "anthropic": {
+                    "base_url": "https://api.anthropic.invalid/v1",
+                    "api_key_ref": "env:ANTHROPIC_FIRST",
+                },
+            },
+            "anthropic_second": {
+                "kind": "key",
+                "anthropic": {
+                    "base_url": "https://api.anthropic.invalid/v1",
+                    "api_key_ref": "env:ANTHROPIC_SECOND",
+                },
+            },
+        },
+    )
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, ["polly"])
+
+    assert result.exit_code == 0, result.output
+    saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    providers = saved["providers"]
+    assert providers["anthropic_first"].get("default") is True
+    assert "default" not in providers["anthropic_second"]
+    assert (
+        "No default Claude credential set — using Anthropic API Key "
+        "(2 Claude credentials found; pick another with: omnigent /model) "
+        "and saving it as the default." in result.output
+    )
+    dispatch.assert_called_once()
+    assert dispatch.call_args.kwargs["target"] == _bundled_example_path("polly")
 
 
 def test_bundled_agent_leaves_existing_default_credential_alone(
