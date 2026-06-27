@@ -222,48 +222,69 @@ async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<Availab
 }
 
 /**
- * The new-session picker's agent catalog: the catalog from
- * `GET /v1/agents` (seeded built-ins + user-registered templates), plus
- * custom agents discovered on the caller's sessions (sub-agent sessions
- * included) via `GET /v1/sessions?kind=any`.
+ * Collapse the catalog + scanned agents PROTECTING every catalog row (seeded
+ * built-ins AND user-registered templates) from same-named session uploads.
  *
- * Two kinds of catalog row are handled differently when a same-named
- * `omnigent run` upload exists:
+ * This is the default, historical behavior, used by every surface that binds
+ * an existing *registered* agent — Add-Subagent, Fork, Switch: those want the
+ * canonical catalog entry, not an ad-hoc session-scoped copy that happens to
+ * share a name. Only the new-session landing picker opts out of this (see
+ * `collapseWithSupersession`).
  *
- * - SEEDED built-ins (`builtin: true`, deterministic id) are protected:
- *   they always list verbatim, and a same-named upload (or a fork/switch
- *   clone of one — `agentRootName` peels every `"(fork <id>)"` layer) is
- *   dropped. The seeded agent is the canonical identity for its name.
- * - USER-registered templates (`builtin: false`, e.g. `--agent`) compete
- *   with same-named uploads on recency: the newest of {template, uploads}
- *   wins, so a fresh `omnigent run agent.yaml` supersedes a stale template
- *   instead of being shadowed by it. This is the fix for the picker binding
- *   an older version when a newer one was just run.
- *
- * Session rows binding a catalog agent directly (by id) are dropped — that
- * agent is already represented. Genuinely custom uploads (a local YAML mints
- * a fresh agent_id per session) collapse by base name, newest session
- * winning (#3234). Binding any survivor needs no new server support:
- * `POST /v1/sessions {agent_id}` already authorizes session-scoped agents
- * the caller can read.
- *
- * Older servers omit `builtin`, so every catalog row degrades to "protected"
- * — i.e. the prior shadow-everything behavior — rather than misclassifying.
- *
- * A failing sessions scan (e.g. transient 5xx) degrades to the catalog list
- * rather than blanking the picker — catalog availability must not be hostage
- * to the discovery extension.
+ * Session rows are dropped when they bind a catalog agent by id, or when their
+ * clone-ROOT name matches a catalog name (fork/switch create per-session rows
+ * named `"<name> (fork <id>)"`; `agentRootName` peels every layer so a fork of
+ * a fork still matches). Surviving genuinely-custom uploads — agents not in the
+ * catalog at all — collapse by base name, newest session first (#3234).
  */
-async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
-  const [catalog, scanned] = await Promise.all([
-    fetchBuiltinAgents(),
-    scanSessionAgents().catch(() => [] as ScannedSessionAgent[]),
-  ]);
-  // Seeded built-ins are emitted verbatim and protected; user-registered
-  // templates seed the newest-wins buckets so an upload can supersede them.
+async function collapseProtectedCatalog(
+  catalog: AvailableAgent[],
+  scanned: ScannedSessionAgent[],
+): Promise<AvailableAgent[]> {
+  const catalogIds = new Set(catalog.map((a) => a.id));
+  const catalogNames = new Set(catalog.map((a) => a.name));
+  const hasKiroBuiltin = catalog.some((a) => nativeCodingAgentForAvailableAgent(a)?.key === "kiro");
+  const kiroLegacyNames = new Set(["kiro"]);
+  const customByName = new Map<string, ScannedSessionAgent>();
+  for (const agent of scanned) {
+    const base = agentRootName(agent.agentName);
+    if (catalogIds.has(agent.agentId) || catalogNames.has(base)) continue;
+    if (hasKiroBuiltin && kiroLegacyNames.has(base.toLocaleLowerCase())) continue;
+    if (!customByName.has(base)) customByName.set(base, agent);
+  }
+  const enriched = (
+    await Promise.all(Array.from(customByName.values()).map(enrichSessionAgent))
+  ).filter((agent) => {
+    const nativeKey = nativeCodingAgentForAvailableAgent(agent)?.key;
+    return nativeKey !== "kiro" || !hasKiroBuiltin;
+  });
+  return [...catalog, ...enriched];
+}
+
+/**
+ * Collapse the catalog + scanned agents letting a newer same-named upload
+ * SUPERSEDE a user-registered template (newest-wins). Only the new-session
+ * landing picker uses this — starting a fresh session should bind the latest
+ * version of an agent the user has run, which is the fix for the picker
+ * binding a stale version after `omnigent run`.
+ *
+ * - SEEDED built-ins (`builtin: true`, deterministic id) stay protected: a
+ *   same-named upload (or a fork/switch clone — `agentRootName` peels every
+ *   `"(fork <id>)"` layer) is dropped. The seeded agent is canonical.
+ * - USER-registered templates (`builtin: false`, e.g. `--agent`) compete with
+ *   same-named uploads on recency: the newest of {template, uploads} wins.
+ *
+ * Session rows binding a catalog agent directly (by id) are dropped — already
+ * represented. Older servers omit `builtin`, so every catalog row degrades to
+ * "protected" (the `collapseProtectedCatalog` behavior) rather than
+ * misclassifying.
+ */
+async function collapseWithSupersession(
+  catalog: AvailableAgent[],
+  scanned: ScannedSessionAgent[],
+): Promise<AvailableAgent[]> {
   // `builtin !== false` keeps both true (seeded) and undefined (older server,
-  // no flag) protected — only an explicit false marks a supersedable
-  // user-registered template.
+  // no flag) protected — only an explicit false marks a supersedable template.
   const seeded = catalog.filter((a) => a.builtin !== false);
   const userTemplates = catalog.filter((a) => a.builtin === false);
   const catalogIds = new Set(catalog.map((a) => a.id));
@@ -330,14 +351,45 @@ async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
   return [...seeded, ...resolved];
 }
 
+/**
+ * The picker's agent catalog: `GET /v1/agents` (seeded built-ins +
+ * user-registered templates) unioned with custom agents discovered on the
+ * caller's sessions (sub-agent sessions included) via
+ * `GET /v1/sessions?kind=any`. Binding any survivor needs no new server
+ * support: `POST /v1/sessions {agent_id}` already authorizes session-scoped
+ * agents the caller can read.
+ *
+ * `supersedeTemplates` selects the collision policy (see the two collapse
+ * helpers). A failing sessions scan (e.g. transient 5xx) degrades to the
+ * catalog list rather than blanking the picker — catalog availability must not
+ * be hostage to the discovery extension.
+ */
+async function fetchAvailableAgents(supersedeTemplates: boolean): Promise<AvailableAgent[]> {
+  const [catalog, scanned] = await Promise.all([
+    fetchBuiltinAgents(),
+    scanSessionAgents().catch(() => [] as ScannedSessionAgent[]),
+  ]);
+  return supersedeTemplates
+    ? collapseWithSupersession(catalog, scanned)
+    : collapseProtectedCatalog(catalog, scanned);
+}
+
 interface UseAvailableAgentsOptions {
   enabled?: boolean;
+  // When true, a newer same-named session upload supersedes a user-registered
+  // template (newest-wins). Only the new-session landing picker opts in, so
+  // starting a fresh session binds the latest version the user has run; other
+  // surfaces (Add-Subagent / Fork / Switch) keep the protected catalog and bind
+  // the canonical registered agent. Seeded built-ins are protected either way.
+  supersedeTemplates?: boolean;
 }
 
 export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
+  const supersedeTemplates = options.supersedeTemplates ?? false;
   return useQuery({
-    queryKey: ["available-agents"],
-    queryFn: fetchAvailableAgents,
+    // Keyed by mode so the two collision policies cache separately.
+    queryKey: ["available-agents", { supersedeTemplates }],
+    queryFn: () => fetchAvailableAgents(supersedeTemplates),
     enabled: options.enabled ?? true,
     staleTime: 30_000,
   });
