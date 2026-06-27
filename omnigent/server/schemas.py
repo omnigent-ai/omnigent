@@ -234,6 +234,16 @@ class AgentObject(BaseModel):
         the launchable choices. Empty list when the spec
         declares no terminals or when the bundle cannot be
         loaded.
+    :param builtin: Whether this is a server-*seeded* built-in
+        agent (deterministic, name-derived id) as opposed to an
+        operator/user-registered template (random id, e.g. via
+        ``omnigent server --agent``) or a session-scoped upload.
+        The Web UI's new-session picker uses this to decide
+        whether a same-named ``omnigent run`` upload may shadow
+        the catalog entry: seeded built-ins are protected, while
+        a user-registered template is superseded by a newer
+        same-named upload. Always ``False`` for session-scoped
+        agents.
     """
 
     id: str
@@ -249,6 +259,7 @@ class AgentObject(BaseModel):
     policies: list[PolicySummary] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
     terminals: list[str] = Field(default_factory=list)
+    builtin: bool = False
 
 
 # ── Session Policies ───────────────────────────────────────────
