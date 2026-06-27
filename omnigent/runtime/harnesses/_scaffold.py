@@ -99,11 +99,11 @@ _SHUTDOWN_GRACE_S = 4.5
 # (DENY), advisory LLM/TOOL_RESULT phases fail OPEN (ALLOW).
 _POLICY_EVAL_TIMEOUT_S = 86400.0
 
-# Per-turn IDLE watchdog: max gap WITHOUT progress before a wedged
+# Per-turn IDLE watchdog: max gap WITHOUT stream activity before a wedged
 # ``run_turn`` becomes ``response.failed`` (vs heartbeating forever).
-# Every non-heartbeat ``ctx.emit`` resets the deadline (see
-# ``_guarded_run_turn``), so a long-but-active turn is never killed.
-# Env var name kept for the ops knob; ``<= 0`` disables.
+# Every ``ctx.emit`` resets the deadline (see ``_guarded_run_turn``), so
+# a long quiet await is not killed while the stream heartbeat is still
+# alive. Env var name kept for the ops knob; ``<= 0`` disables.
 _TURN_IDLE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_TIMEOUT_S", "240"))
 
 # Absolute per-turn ceiling: a hard cap on TOTAL turn duration, backstop
@@ -436,12 +436,12 @@ class TurnContext:
             ``OutputTextDeltaEvent(type="response.output_text.delta",
             delta="hi")``.
         """
-        # Treat any non-heartbeat event as progress and push the idle
-        # watchdog deadline forward. Heartbeats are keep-alive, NOT
-        # progress — letting them reset the deadline would defeat the
-        # watchdog (a wedged turn's 15s heartbeats would keep it alive
-        # forever).
-        if self._reset_idle_watchdog is not None and not isinstance(event, HeartbeatEvent):
+        # Any stream event is activity. ``response.heartbeat`` is not
+        # substantive progress, but it proves the turn stream is still
+        # alive while ``run_turn`` is parked on a legitimate quiet await
+        # such as LLM/tool/sub-agent work. The absolute watchdog remains
+        # the backstop for a turn that heartbeats but never finishes.
+        if self._reset_idle_watchdog is not None:
             self._reset_idle_watchdog()
         self._event_queue.put_nowait(event)
 
@@ -1436,17 +1436,15 @@ class HarnessApp:
 
         Enforces two per-turn watchdogs, whichever trips first:
 
-        - IDLE (:data:`_TURN_IDLE_TIMEOUT_S`): each non-heartbeat
-          ``ctx.emit`` reschedules its deadline via the
-          ``_reset_idle_watchdog`` hook, so a turn that keeps making
-          progress (an orchestrator running tests + build + many tool
-          calls) is never killed — only one that emits nothing for the
-          whole window. This replaces the prior fixed *cumulative* cap,
-          which guillotined long-but-healthy turns mid-stream.
+        - IDLE (:data:`_TURN_IDLE_TIMEOUT_S`): each ``ctx.emit``
+          reschedules its deadline via the ``_reset_idle_watchdog``
+          hook. Heartbeats count as stream activity here, so a turn
+          parked on a legitimate quiet await is not killed solely for
+          withholding substantive deltas.
         - ABSOLUTE (:data:`_TURN_ABSOLUTE_TIMEOUT_S`): a hard ceiling on
           total duration, never rescheduled. Backstops the idle watchdog
-          against a runaway-but-active loop the idle one never sees as
-          stuck.
+          against a runaway-but-active or heartbeat-only loop the idle
+          one never sees as stuck.
 
         Either expiry surfaces a wedged/runaway ``run_turn`` as
         ``response.failed``.
@@ -1465,8 +1463,9 @@ class HarnessApp:
             def _reset() -> None:
                 # Push ONLY the idle deadline ``idle_timeout`` s past now
                 # (the absolute ceiling is never rescheduled). Called from
-                # ``ctx.emit`` during ``run_turn`` (inside the active
-                # context), so the reschedule is always valid.
+                # ``ctx.emit`` while the guarded turn context is active
+                # (run_turn itself or the heartbeat task), so the
+                # reschedule is always valid.
                 idle_wd.reschedule(loop.time() + idle_timeout)
 
             ctx._reset_idle_watchdog = _reset
@@ -1478,14 +1477,15 @@ class HarnessApp:
         except TimeoutError as exc:
             if idle_wd.expired():
                 _logger.warning(
-                    "run_turn for %s made no progress for %.0fs (idle turn watchdog); "
+                    "run_turn for %s emitted no stream activity for %.0fs "
+                    "(idle turn watchdog); "
                     "marking the turn failed",
                     ctx.response_id,
                     idle_timeout,
                 )
                 raise RuntimeError(
                     f"turn exceeded the {idle_timeout:.0f}s harness idle watchdog "
-                    f"(run_turn emitted no events for {idle_timeout:.0f}s; "
+                    f"(run_turn emitted no stream activity for {idle_timeout:.0f}s; "
                     f"likely a wedged LLM or tool call)"
                 ) from exc
             if absolute_wd.expired():
