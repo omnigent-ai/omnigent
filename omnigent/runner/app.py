@@ -12154,6 +12154,13 @@ def create_runner_app(
         _active_turns.pop(conv_id, None)
         # Turn ended: clear the live marker so a concurrent forward is skipped.
         _live_response_id.pop(conv_id, None)
+        # Mirror the clear onto the process manager's in-flight map so the
+        # idle reaper can reap the (now genuinely idle) entry once its idle
+        # window elapses. Reached on every terminal path, so a dropped or
+        # late terminal SSE event can't strand a permanently-marked entry
+        # (which would never be reaped — the inverse of #1414, cf. #1349).
+        if process_manager is not None:
+            process_manager.clear_in_flight(conv_id)
         # Skip the idle transient when a buffered message will start a
         # continuation turn immediately — `_check_and_start_next_turn`
         # publishes "running" microseconds later, and the in-between idle
@@ -13809,6 +13816,13 @@ def create_runner_app(
                                         _resp_to_conv[_response_id] = conv_id
                                         # Mark the turn live for the forward gate.
                                         _live_response_id[conv_id] = _response_id
+                                        # Register the live turn with the process
+                                        # manager so its idle reaper skips this
+                                        # conversation while it is streaming (and
+                                        # forward_cancel can resolve the harness
+                                        # response id). Cleared in
+                                        # _on_proxy_stream_end. See issue #1414.
+                                        process_manager.mark_in_flight(conv_id, _response_id)
 
                                 # Defer publish for action_required
                                 # events that the runner dispatches
