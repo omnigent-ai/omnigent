@@ -243,3 +243,58 @@ def test_ucode_state_with_model_is_not_overridden_by_default(
     env = _build_claude_sdk_spawn_env(spec, workdir=None)
 
     assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-sonnet-4-6"
+
+
+def test_telemetry_env_injected_when_configured_and_span_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Issue #1051: with OTLP configured and an active omnigent span,
+    the builder injects ``TRACEPARENT`` plus the Claude Agent SDK's
+    telemetry-enable flags so the SDK's provider subprocess spans
+    nest under the omnigent agent span in the same trace.
+
+    Failure means the SDK either has no parent context (spans land
+    in a sibling trace) or has the wrong endpoint configured.
+    """
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
+
+    # Use a fresh OTel TracerProvider directly so the active-span
+    # context is guaranteed regardless of whether MLflow's tracing
+    # provider has been initialized in this test session.
+    provider = TracerProvider()
+    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
+    tracer = otel_trace.get_tracer("omnigent.test")
+
+    with tracer.start_as_current_span("agent"):
+        env = _build_claude_sdk_spawn_env(_make_spec(auth=ApiKeyAuth(api_key="x")), workdir=None)
+
+    assert "TRACEPARENT" in env
+    assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://localhost:4317"
+    assert env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
+    assert env["OTEL_TRACES_EXPORTER"] == "otlp"
+
+
+def test_no_telemetry_env_leaks_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Without ``OTEL_EXPORTER_OTLP_ENDPOINT``, no OTel keys leak into
+    the spawn env — operators who haven't wired up a collector get
+    no half-configured OTel state in the executor subprocess.
+    """
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+
+    env = _build_claude_sdk_spawn_env(_make_spec(auth=ApiKeyAuth(api_key="x")), workdir=None)
+
+    for key in (
+        "TRACEPARENT",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "CLAUDE_CODE_ENABLE_TELEMETRY",
+        "OTEL_TRACES_EXPORTER",
+    ):
+        assert key not in env, f"unexpected {key!r} in spawn env: {env!r}"

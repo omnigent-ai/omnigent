@@ -198,3 +198,51 @@ def test_no_ucode_pi_entry_leaves_model_to_executor_default(
     assert env["HARNESS_PI_DATABRICKS_PROFILE"] == "oss"
     # No producer model — the executor's profile-path default applies.
     assert "HARNESS_PI_MODEL" not in env
+
+
+def test_telemetry_env_injected_when_configured_and_span_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Issue #1051: with OTLP configured and an active omnigent span,
+    the pi builder injects ``TRACEPARENT`` plus the OTLP exporter
+    knobs so the pi subprocess's LLM provider spans nest under the
+    omnigent agent span. The Claude SDK-specific flags must NOT be
+    set — pi doesn't read them.
+    """
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
+
+    # Use a fresh OTel TracerProvider directly so the active-span
+    # context is guaranteed regardless of MLflow tracing init state.
+    provider = TracerProvider()
+    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
+    tracer = otel_trace.get_tracer("omnigent.test")
+
+    with tracer.start_as_current_span("agent"):
+        env = _build_pi_spawn_env(_make_spec(model="openai/gpt-5.4"), workdir=None)
+
+    assert "TRACEPARENT" in env
+    assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://localhost:4317"
+    # pi does not read the Claude SDK flags. Gating those to claude_sdk=True
+    # keeps them out of unrelated subprocess envs.
+    assert "CLAUDE_CODE_ENABLE_TELEMETRY" not in env
+    assert "OTEL_TRACES_EXPORTER" not in env
+
+
+def test_no_telemetry_env_leaks_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Without ``OTEL_EXPORTER_OTLP_ENDPOINT``, no OTel keys leak into
+    the pi spawn env.
+    """
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+
+    env = _build_pi_spawn_env(_make_spec(model="openai/gpt-5.4"), workdir=None)
+
+    for key in ("TRACEPARENT", "OTEL_EXPORTER_OTLP_ENDPOINT"):
+        assert key not in env, f"unexpected {key!r} in spawn env: {env!r}"

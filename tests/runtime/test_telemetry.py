@@ -494,6 +494,127 @@ def test_get_traceparent_env_inside_span(
             )
 
 
+# ── get_otel_subprocess_env ─────────────────────────────
+
+
+def test_get_otel_subprocess_env_no_endpoint_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Without ``OTEL_EXPORTER_OTLP_ENDPOINT``, the helper returns an
+    empty dict — no half-configured OTel state leaks into executor
+    subprocesses. This is the no-op baseline operators get when they
+    haven't wired up a collector.
+    """
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_PROTOCOL", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_HEADERS", raising=False)
+    monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
+
+    assert telemetry.get_otel_subprocess_env() == {}
+    assert telemetry.get_otel_subprocess_env(claude_sdk=True) == {}
+
+
+def test_get_otel_subprocess_env_endpoint_no_active_span(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With an endpoint configured but no active span, the helper
+    forwards the OTLP exporter knobs but emits no TRACEPARENT —
+    the child has a collector to ship to but no parent span to
+    nest under (e.g. a subprocess launched during server warmup
+    before any agent turn started).
+    """
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-token=abc")
+    monkeypatch.setenv("OTEL_SERVICE_NAME", "omnigent-test")
+
+    env = telemetry.get_otel_subprocess_env()
+
+    assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://localhost:4317"
+    assert env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "grpc"
+    assert env["OTEL_EXPORTER_OTLP_HEADERS"] == "x-token=abc"
+    assert env["OTEL_SERVICE_NAME"] == "omnigent-test"
+    # No active span → propagator emits no carrier → no TRACEPARENT.
+    assert "TRACEPARENT" not in env
+    assert "TRACESTATE" not in env
+
+
+def test_get_otel_subprocess_env_endpoint_with_active_span(
+    monkeypatch: pytest.MonkeyPatch,
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    Inside an active span with an endpoint configured, the helper
+    emits both the OTLP exporter knobs AND the TRACEPARENT — this
+    is the normal in-flight executor case where a child process
+    must nest under the omnigent agent span in the same trace.
+    """
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+
+    import mlflow
+    from mlflow.entities import SpanType
+
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with mlflow.start_span("agent", span_type=SpanType.AGENT):
+            env = telemetry.get_otel_subprocess_env()
+
+    assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://localhost:4317"
+    assert env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+    assert "TRACEPARENT" in env
+    parts = env["TRACEPARENT"].split("-")
+    assert len(parts) == 4
+    # The TRACEPARENT trace_id must equal our derived hex so the
+    # subprocess's spans land in the same trace as the parent.
+    assert parts[1] == _RESP_HEX
+
+
+def test_get_otel_subprocess_env_claude_sdk_sets_sdk_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``claude_sdk=True`` flips the SDK's built-in telemetry hooks on
+    via ``CLAUDE_CODE_ENABLE_TELEMETRY=1`` and
+    ``OTEL_TRACES_EXPORTER=otlp``. These are gated because they're
+    no-ops in the other executor subprocesses (codex, pi, openai
+    agents) and we don't want to spam unrecognized env vars.
+    """
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+
+    env = telemetry.get_otel_subprocess_env(claude_sdk=True)
+
+    assert env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
+    assert env["OTEL_TRACES_EXPORTER"] == "otlp"
+    # The default branch must NOT set these flags.
+    plain = telemetry.get_otel_subprocess_env()
+    assert "CLAUDE_CODE_ENABLE_TELEMETRY" not in plain
+    assert "OTEL_TRACES_EXPORTER" not in plain
+
+
+def test_get_otel_subprocess_env_omits_unset_forwarded_vars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Only forwarded env vars that are actually set in the parent's
+    environment are copied — we do not invent defaults. This keeps
+    the subprocess env minimal and matches OTel's own behavior of
+    falling back to baked-in defaults when a knob is unset.
+    """
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_PROTOCOL", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_HEADERS", raising=False)
+    monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
+
+    env = telemetry.get_otel_subprocess_env()
+
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT" in env
+    assert "OTEL_EXPORTER_OTLP_PROTOCOL" not in env
+    assert "OTEL_EXPORTER_OTLP_HEADERS" not in env
+    assert "OTEL_SERVICE_NAME" not in env
+
+
 # ── record_llm_usage ────────────────────────────────────
 
 
