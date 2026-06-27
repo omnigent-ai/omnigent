@@ -128,7 +128,9 @@ class SysSessionSendTool(Tool):
             "Returns the child's output when its turn completes. To run "
             "multiple sessions in parallel, emit multiple "
             "sys_session_send tool_calls in the same response — they "
-            "dispatch concurrently."
+            "dispatch concurrently. To attach previously-uploaded files, "
+            "pass their file ids via the object args form's 'file_ids' "
+            "list."
         )
 
     def __init__(self, sub_specs: dict[str, AgentSpec]) -> None:
@@ -345,6 +347,16 @@ def _build_sys_session_send_schema(
                                             "Applies only when this send "
                                             "CREATES the sub-agent session; "
                                             "omitted = the harness default."
+                                        ),
+                                    },
+                                    "file_ids": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": (
+                                            "Optional list of file ids for "
+                                            "files you previously uploaded. "
+                                            "Attaches those files to the "
+                                            "sub-agent so it can read them."
                                         ),
                                     },
                                     **harness_property,

@@ -198,6 +198,8 @@ from omnigent.server.schemas import (
     ChildSessionSummary,
     CompletedEvent,
     ConversationDeleted,
+    CopyFilesRequest,
+    CopyFilesResponse,
     CreatedSessionResponse,
     ElicitationRequestEvent,
     ElicitationRequestParams,
@@ -17153,6 +17155,110 @@ def create_sessions_router(
             "object": "session.resource.deleted",
             "deleted": True,
         }
+
+    @router.post(
+        "/sessions/{session_id}/resources/files:copy",
+        response_model=None,
+    )
+    async def copy_session_files(
+        request: Request,
+        session_id: str,
+        body: CopyFilesRequest,
+    ) -> dict[str, Any]:
+        """
+        Copy lineage-owned files into this (destination) session.
+
+        Authorizes by spawn lineage: ``body.source_session_id`` must be
+        the destination itself or one of its ``parent_conversation_id``
+        ancestors. Each source file is read and re-stored as a new
+        child-scoped row owned by ``session_id`` — this preserves the
+        session-scoping invariant (the child reads its OWN copy; no
+        cross-session read grant is created). Validation is all-or-
+        nothing: an unauthorized source or a missing file copies nothing.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Destination (child) session/conversation id.
+        :param body: Source session id plus the file ids to copy.
+        :returns: A ``session.files.copied`` object carrying the
+            ``{source_file_id: new_file_id}`` mapping.
+        """
+        await _validate_session(session_id, request, LEVEL_EDIT)
+        if file_store is None or artifact_store is None:
+            raise HTTPException(
+                status_code=501,
+                detail="file store not configured",
+            )
+
+        # Lineage authorization: the source must be a STRICT ancestor up
+        # the parent_conversation_id chain. A session may not name itself
+        # as the source — the contract is "copy files down from a parent",
+        # and a top-level session has no lineage to copy from.
+        if body.source_session_id not in set(
+            _ancestor_session_ids(conversation_store, session_id)
+        ):
+            raise OmnigentError(
+                "Source session is not an ancestor of this session",
+                code=ErrorCode.FORBIDDEN,
+            )
+
+        # Validate AND prefetch every source file before writing anything.
+        # Reading the bytes here (not just the metadata row) surfaces a
+        # missing blob before any child row is created, so the copy stays
+        # all-or-nothing under storage failures, not just missing metadata.
+        sources: list[tuple[StoredFile, bytes]] = []
+        for file_id in body.file_ids:
+            stored = file_store.get(file_id, session_id=body.source_session_id)
+            if stored is None:
+                raise OmnigentError(
+                    f"File '{file_id}' not found in source session",
+                    code=ErrorCode.NOT_FOUND,
+                )
+            sources.append((stored, artifact_store.get(stored.id)))
+
+        # Commit the copies. If any write fails mid-batch, roll back the
+        # rows/blobs already created so a partial copy never persists.
+        mapping: dict[str, str] = {}
+        created: list[str] = []
+        copied: list[StoredFile] = []
+        try:
+            for stored, content in sources:
+                new = file_store.create(
+                    session_id=session_id,
+                    filename=stored.filename,
+                    bytes=stored.bytes,
+                    content_type=stored.content_type,
+                )
+                created.append(new.id)
+                artifact_store.put(new.id, content)
+                mapping[stored.id] = new.id
+                copied.append(new)
+        except Exception:
+            for new_id in created:
+                with contextlib.suppress(Exception):
+                    file_store.delete(new_id, session_id=session_id)
+                    artifact_store.delete(new_id)
+            raise
+
+        # Resource events fire only after every write lands. Publishing them
+        # inside the copy loop would emit (and persist as transcript items)
+        # ``session.resource.created`` for early files, then a later write
+        # failure would roll back the file rows/blobs without compensating
+        # those events — clients would see phantom files that no longer
+        # exist. Keep the create + event all-or-nothing together.
+        for new in copied:
+            _publish_and_persist_resource_event(
+                session_id,
+                "session.resource.created",
+                resource_id=new.id,
+                resource_type="file",
+                conversation_store=conversation_store,
+                resource=_stored_file_to_resource(session_id, new),
+            )
+
+        return CopyFilesResponse(
+            session_id=session_id,
+            mapping=mapping,
+        ).model_dump()
 
     # ── Phase 3: environment filesystem proxy endpoints ──────────
 

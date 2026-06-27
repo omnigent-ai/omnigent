@@ -969,6 +969,30 @@
         "title": "ConversationRef",
         "type": "object"
       },
+      "CopyFilesRequest": {
+        "description": "Request to copy files from a lineage ancestor into a session.\n\nThe destination session is the path parameter; `source_session_id`\nmust be the destination itself or one of its `parent_conversation_id`\nancestors (spawn lineage). The copy creates new child-scoped rows \u2014\nit does not grant cross-session read access.",
+        "properties": {
+          "file_ids": {
+            "description": "Ids of the source-owned files to copy, e.g. `[\"file_abc123\"]`.",
+            "items": {
+              "type": "string"
+            },
+            "title": "File Ids",
+            "type": "array"
+          },
+          "source_session_id": {
+            "description": "Session that owns the source files, e.g. `\"conv_parent\"`. Must be in the destination's lineage.",
+            "title": "Source Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_session_id",
+          "file_ids"
+        ],
+        "title": "CopyFilesRequest",
+        "type": "object"
+      },
       "CreateDefaultPolicyRequest": {
         "description": "Request body for `POST /v1/policies`.",
         "properties": {
@@ -9868,6 +9892,58 @@
           }
         },
         "summary": "Get Session File Content",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/files:copy": {
+      "post": {
+        "description": "Copy lineage-owned files into this (destination) session.\n\nAuthorizes by spawn lineage: `body.source_session_id` must be\nthe destination itself or one of its `parent_conversation_id`\nancestors. Each source file is read and re-stored as a new\nchild-scoped row owned by `session_id` \u2014 this preserves the\nsession-scoping invariant (the child reads its OWN copy; no\ncross-session read grant is created). Validation is all-or-\nnothing: an unauthorized source or a missing file copies nothing.\n\n**Parameters**\n\n- `body` \u2014 Source session id plus the file ids to copy.\n\n**Returns:** A `session.files.copied` object carrying the `{source_file_id: new_file_id}` mapping.",
+        "operationId": "copy_session_files_v1_sessions__session_id__resources_files_copy_post",
+        "parameters": [
+          {
+            "description": "Destination (child) session/conversation id.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CopyFilesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Copy Session Files",
         "tags": [
           "session_resources"
         ]

@@ -513,6 +513,40 @@ class FileObject(BaseModel):
     created_at: int
 
 
+class CopyFilesRequest(BaseModel):
+    """
+    Request to copy files from a lineage ancestor into a session.
+
+    The destination session is the path parameter; ``source_session_id``
+    must be the destination itself or one of its ``parent_conversation_id``
+    ancestors (spawn lineage). The copy creates new child-scoped rows —
+    it does not grant cross-session read access.
+
+    :param source_session_id: Session that owns the source files, e.g.
+        ``"conv_parent"``. Must be in the destination's lineage.
+    :param file_ids: Ids of the source-owned files to copy, e.g.
+        ``["file_abc123"]``.
+    """
+
+    source_session_id: str
+    file_ids: list[str]
+
+
+class CopyFilesResponse(BaseModel):
+    """
+    Result of a lineage-scoped file copy.
+
+    :param object: Fixed type, always ``"session.files.copied"``.
+    :param session_id: Destination session that now owns the copies.
+    :param mapping: Map of source ``file_id`` to the new child-scoped
+        file id, e.g. ``{"file_abc123": "file_def456"}``.
+    """
+
+    object: str = "session.files.copied"
+    session_id: str
+    mapping: dict[str, str]
+
+
 # ── Session Resources ───────────────────────────────────────────
 
 
