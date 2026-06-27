@@ -27,6 +27,7 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent import (
+    antigravity_native_bridge,
     claude_native_bridge,
     codex_native_bridge,
     cursor_native_bridge,
@@ -9813,6 +9814,349 @@ async def test_events_stop_session_on_native_returns_503_when_kill_fails(
         f"No session.status: idle should be enqueued when kill_session "
         f"failed; got {status_idle!r}."
     )
+
+
+@pytest.mark.asyncio
+async def test_events_stop_session_on_antigravity_native_kills_and_publishes_idle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    POST ``/events`` ``stop_session`` on an antigravity-native session kills the
+    agy pane, tears down terminals, and clears the spinner.
+
+    antigravity-native was the only native harness in neither the interrupt nor
+    the stop dispatch, so Stop session was a silent no-op — the agy process +
+    runner-owned pane leaked. The stop handler must mirror cursor-native:
+    ``kill_session`` (1.0s snappy timeout), then exactly one
+    ``session.status: idle`` so the web spinner clears, and NO interrupted
+    marker (a teardown is not a mid-turn interrupt).
+    """
+    from omnigent.runner.app import _session_event_queues_ref, _session_histories_ref
+
+    monkeypatch.setattr(antigravity_native_bridge, "_BRIDGE_ROOT", tmp_path / "agy-bridge")
+    captured_kill: list[Any] = []
+
+    def _fake_kill(bridge_dir: Any, *, timeout_s: float) -> None:
+        """Record the kill and return without touching tmux."""
+        captured_kill.append((bridge_dir, timeout_s))
+
+    monkeypatch.setattr(antigravity_native_bridge, "kill_session", _fake_kill)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the antigravity-native spec for any agent_id."""
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_agy_stop", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        stop_resp = await client.post(
+            "/v1/sessions/conv_agy_stop/events",
+            json={"type": "stop_session"},
+        )
+
+        queue = _session_event_queues_ref.get("conv_agy_stop")
+        assert queue is not None
+        queued_events: list[dict[str, Any]] = []
+        while not queue.empty():
+            item = queue.get_nowait()
+            if isinstance(item, dict):
+                queued_events.append(item)
+        captured_history = list(_session_histories_ref.get("conv_agy_stop", []))
+
+    assert stop_resp.status_code == 204, (
+        f"antigravity-native stop_session must return 204 from /events (was a "
+        f"silent no-op fall-through); got {stop_resp.status_code}: {stop_resp.text}"
+    )
+    assert len(captured_kill) == 1, (
+        f"Expected one kill_session call routed by the antigravity-native stop "
+        f"dispatch branch, got {len(captured_kill)}."
+    )
+    _bridge_dir, timeout_s = captured_kill[0]
+    assert timeout_s == 1.0
+    status_idle = [
+        e for e in queued_events if e.get("type") == "session.status" and e.get("status") == "idle"
+    ]
+    assert len(status_idle) == 1, (
+        f"Expected exactly one explicit stop-edge session.status: idle, got "
+        f"{len(status_idle)}. Full queue: {queued_events!r}."
+    )
+    markers = [
+        h
+        for h in captured_history
+        if h.get("type") == "message"
+        and h.get("role") == "user"
+        and any("interrupted" in (b.get("text") or "").lower() for b in h.get("content", []))
+    ]
+    assert markers == [], f"stop_session must not append an interrupted marker; got {markers!r}."
+
+
+@pytest.mark.asyncio
+async def test_events_stop_session_on_antigravity_native_returns_503_when_kill_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """antigravity-native stop returns 503 (no idle) when ``kill_session`` fails."""
+    from omnigent.runner.app import _session_event_queues_ref
+
+    monkeypatch.setattr(antigravity_native_bridge, "_BRIDGE_ROOT", tmp_path / "agy-bridge")
+
+    def _fake_kill(bridge_dir: Any, *, timeout_s: float) -> None:
+        del bridge_dir, timeout_s
+        raise RuntimeError("tmux target is not advertised")
+
+    monkeypatch.setattr(antigravity_native_bridge, "kill_session", _fake_kill)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_agy_stop_fail", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        stop_resp = await client.post(
+            "/v1/sessions/conv_agy_stop_fail/events",
+            json={"type": "stop_session"},
+        )
+        queue = _session_event_queues_ref.get("conv_agy_stop_fail")
+        assert queue is not None
+        queued_events = [queue.get_nowait() for _ in range(queue.qsize())]
+
+    assert stop_resp.status_code == 503, stop_resp.text
+    assert stop_resp.json().get("error") == "antigravity_native_stop_failed"
+    status_idle = [
+        e
+        for e in queued_events
+        if isinstance(e, dict) and e.get("type") == "session.status" and e.get("status") == "idle"
+    ]
+    assert status_idle == [], "No idle on the failed-kill path."
+
+
+@pytest.mark.asyncio
+async def test_events_interrupt_on_antigravity_native_cancels_running_cascade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    POST ``/events`` ``interrupt`` on antigravity-native cancels the running
+    cascade over connect-RPC.
+
+    The executor's ``run_turn`` returns the instant the message is typed into the
+    agy TUI, so the in-process cancel floor is a no-op; the interrupt must drive
+    agy's ``CancelCascadeSteps`` instead. With no WAITING step present, the
+    handler cancels the running cascade (not a deny).
+    """
+    import omnigent.antigravity_native_interactions as agy_interactions
+    import omnigent.antigravity_native_rpc as agy_rpc
+    from omnigent.antigravity_native_bridge import (
+        AntigravityNativeBridgeState,
+        bridge_dir_for_bridge_id,
+        prepare_bridge_dir,
+        write_bridge_state,
+    )
+
+    monkeypatch.setattr(antigravity_native_bridge, "_BRIDGE_ROOT", tmp_path / "agy-bridge")
+    # Real (non-placeholder) cascade id so the RPC interrupt path runs.
+    bridge_dir = prepare_bridge_dir("conv_agy_interrupt")
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(
+            session_id="conv_agy_interrupt", conversation_id="real-cascade-uuid"
+        ),
+    )
+    assert bridge_dir == bridge_dir_for_bridge_id("conv_agy_interrupt")
+
+    monkeypatch.setattr(agy_rpc, "resolve_language_server_port", lambda cid: 52548)
+    # No WAITING step in the trajectory → the cancel branch (not deny) runs.
+    monkeypatch.setattr(agy_rpc, "get_trajectory_steps", lambda port, cid: [])
+    cancelled: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        agy_rpc,
+        "cancel_cascade_steps",
+        lambda port, cid: cancelled.append((port, cid)) or True,
+    )
+    denied: list[Any] = []
+    monkeypatch.setattr(
+        agy_interactions,
+        "handle_user_interaction",
+        lambda *a, **k: denied.append((a, k)),
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_agy_interrupt", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            "/v1/sessions/conv_agy_interrupt/events",
+            json={"type": "interrupt"},
+        )
+
+    assert resp.status_code == 204, (
+        f"antigravity-native interrupt must 204 (was a no-op fall-through to the "
+        f"in-process cancel floor); got {resp.status_code}: {resp.text}"
+    )
+    assert cancelled == [(52548, "real-cascade-uuid")], (
+        f"interrupt must drive CancelCascadeSteps for the running cascade; got {cancelled!r}"
+    )
+    assert denied == [], "No deny should run when no step is WAITING."
+
+
+@pytest.mark.asyncio
+async def test_events_interrupt_on_antigravity_native_denies_waiting_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    POST ``/events`` ``interrupt`` on antigravity-native with a WAITING step
+    DENIES the interaction instead of (no-op) ``CancelCascadeSteps``.
+
+    ``CancelCascadeSteps`` is a no-op on a WAITING ask-question / permission
+    step (agy 200s but the step doesn't transition), so the interrupt must
+    deliver a refusal through ``HandleCascadeUserInteraction`` and clear the
+    parked card via ``external_elicitation_resolved``.
+    """
+    import omnigent.antigravity_native_interactions as agy_interactions
+    import omnigent.antigravity_native_rpc as agy_rpc
+    from omnigent.antigravity_native_bridge import (
+        AntigravityNativeBridgeState,
+        prepare_bridge_dir,
+        write_bridge_state,
+    )
+
+    monkeypatch.setattr(antigravity_native_bridge, "_BRIDGE_ROOT", tmp_path / "agy-bridge")
+    bridge_dir = prepare_bridge_dir("conv_agy_deny")
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(
+            session_id="conv_agy_deny", conversation_id="real-cascade-uuid"
+        ),
+    )
+
+    waiting_permission_step = {
+        "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+        "status": "CORTEX_STEP_STATUS_WAITING",
+        "requestedInteraction": {
+            "permission": {
+                "resource": {"action": "command", "target": "rm -rf /"},
+                "actionDescription": "Dangerous",
+            }
+        },
+        "metadata": {
+            "sourceTrajectoryStepInfo": {
+                "trajectoryId": "traj-1",
+                "stepIndex": 2,
+                "cascadeId": "real-cascade-uuid",
+            }
+        },
+    }
+
+    monkeypatch.setattr(agy_rpc, "resolve_language_server_port", lambda cid: 52548)
+    monkeypatch.setattr(
+        agy_rpc, "get_trajectory_steps", lambda port, cid: [waiting_permission_step]
+    )
+    cancelled: list[Any] = []
+    monkeypatch.setattr(
+        agy_rpc, "cancel_cascade_steps", lambda port, cid: cancelled.append((port, cid)) or True
+    )
+    delivered: list[dict[str, Any]] = []
+
+    def _fake_handle(port: int, cascade_id: str, **kwargs: Any) -> None:
+        """Record the DENY delivery."""
+        delivered.append({"port": port, "cascade_id": cascade_id, **kwargs})
+
+    monkeypatch.setattr(agy_interactions, "handle_user_interaction", _fake_handle)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_agy_deny", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            "/v1/sessions/conv_agy_deny/events",
+            json={"type": "interrupt"},
+        )
+
+    assert resp.status_code == 204, resp.text
+    assert len(delivered) == 1, (
+        f"A WAITING step must be DENIED via HandleCascadeUserInteraction, not "
+        f"left to the no-op CancelCascadeSteps; got {delivered!r}"
+    )
+    call = delivered[0]
+    assert call["step_index"] == 2
+    assert call["payload"]["permission"]["allow"] is False
+    # CancelCascadeSteps must NOT run on the WAITING path (it's a no-op there).
+    assert cancelled == [], "CancelCascadeSteps must be skipped when a step is WAITING."
 
 
 @pytest.mark.asyncio
