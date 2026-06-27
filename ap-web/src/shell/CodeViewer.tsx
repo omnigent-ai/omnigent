@@ -44,16 +44,15 @@ import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
 import {
   type ActiveSelection,
   type SaveStatus,
-  HTML_PREVIEW_SANDBOX,
   detectLang,
   getSelectionOffsets,
   indexToLine,
   isBinaryPath,
   isImageFile,
   lineOverlapsSelection,
-  prepareHtmlPreviewDoc,
 } from "./codeViewerHelpers";
 import { renderLineTokens } from "./codeViewerRendering";
+import { HtmlCommentViewer } from "./HtmlCommentViewer";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { getEmbedRoot } from "@/lib/host";
 
@@ -465,19 +464,24 @@ export function CodeViewer({
     );
   }
 
-  if (viewMode === "preview" && (lang === "markdown" || lang === "html")) {
-    const preview =
-      lang === "markdown" ? (
-        <MarkdownPreview content={content} />
-      ) : (
-        <iframe
-          srcDoc={prepareHtmlPreviewDoc(content)}
-          // oxlint-disable-next-line eslint-plugin-react(iframe-missing-sandbox)
-          sandbox={HTML_PREVIEW_SANDBOX}
-          title="HTML preview"
-          className="w-full h-full border-0"
-        />
-      );
+  // HTML preview gets its own comment-enabled viewer (selection capture +
+  // highlights relayed over a bridge into the still-sandboxed iframe), so it
+  // owns the truncated banner internally.
+  if (viewMode === "preview" && lang === "html") {
+    return (
+      <HtmlCommentViewer
+        conversationId={conversationId}
+        content={content}
+        truncated={truncated}
+        comments={comments}
+        activeSelection={activeSelection}
+        onSetActiveSelection={onSetActiveSelection}
+      />
+    );
+  }
+
+  if (viewMode === "preview" && lang === "markdown") {
+    const preview = <MarkdownPreview content={content} />;
     // A truncated preview renders incomplete content; warn the user (the editor
     // and source surfaces already do). No layout change when not truncated.
     if (!truncated) return preview;
