@@ -140,6 +140,27 @@ function openWorktree(): void {
   fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
 }
 
+/**
+ * Open the agent/harness picker and open <agentId>'s config submenu via
+ * keyboard (ArrowRight). A plain click on a knobbed row instead COMMITS the
+ * pick and closes the menu, so config flows use the keyboard to drill in.
+ */
+function openAgentConfig(agentId: string): void {
+  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  fireEvent.keyDown(screen.getByTestId(`new-chat-landing-agent-${agentId}`), { key: "ArrowRight" });
+}
+
+/** Open the picker and commit (select + close) an agent by clicking its row. */
+function selectAgent(agentId: string): void {
+  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+}
+
+/** Dismiss any open menu so a subsequent submit click isn't swallowed. */
+function closeMenu(): void {
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+}
+
 beforeEach(() => {
   navigateMock.mockReset();
   setPendingInitialPromptMock.mockReset();
@@ -516,17 +537,14 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open the composer's left run-mode pill (Radix opens on pointerdown) and
-    // pick a non-default mode. The create call proves the choice travels as
-    // a `--permission-mode <mode>` pair in terminal_launch_args.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-pill"), { button: 0 });
+    // Open Claude Code's config submenu (ArrowRight) and pick a non-default
+    // permission mode. The create call proves the choice travels as a
+    // `--permission-mode <mode>` pair in terminal_launch_args.
+    openAgentConfig("ag_native");
     fireEvent.click(screen.getByTestId("new-chat-landing-permission-bypassPermissions"));
-    // The pick shows on the mode pill, NOT appended to the agent label
-    // (the label stays the bare agent name).
-    expect(screen.getByTestId("new-chat-landing-permission-pill").textContent).toContain(
-      "Bypass permissions",
-    );
+    // The trigger label stays the bare agent name (the pick lives in the submenu).
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("(");
+    closeMenu();
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -555,11 +573,8 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Seeded without touching the pill — the label proves the state was
-    // pre-filled from storage.
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-permission-pill").textContent).toContain("Plan"),
-    );
+    // Seeded without opening the picker — submitting proves the state was
+    // pre-filled from storage and rides along to the create.
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -578,7 +593,7 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-pill"), { button: 0 });
+    openAgentConfig("ag_native");
     fireEvent.click(screen.getByTestId("new-chat-landing-permission-acceptEdits"));
 
     // The pick is snapshotted under the harness key immediately, so the next
@@ -590,7 +605,7 @@ describe("NewChatLandingScreen create flow", () => {
     );
   });
 
-  it("does not leak one harness's mode onto another harness's pill", async () => {
+  it("does not leak one harness's mode onto another harness", async () => {
     // Codex has a pick on record; selecting Claude Code (no pick) must stay on
     // its default — modes are keyed per harness, not shared.
     localStorage.setItem(
@@ -601,12 +616,16 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Claude Code has no stored pick → default; Codex's "Full access" must not
-    // bleed into the permission pill.
-    expect(screen.getByTestId("new-chat-landing-permission-pill").textContent).toContain("Default");
-    expect(screen.getByTestId("new-chat-landing-permission-pill").textContent).not.toContain(
-      "Full access",
+    // Open Claude Code's submenu: its permission mode is at "Default" (the
+    // checked radio), and Codex's "Full access" approval preset doesn't even
+    // exist in this submenu — no cross-harness bleed.
+    openAgentConfig("ag_native");
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("new-chat-landing-permission-default").getAttribute("aria-checked"),
+      ).toBe("true"),
     );
+    expect(screen.queryByTestId("new-chat-landing-approval-full-access")).toBeNull();
   });
 
   it("resets the shared approval mode to default when switching codex-native → opencode-native", async () => {
@@ -626,32 +645,22 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Pick "Full access" for Codex.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    // Pick "Full access" for Codex (single-section submenu → closes on pick).
+    openAgentConfig("ag_codex");
     fireEvent.click(screen.getByTestId("new-chat-landing-approval-full-access"));
-    expect(screen.getByTestId("new-chat-landing-approval-pill").textContent).toContain(
-      "Full access",
-    );
 
-    // Switch the picker to OpenCode (Radix opens on pointerdown).
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_opencode"));
+    // Switch the picker to OpenCode by clicking its row (commits the pick).
+    selectAgent("ag_opencode");
 
     // OpenCode has no stored pick → the shared approval knob must reset to
-    // Default, not keep Codex's "Full access".
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-approval-pill").textContent).toContain("Default"),
-    );
-    expect(screen.getByTestId("new-chat-landing-approval-pill").textContent).not.toContain(
-      "Full access",
-    );
-
-    // And that reset must reach the launch args: no sandbox/approval flags.
+    // Default, not keep Codex's "Full access". Proven by the launch args:
+    // a default preset posts no sandbox/approval flags.
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string);
+    expect(body.labels?.["omnigent.wrapper"]).toBe("opencode-native-ui");
     expect(body.terminal_launch_args).toBeUndefined();
   });
 
@@ -690,18 +699,15 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // The model/effort trigger shows Claude Code's effective defaults…
-    const trigger = screen.getByTestId("new-chat-landing-model-trigger");
-    expect(trigger.textContent).toContain("Sonnet");
-    expect(trigger.textContent).toContain("Medium");
+    // Claude Code's effective defaults (Sonnet / Medium) ride along on the
+    // create without the user opening the picker — the runner reads them as
+    // --model / --effort at terminal launch.
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string);
-    // …and they ride along on the create — the runner reads them as
-    // --model / --effort at terminal launch.
     expect(body.model_override).toBe("sonnet");
     expect(body.reasoning_effort).toBe("medium");
   });
@@ -715,16 +721,12 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Model + effort are two radio groups in one menu; selecting an item
-    // closes the menu, so reopen between the two picks.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-model-trigger"), { button: 0 });
+    // Model, effort and permission mode share Claude Code's one config submenu;
+    // it stays open across picks (multi-section) so both can be set in one visit.
+    openAgentConfig("ag_native");
     fireEvent.click(screen.getByTestId("new-chat-landing-model-opus"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-model-trigger"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-effort-high"));
-    // The trigger reflects both picks immediately.
-    const trigger = screen.getByTestId("new-chat-landing-model-trigger");
-    expect(trigger.textContent).toContain("Opus");
-    expect(trigger.textContent).toContain("High");
+    closeMenu();
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -766,14 +768,10 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open the composer's left run-mode pill and pick "Full access".
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    // Open Codex's config submenu and pick "Full access" (single section →
+    // selecting it also commits and closes the menu).
+    openAgentConfig("ag_codex");
     fireEvent.click(screen.getByTestId("new-chat-landing-approval-full-access"));
-    // The pick shows on the mode pill, NOT appended to the agent label.
-    expect(screen.getByTestId("new-chat-landing-approval-pill").textContent).toContain(
-      "Full access",
-    );
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("(");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -821,12 +819,10 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open the composer's harness dropdown and pick Pi.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-harness-trigger"), { button: 0 });
+    // Open Polly's config submenu and pick the Pi harness (single section →
+    // selecting it commits the agent pick and closes the menu).
+    openAgentConfig("ag_polly");
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-pi"));
-    // The harness trigger reflects the pick; the agent label stays the bare
-    // name (no "(Pi)" suffix appended).
-    expect(screen.getByTestId("new-chat-landing-harness-trigger").textContent).toContain("Pi");
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("(");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -879,10 +875,11 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Pick Pi, then change mind back to the spec default (Claude SDK).
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-harness-trigger"), { button: 0 });
+    // Pick Pi, then change mind back to the spec default (Claude SDK). Each
+    // pick closes the single-section submenu, so reopen between the two.
+    openAgentConfig("ag_polly");
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-pi"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-harness-trigger"), { button: 0 });
+    openAgentConfig("ag_polly");
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-claude-sdk"));
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));

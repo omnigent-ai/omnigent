@@ -602,6 +602,27 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
   );
 }
 
+/**
+ * Open the agent/harness picker and open <agentId>'s config submenu via
+ * keyboard (ArrowRight). A plain click on a knobbed row instead COMMITS the
+ * pick and closes the menu, so config flows use the keyboard to drill in.
+ */
+function openAgentConfig(agentId: string): void {
+  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  fireEvent.keyDown(screen.getByTestId(`new-chat-landing-agent-${agentId}`), { key: "ArrowRight" });
+}
+
+/** Open the picker and commit (select + close) an agent by clicking its row. */
+function selectAgent(agentId: string): void {
+  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+}
+
+/** Dismiss any open menu. */
+function closeMenu(): void {
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+}
+
 describe("NewChatLandingScreen", () => {
   beforeEach(setupLandingMocks);
   afterEach(() => {
@@ -763,14 +784,15 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
   });
 
-  it("shows permission-mode options behind the run-mode pill for the claude-native agent", () => {
+  it("shows the Claude Code config knobs (model / effort / permission mode) in the picker submenu", () => {
     renderLanding();
-    // The radios live behind the composer's left-side run-mode pill — absent
-    // until the menu opens.
+    // The knobs live in the agent picker's per-entry submenu — absent until opened.
     expect(screen.queryByTestId("new-chat-landing-permission-plan")).toBeNull();
-    // a1 (Claude Code, claude-native) is the default agent → the composer
-    // surfaces the permission-mode pill with the permission-mode radios.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-pill"), { button: 0 });
+    // a1 (Claude Code, claude-native) is the default agent. Open its config
+    // submenu: model + effort + permission-mode radios all appear together.
+    openAgentConfig("a1");
+    expect(screen.getByTestId("new-chat-landing-model-sonnet")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-effort-medium")).toBeTruthy();
     const planOption = screen.getByTestId("new-chat-landing-permission-plan");
     expect(planOption.textContent).toContain("Plan");
     // The footer line explains the SELECTED mode until a row is hovered —
@@ -780,21 +802,12 @@ describe("NewChatLandingScreen", () => {
     expect(detail.textContent).toContain("Prompts before edits and commands");
     fireEvent.pointerEnter(planOption);
     expect(detail.textContent).toContain("Plans only; makes no edits");
-    // Switch to Codex (a2: codex-native) — the run-mode pill stays visible
-    // but now shows approval-mode radios instead of permission-mode radios.
-    // Close the menu first (Escape), then switch agents.
-    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    expect(screen.queryByTestId("new-chat-landing-approval-pill")).not.toBeNull();
   });
 
-  it("shows approval-mode options behind the run-mode pill for the codex-native agent", () => {
+  it("shows the Codex approval-mode knobs in the picker submenu", () => {
     renderLanding();
-    // Switch to Codex first.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    // Open Codex's (a2) config submenu — it carries the approval-mode radios.
+    openAgentConfig("a2");
     const fullAccessOption = screen.getByTestId("new-chat-landing-approval-full-access");
     expect(fullAccessOption.textContent).toContain("Full access");
     // The footer line explains the SELECTED mode until a row is hovered.
@@ -807,10 +820,10 @@ describe("NewChatLandingScreen", () => {
 
   it("arms codex full bypass only after the confirmation phrase is typed", async () => {
     renderLanding();
-    // Switch to Codex, open the Advanced menu.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    // Commit Codex as the selected agent, then reopen its config submenu where
+    // the bypass opt-in lives (arming requires Codex to be the live selection).
+    selectAgent("a2");
+    openAgentConfig("a2");
     const toggle = screen.getByTestId(
       "new-chat-landing-bypass-sandbox-switch",
     ) as HTMLButtonElement;
@@ -850,30 +863,28 @@ describe("NewChatLandingScreen", () => {
 
   it("disarms the dangerous bypass when the agent changes (re-confirm per context)", () => {
     renderLanding();
-    // Arm bypass on Codex (a2): type the phrase, flip the switch, close tray.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    // Arm bypass on Codex (a2): commit it, open its submenu, type the phrase,
+    // flip the switch, close the menu.
+    selectAgent("a2");
+    openAgentConfig("a2");
     fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
       target: { value: "bypass sandbox" },
     });
     fireEvent.click(screen.getByTestId("new-chat-landing-bypass-sandbox-switch"));
-    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    closeMenu();
     // Armed → the persistent banner is up under the composer.
     expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeTruthy();
 
     // Switch away to Claude (a1): the armed bypass must clear immediately, so
     // the persistent banner disappears (Claude has no bypass toggle at all).
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a1"));
+    selectAgent("a1");
     expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeNull();
 
-    // Switch back to Codex and reopen Advanced: the toggle is OFF and disabled
-    // again — the confirmation phrase must be re-typed for this fresh context.
-    // Without the reset effect it would re-render armed from stale state.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    // Switch back to Codex and reopen its submenu: the toggle is OFF and
+    // disabled again — the confirmation phrase must be re-typed for this fresh
+    // context. Without the reset effect it would re-render armed from stale state.
+    selectAgent("a2");
+    openAgentConfig("a2");
     const toggle = screen.getByTestId(
       "new-chat-landing-bypass-sandbox-switch",
     ) as HTMLButtonElement;
@@ -888,15 +899,14 @@ describe("NewChatLandingScreen", () => {
       json: async () => ({ id: "conv_new" }),
     } as unknown as Response);
     renderLanding();
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    selectAgent("a2");
+    openAgentConfig("a2");
     fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
       target: { value: "bypass sandbox" },
     });
     fireEvent.click(screen.getByTestId("new-chat-landing-bypass-sandbox-switch"));
     // Close the menu and submit a real task.
-    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    closeMenu();
     // The persistent banner remains visible under the composer after the
     // Advanced tray closes.
     expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeTruthy();
