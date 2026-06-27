@@ -803,6 +803,74 @@ def test_read_databrickscfg_missing_profile_falls_back_to_file_reader(
     assert creds.token == "dapi-fake-pat-token-for-unit-test"
 
 
+def test_get_openai_client_uses_plain_openai_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_databricks_env: None,
+) -> None:
+    """A plain ``OPENAI_API_KEY`` (no ``OPENAI_BASE_URL``) builds an OpenAI
+    client against the default endpoint instead of falling through to
+    Databricks auth.
+
+    Before the fix, ``_get_openai_client`` only handled ``OPENAI_BASE_URL``
+    or a ``~/.databrickscfg`` profile, so a user who had configured only
+    ``OPENAI_API_KEY`` fell through to ``_resolve_databricks_auth`` and hit a
+    misleading "The 'databricks-sdk' package is required..." ImportError.
+    """
+    from omnigent.inner.databricks_executor import _get_openai_client
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+
+    captured: dict[str, Any] = {}
+
+    def _fake_openai(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("openai.OpenAI", _fake_openai)
+
+    # The Databricks fallback must not be reached for a plain OpenAI key.
+    def _no_databricks(*_args: Any, **_kwargs: Any) -> object:
+        raise AssertionError(
+            "_resolve_databricks_auth must not be called when OPENAI_API_KEY is set"
+        )
+
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        _no_databricks,
+    )
+
+    _get_openai_client()
+
+    assert captured == {"api_key": "sk-test-key"}
+
+
+def test_get_openai_client_base_url_takes_precedence_over_plain_key(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_databricks_env: None,
+) -> None:
+    """``OPENAI_BASE_URL`` still wins over a bare ``OPENAI_API_KEY`` so the
+    gateway/Databricks-serving path is unchanged by the new plain-key mode.
+    """
+    from omnigent.inner.databricks_executor import _get_openai_client
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+
+    captured: dict[str, Any] = {}
+
+    def _fake_openai(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("openai.OpenAI", _fake_openai)
+
+    _get_openai_client()
+
+    assert captured["base_url"] == "https://gateway.example/v1"
+    assert captured["api_key"] == "sk-test-key"
+
+
 def test_read_databrickscfg_empty_config_file_returns_none(
     tmp_path: _Path,
     monkeypatch: pytest.MonkeyPatch,
