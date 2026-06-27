@@ -1043,6 +1043,12 @@ async def supervise_reader(
         # cancelled at), so cancelling both reaches quiescence in a few bounded passes
         # — never an unbounded chain.
         for _ in range(_INTERACTION_DRAIN_PASSES):
+            # Flush queued done-callbacks first: a bridge that completed NORMALLY just
+            # before teardown has a pending ``_clear_slot`` that still schedules a
+            # re-scan — yield once so it lands in ``interaction_rescans`` before the
+            # snapshot below, else it would escape the drain and run post-teardown
+            # (#1472 review).
+            await asyncio.sleep(0)
             inflight = [
                 pending
                 for pending in (state.interaction_task, *state.interaction_rescans)
@@ -1849,13 +1855,16 @@ async def _resurface_pending_interaction(
     Re-surface a WAITING interaction the single-in-flight guard DEFERRED.
 
     Scheduled by an interaction bridge's done-callback (``_clear_slot`` in
-    :func:`_maybe_handle_interaction`). While one bridge runs, the guard skips any
-    other WAITING step so two bridges never race agy's freshest-WAITING delivery
-    (which targets the highest-index WAITING step of a kind, with no per-step
-    pinning). A genuinely-new gate that arrived during that window — e.g. the next
-    segment of a chained ``a && b`` command, each gated separately — is therefore
-    deferred; on the stream path agy emits no further frame while parked on it, so
-    without this re-scan it would hang forever (#1472).
+    :func:`_maybe_handle_interaction`). The guard surfaces one interaction at a time
+    because mis-delivery is otherwise possible: agy gates SEQUENTIALLY (one WAITING
+    step of a kind at a time — the next tool step stays PENDING until the current
+    resolves), and ``bridge_interaction`` pins its verdict to the surfaced step (or,
+    if that step timed out, its same-gate retry — see ``_waiting_step_at``). Serial
+    surfacing keeps the human's answer matched to the gate it was shown for. A
+    genuinely-new gate that arrives while a bridge runs — e.g. the next segment of a
+    chained ``a && b`` command, each gated separately — is therefore deferred; on the
+    stream path agy emits no further frame while parked on it, so without this re-scan
+    it would hang forever (#1472).
 
     This re-reads the freshest trajectory snapshot and re-dispatches every step
     through :func:`_maybe_handle_interaction`. ``state.interacted`` makes any
