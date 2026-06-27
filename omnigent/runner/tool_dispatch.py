@@ -1657,6 +1657,7 @@ def _finalize_created_session(
     agent_id: str,
     title: Any,
     publish_event: Callable[[str, dict[str, Any]], None] | None,
+    has_initial_turn: bool,
 ) -> str:
     """
     Register fan-out, emit ``session.created``, and build the handle.
@@ -1667,12 +1668,22 @@ def _finalize_created_session(
     conversation row), and returns the handle the orchestrator uses to
     drive / monitor the child.
 
+    When *has_initial_turn* is set (the create queued a first user message),
+    also registers the child's sub-agent work so that turn's completion is
+    delivered to the parent's ``sys_read_inbox`` + auto-wakes the parent.
+
     :param data: The :class:`SessionResponse` JSON from the create call.
     :param conversation_id: The caller (parent) session id.
     :param agent_id: The launched agent id, e.g. ``"ag_abc123"``.
     :param title: The caller-supplied title (or non-str when absent).
     :param publish_event: Callback that enqueues an SSE event on the
         caller's outbound queue; ``None`` for in-process callers.
+    :param has_initial_turn: Whether the create queued an initial user
+        message (so a child turn actually runs). Sub-agent work is registered
+        only then — a message-less "create idle, drive later" session starts no
+        turn, so registering work would leave a ``launching`` entry that never
+        completes and would block the next ``sys_session_send`` (its
+        already-running guard); that send re-registers the work itself.
     :returns: JSON handle ``{conversation_id, kind, agent_id,
         agent_name, title, status}``.
     """
@@ -1681,13 +1692,34 @@ def _finalize_created_session(
 
     child_id = data["id"]
     label = title if isinstance(title, str) else ""
+    agent_label = data.get("agent_name") or "agent"
     _runner_app.register_child_session(
         child_id,
         parent_session_id=conversation_id,
         title=label,
-        tool=data.get("agent_name") or "agent",
+        tool=agent_label,
         session_name=label,
     )
+    # Track the child's work so the initial turn's completion is delivered to
+    # the parent's ``sys_read_inbox`` queue and auto-wakes the parent — the same
+    # completion contract BOTH ``sys_session_send`` paths register (named at
+    # ~1169, by-session_id at ~1319). Without it a ``sys_session_create`` child
+    # completes silently: ``register_child_session`` only fans status/preview
+    # deltas onto the parent's stream, it does not deliver completions, so the
+    # orchestrator must busy-poll ``sys_session_get_history`` to recover the
+    # result (#848). Gated on ``has_initial_turn``: a message-less create starts
+    # no turn, so a work entry would never complete (leaking a ``launching``
+    # entry) and would trip the next ``sys_session_send``'s already-running
+    # guard; that send registers the work itself. ``register_subagent_work`` is
+    # idempotent, so a later send to a message-launched child re-registers fine.
+    if has_initial_turn:
+        _runner_app.register_subagent_work(
+            parent_session_id=conversation_id,
+            child_session_id=child_id,
+            agent=agent_label,
+            title=label,
+            wrapper_label=_session_wrapper_label(data),
+        )
     evt = SessionCreatedEvent(
         type="session.created",
         conversation_id=conversation_id,
@@ -1808,6 +1840,8 @@ async def _execute_session_create(
         agent_id=str(agent_id),
         title=args.get("title"),
         publish_event=publish_event,
+        # The create body queues an initial turn only when a message is given.
+        has_initial_turn=bool(args.get("message")),
     )
 
 
@@ -2044,6 +2078,8 @@ async def _session_create_from_config_path(
         agent_id=created_agent_id,
         title=args.get("title"),
         publish_event=publish_event,
+        # A first turn runs only when an initial message was posted above.
+        has_initial_turn=bool(isinstance(message, str) and message),
     )
 
 

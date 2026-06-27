@@ -5903,27 +5903,136 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
             )
         return httpx.Response(404, json={"error": str(request.url)})
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_server_handler),
-        base_url="http://server",
-    ) as server_client:
-        output = await execute_tool(
-            tool_name="sys_session_create",
-            arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
-            server_client=server_client,
-            conversation_id="conv_caller",
-        )
+    from omnigent.runner import app as runner_app
 
-    # Child-only: parent forced to the caller; agent + title + queued
-    # message threaded through to the create body.
-    assert captured["parent_session_id"] == "conv_caller"
-    assert captured["agent_id"] == "ag_x"
-    assert captured["title"] == "auth"
-    assert captured["initial_items"][0]["data"]["content"][0]["text"] == "start"
-    handle = json.loads(output)
-    assert handle["conversation_id"] == "conv_child"
-    assert handle["agent_id"] == "ag_x"
-    assert handle["agent_name"] == "researcher"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+            )
+
+        # Child-only: parent forced to the caller; agent + title + queued
+        # message threaded through to the create body.
+        assert captured["parent_session_id"] == "conv_caller"
+        assert captured["agent_id"] == "ag_x"
+        assert captured["title"] == "auth"
+        assert captured["initial_items"][0]["data"]["content"][0]["text"] == "start"
+        handle = json.loads(output)
+        assert handle["conversation_id"] == "conv_child"
+        assert handle["agent_id"] == "ag_x"
+        assert handle["agent_name"] == "researcher"
+    finally:
+        # The create now registers child + sub-agent work (completion delivery,
+        # #848); drop both so the shared "conv_child" id doesn't leak into other
+        # tests' runner-app registries.
+        runner_app.unregister_subagent_work("conv_child")
+        runner_app.unregister_child_session("conv_child")
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_registers_subagent_work_for_completion_delivery() -> None:
+    """
+    ``sys_session_create`` registers the child's sub-agent work so its turn
+    completion is delivered to the parent's ``sys_read_inbox`` + auto-wakes the
+    parent — parity with both ``sys_session_send`` paths (#848).
+
+    Without the work entry the child completes silently and the orchestrator
+    must busy-poll ``sys_session_get_history`` to recover the result, so the
+    presence of the entry (with the resolved agent/title) is the regression
+    guard. ``register_child_session`` alone (status fan-out) does NOT deliver
+    completions.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(
+                201,
+                json={
+                    "id": "conv_child_work",
+                    "agent_id": "ag_x",
+                    "agent_name": "researcher",
+                    "status": "idle",
+                    "labels": {"omnigent.wrapper": "cursor-native-ui"},
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "ag_x", "title": "review", "message": "go"}),
+                server_client=server_client,
+                conversation_id="conv_caller_work",
+            )
+
+        entry = runner_app.get_subagent_work("conv_child_work")
+        assert entry is not None, (
+            "sys_session_create child not registered for completion delivery; "
+            "_finalize_created_session must call register_subagent_work"
+        )
+        assert entry.parent_session_id == "conv_caller_work"
+        assert entry.agent == "researcher"
+        assert entry.title == "review"
+        assert entry.wrapper_label == "cursor-native-ui"
+    finally:
+        runner_app.unregister_subagent_work("conv_child_work")
+        runner_app.unregister_child_session("conv_child_work")
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_without_message_does_not_register_work() -> None:
+    """
+    A message-less ``sys_session_create`` (create idle, drive later) registers
+    NO sub-agent work.
+
+    Such a create starts no turn, so a work entry would never reach completion
+    (leaking a ``launching`` entry) and — worse — would trip the next
+    ``sys_session_send``'s already-running guard, permanently blocking the
+    documented create-then-drive pattern. The follow-up send registers the work
+    itself, so the create must not.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(
+                201,
+                json={"id": "conv_child_idle", "agent_id": "ag_x", "agent_name": "researcher"},
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "ag_x", "title": "idle-child"}),
+                server_client=server_client,
+                conversation_id="conv_caller_idle",
+            )
+
+        assert runner_app.get_subagent_work("conv_child_idle") is None, (
+            "message-less create must NOT register sub-agent work; the later "
+            "sys_session_send registers it"
+        )
+    finally:
+        runner_app.unregister_subagent_work("conv_child_idle")
+        runner_app.unregister_child_session("conv_child_idle")
 
 
 @pytest.mark.asyncio
@@ -6049,6 +6158,14 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
             conversation_id="conv_caller",
             runner_workspace=tmp_path,
         )
+
+    from omnigent.runner import app as runner_app
+
+    # The create registers child + sub-agent work for completion delivery
+    # (#848); drop both so the shared "conv_child" id doesn't leak into other
+    # tests' runner-app registries.
+    runner_app.unregister_subagent_work("conv_child")
+    runner_app.unregister_child_session("conv_child")
 
     # Exactly one multipart create; parent forced to the caller
     # (child-only) and the title threaded into the metadata part.
