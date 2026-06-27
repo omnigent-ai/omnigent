@@ -194,6 +194,13 @@ _ALT_COVERED: frozenset[str] = frozenset(
         # test_switch_agent_native_e2e.py, test_sessions_fork_e2e.py).
         "sdk-chat-builtin",
         "sandbox-deps-os-env",
+        # rovo: Rovo Dev ACP harness example. Covered by
+        # tests/inner/test_rovo_executor.py, test_rovo_acp.py,
+        # test_rovo_harness.py (unit tests with a fake ACP server) and
+        # tests/inner/test_rovo_live_e2e.py (gated live E2E). The live
+        # round-trip requires ``acli`` which CI runners don't have, so
+        # there is no test_example_rovo.py file.
+        "rovo",
     }
 )
 

@@ -187,6 +187,8 @@ def test_configured_harness_map_covers_all_spellings(
         "hermes",
         "hermes-native",
         "native-hermes",
+        # Rovo Dev ACP harness alias (canonical is rovo-cli).
+        "rovo",
     }
     assert set(result) == expected_keys
 

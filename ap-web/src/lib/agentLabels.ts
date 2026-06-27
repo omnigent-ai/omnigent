@@ -21,6 +21,7 @@ export const BRAIN_HARNESS_LABELS: Record<string, string> = {
   pi: "Pi",
   antigravity: "Antigravity",
   copilot: "Copilot",
+  "rovo-cli": "Rovo Dev",
 };
 
 /**

@@ -18036,6 +18036,7 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "qwen": "HARNESS_QWEN_MODEL",
     "goose": "HARNESS_GOOSE_MODEL",
     "copilot": "HARNESS_COPILOT_MODEL",
+    "rovo-cli": "HARNESS_ROVO_MODEL",
 }
 
 
@@ -18097,6 +18098,13 @@ def _build_spawn_env_from_spec(
             env = _build_goose_spawn_env(spec, workdir=workdir)
         elif harness == "copilot":
             env = _build_copilot_spawn_env(spec, workdir=workdir)
+        elif harness == "rovo-cli":
+            # Rovo has no dedicated spawn-env builder; the harness reads its
+            # ``HARNESS_ROVO_*`` config from the env directly. Start from the
+            # spec model (if any) so a per-session ``/model`` override below
+            # lands in ``HARNESS_ROVO_MODEL`` like the SDK harnesses.
+            spec_model = getattr(spec, "model", None)
+            env = {"HARNESS_ROVO_MODEL": spec_model} if spec_model else {}
         else:
             # Native terminal harnesses and unknown harnesses build env elsewhere.
             return None

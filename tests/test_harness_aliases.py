@@ -22,10 +22,13 @@ from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
         ("pi", "pi"),
         # Canonical cursor id passes through unchanged (no alias).
         ("cursor", "cursor"),
-        # Antigravity SDK harness: user-facing spellings → canonical id.
+        # Antigravity SDK harness: user-facing spellings -> canonical id.
         ("agy", "antigravity"),
         ("google-antigravity", "antigravity"),
         ("antigravity", "antigravity"),
+        # Rovo Dev ACP harness: "rovo" shorthand -> canonical "rovo-cli".
+        ("rovo", "rovo-cli"),
+        ("rovo-cli", "rovo-cli"),
         # Unknown names return unchanged so callers keep their own errors.
         ("bogus", "bogus"),
         (None, None),
@@ -67,6 +70,10 @@ def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
         ("claude", False),
         # cursor is a headless ACP harness, not a native CLI bridge.
         ("cursor", False),
+        # Rovo is an ACP harness owning its own session, NOT a native CLI
+        # harness with an on-disk transcript.
+        ("rovo", False),
+        ("rovo-cli", False),
         ("some-unknown-harness", False),
         (None, False),
     ],

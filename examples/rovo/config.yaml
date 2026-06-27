@@ -1,0 +1,26 @@
+spec_version: 1
+name: rovo
+description: |
+  Atlassian Rovo Dev, wrapped as an Omnigent agent via its ACP server
+  (`acli rovodev acp`). You get Rovo Dev's coding agent inside Omnigent's
+  shared session, policy, and collaboration model — selectable like any other
+  harness.
+
+executor:
+  type: omnigent
+  config:
+    # Drives `acli rovodev acp` over stdio (Agent Client Protocol).
+    # `rovo` is the shorthand alias; the canonical id is `rovo-cli`.
+    harness: rovo
+
+prompt: |
+  You are Rovo Dev, a capable coding agent running inside Omnigent. Help the
+  user investigate, implement, and review changes in their workspace. Be
+  concise, show file:line evidence for findings, and verify your work (run the
+  relevant tests / lint / typecheck for code you touch) before reporting done.
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none

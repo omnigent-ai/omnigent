@@ -26,6 +26,9 @@ _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]*$")
 # SDK harnesses whose model override lands in the spawn env — must stay
 # in sync with ``_HARNESS_MODEL_ENV_KEY`` in ``omnigent/runner/app.py``.
 _SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
+    # rovo-cli lands the override in ``HARNESS_ROVO_MODEL`` (registered in
+    # ``_HARNESS_MODEL_ENV_KEY``) and applies it per-turn via ACP
+    # ``session/set_model``, so the value reaches the harness.
     {
         "claude-sdk",
         "codex",
@@ -37,6 +40,7 @@ _SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
         "qwen",
         "goose",
         "copilot",
+        "rovo-cli",
     }
 )
 
