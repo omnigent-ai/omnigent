@@ -8,7 +8,7 @@
 // returned cleanup directly — no `useEffect` + `useRef` dance, no
 // guard against a missing `ref.current`.
 
-import { Loader2Icon } from "lucide-react";
+import { CheckIcon, ExternalLinkIcon, KeyRoundIcon, Loader2Icon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
@@ -80,6 +80,10 @@ export function TerminalView({
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
+  // An interactive login URL detected in output (e.g. `claude /login`),
+  // surfaced as a copy/open banner so the user never has to wrestle the
+  // hard-wrapped link out of the terminal. Null when none is pending.
+  const [loginUrl, setLoginUrl] = useState<string | null>(null);
   // True between an unexpected close and the re-dial it scheduled, so
   // the overlay reads "Reconnecting…" instead of the dead-end
   // "Bridge closed" message during automatic recovery.
@@ -121,6 +125,9 @@ export function TerminalView({
     onInputRef.current?.();
   }, []);
 
+  // Stable: the session calls this when it detects a login URL in output.
+  const notifyLoginUrl = useCallback((url: string) => setLoginUrl(url), []);
+
   // Dispose the outgoing session before a remount re-dials. React 18
   // ignores the cleanup function attachSession returns (ref cleanups
   // arrived in React 19), so without this every remount would abandon
@@ -150,6 +157,9 @@ export function TerminalView({
       // handshake. The session's WS ``open`` handler transitions us
       // to ``connected``.
       notifyState({ kind: "connecting" });
+      // Drop any login banner from a prior mount; a re-attached tmux
+      // re-emits the prompt if the flow is still waiting.
+      setLoginUrl(null);
 
       // Defer the actual session construction by one microtask so
       // React 19 StrictMode's synchronous attach → cleanup → attach
@@ -172,6 +182,7 @@ export function TerminalView({
           isDarkRef.current,
           notifyActivity,
           notifyInput,
+          notifyLoginUrl,
         );
         sessionRef.current = terminalSession;
       });
@@ -182,7 +193,7 @@ export function TerminalView({
         onStateChangeRef.current?.(null);
       };
     },
-    [sessionId, terminalId, readOnly, notifyState, notifyActivity, notifyInput],
+    [sessionId, terminalId, readOnly, notifyState, notifyActivity, notifyInput, notifyLoginUrl],
   );
 
   // Push theme changes into the live session without remounting.
@@ -256,6 +267,7 @@ export function TerminalView({
       data-terminal-id={terminalId}
       className="relative flex min-h-0 flex-1 flex-col"
     >
+      {loginUrl && <LoginLinkBanner url={loginUrl} onDismiss={() => setLoginUrl(null)} />}
       {/* `p-1` lives on the wrapper, not the xterm mount node: FitAddon
           reads the parent's border-box height but only subtracts the xterm
           element's own padding, so padding on the mount node oversizes the
@@ -330,6 +342,73 @@ export function selectionHintText(isMac: boolean): string {
   return isMac
     ? "Hold ⌥ and drag to select · ⌘C to copy"
     : "Hold Shift and drag to select · right-click to copy";
+}
+
+/**
+ * Banner shown above the terminal when an interactive login URL is
+ * detected in output (see {@link detectLoginUrl}).
+ *
+ * Claude Code (and other Ink CLIs) hard-wrap their long OAuth URL at the
+ * terminal width, so in the raw terminal it splits across rows and resists
+ * both click (the link is broken in two) and select-drag (the wrap break
+ * comes along). This surfaces the rejoined URL with one-click Copy and
+ * Open, so signing in is friction-free.
+ */
+function LoginLinkBanner({ url, onDismiss }: { url: string; onDismiss: () => void }) {
+  const [copied, setCopied] = useState(false);
+  const copy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard blocked (insecure context / denied) — Open still works.
+    }
+  }, [url]);
+  return (
+    <div
+      data-testid="terminal-login-banner"
+      className="flex shrink-0 items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs"
+    >
+      <KeyRoundIcon className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+      <span className="shrink-0 font-medium">Login link detected</span>
+      <code className="min-w-0 flex-1 truncate font-mono text-muted-foreground" title={url}>
+        {url}
+      </code>
+      <Button
+        type="button"
+        size="xs"
+        variant="secondary"
+        onClick={copy}
+        data-testid="terminal-login-copy"
+      >
+        {copied ? (
+          <>
+            <CheckIcon className="size-3" /> Copied
+          </>
+        ) : (
+          "Copy"
+        )}
+      </Button>
+      <Button
+        type="button"
+        size="xs"
+        variant="secondary"
+        onClick={() => window.open(url, "_blank", "noopener,noreferrer")}
+        data-testid="terminal-login-open"
+      >
+        <ExternalLinkIcon className="size-3" /> Open
+      </Button>
+      <button
+        type="button"
+        aria-label="Dismiss login link"
+        onClick={onDismiss}
+        className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+      >
+        <XIcon className="size-3.5" />
+      </button>
+    </div>
+  );
 }
 
 function StatusOverlay({
