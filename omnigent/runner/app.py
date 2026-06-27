@@ -118,8 +118,7 @@ def _version_supports_waiting_status(server_version: str) -> bool:
 
     try:
         return (
-            Version(server_version).release
-            >= Version(_WAITING_STATUS_MIN_SERVER_VERSION).release
+            Version(server_version).release >= Version(_WAITING_STATUS_MIN_SERVER_VERSION).release
         )
     except InvalidVersion:
         _logger.warning(
