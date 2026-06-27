@@ -3880,6 +3880,7 @@ async def _auto_create_antigravity_terminal(
     from omnigent.antigravity_native_bridge import (
         ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
         AntigravityNativeBridgeState,
+        agy_gemini_dir,
         clear_bridge_state,
         ensure_agy_onboarding_complete,
         prepare_bridge_dir,
@@ -3974,19 +3975,21 @@ async def _auto_create_antigravity_terminal(
     # Wire the Omnigent MCP relay so the wrapped agy gets the sys_* tools
     # (spawn sub-agent sessions, drive Omnigent terminals, list agents/models,
     # sys_os_*) — the only native harness that otherwise lacks them (#1194).
-    # agy has no --mcp-config flag and ignores ANTIGRAVITY_* env knobs; it loads
-    # MCP servers ONLY from the HOME-global ~/.gemini/config/mcp_config.json. To
-    # avoid clobbering the user's interactive agy config (and the concurrency
-    # footgun of a single shared file), launch agy under a per-session ISOLATED
-    # HOME seeded with a copy of the user's OAuth token + onboarding state and a
-    # bridge-scoped mcp_config.json. The relay subprocess is the same shared
-    # ``serve-mcp`` claude/codex/cursor use. Offloaded to a thread (file I/O) and
-    # done BEFORE the terminal launch so agy sees the config on its first MCP scan.
+    # agy has no --mcp-config flag and ignores ANTIGRAVITY_* env knobs. It does
+    # accept the hidden --gemini_dir flag, so keep the process HOME real for auth
+    # providers such as macOS Keychain, but point agy's config/state root at a
+    # per-session isolated Gemini dir. This avoids clobbering the user's
+    # interactive ~/.gemini/config/mcp_config.json and avoids the concurrency
+    # footgun of one shared bridge-specific config file. The relay subprocess is
+    # the same shared ``serve-mcp`` claude/codex/cursor use. Offloaded to a thread
+    # (file I/O) and done BEFORE terminal launch so agy sees the config on its
+    # first MCP scan.
     await asyncio.to_thread(write_mcp_config, bridge_dir)
     env_overrides = {
         **env_overrides,
         **await asyncio.to_thread(seed_isolated_agy_home, bridge_dir),
     }
+    argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
     # Start the shared comment/sys_* relay against THIS session's bridge dir before
     # launch so its tool_relay.json is on disk when agy first scans the MCP server.
     # ``await_notify=False``: agy starts its MCP client lazily, so awaiting the

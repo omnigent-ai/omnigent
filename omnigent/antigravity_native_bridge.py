@@ -261,17 +261,15 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
 # two antigravity-native sessions (or a session + the user's interactive agy)
 # would fight over the one global file.
 #
-# CHOSEN DESIGN — per-session ISOLATED HOME. The runner launches agy with
-# ``HOME`` pointed at a per-bridge-dir tree (:func:`agy_home_dir`) seeded with a
-# COPY of the user's OAuth token + onboarding/migration markers and a
-# bridge-scoped ``config/mcp_config.json`` written by :func:`write_mcp_config`.
-# This (1) NEVER touches the user's real ``~/.gemini``, (2) gives each session its
-# own ``mcp_config.json`` so concurrent sessions never clobber one another, and
-# (3) was verified live: agy under the isolated HOME does NOT re-demand OAuth and
-# its ``/mcp`` panel shows ``✓ omnigent`` with the ``sys_*`` tools discovered. agy
-# resolves ``GeminiDir`` from ``$HOME/.gemini`` (its hardcoded default), so the
-# only thing the isolated HOME relocates is the *config + state* tree; auth still
-# works because the seeded token is a copy of the user's real one.
+# CHOSEN DESIGN — per-session ISOLATED GEMINI DIR. The runner keeps agy's real
+# ``HOME`` intact (needed for platform auth such as macOS keyring-backed tokens)
+# and launches agy with its hidden ``--gemini_dir=<bridge_dir>/agy-home/.gemini``
+# flag. That isolated Gemini dir is seeded with onboarding/migration markers and
+# a bridge-scoped ``config/mcp_config.json`` written by :func:`write_mcp_config`.
+# This (1) NEVER touches the user's real ``~/.gemini/config/mcp_config.json`` and
+# (2) gives each session its own config so concurrent sessions never clobber one
+# another. Known file-based OAuth markers are copied best-effort for platforms
+# whose agy auth provider uses them, but HOME is deliberately not relocated.
 _MCP_CONFIG_DIR = "config"
 _MCP_CONFIG_FILE = "mcp_config.json"
 _BRIDGE_CONFIG_FILE = "bridge.json"
@@ -311,29 +309,45 @@ _AGY_ENABLED_TOOLS = [
 ]
 
 # Files copied from the user's real ``~/.gemini`` into the per-session isolated
-# HOME so agy does not re-run OAuth / onboarding. The OAuth token is the only
-# secret; it is COPIED (the real file is never moved or modified). Missing files
-# are skipped (agy regenerates onboarding/migration state, and a missing token
-# only means agy re-auths in that session — never a corruption of the real tree).
+# Gemini dir for platforms whose agy auth provider uses file-backed credentials,
+# plus installation markers. Keep the OAuth credential paths in sync with
+# ``omnigent.onboarding.gemini_auth``: macOS writes ``oauth_creds.json`` while
+# Linux writes ``antigravity-cli/antigravity-oauth-token``. The OAuth credential
+# is the only secret; it is COPIED (the real file is never moved or modified).
+# Missing files are skipped (agy regenerates onboarding/migration state, and a
+# missing credential only means agy re-auths in that session — never corruption
+# of the real tree).
 _AGY_SEED_FILES = (
+    Path("oauth_creds.json"),
     Path("antigravity-cli") / "antigravity-oauth-token",
+    Path("installation_id"),
     Path("antigravity-cli") / "installation_id",
 )
 
 
 def agy_home_dir(bridge_dir: Path) -> Path:
-    """Return the per-session isolated ``HOME`` for an agy launch.
+    """Return the parent directory for this session's isolated agy state.
 
-    A subdirectory of *bridge_dir* so it is naturally per-session (the bridge dir
-    is hash-scoped to the bridge id) and torn down with the bridge. agy reads its
-    MCP config + state from ``$HOME/.gemini``; pinning ``HOME`` here keeps the
-    relay's ``mcp_config.json`` out of the user's real ``~/.gemini`` and prevents
-    two concurrent sessions from sharing one global config.
+    The actual agy config/state root is :func:`agy_gemini_dir`, passed to agy via
+    ``--gemini_dir``. Keeping this parent below *bridge_dir* makes it naturally
+    per-session and easy to tear down with the bridge, while preserving the real
+    ``HOME`` for auth providers that depend on platform state such as macOS
+    Keychain.
 
     :param bridge_dir: Native Antigravity bridge directory.
-    :returns: Absolute path to this session's isolated agy HOME.
+    :returns: Absolute parent path for this session's isolated agy state.
     """
     return bridge_dir / "agy-home"
+
+
+def agy_gemini_dir(bridge_dir: Path) -> Path:
+    """Return the per-session ``--gemini_dir`` path for an agy launch.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :returns: Absolute ``.gemini`` directory that should receive agy's session
+        config/state and the Omnigent MCP config.
+    """
+    return agy_home_dir(bridge_dir) / ".gemini"
 
 
 def build_mcp_config(
@@ -350,14 +364,12 @@ def build_mcp_config(
     The server command is the SAME shared relay claude/codex/cursor use:
     ``<python> -I -m omnigent.claude_native_bridge serve-mcp --bridge-dir <dir>``.
 
-    **HOME pinning (critical for the isolated-HOME design).** agy spawns this relay
-    as a child, so the relay inherits agy's environment — including the per-session
-    isolated ``HOME`` agy runs under. But the relay validates its ``--bridge-dir``
-    against ``bridge_root()`` (``$HOME/.omnigent/antigravity-native``), which must
-    resolve to the RUNNER's real home where the bridge dir actually lives — not the
-    isolated agy HOME (a child of the bridge dir). So the relay's ``env`` pins
-    ``HOME`` back to the runner's real home. ``-I`` does not clear ``HOME``; it only
-    ignores ``PYTHON*`` vars and user site-packages, so this override takes effect.
+    **HOME pinning.** agy spawns this relay as a child. The relay validates its
+    ``--bridge-dir`` against ``bridge_root()`` (``$HOME/.omnigent/antigravity-native``),
+    which must resolve to the RUNNER's real home where the bridge dir actually
+    lives. Pinning ``HOME`` in the relay env keeps that invariant true even when a
+    future agy launch path customizes process environment. ``-I`` does not clear
+    ``HOME``; it only ignores ``PYTHON*`` vars and user site-packages.
 
     :param bridge_dir: Native Antigravity bridge directory whose relay this
         config points at.
@@ -382,8 +394,7 @@ def build_mcp_config(
                 "env": {
                     "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
                     # Pin the relay to the RUNNER's real home so its bridge-root
-                    # validation matches where the bridge dir lives (agy runs under
-                    # an isolated HOME; the relay must not inherit it). See docstring.
+                    # validation matches where the bridge dir lives. See docstring.
                     "HOME": str(Path.home()),
                 },
             }
@@ -417,25 +428,25 @@ def write_mcp_config(
     *,
     python_executable: str | None = None,
 ) -> Path:
-    """Write the per-session agy MCP config + relay token into the isolated HOME.
+    """Write the per-session agy MCP config + relay token.
 
     Writes (1) ``bridge.json`` (the relay token) into *bridge_dir* and (2) the
     ``mcp_config.json`` for the Omnigent relay into the per-session isolated agy
-    HOME at ``<agy_home>/.gemini/config/mcp_config.json`` — the path agy actually
-    loads MCP servers from. Because the HOME is per-session and never the user's
-    real ``~``, this never clobbers the user's interactive agy config and two
-    concurrent sessions never share one config. Mirrors cursor #742's
-    :func:`omnigent.cursor_native_bridge.write_mcp_config`, adapted to agy's
-    HOME-global config path + isolated-HOME scoping.
+    Gemini dir at ``<bridge_dir>/agy-home/.gemini/config/mcp_config.json`` — the
+    path agy loads when launched with ``--gemini_dir``. Because the Gemini dir is
+    per-session and not the user's real ``~/.gemini``, this never clobbers the
+    user's interactive agy config and two concurrent sessions never share one
+    config. Mirrors cursor #742's :func:`omnigent.cursor_native_bridge.write_mcp_config`,
+    adapted to agy's hidden ``--gemini_dir`` flag.
 
     :param bridge_dir: Native Antigravity bridge directory (holds ``bridge.json``
-        and the isolated agy HOME).
+        and the isolated agy Gemini dir).
     :param python_executable: Python interpreter for the relay command;
         defaults to the current interpreter.
     :returns: Absolute path to the written ``mcp_config.json``.
     """
     write_mcp_bridge_config(bridge_dir)
-    config_dir = agy_home_dir(bridge_dir) / ".gemini" / _MCP_CONFIG_DIR
+    config_dir = agy_gemini_dir(bridge_dir) / _MCP_CONFIG_DIR
     config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = config_dir / _MCP_CONFIG_FILE
     payload = build_mcp_config(bridge_dir, python_executable=python_executable)
@@ -446,26 +457,23 @@ def write_mcp_config(
 
 
 def seed_isolated_agy_home(bridge_dir: Path) -> dict[str, str]:
-    """Seed the per-session isolated agy HOME and return the launch env override.
+    """Seed the per-session isolated agy Gemini dir and return env overrides.
 
-    Copies the user's real agy OAuth token + onboarding/migration state (NEVER
-    moving or modifying the real files) into ``<bridge_dir>/agy-home/.gemini`` so
-    a launch under this isolated HOME does not re-demand OAuth or re-run the
-    onboarding wizard. The relay's ``mcp_config.json`` is written separately by
-    :func:`write_mcp_config` so it lands in this same isolated tree rather than
-    the user's real ``~/.gemini`` (the footgun this whole design avoids).
-
-    Verified live (agy 1.0.12): under this isolated HOME agy logs in as the real
-    user from the seeded token and its ``/mcp`` panel shows ``✓ omnigent`` with the
-    ``sys_*`` tools discovered.
+    Copies known file-based agy OAuth markers + onboarding/migration state (NEVER
+    moving or modifying the real files) into ``<bridge_dir>/agy-home/.gemini``.
+    The runner keeps agy's real ``HOME`` intact and passes this directory through
+    ``--gemini_dir``; on macOS that is required because agy uses keyring-backed
+    auth that is not portable to a relocated ``HOME``. The relay's
+    ``mcp_config.json`` is written separately by :func:`write_mcp_config` so it
+    lands in this same isolated tree rather than the user's real ``~/.gemini``
+    (the footgun this whole design avoids).
 
     :param bridge_dir: Native Antigravity bridge directory.
-    :returns: An env-override mapping (``{"HOME": <iso_home>}``) to layer onto the
-        agy launch environment.
+    :returns: Env overrides to layer onto the agy launch environment. Currently
+        empty because ``HOME`` must stay real for platform auth.
     """
     real_home = Path.home()
-    iso_home = agy_home_dir(bridge_dir)
-    iso_gemini = iso_home / ".gemini"
+    iso_gemini = agy_gemini_dir(bridge_dir)
     (iso_gemini / "antigravity-cli" / "cache").mkdir(mode=0o700, parents=True, exist_ok=True)
     (iso_gemini / _MCP_CONFIG_DIR).mkdir(mode=0o700, parents=True, exist_ok=True)
 
@@ -499,11 +507,11 @@ def seed_isolated_agy_home(bridge_dir: Path) -> dict[str, str]:
         )
 
     # Seed the migration marker so agy does not churn a from-scratch migration on
-    # first launch under the fresh HOME (cosmetic; agy creates it itself otherwise).
+    # first launch under the fresh Gemini dir (cosmetic; agy creates it itself otherwise).
     with contextlib.suppress(OSError):
         (iso_gemini / _MCP_CONFIG_DIR / ".migrated").touch()
 
-    return {"HOME": str(iso_home)}
+    return {}
 
 
 def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) -> None:
