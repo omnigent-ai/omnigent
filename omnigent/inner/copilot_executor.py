@@ -59,6 +59,7 @@ from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from
 
 from .datamodel import OSEnvSpec
 from .executor import (
+    CompactionComplete,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -580,6 +581,32 @@ class CopilotExecutor(Executor):
                 turn_error = str(
                     data.get("message") or data.get("errorMessage") or "copilot session error"
                 )
+            elif etype.endswith("SESSION_COMPACTION_COMPLETE"):
+                # The Copilot SDK auto-compacted the session's context window.
+                # Surface it as a CompactionComplete so the runner persists a
+                # compaction item and a resumed session gets the pre-compacted
+                # summary instead of replaying the full transcript (parity with
+                # claude-sdk / openai-agents). Only a *successful* compaction
+                # counts; ``success`` is False on a failed/aborted attempt.
+                if data.get("success"):
+                    post_tokens = data.get("postCompactionTokens")
+                    yield CompactionComplete(
+                        # Copilot uniquely reports the real summary text; fall
+                        # back to a synthetic placeholder like the peers do.
+                        summary=str(
+                            data.get("summaryContent")
+                            or "[GitHub Copilot compaction: context was automatically compacted]"
+                        ),
+                        # Post-compaction context size (same semantic as the
+                        # peers' ``context_tokens``).
+                        token_count=(
+                            int(post_tokens) if isinstance(post_tokens, (int, float)) else 0
+                        ),
+                        model=usage_model or model,
+                        # The event carries no message list; resume falls back to
+                        # the summary (allowed by the field's contract).
+                        compacted_messages=None,
+                    )
 
         try:
             while True:
