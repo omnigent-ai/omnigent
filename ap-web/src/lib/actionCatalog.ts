@@ -118,7 +118,13 @@ export function useActionCatalog(excludeJobId?: string): {
         };
       });
     if (jobActions.length) {
-      out.push({ id: "jobs", name: "Jobs", actions: jobActions });
+      // Jobs wired in as steps carry Omnigent's own mark.
+      out.push({
+        id: "jobs",
+        name: "Jobs",
+        icon: { kind: "component", key: "otto" },
+        actions: jobActions,
+      });
     }
 
     return out;

@@ -67,12 +67,16 @@ import { cn } from "@/lib/utils";
 // ---------------------------------------------------------------------------
 // Per-kind presentation
 // ---------------------------------------------------------------------------
-const KIND_META: Record<FlowNodeType, { tag: string; box: string; chip: string }> = {
-  start: { tag: "Start", box: "border-emerald-500 bg-emerald-500/10", chip: "bg-emerald-500" },
-  process: { tag: "Process", box: "border-blue-500 bg-blue-500/10", chip: "bg-blue-500" },
-  decision: { tag: "Decision", box: "border-amber-500 bg-amber-500/10", chip: "bg-amber-500" },
-  io: { tag: "Input/Output", box: "border-purple-500 bg-purple-500/10", chip: "bg-purple-500" },
-  end: { tag: "End", box: "border-red-500 bg-red-500/10", chip: "bg-red-500" },
+// Boxes use the app's neutral card surface so they sit in spirit with the rest
+// of the UI (no rainbow fills). Node type is conveyed by a small accent dot
+// (`chip`) and the uppercase tag, not the whole box. `chip` is also reused in
+// the "+" menu's generic-node buttons.
+const KIND_META: Record<FlowNodeType, { tag: string; chip: string }> = {
+  start: { tag: "Start", chip: "bg-emerald-500" },
+  process: { tag: "Process", chip: "bg-primary" },
+  decision: { tag: "Decision", chip: "bg-amber-500" },
+  io: { tag: "Input/Output", chip: "bg-violet-500" },
+  end: { tag: "End", chip: "bg-muted-foreground" },
 };
 
 // ---------------------------------------------------------------------------
@@ -286,35 +290,45 @@ function StepView({
   const meta = KIND_META[step.type];
   // Shared props for every nested StepView so the catalog threads down.
   const childProps = { onAdd, onAddAction, onRename, onRenameBranch, onDelete, groups, loadingGroups };
+  // An action step carries its source group's name; find that group in the
+  // catalog to render its icon (built-in component or uploaded image) on the
+  // box's left, matching how the picker presents it.
+  const stepGroup = step.actionGroup
+    ? groups.find((g) => g.name === step.actionGroup)
+    : undefined;
   return (
     <div className="flex flex-col items-center">
       {/* The box. `relative z-10` lifts it above the branch-connector
           pseudo-elements (which sit at the lane's top-0) so its label input and
           delete button always receive clicks. */}
-      <div
-        className={cn(
-          "group relative z-10 flex min-w-[160px] max-w-[260px] flex-col items-center rounded-md border-2 px-4 py-2.5 text-center shadow-sm",
-          meta.box,
-        )}
-      >
-        <span className="text-[9.5px] font-bold tracking-wide text-muted-foreground uppercase">
-          {/* Action steps show their integration group (e.g. "Jira"); generic
-              steps show their node-type tag. */}
-          {step.actionGroup ?? meta.tag}
-        </span>
-        {/* A wired-in job's label IS the job's name — it must mirror the source
-            job, so it's shown read-only (editing it here would desync the two).
-            Entity and generic steps stay inline-editable. */}
-        {step.actionId?.startsWith("job:") ? (
-          <span className="text-sm break-words">{step.label}</span>
+      <div className="group relative z-10 flex min-w-[180px] max-w-[280px] items-center gap-2.5 rounded-lg border border-border bg-card px-3 py-2.5 text-left shadow-sm">
+        {/* Left: the action's group icon, or a node-type accent dot for generic
+            steps — so the box reads as "what kind of step" at a glance. */}
+        {stepGroup?.icon ? (
+          <ActionIcon icon={stepGroup.icon} className="size-5 text-muted-foreground" />
         ) : (
-          <InlineEdit
-            value={step.label}
-            onCommit={(next) => onRename(step.id, next || defaultLabel(step.type))}
-            className="text-sm break-words"
-            inputClassName="text-sm"
-          />
+          <span className={cn("size-2 shrink-0 rounded-full", meta.chip)} />
         )}
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="text-[9.5px] font-bold tracking-wide text-muted-foreground uppercase">
+            {/* Action steps show their integration group (e.g. "Jira"); generic
+                steps show their node-type tag. */}
+            {step.actionGroup ?? meta.tag}
+          </span>
+          {/* A wired-in job's label IS the job's name — it must mirror the source
+              job, so it's shown read-only (editing it here would desync the two).
+              Entity and generic steps stay inline-editable. */}
+          {step.actionId?.startsWith("job:") ? (
+            <span className="text-sm break-words">{step.label}</span>
+          ) : (
+            <InlineEdit
+              value={step.label}
+              onCommit={(next) => onRename(step.id, next || defaultLabel(step.type))}
+              className="text-sm break-words"
+              inputClassName="text-sm"
+            />
+          )}
+        </div>
         {/* Delete (not on the Start root — a flow always has a Start). Shown on
             hover/focus-within; z-20 keeps it clickable above everything. */}
         {!isRoot && (

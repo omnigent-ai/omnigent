@@ -10,10 +10,13 @@
 import type { ComponentType, SVGProps } from "react";
 import { GitHubIcon } from "./GitHubIcon";
 import { JiraIcon } from "./JiraIcon";
+import { OttoIcon } from "./OttoIcon";
 
 const ICON_REGISTRY: Record<string, ComponentType<SVGProps<SVGSVGElement>>> = {
   jira: JiraIcon,
   github: GitHubIcon,
+  // Omnigent's own mark — used for the "Jobs" group (jobs wired in as steps).
+  otto: OttoIcon,
 };
 
 /** Resolve a built-in icon component by key, or `undefined` if unknown. */
