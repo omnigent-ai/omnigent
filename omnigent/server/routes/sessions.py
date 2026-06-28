@@ -62,6 +62,7 @@ from omnigent.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
     reserved_cost_control_keys,
 )
+from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import generate_agent_id, generate_task_id
 from omnigent.entities import (
     Agent,
@@ -499,8 +500,9 @@ _LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
 # by. Empty string clears a stale value because labels are upsert-only.
 _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
-# Hard limit matching the ``String(256)`` column in ``db_models.py``.
-_LABEL_VALUE_MAX_LEN: int = 256
+# Hard limit matching the ``conversation_labels.value`` column width. Sourced
+# from the schema so the truncation and the column can never drift apart.
+_LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
 
 # Todo-list update from the claude-native forwarder. Carries the raw
 # todo items captured from PostToolUse/TodoWrite hook events. Payload
@@ -5235,15 +5237,22 @@ def _publish_status(
 
 
 def _truncate_label(value: str) -> str:
-    """Truncate a label value to fit the ``String(256)`` DB column.
+    """Truncate a label value to fit the ``conversation_labels.value`` column.
 
     Long failure messages (tracebacks, 5xx bodies) overflow the column and
-    cause a ``DataError`` that silently drops the error reason.
+    cause a ``DataError`` that silently drops the error reason. Error messages
+    front-load their signal, so keeping the head and appending an ellipsis
+    preserves the useful part while flagging that more was dropped. The store
+    clamps again as a final guard, but truncating here keeps the marker and
+    makes the call site directly testable.
 
     :param value: The raw string to truncate.
-    :returns: ``value`` unchanged if short enough, else the first 256 chars.
+    :returns: ``value`` unchanged if it already fits, else the head trimmed to
+        the column width with a trailing ``…`` to signal truncation.
     """
-    return value[:_LABEL_VALUE_MAX_LEN]
+    if len(value) <= _LABEL_VALUE_MAX_LEN:
+        return value
+    return value[: _LABEL_VALUE_MAX_LEN - 1] + "…"
 
 
 async def _persist_session_status_error_labels(

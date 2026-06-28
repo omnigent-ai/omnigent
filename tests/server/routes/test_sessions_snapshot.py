@@ -1532,10 +1532,21 @@ def test_truncate_label_short_value_unchanged() -> None:
 
 
 def test_truncate_label_long_value_fits_column() -> None:
-    """Truncated output never exceeds the column limit."""
+    """Truncated output fits the column, keeps the head, and flags the cut."""
     long_value = "a" * (_LABEL_VALUE_MAX_LEN + 100)
     result = _truncate_label(long_value)
-    assert len(result) <= _LABEL_VALUE_MAX_LEN
+    assert len(result) == _LABEL_VALUE_MAX_LEN
+    # The informative head is preserved and a marker signals the truncation.
+    assert result.endswith("…")
+    assert result[:-1] == long_value[: _LABEL_VALUE_MAX_LEN - 1]
+
+
+def test_truncate_label_at_limit_no_marker() -> None:
+    """A value exactly at the limit is kept verbatim — no spurious ellipsis."""
+    value = "b" * _LABEL_VALUE_MAX_LEN
+    result = _truncate_label(value)
+    assert result == value
+    assert not result.endswith("…")
 
 
 def test_truncate_label_empty_string() -> None:
@@ -1563,8 +1574,10 @@ async def test_persist_error_labels_truncates_long_message() -> None:
 
     await _persist_session_status_error_labels("conv_123", error, _MockStore())  # type: ignore[arg-type]
 
-    stored = captured["conv_123"]
-    assert len(stored["omnigent.last_task_error_message"]) <= _LABEL_VALUE_MAX_LEN
+    stored = captured["conv_123"]["omnigent.last_task_error_message"]
+    assert len(stored) <= _LABEL_VALUE_MAX_LEN
+    # The diagnostic prefix survives so the reload-visible reason is still useful.
+    assert stored.startswith("Runner MCP execute failed: ")
 
 
 @pytest.mark.asyncio
