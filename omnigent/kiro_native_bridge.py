@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,7 @@ _KIRO_INPUT_READY_MARKERS = (
     "ask a question or describe a task",
     "Type to steer",
 )
-_SEND_KEYS_LITERAL_CHARS_PER_CALL = 1024
+_PASTE_BUFFER = "omnigent-kiro-paste"
 
 # Ambient provider/cloud/CI credentials that must not be inherited by Kiro.
 KIRO_NATIVE_ENV_UNSET = [
@@ -319,22 +320,54 @@ def _wait_for_kiro_input_ready(
     raise RuntimeError("kiro-native TUI input prompt was not ready before injection")
 
 
-def _type_literal_text(socket_path: str, tmux_target: str, text: str) -> None:
-    """Type text into Kiro using literal tmux keystrokes."""
-    for start in range(0, len(text), _SEND_KEYS_LITERAL_CHARS_PER_CALL):
-        chunk = text[start : start + _SEND_KEYS_LITERAL_CHARS_PER_CALL]
-        # ``--`` ends option parsing so a chunk starting with ``-`` (or a chunk
-        # boundary that lands on one) is sent as literal text, not parsed as a
-        # tmux flag — which would otherwise fail the send-keys call silently.
+def _paste_payload_bytes(text: str) -> bytes:
+    r"""Encode text for ``tmux load-buffer``: line breaks → CR, tabs kept, other
+    control bytes dropped (a stray ESC would close the bracketed-paste early)."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    body = bytearray()
+    for ch in normalized:
+        if ch == "\n":
+            body.append(0x0D)
+            continue
+        if ch == "\t":
+            body.append(0x09)
+            continue
+        if ord(ch) < 0x20:
+            continue
+        body.extend(ch.encode("utf-8"))
+    return bytes(body)
+
+
+def _paste_literal_text(socket_path: str, tmux_target: str, bridge_dir: Path, text: str) -> None:
+    """Deliver text into Kiro via a tmux bracketed paste (multi-line safe).
+
+    ``send-keys -l`` sends interior newlines as raw Enter keys, so a multi-line
+    web message submits line-by-line on the first break. ``load-buffer`` +
+    ``paste-buffer -p`` wraps the text in bracketed-paste markers so Kiro's
+    composer keeps the line breaks (encoded as CR by :func:`_paste_payload_bytes`)
+    as draft data, not submits. Mirrors cursor-native / goose-native; the trailing
+    newline absorbs any trailing backslash so it can't escape the follow-up Enter.
+    """
+    with tempfile.NamedTemporaryFile(
+        dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
+    ) as paste_file:
+        paste_file.write(_paste_payload_bytes(text + "\n"))
+        paste_path = paste_file.name
+    try:
+        _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
         _run_tmux(
             socket_path,
-            "send-keys",
-            "-l",
+            "paste-buffer",
+            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
+            "-d",  # drop the buffer after pasting
+            "-b",
+            _PASTE_BUFFER,
             "-t",
             tmux_target,
-            "--",
-            chunk,
         )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(paste_path)
 
 
 def inject_user_message(
@@ -363,7 +396,7 @@ def inject_user_message(
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
     baseline_region = _kiro_input_region(_capture_pane(socket_path, tmux_target))
-    _type_literal_text(socket_path, tmux_target, content)
+    _paste_literal_text(socket_path, tmux_target, bridge_dir, content)
     needle = _submit_needle(content)
     draft_seen = False
     if needle:
