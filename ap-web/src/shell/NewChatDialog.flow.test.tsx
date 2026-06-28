@@ -34,7 +34,12 @@ const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
 // The landing screen navigates via the embed-aware routing abstraction
 // (`@/lib/routing`), not react-router directly — mock that so the create
 // flow's navigate() lands on our spy regardless of router/provider setup.
-vi.mock("@/lib/routing", () => ({ useNavigate: () => navigateMock }));
+vi.mock("@/lib/routing", () => ({
+  useNavigate: () => navigateMock,
+  // The landing screen reads `?project=` to pre-fill the project chip; this
+  // flow suite never sets one, so an empty params object is enough.
+  useSearchParams: () => [new URLSearchParams(), vi.fn()],
+}));
 
 // The screen hands the first message to ChatPage through the chatStore
 // (keyed by conversation id), not router state — assert on that call.
@@ -61,6 +66,13 @@ vi.mock("@/hooks/useDirectorySessions", () => ({
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => new Map<string, boolean>(),
+}));
+// The composer's project chip lists projects via useProjects; stub it to an
+// empty list so it doesn't fire its own authenticatedFetch (which would land
+// at mock.calls[0] and skew these create-POST call assertions).
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
+  useProjects: () => ({ data: [] }),
 }));
 
 function host(overrides: Partial<Host> = {}): Host {
@@ -126,6 +138,27 @@ async function waitForWorkspaceSeed(): Promise<void> {
 /** Open the git-worktree popover so its branch fields mount. */
 function openWorktree(): void {
   fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+}
+
+/**
+ * Open the agent/harness picker and open <agentId>'s config submenu via
+ * keyboard (ArrowRight). A plain click on a knobbed row instead COMMITS the
+ * pick and closes the menu, so config flows use the keyboard to drill in.
+ */
+function openAgentConfig(agentId: string): void {
+  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  fireEvent.keyDown(screen.getByTestId(`new-chat-landing-agent-${agentId}`), { key: "ArrowRight" });
+}
+
+/** Open the picker and commit (select + close) an agent by clicking its row. */
+function selectAgent(agentId: string): void {
+  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+}
+
+/** Dismiss any open menu so a subsequent submit click isn't swallowed. */
+function closeMenu(): void {
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
 }
 
 beforeEach(() => {
@@ -504,17 +537,14 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open the composer's left run-mode pill (Radix opens on pointerdown) and
-    // pick a non-default mode. The create call proves the choice travels as
-    // a `--permission-mode <mode>` pair in terminal_launch_args.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-pill"), { button: 0 });
+    // Open Claude Code's config submenu (ArrowRight) and pick a non-default
+    // permission mode. The create call proves the choice travels as a
+    // `--permission-mode <mode>` pair in terminal_launch_args.
+    openAgentConfig("ag_native");
     fireEvent.click(screen.getByTestId("new-chat-landing-permission-bypassPermissions"));
-    // The pick shows on the mode pill, NOT appended to the agent label
-    // (the label stays the bare agent name).
-    expect(screen.getByTestId("new-chat-landing-permission-pill").textContent).toContain(
-      "Bypass permissions",
-    );
+    // The trigger label stays the bare agent name (the pick lives in the submenu).
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("(");
+    closeMenu();
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -525,6 +555,113 @@ describe("NewChatLandingScreen create flow", () => {
     // bare single token) means the runner would launch claude with the wrong
     // permission mode.
     expect(body.terminal_launch_args).toEqual(["--permission-mode", "bypassPermissions"]);
+  });
+
+  it("seeds the permission mode from the last pick for claude-native on a new session", async () => {
+    // A returning user's last pick for this harness is on record; the new
+    // session must auto-fill it (the "Mode:" pill reflects it) and post it
+    // WITHOUT the user re-opening the pill.
+    localStorage.setItem(
+      "omnigent:last-mode-by-harness",
+      JSON.stringify({ "claude-native": "plan" }),
+    );
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_native" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // Seeded without opening the picker — submitting proves the state was
+    // pre-filled from storage and rides along to the create.
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.terminal_launch_args).toEqual(["--permission-mode", "plan"]);
+  });
+
+  it("persists the picked permission mode for claude-native so the next session seeds it", async () => {
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_native" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_native");
+    fireEvent.click(screen.getByTestId("new-chat-landing-permission-acceptEdits"));
+
+    // The pick is snapshotted under the harness key immediately, so the next
+    // visit can seed from it.
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem("omnigent:last-mode-by-harness") ?? "{}")).toEqual({
+        "claude-native": "acceptEdits",
+      }),
+    );
+  });
+
+  it("does not leak one harness's mode onto another harness", async () => {
+    // Codex has a pick on record; selecting Claude Code (no pick) must stay on
+    // its default — modes are keyed per harness, not shared.
+    localStorage.setItem(
+      "omnigent:last-mode-by-harness",
+      JSON.stringify({ "codex-native": "full-access" }),
+    );
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // Open Claude Code's submenu: its permission mode is at "Default" (the
+    // checked radio), and Codex's "Full access" approval preset doesn't even
+    // exist in this submenu — no cross-harness bleed.
+    openAgentConfig("ag_native");
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("new-chat-landing-permission-default").getAttribute("aria-checked"),
+      ).toBe("true"),
+    );
+    expect(screen.queryByTestId("new-chat-landing-approval-full-access")).toBeNull();
+  });
+
+  it("resets the shared approval mode to default when switching codex-native → opencode-native", async () => {
+    // codex-native and opencode-native share a single approvalMode state. A
+    // codex pick must NOT linger after switching to OpenCode (which has no
+    // stored pick) — otherwise a more-permissive mode would silently flow
+    // into the OpenCode launch args. Regression test for the seeding effect's
+    // reset-on-no-stored-value branch.
+    setAgents([
+      agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" }),
+      agent({ id: "ag_opencode", name: "opencode-native-ui", display_name: "OpenCode" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_opencode" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // Pick "Full access" for Codex (single-section submenu → closes on pick).
+    openAgentConfig("ag_codex");
+    fireEvent.click(screen.getByTestId("new-chat-landing-approval-full-access"));
+
+    // Switch the picker to OpenCode by clicking its row (commits the pick).
+    selectAgent("ag_opencode");
+
+    // OpenCode has no stored pick → the shared approval knob must reset to
+    // Default, not keep Codex's "Full access". Proven by the launch args:
+    // a default preset posts no sandbox/approval flags.
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.labels?.["omnigent.wrapper"]).toBe("opencode-native-ui");
+    expect(body.terminal_launch_args).toBeUndefined();
   });
 
   it("omits terminal_launch_args when permission mode is left at default for claude-native", async () => {
@@ -553,6 +690,75 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.terminal_launch_args).toBeUndefined();
   });
 
+  it("rides the default model + effort along to create for claude-native", async () => {
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_native" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // Claude Code's effective defaults (Sonnet / Medium) ride along on the
+    // create without the user opening the picker — the runner reads them as
+    // --model / --effort at terminal launch.
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBe("sonnet");
+    expect(body.reasoning_effort).toBe("medium");
+  });
+
+  it("rides a picked model + effort along to create for claude-native", async () => {
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_native" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // Model, effort and permission mode share Claude Code's one config submenu;
+    // it stays open across picks (multi-section) so both can be set in one visit.
+    openAgentConfig("ag_native");
+    fireEvent.click(screen.getByTestId("new-chat-landing-model-opus"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-effort-high"));
+    closeMenu();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBe("opus");
+    expect(body.reasoning_effort).toBe("high");
+  });
+
+  it("omits model_override / reasoning_effort for a non-claude-native agent", async () => {
+    // hello_world (harness null) has no permission-mode capability, so the
+    // model/effort picker never renders and the create carries no model/effort.
+    setAgents([agent()]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_x" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    expect(screen.queryByTestId("new-chat-landing-model-trigger")).toBeNull();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
   it("posts sandbox + approval args when a non-default preset is picked for codex-native", async () => {
     setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
@@ -562,14 +768,10 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open the composer's left run-mode pill and pick "Full access".
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    // Open Codex's config submenu and pick "Full access" (single section →
+    // selecting it also commits and closes the menu).
+    openAgentConfig("ag_codex");
     fireEvent.click(screen.getByTestId("new-chat-landing-approval-full-access"));
-    // The pick shows on the mode pill, NOT appended to the agent label.
-    expect(screen.getByTestId("new-chat-landing-approval-pill").textContent).toContain(
-      "Full access",
-    );
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("(");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -617,12 +819,10 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open the composer's harness dropdown and pick Pi.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-harness-trigger"), { button: 0 });
+    // Open Polly's config submenu and pick the Pi harness (single section →
+    // selecting it commits the agent pick and closes the menu).
+    openAgentConfig("ag_polly");
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-pi"));
-    // The harness trigger reflects the pick; the agent label stays the bare
-    // name (no "(Pi)" suffix appended).
-    expect(screen.getByTestId("new-chat-landing-harness-trigger").textContent).toContain("Pi");
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("(");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -675,10 +875,11 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Pick Pi, then change mind back to the spec default (Claude SDK).
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-harness-trigger"), { button: 0 });
+    // Pick Pi, then change mind back to the spec default (Claude SDK). Each
+    // pick closes the single-section submenu, so reopen between the two.
+    openAgentConfig("ag_polly");
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-pi"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-harness-trigger"), { button: 0 });
+    openAgentConfig("ag_polly");
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-claude-sdk"));
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));

@@ -3,16 +3,17 @@
 The landing composer (``NewChatLandingScreen`` in
 ``ap-web/src/shell/NewChatDialog.tsx``) owns session creation end to end:
 the textarea is the new session's first message and the footer chips —
-host, working directory, git worktree — plus the agent picker and the
-composer's run-mode pill / harness picker supply every create parameter.
-Hitting Send POSTs ``/v1/sessions`` and navigates to the new session;
-there is no modal.
+host, working directory, git worktree — plus the unified agent/harness
+picker supply every create parameter. The picker is a single dropdown
+(``new-chat-landing-agent-select``); each agent's run-config knobs live in a
+per-entry submenu (see :func:`_open_entry_config`). Hitting Send POSTs
+``/v1/sessions`` and navigates to the new session; there is no modal.
 
 These tests cover the three configuration affordances the user reaches
 before sending:
 
 1. **Permission mode** — Claude Code's ``--permission-mode`` choices, in
-   the composer's run-mode ("Mode:") pill. A non-default pick rides
+   the agent picker's per-entry config submenu. A non-default pick rides
    along as ``terminal_launch_args``.
 2. **Working directory** — the file-browser popover behind the working-
    directory chip. Browsing into a folder sets the session's
@@ -155,6 +156,58 @@ def _codex_native_agents_body() -> str:
                     "skills": [],
                 }
             ]
+        }
+    )
+
+
+def _forked_codex_first_page_body() -> str:
+    """First ``GET /v1/agents`` page with stale Codex forks only.
+
+    Mirrors an older deployment where fork clones leaked into the built-in
+    catalog before the server-side forward fix. The canonical Codex row is on
+    page 2, so the picker must paginate before deduping native rows.
+    """
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_codex_fork_1",
+                    "name": "codex-native-ui (fork ag_old1)",
+                    "display_name": "Codex",
+                    "description": "Stale Codex fork",
+                    "harness": "codex-native",
+                    "skills": [],
+                },
+                {
+                    "id": "ag_codex_fork_2",
+                    "name": "codex-native-ui (fork ag_old2)",
+                    "display_name": "Codex",
+                    "description": "Another stale Codex fork",
+                    "harness": "codex-native",
+                    "skills": [],
+                },
+            ],
+            "has_more": True,
+            "last_id": "ag_codex_fork_2",
+        }
+    )
+
+
+def _canonical_codex_second_page_body() -> str:
+    """Second ``GET /v1/agents`` page containing canonical Codex."""
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_codex_e2e",
+                    "name": "codex-native-ui",
+                    "display_name": "Codex",
+                    "description": "OpenAI's coding agent",
+                    "harness": "codex-native",
+                    "skills": [],
+                }
+            ],
+            "has_more": False,
         }
     )
 
@@ -408,11 +461,34 @@ async def _register_common_routes(
     await page.route(_SESSIONS_RE, handle_sessions)
 
 
+async def _open_entry_config(page, agent_id: str) -> None:
+    """Open the agent/harness picker and drill into one entry's config submenu.
+
+    The redesigned composer replaces the old per-control pills/triggers (the
+    run-mode pill, the model trigger, the harness trigger) with a single
+    agent/harness dropdown (``new-chat-landing-agent-select``). Each agent is a
+    row; a knobbed entry's run-config (model / effort / permission / approval /
+    brain-harness override) lives in a per-entry **submenu**. A plain *click* on
+    a knobbed row COMMITS that agent and closes the menu, so config flows hover
+    the row and nudge it with ``ArrowRight`` to open the submenu without
+    committing — the Playwright counterpart of the unit test's
+    ``openAgentConfig`` helper.
+
+    :param page: The Playwright page (the landing picker is already mounted).
+    :param agent_id: The stubbed agent id whose submenu to open, e.g.
+        ``"ag_claude_e2e"``.
+    """
+    await page.get_by_test_id("new-chat-landing-agent-select").click()
+    row = page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
+    await row.hover()
+    await row.press("ArrowRight")
+
+
 def test_start_session_select_permission_mode(seeded_session: tuple[str, str]) -> None:
     """Picking a non-default permission mode rides along to the create call.
 
-    Selecting "Accept edits" in the composer's run-mode ("Mode:") pill
-    must (a) surface in the pill label as immediate feedback and
+    Selecting "Accept edits" in the Claude Code entry's config submenu
+    must (a) check that radio as immediate feedback and
     (b) reach ``POST /v1/sessions`` as
     ``terminal_launch_args: ["--permission-mode", "acceptEdits"]``.
     """
@@ -429,6 +505,24 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await _register_common_routes(
                 page, created_session_id=session_id, create_bodies=create_bodies
             )
+
+            # Neutralize agent discovery so ONLY the stubbed Claude agent feeds
+            # the picker. The landing picker merges `/v1/agents` with agents found
+            # by scanning the caller's sessions (`/v1/sessions?kind=any`); on the
+            # shared e2e_ui server a native agent another test left behind would
+            # otherwise leak in and — ranking ahead — auto-select, so opening
+            # Claude's submenu and picking a knob would SWITCH agent mid-flow
+            # (remounting the submenu and detaching the next row). Registered
+            # after _register_common_routes so it wins the kind=any scan.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
             # Seed a recent working directory for the stubbed host so the
             # working-directory chip auto-fills and Send can enable without
             # touching the (host-less) file browser. Set before the SPA boots
@@ -444,20 +538,24 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Claude Code auto-selects (only built-in, ranked first), so the
-            # run-mode pill — gated on the Claude-native agent — is present.
-            await page.get_by_test_id("new-chat-landing-permission-pill").click()
-            # All six Claude permission modes render as radio rows.
+            # Claude Code auto-selects (only built-in, ranked first); its config
+            # lives in the picker's per-entry submenu (model / effort / permission
+            # mode), opened without committing the row.
+            await _open_entry_config(page, "ag_claude_e2e")
+            # All six Claude permission modes render as radio rows in the submenu.
             for mode in ("default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"):
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-permission-{mode}")
                 ).to_be_visible()
-            await page.get_by_test_id("new-chat-landing-permission-acceptEdits").click()
+            accept_edits = page.get_by_test_id("new-chat-landing-permission-acceptEdits")
+            await accept_edits.click()
 
-            # The mode pill reflects the non-default pick immediately.
-            await expect(page.get_by_test_id("new-chat-landing-permission-pill")).to_contain_text(
-                "Accept edits"
-            )
+            # The radio reflects the non-default pick immediately; the submenu
+            # stays open after a permission pick, so close it (submenu, then root)
+            # before typing into the composer.
+            await expect(accept_edits).to_have_attribute("aria-checked", "true")
+            await page.keyboard.press("Escape")
+            await page.keyboard.press("Escape")
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -472,17 +570,201 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_select_model_and_effort(seeded_session: tuple[str, str]) -> None:
+    """Picking a model + reasoning effort rides along to the create call.
+
+    For the Claude-native agent the config submenu shows a model/effort
+    picker that defaults to Claude Code's own "Sonnet / Medium". Selecting
+    "Opus" and "High" must (a) check those radios as immediate feedback and
+    (b) reach ``POST /v1/sessions`` as ``model_override: "opus"`` +
+    ``reasoning_effort: "high"`` (the runner reads them as ``--model`` /
+    ``--effort`` at terminal launch).
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_model_effort(base_url, session_id))
+
+
+async def _drive_model_effort(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            # Neutralize agent discovery so ONLY the stubbed Claude agent feeds
+            # the picker (see _drive_permission_mode for the full rationale): a
+            # leaked native agent auto-selecting ahead of Claude would make the
+            # model pick SWITCH agent, remounting the submenu and detaching the
+            # effort row before it can be clicked. Registered after
+            # _register_common_routes so it wins the kind=any scan.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            # Claude Code auto-selects; open its config submenu, which carries the
+            # model + effort radio groups defaulting to Claude Code's effective
+            # defaults (Sonnet / Medium).
+            await _open_entry_config(page, "ag_claude_e2e")
+            await expect(page.get_by_test_id("new-chat-landing-model-sonnet")).to_have_attribute(
+                "aria-checked", "true"
+            )
+            await expect(page.get_by_test_id("new-chat-landing-effort-medium")).to_have_attribute(
+                "aria-checked", "true"
+            )
+
+            # Pick model and effort in SEPARATE submenu visits. Picking a knob
+            # COMMITS the agent, which collapses the submenu (its model / effort /
+            # permission rows unmount) while the ROOT menu stays open — so a second
+            # knob clicked in the same visit chases a row that has already detached
+            # and flakes ("detached from the DOM, retrying" until the click times
+            # out). Reopen the submenu between the two picks: the picks persist as
+            # screen state, and each click then lands in a fresh, stable submenu.
+            opus = page.get_by_test_id("new-chat-landing-model-opus")
+            await opus.click()
+            await expect(opus).to_have_attribute("aria-checked", "true")
+            # The model pick collapsed the submenu; wait for it to fully unmount,
+            # then reopen it. The root menu never closed (the radio's preventDefault
+            # keeps it open), so reopen via the row — re-hover + ArrowRight — rather
+            # than re-clicking the trigger (which would race the still-settling
+            # dismiss and fail to reopen).
+            row = page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e")
+            await expect(page.get_by_test_id("new-chat-landing-effort-high")).to_have_count(0)
+            await row.hover()
+            await row.press("ArrowRight")
+            # The model pick persisted across the reopen.
+            await expect(page.get_by_test_id("new-chat-landing-model-opus")).to_have_attribute(
+                "aria-checked", "true"
+            )
+            high = page.get_by_test_id("new-chat-landing-effort-high")
+            await high.click()
+            await expect(high).to_have_attribute("aria-checked", "true")
+            # Close the submenu then the root menu before typing the prompt.
+            await page.keyboard.press("Escape")
+            await page.keyboard.press("Escape")
+
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_claude_e2e", body
+            assert body.get("model_override") == "opus", body
+            assert body.get("reasoning_effort") == "high", body
+        finally:
+            await browser.close()
+
+
 def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> None:
     """Picking a non-default approval preset rides along to the create call.
 
-    Selecting "Full access" in the composer's run-mode ("Mode:") pill
-    must (a) surface in the pill label as immediate feedback and
-    (b) reach ``POST /v1/sessions`` as
+    Selecting "Full access" in the Codex entry's config submenu must reach
+    ``POST /v1/sessions`` as
     ``terminal_launch_args: ["--sandbox", "danger-full-access",
-    "--ask-for-approval", "never"]``.
+    "--ask-for-approval", "never"]``. (Unlike the model/permission radios, an
+    approval pick commits and closes the menu.)
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_approval_mode(base_url, session_id))
+
+
+def test_start_session_agent_picker_paginates_and_dedupes_native_forks(
+    seeded_session: tuple[str, str],
+) -> None:
+    """The new-session picker recovers canonical Codex from page 2.
+
+    Older servers leaked fork clones into ``GET /v1/agents``. New servers stop
+    creating those rows, but existing databases can still have enough stale
+    forked native agents to push canonical built-ins off page 1. The picker must
+    follow pagination and then collapse all ``codex-native`` rows to the
+    canonical ``codex-native-ui`` row, so users see one top-level Codex choice.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_agent_picker_pagination_dedupe(base_url, session_id))
+
+
+async def _drive_agent_picker_pagination_dedupe(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_forked_codex_first_page_body(),
+            )
+
+            async def handle_agents_page_2(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=_canonical_codex_second_page_body(),
+                )
+
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route("**/v1/agents?after=ag_codex_fork_2", handle_agents_page_2)
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            picker = page.get_by_test_id("new-chat-landing-agent-select")
+            await expect(picker).to_contain_text("Codex")
+            await picker.click()
+
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e")
+            ).to_be_visible()
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_codex_fork_1")
+            ).to_have_count(0)
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_codex_fork_2")
+            ).to_have_count(0)
+
+            await page.keyboard.press("Escape")
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_codex_e2e", body
+        finally:
+            await browser.close()
 
 
 async def _drive_approval_mode(base_url: str, session_id: str) -> None:
@@ -520,20 +802,17 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Codex auto-selects (only built-in), so the run-mode pill —
-            # gated on the Codex-native agent — is present.
-            await page.get_by_test_id("new-chat-landing-approval-pill").click()
-            # All three Codex approval presets render as radio rows.
+            # Codex auto-selects (only built-in); its approval presets live in the
+            # picker's per-entry config submenu.
+            await _open_entry_config(page, "ag_codex_e2e")
+            # All three Codex approval presets render as radio rows in the submenu.
             for mode in ("default", "full-access", "read-only"):
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-approval-{mode}")
                 ).to_be_visible()
+            # Picking an approval preset commits and closes the menu (unlike the
+            # model/permission radios), leaving the composer ready for the prompt.
             await page.get_by_test_id("new-chat-landing-approval-full-access").click()
-
-            # The mode pill reflects the non-default pick immediately.
-            await expect(page.get_by_test_id("new-chat-landing-approval-pill")).to_contain_text(
-                "Full access"
-            )
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -556,7 +835,7 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
 def test_start_session_bypass_sandbox(seeded_session: tuple[str, str]) -> None:
     """Arming the DANGEROUS Codex full-bypass toggle rides along to the create.
 
-    The bypass switch in the Codex run-mode pill's menu is the first-class
+    The bypass switch in the Codex entry's config submenu is the first-class
     opt-in for Codex's ``--dangerously-bypass-approvals-and-sandbox`` stance. It
     is deliberately hard to arm: the Switch stays **disabled** until the user
     types the confirmation phrase *verbatim* (a click alone, or a near-miss
@@ -605,9 +884,9 @@ async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Codex auto-selects (only built-in), so the run-mode pill is present;
-            # the bypass opt-in lives inside its menu below the approval presets.
-            await page.get_by_test_id("new-chat-landing-approval-pill").click()
+            # Codex auto-selects (only built-in); the bypass opt-in lives inside
+            # its config submenu, below the approval presets.
+            await _open_entry_config(page, "ag_codex_e2e")
 
             # Guardrail: the bypass Switch is DISABLED until the verbatim phrase
             # is typed — a click alone can never arm the dangerous mode.
@@ -625,9 +904,10 @@ async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
             await expect(switch).to_be_enabled()
             await switch.click()
 
-            # Close the mode menu; the in-menu banner goes with it, but the
-            # persistent red banner under the composer must remain — proof the
-            # armed stance stays visible after the menu closes.
+            # Close the submenu then the root menu; the in-menu banner goes with
+            # them, but the persistent red banner under the composer must remain —
+            # proof the armed stance stays visible after the menu closes.
+            await page.keyboard.press("Escape")
             await page.keyboard.press("Escape")
             await expect(
                 page.get_by_test_id("new-chat-landing-bypass-sandbox-active-banner")
@@ -652,11 +932,11 @@ async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
 def test_start_session_select_harness(seeded_session: tuple[str, str]) -> None:
     """For a bundle agent (Polly/Debby), the composer offers an agent-harness pick.
 
-    Unlike Claude Code — which shows a permission-mode pill — Polly and Debby
-    declare a brain harness, so the composer renders a harness picker (an "Agent
-    Harness" radio group). Selecting a non-default harness ("Pi") must (a) show
-    all four harness options, (b) surface the pick on the harness picker's
-    trigger, and (c) reach ``POST /v1/sessions`` as ``harness_override: "pi"``.
+    Unlike Claude Code — whose submenu shows permission/model knobs — Polly and
+    Debby declare a brain harness, so their config submenu renders an "Agent
+    Harness" radio group. Selecting a non-default harness ("Pi") must (a) show
+    all four harness options and (b) reach ``POST /v1/sessions`` as
+    ``harness_override: "pi"``.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_select_harness(base_url, session_id))
@@ -705,21 +985,17 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Polly auto-selects (ranked ahead of Debby), so the harness picker —
-            # present because Polly declares a harness — opens the harness group.
-            await page.get_by_test_id("new-chat-landing-harness-trigger").click()
+            # Polly auto-selects (ranked ahead of Debby); its brain-harness
+            # override radios live in the picker's per-entry config submenu.
+            await _open_entry_config(page, "ag_polly_e2e")
             # All four brain harnesses render as radio rows, in registry order.
             for harness in ("claude-sdk", "openai-agents", "codex", "pi"):
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-harness-{harness}")
                 ).to_be_visible()
+            # Picking a harness commits and closes the menu (the agent chip keeps
+            # the bare agent label "Polly"); the override rides along on create.
             await page.get_by_test_id("new-chat-landing-harness-pi").click()
-
-            # The harness picker's trigger reflects the non-default harness
-            # immediately (the agent label stays the bare agent name).
-            await expect(page.get_by_test_id("new-chat-landing-harness-trigger")).to_contain_text(
-                "Pi"
-            )
 
             await page.get_by_test_id("new-chat-landing-input").fill("debate the design")
             await page.get_by_test_id("new-chat-landing-submit").click()

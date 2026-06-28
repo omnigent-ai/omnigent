@@ -38,7 +38,7 @@ afterEach(cleanup);
 
 describe("settingsNavGroups", () => {
   it("flags Keyboard shortcuts as hidden on mobile, but not the other items", () => {
-    const items = settingsNavGroups(false).flatMap((g) => g.items);
+    const items = settingsNavGroups(false, false).flatMap((g) => g.items);
     const shortcuts = items.find((i) => i.id === "shortcuts");
     expect(shortcuts?.hideOnMobile).toBe(true);
     for (const item of items) {
@@ -48,16 +48,25 @@ describe("settingsNavGroups", () => {
 
   it("includes Account (leading) only when accounts auth is enabled", () => {
     expect(
-      settingsNavGroups(false)
+      settingsNavGroups(false, false)
         .flatMap((g) => g.items)
         .map((i) => i.id),
     ).not.toContain("account");
-    const withAccounts = settingsNavGroups(true)
+    const withAccounts = settingsNavGroups(true, false)
       .flatMap((g) => g.items)
       .map((i) => i.id);
     expect(withAccounts).toContain("account");
     // Account leads its group — it's the most-visited section on accounts deploys.
     expect(withAccounts[0]).toBe("account");
+  });
+
+  it("includes the Local CLI section only in the desktop shell", () => {
+    const ids = (isDesktop: boolean) =>
+      settingsNavGroups(false, isDesktop)
+        .flatMap((g) => g.items)
+        .map((i) => i.id);
+    expect(ids(false)).not.toContain("cli");
+    expect(ids(true)).toContain("cli");
   });
 });
 

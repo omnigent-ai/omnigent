@@ -67,6 +67,7 @@ import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { Toaster } from "@/components/ui/toast";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
+import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { WorkspacePanel } from "./WorkspacePanel";
 import type { RightRailTab } from "./railTabs";
 
@@ -206,6 +207,7 @@ export function AppShell() {
   // push panel of their own. On desktop these are tabs in the workspace rail;
   // on a phone they open as full-screen overlays from the session-menu FAB.
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
+  const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
   const [todosPanelOpen, setTodosPanelOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) is open by default and
   // remembers its open/closed state per session — a brand-new session starts
@@ -519,6 +521,7 @@ export function AppShell() {
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
+    setShellsPanelOpen(false);
     setTodosPanelOpen(false);
     setFilesPanelShowHidden(false);
     if (!conversationId) {
@@ -849,6 +852,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
     setPanelInitialKey(key);
   }
@@ -859,6 +863,7 @@ export function AppShell() {
     setPanelInitialKey(null); // close terminals panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
     setExecutionLogsKey(key);
   }
@@ -872,6 +877,7 @@ export function AppShell() {
     setPanelInitialKey(null); // close terminals panel
     setExecutionLogsKey(null); // close execution-logs panel
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
     setFilesPanelOpen(true);
   }
@@ -884,8 +890,23 @@ export function AppShell() {
     setPanelInitialKey(null); // close terminals panel
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
     setSubagentsPanelOpen(true);
+  }
+
+  // Mobile FAB → "Shells" opens the desktop rail's Shells tab content as a
+  // full-screen drawer. This preserves the "+ New shell" empty state on
+  // phones instead of requiring an existing shell before the entry works.
+  function openShellsPanel() {
+    setSelectedFilePath(null); // close file viewer
+    clearFileViewerUrl();
+    setPanelInitialKey(null); // close terminals panel / terminal-first view
+    setExecutionLogsKey(null); // close execution-logs panel
+    setFilesPanelOpen(false); // close files drawer
+    setSubagentsPanelOpen(false); // close mobile agents drawer
+    setTodosPanelOpen(false); // close mobile tasks drawer
+    setShellsPanelOpen(true);
   }
 
   // Mobile FAB → "Tasks" opens the todo list (the desktop rail's Tasks tab)
@@ -897,16 +918,8 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(true);
-  }
-
-  function openFirstTerminal() {
-    // Mobile FAB → "Terminals" routes to the first terminal so the
-    // single tap is equivalent to clicking the first row in the
-    // desktop rail's terminals card. Inventory view — the embedded
-    // REPL terminal is the pill's Terminal view, not a rail entry.
-    if (railTerminals.length === 0) return;
-    openTerminalsPanel(terminalTabKey(railTerminals[0]));
   }
 
   function openMainExecutionLog() {
@@ -1094,8 +1107,10 @@ export function AppShell() {
                     executionLogsOpen,
                     filesPanelOpen,
                     subagentsPanelOpen,
+                    shellsPanelOpen,
                     todosPanelOpen,
                     hideTerminalsTab,
+                    showShellsTab: railTabsAvailable.terminals,
                     terminalsLength: railTerminals.length,
                     isClaudeNative,
                     todosCompleted,
@@ -1105,7 +1120,7 @@ export function AppShell() {
                     subagentsWorking,
                     agentCount,
                     onOpenFiles: openFilesPanel,
-                    onOpenFirstTerminal: openFirstTerminal,
+                    onOpenShells: openShellsPanel,
                     onOpenSubagents: openSubagentsPanel,
                     onOpenTodos: openTodosPanel,
                     onOpenMainExecutionLog: openMainExecutionLog,
@@ -1216,6 +1231,19 @@ export function AppShell() {
                   testId="subagents-panel-drawer"
                 >
                   <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+                </MobilePanelDrawer>
+              )}
+              {conversationId && (
+                <MobilePanelDrawer
+                  open={shellsPanelOpen}
+                  title="Shells"
+                  onClose={() => setShellsPanelOpen(false)}
+                  testId="shells-panel-drawer"
+                >
+                  <InlineTerminalsSection
+                    conversationId={conversationId}
+                    onExpand={openTerminalsPanel}
+                  />
                 </MobilePanelDrawer>
               )}
               {conversationId && (

@@ -280,6 +280,14 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``).
         # Safe to propagate: not a secret.
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX",
+        # Native-Claude launcher plugin selector (``module.path:callable``).
+        # Read by omnigent.claude_launcher.resolve_claude_launch in the
+        # managed-host runner (``_auto_create_claude_terminal``) to wrap the
+        # Claude launch through a downstream binary (e.g. Databricks' isaac).
+        # The daemon→runner env strip would otherwise drop it, leaving the
+        # runner on the default launch. Safe to propagate: not a secret, just a
+        # plugin reference string.
+        "OMNIGENT_CLAUDE_LAUNCHER",
         # Testing knob: override the context window size for compaction
         # trigger threshold. Not a secret — a plain integer.
         "AP_CONTEXT_WINDOW_OVERRIDE",
@@ -1402,6 +1410,12 @@ class HostProcess:
         # is not a browser. Seeded before either auth branch so it is sent
         # on both the managed-token and Bearer paths.
         headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+        # Workspace routing: the tunnel handshake must name the workspace or
+        # it routes to the account. Empty for single-workspace and managed
+        # hosts (no recorded selector), so neither is affected.
+        from omnigent.cli_auth import databricks_org_id_headers
+
+        headers.update(databricks_org_id_headers(self._server_url))
 
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:

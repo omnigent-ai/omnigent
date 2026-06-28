@@ -49,6 +49,12 @@
       "AgentObject": {
         "description": "API representation of a registered agent.",
         "properties": {
+          "builtin": {
+            "default": false,
+            "description": "Whether this is a server-*seeded* built-in agent (deterministic, name-derived id) as opposed to an operator/user-registered template (random id, e.g. via `omnigent server --agent`) or a session-scoped upload. The Web UI's new-session picker uses this to decide whether a same-named `omnigent run` upload may shadow the catalog entry: seeded built-ins are protected, while a user-registered template is superseded by a newer same-named upload. Always `False` for session-scoped agents.",
+            "title": "Builtin",
+            "type": "boolean"
+          },
           "created_at": {
             "description": "Unix epoch timestamp of creation.",
             "title": "Created At",
@@ -3763,6 +3769,7 @@
             "enum": [
               "idle",
               "running",
+              "waiting",
               "failed"
             ],
             "title": "Status",
@@ -4476,10 +4483,11 @@
             "type": "array"
           },
           "status": {
-            "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), or `\"failed\"` (terminal failure).",
+            "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Current read paths collapse `\"waiting\"` -> `\"running\"` before building this snapshot; the literal stays a superset of what the runtime can produce so a server that forwards the raw status never 500s on serialization.",
             "enum": [
               "idle",
               "running",
+              "waiting",
               "failed"
             ],
             "title": "Status",
@@ -5719,6 +5727,19 @@
             "description": "Context-fill estimate for the next turn \u2014 set only by executors that make multiple LLM sub-calls per turn (e.g. `openai-agents`). For single-call executors this is absent and `total_tokens` serves the same purpose. The toolbar context ring and `/context` command use this field when present, falling back to `total_tokens`.",
             "title": "Context Tokens"
           },
+          "cost_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Authoritative per-turn cost in USD reported directly by the harness/provider (e.g. GitHub Copilot's AI-credit total). When present, the server-side cost path uses it in preference to the catalog token-price estimate; `None` when the harness doesn't report a cost (the common case, where cost is computed from token counts x catalog pricing).",
+            "title": "Cost Usd"
+          },
           "input_tokens": {
             "default": 0,
             "description": "Number of input (prompt) tokens consumed.",
@@ -6931,6 +6952,22 @@
               "title": "Kind",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "project",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Project"
+            }
           }
         ],
         "responses": {
@@ -6974,6 +7011,26 @@
           }
         },
         "summary": "Create Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/projects": {
+      "get": {
+        "description": "Return all project names for the authenticated user, ordered\nalphabetically.\n\nProjects are implicit: they exist while at least one session\nhas a `conversation_labels` row with `key=\"omni_project\"`.\n\n**Returns:** List of project names.",
+        "operationId": "list_session_projects_v1_sessions_projects_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Session Projects",
         "tags": [
           "sessions"
         ]

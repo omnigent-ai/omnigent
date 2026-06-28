@@ -36,6 +36,11 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
+  useProjects: () => ({ data: [] }),
+  useMoveToProject: () => ({ mutate: vi.fn() }),
+  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  fetchProjectSessionIds: () => Promise.resolve([]),
+  PROJECT_LABEL_KEY: "omni_project",
 }));
 
 // Heavy sibling widgets pull their own hooks/providers; stub them so this
@@ -166,14 +171,34 @@ describe("quick pin/unpin hover button", () => {
     // affordance is visible at any breakpoint.
     renderSidebar();
 
-    // Desktop quick button: hidden on mobile, shown on desktop.
+    // Desktop quick button: hidden on mobile, revealed from `md` up. The reveal
+    // uses `md:inline-flex` (not `md:block`) so the button stays a flex
+    // container — see the centering regression test below.
     const quickButton = screen.getByTestId("quick-pin-conversation");
-    expect(quickButton).toHaveClass("hidden", "md:block");
+    expect(quickButton).toHaveClass("hidden", "md:inline-flex");
 
     // Kebab Pin item: present in the menu but hidden from `md` up, so it only
     // surfaces on mobile.
     fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
     expect(screen.getByTestId("pin-conversation")).toHaveClass("md:hidden");
+  });
+
+  it("reveals the quick-pin button without breaking icon centering (regression for #1226)", () => {
+    // The Button base centers its icon with `inline-flex` + `items-center
+    // justify-center`. The desktop reveal MUST keep a flex display: PR #1226
+    // revealed it with `md:block`, which overrode `inline-flex`, made the
+    // centering classes inert, and shoved the pin glyph to the button's
+    // top-left corner (~6px off-center). Guard the display so the reveal
+    // stays flex and the glyph stays centered.
+    renderSidebar();
+
+    const quickButton = screen.getByTestId("quick-pin-conversation");
+    // The centering classes are present...
+    expect(quickButton).toHaveClass("items-center", "justify-center");
+    // ...and the desktop reveal makes the button a flex container (so those
+    // classes actually take effect), rather than a block (which would not).
+    expect(quickButton).toHaveClass("md:inline-flex");
+    expect(quickButton).not.toHaveClass("md:block");
   });
 });
 
@@ -208,5 +233,30 @@ describe("double-click to rename", () => {
 
     expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
     expect(mocks.rename.mutate).not.toHaveBeenCalled();
+  });
+});
+
+describe("right-click context menu", () => {
+  it("opens the same action items as the kebab and drives the same handlers", () => {
+    renderSidebar();
+
+    // Nothing in the DOM until the row is right-clicked (the kebab menu is
+    // closed, so its items aren't rendered either).
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    // The context menu carries the full set of kebab actions — same testids,
+    // so it renders from the shared ConversationMenuItems body.
+    expect(screen.getByTestId("share-conversation")).toBeInTheDocument();
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(screen.getByTestId("move-to-project")).toBeInTheDocument();
+    expect(screen.getByTestId("archive-conversation")).toBeInTheDocument();
+    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+
+    // Selecting Rename runs the same path as the kebab / double-click: the
+    // inline rename input appears.
+    fireEvent.click(screen.getByTestId("rename-conversation"));
+    expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
   });
 });

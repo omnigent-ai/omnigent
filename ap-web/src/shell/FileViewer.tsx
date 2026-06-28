@@ -278,6 +278,8 @@ interface FileViewerProps {
    * when the viewer is embedded inside the inline right panel.
    */
   frameless?: boolean;
+  /** Called when the user presses Escape to close the active file tab. */
+  onCloseTab?: () => void;
   /** Called when the comments panel opens or closes inside the viewer. */
   onCommentsOpenChange?: (open: boolean) => void;
   /**
@@ -312,6 +314,7 @@ function FileViewerBody({
   conversationId,
   path,
   onClose,
+  onCloseTab,
   onNavigateTo,
   permissionLevel,
   frameless,
@@ -572,6 +575,26 @@ function FileViewerBody({
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [open, onNavigateTo, currentNavIdx, prevPath, nextPath, guardDirty]);
+
+  // Escape closes the active file tab (when search is not open).
+  useEffect(() => {
+    if (!open || !onCloseTab) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (searchOpen) return;
+      const target = e.target;
+      if (
+        target instanceof HTMLElement &&
+        target.closest('textarea, input, [contenteditable="true"]')
+      ) {
+        return;
+      }
+      e.preventDefault();
+      guardDirty(onCloseTab);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [open, onCloseTab, searchOpen, guardDirty]);
 
   // View mode toggle — preview is the default for md/html, source for everything else.
   const lang = detectLang(path);

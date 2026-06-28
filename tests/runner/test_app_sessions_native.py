@@ -31,6 +31,7 @@ from omnigent import (
     codex_native_bridge,
     cursor_native_bridge,
     kiro_native_bridge,
+    qwen_native_bridge,
 )
 from omnigent.antigravity_native_bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -11371,6 +11372,316 @@ async def test_events_compact_on_cursor_native_503_dismisses_spinner_on_inject_f
     ]
     # in_progress raised the spinner; failed must dismiss it. completed must
     # never fire — the history was not compacted.
+    assert compaction_types == [
+        "response.compaction.in_progress",
+        "response.compaction.failed",
+    ], f"Expected in_progress then failed (no completed); got {compaction_types!r}."
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_pi_native_enqueues_compact_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    POST ``/events`` with ``{"type":"compact"}`` on a pi-native session
+    queues a ``compact`` payload to the Pi extension inbox and returns 200.
+
+    Pi owns its context window inside the resident Pi TUI process, so explicit
+    compaction must run there (the Omnigent server's AP-side compaction would
+    only summarise the transcript mirror and desync the two, and 400s on the
+    LLM-less pi-native pseudo-agent). The runner's ``compact`` dispatch routes
+    to ``_handle_pi_native_compact``, which drops a ``compact`` payload into the
+    bridge inbox; the resident extension consumes it and calls Pi's
+    ``ExtensionContext.compact()``.
+
+    Regression guard: the dispatch originally enumerated only claude/codex/
+    cursor-native, so pi-native fell through to the 204 no-op.
+
+    Pins:
+    1. 200 returned (not 204) so the Omnigent server skips its own AP-side
+       compaction.
+    2. A ``compact_*`` payload is written to the session's bridge inbox.
+    3. /compact is a control signal and publishes no ``session.status`` events.
+    """
+    import omnigent.pi_native_bridge as pi_native_bridge
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_pi_native_compact"
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+
+    pi_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the pi-native spec for any agent_id."""
+        del agent_id, session_id
+        return pi_native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        # Seeds _session_spec_cache so the dispatch detects "pi-native".
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        # Drain creation-time events (pi-native auto-create enqueues
+        # session.terminal_pending and, with no real Pi terminal in the test,
+        # a session.status failure) so the drain below isolates only what
+        # /compact emits.
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+        # /compact is a control signal; it must not enqueue session.status events.
+        queue = _session_event_queues_ref.get(conv_id)
+        queued_events: list[dict[str, Any]] = []
+        if queue is not None:
+            while not queue.empty():
+                item = queue.get_nowait()
+                if isinstance(item, dict):
+                    queued_events.append(item)
+
+    # 1) 200 means pi-native owns its context, so the control was handled in the
+    # terminal and the server must skip its own compaction. 204 would mean the
+    # dispatch fell through to the no-op (the original bug).
+    assert resp.status_code == 200, (
+        f"pi-native compact must return 200; got {resp.status_code}: {resp.text}"
+    )
+
+    # 2) The compact request reached the bridge inbox (the extension's
+    # compaction channel). If empty, the dispatch fell through to the no-op.
+    inbox = pi_native_bridge.bridge_dir_for_session_id(conv_id) / "inbox"
+    queued = sorted(p.name for p in inbox.glob("*.json")) if inbox.exists() else []
+    assert any("compact_" in name for name in queued), (
+        f"pi-native compact must enqueue a compact payload to the bridge inbox; "
+        f"inbox contained {queued!r}."
+    )
+
+    # 3) No session.status events; /compact is a control signal, not a state change.
+    assert queued_events == [], (
+        f"pi-native compact must not publish session events; got {queued_events!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_pi_native_returns_503_when_inbox_unwritable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Pi-native compact returns 503 when the bridge inbox cannot be written.
+
+    Sister to the happy-path test. If the inbox enqueue raises OSError (e.g. a
+    filesystem fault), the handler surfaces 503 with the
+    ``pi_native_compact_failed`` code rather than silently swallowing the
+    request; the Omnigent server then treats it as not-handled.
+    """
+    import omnigent.pi_native_bridge as pi_native_bridge
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_pi_native_compact_fail"
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+
+    def _boom(*_args: Any, **_kwargs: Any) -> str:
+        """Simulate an unwritable inbox."""
+        raise OSError("inbox is read-only")
+
+    monkeypatch.setattr(pi_native_bridge, "enqueue_compact", _boom)
+
+    pi_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the pi-native spec for any agent_id."""
+        del agent_id, session_id
+        return pi_native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+    assert resp.status_code == 503, (
+        f"pi-native compact with unwritable inbox must return 503; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    body = resp.json()
+    assert body.get("error") == "pi_native_compact_failed", (
+        f"503 body must carry the pi bridge-failure error code; got {body!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_qwen_native_submits_compress_and_raises_spinner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    POST ``/events`` ``{"type":"compact"}`` on a qwen-native session submits
+    ``/compress`` via the input file, returns 200, and raises the spinner only.
+
+    qwen owns its context window inside the TUI, so compaction runs there
+    (``/compress``), not as AP-side compaction; same rationale as cursor-native.
+    Unlike cursor, injection is file-based: a ``submit`` line routes through
+    qwen's ``RemoteInputWatcher`` then ``submitQuery``, which processes the slash
+    command (no autocomplete-dropdown trap). The 200 is load-bearing (server
+    skips its own ``_run_compact_locked``). The handler publishes only
+    ``in_progress``; the ``completed`` edge is the compaction mirror's job once
+    the ``chat_compression`` record lands (covered in test_qwen_native_forwarder).
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    captured: list[tuple[Any, str]] = []
+
+    def _fake_submit(bridge_dir: Any, *, content: str) -> None:
+        """Record the input-file submit without touching disk."""
+        captured.append((bridge_dir, content))
+
+    monkeypatch.setattr(qwen_native_bridge, "submit_user_message", _fake_submit)
+
+    qwen_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "qwen-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return qwen_native_spec
+
+    conv_id = "conv_qwen_compact"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+    assert resp.status_code == 200, (
+        f"qwen-native compact must return 200 from /events; got {resp.status_code}: {resp.text}"
+    )
+    assert len(captured) == 1, (
+        f"Expected one submit_user_message call from qwen compact, got {len(captured)}."
+    )
+    bridge_dir, content = captured[0]
+    assert bridge_dir == qwen_native_bridge.bridge_dir_for_session_id(conv_id)
+    assert content == "/compress", f"Expected '/compress' submit content, got {content!r}."
+
+    compaction_types = [
+        e.get("type")
+        for e in queued_events
+        if str(e.get("type", "")).startswith("response.compaction")
+    ]
+    assert compaction_types == ["response.compaction.in_progress"], (
+        f"Handler must publish only in_progress (mirror completes it); got {compaction_types!r}."
+    )
+    in_progress = next(
+        e for e in queued_events if e.get("type") == "response.compaction.in_progress"
+    )
+    assert in_progress.get("task_id") == conv_id
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_qwen_native_503_dismisses_spinner_on_submit_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A submit failure surfaces as 503 AND dismisses the spinner (in_progress->failed)."""
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_submit(bridge_dir: Any, *, content: str) -> None:
+        del bridge_dir, content
+        raise RuntimeError("input file unwritable")
+
+    monkeypatch.setattr(qwen_native_bridge, "submit_user_message", _fake_submit)
+
+    qwen_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "qwen-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return qwen_native_spec
+
+    conv_id = "conv_qwen_compact_fail"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+    assert resp.status_code == 503, f"got {resp.status_code}: {resp.text}"
+    assert resp.json().get("error") == "qwen_native_compact_failed"
+    compaction_types = [
+        e.get("type")
+        for e in queued_events
+        if str(e.get("type", "")).startswith("response.compaction")
+    ]
     assert compaction_types == [
         "response.compaction.in_progress",
         "response.compaction.failed",

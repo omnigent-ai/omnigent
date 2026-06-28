@@ -108,3 +108,29 @@ export function useRootSessionId(
   if (parentSessionId === null) return conversationId;
   return data ?? null;
 }
+
+/**
+ * Resolve the top-level root of the *active* conversation in one call,
+ * fetching its snapshot for the parent link and walking up from there.
+ *
+ * The sidebar lists only top-level sessions — child (sub-agent) rows are
+ * omitted. When the user clicks a sub-agent in the Agents rail the URL
+ * becomes ``/c/<childId>``, which matches no sidebar row, so a row that
+ * compares its id against the raw active id loses its highlight. Comparing
+ * against this resolved root instead keeps the owning top-level session
+ * highlighted while viewing any of its descendants.
+ *
+ * Returns ``null`` while the snapshot or the parent walk is still loading
+ * (callers fall back to the raw active id for that one render), and the
+ * active id itself for a top-level session.
+ *
+ * @param activeConversationId - The conversation rendered in main, or
+ *   ``null`` when on a non-chat route (disables resolution).
+ */
+export function useActiveRootSessionId(
+  activeConversationId: string | null | undefined,
+): string | null {
+  const id = activeConversationId ?? null;
+  const { session } = useSession(id);
+  return useRootSessionId(id, session?.parentSessionId);
+}
