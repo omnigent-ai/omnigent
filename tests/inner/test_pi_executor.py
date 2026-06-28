@@ -319,7 +319,7 @@ def test_sanitize_real_sys_session_send_args_collapses_to_object() -> None:
     # Structured fields the purpose guard and the per-dispatch model
     # override read must survive the collapse.
     assert sanitized_args["type"] == "object"
-    assert set(sanitized_args["properties"]) == {"input", "purpose", "model"}
+    assert set(sanitized_args["properties"]) == {"input", "purpose", "model", "file_ids"}
     assert sanitized_args["required"] == ["input"]
     # Exact dict: the chosen object branch minus its stripped
     # additionalProperties — anything else means extra keys leaked or

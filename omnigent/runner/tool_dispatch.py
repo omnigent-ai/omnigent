@@ -20,6 +20,7 @@ Tool categories:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -916,6 +917,143 @@ def _subagent_model_from_args(args: dict[str, Any]) -> str | None:
     return validate_model_override(raw_model)
 
 
+def _subagent_file_ids_from_args(args: dict[str, Any]) -> list[str]:
+    """
+    Extract the optional ``file_ids`` from ``sys_session_send`` args.
+
+    ``file_ids`` lives only in the object form of ``args``
+    (``{"input": ..., "file_ids": [...]}``); the plain-string form
+    carries no files. A present-but-malformed value fails loud rather
+    than being silently dropped — the ids later drive a parent→child
+    file copy whose failure must surface to the caller.
+
+    :param args: Parsed ``sys_session_send`` arguments, e.g.
+        ``{"args": {"input": "review", "file_ids": ["file_abc"]}}``.
+    :returns: The requested file ids in order, or ``[]`` when absent.
+    :raises ValueError: If ``file_ids`` is present but is not a list of
+        non-empty strings.
+    """
+    raw_message = args.get("args")
+    if not isinstance(raw_message, dict):
+        return []
+    raw_ids = raw_message.get("file_ids")
+    if raw_ids is None:
+        return []
+    if not isinstance(raw_ids, list) or not all(isinstance(fid, str) and fid for fid in raw_ids):
+        raise ValueError("'file_ids' must be a list of non-empty strings when provided")
+    return list(raw_ids)
+
+
+async def _teardown_failed_child(
+    server_client: httpx.AsyncClient,
+    child_session_id: str,
+    *,
+    created_child: bool,
+) -> None:
+    """Undo a failed named-send spawn so it leaves no phantom behind.
+
+    Unregisters the runner-local child/work mappings and, when this send
+    just created the server child session, deletes it. Deleting the child
+    also reclaims any files copied into it before the failure — leaving an
+    empty child behind would poison a retry with the same ``(agent, title)``
+    (the next send would attach to the phantom instead of spawning clean)
+    and orphan the copied file rows. Used on both the copy/content failure
+    and the message-post failure paths so they tear down identically.
+    """
+    from omnigent.runner import app as _runner_app
+
+    _runner_app.unregister_child_session(child_session_id)
+    _runner_app.unregister_subagent_work(child_session_id)
+    if created_child:
+        with contextlib.suppress(httpx.HTTPError):
+            await server_client.delete(f"/v1/sessions/{child_session_id}", timeout=30.0)
+
+
+async def _build_subagent_message_content(
+    message: str,
+    file_ids: list[str],
+    *,
+    child_session_id: str,
+    parent_session_id: str,
+    server_client: httpx.AsyncClient,
+) -> tuple[list[dict[str, Any]], None] | tuple[None, str]:
+    """
+    Build the child's first-turn content, copying parent files first.
+
+    With no ``file_ids`` this returns the single ``input_text`` block the
+    text-only path has always sent (byte-for-byte unchanged). With
+    ``file_ids`` it copies those files from the parent into the child via
+    the lineage-scoped copy endpoint, then appends one file block per
+    original id (in order) referencing the MAPPED child-scoped id.
+
+    The block type mirrors ``_resolve_forwarded_message_content``: an
+    ``image/*`` content type yields ``input_image``; everything else
+    yields ``input_file``. Content type is guessed from the copied
+    file's filename (the copy response carries only an id mapping), read
+    back from the child file's metadata.
+
+    :param message: The user message text.
+    :param file_ids: Parent-owned source file ids to forward, in order.
+    :param child_session_id: Destination (child) session id.
+    :param parent_session_id: Source session id (the dispatching runner's
+        own session), passed as the copy ``source_session_id``.
+    :param server_client: Authenticated Omnigent server client.
+    :returns: ``(content, None)`` on success, or ``(None, error)`` when
+        the copy or metadata lookup fails — surfaced to the parent agent.
+    """
+    content: list[dict[str, Any]] = [{"type": "input_text", "text": str(message)}]
+    if not file_ids:
+        return content, None
+
+    try:
+        copy_resp = await server_client.post(
+            f"/v1/sessions/{child_session_id}/resources/files:copy",
+            json={"source_session_id": parent_session_id, "file_ids": file_ids},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        return None, (f"Error: failed to copy files to child: {type(exc).__name__}: {exc}")
+    if copy_resp.status_code >= 400:
+        return None, (
+            f"Error: failed to copy files to child: {copy_resp.status_code} {copy_resp.text[:200]}"
+        )
+
+    mapping = copy_resp.json().get("mapping")
+    if not isinstance(mapping, dict):
+        return None, "Error: file copy response missing 'mapping'"
+
+    import mimetypes
+
+    for old_id in file_ids:
+        new_id = mapping.get(old_id)
+        if not isinstance(new_id, str) or not new_id:
+            return None, f"Error: file copy mapping missing new id for {old_id!r}"
+        try:
+            meta_resp = await server_client.get(
+                f"/v1/sessions/{child_session_id}/resources/files/{new_id}",
+                timeout=10.0,
+            )
+        except httpx.HTTPError as exc:
+            return None, (
+                f"Error: failed to read copied file {new_id!r}: {type(exc).__name__}: {exc}"
+            )
+        if meta_resp.status_code >= 400:
+            return None, (
+                f"Error: failed to read copied file {new_id!r}: "
+                f"{meta_resp.status_code} {meta_resp.text[:200]}"
+            )
+        meta = meta_resp.json()
+        # The file resource carries no content_type; the filename is the
+        # cheap, reliable signal for the image-vs-file split (mirrors how
+        # the upload path guesses a content type from the path).
+        filename = meta.get("name") or (meta.get("metadata") or {}).get("filename")
+        guessed, _ = mimetypes.guess_type(filename) if isinstance(filename, str) else (None, None)
+        block_type = "input_image" if (guessed or "").startswith("image/") else "input_file"
+        content.append({"type": block_type, "file_id": new_id})
+
+    return content, None
+
+
 def _find_subagent_spec(sub_agent_name: str, agent_spec: Any | None) -> Any | None:
     """
     Look up a named sub-agent's spec in the parent's ``sub_agents`` list.
@@ -1134,6 +1272,11 @@ async def _execute_subagent_tool(
         return f"Error: sys_session_send invalid 'model': {exc}"
 
     try:
+        file_ids = _subagent_file_ids_from_args(args)
+    except ValueError as exc:
+        return f"Error: sys_session_send invalid 'file_ids': {exc}"
+
+    try:
         harness_override = _subagent_harness_override_from_args(args)
     except ValueError as exc:
         return f"Error: sys_session_send invalid 'harness': {exc}"
@@ -1156,6 +1299,12 @@ async def _execute_subagent_tool(
                 "sub-agent session is first created; it cannot change an "
                 "existing session. Re-send without 'model' to continue "
                 f"session {target_session_id!r}."
+            )
+        if file_ids:
+            return (
+                "Error: sys_session_send 'file_ids' is supported only when "
+                "addressing a sub-agent by 'agent'/'title'; it cannot be "
+                f"forwarded to an existing session by id ({target_session_id!r})."
             )
         if harness_override is not None:
             return (
@@ -1415,6 +1564,22 @@ async def _execute_subagent_tool(
         publish_event=publish_event,
     )
 
+    # Copy any forwarded parent files into the child and build the
+    # first-turn content (input_text plus a file block per copied id).
+    # On copy failure we surface the error to the parent and post no
+    # event — but first undo the registrations made above so a failed
+    # spawn doesn't leak a phantom child.
+    message_content, content_error = await _build_subagent_message_content(
+        message,
+        file_ids,
+        child_session_id=child_session_id,
+        parent_session_id=conversation_id,
+        server_client=server_client,
+    )
+    if content_error is not None:
+        await _teardown_failed_child(server_client, child_session_id, created_child=created_child)
+        return content_error
+
     # Send the user message as a separate event so the server's
     # post_event forwards it to the runner and starts the child
     # turn.
@@ -1425,7 +1590,7 @@ async def _execute_subagent_tool(
                 "type": "message",
                 "data": {
                     "role": "user",
-                    "content": [{"type": "input_text", "text": str(message)}],
+                    "content": message_content,
                 },
             },
             # This message is gated at the recipient's REQUEST phase, which can
@@ -1436,12 +1601,10 @@ async def _execute_subagent_tool(
             timeout=_ASK_GATE_DELIVERY_TIMEOUT,
         )
     except httpx.HTTPError as exc:
-        _runner_app.unregister_child_session(child_session_id)
-        _runner_app.unregister_subagent_work(child_session_id)
+        await _teardown_failed_child(server_client, child_session_id, created_child=created_child)
         return f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
     if msg_resp.status_code >= 400:
-        _runner_app.unregister_child_session(child_session_id)
-        _runner_app.unregister_subagent_work(child_session_id)
+        await _teardown_failed_child(server_client, child_session_id, created_child=created_child)
         return (
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
         )
