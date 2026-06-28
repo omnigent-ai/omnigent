@@ -183,6 +183,23 @@ class MeterLike(Protocol):
         ...
 
 
+def _sanitize_access_log_value(value: str) -> str:
+    """
+    Make a client-controlled string safe to embed in an access-log line.
+
+    The ``User-Agent`` header and the session ID parsed from the URL path
+    are both attacker-controlled. Replaces control characters (CR, LF,
+    NUL, ANSI escape sequences, ...) and the double-quote delimiter with
+    ``?`` so a crafted value cannot forge additional log records, corrupt
+    the quoted ``ua`` field, or smuggle terminal escapes into log viewers
+    (CWE-117).
+
+    :param value: Raw, untrusted string to embed in the access log.
+    :returns: Value containing only printable, non-quote characters.
+    """
+    return "".join(char if char.isprintable() and char != '"' else "?" for char in value)
+
+
 class RequestDurationAccessFormatter(AccessFormatter):
     """
     Uvicorn access formatter that appends Omnigent request duration.
@@ -223,11 +240,11 @@ class RequestDurationAccessFormatter(AccessFormatter):
             user_agent = _REQUEST_USER_AGENT_CONTEXT.get()
             if user_agent is not None:
                 truncated = user_agent[: self._MAX_USER_AGENT_LENGTH]
-                parts.append(f'ua="{truncated}"')
+                parts.append(f'ua="{_sanitize_access_log_value(truncated)}"')
 
             session_id = _REQUEST_SESSION_ID_CONTEXT.get()
             if session_id is not None:
-                parts.append(f"sid={session_id}")
+                parts.append(f"sid={_sanitize_access_log_value(session_id)}")
         finally:
             _REQUEST_DURATION_CONTEXT.set(None)
             _REQUEST_ID_CONTEXT.set(None)

@@ -471,6 +471,57 @@ def test_access_formatter_truncates_long_user_agent() -> None:
         set_request_user_agent_for_access_log(None)
 
 
+def test_access_formatter_sanitizes_user_agent_control_chars() -> None:
+    """A crafted User-Agent cannot inject newlines or terminal escapes."""
+    formatter = _make_formatter()
+    record = _make_access_record()
+
+    # CRLF log-forging attempt plus an ANSI escape sequence.
+    set_request_user_agent_for_access_log(
+        'evil\r\n10.0.0.1 - "GET /admin" 200\x1b[2J',
+    )
+    try:
+        output = formatter.format(record)
+        # The whole access line stays on one physical line.
+        assert "\n" not in output
+        assert "\r" not in output
+        assert "\x1b" not in output
+        # Sanitized field is present with control chars replaced by '?'.
+        assert "ua=" in output
+    finally:
+        set_request_user_agent_for_access_log(None)
+
+
+def test_access_formatter_sanitizes_quote_in_user_agent() -> None:
+    """An embedded double quote cannot break out of the quoted ua field."""
+    formatter = _make_formatter()
+    record = _make_access_record()
+
+    set_request_user_agent_for_access_log('foo" bar')
+    try:
+        output = formatter.format(record)
+        # Exactly one opening and one closing quote around the field.
+        assert 'ua="foo? bar"' in output
+    finally:
+        set_request_user_agent_for_access_log(None)
+
+
+def test_access_formatter_sanitizes_session_id_control_chars() -> None:
+    """Control chars surviving URL parsing are stripped from the sid field."""
+    formatter = _make_formatter()
+    record = _make_access_record()
+
+    # \x1b (ANSI ESC) survives Starlette's URL path parsing; ensure it
+    # cannot reach the log line unescaped.
+    set_request_session_id_for_access_log("conv_abc\x1b[31m")
+    try:
+        output = formatter.format(record)
+        assert "\x1b" not in output
+        assert "sid=conv_abc?[31m" in output
+    finally:
+        set_request_session_id_for_access_log(None)
+
+
 def test_access_formatter_includes_session_id() -> None:
     """Session ID appears in the access log when set."""
     formatter = _make_formatter()
