@@ -110,6 +110,7 @@ import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useActiveRootSessionId } from "@/hooks/useSession";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
@@ -1998,7 +1999,17 @@ function ConversationRow({
   // `useParams` reads from the active matched route. On `/`, the param is
   // undefined; on `/c/:conversationId`, it carries the active id.
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
-  const isActive = activeId === conversation.id;
+  // The sidebar lists only top-level sessions; child (sub-agent) rows are
+  // omitted. When the user clicks a sub-agent in the Agents rail the active
+  // id becomes the child's, which matches no row here — so highlighting on
+  // the raw id alone would leave the owning session unhighlighted. Resolve
+  // the active conversation's top-level root and highlight against that, so
+  // the parent row stays selected while viewing any of its descendants.
+  // While the resolution loads (`null`), fall back to the raw id for that
+  // render — a top-level session resolves to itself, so the common case is
+  // unaffected.
+  const activeRootId = useActiveRootSessionId(activeId ?? null);
+  const isActive = (activeRootId ?? activeId) === conversation.id;
   const navigate = useNavigate();
   // Track the *live* active conversation id. Delete is fire-and-forget,
   // so the user can navigate to another conversation before the mutation
