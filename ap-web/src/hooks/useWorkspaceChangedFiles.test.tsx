@@ -6,12 +6,27 @@ import type { ReactNode } from "react";
 
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
+  useSessionHostOnline: vi.fn(),
 }));
 vi.mock("@/store/chatStore", () => ({
   useChatStore: vi.fn(),
 }));
+// useSession feeds the host-filesystem fallback (host id + workspace path).
+// Default to no session so the fallback stays disabled for the pre-existing
+// gating tests; the fallback-specific tests override the mock per-test.
+vi.mock("@/hooks/useSession", () => ({
+  useSession: vi.fn(),
+}));
+// fetchHostFilesystem is the host-daemon listing used by the offline fallback.
+// Mocked so the fallback tests assert the call args without a real network.
+vi.mock("@/hooks/useHostFilesystem", () => ({
+  fetchHostFilesystem: vi.fn(),
+}));
 
-import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useSessionRunnerOnline, useSessionHostOnline } from "@/hooks/RunnerHealthProvider";
+import { useSession } from "@/hooks/useSession";
+import { fetchHostFilesystem } from "@/hooks/useHostFilesystem";
+import type { Session } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import {
   MAX_RUNNER_OFFLINE_RETRIES,
@@ -27,9 +42,13 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
+  type WorkspaceFile,
 } from "./useWorkspaceChangedFiles";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
+const hostOnlineMock = vi.mocked(useSessionHostOnline);
+const sessionMock = vi.mocked(useSession);
+const hostFsMock = vi.mocked(fetchHostFilesystem);
 const chatStoreMock = vi.mocked(useChatStore);
 const fetchMock = vi.fn();
 
@@ -154,8 +173,24 @@ beforeEach(() => {
   // assume sessionActive is false (initial fetch from `enabled`, no
   // polling). The trailing-invalidate test overrides per-call.
   stubChatStore();
+  // Default: host liveness unknown and no session snapshot → the
+  // host-filesystem fallback stays disabled, preserving the pre-existing
+  // gating behaviour. Fallback tests override these per-test.
+  hostOnlineMock.mockReturnValue(undefined);
+  sessionMock.mockReturnValue({ session: null, isLoading: false, error: null });
+  hostFsMock.mockReset();
 });
 
+/** Build a minimal host-bound session snapshot for the fallback tests. */
+function hostSession(hostId: string | null, workspace: string | null) {
+  return {
+    session: { hostId, workspace } as unknown as Session,
+    isLoading: false,
+    error: null,
+  };
+}
+
+// afterEach kept here so the hostSession helper stays in module scope.
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
@@ -496,6 +531,203 @@ describe("useWorkspaceDirectory gating", () => {
     );
     await flushMicrotasks();
 
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+// ── Host-filesystem fallback (runner offline, host online) ───────────────────
+//
+// After the host reconnects but before the first message re-initializes the
+// runner, the runner-backed /filesystem endpoints are gated off. The file
+// browser falls back to the host-filesystem API (no runner required) so the
+// workspace tree isn't empty. These tests mock the session snapshot + host
+// liveness so the fallback engages, and assert it routes to fetchHostFilesystem
+// with the workspace's absolute path.
+
+function AllFilesDataProbe({
+  id,
+  onData,
+}: {
+  id: string | undefined;
+  onData: (data: { available: boolean; data: WorkspaceFile[] } | undefined) => void;
+}) {
+  const query = useWorkspaceAllFiles(id);
+  useEffect(() => {
+    if (query.isSuccess) onData(query.data);
+  }, [query.isSuccess, query.data, onData]);
+  return null;
+}
+
+function AllFilesErrorProbe({
+  id,
+  onError,
+}: {
+  id: string | undefined;
+  onError: (err: Error | null | undefined) => void;
+}) {
+  const query = useWorkspaceAllFiles(id);
+  useEffect(() => {
+    if (query.isError) onError(query.error);
+  }, [query.isError, query.error, onError]);
+  return null;
+}
+
+function hostEntry(name: string, type: "file" | "directory", absRoot: string) {
+  return {
+    name,
+    path: `${absRoot}/${name}`,
+    type,
+    bytes: type === "file" ? 7 : null,
+    modified_at: 42,
+  };
+}
+
+describe("useWorkspaceAllFiles host-filesystem fallback", () => {
+  it("lists the workspace root via the host filesystem when the runner is offline and the host is online", async () => {
+    // Repro of #386: host reconnected, runner not yet re-initialized. The
+    // runner-backed query would be gated off (no fetch); instead the hook
+    // falls back to the host daemon and returns a non-empty tree.
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
+    sessionMock.mockReturnValue(hostSession("host_1", "/home/u/ws"));
+    hostFsMock.mockResolvedValue({
+      entries: [
+        hostEntry("src", "directory", "/home/u/ws"),
+        hostEntry("README.md", "file", "/home/u/ws"),
+      ],
+      truncated: false,
+    });
+
+    const results: Array<{ available: boolean; data: WorkspaceFile[] }> = [];
+    render(
+      <Wrap>
+        <AllFilesDataProbe
+          id="conv_reconnect"
+          onData={(d) => results.push(d as { available: boolean; data: WorkspaceFile[] })}
+        />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(hostFsMock).toHaveBeenCalled());
+    // The host listing is requested with the workspace's absolute path.
+    expect(hostFsMock.mock.calls[0]).toEqual(["host_1", "/home/u/ws"]);
+    // The runner endpoint is NOT hit (the runner is offline).
+    expect(fetchMock).not.toHaveBeenCalled();
+    // Absolute paths are mapped to workspace-relative for the tree.
+    await waitFor(() =>
+      expect(results.at(-1)).toEqual({
+        available: true,
+        data: [
+          { path: "src", name: "src", type: "directory", bytes: null, modified_at: 42 },
+          { path: "README.md", name: "README.md", type: "file", bytes: 7, modified_at: 42 },
+        ],
+      }),
+    );
+  });
+
+  it("does not fall back when the host is also offline", async () => {
+    // Runner offline AND host down → nothing can serve the tree. No fetch at
+    // all (preserves the pre-reconnect empty/asleep state rather than a
+    // doomed host request that would 409).
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(false);
+    sessionMock.mockReturnValue(hostSession("host_1", "/home/u/ws"));
+
+    render(
+      <Wrap>
+        <AllFilesProbe id="conv_down" />
+      </Wrap>,
+    );
+    await flushMicrotasks();
+
+    expect(hostFsMock).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not fall back for a non-host-bound session", async () => {
+    // Cloud-only / local sessions have no host_id → no host filesystem to
+    // fall back to. The runner gate keeps the query disabled as before.
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
+    sessionMock.mockReturnValue(hostSession(null, null));
+
+    render(
+      <Wrap>
+        <AllFilesProbe id="conv_cloud" />
+      </Wrap>,
+    );
+    await flushMicrotasks();
+
+    expect(hostFsMock).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("translates a host-offline 409 into RunnerOfflineError (reconnect hint, not raw error)", async () => {
+    // The host went offline between the liveness check and the fetch → the
+    // host endpoint 409s. The fallback must surface RunnerOfflineError so the
+    // panel shows the reconnect hint, not "Failed to load: 409".
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
+    sessionMock.mockReturnValue(hostSession("host_1", "/home/u/ws"));
+    const hostDownErr = Object.assign(new Error("host is offline"), { status: 409 });
+    hostFsMock.mockRejectedValue(hostDownErr);
+
+    const errors: Array<Error | null | undefined> = [];
+    render(
+      <Wrap>
+        <AllFilesErrorProbe id="conv_reconnect" onError={(e) => errors.push(e)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(errors.at(-1)).toBeInstanceOf(RunnerOfflineError));
+    // The runner endpoint is never hit (runner is offline).
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("propagates a non-409 host failure as a raw error (not RunnerOfflineError)", async () => {
+    // A 500 from the host is a real failure, not "host offline" — surface it
+    // so it isn't misread as the reconnect-hint path.
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
+    sessionMock.mockReturnValue(hostSession("host_1", "/home/u/ws"));
+    const hostErr = Object.assign(new Error("host I/O failed"), { status: 502 });
+    hostFsMock.mockRejectedValue(hostErr);
+
+    const errors: Array<Error | null | undefined> = [];
+    render(
+      <Wrap>
+        <AllFilesErrorProbe id="conv_io" onError={(e) => errors.push(e)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(errors.at(-1)).toBeInstanceOf(Error));
+    expect(errors.at(-1)).not.toBeInstanceOf(RunnerOfflineError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("useWorkspaceDirectory host-filesystem fallback", () => {
+  it("lists a subdirectory via the host filesystem when the runner is offline", async () => {
+    // Lazy-expand path: a directory expanded while the runner is offline
+    // also falls back to the host daemon so the tree is browsable, not just
+    // a flat root listing.
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
+    sessionMock.mockReturnValue(hostSession("host_1", "/home/u/ws"));
+    hostFsMock.mockResolvedValue({
+      entries: [hostEntry("app.ts", "file", "/home/u/ws/src")],
+      truncated: false,
+    });
+
+    render(
+      <Wrap>
+        <DirectoryProbe id="conv_reconnect" path="src" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(hostFsMock).toHaveBeenCalled());
+
+    // The subdir is resolved under the workspace root as an absolute path.
+    expect(hostFsMock.mock.calls[0]).toEqual(["host_1", "/home/u/ws/src"]);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });

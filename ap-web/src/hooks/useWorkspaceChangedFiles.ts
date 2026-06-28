@@ -16,7 +16,9 @@
 
 import { useEffect, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { type HostFilesystemEntry, fetchHostFilesystem } from "@/hooks/useHostFilesystem";
+import { useSession } from "@/hooks/useSession";
 import { authenticatedFetch } from "@/lib/identity";
 import { useChatStore } from "@/store/chatStore";
 
@@ -305,18 +307,29 @@ export function useWorkspaceAllFiles(
   });
   const sessionActive = useSessionActive(conversationId);
   useTrailingInvalidate(conversationId, sessionActive, "workspace-all-files");
+  const fallback = useHostFilesystemFallback(conversationId);
   return useQuery({
-    queryKey: ["workspace-all-files", conversationId],
-    queryFn: () => fetchWorkspaceAllFiles(conversationId!),
+    // Encode the source in the key so the host-fallback cache and the runner
+    // cache never collide (see useWorkspaceDirectory for the same reason).
+    queryKey: [
+      "workspace-all-files",
+      conversationId,
+      fallback.enabled ? { host: fallback.hostId, ws: fallback.workspace } : "runner",
+    ],
+    queryFn: fallback.enabled
+      ? () => fetchHostWorkspaceAllFiles(fallback.hostId!, fallback.workspace!)
+      : () => fetchWorkspaceAllFiles(conversationId!),
     enabled:
       queryEnabled &&
       !!conversationId &&
-      runnerOnline !== false &&
-      environmentQuery.data?.available === true,
+      (fallback.enabled
+        ? true
+        : runnerOnline !== false && environmentQuery.data?.available === true),
     // Capped-backoff retry of the runner-offline case (see
     // shouldRetryRunnerOffline). The asleep-vs-empty decision is made by
-    // the session's `failed` status downstream, not by retries.
-    retry: shouldRetryRunnerOffline,
+    // the session's `failed` status downstream, not by retries. The host
+    // fallback is a one-shot best-effort read of on-disk state; don't retry.
+    retry: fallback.enabled ? false : shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 5_000,
   });
@@ -617,6 +630,141 @@ export function useWorkspaceEnvironment(
   });
 }
 
+// ── Host-filesystem fallback (runner offline) ─────────────────────────────────
+//
+// When the host has reconnected to the server but the backend runner for a
+// session has not been re-initialized yet (i.e. before the first post-reconnect
+// message), the runner-backed `/filesystem` endpoints 503 and the workspace
+// queries are disabled (see the `runnerOnline !== false` gates above), so the
+// file browser shows "No files in workspace" even though the host is up and
+// the workspace directory still exists on disk. The host-filesystem API
+// (`GET /v1/hosts/{id}/filesystem`) talks to the host daemon directly — no
+// runner required — so we fall back to it for the root listing and lazy
+// directory expansion while the runner is known offline, and switch back to
+// the runner endpoints once the runner comes back online (first message).
+
+/**
+ * Resolve the session's host id and absolute workspace path from its snapshot.
+ *
+ * The host-filesystem endpoint needs the host id (which host owns the dir) and
+ * an absolute path on that host (the endpoint does not speak workspace-relative
+ * paths). Both live on the single-session snapshot cached under
+ * `["session", id]`, shared with the chat stream bind, so this is usually a
+ * cache hit. Returns `null` for either field when the session isn't host-bound
+ * or has no workspace, which disables the fallback.
+ */
+function useSessionHostWorkspace(conversationId: string | undefined): {
+  hostId: string | null;
+  workspace: string | null;
+} {
+  const { session } = useSession(conversationId ?? null);
+  return { hostId: session?.hostId ?? null, workspace: session?.workspace ?? null };
+}
+
+/**
+ * Whether the host-filesystem fallback should drive the workspace queries for
+ * this session right now: only when the runner is *known* offline (`false`,
+ * not the pre-liveness `undefined` that gates a still-booting runner), the
+ * host itself is reachable, and the session is host-bound with a workspace.
+ */
+function useHostFilesystemFallback(conversationId: string | undefined): {
+  enabled: boolean;
+  hostId: string | null;
+  workspace: string | null;
+} {
+  const runnerOnline = useSessionRunnerOnline(conversationId);
+  const hostOnline = useSessionHostOnline(conversationId);
+  const { hostId, workspace } = useSessionHostWorkspace(conversationId);
+  const enabled =
+    runnerOnline === false && hostOnline === true && hostId !== null && workspace !== null;
+  return { enabled, hostId, workspace };
+}
+
+/**
+ * Normalize a workspace root so it has exactly one trailing slash for the
+ * prefix strip below (``/Users/u/ws`` → ``/Users/u/ws/``).
+ */
+function withTrailingSlash(absPath: string): string {
+  return absPath.replace(/\/+$/, "") + "/";
+}
+
+/**
+ * Map host-filesystem entries (absolute paths) into `WorkspaceFile[]` with
+ * workspace-relative `path`s, the shape `buildTree` and the folder tree expect.
+ *
+ * Entries outside the workspace root (shouldn't happen for a workspace listing
+ * but defensive against a host that returns parent/sibling entries) are
+ * dropped rather than remapped to a basename — a misleading relative path
+ * could feed `buildTree`/FileViewer and open a file that doesn't exist under
+ * the workspace. "other" entry types are also dropped — the tree only knows
+ * files and directories.
+ */
+function mapHostEntriesToWorkspaceFiles(
+  entries: HostFilesystemEntry[],
+  workspaceAbs: string,
+): WorkspaceFile[] {
+  const prefix = withTrailingSlash(workspaceAbs);
+  return entries
+    .filter((e) => (e.type === "file" || e.type === "directory") && e.path.startsWith(prefix))
+    .map((e) => ({
+      path: e.path.slice(prefix.length),
+      name: e.name,
+      type: e.type === "directory" ? "directory" : "file",
+      bytes: e.bytes,
+      modified_at: e.modified_at,
+    }));
+}
+
+/**
+ * Fetch the workspace root via the host-filesystem API (runner offline).
+ *
+ * Paginates to completion via `fetchHostFilesystem` (same helper the
+ * new-session workspace picker uses) and wraps the result in the
+ * `WorkspaceAllFilesResult` shape so the consuming hook is agnostic to the
+ * source. A 409 (host went offline between the liveness check and the fetch)
+ * throws `RunnerOfflineError` so the panel falls through to the reconnect
+ * hint rather than a raw "Failed to load".
+ */
+async function fetchHostWorkspaceAllFiles(
+  hostId: string,
+  workspaceAbs: string,
+): Promise<WorkspaceAllFilesResult> {
+  try {
+    const listing = await fetchHostFilesystem(hostId, workspaceAbs);
+    return { available: true, data: mapHostEntriesToWorkspaceFiles(listing.entries, workspaceAbs) };
+  } catch (err) {
+    const status = (err as { status?: number }).status;
+    if (status === 409) throw new RunnerOfflineError();
+    throw err;
+  }
+}
+
+/**
+ * Fetch a workspace subdirectory via the host-filesystem API (runner offline),
+ * returning `WorkspaceFile[]` in the same shape as `fetchWorkspaceDirectory`.
+ */
+async function fetchHostWorkspaceDirectory(
+  dirPath: string,
+  hostId: string,
+  workspaceAbs: string,
+): Promise<WorkspaceFile[]> {
+  // Strip any leading slash off the workspace-relative dirPath so it joins
+  // cleanly under the workspace root (a leading slash would produce a
+  // double slash that encodes to an empty middle segment and 404s). The
+  // tree contract already passes relative paths, but this keeps the helper
+  // robust independent of the caller.
+  const rel = dirPath.replace(/^\/+/, "");
+  const absDir = `${withTrailingSlash(workspaceAbs)}${rel}`;
+  try {
+    const listing = await fetchHostFilesystem(hostId, absDir);
+    return mapHostEntriesToWorkspaceFiles(listing.entries, workspaceAbs);
+  } catch (err) {
+    const status = (err as { status?: number }).status;
+    if (status === 409) throw new RunnerOfflineError();
+    throw err;
+  }
+}
+
 /**
  * Fetch the contents of a specific workspace directory on demand.
  *
@@ -626,10 +774,24 @@ export function useWorkspaceEnvironment(
  */
 export function useWorkspaceDirectory(conversationId: string | undefined, dirPath: string | null) {
   const runnerOnline = useSessionRunnerOnline(conversationId);
+  const fallback = useHostFilesystemFallback(conversationId);
   return useQuery({
-    queryKey: ["workspace-dir", conversationId, dirPath],
-    queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath!),
-    enabled: !!conversationId && !!dirPath && runnerOnline !== false,
+    // Encode the source in the key so the host-fallback cache and the runner
+    // cache never collide (a stale host listing must not surface after the
+    // runner is back online and vice versa).
+    queryKey: [
+      "workspace-dir",
+      conversationId,
+      dirPath,
+      fallback.enabled ? { host: fallback.hostId, ws: fallback.workspace } : "runner",
+    ],
+    queryFn: fallback.enabled
+      ? () => fetchHostWorkspaceDirectory(dirPath!, fallback.hostId!, fallback.workspace!)
+      : () => fetchWorkspaceDirectory(conversationId!, dirPath!),
+    enabled: !!conversationId && !!dirPath && (fallback.enabled || runnerOnline !== false),
+    // The host fallback is a one-shot best-effort read of on-disk state; don't
+    // retry it on failure (the runner coming back online switches the source).
+    retry: fallback.enabled ? false : undefined,
     staleTime: 5_000,
   });
 }
