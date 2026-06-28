@@ -371,10 +371,15 @@ def test_headless_subagent_purpose_guard_ignores_non_session_tools() -> None:
     [
         ("src/app.py", "ALLOW"),
         ("ap-web/src/store/chatStore.ts", "ALLOW"),
+        # normpath collapses safe ..-then-back traversals — these stay in tree.
+        ("subdir/../file.py", "ALLOW"),
         ("/etc/passwd", "DENY"),
         ("~/.bashrc", "DENY"),
         ("../outside.py", "DENY"),
         ("a/../../escape.py", "DENY"),
+        # Backslash embedded in a component was bypassing the split-on-'/' check.
+        ("subdir/..\\escape", "DENY"),
+        ("..\\etc\\passwd", "DENY"),
     ],
 )
 def test_worktree_guard_blocks_escapes(path: str, expected: str) -> None:
