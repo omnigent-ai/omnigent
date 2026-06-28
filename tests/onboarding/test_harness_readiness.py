@@ -8,10 +8,14 @@ import pytest
 import yaml
 
 import omnigent.onboarding.harness_install as hi
+import omnigent.onboarding.hermes_auth as ha
+import omnigent.onboarding.opencode_auth as oa
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
 )
+from omnigent.onboarding.hermes_auth import HermesConfigSummary
+from omnigent.onboarding.opencode_auth import OpenCodeAuthSummary
 
 
 @pytest.fixture(autouse=True)
@@ -97,7 +101,6 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "native-kiro",
         "goose-native",
         "native-goose",
-        "hermes",
     ],
 )
 def test_cli_harness_configured_only_when_binary_installed(
@@ -250,11 +253,16 @@ def test_configured_harness_map_all_true_with_clis(
 
     The CLI harnesses pass their binary check, the SDK harnesses are ungated,
     cursor (key-gated) is satisfied by a ``CURSOR_API_KEY``, copilot
-    (token-gated) by a ``GH_TOKEN``, and antigravity-native (binary + credential
-    gated) by a detected Gemini OAuth credential — so nothing is reported
-    unconfigured.
+    (token-gated) by a ``GH_TOKEN``, antigravity-native (binary + credential
+    gated) by a detected Gemini OAuth credential, and hermes / opencode-native
+    (binary + provider gated) by a configured provider summary — so nothing is
+    reported unconfigured.
     """
     import omnigent.onboarding.gemini_auth as _ga
+    import omnigent.onboarding.hermes_auth as _ha
+    import omnigent.onboarding.opencode_auth as _oa
+    from omnigent.onboarding.hermes_auth import HermesConfigSummary
+    from omnigent.onboarding.opencode_auth import OpenCodeAuthSummary
 
     _all_clis_installed(monkeypatch)
     monkeypatch.setattr(
@@ -265,6 +273,21 @@ def test_configured_harness_map_all_true_with_clis(
     # antigravity-native also needs a credential (not just the ``agy`` binary).
     monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
     monkeypatch.setenv("GH_TOKEN", "gho_ready")
+    # hermes / opencode-native need a configured provider (not just the binary).
+    # Patch the summary functions so a developer's real ~/.hermes / opencode auth
+    # can't flip the verdict.
+    monkeypatch.setattr(
+        _ha,
+        "hermes_config_summary",
+        lambda: HermesConfigSummary(installed=True, provider="openrouter", model=None),
+    )
+    monkeypatch.setattr(
+        _oa,
+        "opencode_auth_summary",
+        lambda: OpenCodeAuthSummary(
+            installed=True, stored_providers=("anthropic",), env_providers=()
+        ),
+    )
     result = configured_harness_map()
     assert all(result.values())
 
@@ -286,6 +309,49 @@ def test_kimi_readiness_keys_off_binary(
     _all_clis_installed(monkeypatch)
     assert harness_is_configured("kimi") is True
     assert harness_is_configured("kimi-code") is True
+
+
+def test_native_harness_requires_credentials_not_just_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hermes / OpenCode are configured only with a provider, not just the binary.
+
+    The headline bug (#152): availability was reported from binary presence, so
+    an installed-but-unconfigured native harness was listed as available and
+    then failed at model time. Both now gate on their pure credential probe's
+    ``.ready`` (binary AND a configured provider). The summary functions are
+    patched at their source module so a developer's real ~/.hermes / opencode
+    auth can't flip the verdict.
+    """
+    _all_clis_installed(monkeypatch)  # binary present
+    # binary present + NO provider configured -> unavailable.
+    monkeypatch.setattr(
+        ha,
+        "hermes_config_summary",
+        lambda: HermesConfigSummary(installed=True, provider=None, model=None),
+    )
+    monkeypatch.setattr(
+        oa,
+        "opencode_auth_summary",
+        lambda: OpenCodeAuthSummary(installed=True, stored_providers=(), env_providers=()),
+    )
+    assert harness_is_configured("hermes") is False
+    assert harness_is_configured("opencode-native") is False
+    # binary present + provider configured -> available.
+    monkeypatch.setattr(
+        ha,
+        "hermes_config_summary",
+        lambda: HermesConfigSummary(installed=True, provider="openrouter", model=None),
+    )
+    monkeypatch.setattr(
+        oa,
+        "opencode_auth_summary",
+        lambda: OpenCodeAuthSummary(
+            installed=True, stored_providers=("anthropic",), env_providers=()
+        ),
+    )
+    assert harness_is_configured("hermes") is True
+    assert harness_is_configured("opencode-native") is True
 
 
 def test_cursor_readiness_keys_off_api_key(

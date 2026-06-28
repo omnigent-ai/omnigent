@@ -209,9 +209,15 @@ def harness_is_configured(harness: str) -> bool:
         # Hermes — both the native TUI (``hermes-native`` / ``native-hermes``,
         # via ``omni hermes``) and the headless subprocess harness (``hermes``)
         # — wraps the ``hermes`` CLI (installed via a curl script from Nous
-        # Research). Auth/provider config surfaces at run time via Hermes' own
-        # ``hermes model`` flow; gate only on binary presence.
-        return harness_cli_installed(HERMES_KEY)
+        # Research). Gate on credentials, not just the binary: ``.ready`` is
+        # ``installed`` AND a concrete provider picked via ``hermes model``
+        # (``~/.hermes/config.yaml``), so an installed-but-unconfigured Hermes is
+        # reported unavailable instead of dispatched to and failing at model
+        # time. ``.ready`` re-checks the same ``HERMES_KEY`` binary, so this does
+        # not double-gate.
+        from omnigent.onboarding.hermes_auth import hermes_config_summary
+
+        return hermes_config_summary().ready
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -245,6 +251,16 @@ def harness_is_configured(harness: str) -> bool:
         return copilot_github_token_configured() or any(
             os.environ.get(var) for var in COPILOT_TOKEN_ENV_VARS
         )
+    if canonical in _OPENCODE_HARNESSES:
+        # OpenCode wraps the ``opencode`` CLI but, like Hermes, gate on
+        # credentials too: ``.ready`` is ``installed`` AND a reachable provider
+        # (a stored ``auth.json`` credential or a provider API-key env var), so
+        # an installed-but-unconfigured OpenCode is reported unavailable instead
+        # of dispatched to and failing at model time. ``.ready`` re-checks the
+        # same ``OPENCODE_KEY`` binary, so this does not double-gate.
+        from omnigent.onboarding.opencode_auth import opencode_auth_summary
+
+        return opencode_auth_summary().ready
     if (
         canonical not in _HARNESS_FAMILY
         and canonical not in _PI_HARNESSES
