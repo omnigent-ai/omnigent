@@ -1,6 +1,6 @@
 name: E2E UI Required
 
-# Required-status gate: a PR that changes ap-web/** must ship a tests/e2e_ui/**
+# Required-status gate: a PR that changes web/** must ship a tests/e2e_ui/**
 # test covering the change or carry a maintainer-effective `skip-e2e-ui-test`
 # label. The policy verdict FAILS the job; mark `E2E UI Required` as a required
 # check in branch protection for that to block merge. Whether a change "needs a
@@ -22,7 +22,7 @@ name: E2E UI Required
 #
 # NO `paths:` filter on purpose: a path-filtered required check never reports on
 # non-matching PRs, stranding the status pending forever. This always runs and
-# the gate script self-determines whether ap-web/** was touched.
+# the gate script self-determines whether web/** was touched.
 #
 # leak-scan-allow: pull_request_target
 on:

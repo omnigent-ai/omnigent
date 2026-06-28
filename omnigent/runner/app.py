@@ -5701,7 +5701,7 @@ async def _auto_create_repl_terminal(
         resource_role=OMNIGENT_REPL_TERMINAL_ROLE,
     )
     # Stamp the presentation label that gates the web UI's Chat/Terminal
-    # pill (ap-web TerminalFirstContext). Stamped here — not at session
+    # pill (web TerminalFirstContext). Stamped here — not at session
     # creation — so only sessions whose runner actually hosts a REPL
     # terminal get the toggle; in-process (runner-less) sessions never
     # show a dead pill. The ``omnigent.wrapper`` label is deliberately

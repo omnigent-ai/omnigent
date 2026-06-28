@@ -1,6 +1,6 @@
 """E2E: Cmd/Ctrl+↑/↓ switches sessions even while the composer is focused.
 
-Covers the composer fix in ``ap-web/src/pages/ChatPage.tsx``: the composer's
+Covers the composer fix in ``web/src/pages/ChatPage.tsx``: the composer's
 ArrowUp/ArrowDown draft-recall handler used to intercept *any* arrow keydown,
 so the global session-switch hotkey (``useSessionSwitchHotkey``, Cmd/Ctrl+↑/↓)
 appeared dead while typing — recall swallowed the keystroke and replaced the

@@ -3666,7 +3666,7 @@ async def test_post_external_session_usage_publishes_session_usage(
     persists the value on the conversation labels.
 
     The claude-native forwarder posts this whenever Claude's transcript
-    grows a fresh ``message.usage`` block so the ap-web context ring
+    grows a fresh ``message.usage`` block so the web context ring
     updates without waiting for a ``response.completed`` event (Claude
     Code runs in a separate process and never produces one). Both the
     live SSE path and the snapshot-restore path read from this event:
@@ -5443,7 +5443,7 @@ async def test_post_external_session_usage_rejects_negative_context_tokens(
     """
     Negative or non-int ``context_tokens`` is rejected with a 400.
 
-    Defends ap-web's ring math (``pct = tokensUsed / contextWindow``)
+    Defends web's ring math (``pct = tokensUsed / contextWindow``)
     from inheriting a bogus negative numerator that would clamp the
     arc to zero and silently mislead users about their context budget.
     """
@@ -5466,7 +5466,7 @@ async def test_post_external_session_todos_publishes_session_todos(
     ``external_session_todos`` publishes a ``session.todos`` SSE event.
 
     The claude-native forwarder posts this on every PostToolUse / TodoWrite
-    hook so the ap-web todo panel updates in real time. A regression here
+    hook so the web todo panel updates in real time. A regression here
     would break the panel for ``omnigent claude`` sessions: the UI would
     never receive a ``session.todos`` broadcast and the panel would stay
     blank even when Claude has active tasks.

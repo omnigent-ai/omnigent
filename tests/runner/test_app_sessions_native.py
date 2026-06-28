@@ -552,7 +552,7 @@ class _FakeFileServerClient:
 
 @pytest.mark.asyncio
 async def test_sessions_native_resolves_file_id_before_harness() -> None:
-    """Remote runner resolves raw AP-web ``file_id`` blocks before harness input."""
+    """Remote runner resolves raw web ``file_id`` blocks before harness input."""
     harness_client = _ScriptedHarnessClient(
         [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
     )

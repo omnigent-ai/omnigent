@@ -1992,7 +1992,7 @@ async def test_create_claude_session_omits_title_for_generic_seed_path() -> None
     user message. The sidebar fills the create-to-first-message gap
     by rendering a default label off the
     ``omnigent.wrapper = claude-code-native-ui`` label
-    (see ``ap-web/src/shell/sidebarNav.ts::conversationDisplayLabel``).
+    (see ``web/src/shell/sidebarNav.ts::conversationDisplayLabel``).
     The labels must still reach the server unchanged because that
     sidebar fallback keys off the wrapper label.
     """

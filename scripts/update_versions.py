@@ -20,8 +20,8 @@ so unrelated version literals (host/runner wire-protocol versions,
 docstring examples, third-party dependency floors like
 ``databricks-mcp>=0.1.0``) are left untouched.
 
-``ap-web/package.json`` (a ``0.0.0`` sentinel for the private SPA) and
-``ap-web/electron/package.json`` (the desktop app's independent
+``web/package.json`` (a ``0.0.0`` sentinel for the private SPA) and
+``web/electron/package.json`` (the desktop app's independent
 version) are intentionally OUT of scope: neither is part of the
 release-validated Python lockstep.
 

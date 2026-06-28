@@ -194,7 +194,7 @@ WELCOME_HINTS = ["/help help", "Ctrl+O debug", "Ctrl+T show tools", "Esc cancel"
 # position 99.
 _LIST_ITEMS_PAGE_SIZE = 100
 
-# Sub-agent tree (state badge + ``↓`` menu). The depth cap mirrors ap-web's
+# Sub-agent tree (state badge + ``↓`` menu). The depth cap mirrors web's
 # ``MAX_TREE_DEPTH`` so the CLI tree matches the web Agents rail; the poll
 # cadence refreshes deeper levels (the SSE stream only carries the active
 # session's direct children) while sub-agents are active.
@@ -1512,7 +1512,7 @@ class _SessionsChatReplAdapter:
         event's workflow already sees ``conv.model_override`` via the
         server-side fallback. After the session exists, persists
         through ``PATCH /v1/sessions/{id}`` (matching
-        :meth:`set_reasoning_effort`) so the ap-web picker and the
+        :meth:`set_reasoning_effort`) so the web picker and the
         REPL stay in sync on the next snapshot read.
 
         :param model: New model identifier, e.g. ``"claude-opus-4-7"``,

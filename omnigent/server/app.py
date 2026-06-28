@@ -2204,9 +2204,9 @@ def create_app(
                 tags=["auth"],
             )
 
-    # Mount the built ap-web SPA at "/" if a build is present. The SPA is
-    # built into ``omnigent/server/static/web-ui/`` by ``ap-web/``'s Vite
-    # build (see ``ap-web/vite.config.ts`` ``build.outDir``). The mount is
+    # Mount the built web SPA at "/" if a build is present. The SPA is
+    # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite
+    # build (see ``web/vite.config.ts`` ``build.outDir``). The mount is
     # registered AFTER all API routers so router routes win on overlap.
     # Skipping the mount when no build is present keeps API-only
     # deployments working (and ``/`` 404s cleanly instead of exploding at
