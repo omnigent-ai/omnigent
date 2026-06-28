@@ -135,6 +135,44 @@ describe("CodexGoalDialog", () => {
     );
   });
 
+  it("re-submits the goal even when nothing changed", async () => {
+    // #1289 follow-up: "Update goal" must always re-apply the goal. Re-submitting
+    // the same objective is valid and must still hit the API (no silent no-op).
+    renderDialog({ goal: ACTIVE_GOAL });
+    await waitFor(() => expect(screen.getByTestId("codex-goal-current")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId("codex-goal-save"));
+
+    await waitFor(() =>
+      expect(mockSetCodexGoal).toHaveBeenCalledWith(
+        "conv_codex",
+        expect.objectContaining({ objective: ACTIVE_GOAL.objective }),
+      ),
+    );
+  });
+
+  it("keeps the objective editable while a save is in flight", async () => {
+    // #1289: the flicker was the whole editor dimming on each save. The editor
+    // must stay enabled during an in-flight save (only the initial load disables it).
+    let resolveSave: (value: { goal: CodexGoal }) => void = () => {};
+    mockSetCodexGoal.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveSave = resolve;
+        }),
+    );
+    renderDialog({ goal: ACTIVE_GOAL });
+    await waitFor(() => expect(screen.getByTestId("codex-goal-current")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId("codex-goal-save"));
+
+    await waitFor(() => expect(mockSetCodexGoal).toHaveBeenCalled());
+    expect(screen.getByTestId("codex-goal-objective")).not.toBeDisabled();
+
+    resolveSave({ goal: ACTIVE_GOAL });
+    await waitFor(() => expect(screen.getByTestId("codex-goal-save")).not.toBeDisabled());
+  });
+
   it("shows validation errors without calling the API", async () => {
     renderDialog({ goal: null });
     await waitFor(() => expect(mockGetCodexGoal).toHaveBeenCalled());
