@@ -1,0 +1,69 @@
+"""Static landing page served at ``/`` when the server has no web UI bundle.
+
+Kept out of :mod:`omnigent.server.app` so the large HTML string doesn't clutter
+the app definition. ``create_app`` serves this at ``/`` with a 200 — only when
+no SPA bundle is mounted (an API-only build, or an install that skipped the web
+UI). A normal install always bundles the UI, so users never see this.
+"""
+
+from __future__ import annotations
+
+API_ONLY_LANDING_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Omnigent — web UI not installed</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    max-width: 42rem; margin: 12vh auto; padding: 0 1.25rem;
+  }
+  h1 { font-size: 1.35rem; margin: 0 0 .5rem; }
+  h2 { font-size: 1.05rem; margin: 1.5rem 0 .25rem; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre {
+    background: rgba(127, 127, 127, .14); padding: .75rem 1rem;
+    border-radius: 8px; overflow-x: auto;
+  }
+  .muted { opacity: .7; font-size: .9rem; margin-top: 1.5rem; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+  <h1>Omnigent is running — but the web UI isn't installed</h1>
+  <p>
+    This server was built without the web UI (API-only mode), so there's
+    nothing to render in the browser here.
+  </p>
+  <h2>How to fix</h2>
+  <p>
+    A normal install includes the web UI, so this means either you're running a
+    source checkout that hasn't built it, or the UI was skipped at build time
+    (<code>OMNIGENT_SKIP_WEB_UI</code>) — possibly a cached UI-less build being
+    reused.
+  </p>
+  <p>
+    <strong>From a source checkout</strong> — build the UI in place (needs
+    <code>Node.js</code> and <code>npm</code>), then restart:
+  </p>
+  <pre>cd ap-web
+npm install
+npm run build</pre>
+  <p>
+    <strong>Installed from source / git</strong> — rebuild with the UI included:
+    make sure <code>OMNIGENT_SKIP_WEB_UI</code> is unset and <code>npm</code>
+    works, clear the cache (a cached UI-less build can otherwise be reused), then
+    reinstall the same spec you originally used:
+  </p>
+  <pre>uv cache clean omnigent</pre>
+  <p class="muted">
+    <code>npm run dev</code> is for live UI development — it runs a separate dev
+    server and won't fix this page. The CLI works regardless, and the JSON API
+    is at <a href="/docs">/docs</a>.
+    Details: <a href="https://github.com/omnigent-ai/omnigent#readme">omnigent-ai/omnigent</a>
+  </p>
+</body>
+</html>
+"""
