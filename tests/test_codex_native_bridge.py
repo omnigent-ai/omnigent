@@ -216,3 +216,78 @@ def test_bridge_startup_error_round_trips_and_is_cleared(bridge_dir: Path) -> No
 
     clear_bridge_state(bridge_dir)
     assert read_bridge_startup_error(bridge_dir) is None
+
+
+def test_prepare_bridge_dir_writes_owner_pid_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prepare_bridge_dir records the creating process pid so the
+    periodic sweep can prune the dir only when its owner is dead (O6)."""
+    import os
+
+    from omnigent.codex_native_bridge import prepare_bridge_dir
+
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native")
+    bridge_dir = prepare_bridge_dir("bridge_owner")
+    marker = bridge_dir / "owner.pid"
+    assert marker.read_text(encoding="utf-8").strip() == str(os.getpid())
+
+
+def test_cleanup_bridge_dir_removes_the_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cleanup_bridge_dir rmtrees the per-session dir (O6)."""
+    from omnigent.codex_native_bridge import cleanup_bridge_dir, prepare_bridge_dir
+
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native")
+    bridge_dir = prepare_bridge_dir("bridge_cleanup")
+    assert bridge_dir.exists()
+
+    removed = cleanup_bridge_dir("bridge_cleanup")
+
+    assert removed is True
+    assert not bridge_dir.exists()
+    # Idempotent: a second call is a safe no-op.
+    assert cleanup_bridge_dir("bridge_cleanup") is False
+
+
+def test_prune_orphaned_bridge_dirs_only_dead_owners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prune removes only dirs whose owner pid is provably dead;
+    live-owner and unmarked dirs survive (owner-pid invariant, O6)."""
+    import os
+    import subprocess
+    import sys
+
+    from omnigent.codex_native_bridge import (
+        bridge_root,
+        prune_orphaned_bridge_dirs,
+    )
+
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native")
+    root = bridge_root()
+    root.mkdir(parents=True, exist_ok=True)
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    dead_dir = root / "deadowner"
+    dead_dir.mkdir()
+    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+
+    live_dir = root / "liveowner"
+    live_dir.mkdir()
+    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+    unmarked_dir = root / "unmarked"
+    unmarked_dir.mkdir()
+
+    pruned = prune_orphaned_bridge_dirs()
+
+    assert pruned == 1
+    assert not dead_dir.exists()
+    assert live_dir.exists()
+    assert unmarked_dir.exists()
