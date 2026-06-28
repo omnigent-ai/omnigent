@@ -29,6 +29,7 @@ from omnigent.inner.copilot_executor import (
     _event_data,
     _finalize_usage,
     _resolve_model,
+    _resolve_reasoning_effort,
 )
 from omnigent.inner.executor import (
     ExecutorConfig,
@@ -213,6 +214,20 @@ def test_resolve_model_passthrough_and_databricks_drop() -> None:
     assert _resolve_model(None) is None
     assert _resolve_model("claude-haiku-4.5") == "claude-haiku-4.5"
     assert _resolve_model("databricks-claude-opus-4-8") is None
+
+
+def test_resolve_reasoning_effort() -> None:
+    # No config / no effort -> None (model default).
+    assert _resolve_reasoning_effort(None) is None
+    assert _resolve_reasoning_effort(ExecutorConfig()) is None
+    # Supported Copilot levels pass through.
+    for level in ("low", "medium", "high", "xhigh"):
+        assert (
+            _resolve_reasoning_effort(ExecutorConfig(extra={"reasoning_effort": level})) == level
+        )
+    # Values Copilot can't honor (OpenAI-style) are dropped, not raised.
+    assert _resolve_reasoning_effort(ExecutorConfig(extra={"reasoning_effort": "minimal"})) is None
+    assert _resolve_reasoning_effort(ExecutorConfig(extra={"reasoning_effort": "none"})) is None
 
 
 def test_build_prompt_first_turn_history_and_latest() -> None:
@@ -483,6 +498,64 @@ async def test_system_message_and_model_threaded(monkeypatch: pytest.MonkeyPatch
     # system prompt delivered as an append-mode system_message.
     assert kwargs["system_message"] == {"mode": "append", "content": "SYS"}
     assert kwargs["on_permission_request"] == _PermissionHandler.approve_all
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_threaded_to_create_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
+    ex = CopilotExecutor(github_token="gho_x")
+    _ = [
+        e
+        async for e in ex.run_turn(
+            [_user("hi")], [], "SYS", ExecutorConfig(extra={"reasoning_effort": "high"})
+        )
+    ]
+    # The /reasoning pick reaches the SDK's create_session.
+    assert state["create_kwargs"][0]["reasoning_effort"] == "high"
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_omitted_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
+    ex = CopilotExecutor(github_token="gho_x")
+    _ = [e async for e in ex.run_turn([_user("hi")], [], "SYS")]
+    # No effort pinned -> None, so the model uses its default.
+    assert state["create_kwargs"][0]["reasoning_effort"] is None
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_session_restart_on_reasoning_effort_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_fake_copilot(
+        monkeypatch,
+        [
+            [_ev("ASSISTANT_MESSAGE", content="one")],
+            [_ev("ASSISTANT_MESSAGE", content="two")],
+        ],
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+    _ = [
+        e
+        async for e in ex.run_turn(
+            [_user("first")], [], "SYS", ExecutorConfig(extra={"reasoning_effort": "low"})
+        )
+    ]
+    _ = [
+        e
+        async for e in ex.run_turn(
+            [_user("second")], [], "SYS", ExecutorConfig(extra={"reasoning_effort": "high"})
+        )
+    ]
+    # Reasoning effort is fixed at session creation, so a change recreates it.
+    assert len(state["create_kwargs"]) == 2
+    assert [k["reasoning_effort"] for k in state["create_kwargs"]] == ["low", "high"]
+    assert state["client_closed"] >= 1
     await ex.close()
 
 
