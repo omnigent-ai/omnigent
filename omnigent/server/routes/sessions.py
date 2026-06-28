@@ -16140,6 +16140,18 @@ def create_sessions_router(
         policy_name = payload.get("policy_name")
         if not isinstance(policy_name, str) or not policy_name:
             policy_name = "native_permission"
+        # Structured AskQuestion payload (e.g. opencode's ``question`` tool):
+        # when present, stamp it as the ``ask_user_question`` extra so the web
+        # UI renders the interactive form from it directly. ``content_preview``
+        # is hard-capped at 1024 chars, which truncates a multi-question payload
+        # — the structured field has no such cap and is the authoritative source
+        # the UI consumes when present (mirrors the cursor hook).
+        extras: dict[str, Any] = {}
+        ask_user_question = payload.get("ask_user_question")
+        if isinstance(ask_user_question, dict) and isinstance(
+            ask_user_question.get("questions"), list
+        ):
+            extras["ask_user_question"] = ask_user_question
         params = ElicitationRequestParams(
             mode="form",
             message=message,
@@ -16148,6 +16160,7 @@ def create_sessions_router(
             phase="pre_tool_use",
             policy_name=policy_name,
             content_preview=content_preview,
+            **extras,
         )
         result = await _publish_and_wait_for_harness_elicitation(
             request,
