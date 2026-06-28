@@ -42,6 +42,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server.auth import AuthProvider
+from omnigent.server.job_scheduler import run_job_scheduler_periodically
 from omnigent.server.managed_hosts import ManagedSandboxConfig
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
@@ -74,8 +75,8 @@ from omnigent.stores import (
 )
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import SessionConnectivity
-from omnigent.stores.host_store import HostStore
 from omnigent.stores.entity_store import EntityStore
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.job_store import JobStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
@@ -1229,12 +1230,37 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+        # Time-trigger scheduler: polls for jobs with a due ``schedule_config``
+        # and spawns scheduled runs. Gated on a job store being configured (same
+        # condition as the jobs router). Single-process only — see the module
+        # docstring.
+        job_scheduler_task: asyncio.Task[None] | None = None
+        if job_store is not None:
+            job_scheduler_task = asyncio.create_task(
+                run_job_scheduler_periodically(
+                    app=app_inst,
+                    job_store=job_store,
+                    conversation_store=conversation_store,
+                    agent_store=agent_store,
+                    runner_router=runner_router,
+                    agent_cache=agent_cache,
+                    permission_store=permission_store,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
+                    liveness_lookup=_bulk_session_liveness,
+                    default_run_agent_id=None,
+                )
+            )
         try:
             yield
         finally:
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
+            if job_scheduler_task is not None:
+                job_scheduler_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await job_scheduler_task
             # Stop in-flight background managed-sandbox launches so a
             # slow provision doesn't outlive the ASGI shutdown (the
             # sandbox itself, if already provisioned, is reaped by the

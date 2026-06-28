@@ -3864,6 +3864,8 @@ class JobCreateRequest(BaseModel):
     agent_id: str | None = None
     harness_override: str | None = None
     model_override: str | None = None
+    schedule_config: dict[str, Any] | None = None
+    host_id: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3879,6 +3881,11 @@ class JobUpdateRequest(BaseModel):
     :param agent_id: New bound agent.
     :param harness_override: New harness override.
     :param model_override: New model override.
+    :param schedule_config: New scheduling config, e.g.
+        ``{"enabled": true, "interval_minutes": 5}``. Set ``enabled`` to
+        ``false`` to stop the schedule.
+    :param host_id: New preferred host id; the empty string clears the
+        binding (pick any online host). ``None`` leaves it unchanged.
     """
 
     name: str | None = Field(default=None, min_length=1, max_length=256)
@@ -3887,6 +3894,8 @@ class JobUpdateRequest(BaseModel):
     agent_id: str | None = None
     harness_override: str | None = None
     model_override: str | None = None
+    schedule_config: dict[str, Any] | None = None
+    host_id: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3903,6 +3912,11 @@ class JobResponse(BaseModel):
     :param agent_id: Agent the job runs as, or ``None``.
     :param harness_override: Harness override, or ``None``.
     :param model_override: Model override, or ``None``.
+    :param schedule_config: Scheduling config, e.g.
+        ``{"enabled": true, "interval_minutes": 5}``, or ``None`` if the job
+        is unscheduled.
+    :param host_id: Preferred host for runs, or ``None`` to pick any online
+        host.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of the last update.
     """
@@ -3915,6 +3929,8 @@ class JobResponse(BaseModel):
     agent_id: str | None = None
     harness_override: str | None = None
     model_override: str | None = None
+    schedule_config: dict[str, Any] | None = None
+    host_id: str | None = None
     created_at: int
     updated_at: int
 
@@ -3934,6 +3950,8 @@ class RunResponse(BaseModel):
     :param completed_at: Unix epoch seconds of the terminal state, or
         ``None`` while running.
     :param error: Failure detail when ``status == "failed"``, else ``None``.
+    :param trigger: How the run was triggered — ``"adhoc"`` (manual "Run now")
+        or ``"scheduled"`` (the time-trigger scheduler).
     """
 
     id: str
@@ -3944,3 +3962,4 @@ class RunResponse(BaseModel):
     started_at: int
     completed_at: int | None = None
     error: str | None = None
+    trigger: str = "adhoc"

@@ -32,6 +32,23 @@ function apiJob(overrides: Partial<api.Job> = {}): api.Job {
     graph: treeWithStep(),
     narrative: "x",
     agentId: null,
+    scheduleConfig: null,
+    hostId: null,
+    ...overrides,
+  };
+}
+
+/** A backend run fixture with the required `trigger` field. */
+function apiRun(overrides: Partial<api.Run> = {}): api.Run {
+  return {
+    id: "run_1",
+    jobId: "job_1",
+    sessionId: "conv_1",
+    status: "running",
+    startedAt: 1000,
+    completedAt: null,
+    error: null,
+    trigger: "adhoc",
     ...overrides,
   };
 }
@@ -93,27 +110,9 @@ describe("jobsStore", () => {
   });
 
   it("runJob triggers the backend run and returns the latest run with its session", async () => {
-    vi.mocked(api.apiRunJob).mockResolvedValue({
-      id: "run_1",
-      jobId: "job_1",
-      sessionId: "conv_1",
-      status: "running",
-      startedAt: 1000,
-      completedAt: null,
-      error: null,
-    });
+    vi.mocked(api.apiRunJob).mockResolvedValue(apiRun());
     vi.mocked(api.apiGetJob).mockResolvedValue(apiJob());
-    vi.mocked(api.apiListRuns).mockResolvedValue([
-      {
-        id: "run_1",
-        jobId: "job_1",
-        sessionId: "conv_1",
-        status: "running",
-        startedAt: 1000,
-        completedAt: null,
-        error: null,
-      },
-    ]);
+    vi.mocked(api.apiListRuns).mockResolvedValue([apiRun()]);
 
     const run = await runJob("job_1");
     expect(api.apiRunJob).toHaveBeenCalledWith("job_1");

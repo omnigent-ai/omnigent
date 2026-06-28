@@ -77,6 +77,72 @@ async def test_create_job(client: httpx.AsyncClient, agent_id: str) -> None:
     assert body["created_at"] == body["updated_at"]
 
 
+async def test_create_job_round_trips_schedule_config(
+    client: httpx.AsyncClient, agent_id: str
+) -> None:
+    """``schedule_config`` is persisted and echoed back on create + get."""
+    resp = await client.post(
+        "/v1/jobs",
+        json={
+            "name": "Scheduled",
+            "graph": _graph(),
+            "narrative": "go",
+            "agent_id": agent_id,
+            "schedule_config": {"enabled": True, "interval_minutes": 15},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["schedule_config"] == {"enabled": True, "interval_minutes": 15}
+    got = (await client.get(f"/v1/jobs/{body['id']}")).json()
+    assert got["schedule_config"] == {"enabled": True, "interval_minutes": 15}
+
+
+async def test_create_job_defaults_schedule_config_null(client: httpx.AsyncClient) -> None:
+    """A job created without scheduling reports ``schedule_config: null``."""
+    body = (
+        await client.post("/v1/jobs", json={"name": "Plain", "graph": {}, "narrative": "n"})
+    ).json()
+    assert body["schedule_config"] is None
+
+
+async def test_patch_job_sets_and_disables_schedule(client: httpx.AsyncClient) -> None:
+    """PATCH can enable a schedule and later disable it (the stop control)."""
+    created = (
+        await client.post("/v1/jobs", json={"name": "S", "graph": {}, "narrative": "s"})
+    ).json()
+    enabled = (
+        await client.patch(
+            f"/v1/jobs/{created['id']}",
+            json={"schedule_config": {"enabled": True, "interval_minutes": 5}},
+        )
+    ).json()
+    assert enabled["schedule_config"] == {"enabled": True, "interval_minutes": 5}
+    disabled = (
+        await client.patch(
+            f"/v1/jobs/{created['id']}",
+            json={"schedule_config": {"enabled": False, "interval_minutes": 5}},
+        )
+    ).json()
+    assert disabled["schedule_config"]["enabled"] is False
+
+
+async def test_job_host_id_round_trips_and_clears(client: httpx.AsyncClient) -> None:
+    """``host_id`` persists on create/get, patches, and clears via empty string."""
+    created = (
+        await client.post(
+            "/v1/jobs",
+            json={"name": "Hosted", "graph": {}, "narrative": "n", "host_id": "host_abc"},
+        )
+    ).json()
+    assert created["host_id"] == "host_abc"
+    assert (await client.get(f"/v1/jobs/{created['id']}")).json()["host_id"] == "host_abc"
+    patched = (
+        await client.patch(f"/v1/jobs/{created['id']}", json={"host_id": ""})
+    ).json()
+    assert patched["host_id"] is None
+
+
 async def test_create_job_rejects_unknown_field(client: httpx.AsyncClient) -> None:
     """``extra='forbid'`` makes an unexpected field a 422."""
     resp = await client.post(
@@ -198,6 +264,8 @@ async def test_run_job_creates_session_and_run(client: httpx.AsyncClient, agent_
     assert run["job_id"] == job["id"]
     assert run["session_id"] is not None
     assert run["status"] in ("running", "finished")
+    # A manual "Run now" is recorded as an adhoc trigger.
+    assert run["trigger"] == "adhoc"
 
     # The created session exists and carries the narrative as a seed message.
     session = await client.get(f"/v1/sessions/{run['session_id']}")

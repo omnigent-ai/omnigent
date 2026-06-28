@@ -29,6 +29,8 @@ from omnigent.entities.job import (
     RUN_STATUS_FAILED,
     RUN_STATUS_FINISHED,
     RUN_STATUS_RUNNING,
+    RUN_TRIGGER_ADHOC,
+    RUN_TRIGGER_SCHEDULED,
     Job,
     Run,
 )
@@ -49,6 +51,8 @@ __all__ = [
     "RUN_STATUS_FAILED",
     "RUN_STATUS_FINISHED",
     "RUN_STATUS_RUNNING",
+    "RUN_TRIGGER_ADHOC",
+    "RUN_TRIGGER_SCHEDULED",
     "Account",
     "AccountToken",
     "Agent",

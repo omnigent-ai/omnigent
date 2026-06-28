@@ -31,6 +31,8 @@ import {
 } from "lucide-react";
 import { MessageResponse } from "@/components/ai-elements/message";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { generateFlowText } from "@/lib/flowToText";
@@ -52,6 +54,7 @@ import {
 } from "@/lib/flowTree";
 import { runJob, updateJob, useJob, type Run } from "@/lib/jobsStore";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { useHosts } from "@/hooks/useHosts";
 import { useActionCatalog, type ActionDef, type ActionGroup } from "@/lib/actionCatalog";
 import { cn } from "@/lib/utils";
 
@@ -412,9 +415,13 @@ export function FlowchartPage() {
   // the full instruction as the label, which garbled the narrative).
   const [tree, setTree] = useState<FlowStep>(() => job?.tree ?? newStep("start"));
   const [seededFor, setSeededFor] = useState<string | undefined>(undefined);
+  // The builder's working copy of the job name, edited inline in the header and
+  // persisted on blur/Enter. Seeded from the job alongside the tree.
+  const [name, setName] = useState<string>(() => job?.name ?? "");
   useEffect(() => {
     if (job && job.id !== seededFor) {
       setTree(repairActionSteps(job.tree, actionLookup));
+      setName(job.name);
       setSeededFor(job.id);
     }
   }, [job, seededFor, actionLookup]);
@@ -433,6 +440,53 @@ export function FlowchartPage() {
       void updateJob(jobId, { agentId: agentId || null });
     },
     [jobId],
+  );
+
+  // Host picker: a job's runs launch their runner on the chosen host (persisted
+  // on the job). Empty = let the run pick any online host. Persisted as hostId.
+  const { data: hosts } = useHosts();
+  const onPickHost = useCallback(
+    (hostId: string) => {
+      if (!jobId) return;
+      void updateJob(jobId, { hostId: hostId || null });
+    },
+    [jobId],
+  );
+
+  // Inline name editing in the header: persist on blur / Enter. Empty falls
+  // back to the job's current name (never save a blank title).
+  const commitName = useCallback(() => {
+    if (!jobId) return;
+    const trimmed = name.trim();
+    if (!trimmed || trimmed === job?.name) {
+      setName(job?.name ?? "");
+      return;
+    }
+    void updateJob(jobId, { name: trimmed });
+  }, [jobId, name, job?.name]);
+
+  // Schedule (time trigger): a job can fire automatically every N minutes. The
+  // 1-min minimum matches the server poll cadence. Persisted on the job.
+  const schedule = job?.schedule ?? null;
+  const scheduleEnabled = !!schedule?.enabled;
+  const intervalMinutes = schedule?.intervalMinutes ?? 5;
+  const onToggleSchedule = useCallback(
+    (enabled: boolean) => {
+      if (!jobId) return;
+      void updateJob(jobId, {
+        schedule: { enabled, intervalMinutes: Math.max(intervalMinutes, 1) },
+      });
+    },
+    [jobId, intervalMinutes],
+  );
+  const onChangeInterval = useCallback(
+    (minutes: number) => {
+      if (!jobId || Number.isNaN(minutes)) return;
+      void updateJob(jobId, {
+        schedule: { enabled: scheduleEnabled, intervalMinutes: Math.max(minutes, 1) },
+      });
+    },
+    [jobId, scheduleEnabled],
   );
 
   // Tree → flat graph → text. Pure & cheap, recompute on every edit.
@@ -531,9 +585,23 @@ export function FlowchartPage() {
             <ArrowLeftIcon className="size-4" /> Jobs
           </Link>
         </Button>
-        <span className="min-w-0 flex-1 truncate text-sm font-medium">
-          {job?.name ?? "Flow builder"}
-        </span>
+        <Input
+          aria-label="Flow name"
+          data-testid="job-name-input"
+          value={name}
+          placeholder="Flow builder"
+          onChange={(e) => setName(e.target.value)}
+          onBlur={commitName}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+            if (e.key === "Escape") {
+              setName(job?.name ?? "");
+              e.currentTarget.blur();
+            }
+          }}
+          disabled={!jobId}
+          className="h-8 min-w-0 flex-1 border-transparent bg-transparent px-2 text-sm font-medium hover:border-input focus-visible:border-input"
+        />
         <select
           aria-label="Run as agent"
           data-testid="job-agent-select"
@@ -549,6 +617,50 @@ export function FlowchartPage() {
             </option>
           ))}
         </select>
+        {/* Host picker: where the run's runner launches. Persisted on the job;
+            empty means "any online host" (chosen at run time). */}
+        <select
+          aria-label="Run on host"
+          data-testid="job-host-select"
+          value={job?.hostId ?? ""}
+          onChange={(e) => onPickHost(e.target.value)}
+          disabled={!jobId}
+          className="h-8 rounded-md border border-input bg-background px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <option value="">Any host</option>
+          {(hosts ?? []).map((h) => (
+            <option key={h.host_id} value={h.host_id}>
+              {h.name}
+              {h.status === "offline" ? " (offline)" : ""}
+            </option>
+          ))}
+        </select>
+        {/* Schedule (time trigger): run automatically every N minutes. */}
+        <div
+          className="flex items-center gap-2 rounded-md border border-input px-2 py-1"
+          title="Run this flow automatically on a fixed interval"
+        >
+          <Switch
+            aria-label="Enable schedule"
+            data-testid="job-schedule-toggle"
+            checked={scheduleEnabled}
+            onCheckedChange={onToggleSchedule}
+            disabled={!jobId}
+          />
+          <span className="text-xs whitespace-nowrap text-muted-foreground">every</span>
+          <Input
+            type="number"
+            min={1}
+            step={1}
+            aria-label="Schedule interval in minutes"
+            data-testid="job-schedule-interval"
+            value={intervalMinutes}
+            onChange={(e) => onChangeInterval(Number(e.target.value))}
+            disabled={!jobId || !scheduleEnabled}
+            className="h-7 w-16 px-2 text-sm"
+          />
+          <span className="text-xs whitespace-nowrap text-muted-foreground">min</span>
+        </div>
         <Button variant="outline" size="sm" onClick={onSave} disabled={!jobId}>
           <SaveIcon className="size-3.5" /> {saved ? "Saved!" : "Save"}
         </Button>
@@ -690,6 +802,16 @@ function RunsList({ runs }: { runs: Run[] }) {
                 <RunStatusIcon status={run.status} />
                 <span className="font-medium">Run #{run.number}</span>
                 <span className="text-xs text-muted-foreground capitalize">{run.status}</span>
+                <span
+                  className={cn(
+                    "rounded px-1.5 py-0.5 text-[10px] font-medium",
+                    run.trigger === "scheduled"
+                      ? "bg-violet-500/15 text-violet-600 dark:text-violet-400"
+                      : "bg-muted text-muted-foreground",
+                  )}
+                >
+                  {run.trigger === "scheduled" ? "Scheduled" : "Manual"}
+                </span>
                 <span className="ml-auto text-xs text-muted-foreground tabular-nums">
                   {duration}
                 </span>

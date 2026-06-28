@@ -43,6 +43,8 @@ class JobStore(ABC):
         harness_override: str | None = None,
         model_override: str | None = None,
         created_by: str | None = None,
+        schedule_config: str | None = None,
+        host_id: str | None = None,
     ) -> Job:
         """
         Create a new job. The store mints the id.
@@ -54,6 +56,11 @@ class JobStore(ABC):
         :param harness_override: Optional harness override for runs.
         :param model_override: Optional model override for runs.
         :param created_by: Owning user id, or ``None`` in single-user mode.
+        :param schedule_config: Opaque scheduling JSON, e.g.
+            ``'{"enabled": true, "interval_minutes": 5}'``, or ``None`` for
+            an unscheduled job.
+        :param host_id: Preferred host for runs, or ``None`` to pick any
+            online host.
         :returns: The newly created :class:`Job`.
         """
         ...
@@ -80,6 +87,19 @@ class JobStore(ABC):
         ...
 
     @abstractmethod
+    def list_scheduled_jobs(self) -> list[Job]:
+        """
+        List all jobs with a non-null ``schedule_config``, across all owners.
+
+        Used by the background scheduler to find candidate jobs. The
+        ``enabled`` / ``interval_minutes`` interpretation of ``schedule_config``
+        is left to the caller (kept out of SQL to stay backend-agnostic).
+
+        :returns: Jobs that have any scheduling config set.
+        """
+        ...
+
+    @abstractmethod
     def update_job(
         self,
         job_id: str,
@@ -90,6 +110,8 @@ class JobStore(ABC):
         agent_id: str | None = None,
         harness_override: str | None = None,
         model_override: str | None = None,
+        schedule_config: str | None = None,
+        host_id: str | None = None,
     ) -> Job | None:
         """
         Patch the given fields and bump ``updated_at``. Only non-``None``
@@ -97,6 +119,12 @@ class JobStore(ABC):
         id is unknown.
 
         :param job_id: Unique job identifier, e.g. ``"job_abc123"``.
+        :param schedule_config: New opaque scheduling JSON. Pass the JSON
+            string to set/replace it; ``None`` leaves it unchanged (use a
+            disabled config like ``'{"enabled": false}'`` to turn scheduling
+            off rather than clearing it).
+        :param host_id: New preferred host id. ``None`` leaves it unchanged;
+            pass the empty string to clear the binding (pick any online host).
         :returns: The updated :class:`Job`, or ``None`` if not found.
         """
         ...
@@ -122,6 +150,7 @@ class JobStore(ABC):
         session_id: str | None,
         status: str = "running",
         created_by: str | None = None,
+        trigger: str = "adhoc",
     ) -> Run:
         """
         Record a new run for a job. The store mints the id and stamps
@@ -131,6 +160,8 @@ class JobStore(ABC):
         :param session_id: The session created for this run.
         :param status: Initial status, normally ``"running"``.
         :param created_by: Owning user id, or ``None``.
+        :param trigger: How the run was triggered — ``"adhoc"`` (manual
+            "Run now") or ``"scheduled"`` (the time-trigger scheduler).
         :returns: The newly created :class:`Run`.
         """
         ...

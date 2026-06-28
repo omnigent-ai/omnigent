@@ -20,6 +20,11 @@ RUN_STATUS_RUNNING = "running"
 RUN_STATUS_FINISHED = "finished"
 RUN_STATUS_FAILED = "failed"
 
+# How a run was triggered. ``adhoc`` is a manual "Run now"; ``scheduled`` is one
+# spawned by the background time-trigger scheduler.
+RUN_TRIGGER_ADHOC = "adhoc"
+RUN_TRIGGER_SCHEDULED = "scheduled"
+
 
 @dataclass
 class Job:
@@ -42,6 +47,9 @@ class Job:
     :param created_by: Owning user id, or ``None`` in single-user mode.
     :param schedule_config: Reserved for future scheduling (cron/loops);
         opaque JSON, unused in v1.
+    :param host_id: The host this job's runs launch their runner on, or
+        ``None`` to let the run pick any online host the owner has. Persisted
+        so a (scheduled or manual) run always targets the same machine.
     """
 
     id: str
@@ -55,6 +63,7 @@ class Job:
     model_override: str | None = None
     created_by: str | None = None
     schedule_config: str | None = None
+    host_id: str | None = None
 
 
 @dataclass
@@ -72,6 +81,8 @@ class Run:
         state, or ``None`` while still running.
     :param error: Failure detail when ``status == "failed"``, else ``None``.
     :param created_by: Owning user id, or ``None`` in single-user mode.
+    :param trigger: How the run was triggered — ``adhoc`` (manual "Run now")
+        or ``scheduled`` (spawned by the time-trigger scheduler).
     """
 
     id: str
@@ -82,3 +93,4 @@ class Run:
     completed_at: int | None = None
     error: str | None = None
     created_by: str | None = None
+    trigger: str = RUN_TRIGGER_ADHOC

@@ -813,6 +813,9 @@ class SqlJob(Base):
     :param created_by: Owning user id, or ``None`` in single-user mode.
     :param schedule_config: Reserved for future scheduling (cron/loops);
         opaque JSON, unused in v1.
+    :param host_id: Preferred host for this job's runs, or ``None`` to pick
+        any online host. Stored as a plain id (no FK) so host lifecycle is
+        decoupled from the job.
     """
 
     __tablename__ = "jobs"
@@ -832,6 +835,10 @@ class SqlJob(Base):
     model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     schedule_config: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Plain id (no FK): hosts come and go independently, and a host being
+    # deleted/offline shouldn't cascade-delete or null the job — the run path
+    # falls back to picking any online host when this one isn't available.
+    host_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         Index("ix_jobs_created_by_updated_at", "created_by", "updated_at"),
@@ -857,6 +864,8 @@ class SqlRun(Base):
         while running.
     :param error: Failure detail when ``status == "failed"``.
     :param created_by: Owning user id, or ``None`` in single-user mode.
+    :param trigger: How the run was triggered — ``adhoc`` (manual "Run now")
+        or ``scheduled`` (spawned by the time-trigger scheduler).
     """
 
     __tablename__ = "runs"
@@ -872,6 +881,7 @@ class SqlRun(Base):
         nullable=True,
     )
     status: Mapped[str] = mapped_column(String(32), default="running")
+    trigger: Mapped[str] = mapped_column(String(32), default="adhoc")
     started_at: Mapped[int] = mapped_column(Integer)
     completed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)

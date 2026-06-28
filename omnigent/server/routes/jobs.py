@@ -31,6 +31,7 @@ from omnigent.entities import (
     RUN_STATUS_FAILED,
     RUN_STATUS_FINISHED,
     RUN_STATUS_RUNNING,
+    RUN_TRIGGER_ADHOC,
     Job,
     Run,
 )
@@ -89,6 +90,10 @@ def _job_to_response(job: Job) -> JobResponse:
         # The graph is opaque to us; if it somehow isn't valid JSON, surface
         # the raw string rather than 500ing a read.
         graph = {"raw": job.graph}
+    try:
+        schedule_config = json.loads(job.schedule_config) if job.schedule_config else None
+    except json.JSONDecodeError:
+        schedule_config = None
     return JobResponse(
         id=job.id,
         name=job.name,
@@ -97,6 +102,8 @@ def _job_to_response(job: Job) -> JobResponse:
         agent_id=job.agent_id,
         harness_override=job.harness_override,
         model_override=job.model_override,
+        schedule_config=schedule_config,
+        host_id=job.host_id,
         created_at=job.created_at,
         updated_at=job.updated_at,
     )
@@ -116,6 +123,7 @@ def _run_to_response(run: Run) -> RunResponse:
         started_at=run.started_at,
         completed_at=run.completed_at,
         error=run.error,
+        trigger=run.trigger,
     )
 
 
@@ -182,6 +190,7 @@ def _pick_online_host(
     request: Request,
     *,
     user_id: str | None,
+    preferred_host_id: str | None = None,
 ) -> str | None:
     """Pick an online host to launch the job-run's runner on.
 
@@ -193,6 +202,9 @@ def _pick_online_host(
 
     :param request: The originating request, carrying ``app.state``.
     :param user_id: Authenticated caller; ``None`` in single-user mode.
+    :param preferred_host_id: The job's persisted host, if any. When it is
+        online (and owned by the caller when auth is on) it is used verbatim;
+        otherwise we fall back to auto-picking an online host.
     :returns: An online ``host_id``, or ``None``.
     """
     host_registry = getattr(request.app.state, "host_registry", None)
@@ -202,9 +214,15 @@ def _pick_online_host(
     online = host_registry.online_host_ids()
     if not online:
         return None
-    # When auth + a host store are wired, prefer a host the caller owns.
+    owned: set[str] | None = None
     if user_id is not None and host_store is not None:
         owned = {h.host_id for h in host_store.list_hosts(user_id)}
+    # Honour the job's pinned host when it's online (and owned, if auth is on).
+    if preferred_host_id is not None and preferred_host_id in online:
+        if owned is None or preferred_host_id in owned:
+            return preferred_host_id
+    # Otherwise auto-pick: prefer an owned host when auth + a store are wired.
+    if owned is not None:
         for host_id in online:
             if host_id in owned:
                 return host_id
@@ -290,6 +308,7 @@ async def _execute_job_run(
     file_store: FileStore | None,
     artifact_store: ArtifactStore | None,
     default_run_agent_id: str | None,
+    trigger: str = RUN_TRIGGER_ADHOC,
 ) -> Run:
     """Run a job: create a session, bind a runner, dispatch the narrative.
 
@@ -300,13 +319,18 @@ async def _execute_job_run(
     host is registered), the narrative is persisted as a history-only seed so
     the session opens with the prompt ready to send.
 
-    This is the single execution path shared by the HTTP "Run now" handler and
-    any future scheduler — a scheduler would load jobs with a non-null
-    ``schedule_config`` and call this with ``user_id`` set to the job owner.
+    the background scheduler — both create a session, bind a runner, and
+    dispatch the job's narrative, then persist a run row. The scheduler loads
+    jobs with a non-null ``schedule_config`` and calls this with ``user_id`` set
+    to the job owner and ``trigger=RUN_TRIGGER_SCHEDULED``.
 
     :param job: The job to run.
-    :param request: The originating request (forwarded to session creation).
+    :param request: The originating request (forwarded to session creation;
+        only dereferenced for host-bound sessions, never for job runs which
+        are host-less ``external`` sessions).
     :param default_run_agent_id: Fallback agent when the job has none bound.
+    :param trigger: How this run was triggered — ``adhoc`` (default, manual
+        "Run now") or ``scheduled`` (the time-trigger scheduler).
     :returns: The created :class:`Run`.
     :raises OmnigentError: 400 if no agent is bound and no default exists.
     """
@@ -321,7 +345,7 @@ async def _execute_job_run(
     # Pick an online host to launch the run's runner on. Runners are spawned on
     # demand by a host, so without one the narrative can only be seeded (the
     # session opens with the prompt ready to send manually).
-    host_id = _pick_online_host(request, user_id=user_id)
+    host_id = _pick_online_host(request, user_id=user_id, preferred_host_id=job.host_id)
 
     # A host-bound session needs an absolute workspace, and only the host knows
     # its HOME — resolve it via a list_dir round-trip. If that fails, drop the
@@ -462,6 +486,7 @@ async def _execute_job_run(
         session_id=session.id,
         status=RUN_STATUS_RUNNING,
         created_by=attribution_user(user_id),
+        trigger=trigger,
     )
 
 
@@ -528,6 +553,10 @@ def create_jobs_router(
             harness_override=body.harness_override,
             model_override=body.model_override,
             created_by=attribution_user(user_id),
+            schedule_config=(
+                json.dumps(body.schedule_config) if body.schedule_config is not None else None
+            ),
+            host_id=body.host_id,
         )
         return _job_to_response(job)
 
@@ -550,6 +579,9 @@ def create_jobs_router(
         user_id = require_user(request, auth_provider)
         await _load_owned_job(job_id, user_id)
         graph = json.dumps(body.graph) if body.graph is not None else None
+        schedule_config = (
+            json.dumps(body.schedule_config) if body.schedule_config is not None else None
+        )
         updated = await asyncio.to_thread(
             job_store.update_job,
             job_id,
@@ -559,6 +591,8 @@ def create_jobs_router(
             agent_id=body.agent_id,
             harness_override=body.harness_override,
             model_override=body.model_override,
+            schedule_config=schedule_config,
+            host_id=body.host_id,
         )
         if updated is None:
             raise OmnigentError(f"Job not found: {job_id!r}", code=ErrorCode.NOT_FOUND)

@@ -44,6 +44,7 @@ def sql_job_to_entity(row: SqlJob) -> Job:
         model_override=row.model_override,
         created_by=row.created_by,
         schedule_config=row.schedule_config,
+        host_id=row.host_id,
     )
 
 
@@ -63,6 +64,7 @@ def sql_run_to_entity(row: SqlRun) -> Run:
         completed_at=row.completed_at,
         error=row.error,
         created_by=row.created_by,
+        trigger=row.trigger,
     )
 
 

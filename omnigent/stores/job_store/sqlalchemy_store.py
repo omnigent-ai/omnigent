@@ -48,6 +48,8 @@ class SqlAlchemyJobStore(JobStore):
         harness_override: str | None = None,
         model_override: str | None = None,
         created_by: str | None = None,
+        schedule_config: str | None = None,
+        host_id: str | None = None,
     ) -> Job:
         """Create a new job. See :meth:`JobStore.create_job`."""
         ts = now_epoch()
@@ -62,6 +64,8 @@ class SqlAlchemyJobStore(JobStore):
             harness_override=harness_override,
             model_override=model_override,
             created_by=created_by,
+            schedule_config=schedule_config,
+            host_id=host_id,
         )
         with self._session() as session:
             session.add(row)
@@ -84,6 +88,17 @@ class SqlAlchemyJobStore(JobStore):
             rows = session.execute(stmt).scalars().all()
             return [sql_job_to_entity(r) for r in rows]
 
+    def list_scheduled_jobs(self) -> list[Job]:
+        """List jobs with any schedule_config. See :meth:`JobStore.list_scheduled_jobs`."""
+        with self._session() as session:
+            stmt = (
+                select(SqlJob)
+                .where(SqlJob.schedule_config.is_not(None))
+                .order_by(desc(SqlJob.updated_at), desc(SqlJob.id))
+            )
+            rows = session.execute(stmt).scalars().all()
+            return [sql_job_to_entity(r) for r in rows]
+
     def update_job(
         self,
         job_id: str,
@@ -94,6 +109,8 @@ class SqlAlchemyJobStore(JobStore):
         agent_id: str | None = None,
         harness_override: str | None = None,
         model_override: str | None = None,
+        schedule_config: str | None = None,
+        host_id: str | None = None,
     ) -> Job | None:
         """Patch a job and bump ``updated_at``. See :meth:`JobStore.update_job`."""
         with self._session() as session:
@@ -112,6 +129,11 @@ class SqlAlchemyJobStore(JobStore):
                 row.harness_override = harness_override
             if model_override is not None:
                 row.model_override = model_override
+            if schedule_config is not None:
+                row.schedule_config = schedule_config
+            # Empty string clears the binding; None leaves it unchanged.
+            if host_id is not None:
+                row.host_id = host_id or None
             row.updated_at = now_epoch()
             return sql_job_to_entity(row)
 
@@ -133,6 +155,7 @@ class SqlAlchemyJobStore(JobStore):
         session_id: str | None,
         status: str = "running",
         created_by: str | None = None,
+        trigger: str = "adhoc",
     ) -> Run:
         """Record a new run. See :meth:`JobStore.create_run`."""
         row = SqlRun(
@@ -142,6 +165,7 @@ class SqlAlchemyJobStore(JobStore):
             status=status,
             started_at=now_epoch(),
             created_by=created_by,
+            trigger=trigger,
         )
         with self._session() as session:
             session.add(row)

@@ -22,6 +22,12 @@ import { ApiError } from "./sessionsApi";
  */
 export type FlowPayload = unknown;
 
+/** A job's time-trigger schedule. `null`/`enabled:false` means it won't fire. */
+export interface ScheduleConfig {
+  enabled: boolean;
+  intervalMinutes: number;
+}
+
 /** A saved job, camelCased with ms timestamps. */
 export interface Job {
   id: string;
@@ -32,6 +38,9 @@ export interface Job {
   graph: FlowPayload;
   narrative: string;
   agentId: string | null;
+  scheduleConfig: ScheduleConfig | null;
+  /** Preferred host for runs, or null to pick any online host. */
+  hostId: string | null;
 }
 
 /** One execution of a job. */
@@ -44,6 +53,14 @@ export interface Run {
   startedAt: number;
   completedAt: number | null;
   error: string | null;
+  /** How the run was triggered: manual "Run now" vs the time scheduler. */
+  trigger: "adhoc" | "scheduled";
+}
+
+/** The `schedule_config` JSON the backend round-trips (snake_case). */
+interface ScheduleConfigWire {
+  enabled?: boolean;
+  interval_minutes?: number;
 }
 
 interface JobWire {
@@ -54,6 +71,8 @@ interface JobWire {
   graph: FlowPayload;
   narrative: string;
   agent_id: string | null;
+  schedule_config: ScheduleConfigWire | null;
+  host_id: string | null;
 }
 
 interface RunWire {
@@ -64,6 +83,12 @@ interface RunWire {
   started_at: number;
   completed_at: number | null;
   error: string | null;
+  trigger: "adhoc" | "scheduled";
+}
+
+function scheduleFromWire(w: ScheduleConfigWire | null | undefined): ScheduleConfig | null {
+  if (!w || typeof w.interval_minutes !== "number") return null;
+  return { enabled: !!w.enabled, intervalMinutes: w.interval_minutes };
 }
 
 function jobFromWire(w: JobWire): Job {
@@ -75,6 +100,8 @@ function jobFromWire(w: JobWire): Job {
     graph: w.graph ?? null,
     narrative: w.narrative ?? "",
     agentId: w.agent_id ?? null,
+    scheduleConfig: scheduleFromWire(w.schedule_config),
+    hostId: w.host_id ?? null,
   };
 }
 
@@ -87,6 +114,7 @@ function runFromWire(w: RunWire): Run {
     startedAt: w.started_at * 1000,
     completedAt: w.completed_at == null ? null : w.completed_at * 1000,
     error: w.error,
+    trigger: w.trigger ?? "adhoc",
   };
 }
 
@@ -112,6 +140,9 @@ export interface JobInput {
   graph?: FlowPayload;
   narrative?: string;
   agentId?: string | null;
+  scheduleConfig?: ScheduleConfig | null;
+  /** Set to a host id to pin; `null` clears the binding (any online host). */
+  hostId?: string | null;
 }
 
 function toBody(input: JobInput): Record<string, unknown> {
@@ -120,6 +151,15 @@ function toBody(input: JobInput): Record<string, unknown> {
   if (input.graph !== undefined) body.graph = input.graph;
   if (input.narrative !== undefined) body.narrative = input.narrative;
   if (input.agentId !== undefined) body.agent_id = input.agentId;
+  if (input.scheduleConfig !== undefined && input.scheduleConfig !== null) {
+    body.schedule_config = {
+      enabled: input.scheduleConfig.enabled,
+      interval_minutes: input.scheduleConfig.intervalMinutes,
+    };
+  }
+  // The backend clears the host binding on the empty string; null leaves it
+  // unchanged — so map a null hostId to "" to mean "unpin".
+  if (input.hostId !== undefined) body.host_id = input.hostId ?? "";
   return body;
 }
 

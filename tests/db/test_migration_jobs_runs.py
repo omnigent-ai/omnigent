@@ -19,7 +19,11 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
-from omnigent.db.utils import clear_engine_cache, get_or_create_engine
+from omnigent.db.utils import (
+    _build_alembic_config,
+    clear_engine_cache,
+    get_or_create_engine,
+)
 
 
 @pytest.fixture
@@ -39,7 +43,15 @@ def test_jobs_and_runs_tables_present(db_engine: Engine) -> None:
     job_cols = {c["name"] for c in insp.get_columns("jobs")}
     assert {"id", "name", "graph", "narrative", "agent_id", "schedule_config"} <= job_cols
     run_cols = {c["name"] for c in insp.get_columns("runs")}
-    assert {"id", "job_id", "session_id", "status", "started_at", "completed_at"} <= run_cols
+    assert {
+        "id",
+        "job_id",
+        "session_id",
+        "status",
+        "started_at",
+        "completed_at",
+        "trigger",
+    } <= run_cols
 
 
 def test_run_indexes_present(db_engine: Engine) -> None:
@@ -49,6 +61,46 @@ def test_run_indexes_present(db_engine: Engine) -> None:
     assert "ix_runs_job_id_started_at" in names
     assert "ix_runs_session_id" in names
     assert "ix_runs_status" in names
+
+
+def test_trigger_backfills_existing_runs_on_upgrade(tmp_path: Path) -> None:
+    """Upgrading a DB that already has runs backfills ``trigger`` to ``adhoc``.
+
+    Regression guard: the trigger column is added NOT NULL with a server
+    default. A DB that predates the column has rows that must backfill on
+    upgrade — if the migration dropped the default mid-rebuild (SQLite batch
+    mode), this would fail the NOT NULL constraint and crash server startup.
+    """
+    from alembic import command
+
+    db_uri = f"sqlite:///{tmp_path / 'pre.db'}"
+    cfg = _build_alembic_config(db_uri)
+    # Bring the DB to the revision *before* the trigger column was added.
+    command.upgrade(cfg, "o1a2b3c4d5e6")
+    engine = get_or_create_engine(db_uri)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO jobs (id, created_at, updated_at, name, graph, narrative) "
+                    "VALUES ('job_pre', 1, 1, 'J', '{}', 'n')"
+                )
+            )
+            conn.execute(
+                sa.text(
+                    "INSERT INTO runs (id, job_id, session_id, status, started_at) "
+                    "VALUES ('run_pre', 'job_pre', NULL, 'running', 1)"
+                )
+            )
+        # Apply the trigger migration on top of existing data.
+        command.upgrade(cfg, "head")
+        with engine.begin() as conn:
+            trigger = conn.execute(
+                sa.text("SELECT trigger FROM runs WHERE id = 'run_pre'")
+            ).scalar_one()
+        assert trigger == "adhoc", "Pre-existing runs must backfill to the adhoc trigger."
+    finally:
+        clear_engine_cache()
 
 
 def test_delete_job_cascades_to_runs(db_engine: Engine) -> None:
@@ -62,8 +114,8 @@ def test_delete_job_cascades_to_runs(db_engine: Engine) -> None:
         )
         conn.execute(
             sa.text(
-                "INSERT INTO runs (id, job_id, session_id, status, started_at) "
-                "VALUES ('run_c', 'job_c', NULL, 'running', 1)"
+                "INSERT INTO runs (id, job_id, session_id, status, started_at, trigger) "
+                "VALUES ('run_c', 'job_c', NULL, 'running', 1, 'adhoc')"
             )
         )
         conn.commit()
@@ -93,8 +145,8 @@ def test_delete_session_nulls_run_session_id(db_engine: Engine) -> None:
         )
         conn.execute(
             sa.text(
-                "INSERT INTO runs (id, job_id, session_id, status, started_at) "
-                "VALUES ('run_s', 'job_s', 'conv_r', 'running', 1)"
+                "INSERT INTO runs (id, job_id, session_id, status, started_at, trigger) "
+                "VALUES ('run_s', 'job_s', 'conv_r', 'running', 1, 'adhoc')"
             )
         )
         conn.commit()

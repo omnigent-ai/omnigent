@@ -52,6 +52,14 @@ export interface Run {
   logs: string[];
   /** The agent session this run created, for deep-linking. */
   sessionId?: string;
+  /** How the run was triggered: manual "Run now" vs the time scheduler. */
+  trigger: "adhoc" | "scheduled";
+}
+
+/** A job's time-trigger schedule (the builder's model). */
+export interface Schedule {
+  enabled: boolean;
+  intervalMinutes: number;
 }
 
 export interface Job {
@@ -66,6 +74,10 @@ export interface Job {
   runs: Run[];
   /** Agent the job runs as, or null until one is picked. */
   agentId: string | null;
+  /** Time-trigger schedule, or null if the job is unscheduled. */
+  schedule: Schedule | null;
+  /** Preferred host for runs, or null to pick any online host. */
+  hostId: string | null;
 }
 
 /** Cross-component change signal so the hooks re-read after a mutation. */
@@ -106,6 +118,7 @@ function runFromApi(r: ApiRun, number: number): Run {
     finishedAt: r.completedAt ?? undefined,
     logs,
     sessionId: r.sessionId ?? undefined,
+    trigger: r.trigger,
   };
 }
 
@@ -121,6 +134,13 @@ function toJob(api: ApiJob, runs: ApiRun[]): Job {
     updatedAt: api.updatedAt,
     tree: treeFromApi(api),
     agentId: api.agentId,
+    schedule: api.scheduleConfig
+      ? {
+          enabled: api.scheduleConfig.enabled,
+          intervalMinutes: api.scheduleConfig.intervalMinutes,
+        }
+      : null,
+    hostId: api.hostId,
     runs: runs.map((r) => runFromApi(r, numberById.get(r.id) ?? 0)),
   };
 }
@@ -172,20 +192,34 @@ export async function createJob(name: string, tree: FlowStep = newTree()): Promi
   return job;
 }
 
-/** Patch name and/or tree; a tree change re-renders the narrative. */
+/** Patch name, tree, agent, schedule, and/or host; a tree change re-renders the narrative. */
 export async function updateJob(
   id: string,
-  patch: { name?: string; tree?: FlowStep; agentId?: string | null },
+  patch: {
+    name?: string;
+    tree?: FlowStep;
+    agentId?: string | null;
+    schedule?: Schedule | null;
+    hostId?: string | null;
+  },
 ): Promise<void> {
   const input: {
     name?: string;
     graph?: FlowStep;
     narrative?: string;
     agentId?: string | null;
+    scheduleConfig?: { enabled: boolean; intervalMinutes: number } | null;
+    hostId?: string | null;
   } = { name: patch.name, agentId: patch.agentId };
   if (patch.tree !== undefined) {
     input.graph = patch.tree;
     input.narrative = narrativeFor(patch.tree);
+  }
+  if (patch.schedule !== undefined) {
+    input.scheduleConfig = patch.schedule;
+  }
+  if (patch.hostId !== undefined) {
+    input.hostId = patch.hostId;
   }
   await apiUpdateJob(id, input);
   await refreshJob(id);

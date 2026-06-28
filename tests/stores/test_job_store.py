@@ -52,6 +52,56 @@ def test_delete_job(job_store: SqlAlchemyJobStore) -> None:
     assert job_store.delete_job(job.id) is False
 
 
+def test_schedule_config_round_trips(job_store: SqlAlchemyJobStore) -> None:
+    """``schedule_config`` is persisted on create and patchable via update."""
+    job = job_store.create_job(
+        name="S", graph="{}", narrative="s", schedule_config='{"enabled": true}'
+    )
+    assert job.schedule_config == '{"enabled": true}'
+    updated = job_store.update_job(job.id, schedule_config='{"enabled": false}')
+    assert updated is not None
+    assert updated.schedule_config == '{"enabled": false}'
+
+
+def test_list_scheduled_jobs_only_returns_jobs_with_config(
+    job_store: SqlAlchemyJobStore,
+) -> None:
+    """``list_scheduled_jobs`` returns only jobs with a non-null schedule_config."""
+    job_store.create_job(name="plain", graph="{}", narrative="n")
+    scheduled = job_store.create_job(
+        name="sched", graph="{}", narrative="n", schedule_config='{"enabled": true}'
+    )
+    ids = {j.id for j in job_store.list_scheduled_jobs()}
+    assert ids == {scheduled.id}
+
+
+def test_create_run_defaults_adhoc_and_persists_scheduled(
+    job_store: SqlAlchemyJobStore,
+) -> None:
+    """A run defaults to the adhoc trigger; a scheduled trigger round-trips."""
+    job = job_store.create_job(name="T", graph="{}", narrative="go")
+    adhoc = job_store.create_run(job_id=job.id, session_id=None)
+    assert adhoc.trigger == "adhoc"
+    scheduled = job_store.create_run(job_id=job.id, session_id=None, trigger="scheduled")
+    assert scheduled.trigger == "scheduled"
+    assert job_store.get_run(scheduled.id).trigger == "scheduled"
+
+
+def test_host_id_round_trips_and_clears(job_store: SqlAlchemyJobStore) -> None:
+    """``host_id`` persists on create, patches on update, and clears on empty string."""
+    job = job_store.create_job(name="H", graph="{}", narrative="n", host_id="host_1")
+    assert job.host_id == "host_1"
+    # Patch to a different host.
+    updated = job_store.update_job(job.id, host_id="host_2")
+    assert updated is not None and updated.host_id == "host_2"
+    # None leaves it unchanged.
+    unchanged = job_store.update_job(job.id, name="renamed")
+    assert unchanged is not None and unchanged.host_id == "host_2"
+    # Empty string clears the binding.
+    cleared = job_store.update_job(job.id, host_id="")
+    assert cleared is not None and cleared.host_id is None
+
+
 def test_run_lifecycle_and_cascade(job_store: SqlAlchemyJobStore) -> None:
     """Runs are created, filtered by status, and cascade-deleted with the job."""
     job = job_store.create_job(name="R", graph="{}", narrative="go")
