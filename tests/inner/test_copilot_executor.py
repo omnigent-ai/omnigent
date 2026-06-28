@@ -102,7 +102,7 @@ class _FakeSession:
     async def disconnect(self) -> None:
         self._state["session_closed"] += 1
 
-    def abort(self) -> None:
+    async def abort(self) -> None:
         self._state["aborted"] += 1
 
 
@@ -794,9 +794,36 @@ async def test_interrupt_session_drops_and_recreates(monkeypatch: pytest.MonkeyP
     assert await ex.interrupt_session("unknown") is False  # no live session
     _ = [e async for e in ex.run_turn([_user("first")], [], "SYS")]
     assert await ex.interrupt_session("conv1") is True
+    assert state["aborted"] == 1  # SDK abort issued before teardown
+    assert state["session_closed"] >= 1  # session disconnected
     assert state["client_closed"] >= 1
     _ = [e async for e in ex.run_turn([_user("second")], [], "SYS")]
     assert len(state["create_kwargs"]) == 2  # session re-created after interrupt
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_aborts_then_drops_even_when_abort_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A failing abort must NOT prevent the session teardown: interrupt still
+    # drops the session and the next turn rebuilds a fresh one.
+    state = _install_fake_copilot(
+        monkeypatch,
+        [[_ev("ASSISTANT_MESSAGE", content="one")], [_ev("ASSISTANT_MESSAGE", content="two")]],
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+    _ = [e async for e in ex.run_turn([_user("first")], [], "SYS")]
+    sess = ex._session_states["conv1"].session
+
+    async def _boom() -> None:
+        raise RuntimeError("abort boom")
+
+    monkeypatch.setattr(sess, "abort", _boom)
+    assert await ex.interrupt_session("conv1") is True
+    assert state["client_closed"] >= 1
+    _ = [e async for e in ex.run_turn([_user("second")], [], "SYS")]
+    assert len(state["create_kwargs"]) == 2  # fresh session next turn
     await ex.close()
 
 
