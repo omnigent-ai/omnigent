@@ -24,6 +24,7 @@ from omnigent.entities.conversation import (
     synthesize_conversation_title,
 )
 from omnigent.entities.file import StoredFile
+from omnigent.entities.mcp_server import McpServer
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import ResolvedAccess, SessionPermission
 from omnigent.entities.policy import Policy
@@ -51,6 +52,7 @@ __all__ = [
     "FunctionCallOutputData",
     "ItemData",
     "LoadedAgent",
+    "McpServer",
     "MessageData",
     "NativeToolData",
     "NewConversationItem",
