@@ -112,12 +112,30 @@ def _discover_kiro_session_jsonl(
     launch_epoch_ms: int,
     sessions_dir: Path | None = None,
 ) -> tuple[str, Path] | None:
-    """Find this Omnigent session's Kiro JSONL file."""
+    """Find this Omnigent session's Kiro JSONL file — only when it's unambiguous.
+
+    Candidates are Kiro sessions in the same workspace (``cwd``) created at/after
+    the launch floor (``launch_epoch_ms`` minus a small skew, which already drops
+    pre-existing sessions). We bind **only when exactly one** session qualifies.
+
+    Each Kiro session is its own JSONL keyed by Kiro's minted id, so two fresh
+    sessions launched in the same workspace within the skew window both qualify.
+    Picking newest-by-``updated_at`` (the old behaviour) would latch onto
+    whichever session most recently emitted a turn — i.e. it can bind the *other*
+    session's transcript and silently cross-talk it into this conversation. With
+    two or more candidates we can't tell which JSONL is ours, so we return
+    ``None`` and retry rather than guess. A brief delay is safe; mirroring the
+    wrong conversation is not. Mirrors cursor-native's "bind only when exactly one
+    chat qualifies" (:func:`omnigent.cursor_native_forwarder._discover_store`).
+
+    The resume/fork path doesn't reach here: when the Kiro id is already known the
+    caller binds it directly via :func:`_kiro_session_jsonl_for_id`.
+    """
     root = sessions_dir or _kiro_cli_sessions_dir()
     if not root.is_dir():
         return None
     floor_ms = max(0, launch_epoch_ms - _DISCOVERY_SKEW_MS)
-    best: tuple[int, str, Path] | None = None
+    candidates: list[tuple[str, Path]] = []
     for metadata_path in root.glob("*.json"):
         session_id = metadata_path.stem
         jsonl_path = root / f"{session_id}.jsonl"
@@ -130,15 +148,12 @@ def _discover_kiro_session_jsonl(
         if not isinstance(metadata, dict) or not _same_workspace(metadata.get("cwd"), workspace):
             continue
         created_ms = _parse_iso_epoch_ms(metadata.get("created_at"))
-        updated_ms = _parse_iso_epoch_ms(metadata.get("updated_at"))
         if created_ms and created_ms < floor_ms:
             continue
-        sort_ms = updated_ms or created_ms
-        if best is None or sort_ms > best[0]:
-            best = (sort_ms, session_id, jsonl_path)
-    if best is None:
+        candidates.append((session_id, jsonl_path))
+    if len(candidates) != 1:
         return None
-    return best[1], best[2]
+    return candidates[0]
 
 
 def _kiro_session_jsonl_for_id(

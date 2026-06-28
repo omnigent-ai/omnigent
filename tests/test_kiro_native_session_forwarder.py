@@ -47,7 +47,11 @@ def _write_kiro_session(
 def test_discover_kiro_session_jsonl_filters_by_workspace_and_launch_time(
     tmp_path: Path,
 ) -> None:
-    """Discovery chooses the newest Kiro session for the runner workspace."""
+    """Discovery binds the unique qualifying Kiro session for the workspace.
+
+    The wrong-workspace and below-floor sessions are filtered out, leaving
+    exactly one candidate, which is bound.
+    """
     sessions_dir = tmp_path / "sessions" / "cli"
     workspace = tmp_path / "repo"
     other = tmp_path / "other"
@@ -82,6 +86,45 @@ def test_discover_kiro_session_jsonl_filters_by_workspace_and_launch_time(
     )
 
     assert discovered == ("current", expected)
+
+
+def test_discover_kiro_session_jsonl_returns_none_when_multiple_candidates(
+    tmp_path: Path,
+) -> None:
+    """Two concurrent same-workspace sessions are ambiguous → bind nothing.
+
+    Each Kiro session is its own JSONL, so two fresh sessions launched in the
+    same workspace within the discovery window both qualify. Picking newest-by-
+    ``updated_at`` could latch onto the other session's transcript (cross-talk),
+    so discovery must return ``None`` and retry rather than guess. Regression for
+    the #1137 'forwarder can bind the wrong session' item.
+    """
+    sessions_dir = tmp_path / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    # Both created after the launch floor, same workspace — indistinguishable.
+    _write_kiro_session(
+        sessions_dir,
+        session_id="session-a",
+        cwd=workspace,
+        created_at="2026-06-21T01:39:35Z",
+        updated_at="2026-06-21T01:40:10Z",
+    )
+    _write_kiro_session(
+        sessions_dir,
+        session_id="session-b",
+        cwd=workspace,
+        created_at="2026-06-21T01:39:36Z",
+        updated_at="2026-06-21T01:41:00Z",  # newest updated_at — the old tie-break
+    )
+
+    discovered = forwarder._discover_kiro_session_jsonl(
+        workspace=str(workspace),
+        launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        sessions_dir=sessions_dir,
+    )
+
+    assert discovered is None
 
 
 def test_read_new_kiro_messages_returns_user_and_assistant_text(tmp_path: Path) -> None:
