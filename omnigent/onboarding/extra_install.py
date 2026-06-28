@@ -26,6 +26,12 @@ def _is_uv_tool_install() -> bool:
     ``uv/tools/<package>/`` directory.  Checking ``sys.prefix`` for the
     ``uv/tools/`` segment mirrors the ``pipx/venvs`` heuristic in
     :func:`omnigent.update_check._looks_like_pipx_install`.
+
+    .. note::
+
+       Misses custom layouts set via ``UV_TOOL_DIR`` / ``XDG_DATA_HOME``
+       (falls through to ``uv pip install``, same accepted gap as the pipx
+       heuristic).
     """
     return "uv/tools/" in sys.prefix.replace(os.sep, "/")
 
