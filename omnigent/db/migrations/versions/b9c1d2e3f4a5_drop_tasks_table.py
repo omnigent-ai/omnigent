@@ -32,6 +32,12 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Drop the tasks table and all of its indexes."""
+    bind = op.get_bind()
+    if bind.dialect.name in ("mysql", "mariadb"):
+        # MySQL/MariaDB: cannot drop indexes that support FK constraints while
+        # the constraints still exist. DROP TABLE removes everything atomically.
+        op.drop_table("tasks")
+        return
     with op.batch_alter_table("tasks") as batch_op:
         batch_op.drop_index("ix_tasks_conversation_id")
         batch_op.drop_index("ix_tasks_agent_id")

@@ -279,13 +279,13 @@ def _upsert_labels(
         }
         for key, value in updates.items()
     ]
-    if dialect in ("sqlite", "postgresql"):
+    if dialect in ("sqlite", "postgresql", "mysql", "mariadb"):
         _dialect_upsert_labels(session, dialect, rows)
         return
     # Generic dialect fallback — SELECT-then-INSERT/UPDATE in
     # one transaction. Safe for the v1 "one active workflow
     # per conversation" invariant (POLICIES.md §10); the
-    # SQLite / Postgres dialect-specific paths above give
+    # SQLite / Postgres / MySQL dialect-specific paths above give
     # true atomic UPSERT for the supported production dbs.
     for row in rows:
         existing = session.get(
@@ -310,39 +310,57 @@ def _dialect_upsert_labels(
     rows: list[dict[str, Any]],
 ) -> None:
     """
-    Dialect-specific UPSERT path for SQLite / PostgreSQL.
+    Dialect-specific UPSERT path for SQLite / PostgreSQL / MySQL / MariaDB.
 
-    Extracted from ``_upsert_labels`` so the two branches
+    Extracted from ``_upsert_labels`` so the branches
     (which use different ``insert`` builders producing
     incompatible type variances at the mypy level) each live
     in their own narrow scope. The outer function selects the
     branch; this one executes it.
 
     :param session: Active SQLAlchemy session.
-    :param dialect: ``"sqlite"`` or ``"postgresql"`` (the
-        outer function gates all other dialects onto the
-        generic fallback path).
+    :param dialect: ``"sqlite"``, ``"postgresql"``, ``"mysql"``, or
+        ``"mariadb"`` (the outer function gates all other dialects
+        onto the generic fallback path).
     :param rows: Pre-built row dicts to upsert.
     """
     # Typed as Any to sidestep the mypy variance issue between
-    # the two dialect-specific ``Insert`` classes; the runtime
-    # shape of both classes is identical for our use.
+    # the dialect-specific ``Insert`` classes; the runtime
+    # shape of all classes is identical for our use.
     stmt: Any
     if dialect == "sqlite":
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
         stmt = sqlite_insert(SqlConversationLabel).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["conversation_id", "key"],
+            set_={
+                "value": stmt.excluded.value,
+                "updated_at": stmt.excluded.updated_at,
+            },
+        )
+    elif dialect in ("mysql", "mariadb"):
+        # MySQL/MariaDB: ON DUPLICATE KEY UPDATE instead of PostgreSQL's
+        # ON CONFLICT DO UPDATE. Both are atomic upserts; the SQLAlchemy
+        # dialect objects differ but the intent is identical.
+        from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+        stmt = mysql_insert(SqlConversationLabel).values(rows)
+        stmt = stmt.on_duplicate_key_update(
+            value=stmt.inserted.value,
+            updated_at=stmt.inserted.updated_at,
+        )
     else:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 
         stmt = pg_insert(SqlConversationLabel).values(rows)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["conversation_id", "key"],
-        set_={
-            "value": stmt.excluded.value,
-            "updated_at": stmt.excluded.updated_at,
-        },
-    )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["conversation_id", "key"],
+            set_={
+                "value": stmt.excluded.value,
+                "updated_at": stmt.excluded.updated_at,
+            },
+        )
     session.execute(stmt)
 
 
@@ -954,7 +972,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
         with self._session() as session:
             dialect = session.bind.dialect.name if session.bind is not None else ""
-            if dialect in ("sqlite", "postgresql"):
+            if dialect in ("sqlite", "postgresql", "mysql", "mariadb"):
                 self._upsert_daily_cost_dialect(session, dialect, user_id, day_utc, delta_usd, now)
                 return
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE in one
@@ -1013,18 +1031,45 @@ class SqlAlchemyConversationStore(ConversationStore):
             from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
             stmt = sqlite_insert(SqlUserDailyCost)
+            stmt = stmt.values(
+                user_id=user_id, day_utc=day_utc, cost_usd=delta_usd, updated_at=now
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["user_id", "day_utc"],
+                set_={
+                    "cost_usd": SqlUserDailyCost.cost_usd + stmt.excluded.cost_usd,
+                    "updated_at": stmt.excluded.updated_at,
+                },
+            )
+        elif dialect in ("mysql", "mariadb"):
+            # MySQL/MariaDB: ON DUPLICATE KEY UPDATE instead of PostgreSQL's
+            # ON CONFLICT DO UPDATE. stmt.inserted.cost_usd is the MySQL
+            # equivalent of stmt.excluded.cost_usd — the value from the
+            # attempted INSERT row. Both produce an atomic increment.
+            from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+            stmt = mysql_insert(SqlUserDailyCost)
+            stmt = stmt.values(
+                user_id=user_id, day_utc=day_utc, cost_usd=delta_usd, updated_at=now
+            )
+            stmt = stmt.on_duplicate_key_update(
+                cost_usd=SqlUserDailyCost.cost_usd + stmt.inserted.cost_usd,
+                updated_at=stmt.inserted.updated_at,
+            )
         else:
             from sqlalchemy.dialects.postgresql import insert as pg_insert
 
             stmt = pg_insert(SqlUserDailyCost)
-        stmt = stmt.values(user_id=user_id, day_utc=day_utc, cost_usd=delta_usd, updated_at=now)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["user_id", "day_utc"],
-            set_={
-                "cost_usd": SqlUserDailyCost.cost_usd + stmt.excluded.cost_usd,
-                "updated_at": stmt.excluded.updated_at,
-            },
-        )
+            stmt = stmt.values(
+                user_id=user_id, day_utc=day_utc, cost_usd=delta_usd, updated_at=now
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["user_id", "day_utc"],
+                set_={
+                    "cost_usd": SqlUserDailyCost.cost_usd + stmt.excluded.cost_usd,
+                    "updated_at": stmt.excluded.updated_at,
+                },
+            )
         session.execute(stmt)
 
     def get_daily_cost(self, user_id: str, day_utc: str) -> float:
@@ -1085,34 +1130,68 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
         with self._session() as session:
             dialect = session.bind.dialect.name if session.bind is not None else ""
-            if dialect in ("sqlite", "postgresql"):
+            if dialect in ("sqlite", "postgresql", "mysql", "mariadb"):
                 # Typed as Any to sidestep the mypy variance between the
-                # two dialect-specific ``Insert`` classes.
+                # dialect-specific ``Insert`` classes.
                 stmt: Any
                 if dialect == "sqlite":
                     from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
                     stmt = sqlite_insert(SqlUserDailyCost)
+                    stmt = stmt.values(
+                        user_id=user_id,
+                        day_utc=day_utc,
+                        cost_usd=0.0,
+                        ask_approved_usd=ask_approved_usd,
+                        updated_at=now,
+                    )
+                    # On conflict touch only the approval (+ stamp) — never
+                    # the accumulated cost.
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=["user_id", "day_utc"],
+                        set_={
+                            "ask_approved_usd": stmt.excluded.ask_approved_usd,
+                            "updated_at": stmt.excluded.updated_at,
+                        },
+                    )
+                elif dialect in ("mysql", "mariadb"):
+                    # MySQL/MariaDB: ON DUPLICATE KEY UPDATE instead of
+                    # PostgreSQL's ON CONFLICT DO UPDATE. Only touches the
+                    # approval field, never the accumulated cost.
+                    from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+                    stmt = mysql_insert(SqlUserDailyCost)
+                    stmt = stmt.values(
+                        user_id=user_id,
+                        day_utc=day_utc,
+                        cost_usd=0.0,
+                        ask_approved_usd=ask_approved_usd,
+                        updated_at=now,
+                    )
+                    stmt = stmt.on_duplicate_key_update(
+                        ask_approved_usd=stmt.inserted.ask_approved_usd,
+                        updated_at=stmt.inserted.updated_at,
+                    )
                 else:
                     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
                     stmt = pg_insert(SqlUserDailyCost)
-                stmt = stmt.values(
-                    user_id=user_id,
-                    day_utc=day_utc,
-                    cost_usd=0.0,
-                    ask_approved_usd=ask_approved_usd,
-                    updated_at=now,
-                )
-                # On conflict touch only the approval (+ stamp) — never
-                # the accumulated cost.
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["user_id", "day_utc"],
-                    set_={
-                        "ask_approved_usd": stmt.excluded.ask_approved_usd,
-                        "updated_at": stmt.excluded.updated_at,
-                    },
-                )
+                    stmt = stmt.values(
+                        user_id=user_id,
+                        day_utc=day_utc,
+                        cost_usd=0.0,
+                        ask_approved_usd=ask_approved_usd,
+                        updated_at=now,
+                    )
+                    # On conflict touch only the approval (+ stamp) — never
+                    # the accumulated cost.
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=["user_id", "day_utc"],
+                        set_={
+                            "ask_approved_usd": stmt.excluded.ask_approved_usd,
+                            "updated_at": stmt.excluded.updated_at,
+                        },
+                    )
                 session.execute(stmt)
                 return
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE.
@@ -1185,9 +1264,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._session() as session:
             # Dialect-specific search: the SQLite family (SQLite + D1) has
             # FTS5 virtual tables (MATCH + rank); PostgreSQL doesn't. ILIKE on
-            # the JSON data column is a functional fallback there. Proper
-            # tsvector indexing is a future optimization (tracked in GAPS.md).
-            use_fts = _supports_fts5(self._engine.dialect.name)
+            # the JSON data column is a functional fallback there. MySQL/MariaDB
+            # uses LIKE (case-insensitive by default with utf8mb4_general_ci).
+            # Proper tsvector/FULLTEXT indexing is a future optimization.
+            dialect = self._engine.dialect.name
+            use_fts = _supports_fts5(dialect)
             if use_fts:
                 if conversation_id is not None:
                     stmt = text(
@@ -1202,6 +1283,25 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "WHERE search_text MATCH :query "
                         "ORDER BY rank LIMIT :limit"
                     )
+            elif dialect in ("mysql", "mariadb"):
+                # MySQL/MariaDB: `data` is a TEXT column (no ::text cast needed),
+                # and LIKE is case-insensitive by default with utf8mb4_general_ci
+                # collation (no ILIKE needed).
+                like_pattern = f"%{query}%"
+                if conversation_id is not None:
+                    stmt = text(
+                        "SELECT ci.id FROM conversation_items ci "
+                        "WHERE ci.conversation_id = :cid "
+                        "AND ci.data LIKE :query "
+                        "ORDER BY ci.created_at DESC LIMIT :limit"
+                    )
+                else:
+                    stmt = text(
+                        "SELECT ci.id FROM conversation_items ci "
+                        "WHERE ci.data LIKE :query "
+                        "ORDER BY ci.created_at DESC LIMIT :limit"
+                    )
+                query = like_pattern
             else:
                 # PostgreSQL: ILIKE fallback (no FTS5 virtual table).
                 # Full tsvector/tsquery indexing can be added later.

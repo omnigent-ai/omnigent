@@ -53,13 +53,13 @@ class SqlAlchemyPermissionStore(PermissionStore):
     ) -> SessionPermission:
         """Upsert a permission grant. See base class for contract."""
         with self._session() as session:
-            is_sqlite = self._engine.dialect.name == "sqlite"
+            dialect = self._engine.dialect.name
             values = {
                 "user_id": user_id,
                 "conversation_id": conversation_id,
                 "level": level,
             }
-            if is_sqlite:
+            if dialect == "sqlite":
                 stmt = (
                     sqlite_insert(SqlSessionPermission)
                     .values(**values)
@@ -68,6 +68,14 @@ class SqlAlchemyPermissionStore(PermissionStore):
                         set_={"level": level},
                     )
                 )
+            elif dialect in ("mysql", "mariadb"):
+                # MySQL/MariaDB: ON DUPLICATE KEY UPDATE instead of PostgreSQL's
+                # ON CONFLICT DO UPDATE. Both are atomic upserts; the SQLAlchemy
+                # dialect objects differ but the intent is identical.
+                from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+                stmt = mysql_insert(SqlSessionPermission).values(**values)
+                stmt = stmt.on_duplicate_key_update(level=stmt.inserted.level)
             else:
                 stmt = (
                     pg_insert(SqlSessionPermission)
@@ -208,14 +216,21 @@ class SqlAlchemyPermissionStore(PermissionStore):
     def ensure_user(self, user_id: str, *, is_admin: bool = False) -> None:
         """Upsert a user row. See base class for contract."""
         with self._session() as session:
-            is_sqlite = self._engine.dialect.name == "sqlite"
+            dialect = self._engine.dialect.name
             values = {"id": user_id, "is_admin": is_admin}
-            if is_sqlite:
+            if dialect == "sqlite":
                 stmt = (
                     sqlite_insert(SqlUser)
                     .values(**values)
                     .on_conflict_do_nothing(index_elements=["id"])
                 )
+            elif dialect in ("mysql", "mariadb"):
+                # MySQL/MariaDB: no ON CONFLICT DO NOTHING; use a no-op
+                # ON DUPLICATE KEY UPDATE instead (update id to itself).
+                from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+                stmt = mysql_insert(SqlUser).values(**values)
+                stmt = stmt.on_duplicate_key_update(id=stmt.inserted.id)
             else:
                 stmt = (
                     pg_insert(SqlUser)
