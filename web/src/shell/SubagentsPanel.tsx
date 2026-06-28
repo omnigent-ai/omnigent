@@ -150,7 +150,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
 // label word shows, and whether the row is de-emphasized. ``awaiting`` =
 // parked on an approval / input prompt and needs the user's attention.
 // ``disconnected`` = the runner dropped its tunnel or exited; the task did
-// NOT genuinely fail, so it renders a quiet, non-destructive blue dot rather
+// NOT genuinely fail, so it renders a quiet, non-destructive grey dot rather
 // than the red "Failed" one.
 type AgentActivity =
   | "launching"
@@ -275,18 +275,25 @@ function sessionStatus(
 
 // Dot color per dot-rendered state. Working uses the animated RunningDot
 // and awaiting uses the "Needs response" tag, so both are excluded here.
-// "done" is a quiet, expected outcome, so it reads as a muted dot rather
-// than a loud green one.
+// Panel-scoped palette: the quiet live/settled states (launching, idle,
+// done) read in the blue --disconnected hue, while the disconnected runner
+// reads in the neutral grey --muted-foreground. This is a per-state token
+// REASSIGNMENT scoped to this panel — the global --disconnected (blue) and
+// --muted-foreground (grey) values are unchanged.
 const DOT_TONE: Record<Exclude<AgentActivity, "working" | "awaiting">, string> = {
-  done: "bg-muted-foreground/55",
+  // Blue, quiet — "done" is an expected outcome, so it reads as a subtle
+  // (/55) blue dot rather than a loud green one.
+  done: "bg-disconnected/55",
   failed: "bg-destructive",
-  // Blue, not destructive — a disconnect is a transient liveness loss, not a
-  // task failure, so it reads distinctly from the red "Failed". Its own
-  // --disconnected token (not the shared amber --warning) so the "Needs
-  // response" badge keeps its amber.
-  disconnected: "bg-disconnected",
-  idle: "bg-muted-foreground/55",
-  launching: "bg-muted-foreground/70",
+  // Grey, not destructive — a disconnect is a transient liveness loss, not a
+  // task failure, so it reads distinctly from the red "Failed". Full-strength
+  // neutral --muted-foreground (not the shared amber --warning) so the "Needs
+  // response" badge keeps its amber and the dot stays notable (it is not a
+  // dimmed SETTLED_STATE).
+  disconnected: "bg-muted-foreground",
+  idle: "bg-disconnected/55",
+  launching: "bg-disconnected/70",
+  // Exception: the verbatim "other status" fallthrough stays neutral grey.
   other: "bg-muted-foreground/55",
 };
 
@@ -299,7 +306,7 @@ const QUIET_STATE: Record<AgentActivity, boolean> = {
   working: true,
   awaiting: false,
   failed: false,
-  // Quiet — show only the blue dot (the word lives in the tooltip), like the
+  // Quiet — show only the grey dot (the word lives in the tooltip), like the
   // idle/done/working dot states. The colored dot is enough to flag the
   // liveness loss without adding label text to the row.
   disconnected: true,
@@ -433,15 +440,21 @@ function StatusIndicator({ activity, label, details }: AgentStatus) {
     );
   }
   // ``disconnected`` falls through to the quiet default below: it's a
-  // QUIET_STATE, so only the blue --disconnected dot renders (no inline
+  // QUIET_STATE, so only the grey --muted-foreground dot renders (no inline
   // word) — the cause stays in the tooltip / aria-label. Distinct from the
   // red "Failed" pill above, without repurposing the shared amber --warning.
+  //
+  // Launching's inline word reads in the blue --disconnected hue to match its
+  // dot; every other state here keeps the neutral muted text — the verbatim
+  // "other" word stays grey, and idle/done/disconnected show no word at all.
+  const wrapperTextClass =
+    activity === "launching" ? "text-disconnected" : "text-muted-foreground";
   return (
     <span
       aria-label={title}
       title={title}
       data-testid="subagent-status-dot"
-      className="inline-flex shrink-0 items-center gap-1 text-muted-foreground text-xs"
+      className={cn("inline-flex shrink-0 items-center gap-1 text-xs", wrapperTextClass)}
     >
       {!QUIET_STATE[activity] && <span>{label}</span>}
       {activity === "working" ? (

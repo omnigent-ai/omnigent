@@ -780,15 +780,15 @@ describe("SubagentsPanel", () => {
     ["runner_disconnected", "Runner disconnected unexpectedly."],
     ["runner_failed_to_start", "runner exited before the first turn"],
   ])(
-    "renders a quiet blue disconnected dot (no word, not red 'Failed') for the runner-disconnect code %s",
+    "renders a quiet grey disconnected dot (no word, not red 'Failed') for the runner-disconnect code %s",
     (code, message) => {
       // Option B: a runner that merely disconnected/exited is NOT a task
       // failure. The child summary still collapses to current_task_status
       // "failed", but last_task_error.code carries the disconnect cause, so
-      // the row must branch to the quiet blue disconnected dot before the red
+      // the row must branch to the quiet disconnected dot before the red
       // "Failed" pill. The dot shows NO inline word — the cause lives in the
-      // tooltip — and uses the dedicated --disconnected token, never the
-      // shared amber --warning.
+      // tooltip — and uses the neutral grey --muted-foreground token, never
+      // the shared amber --warning.
       mockChildTree({
         conv_parent: [
           childInfo({
@@ -811,15 +811,17 @@ describe("SubagentsPanel", () => {
       expect(row).not.toHaveTextContent(/Failed/);
       // Positive quiet-dot guarantee: disconnected falls through to the
       // generic quiet-dot path, so the wrapper carries the standard muted text
-      // class (same as idle/done) and the blue --disconnected dot is the ONLY
-      // color hook — no warning/destructive bleed on the wrapper or the dot,
-      // and crucially never the shared amber --warning (owned by "Needs
-      // response").
+      // class (same as idle/done) and the grey --muted-foreground dot is the
+      // ONLY color hook — no warning/destructive bleed on the wrapper or the
+      // dot, and crucially never the shared amber --warning (owned by "Needs
+      // response"). The blue --disconnected hue is now reserved for the
+      // launching/idle/done dots, so it must NOT appear here.
       expect(indicator).toHaveClass("text-muted-foreground");
       expect(indicator).not.toHaveClass("text-warning");
       expect(indicator).not.toHaveClass("text-destructive");
       const dot = indicator.querySelector("span.rounded-full");
-      expect(dot).toHaveClass("bg-disconnected");
+      expect(dot).toHaveClass("bg-muted-foreground");
+      expect(dot).not.toHaveClass("bg-disconnected");
       expect(dot).not.toHaveClass("bg-warning");
       expect(dot).not.toHaveClass("bg-destructive");
       // The cause is still surfaced in the accessible label / tooltip.
@@ -857,12 +859,12 @@ describe("SubagentsPanel", () => {
     ["runner_disconnected", "Runner disconnected unexpectedly."],
     ["runner_failed_to_start", "runner exited before the first turn"],
   ])(
-    "renders a quiet blue disconnected dot on the main row when the parent failed with the runner-disconnect code %s",
+    "renders a quiet grey disconnected dot on the main row when the parent failed with the runner-disconnect code %s",
     (code, message) => {
       // The session snapshot collapses a runner exit to status "failed" but
       // preserves the cause in lastTaskError.code (runner_failed_to_start /
       // runner_disconnected). The main row must branch on it to render the
-      // quiet blue disconnected dot rather than the red "Failed" pill.
+      // quiet grey disconnected dot rather than the red "Failed" pill.
       // Parametrized over BOTH disconnect codes, mirroring the child-row
       // it.each above so neither code can regress on the main row.
       useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
@@ -891,18 +893,20 @@ describe("SubagentsPanel", () => {
 
       const mainRow = screen.getByTestId("subagent-main-row");
       const indicator = within(mainRow).getByTestId("subagent-status-dot");
-      // Quiet blue dot, no inline word — distinct from the red "Failed" pill.
+      // Quiet grey dot, no inline word — distinct from the red "Failed" pill.
       expect(mainRow).not.toHaveTextContent(/Disconnected/);
       expect(mainRow).not.toHaveTextContent(/Failed/);
       // Positive quiet-dot guarantee: the wrapper carries the standard muted
-      // quiet-dot text class (same path as idle/done) and the blue dot is the
+      // quiet-dot text class (same path as idle/done) and the grey dot is the
       // ONLY color hook — no warning/destructive class bleeds onto either the
-      // wrapper or the dot.
+      // wrapper or the dot. The blue --disconnected hue is reserved for the
+      // launching/idle/done dots, so it must NOT appear here.
       expect(indicator).toHaveClass("text-muted-foreground");
       expect(indicator).not.toHaveClass("text-warning");
       expect(indicator).not.toHaveClass("text-destructive");
       const dot = indicator.querySelector("span.rounded-full");
-      expect(dot).toHaveClass("bg-disconnected");
+      expect(dot).toHaveClass("bg-muted-foreground");
+      expect(dot).not.toHaveClass("bg-disconnected");
       expect(dot).not.toHaveClass("bg-warning");
       expect(dot).not.toHaveClass("bg-destructive");
       // The disconnect cause stays in the tooltip / accessible label.
@@ -1009,12 +1013,21 @@ describe("SubagentsPanel", () => {
           busy: true,
           current_task_status: "in_progress",
         }),
+        childInfo({ id: "c_launch", tool: "researcher", current_task_status: "launching" }),
         childInfo({ id: "c_done", tool: "researcher", current_task_status: "completed" }),
+        childInfo({ id: "c_idle", tool: "researcher" }),
+        // A verbatim "other status" fallthrough — the GREY exception.
+        childInfo({ id: "c_other", tool: "researcher", current_task_status: "cancelled" }),
         childInfo({ id: "c_fail", tool: "researcher", current_task_status: "failed" }),
       ],
     });
 
     const { container } = renderPanel();
+
+    const dotOf = (id: string) =>
+      within(childRow(container, id))
+        .getByTestId("subagent-status-dot")
+        .querySelector("span.rounded-full");
 
     // Working reuses the sidebar RunningDot in the brand-pink tone —
     // identical to the sidebar's running indicator; a wrong tone drops
@@ -1022,10 +1035,28 @@ describe("SubagentsPanel", () => {
     expect(
       childRow(container, "c_work").querySelector('[data-testid="running-dot"].bg-brand-accent'),
     ).not.toBeNull();
-    // Terminal states use design tokens, not raw 500-weight Tailwind. "done"
-    // is a quiet, expected outcome, so it reads as a muted dot (not green);
-    // failures keep destructive text + a destructive dot.
-    expect(childRow(container, "c_done").querySelector(".bg-muted-foreground\\/55")).not.toBeNull();
+
+    // Panel-scoped palette swap: the quiet live/settled states read in the
+    // blue --disconnected hue, each PRESERVING its prior opacity treatment
+    // (launching kept /70, idle + done kept /55) — only the hue flipped from
+    // grey to blue.
+    const launchDot = dotOf("c_launch");
+    expect(launchDot).toHaveClass("bg-disconnected/70");
+    expect(launchDot).not.toHaveClass("bg-muted-foreground/70");
+    const doneDot = dotOf("c_done");
+    expect(doneDot).toHaveClass("bg-disconnected/55");
+    expect(doneDot).not.toHaveClass("bg-muted-foreground/55");
+    const idleDot = dotOf("c_idle");
+    expect(idleDot).toHaveClass("bg-disconnected/55");
+    expect(idleDot).not.toHaveClass("bg-muted-foreground/55");
+
+    // Exception: the verbatim "other status" fallthrough STAYS neutral grey —
+    // it is the one quiet dot the swap deliberately leaves on --muted-foreground.
+    const otherDot = dotOf("c_other");
+    expect(otherDot).toHaveClass("bg-muted-foreground/55");
+    expect(otherDot).not.toHaveClass("bg-disconnected/55");
+
+    // Terminal failures keep destructive text + a destructive dot.
     const failedIndicator = within(childRow(container, "c_fail")).getByTestId(
       "subagent-status-dot",
     );
@@ -1086,9 +1117,22 @@ describe("SubagentsPanel", () => {
     // The unexpected "cancelled" terminal state keeps its word so it stands out.
     expect(childRow(container, "c_cancel")).toHaveTextContent(/cancelled/);
     // Launching is not yet real work, so it shows its word and does not reuse
-    // the active running dot.
+    // the active running dot. Its inline word now reads in the blue
+    // --disconnected hue (matching its dot), not the neutral muted text.
     expect(childRow(container, "c_launch")).toHaveTextContent(/Launching/);
     expect(childRow(container, "c_launch").querySelector('[data-testid="running-dot"]')).toBeNull();
+    const launchIndicator = within(childRow(container, "c_launch")).getByTestId(
+      "subagent-status-dot",
+    );
+    expect(launchIndicator).toHaveClass("text-disconnected");
+    expect(launchIndicator).not.toHaveClass("text-muted-foreground");
+    // The verbatim "other" word stays neutral grey — its wrapper keeps the
+    // muted text class (the GREY exception).
+    const cancelIndicator = within(childRow(container, "c_cancel")).getByTestId(
+      "subagent-status-dot",
+    );
+    expect(cancelIndicator).toHaveClass("text-muted-foreground");
+    expect(cancelIndicator).not.toHaveClass("text-disconnected");
     // Quiet states render no word — the label lives in the tooltip. Working is
     // quiet too: the pulsing pink dot already reads as "active".
     expect(childRow(container, "c_work")).not.toHaveTextContent(/Working/);
