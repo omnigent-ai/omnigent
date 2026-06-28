@@ -604,6 +604,144 @@ async def test_error_step_without_message_still_fails(monkeypatch: pytest.Monkey
     assert not any(isinstance(e, TurnComplete) for e in events)
 
 
+# Raw GenerativeLanguage 404 the Antigravity backend returns for an unusable
+# model id; mirrors the bug-bash repro and carries the wire surface that must
+# not leak into the persisted transcript.
+def _raw_model_not_found_404(model: str) -> str:
+    return (
+        f"request failed (code 404): models/{model} is not found for API "
+        "version v1beta, or is not supported for generateContent. Call "
+        "ModelService.ListModels to see the list of available models and "
+        "their supported methods."
+    )
+
+
+# Wire-surface tokens that must never reach the persisted transcript.
+_WIRE_LEAK_TOKENS = ("v1beta", "ListModels", "generateContent", "models/")
+
+
+async def _model_error_for(
+    monkeypatch: pytest.MonkeyPatch, model: str, status: _StepStatus = _StepStatus.TERMINAL_ERROR
+) -> ExecutorError:
+    """Drive a turn whose terminal step carries the raw 404 for *model*."""
+    script: list[_TurnAction] = [
+        _YieldStep(
+            _FakeStep(
+                step_type=_StepType.FINISH,
+                status=status,
+                error=_raw_model_not_found_404(model),
+            )
+        ),
+    ]
+    _install_fake_sdk(monkeypatch, scripts=[script])
+    executor = AntigravityExecutor()
+    events = await _drain(
+        executor,
+        [{"role": "user", "content": "go", "session_id": "s1"}],
+        config=ExecutorConfig(model=model),
+    )
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    assert not any(isinstance(e, TurnComplete) for e in events)
+    return errors[0]
+
+
+@pytest.mark.asyncio
+async def test_invalid_gemini_model_404_normalized_no_wire_leak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A nonexistent Gemini id 404 is normalized; raw wire text never leaks."""
+    script: list[_TurnAction] = [
+        _YieldStep(
+            _FakeStep(
+                step_type=_StepType.FINISH,
+                status=_StepStatus.TERMINAL_ERROR,
+                error=_raw_model_not_found_404("gemini-bogus-xyz"),
+            )
+        ),
+    ]
+    _install_fake_sdk(monkeypatch, scripts=[script])
+    executor = AntigravityExecutor()
+
+    events = await _drain(
+        executor,
+        [{"role": "user", "content": "go", "session_id": "s1"}],
+        config=ExecutorConfig(model="gemini-bogus-xyz"),
+    )
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    message = errors[0].message
+    # The wire API surface must be stripped from the persisted message.
+    for token in _WIRE_LEAK_TOKENS:
+        assert token not in message, f"raw wire token {token!r} leaked: {message!r}"
+    # A genuine unknown Gemini id is a generic not-found, not cross-family.
+    assert "gemini-bogus-xyz" in message
+    assert "not a Gemini model" not in message
+    # A bad model id is config, not transient — non-retryable.
+    assert errors[0].retryable is False
+    assert not any(isinstance(e, TurnComplete) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_cross_family_gpt_id_404_names_gemini_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GPT id routed at the Gemini backend gets a precise Gemini-only message."""
+    error = await _model_error_for(monkeypatch, "gpt-4o")
+    message = error.message
+    for token in _WIRE_LEAK_TOKENS:
+        assert token not in message, f"raw wire token {token!r} leaked: {message!r}"
+    assert "only runs Gemini models" in message
+    assert "gpt-4o" in message
+    assert error.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_cross_family_databricks_claude_id_404_names_gemini_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A databricks-claude id at the Gemini backend gets the Gemini-only message."""
+    error = await _model_error_for(monkeypatch, "databricks-claude-opus-4-8")
+    message = error.message
+    for token in _WIRE_LEAK_TOKENS:
+        assert token not in message, f"raw wire token {token!r} leaked: {message!r}"
+    assert "only runs Gemini models" in message
+    assert "databricks-claude-opus-4-8" in message
+    assert error.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_non_model_error_text_preserved_not_normalized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-model-404 turn error is surfaced verbatim (only model 404s normalize)."""
+    script: list[_TurnAction] = [
+        _YieldStep(
+            _FakeStep(
+                step_type=_StepType.FINISH,
+                status=_StepStatus.ERROR,
+                error="request failed (code 503): backend overloaded, retry later",
+            )
+        ),
+    ]
+    _install_fake_sdk(monkeypatch, scripts=[script])
+    executor = AntigravityExecutor()
+
+    events = await _drain(
+        executor,
+        [{"role": "user", "content": "go", "session_id": "s1"}],
+        config=ExecutorConfig(model="gemini-3.5-flash"),
+    )
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    # Non-model errors pass through unchanged (no spurious normalization) and a
+    # plain ERROR stays retryable.
+    assert "backend overloaded" in errors[0].message
+    assert errors[0].retryable is True
+
+
 @pytest.mark.asyncio
 async def test_empty_turn_yields_turn_complete_none(monkeypatch: pytest.MonkeyPatch) -> None:
     """A turn that streams no text ends as TurnComplete(response=None), not ''."""

@@ -44,6 +44,7 @@ import contextlib
 import importlib
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -265,6 +266,79 @@ def _enum_name(value: Any) -> str:  # type: ignore[explicit-any]
     """
     name = getattr(value, "name", None)
     return name if isinstance(name, str) else ""
+
+
+# A Gemini-backend "model not found" 404. The Antigravity backend answers an
+# unusable model id with the GenerativeLanguage wire error, e.g.::
+#
+#   request failed (code 404): models/gemini-bogus-xyz is not found for API
+#   version v1beta, or is not supported for generateContent. Call
+#   ModelService.ListModels to see the list of available models ...
+#
+# Matched loosely (code 404 + "is not found") so backend phrasing drift
+# (``v1beta`` -> ``v1``, ``generateContent`` -> ``streamGenerateContent``)
+# still normalizes. The raw text leaks the wire API surface
+# (``v1beta`` / ``generateContent`` / ``ListModels``) and must never reach
+# the persisted transcript — :func:`_normalize_model_error` strips it.
+_GEMINI_MODEL_NOT_FOUND_RE = re.compile(
+    r"code\s+404.*\bis not found\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_non_gemini_model_id(model: str) -> bool:
+    """Return ``True`` when *model* is recognizably a non-Gemini vendor id.
+
+    Mirrors the vendor-token rule in
+    :func:`omnigent.model_catalog.model_family_token` /
+    :func:`omnigent.model_override.model_family_mismatch` (Claude ids contain
+    ``"claude"``; GPT ids contain ``"gpt"`` — which also covers ``"gpt-oss"``)
+    and adds the ``"databricks-"`` gateway prefix and ``"codex"`` token. The
+    rule is mirrored rather than imported to keep this low-level executor free
+    of the ``model_catalog`` dependency graph (no inner executor imports it).
+
+    A bare unknown id (e.g. a typo'd Gemini name) returns ``False`` so it is
+    treated as a generic not-found rather than mislabelled cross-family.
+
+    :param model: The resolved model id, e.g. ``"databricks-claude-opus-4-8"``.
+    :returns: ``True`` if the id looks like another vendor's model.
+    """
+    lower = model.lower()
+    return (
+        "claude" in lower or "gpt" in lower or "codex" in lower or lower.startswith("databricks-")
+    )
+
+
+def _normalize_model_error(raw_error: str, model: str) -> str | None:
+    """Map a raw Gemini "model not found" 404 to a clean Omnigent message.
+
+    Antigravity is Gemini-only, so an unusable model id — a nonexistent
+    Gemini name or a cross-family id routed as a literal Gemini model —
+    404s at the backend. The raw provider text exposes the wire API surface
+    (``v1beta``, ``generateContent``, ``ModelService.ListModels``); returning
+    a normalized message keeps that out of the persisted transcript and
+    matches the clean, human-readable model errors the other SDK-wrap
+    executors surface (cf. the 404 ``terminal_error`` in
+    :mod:`omnigent.inner.claude_sdk_executor`).
+
+    Cross-family ids get a precise "Gemini only" message naming the offending
+    id; a genuine unknown Gemini id gets a generic not-found message. Errors
+    that are not a model-not-found 404 return ``None`` (caller keeps the raw
+    text — only the model-routing leak is normalized here).
+
+    :param raw_error: The raw ``Step.error`` string from the SDK.
+    :param model: The resolved model id pinned for this turn.
+    :returns: A normalized, leak-free message, or ``None`` when *raw_error*
+        is not a recognizable model-not-found 404.
+    """
+    if not _GEMINI_MODEL_NOT_FOUND_RE.search(raw_error or ""):
+        return None
+    if _is_non_gemini_model_id(model):
+        return f'antigravity only runs Gemini models; "{model}" is not a Gemini model'
+    return (
+        f'The selected model "{model}" was not found. It may not exist or '
+        "may not be available to this Antigravity backend."
+    )
 
 
 @dataclass
@@ -530,7 +604,7 @@ class AntigravityExecutor(Executor):
         state.interrupt_requested = False
 
         producer = asyncio.create_task(
-            self._drive_turn(state, prompt),
+            self._drive_turn(state, prompt, model),
             name=f"antigravity-turn:{session_key}",
         )
         final_text_parts: list[str] = []
@@ -581,7 +655,7 @@ class AntigravityExecutor(Executor):
 
     # ── SDK touchpoints (isolated; duck-typed; verified against v0.1.x) ──
 
-    async def _drive_turn(self, state: _AntigravitySessionState, prompt: str) -> None:
+    async def _drive_turn(self, state: _AntigravitySessionState, prompt: str, model: str) -> None:
         """Producer: drive one SDK turn, enqueuing mapped events.
 
         Sends *prompt*, then iterates ``receive_steps()`` mapping each
@@ -592,6 +666,8 @@ class AntigravityExecutor(Executor):
 
         :param state: The session state (conversation, queue, pending tools).
         :param prompt: The user text to send for this turn.
+        :param model: The resolved model id pinned for this turn, used to
+            normalize an unusable-model 404 into a clean message.
         """
         queue = state.active_queue
         assert queue is not None  # set by run_turn before spawning this task
@@ -648,9 +724,29 @@ class AntigravityExecutor(Executor):
                     # is non-retryable; plain ERROR may succeed on retry. Fall back
                     # to a generic message when the SDK reports none, so the turn
                     # isn't mis-reported as a silent empty success.
-                    message = (
-                        getattr(step, "error", "") or f"Antigravity turn failed (status={status})"
-                    )
+                    raw_error = getattr(step, "error", "") or ""
+                    # An unusable model id (nonexistent Gemini name, or a
+                    # cross-family id the Gemini-only backend can't route)
+                    # 404s with the raw GenerativeLanguage wire error. Strip
+                    # that to a clean message so the wire surface (v1beta /
+                    # generateContent / ListModels) never lands in the
+                    # persisted transcript; a bad model is config, not
+                    # transient, so it is non-retryable regardless of status.
+                    # NOTE: this normalizes the *message*; the turn still ends
+                    # ExecutorError -> status=failed. The graceful "idle" turn
+                    # the claude-native CLI bridge produces for a bad model is
+                    # a property of that native-bridge architecture, not the
+                    # SDK-wrap executor path: a normalized ExecutorError from
+                    # any SDK-wrap executor (this one and claude_sdk's 404
+                    # terminal_error alike) maps to failed via
+                    # ExecutorAdapter -> "inner executor error". Matching that
+                    # peer contract is the right cross-harness behavior here;
+                    # there is no idle escape hatch on this path to target.
+                    normalized = _normalize_model_error(raw_error, model)
+                    if normalized is not None:
+                        queue.put_nowait(ExecutorError(message=normalized, retryable=False))
+                        return
+                    message = raw_error or f"Antigravity turn failed (status={status})"
                     queue.put_nowait(ExecutorError(message=message, retryable=(status == "ERROR")))
                     return
         except asyncio.CancelledError:
