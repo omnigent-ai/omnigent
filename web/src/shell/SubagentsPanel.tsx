@@ -150,7 +150,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
 // label word shows, and whether the row is de-emphasized. ``awaiting`` =
 // parked on an approval / input prompt and needs the user's attention.
 // ``disconnected`` = the runner dropped its tunnel or exited; the task did
-// NOT genuinely fail, so it renders a non-destructive (amber) pill rather
+// NOT genuinely fail, so it renders a quiet, non-destructive blue dot rather
 // than the red "Failed" one.
 type AgentActivity =
   | "launching"
@@ -214,8 +214,8 @@ function childStatus(child: ChildSessionInfo): AgentStatus {
   }
   if (child.busy) return { activity: "working", label: "Working" };
   // A runner disconnect/exit is NOT a task failure — branch on the error
-  // code before the generic failed paths so it renders the amber
-  // "Disconnected" pill instead of the red "Failed" one.
+  // code before the generic failed paths so it renders the quiet blue
+  // disconnected dot instead of the red "Failed" pill.
   if (isRunnerDisconnectCode(child.last_task_error?.code)) {
     return {
       activity: "disconnected",
@@ -259,8 +259,8 @@ function sessionStatus(
   if (status === "failed") {
     // A runner disconnect/exit collapses the snapshot to ``failed`` but
     // preserves the cause in ``lastTaskError.code`` — branch on it before
-    // the generic failed path so it reads as "Disconnected", not a real
-    // failure.
+    // the generic failed path so it reads as a quiet blue disconnected dot,
+    // not a real failure.
     if (isRunnerDisconnectCode(lastTaskError?.code)) {
       return {
         activity: "disconnected",
@@ -280,9 +280,11 @@ function sessionStatus(
 const DOT_TONE: Record<Exclude<AgentActivity, "working" | "awaiting">, string> = {
   done: "bg-muted-foreground/55",
   failed: "bg-destructive",
-  // Amber, not destructive — a disconnect is a transient liveness loss,
-  // not a task failure, so it must read distinctly from the red "Failed".
-  disconnected: "bg-warning",
+  // Blue, not destructive — a disconnect is a transient liveness loss, not a
+  // task failure, so it reads distinctly from the red "Failed". Its own
+  // --disconnected token (not the shared amber --warning) so the "Needs
+  // response" badge keeps its amber.
+  disconnected: "bg-disconnected",
   idle: "bg-muted-foreground/55",
   launching: "bg-muted-foreground/70",
   other: "bg-muted-foreground/55",
@@ -297,9 +299,10 @@ const QUIET_STATE: Record<AgentActivity, boolean> = {
   working: true,
   awaiting: false,
   failed: false,
-  // Show the "Disconnected" word — the user needs to know the runner
-  // went away, the same way "Failed" keeps its word.
-  disconnected: false,
+  // Quiet — show only the blue dot (the word lives in the tooltip), like the
+  // idle/done/working dot states. The colored dot is enough to flag the
+  // liveness loss without adding label text to the row.
+  disconnected: true,
   other: false,
   done: true,
   idle: true,
@@ -429,21 +432,10 @@ function StatusIndicator({ activity, label, details }: AgentStatus) {
       </span>
     );
   }
-  if (activity === "disconnected") {
-    // Amber, non-destructive — a runner disconnect/exit is a liveness loss,
-    // not a task failure, so it must read distinctly from the red "Failed".
-    return (
-      <span
-        aria-label={title}
-        title={title}
-        data-testid="subagent-status-dot"
-        className="inline-flex shrink-0 items-center gap-1 text-warning text-xs"
-      >
-        <span>{label}</span>
-        <span className={cn("inline-block size-2 shrink-0 rounded-full", DOT_TONE.disconnected)} />
-      </span>
-    );
-  }
+  // ``disconnected`` falls through to the quiet default below: it's a
+  // QUIET_STATE, so only the blue --disconnected dot renders (no inline
+  // word) — the cause stays in the tooltip / aria-label. Distinct from the
+  // red "Failed" pill above, without repurposing the shared amber --warning.
   return (
     <span
       aria-label={title}

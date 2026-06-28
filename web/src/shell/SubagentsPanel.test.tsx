@@ -780,13 +780,15 @@ describe("SubagentsPanel", () => {
     ["runner_disconnected", "Runner disconnected unexpectedly."],
     ["runner_failed_to_start", "runner exited before the first turn"],
   ])(
-    "renders 'Disconnected' (amber, not red 'Failed') for the runner-disconnect code %s",
+    "renders a quiet blue disconnected dot (no word, not red 'Failed') for the runner-disconnect code %s",
     (code, message) => {
       // Option B: a runner that merely disconnected/exited is NOT a task
       // failure. The child summary still collapses to current_task_status
       // "failed", but last_task_error.code carries the disconnect cause, so
-      // the row must branch to the amber "Disconnected" pill before the red
-      // "Failed" one.
+      // the row must branch to the quiet blue disconnected dot before the red
+      // "Failed" pill. The dot shows NO inline word — the cause lives in the
+      // tooltip — and uses the dedicated --disconnected token, never the
+      // shared amber --warning.
       mockChildTree({
         conv_parent: [
           childInfo({
@@ -804,13 +806,16 @@ describe("SubagentsPanel", () => {
 
       const row = childRow(container, "conv_child");
       const indicator = within(row).getByTestId("subagent-status-dot");
-      expect(row).toHaveTextContent(/Disconnected/);
+      // The inline "Disconnected" word is hidden (quiet dot, like idle/done).
+      expect(row).not.toHaveTextContent(/Disconnected/);
       expect(row).not.toHaveTextContent(/Failed/);
-      // Non-destructive amber tone — distinct from the red failure pill.
-      expect(indicator).toHaveClass("text-warning");
-      expect(indicator).not.toHaveClass("text-destructive");
-      expect(indicator.querySelector(".bg-warning")).not.toBeNull();
+      // Blue --disconnected dot — not the red failure tone, and crucially not
+      // the shared amber --warning (still owned by "Needs response").
+      expect(indicator.querySelector(".bg-disconnected")).not.toBeNull();
+      expect(indicator.querySelector(".bg-warning")).toBeNull();
       expect(indicator.querySelector(".bg-destructive")).toBeNull();
+      expect(indicator).not.toHaveClass("text-warning");
+      expect(indicator).not.toHaveClass("text-destructive");
       // The cause is still surfaced in the accessible label / tooltip.
       expect(indicator).toHaveAttribute("aria-label", `Disconnected: ${message}`);
     },
@@ -842,11 +847,11 @@ describe("SubagentsPanel", () => {
     expect(indicator.querySelector(".bg-destructive")).not.toBeNull();
   });
 
-  it("renders 'Disconnected' on the main row when the parent failed with a runner-disconnect code", () => {
+  it("renders a quiet blue disconnected dot on the main row when the parent failed with a runner-disconnect code", () => {
     // The session snapshot collapses a runner exit to status "failed" but
     // preserves the cause in lastTaskError.code (runner_failed_to_start /
     // runner_disconnected). The main row must branch on it to render the
-    // amber "Disconnected" pill rather than the red "Failed" one.
+    // quiet blue disconnected dot rather than the red "Failed" pill.
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
     useSessionMock.mockReturnValue({
       session: {
@@ -876,10 +881,18 @@ describe("SubagentsPanel", () => {
 
     const mainRow = screen.getByTestId("subagent-main-row");
     const indicator = within(mainRow).getByTestId("subagent-status-dot");
-    expect(mainRow).toHaveTextContent(/Disconnected/);
+    // Quiet blue dot, no inline word — distinct from the red "Failed" pill.
+    expect(mainRow).not.toHaveTextContent(/Disconnected/);
     expect(mainRow).not.toHaveTextContent(/Failed/);
-    expect(indicator).toHaveClass("text-warning");
+    expect(indicator.querySelector(".bg-disconnected")).not.toBeNull();
+    expect(indicator.querySelector(".bg-warning")).toBeNull();
+    expect(indicator).not.toHaveClass("text-warning");
     expect(indicator).not.toHaveClass("text-destructive");
+    // The disconnect cause stays in the tooltip / accessible label.
+    expect(indicator).toHaveAttribute(
+      "aria-label",
+      "Disconnected: runner exited before the first turn",
+    );
   });
 
   it("renders red 'Failed' on the main row for a genuine parent failure (non-disconnect code)", () => {
