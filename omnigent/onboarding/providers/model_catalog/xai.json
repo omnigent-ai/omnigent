@@ -351,8 +351,8 @@
       },
       "capabilities": {
         "function_calling": true,
-        "vision": false,
-        "reasoning": false,
+        "vision": true,
+        "reasoning": true,
         "prompt_caching": false,
         "response_schema": false
       }
@@ -377,8 +377,8 @@
       },
       "capabilities": {
         "function_calling": true,
-        "vision": false,
-        "reasoning": false,
+        "vision": true,
+        "reasoning": true,
         "prompt_caching": false,
         "response_schema": false
       }
@@ -592,8 +592,8 @@
       },
       "capabilities": {
         "function_calling": true,
-        "vision": false,
-        "reasoning": false,
+        "vision": true,
+        "reasoning": true,
         "prompt_caching": false,
         "response_schema": false
       }
@@ -658,6 +658,46 @@
         "response_schema": false
       }
     },
+    "grok-4.3": {
+      "mode": "chat",
+      "context_window": {
+        "max_input": 1000000,
+        "max_output": 1000000,
+        "max_tokens": 1000000
+      },
+      "pricing": {
+        "input_per_million_tokens": 1.25,
+        "output_per_million_tokens": 2.5,
+        "cache_read_per_million_tokens": 0.2
+      },
+      "capabilities": {
+        "function_calling": true,
+        "vision": true,
+        "reasoning": true,
+        "prompt_caching": false,
+        "response_schema": true
+      }
+    },
+    "grok-4.3-latest": {
+      "mode": "chat",
+      "context_window": {
+        "max_input": 1000000,
+        "max_output": 1000000,
+        "max_tokens": 1000000
+      },
+      "pricing": {
+        "input_per_million_tokens": 1.25,
+        "output_per_million_tokens": 2.5,
+        "cache_read_per_million_tokens": 0.2
+      },
+      "capabilities": {
+        "function_calling": true,
+        "vision": true,
+        "reasoning": true,
+        "prompt_caching": false,
+        "response_schema": true
+      }
+    },
     "grok-beta": {
       "mode": "chat",
       "context_window": {
@@ -675,6 +715,26 @@
         "reasoning": false,
         "prompt_caching": false,
         "response_schema": false
+      }
+    },
+    "grok-build-0.1": {
+      "mode": "chat",
+      "context_window": {
+        "max_input": 256000,
+        "max_output": 256000,
+        "max_tokens": 256000
+      },
+      "pricing": {
+        "input_per_million_tokens": 1.0,
+        "output_per_million_tokens": 2.0,
+        "cache_read_per_million_tokens": 0.2
+      },
+      "capabilities": {
+        "function_calling": true,
+        "vision": true,
+        "reasoning": true,
+        "prompt_caching": false,
+        "response_schema": true
       }
     },
     "grok-code-fast": {
