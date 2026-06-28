@@ -11,7 +11,6 @@ from omnigent.onboarding.extra_install import (
     extra_install_display,
 )
 
-
 # -- _is_uv_tool_install() --------------------------------------------------
 
 
@@ -31,9 +30,7 @@ from omnigent.onboarding.extra_install import (
     ],
     ids=["linux-uv-tool", "windows-uv-tool", "venv", "system", "pipx"],
 )
-def test_is_uv_tool_install(
-    monkeypatch: pytest.MonkeyPatch, prefix: str, expected: bool
-) -> None:
+def test_is_uv_tool_install(monkeypatch: pytest.MonkeyPatch, prefix: str, expected: bool) -> None:
     monkeypatch.setattr(extra_install.sys, "prefix", prefix)
     assert _is_uv_tool_install() is expected
 
