@@ -61,8 +61,33 @@ const _MAX_RAW_ASK_ROUNDS = 50;
 const _FAIL_CLOSED_REASON =
   "blocked: Omnigent policy server unreachable — failing closed (PHASE_TOOL_CALL)";
 
-function failClosedVerdict() {
-  return { block: true, reason: _FAIL_CLOSED_REASON };
+// Phases whose unobtainable verdict must FAIL CLOSED (block). Mirrors the
+// server's omnigent.policies.types.FAIL_CLOSED_PHASES: only PHASE_TOOL_CALL
+// qualifies — it is the sole pre-execution enforcement point, so an
+// unevaluable policy must not let the call through. PHASE_TOOL_RESULT runs
+// AFTER the tool already executed, so a never-resolving result gate fails
+// OPEN (the side effect is already incurred; blocking only suppresses an
+// already-produced output) — matching fail_closed_hook_output(PostToolUse) →
+// None and the runner-side posture.
+const _FAIL_CLOSED_PHASES = new Set(["PHASE_TOOL_CALL"]);
+
+function failClosedVerdict(phase) {
+  // Block verdict when an enforcement-boundary phase cannot be evaluated.
+  // Tag the reason with the phase for diagnosability.
+  const tag = phase || "PHASE_TOOL_CALL";
+  const reason =
+    tag === "PHASE_TOOL_CALL"
+      ? _FAIL_CLOSED_REASON
+      : `blocked: Omnigent policy server unreachable — failing closed (${tag})`;
+  return { block: true, reason };
+}
+
+// The unobtainable-verdict outcome for one phase: a block (fail closed) for
+// FAIL_CLOSED phases, else a proceed (fail open). PHASE_TOOL_RESULT fails open
+// so a transient outage never suppresses a legitimately-produced result.
+function unobtainableVerdict(phase) {
+  if (_FAIL_CLOSED_PHASES.has(phase)) return failClosedVerdict(phase);
+  return { block: false, reason: "" };
 }
 
 function mintEvaluateElicitationId() {
@@ -86,52 +111,72 @@ function readConfig() {
 }
 
 /**
- * Evaluate a TOOL_CALL policy for a native Pi tool via the Omnigent server's
+ * Evaluate a policy phase for a native Pi tool via the Omnigent server's
  * session-level HTTP endpoint (POST /v1/sessions/{sessionId}/policies/evaluate).
+ *
+ * Drives BOTH enforcement checkpoints (SKILL.md harness checklist #6):
+ *   - PHASE_TOOL_CALL  (before the tool runs) — fail CLOSED.
+ *   - PHASE_TOOL_RESULT (after the tool ran, before the model consumes the
+ *       output) — fail OPEN. pi-native's ``tool_result`` extension hook can
+ *       replace/suppress a result before the model sees it, so the result
+ *       checkpoint is a real ALLOW/ASK/DENY gate here (unlike Claude/Codex
+ *       PostToolUse, where a committed result can only be annotated).
  *
  * This is the same endpoint used by the Claude Code, Codex, and Cursor native
  * hooks. It does NOT require an active Omnigent turn context on the harness
  * side — the endpoint evaluates against the session's full policy set directly.
  *
  * Verdict handling (parity with the native hooks):
- *   - POLICY_ACTION_DENY  → block the Pi tool call with the policy reason.
+ *   - POLICY_ACTION_DENY  → block (TOOL_CALL: block the call; TOOL_RESULT:
+ *       suppress the result) with the policy reason.
  *   - POLICY_ACTION_ALLOW / UNSPECIFIED (the engine default when no policy
  *       matches) → proceed.
  *   - POLICY_ACTION_ASK   → the server resolves ASK by PARKING this request
  *       (URL-based elicitation: it publishes an approval card to the web UI
  *       and holds the connection until a human resolves it), then returns a
  *       hard ALLOW/DENY — so a writable session never observes a raw ASK here.
- *       The park is realized by a generous client read budget plus re-attach
- *       retries (see the _PARK_* tuning above): if undici severs a long park
- *       (headersTimeout) we re-POST the SAME _omnigent_elicitation_id so the
- *       server re-attaches to the existing elicitation instead of opening a
- *       second approval card. A LEGITIMATE long-poll re-attach (the server is
- *       reachable and still holding the connection) is the only case that may
- *       loop toward the long park ceiling. If a raw ASK ever does come back
- *       (e.g. a read-only caller that cannot park), we re-evaluate up to
- *       _MAX_RAW_ASK_ROUNDS and then fail CLOSED.
+ *       The server parks ASK for TOOL_CALL, LLM_REQUEST, REQUEST and (for
+ *       pi-native's interceptable result) TOOL_RESULT. The park is realized by
+ *       a generous client read budget plus re-attach retries (see the _PARK_*
+ *       tuning above): if undici severs a long park (headersTimeout) we re-POST
+ *       the SAME _omnigent_elicitation_id so the server re-attaches to the
+ *       existing elicitation instead of opening a second approval card. A
+ *       LEGITIMATE long-poll re-attach (the server is reachable and still
+ *       holding the connection) is the only case that may loop toward the long
+ *       park ceiling. If a raw ASK ever does come back (e.g. a read-only caller
+ *       that cannot park), we re-evaluate up to _MAX_RAW_ASK_ROUNDS and then
+ *       apply the phase's unobtainable-verdict posture.
  *
- * Fail CLOSED (a block verdict) whenever a usable verdict cannot be obtained:
- * the transient-retry budget for a genuine transport/5xx error is exhausted,
- * a raw ASK never collapses within _MAX_RAW_ASK_ROUNDS, or the long park
- * ceiling is reached. PHASE_TOOL_CALL is the SOLE enforcement point for a
- * native connector tool — the call is never re-checked server-side — so an
- * unevaluable policy MUST block, not proceed. This matches
+ * When a usable verdict cannot be obtained (transient-retry budget exhausted,
+ * raw ASK never collapses within _MAX_RAW_ASK_ROUNDS, or the long park ceiling
+ * reached), apply the phase's posture via ``unobtainableVerdict(phase)``:
+ * PHASE_TOOL_CALL fails CLOSED (it is the SOLE pre-execution enforcement point,
+ * never re-checked server-side, so an unevaluable policy MUST block — matching
  * omnigent.policies.types.FAIL_CLOSED_PHASES and the Python native hook's
- * fail_closed_hook_output(PreToolUse) → deny. (pi-native is itself a sole
- * gate, exactly like the Claude / Codex native hooks; an eventually-allowing
- * human-approval gate would defeat its own purpose, so the earlier fail-open
- * posture was wrong here.) A reachable server long-polling a parked ASK is
- * the deliberate exception: that is the human approval window, not an outage,
- * and we keep waiting (re-attaching) rather than blocking.
+ * fail_closed_hook_output(PreToolUse) → deny). PHASE_TOOL_RESULT fails OPEN
+ * (the tool already executed; suppressing a legitimately-produced result on a
+ * transient outage would be worse than letting it through — matching
+ * fail_closed_hook_output(PostToolUse) → None). A reachable server long-polling
+ * a parked ASK is the deliberate exception for both: that is the human approval
+ * window, not an outage, and we keep waiting (re-attaching) rather than giving
+ * up.
  *
+ * @param {object} config - Bridge config (serverUrl, sessionId, authHeaders).
+ * @param {string} phase - Proto phase wire string, e.g. ``"PHASE_TOOL_CALL"``
+ *   or ``"PHASE_TOOL_RESULT"``.
+ * @param {object} data - The proto event ``data`` for this phase
+ *   (TOOL_CALL: ``{name, arguments}``; TOOL_RESULT: ``{result}``).
+ * @param {object} [requestData] - Original tool-call payload on TOOL_RESULT
+ *   (``{name, arguments}``) so an ON RESULT policy can resolve the tool name /
+ *   correlate input. Omitted for TOOL_CALL.
  * @returns {Promise<{block: boolean, reason: string} | null>} A verdict.
- *   ``{block: true}`` either from a DENY or from failing closed; ``{block:
- *   false}`` on ALLOW; ``null`` only when the gate is structurally disabled
- *   (no server/session configured or no global fetch) so there is nothing to
- *   enforce against.
+ *   ``{block: true}`` either from a DENY or from a fail-closed phase that could
+ *   not be evaluated; ``{block: false}`` on ALLOW (or a fail-open phase that
+ *   could not be evaluated); ``null`` only when the gate is structurally
+ *   disabled (no server/session configured or no global fetch) so there is
+ *   nothing to enforce against.
  */
-async function evalNativePolicyHttp(config, toolName, args) {
+async function evalNativePolicyHttp(config, phase, data, requestData) {
   if (
     !config ||
     !config.serverUrl ||
@@ -140,18 +185,23 @@ async function evalNativePolicyHttp(config, toolName, args) {
   )
     return null;
   const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
-  // Mint one stable re-attach id for this tool call. Every (re)POST carries
+  // Mint one stable re-attach id for this evaluation. Every (re)POST carries
   // it so a re-park lands on the SAME elicitation — no duplicate approval
   // card. Kept for the whole call, across both the park loop and any
   // transient-error retries.
   const elicitationId = mintEvaluateElicitationId();
+  const event = {
+    type: phase,
+    target: "",
+    data: data || {},
+    context: {},
+  };
+  // request_data carries the originating tool call on the result phase so an
+  // ON RESULT policy can read the tool name / correlate input (the server's
+  // _build_evaluation_context resolves tool_name from request_data.name).
+  if (requestData) event.request_data = requestData;
   const body = JSON.stringify({
-    event: {
-      type: "PHASE_TOOL_CALL",
-      target: "",
-      data: { name: toolName, arguments: args },
-      context: {},
-    },
+    event,
     _omnigent_elicitation_id: elicitationId,
   });
   const reqHeaders = {
@@ -170,9 +220,10 @@ async function evalNativePolicyHttp(config, toolName, args) {
   while (true) {
     if (Date.now() >= parkDeadline) {
       // Park ceiling reached (well past any sane ask_timeout): the gate is
-      // wedged, not resolving. Fail CLOSED — PHASE_TOOL_CALL is the sole
-      // enforcement point, so a never-resolving gate must block, not proceed.
-      return failClosedVerdict();
+      // wedged, not resolving. Apply the phase posture — a never-resolving
+      // TOOL_CALL gate blocks (sole pre-execution point); a never-resolving
+      // TOOL_RESULT gate fails open (the tool already ran).
+      return unobtainableVerdict(phase);
     }
     // AbortController bounds each attempt under undici's headersTimeout so a
     // long park is retried (re-attach) rather than thrown as a header
@@ -221,9 +272,10 @@ async function evalNativePolicyHttp(config, toolName, args) {
       }
       // Genuine transport error (connect refused / reset, or an abort that
       // fired too early to be a real park) → charge it against the short
-      // transient budget. When that budget is exhausted, fail CLOSED.
+      // transient budget. When that budget is exhausted, apply the phase
+      // posture (fail closed for TOOL_CALL, open for TOOL_RESULT).
       if (Date.now() + transientBackoff >= transientDeadline) {
-        return failClosedVerdict();
+        return unobtainableVerdict(phase);
       }
       await sleep(transientBackoff);
       transientBackoff = Math.min(
@@ -238,10 +290,10 @@ async function evalNativePolicyHttp(config, toolName, args) {
     if (!resp.ok) {
       // 5xx is transient (retry within budget, re-attaching); 4xx is final
       // (a bad request won't succeed on retry). Either way, an unevaluable
-      // PHASE_TOOL_CALL fails CLOSED.
+      // phase applies its posture (TOOL_CALL closed, TOOL_RESULT open).
       if (resp.status >= 500) {
         if (Date.now() + transientBackoff >= transientDeadline) {
-          return failClosedVerdict();
+          return unobtainableVerdict(phase);
         }
         await sleep(transientBackoff);
         transientBackoff = Math.min(
@@ -250,15 +302,15 @@ async function evalNativePolicyHttp(config, toolName, args) {
         );
         continue;
       }
-      return failClosedVerdict();
+      return unobtainableVerdict(phase);
     }
 
     let json;
     try {
       json = await resp.json();
     } catch (_err) {
-      // Malformed body — not retryable, and we have no verdict. Fail CLOSED.
-      return failClosedVerdict();
+      // Malformed body — not retryable, and we have no verdict. Apply posture.
+      return unobtainableVerdict(phase);
     }
 
     const result = json && json.result;
@@ -273,13 +325,14 @@ async function evalNativePolicyHttp(config, toolName, args) {
       // open an elicitation) yet still wants approval. Re-evaluate
       // (re-attaching) so a gate that is about to collapse to a hard verdict
       // gets the chance — but bound it: a raw ASK that NEVER collapses must
-      // not ride the 24h park ceiling and then proceed. After
-      // _MAX_RAW_ASK_ROUNDS we fail CLOSED, mirroring the Python native hook
-      // which denies a stray ASK rather than deferring (an unresolvable
-      // approval gate that eventually allows would defeat its purpose).
+      // not ride the 24h park ceiling. After _MAX_RAW_ASK_ROUNDS we apply the
+      // phase posture, mirroring the Python native hook which denies a stray
+      // ASK on the enforcement-boundary phase rather than deferring (an
+      // unresolvable approval gate that eventually allows would defeat its
+      // purpose); a TOOL_RESULT stray ASK fails open instead.
       rawAskRounds += 1;
       if (rawAskRounds >= _MAX_RAW_ASK_ROUNDS) {
-        return failClosedVerdict();
+        return unobtainableVerdict(phase);
       }
       // Reset the transient budget since this is a healthy round-trip, not a
       // failure, and give it a brief beat so we do not hot-loop a server that
@@ -509,7 +562,10 @@ async function callOmnigentTool(config, toolName, args) {
     };
   }
 
-  const verdict = await evalNativePolicyHttp(config, toolName, args || {});
+  const verdict = await evalNativePolicyHttp(config, "PHASE_TOOL_CALL", {
+    name: toolName,
+    arguments: args || {},
+  });
   if (verdict === null) {
     // The approval gate is structurally unavailable (no server/session/fetch,
     // or a transport error) — fail CLOSED rather than report false success.
@@ -588,6 +644,18 @@ function textFromToolResult(event) {
   }
   if ("details" in event) return safeJsonStringify(event.details);
   return "";
+}
+
+// The model-facing text when a TOOL_RESULT policy DENIES (suppresses) a
+// result. The real tool output is discarded and replaced with this error so
+// the model learns the result was withheld by policy and cannot act on the
+// suppressed content. Mirrors the "policy-denied error to the model" contract
+// in the harness checklist (SKILL.md #6, Tool result → DENY).
+function deniedResultText(reason) {
+  const detail = reason && String(reason).trim();
+  return detail
+    ? `[Omnigent policy] Tool result suppressed: ${detail}`
+    : "[Omnigent policy] Tool result suppressed by policy.";
 }
 
 function contentBlocks(message) {
@@ -1190,7 +1258,7 @@ module.exports = function (pi) {
     });
   }
 
-  async function postToolResult(event, responseId) {
+  async function postToolResult(event, responseId, outputOverride) {
     if (!event || typeof event !== "object") return;
     const callId = String(event.toolCallId || event.id || "");
     if (!callId) return;
@@ -1198,6 +1266,14 @@ module.exports = function (pi) {
     const key = known && known.key ? known.key : `${responseId}:${callId}`;
     if (postedToolResults.has(key)) return;
     postedToolResults.add(key);
+    // The mirror must reflect what the model actually consumed. When a
+    // TOOL_RESULT policy suppressed the real output (DENY), the caller passes
+    // the policy-error text as ``outputOverride`` so the Omnigent conversation
+    // shows the same denied result the model saw — not the suppressed output.
+    const output =
+      typeof outputOverride === "string"
+        ? outputOverride
+        : textFromToolResult(event);
     await postEvent(config, {
       type: "external_conversation_item",
       data: {
@@ -1205,7 +1281,7 @@ module.exports = function (pi) {
         item_type: "function_call_output",
         item_data: {
           call_id: callId,
-          output: textFromToolResult(event),
+          output,
         },
       },
     });
@@ -1450,11 +1526,10 @@ module.exports = function (pi) {
     // happens immediately for pi-native — just enqueue + TurnComplete), so
     // the verdict is always evaluated against live session policies regardless
     // of whether an Omnigent turn is currently in flight.
-    const verdict = await evalNativePolicyHttp(
-      config,
-      (event && event.toolName) || "",
-      (event && event.input) || {},
-    );
+    const verdict = await evalNativePolicyHttp(config, "PHASE_TOOL_CALL", {
+      name: (event && event.toolName) || "",
+      arguments: (event && event.input) || {},
+    });
     if (verdict && verdict.block) {
       return {
         block: true,
@@ -1465,13 +1540,69 @@ module.exports = function (pi) {
 
   pi.on("tool_result", async (event, ctx) => {
     rememberContext(ctx);
-    replayPendingInterrupt(ctx);
-    await postToolResult(event, currentResponseId());
+    const blocked = replayPendingInterrupt(ctx);
+    const responseId = currentResponseId();
+    // A pending interrupt short-circuits BEFORE the result-policy evaluation —
+    // mirroring the tool_call gate, which returns on ``blocked`` before its own
+    // (potentially long-parking) policy call. The TOOL_RESULT gate can PARK
+    // server-side waiting for a human approval, and that fetch is not bound to
+    // ctx.abort(); without this guard a user interrupt arriving while the gate
+    // is parked would be swallowed and the agent loop held until the human
+    // resolves the card or the park ceiling. The interrupt already aborts the
+    // turn (replayPendingInterrupt → ctx.abort()); we just mirror the real
+    // result once (so the conversation stays consistent) and return nothing so
+    // we neither park nor suppress an interrupted turn's result.
+    if (blocked) {
+      await postToolResult(event, responseId);
+      return;
+    }
+    // Evaluate the TOOL_RESULT policy checkpoint BEFORE mirroring the result
+    // to Omnigent or returning it to the model. This is the second enforcement
+    // point (SKILL.md harness checklist #6): the server gates the *output* with
+    // ALLOW / ASK / DENY. ASK is parked server-side and collapses to ALLOW or
+    // DENY (same machinery as the tool-call gate), so the extension only ever
+    // observes a hard verdict here. PHASE_TOOL_RESULT fails OPEN, so a server
+    // outage never suppresses a legitimately-produced result.
+    //
+    // Pi's agent loop applies this handler's returned {content, isError} to the
+    // finalized tool result (agent-loop.finalizeExecutedToolCall) BEFORE it
+    // builds the toolResult message the model consumes and BEFORE it emits
+    // tool_execution_end — so a DENY replacement reaches the model and the
+    // dedup'd mirror below reflects exactly what the model saw.
+    const toolName =
+      (event && event.toolName) ||
+      (event && toolCallsById.get(String(event.toolCallId || ""))?.name) ||
+      "";
+    const verdict = await evalNativePolicyHttp(
+      config,
+      "PHASE_TOOL_RESULT",
+      { result: textFromToolResult(event) },
+      { name: toolName, arguments: (event && event.input) || {} },
+    );
+    if (verdict && verdict.block) {
+      // DENY → suppress the real output. Replace the result content with a
+      // policy-denied error the model receives in place of the tool output,
+      // and mark it an error so the model treats it as a failed call. Mirror
+      // the SAME suppressed text to Omnigent so the conversation matches what
+      // the model consumed (postToolResult dedups on response_id:call_id, so
+      // the later tool_execution_end / turn_end mirrors are no-ops).
+      const text = deniedResultText(verdict.reason);
+      await postToolResult(event, responseId, text);
+      return { content: [{ type: "text", text }], isError: true };
+    }
+    // ALLOW: mirror the real result as-is and return nothing so Pi hands the
+    // real output to the model unchanged.
+    await postToolResult(event, responseId);
   });
 
   pi.on("tool_execution_end", async (event, ctx) => {
     rememberContext(ctx);
     replayPendingInterrupt(ctx);
+    // Backstop mirror only: the TOOL_RESULT policy verdict (incl. any DENY
+    // suppression) was already applied in the ``tool_result`` handler, which
+    // runs first and dedups the mirror. This event carries the
+    // already-modified result, so a no-op here just covers the case where no
+    // ``tool_result`` handler ran (it always does in this extension).
     await postToolResult(event, currentResponseId());
   });
 
