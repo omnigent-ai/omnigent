@@ -5727,6 +5727,19 @@
             "description": "Context-fill estimate for the next turn \u2014 set only by executors that make multiple LLM sub-calls per turn (e.g. `openai-agents`). For single-call executors this is absent and `total_tokens` serves the same purpose. The toolbar context ring and `/context` command use this field when present, falling back to `total_tokens`.",
             "title": "Context Tokens"
           },
+          "cost_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Authoritative per-turn cost in USD reported directly by the harness/provider (e.g. GitHub Copilot's AI-credit total). When present, the server-side cost path uses it in preference to the catalog token-price estimate; `None` when the harness doesn't report a cost (the common case, where cost is computed from token counts x catalog pricing).",
+            "title": "Cost Usd"
+          },
           "input_tokens": {
             "default": 0,
             "description": "Number of input (prompt) tokens consumed.",

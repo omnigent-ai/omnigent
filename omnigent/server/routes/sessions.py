@@ -2884,10 +2884,14 @@ def _accumulate_session_usage(
 
     Cost is computed when the model's per-token pricing is
     available from the MLflow catalog (looked up once per call
-    from the response's ``model`` field). The ``total_cost_usd`` key is
-    written **only when pricing is available** — an unpriced session
-    leaves it absent (its presence is what distinguishes a priced
-    ``$0.00`` from "unpriced"; see :func:`_priced_cost_for_display`).
+    from the response's ``model`` field). When the harness instead
+    reports an authoritative per-turn ``cost_usd`` (e.g. Copilot's
+    AI-credit total), that value is used directly in preference to
+    the catalog estimate. The ``total_cost_usd`` key is written
+    **only when the turn is priced** (catalog pricing available or a
+    harness-reported cost) — an unpriced session leaves it absent
+    (its presence is what distinguishes a priced ``$0.00`` from
+    "unpriced"; see :func:`_priced_cost_for_display`).
 
     :param resp_obj: The ``response`` dict from the
         ``response.completed`` SSE event.
@@ -2940,6 +2944,9 @@ def _accumulate_session_usage(
     # created only on this priced branch, so an unpriced session never
     # gains a (misleading $0.00) cost key.
     cost_delta = 0.0
+    # Prefer an authoritative harness-reported cost over the catalog estimate.
+    provider_cost = usage_obj.get("cost_usd")
+    has_provider_cost = isinstance(provider_cost, (int, float))
     usage_model = usage_obj.get("model")
     llm_model = (
         usage_model
@@ -2947,15 +2954,20 @@ def _accumulate_session_usage(
         else (conv.model_override if conv and conv.model_override else _resolve_llm_model(conv))
     )
     if llm_model:
-        from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
+        if has_provider_cost:
+            cost_delta = float(provider_cost)
+            priced = True
+        else:
+            from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
 
-        pricing = fetch_model_pricing(llm_model)
-        priced = pricing is not None
-        if pricing is not None:
-            # Cache-aware: usage_obj carries cache_read/cache_creation
-            # token counts when the harness reports them; compute_llm_cost
-            # prices them at their own (cheaper read / pricier write) rates.
-            cost_delta = compute_llm_cost(usage_obj, pricing)
+            pricing = fetch_model_pricing(llm_model)
+            priced = pricing is not None
+            if pricing is not None:
+                # Cache-aware: usage_obj carries cache_read/cache_creation
+                # token counts when the harness reports them; compute_llm_cost
+                # prices them at their own (cheaper read / pricier write) rates.
+                cost_delta = compute_llm_cost(usage_obj, pricing)
+        if priced:
             current["total_cost_usd"] = current.get("total_cost_usd", 0.0) + cost_delta
         # Per-model attribution (ADD). Tokens are attributed whenever the
         # model is known — including unpriced turns — so the per-model token
