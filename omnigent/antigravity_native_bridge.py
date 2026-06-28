@@ -506,6 +506,121 @@ def seed_isolated_agy_home(bridge_dir: Path) -> dict[str, str]:
     return {"HOME": str(iso_home)}
 
 
+# agy's periodic engagement survey ("How's the CLI experience so far?") is gated by
+# this ``settings.json`` key. Its modal footer line ``esc to cancel`` is identical
+# to :data:`_AGY_ACTIVE_MARKER` (the running-turn signal the TUI inject path keys
+# on), so a web turn typed into the pane while the survey is up is misread as a
+# mid-turn steer and silently lost (#1494). Disabling the survey removes the
+# trigger. Verified live: toggling agy's ``/config`` "Show Feedback Survey" off
+# writes exactly ``"showFeedbackSurvey": false`` here (``disableFeedback`` is an
+# unrelated internal proto field, NOT a settings key — it would be ignored).
+_AGY_FEEDBACK_SURVEY_SETTING = "showFeedbackSurvey"
+
+
+def ensure_agy_feedback_survey_disabled(home: Path) -> None:
+    """
+    Disable agy's feedback survey in the launch HOME's ``settings.json``.
+
+    agy periodically renders an engagement survey whose modal footer
+    (``esc to cancel``) collides with :data:`_AGY_ACTIVE_MARKER`; with it up, a
+    web turn injected into the TUI is mistaken for a running turn and lost
+    (#1494). The survey is governed by ``showFeedbackSurvey`` in
+    ``<home>/.gemini/antigravity-cli/settings.json`` — set it ``false`` before
+    launch so the survey never appears (deterministic prevention; text-matching
+    the survey itself would be brittle to agy wording changes).
+
+    Merge-only + idempotent: existing keys (``model``, ``trustedWorkspaces``,
+    ``enableTelemetry``, …) are preserved; a missing file is created with just
+    this key; a malformed / non-object file is left UNTOUCHED rather than
+    clobbered. Best-effort — a read/write failure is logged and the launch
+    proceeds (the survey is a degradation, not a hard blocker).
+
+    :param home: The HOME agy launches under (the per-session isolated home, or
+        the real home when the harness runs agy under it). Settings live at
+        ``<home>/.gemini/antigravity-cli/settings.json``.
+    :returns: None.
+    """
+    # resolve() follows a symlinked settings.json (e.g. a dotfiles-managed file) to
+    # its real target, so the atomic os.replace below rewrites the linked file rather
+    # than silently replacing the symlink with a regular one. strict=False is a no-op
+    # for a normal or not-yet-existing path (it only resolves parent symlinks).
+    settings_path = (home / ".gemini" / "antigravity-cli" / "settings.json").resolve(strict=False)
+    data: dict[str, object] = {}
+    try:
+        raw = settings_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raw = ""  # no settings yet -> create a fresh one carrying just this key
+    except OSError:
+        # An EXISTING but unreadable file (perms, stale NFS, …) must NOT be
+        # recreated from scratch — that would drop the user's real settings.
+        _logger.warning(
+            "could not read agy settings.json at %s; leaving it untouched",
+            settings_path,
+            exc_info=True,
+        )
+        return
+    except UnicodeDecodeError:
+        # read_text raises this (a ValueError, not an OSError) on non-UTF-8 bytes;
+        # treat it like malformed JSON and never clobber the file (mirrors the
+        # ``(OSError, ValueError)`` read guard in ensure_agy_onboarding_complete).
+        _logger.warning(
+            "agy settings.json at %s is not valid UTF-8; leaving it untouched",
+            settings_path,
+        )
+        return
+    if raw.strip():
+        try:
+            loaded = json.loads(raw)
+        except ValueError:
+            # json.JSONDecodeError subclasses ValueError; catch the supertype to
+            # match the decode-family guard in ensure_agy_onboarding_complete.
+            _logger.warning(
+                "agy settings.json at %s is not valid JSON; leaving it untouched "
+                "(the feedback survey may still appear)",
+                settings_path,
+            )
+            return
+        if not isinstance(loaded, dict):
+            _logger.warning(
+                "agy settings.json at %s is not a JSON object; leaving it untouched",
+                settings_path,
+            )
+            return
+        data = loaded
+    if data.get(_AGY_FEEDBACK_SURVEY_SETTING) is False:
+        return  # already disabled — avoid a needless rewrite
+    data[_AGY_FEEDBACK_SURVEY_SETTING] = False
+    # The write is atomic (mkstemp + os.replace) so a concurrent reader/writer
+    # never sees a torn file. On macOS the harness runs agy under the user's REAL
+    # ~/.gemini (the #1477 Keychain trade-off), so this file is shared across
+    # concurrent sessions and with agy itself: the atomic replace prevents
+    # corruption but not lost updates. That window is self-limiting — the
+    # idempotent short-circuit above makes every launch after the first disable
+    # read-only, so a racing agy trust/model write can only be clobbered on the
+    # one-time first disable, and the clobbered values fail safe (lost trust is
+    # re-prompted, lost model defaults). A cross-process lock is intentionally not
+    # taken (a separately-launched agy would not honor it).
+    try:
+        settings_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix="settings.json.", dir=str(settings_path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())  # crash-safe, mirrors ensure_agy_onboarding_complete
+            os.replace(tmp_name, settings_path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+    except OSError:
+        _logger.warning(
+            "could not write agy settings.json at %s to disable the feedback survey",
+            settings_path,
+            exc_info=True,
+        )
+
+
 def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) -> None:
     """
     Persist shared native Antigravity state atomically.
