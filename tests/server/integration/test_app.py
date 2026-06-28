@@ -277,10 +277,12 @@ async def test_me_header_mode_behaviors(
     # 200 (it's the identity probe the frontend bootstraps from) but
     # reports no user instead of resolving to a shared "local" identity.
     assert missing.status_code == 200
-    assert missing.json() == {"user_id": None}
-    # Valid header returns the identity.
+    # /v1/me now also carries is_admin (the admin surface gates on it); a
+    # headerless caller is no user and therefore not an admin.
+    assert missing.json() == {"user_id": None, "is_admin": False}
+    # Valid header returns the identity (not an admin on a fresh DB).
     assert normal.status_code == 200
-    assert normal.json() == {"user_id": "alice@example.com"}
+    assert normal.json() == {"user_id": "alice@example.com", "is_admin": False}
     # Reserved name is rejected (returns None → route returns null).
     assert reserved.status_code == 200
-    assert reserved.json() == {"user_id": None}
+    assert reserved.json() == {"user_id": None, "is_admin": False}
