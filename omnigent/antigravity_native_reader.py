@@ -1059,7 +1059,14 @@ async def supervise_reader(
             for pending in inflight:
                 pending.cancel()
             for pending in inflight:
-                with contextlib.suppress(asyncio.CancelledError):
+                # Await each cancelled task to completion. Suppress not only the
+                # expected CancelledError but ANY exception: a task that had already
+                # finished with a real error (before the cancel landed) would re-raise
+                # it here and abort the drain, stranding the remaining tasks
+                # uncancelled (resource leak). Its own done-callback already logged
+                # that error, so swallowing it here is safe (asyncio.CancelledError is
+                # a BaseException, hence listed explicitly alongside Exception).
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await pending
 
     # Report how many committed steps (turns) this run mirrored for the bound
