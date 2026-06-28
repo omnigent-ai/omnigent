@@ -25,6 +25,7 @@ from sqlalchemy.sql.selectable import Subquery
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
+    LABEL_VALUE_MAX_LEN,
     SqlAgent,
     SqlConversation,
     SqlConversationItem,
@@ -264,11 +265,17 @@ def _upsert_labels(
         touched by this call.
     """
     dialect = session.bind.dialect.name if session.bind is not None else ""
+    # Defense-in-depth: clamp every value to the column width so no label
+    # writer can overflow ``String(256)`` and raise ``DataError`` on
+    # PostgreSQL. Callers (session error labels, client-supplied ``body.labels``
+    # on session create/patch, policy-author writes) all funnel through here,
+    # so this is the single point that guarantees the column constraint. The
+    # slice is character-based, matching Postgres ``VARCHAR(n)`` semantics.
     rows = [
         {
             "conversation_id": conversation_id,
             "key": key,
-            "value": value,
+            "value": value[:LABEL_VALUE_MAX_LEN],
             "updated_at": updated_at,
         }
         for key, value in updates.items()

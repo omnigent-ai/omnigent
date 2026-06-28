@@ -4,7 +4,9 @@ import asyncio
 import logging
 import mimetypes
 import os
+import re
 import tarfile
+import uuid
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -49,6 +51,9 @@ from omnigent.server.performance_metrics import (
     ServerPerformanceMetrics,
     publish_server_metrics_periodically,
     set_request_duration_for_access_log,
+    set_request_id_for_access_log,
+    set_request_session_id_for_access_log,
+    set_request_user_agent_for_access_log,
 )
 from omnigent.server.routes.admin import create_admin_router
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
@@ -78,6 +83,85 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
+
+
+def _is_pep440_version(version: str) -> bool:
+    """Return whether *version* can be parsed as a PEP 440 version."""
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        Version(version)
+    except InvalidVersion:
+        return False
+    return True
+
+
+def _metadata_omnigent_version() -> str:
+    """Return the omnigent version recorded in installed package metadata."""
+    from importlib.metadata import version as _pkg_version
+
+    return _pkg_version("omnigent")
+
+
+def _source_pyproject_version(start: Path | None = None) -> str | None:
+    """Return ``[project].version`` from a source checkout's ``pyproject.toml``."""
+    import tomllib
+
+    current = start or Path(__file__).resolve()
+    for parent in (current, *current.parents):
+        pyproject = parent / "pyproject.toml"
+        if not pyproject.is_file():
+            continue
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+            _logger.warning(
+                "could not read %s for server version fallback (%s)",
+                pyproject,
+                exc,
+            )
+            return None
+        project = data.get("project")
+        if not isinstance(project, dict) or project.get("name") != "omnigent":
+            continue
+        version = project.get("version")
+        if not isinstance(version, str) or not version:
+            return None
+        if not _is_pep440_version(version):
+            _logger.warning(
+                "pyproject version %r from %s is not PEP 440",
+                version,
+                pyproject,
+            )
+            return None
+        return version
+    return None
+
+
+def _server_version() -> str:
+    """Return the server version exposed to clients.
+
+    Source/editable installs can have placeholder package metadata such as
+    ``source``. Prefer the installed metadata when it is parseable, but fall
+    back to the source checkout's ``pyproject.toml`` version so local developer
+    servers still report a PEP 440 version.
+    """
+    version = _metadata_omnigent_version()
+    if _is_pep440_version(version):
+        return version
+    fallback = _source_pyproject_version()
+    if fallback is not None:
+        _logger.info(
+            "installed omnigent version %r is not PEP 440; using pyproject version %s",
+            version,
+            fallback,
+        )
+        return fallback
+    _logger.warning(
+        "installed omnigent version %r is not PEP 440 and no pyproject fallback was found",
+        version,
+    )
+    return version
 
 
 def _register_web_mimetypes() -> None:
@@ -123,6 +207,7 @@ _KIMI_NATIVE_AGENT_NAME = KIMI_NATIVE_CODING_AGENT.agent_name
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
+_SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 # polly's and debby's multi-file bundles are packaged under
 # omnigent.resources.examples (see pyproject package-data), so they resolve
 # in both a repo checkout and an installed wheel. The presence check in each
@@ -1289,19 +1374,35 @@ def create_app(
         call_next: _FastAPICallNext,
     ) -> Response:
         """
-        Count each HTTP request while it is being processed.
+        Count each HTTP request and enrich access logs.
+
+        Generates a per-request correlation ID, captures the
+        ``User-Agent`` header and session ID from the URL path, and
+        stores them in context variables for the Uvicorn access
+        formatter.
 
         :param request: Incoming FastAPI request, e.g. ``GET /health``.
         :param call_next: FastAPI middleware continuation that executes
             the matched route and returns its response.
         :returns: The downstream route response.
         """
+        request_id = uuid.uuid4().hex
+        set_request_id_for_access_log(request_id)
+        set_request_user_agent_for_access_log(
+            request.headers.get("user-agent"),
+        )
+        session_match = _SESSION_PATH_RE.search(request.url.path)
+        set_request_session_id_for_access_log(
+            session_match.group(1) if session_match else None,
+        )
+
         failed = False
         status_code: int | None = None
         started_at = server_metrics.request_started()
         try:
             response = await call_next(request)
             status_code = response.status_code
+            response.headers["X-Request-Id"] = request_id
             return response
         except Exception:
             failed = True
@@ -1634,9 +1735,7 @@ def create_app(
         :returns: ``{"version": "<semver string>"}``,
             e.g. ``{"version": "0.1.0"}``.
         """
-        from importlib.metadata import version as _pkg_version
-
-        return {"version": _pkg_version("omnigent")}
+        return {"version": _server_version()}
 
     @app.get("/v1/info")
     async def info() -> dict[str, bool | str | None]:
@@ -1706,8 +1805,6 @@ def create_app(
         # server_version is the installed omnigent package version (same
         # source as /api/version), surfaced so the web UI can show it in the
         # session info popover alongside the per-session host version.
-        from importlib.metadata import version as _pkg_version
-
         # smart_routing_enabled: true when the server can route — either
         # a RoutingClient is explicitly configured (OMNIGENT_SMART_ROUTING=1
         # + llm: config) or the managed deployment registered a
@@ -1728,7 +1825,7 @@ def create_app(
             "databricks_features": databricks_features,
             "managed_sandboxes_enabled": managed_sandboxes_enabled,
             "sandbox_provider": sandbox_provider,
-            "server_version": _pkg_version("omnigent"),
+            "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
         }
 
