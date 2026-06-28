@@ -2424,6 +2424,43 @@ async def test_relay_persists_failed_status_error_labels_from_runner() -> None:
 
 
 @pytest.mark.asyncio
+async def test_relay_truncates_long_error_message_before_persisting() -> None:
+    """A >256-char error message is truncated before the label write.
+
+    Long messages (tracebacks, 5xx bodies) overflow the String(256)
+    ``conversation_labels.value`` column and previously caused a
+    ``DataError`` that silently dropped the failure reason — the session
+    rendered as bare ``"failed"`` with no explanation on reload.
+    Truncation must happen inside the relay (the real call site) so no
+    long message ever reaches the store.
+    """
+    from omnigent.server.routes.sessions import _LABEL_VALUE_MAX_LEN, _relay_runner_stream
+
+    store = _ConversationStore()
+    long_message = "Runner MCP execute failed: " + "x" * 300  # 327 chars, well over 256
+    client = _FakeStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": {
+                        "code": "mcp_error",
+                        "message": long_message,
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+
+    stored = store._conversations["conv_proxy"].labels["omnigent.last_task_error_message"]
+    assert len(stored) <= _LABEL_VALUE_MAX_LEN
+
+
+@pytest.mark.asyncio
 async def test_relay_persists_routing_decision_before_assistant_output() -> None:
     """The relay persists a turn-start ``routing_decision`` item BEFORE the
     turn's assistant output.
