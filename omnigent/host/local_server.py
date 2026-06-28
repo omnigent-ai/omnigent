@@ -510,6 +510,15 @@ def ensure_local_omnigent_server() -> LocalServerStartup:
         # natural EADDRINUSE exit, then respawn once on an OS-assigned
         # free port, which concurrent spawners never prefer.
         _await_doomed_child_exit(spawned.proc)
+        if pinned_local_port() is not None:
+            # The user pinned this port and asked to fail rather than wander
+            # to a random one. A foreign owner means the pinned port is taken.
+            raise click.ClickException(
+                f"Local server port {port} is pinned but owned by pid "
+                f"{foreign_owner} — refusing to start on a random port. Free it "
+                f"(`lsof -nP -iTCP:{port} -sTCP:LISTEN`) or change "
+                f"`local_server_port` in ~/.omnigent/config.yaml, then retry."
+            )
         if retried:
             raise click.ClickException(
                 f"Local server port contention persists: port {port} is owned by "
@@ -691,28 +700,91 @@ def _find_free_local_port() -> int:
 _DEFAULT_LOCAL_PORT = 6767
 
 
-def pick_local_port(preferred: int = _DEFAULT_LOCAL_PORT) -> int:
-    """Return ``preferred`` if it's bindable on loopback, else a free port.
+def pinned_local_port() -> int | None:
+    """Return the user-pinned local server port, or ``None`` when unpinned.
 
-    The local server prefers a stable, predictable port (6767) so the
-    URL is the same across ``omnigent server`` and daemon spawns —
-    but falls back to a free port when 6767 is already taken (another
-    app, a second OS user on a shared box). Reuse of an existing
-    omnigent server happens via the pidfile (:func:`register_local_server`
-    / :func:`local_server_url_if_healthy`), NOT by assuming the port, so
-    the fallback never breaks discovery.
+    Precedence: the ``OMNIGENT_LOCAL_PORT`` env var (shell / CLI launches)
+    over ``local_server_port`` in ``config.yaml`` (the latter survives GUI
+    app launches that don't inherit the shell env). The config dir honors
+    ``OMNIGENT_CONFIG_HOME`` like the CLI; this module reads the file
+    directly rather than importing ``cli.py`` (see the module docstring).
+    Invalid / out-of-range values are ignored (treated as unpinned).
 
-    :param preferred: The port to try first, e.g. ``6767``.
-    :returns: ``preferred`` if free, otherwise an OS-assigned free port.
+    :returns: The pinned port, or ``None`` if not configured / invalid.
     """
+    raw: object = os.environ.get("OMNIGENT_LOCAL_PORT")
+    if not raw:
+        config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
+        config_path = (
+            Path(config_home).expanduser() if config_home else Path.home() / ".omnigent"
+        ) / "config.yaml"
+        if config_path.exists():
+            import yaml
+
+            with contextlib.suppress(Exception):
+                cfg = yaml.safe_load(config_path.read_text()) or {}
+                if isinstance(cfg, dict):
+                    raw = cfg.get("local_server_port")
+    if raw in (None, ""):
+        return None
+    try:
+        port = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def _port_bindable(port: int) -> bool:
+    """Return ``True`` if *port* can be bound on loopback right now."""
     import socket
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
-            s.bind(("127.0.0.1", preferred))
+            s.bind(("127.0.0.1", port))
         except OSError:
-            return _find_free_local_port()
-        return preferred
+            return False
+        return True
+
+
+def pick_local_port(preferred: int | None = None) -> int:
+    """Return the loopback port for the local server.
+
+    With no *preferred* (the daemon / ``omnigent run`` spawn path) the port
+    is resolved from the user's pin (:func:`pinned_local_port`): a pinned
+    port is returned when free, else a :class:`click.ClickException` is
+    raised — the user asked to fail rather than silently land on a random
+    port (which breaks bookmarked URLs). Unpinned, it prefers the stable
+    :data:`_DEFAULT_LOCAL_PORT` (6767) and falls back to a free port when
+    that is taken.
+
+    An explicit *preferred* (the foreground ``omnigent server --port``)
+    keeps the legacy prefer-or-free behavior.
+
+    Reuse of an existing server happens via the pidfile
+    (:func:`local_server_url_if_healthy`), NOT by assuming the port, so a
+    fallback never breaks discovery.
+
+    :param preferred: A caller-chosen port to try first, or ``None`` to
+        resolve from the pin / stable default.
+    :returns: An available loopback port.
+    :raises click.ClickException: When a pinned port is busy.
+    """
+    if preferred is not None:
+        return preferred if _port_bindable(preferred) else _find_free_local_port()
+
+    pinned = pinned_local_port()
+    if pinned is not None:
+        if _port_bindable(pinned):
+            return pinned
+        raise click.ClickException(
+            f"Local server port {pinned} is pinned but busy — refusing to start "
+            f"on a random port. Free it (`lsof -nP -iTCP:{pinned} -sTCP:LISTEN`) "
+            f"or change `local_server_port` in ~/.omnigent/config.yaml, then retry."
+        )
+
+    if _port_bindable(_DEFAULT_LOCAL_PORT):
+        return _DEFAULT_LOCAL_PORT
+    return _find_free_local_port()
 
 
 def _pid_listening_on_port(port: int) -> int | None:
