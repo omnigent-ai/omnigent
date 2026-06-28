@@ -464,6 +464,20 @@ def seed_isolated_agy_home(bridge_dir: Path) -> dict[str, str]:
         agy launch environment.
     """
     real_home = Path.home()
+    # macOS: agy binds its OAuth credential to the REAL ``$HOME`` — the login
+    # Keychain item "Antigravity Safe Storage" resolves against the real home
+    # PATH, not the contents of ``$HOME/.gemini``. Verified: ``agy -p`` authenticates
+    # headlessly under the real HOME but stalls at the interactive OAuth login prompt
+    # under ANY isolated HOME — even one whose ``.gemini``/``.antigravity`` are
+    # symlinked to the real ones, and even with ``oauth_creds.json`` present. So an
+    # isolated HOME makes every agy turn hang at login on macOS (#1477). Run agy under
+    # the real HOME there — no per-session HOME isolation is possible. (Linux stores a
+    # seedable FILE token — ``antigravity-cli/antigravity-oauth-token`` — so isolation
+    # works there and is kept below.) Trade-off on macOS: per-session agy state shares
+    # the user's real ``~/.gemini`` (and the relay MCP lands in the bridge tree agy
+    # won't read — a separate concern, see #1194); this is the only way agy authenticates.
+    if sys.platform == "darwin":
+        return {"HOME": str(real_home)}
     iso_home = agy_home_dir(bridge_dir)
     iso_gemini = iso_home / ".gemini"
     (iso_gemini / "antigravity-cli" / "cache").mkdir(mode=0o700, parents=True, exist_ok=True)
