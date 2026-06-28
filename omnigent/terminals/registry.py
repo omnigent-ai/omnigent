@@ -502,10 +502,11 @@ class TerminalRegistry:
     async def shutdown(self) -> None:
         """Tear down every registered terminal across all conversations.
 
-        Called from the FastAPI server's lifespan shutdown handler.
-        Iterates every conversation slot and closes each instance,
-        bounded by ``_CLOSE_TIMEOUT_S`` per instance. Best-effort —
-        a stuck instance shouldn't block the rest of Omnigent shutdown.
+        Called from the FastAPI server's lifespan shutdown handler. Closes
+        every instance CONCURRENTLY (each bounded by ``_CLOSE_TIMEOUT_S`` and
+        isolated) so an N-terminal shutdown fits the runner's bounded
+        parent-death drain window instead of taking N x the per-close timeout
+        (B7). Best-effort -- a stuck or throwing instance never blocks the rest.
         """
         with self._lock:
             slots = list(self._by_conversation.items())
@@ -513,24 +514,32 @@ class TerminalRegistry:
             # AP-shutdown clears all instance locks too — every
             # conversation's terminals are being torn down.
             self._instance_locks.clear()
-        for conversation_id, slot in slots:
-            for (name, key), instance in slot.items():
-                try:
-                    await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "shutdown: close timed out for %s:%s in conv %s",
-                        name,
-                        key,
-                        conversation_id,
-                    )
-                except Exception:
-                    logger.exception(
-                        "shutdown: close failed for %s:%s in conv %s",
-                        name,
-                        key,
-                        conversation_id,
-                    )
+
+        async def _close_one(conversation_id: str, name: str, key: str, instance: object) -> None:
+            try:
+                await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)  # type: ignore[union-attr]
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "shutdown: close timed out for %s:%s in conv %s",
+                    name,
+                    key,
+                    conversation_id,
+                )
+            except Exception:
+                logger.exception(
+                    "shutdown: close failed for %s:%s in conv %s",
+                    name,
+                    key,
+                    conversation_id,
+                )
+
+        tasks = [
+            _close_one(conversation_id, name, key, instance)
+            for conversation_id, slot in slots
+            for (name, key), instance in slot.items()
+        ]
+        if tasks:
+            await asyncio.gather(*tasks)
 
     def active_conversation_ids(self) -> list[str]:
         """Return ids of conversations with at least one registered terminal.
