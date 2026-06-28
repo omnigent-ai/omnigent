@@ -138,17 +138,21 @@ def test_search_duckduckgo_timeout() -> None:
     assert out.startswith("DuckDuckGo search error")
 
 
-def test_web_search_defaults_to_duckduckgo_without_provider(
+def test_web_search_no_provider_fails_loudly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no ``search_provider``, the selector routes to the keyless DDG
-    backend — so ``web_search`` works out of the box. This is the core fix:
-    previously it returned a configuration error and the agent had no search."""
+    """With no ``search_provider``, the selector returns a loud, helpful error
+    naming the engines — it does NOT silently pick one (per maintainer review),
+    so it's always explicit which engine ran. The DDG backend is not invoked."""
     import omnigent.tools.builtins.web_search_duckduckgo as ddg
     from omnigent.tools.builtins.web_search import _search
 
-    monkeypatch.setattr(ddg, "_search_duckduckgo", lambda q, c: f"DDG:{q}")
-    assert _search("hello world", {}) == "DDG:hello world"
+    monkeypatch.setattr(
+        ddg, "_search_duckduckgo", lambda q, c: pytest.fail("must not auto-run DDG")
+    )
+    out = _search("hello world", {})
+    assert out.startswith("web_search error: no search_provider")
+    assert "duckduckgo" in out
 
 
 def test_web_search_explicit_duckduckgo_provider(

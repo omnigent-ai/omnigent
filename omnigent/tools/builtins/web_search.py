@@ -4,11 +4,12 @@ Backend selection is fully determined by the agent spec:
 
 - **OpenAI model** → passthrough to OpenAI's native
   ``web_search_preview`` (server-side, uses the LLM API key).
-- **Other models** → defaults to a **keyless DuckDuckGo** search so
-  ``web_search`` works with no configuration. For a sturdier / higher-rate
-  backend, set ``search_provider`` to ``"google"``, ``"perplexity"``, or
-  ``"nimble"`` with the appropriate credentials. No env var fallbacks — the
-  spec is self-contained.
+- **Other models** → use the ``search_provider`` named in the spec:
+  ``"duckduckgo"`` (keyless, no API key) or ``"google"`` / ``"perplexity"`` /
+  ``"nimble"`` with credentials for a sturdier / higher-rate backend.
+  ``web_search`` never picks an engine for you — with no ``search_provider``
+  set it returns an error naming the options, so it is always explicit which
+  engine ran. No env var fallbacks — the spec is self-contained.
 
 Usage in config.yaml::
 
@@ -17,12 +18,12 @@ Usage in config.yaml::
       builtins:
         - web_search
 
-    # Non-OpenAI model — must specify search_provider + credentials:
+    # Non-OpenAI model — name a search_provider (there is no default):
     tools:
       builtins:
         - name: web_search
-          search_provider: perplexity
-          api_key: ${PERPLEXITY_API_KEY}
+          search_provider: duckduckgo   # keyless; or google/perplexity/nimble
+          # api_key: ${PERPLEXITY_API_KEY}   # required for keyed backends
 """
 
 from __future__ import annotations
@@ -42,9 +43,10 @@ class WebSearchTool(Tool):
 
     When the agent uses an OpenAI model, this emits the native
     ``web_search_preview`` passthrough schema. For other models,
-    the spec must set ``search_provider`` to ``"google"`` or
-    ``"perplexity"`` with credentials — there is no env var
-    fallback because the agent spec must be self-contained.
+    the spec must set ``search_provider`` (``"duckduckgo"`` is
+    keyless; ``"google"`` / ``"perplexity"`` / ``"nimble"`` need
+    credentials) — there is no default and no env var fallback, so
+    the spec is self-contained and the engine used is explicit.
 
     :param config: Spec-level config from config.yaml, e.g.
         ``{"search_provider": "perplexity", "api_key": "pplx-..."}``.
@@ -178,11 +180,13 @@ def _search(query: str, config: dict[str, str]) -> str:
     :param query: The search query string.
     :param config: Spec-level config. Required keys:
 
-        - ``search_provider``: ``"google"``, ``"perplexity"``, or ``"nimble"``
-        - ``api_key``: API key for the chosen backend
+        - ``search_provider`` (required; no default): ``"duckduckgo"``
+          (keyless), ``"google"``, ``"perplexity"``, or ``"nimble"``
+        - ``api_key``: API key for the chosen backend (not for duckduckgo)
         - ``engine_id``: Required for Google only
 
-    :returns: Search results, or an error message.
+    :returns: Search results, or an error message (including when no
+        ``search_provider`` is configured).
     """
     backend = config.get("search_provider")
 
@@ -198,11 +202,20 @@ def _search(query: str, config: dict[str, str]) -> str:
     if backend == "duckduckgo":
         return _run_duckduckgo(query, config)
 
-    # No (or unrecognized) search_provider → keyless DuckDuckGo so web_search
-    # works out of the box with no credentials. Agents that want a sturdier,
-    # higher-rate backend set search_provider to google / perplexity / nimble
-    # with credentials.
-    return _run_duckduckgo(query, config)
+    # Fail loudly instead of silently picking an engine, so the user always
+    # knows which engine ran and opts in explicitly (per maintainer review).
+    if backend:
+        return (
+            f"web_search error: unknown search_provider {backend!r}. "
+            "Set search_provider to one of: duckduckgo (keyless, no API key), "
+            "google, perplexity, nimble."
+        )
+    return (
+        "web_search error: no search_provider configured. Set one in the "
+        "web_search tool config — e.g. search_provider: duckduckgo (keyless, "
+        "no API key), or google / perplexity / nimble with credentials for a "
+        "sturdier, higher-rate backend."
+    )
 
 
 def _run_google(query: str, config: dict[str, str]) -> str:
