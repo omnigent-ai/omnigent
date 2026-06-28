@@ -49,6 +49,7 @@ from .open_responses_sdk import (
     _OPENAI_KEY_PLACEHOLDER,
     _convert_messages_to_responses,
     _databricks_openai_base_url,
+    _strip_strict_from_tools,
 )
 
 logger = logging.getLogger(__name__)
@@ -939,6 +940,70 @@ def _wrap_client_for_reasoning_models(client: AsyncOpenAIClient) -> AsyncOpenAIC
     return client
 
 
+class _DatabricksToolStripResource:
+    """Wraps an async OpenAI resource so outgoing tool ``strict`` is removed.
+
+    Sits in front of ``chat.completions`` or ``responses`` and rewrites the
+    ``tools`` kwarg via :func:`_strip_strict_from_tools` before delegating, so a
+    Databricks-AI-Gateway-bound request never carries the rejected ``strict``
+    field. All other attributes and the response (incl. streams) pass through
+    unchanged.
+
+    :param resource: The real ``AsyncCompletions`` or ``AsyncResponses`` object.
+    """
+
+    def __init__(self, resource: Any) -> None:  # type: ignore[explicit-any]
+        self._resource = resource
+
+    async def create(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[explicit-any]
+        """Strip tool ``strict`` then proxy ``create()`` verbatim."""
+        if kwargs.get("tools"):
+            kwargs["tools"] = _strip_strict_from_tools(kwargs["tools"])
+        return await self._resource.create(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:  # type: ignore[explicit-any]
+        return getattr(self._resource, name)
+
+
+class _DatabricksToolStripChat:
+    """Wraps ``AsyncChat`` to expose a strict-stripping ``completions``.
+
+    :param chat: The real ``AsyncOpenAI.chat`` object.
+    """
+
+    def __init__(self, chat: Any) -> None:  # type: ignore[explicit-any]
+        self._chat = chat
+        self.completions: _DatabricksToolStripResource = _DatabricksToolStripResource(
+            chat.completions
+        )
+
+    def __getattr__(self, name: str) -> Any:  # type: ignore[explicit-any]
+        return getattr(self._chat, name)
+
+
+def _wrap_client_for_databricks_tools(client: AsyncOpenAIClient) -> AsyncOpenAIClient:
+    """Wrap *client* so outgoing tool ``strict`` is stripped on both wires.
+
+    Replaces ``client.chat`` (chat-completions wire, used by non-GPT models)
+    and ``client.responses`` (Responses wire, used by Databricks GPT) with
+    proxies that drop the ``strict`` field the Databricks AI Gateway rejects.
+    Apply ONLY when :func:`_is_databricks_openai_client` is true, so standard
+    OpenAI structured-output ``strict`` behavior is preserved for every other
+    provider. Composes with :func:`_wrap_client_for_reasoning_models` (apply
+    this first; the reasoning proxy then wraps the strict-stripping completions).
+
+    :param client: The ``AsyncOpenAI`` (or compatible) client to wrap.
+    :returns: The same *client*, modified in-place and returned for chaining.
+    """
+    # A client may expose only one wire (chat-only / responses-only compatible
+    # clients, or a partial test double); wrap only the wire it actually has.
+    if getattr(client, "chat", None) is not None:
+        object.__setattr__(client, "chat", _DatabricksToolStripChat(client.chat))
+    if getattr(client, "responses", None) is not None:
+        object.__setattr__(client, "responses", _DatabricksToolStripResource(client.responses))
+    return client
+
+
 def _count_output_items(new_items: list[Any]) -> int:  # type: ignore[explicit-any]
     """Count run items that represent user-visible output.
 
@@ -1067,6 +1132,15 @@ class OpenAIAgentsSDKExecutor(Executor):
                 model=model,
             )
         )
+        databricks = _is_databricks_openai_client(raw_client)
+        # The Databricks AI Gateway rejects the ``strict`` field on tool
+        # definitions (by presence, even ``false``). Strip it at the request
+        # boundary on both wires — gated on the gateway base URL so standard
+        # OpenAI strict/structured-output behavior is untouched for every other
+        # provider. Applied before the reasoning wrapper so the two compose.
+        databricks_client = (
+            _wrap_client_for_databricks_tools(raw_client) if databricks else raw_client
+        )
         # Wrap the chat.completions path to strip list-type delta.content
         # (reasoning blocks emitted by models like Kimi K2).  The SDK's
         # ChatCmplStreamHandler validates delta as str; list input raises
@@ -1075,12 +1149,14 @@ class OpenAIAgentsSDKExecutor(Executor):
         # Only needed for the chat-completions path; the Responses API path
         # has its own event handling that doesn't go through ChatCmplStreamHandler.
         self._client = (
-            _wrap_client_for_reasoning_models(raw_client) if not use_responses else raw_client
+            _wrap_client_for_reasoning_models(databricks_client)
+            if not use_responses
+            else databricks_client
         )
         self._profile = profile
         self._use_responses = use_responses
         self._model_override = model
-        self._databricks = _is_databricks_openai_client(self._client)
+        self._databricks = databricks
         self._tool_executor: ToolExecutor | None = None
         self._session_states: dict[str, _AgentsSessionState] = {}
 

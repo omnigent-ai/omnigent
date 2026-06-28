@@ -87,6 +87,51 @@ def _is_legacy_databricks_serving_base_url(client: OpenAI) -> bool:
     return "/serving-endpoints" in str(client.base_url)
 
 
+def _is_databricks_gateway_base_url(client: OpenAI) -> bool:
+    """Return whether *client* targets a Databricks AI Gateway base URL.
+
+    The gateway exposes OpenAI-compatible endpoints under ``/ai-gateway/`` and
+    rejects the ``strict`` field on tool definitions, so callers omit it when
+    this is true. Duck-typed (no isinstance guard) so tests can pass fakes.
+    """
+    return "/ai-gateway/" in str(getattr(client, "base_url", ""))
+
+
+def _strip_strict_from_tools(tools: Any) -> Any:
+    """Return *tools* with the ``strict`` field removed from each tool envelope.
+
+    The Databricks AI Gateway rejects the ``strict`` field on tool definitions
+    by presence (a 400 ``tools.N.*.strict: Extra inputs are not permitted`` —
+    ``false`` fails the same as ``true``). Removes only the well-known envelope
+    locations: the tool's own ``strict`` (Responses-wire flat function/custom
+    tool) and a nested ``function``/``custom`` block's ``strict`` (Chat wire).
+    Does NOT recurse into ``parameters`` — a user JSON Schema may legitimately
+    contain a property named ``strict``. Copies the list and any mutated dicts
+    so the caller's tool objects are not aliased; non-dict entries pass through.
+
+    Shared with :mod:`omnigent.inner.openai_agents_sdk_executor` (which wraps the
+    async client) so both executors strip identically.
+
+    :param tools: The outgoing ``tools`` value (normally a list of dicts).
+    :returns: A sanitized copy when *tools* is a list; *tools* unchanged otherwise.
+    """
+    if not isinstance(tools, list):
+        return tools
+    sanitized = []
+    for tool in tools:
+        if isinstance(tool, dict):
+            tool = dict(tool)
+            tool.pop("strict", None)
+            for envelope_key in ("function", "custom"):
+                envelope = tool.get(envelope_key)
+                if isinstance(envelope, dict):
+                    envelope = dict(envelope)
+                    envelope.pop("strict", None)
+                    tool[envelope_key] = envelope
+        sanitized.append(tool)
+    return sanitized
+
+
 def _get_openai_client(
     profile: str | None = None,
     retry_policy: RetryPolicy | None = None,
@@ -149,8 +194,18 @@ def _get_openai_client(
     )
 
 
-def _convert_tools_to_responses(tools: list[ToolSpec]) -> list[ResponsesItem]:
-    """Convert Omnigent tool schemas to Responses API function tools."""
+def _convert_tools_to_responses(
+    tools: list[ToolSpec], *, include_strict: bool = True
+) -> list[ResponsesItem]:
+    """Convert Omnigent tool schemas to Responses API function tools.
+
+    :param tools: Omnigent tool specs to convert.
+    :param include_strict: When True (default), emit ``"strict": False`` to be
+        permissive with hand-authored schemas. Set False for the Databricks AI
+        Gateway, which rejects the ``strict`` field by presence (a 400
+        ``tools.N.*.strict: Extra inputs are not permitted`` — ``false`` fails
+        the same as ``true``); the key is then omitted entirely.
+    """
     result: list[ResponsesItem] = []
     for tool in tools:
         raw_name = tool.get("name")
@@ -160,16 +215,16 @@ def _convert_tools_to_responses(tools: list[ToolSpec]) -> list[ResponsesItem]:
             continue
         raw_desc = tool.get("description")
         desc: str = raw_desc if isinstance(raw_desc, str) else ""
-        result.append(
-            {
-                "type": "function",
-                "name": raw_name,
-                "description": desc,
-                "parameters": tool.get("parameters", {"type": "object", "properties": {}}),
-                # Be permissive with hand-authored schemas in this repo.
-                "strict": False,
-            }
-        )
+        item: ResponsesItem = {
+            "type": "function",
+            "name": raw_name,
+            "description": desc,
+            "parameters": tool.get("parameters", {"type": "object", "properties": {}}),
+        }
+        if include_strict:
+            # Be permissive with hand-authored schemas in this repo.
+            item["strict"] = False
+        result.append(item)
     return result
 
 
@@ -410,6 +465,9 @@ class OpenResponsesExecutor(Executor):
         self._profile = profile
         self._client = client if client is not None else _get_openai_client(profile=profile)
         self._stream_responses = not _is_legacy_databricks_serving_base_url(self._client)
+        # The Databricks AI Gateway rejects the tool ``strict`` field by
+        # presence; omit it from converted tools when targeting the gateway.
+        self._omit_tool_strict = _is_databricks_gateway_base_url(self._client)
         self._supports_previous_response_id = True
         self._session_states: dict[str, _ResponsesSessionState] = {}
 
@@ -522,7 +580,11 @@ class OpenResponsesExecutor(Executor):
         state = self._get_or_create_session_state(session_key)
         state.interrupt_requested = False
         delta_input_items = self._build_delta_input(state, messages)
-        response_tools = _convert_tools_to_responses(tools) if tools else None
+        response_tools = (
+            _convert_tools_to_responses(tools, include_strict=not self._omit_tool_strict)
+            if tools
+            else None
+        )
 
         include = ["reasoning.encrypted_content"]
         extra_include = cfg.extra.get("include")
@@ -550,6 +612,11 @@ class OpenResponsesExecutor(Executor):
         for key in _SESSION_ONLY_EXECUTOR_EXTRA_KEYS:
             extra.pop(key, None)
         kwargs.update(extra)
+        # cfg.extra may carry its own ``tools`` that overwrote the converted set
+        # above; re-strip the final value so caller-supplied tools can't smuggle
+        # the gateway-rejected ``strict`` field past the conversion gate.
+        if self._omit_tool_strict and kwargs.get("tools"):
+            kwargs["tools"] = _strip_strict_from_tools(kwargs["tools"])
         if self._supports_previous_response_id and state.previous_response_id:
             kwargs["previous_response_id"] = state.previous_response_id
             request_input = delta_input_items

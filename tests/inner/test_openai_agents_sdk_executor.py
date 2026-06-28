@@ -29,10 +29,13 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.openai_agents_sdk_executor import (
     OpenAIAgentsSDKExecutor,
+    _DatabricksToolStripResource,
     _normalize_content_blocks_for_chat,
     _normalize_responses_items_for_chat,
     _ReasoningBlockFilterStream,
     _sanitize_replay_item,
+    _strip_strict_from_tools,
+    _wrap_client_for_databricks_tools,
     _wrap_client_for_reasoning_models,
 )
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
@@ -409,6 +412,183 @@ def test_wrap_client_non_streaming_create_not_wrapped() -> None:
 
     result = _run(_run_inner())
     assert isinstance(result, _FakeResult)
+
+
+def test_strip_strict_from_tools_all_envelope_shapes() -> None:
+    """``strict`` is removed from flat, ``function``, and ``custom`` envelopes.
+
+    What breaks if this fails: the Databricks AI Gateway 400s tool-bearing turns
+    with ``tools.N.*.strict: Extra inputs are not permitted``.
+    """
+    tools = [
+        {"type": "function", "name": "flat", "strict": True},  # Responses wire
+        {"type": "function", "function": {"name": "nested", "strict": False}},  # Chat wire
+        {"type": "custom", "custom": {"name": "c", "strict": True}},
+    ]
+    out = _strip_strict_from_tools(tools)
+    assert out == [
+        {"type": "function", "name": "flat"},
+        {"type": "function", "function": {"name": "nested"}},
+        {"type": "custom", "custom": {"name": "c"}},
+    ]
+
+
+def test_strip_strict_does_not_mutate_caller_or_parameters() -> None:
+    """Caller tools are not aliased, and a ``strict`` property inside a JSON
+    Schema ``parameters`` is preserved (only the envelope is touched)."""
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "f",
+                "strict": True,
+                "parameters": {"type": "object", "properties": {"strict": {"type": "boolean"}}},
+            },
+        }
+    ]
+    out = _strip_strict_from_tools(tools)
+    # caller untouched
+    assert tools[0]["function"]["strict"] is True
+    # envelope strict gone, schema property named "strict" preserved
+    assert "strict" not in out[0]["function"]
+    assert out[0]["function"]["parameters"]["properties"]["strict"] == {"type": "boolean"}
+
+
+def test_strip_strict_passthrough_non_list_and_non_dict() -> None:
+    assert _strip_strict_from_tools(None) is None
+    sentinel = object()
+    assert _strip_strict_from_tools([sentinel]) == [sentinel]
+
+
+def test_databricks_tool_strip_wraps_both_wires() -> None:
+    """The Databricks client wrapper strips ``strict`` on chat AND responses."""
+    chat_completions = _RecordingResource()
+    responses_resource = _RecordingResource()
+
+    # Build the fake client with instance attributes set in ``__init__`` (a real
+    # closure scope) rather than class-body assignments — a class body does not
+    # see enclosing-function locals when the name is also assigned there.
+    class _Chat:
+        def __init__(self) -> None:
+            self.completions = chat_completions
+
+    class _Client:
+        def __init__(self) -> None:
+            self.base_url = "https://x.databricks.com/ai-gateway/openai/v1"
+            self.chat = _Chat()
+            self.responses = responses_resource
+
+    tools = [{"type": "function", "function": {"name": "f", "strict": False}}]
+
+    async def _run_inner() -> None:
+        client = _Client()
+        _wrap_client_for_databricks_tools(client)
+        await client.chat.completions.create(tools=list(tools), stream=False)
+        await client.responses.create(tools=list(tools))
+
+    _run(_run_inner())
+    for rec in (chat_completions, responses_resource):
+        assert rec.seen is not None
+        assert rec.seen["tools"] == [{"type": "function", "function": {"name": "f"}}]
+
+
+class _RecordingResource:
+    def __init__(self) -> None:
+        self.seen: dict | None = None
+
+    async def create(self, **kwargs) -> object:
+        self.seen = kwargs
+        return kwargs.get("_result", "ok")
+
+    def __getattr__(self, name: str) -> object:
+        raise AttributeError(name)
+
+
+def _fake_async_client(base_url: str) -> object:
+    completions = _RecordingResource()
+    responses = _RecordingResource()
+
+    class _Chat:
+        def __init__(self) -> None:
+            self.completions = completions
+
+        def __getattr__(self, name: str) -> object:
+            raise AttributeError(name)
+
+    class _Client:
+        def __init__(self) -> None:
+            self.base_url = base_url
+            self.chat = _Chat()
+            self.responses = responses
+
+    return _Client()
+
+
+def test_executor_installs_strip_proxy_only_for_gateway() -> None:
+    """The executor wraps the client for `/ai-gateway/` and leaves it alone otherwise.
+
+    What breaks if this fails: either tool-bearing gateway turns 400 on `strict`,
+    or non-gateway OpenAI traffic loses Structured-Outputs `strict` enforcement.
+    """
+    gw = OpenAIAgentsSDKExecutor(
+        client=_fake_async_client("https://x.databricks.com/ai-gateway/openai/v1"),
+        use_responses=True,  # skip the reasoning wrapper to assert proxy identity directly
+    )
+    assert isinstance(gw._client.chat.completions, _DatabricksToolStripResource)
+    assert isinstance(gw._client.responses, _DatabricksToolStripResource)
+    assert gw._databricks is True
+
+    plain = OpenAIAgentsSDKExecutor(
+        client=_fake_async_client("https://api.openai.com/v1"),
+        use_responses=True,
+    )
+    assert not isinstance(plain._client.chat.completions, _DatabricksToolStripResource)
+    assert plain._databricks is False
+
+
+def test_databricks_strip_composes_with_reasoning_wrapper_and_stream() -> None:
+    """Strict-strip + reasoning-stream wrapping survive the nested proxy chain."""
+
+    class _ListDeltaChunk:
+        def __init__(self) -> None:
+            self.choices = [types.SimpleNamespace(delta=types.SimpleNamespace(content=[{"x": 1}]))]
+
+    async def _fake_stream():
+        yield _ListDeltaChunk()
+
+    completions = _RecordingResource()
+
+    async def _create(**kwargs):
+        completions.seen = kwargs
+        return _fake_stream()
+
+    completions.create = _create  # type: ignore[method-assign]
+
+    class _Chat:
+        def __init__(self) -> None:
+            self.completions = completions
+
+    class _Client:
+        def __init__(self) -> None:
+            self.base_url = "https://x.databricks.com/ai-gateway/openai/v1"
+            self.chat = _Chat()
+            self.responses = _RecordingResource()
+
+    async def _run_inner():
+        client = _Client()
+        _wrap_client_for_databricks_tools(client)
+        _wrap_client_for_reasoning_models(client)
+        result = await client.chat.completions.create(
+            tools=[{"type": "function", "function": {"name": "f", "strict": True}}],
+            stream=True,
+        )
+        return result, completions.seen
+
+    result, seen = _run(_run_inner())
+    # strict stripped before the underlying create saw it
+    assert seen["tools"] == [{"type": "function", "function": {"name": "f"}}]
+    # reasoning wrapper still wrapped the stream
+    assert isinstance(result, _ReasoningBlockFilterStream)
 
 
 class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
