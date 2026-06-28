@@ -41,6 +41,7 @@ class SqlAlchemyEntityStore(EntityStore):
         title: str,
         instruction: str,
         created_by: str | None = None,
+        group_id: str | None = None,
     ) -> Entity:
         """Create a new entity. See :meth:`EntityStore.create_entity`."""
         ts = now_epoch()
@@ -51,6 +52,7 @@ class SqlAlchemyEntityStore(EntityStore):
             title=title,
             instruction=instruction,
             created_by=created_by,
+            group_id=group_id,
         )
         with self._session() as session:
             session.add(row)
@@ -79,6 +81,7 @@ class SqlAlchemyEntityStore(EntityStore):
         *,
         title: str | None = None,
         instruction: str | None = None,
+        group_id: str | None = None,
     ) -> Entity | None:
         """Patch an entity and bump ``updated_at``. See :meth:`EntityStore.update_entity`."""
         with self._session() as session:
@@ -89,6 +92,9 @@ class SqlAlchemyEntityStore(EntityStore):
                 row.title = title
             if instruction is not None:
                 row.instruction = instruction
+            # Empty string clears the group (ungrouped); None leaves it unchanged.
+            if group_id is not None:
+                row.group_id = group_id or None
             row.updated_at = now_epoch()
             return sql_entity_to_entity(row)
 

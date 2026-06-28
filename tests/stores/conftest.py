@@ -11,6 +11,8 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.entity_group_store.sqlalchemy_store import SqlAlchemyEntityGroupStore
+from omnigent.stores.entity_store.sqlalchemy_store import SqlAlchemyEntityStore
 from omnigent.stores.job_store.sqlalchemy_store import SqlAlchemyJobStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
@@ -45,6 +47,22 @@ def job_store(db_uri: str) -> SqlAlchemyJobStore:
     :returns: A SqlAlchemyJobStore backed by the test database.
     """
     return SqlAlchemyJobStore(db_uri)
+
+
+@pytest.fixture()
+def entity_store(db_uri: str) -> SqlAlchemyEntityStore:
+    """
+    :returns: A SqlAlchemyEntityStore backed by the test database.
+    """
+    return SqlAlchemyEntityStore(db_uri)
+
+
+@pytest.fixture()
+def entity_group_store(db_uri: str) -> SqlAlchemyEntityGroupStore:
+    """
+    :returns: A SqlAlchemyEntityGroupStore backed by the test database.
+    """
+    return SqlAlchemyEntityGroupStore(db_uri)
 
 
 @pytest.fixture()

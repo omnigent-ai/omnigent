@@ -3800,6 +3800,7 @@ class EntityCreateRequest(BaseModel):
 
     title: str = Field(min_length=1, max_length=256)
     instruction: str = ""
+    group_id: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3811,10 +3812,13 @@ class EntityUpdateRequest(BaseModel):
 
     :param title: New entity title.
     :param instruction: New instruction text.
+    :param group_id: New owning group id; the empty string moves the entity to
+        ungrouped. ``None`` leaves it unchanged.
     """
 
     title: str | None = Field(default=None, min_length=1, max_length=256)
     instruction: str | None = None
+    group_id: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3827,6 +3831,8 @@ class EntityResponse(BaseModel):
     :param object: Always ``"entity"``.
     :param title: Human-readable title.
     :param instruction: Instruction text folded into a flow when used.
+    :param group_id: Owning group id, or ``None`` if ungrouped.
+    :param is_builtin: Whether this is a read-only code-owned built-in.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of the last update.
     """
@@ -3835,6 +3841,61 @@ class EntityResponse(BaseModel):
     object: str = "entity"
     title: str
     instruction: str
+    group_id: str | None = None
+    is_builtin: bool = False
+    created_at: int
+    updated_at: int
+
+
+class EntityGroupCreateRequest(BaseModel):
+    """
+    Request body for ``POST /v1/entity-groups``.
+
+    :param name: Human-readable group name.
+    :param icon_key: Optional bundled-icon key (normally unset; user groups
+        upload an icon image instead).
+    """
+
+    name: str = Field(min_length=1, max_length=256)
+    icon_key: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class EntityGroupUpdateRequest(BaseModel):
+    """
+    Request body for ``PATCH /v1/entity-groups/{id}``. All fields optional.
+
+    :param name: New group name.
+    :param icon_key: New bundled-icon key.
+    """
+
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    icon_key: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class EntityGroupResponse(BaseModel):
+    """
+    An entity group as returned by the entity-groups endpoints.
+
+    :param id: Unique group identifier, e.g. ``"grp_abc123"``.
+    :param object: Always ``"entity_group"``.
+    :param name: Human-readable group name.
+    :param icon_key: Bundled-icon key for built-ins, else ``None``.
+    :param icon_url: URL serving an uploaded custom icon, or ``None``.
+    :param is_builtin: Whether this is a read-only code-owned built-in group.
+    :param created_at: Unix epoch seconds of creation.
+    :param updated_at: Unix epoch seconds of the last update.
+    """
+
+    id: str
+    object: str = "entity_group"
+    name: str
+    icon_key: str | None = None
+    icon_url: str | None = None
+    is_builtin: bool = False
     created_at: int
     updated_at: int
 

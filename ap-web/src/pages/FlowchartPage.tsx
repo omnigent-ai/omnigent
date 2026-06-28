@@ -55,7 +55,13 @@ import {
 import { runJob, updateJob, useJob, type Run } from "@/lib/jobsStore";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
-import { useActionCatalog, type ActionDef, type ActionGroup } from "@/lib/actionCatalog";
+import { getIconComponent } from "@/components/icons/iconRegistry";
+import {
+  useActionCatalog,
+  type ActionDef,
+  type ActionGroup,
+  type ActionGroupIcon,
+} from "@/lib/actionCatalog";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -73,6 +79,20 @@ const KIND_META: Record<FlowNodeType, { tag: string; box: string; chip: string }
 // "+" add control — click reveals the addable box types plus any predefined
 // action groups (from the catalog), pick one to append.
 // ---------------------------------------------------------------------------
+/**
+ * Renders a group's icon — a bundled brand component (built-in groups, by key)
+ * or an uploaded image (custom groups, by URL). Falls back to nothing when the
+ * group has no icon (e.g. the plain "Entities" / "Jobs" groups).
+ */
+function ActionIcon({ icon, className }: { icon?: ActionGroupIcon; className?: string }) {
+  if (!icon) return null;
+  if (icon.kind === "component") {
+    const Cmp = getIconComponent(icon.key);
+    return Cmp ? <Cmp className={cn("shrink-0", className)} /> : null;
+  }
+  return <img src={icon.url} alt="" className={cn("shrink-0 object-contain", className)} />;
+}
+
 function AddStep({
   onPick,
   onPickAction,
@@ -125,7 +145,8 @@ function AddStep({
       ) : (
         groups.map((group) => (
           <div key={group.id} className="border-t border-border pt-1">
-            <div className="px-2 py-0.5 text-[10px] font-bold tracking-wide text-muted-foreground uppercase">
+            <div className="flex items-center gap-1.5 px-2 py-0.5 text-[10px] font-bold tracking-wide text-muted-foreground uppercase">
+              <ActionIcon icon={group.icon} className="size-3" />
               {group.name}
             </div>
             {group.actions.map((action) => (
@@ -137,8 +158,9 @@ function AddStep({
                   onPickAction(action, group);
                   setOpen(false);
                 }}
-                className="w-full rounded-md px-2 py-1 text-left text-sm hover:bg-muted"
+                className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-sm hover:bg-muted"
               >
+                <ActionIcon icon={group.icon} className="size-3.5 text-muted-foreground" />
                 {action.label}
               </button>
             ))}

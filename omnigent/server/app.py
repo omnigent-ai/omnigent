@@ -55,6 +55,7 @@ from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.entities import create_entities_router
+from omnigent.server.routes.entity_groups import create_entity_groups_router
 from omnigent.server.routes.jobs import create_jobs_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
@@ -75,6 +76,7 @@ from omnigent.stores import (
 )
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import SessionConnectivity
+from omnigent.stores.entity_group_store import EntityGroupStore
 from omnigent.stores.entity_store import EntityStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.job_store import JobStore
@@ -983,6 +985,7 @@ def create_app(
     host_store: HostStore | None = None,
     job_store: JobStore | None = None,
     entity_store: EntityStore | None = None,
+    entity_group_store: EntityGroupStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
     extra_routers: list[tuple[Any, str, list[str]]] | None = None,
     policy_modules: list[str] | None = None,
@@ -1853,6 +1856,20 @@ def create_app(
             ),
             prefix="/v1",
             tags=["entities"],
+        )
+    if entity_group_store is not None:
+        # Entity groups: named, icon-bearing categories for entities (built-in
+        # Jira/GitHub groups are merged in by the router). Custom group icons
+        # are stored in the artifact store and served by the router.
+        app.include_router(
+            create_entity_groups_router(
+                entity_group_store,
+                artifact_store,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["entity-groups"],
         )
     # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
     # Successor to the removed GET /api/agents list; lists only
