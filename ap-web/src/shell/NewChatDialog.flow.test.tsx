@@ -135,6 +135,15 @@ async function waitForWorkspaceSeed(): Promise<void> {
   );
 }
 
+/**
+ * Flush the deferred isComposing reset queued by compositionend. In real
+ * browsers the reset lands within ~one macrotask; in jsdom we await a 0ms
+ * timeout to model that gap before firing the next deliberate Enter. #433.
+ */
+async function flushCompositionReset(): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
 /** Open the git-worktree popover so its branch fields mount. */
 function openWorktree(): void {
   fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
@@ -266,7 +275,40 @@ describe("NewChatLandingScreen create flow", () => {
     expect(authenticatedFetch).not.toHaveBeenCalled();
     expect(navigateMock).not.toHaveBeenCalled();
 
+    // compositionend defers the isComposing reset to the next macrotask so the
+    // Safari confirming Enter (next test) still observes composition active.
+    // Here the confirming Enter already fired mid-composition above; the next
+    // Enter is a deliberate create, but only once the deferred reset flushes.
     fireEvent.compositionEnd(input);
+    await flushCompositionReset();
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("does not create a session when Safari fires the confirming Enter after compositionend (#433)", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "オムニジェント" } });
+
+    // Safari order: compositionend BEFORE the confirming keydown, which reports
+    // isComposing=false / keyCode=13 (not the 229 fallback) — the #132 guard
+    // misses it. The deferred reset keeps isComposing true through this keydown.
+    fireEvent.compositionEnd(input);
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(navigateMock).not.toHaveBeenCalled();
+
+    // After the deferred reset flushes, a deliberate Enter creates the session.
+    await flushCompositionReset();
     fireEvent.keyDown(input, { key: "Enter" });
 
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));

@@ -55,6 +55,15 @@ function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
 
+/**
+ * Flush the deferred isComposing reset queued by compositionend. In real
+ * browsers the reset lands within ~one macrotask; in jsdom we await a 0ms
+ * timeout to model that gap before firing the next deliberate Enter. #433.
+ */
+async function flushCompositionReset() {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
 describe("Composer slash-command menu", () => {
   beforeEach(() => {
     // Two skills so the menu has skill rows distinct from the built-ins.
@@ -121,7 +130,7 @@ describe("Composer slash-command menu", () => {
     expect(onSend).toHaveBeenCalledWith("hello there", undefined);
   });
 
-  it("does not send when Enter confirms active IME composition", () => {
+  it("does not send when Enter confirms active IME composition", async () => {
     const onSend = vi.fn();
     render(<Composer {...composerProps({ onSend })} />);
     const ta = textarea();
@@ -131,7 +140,32 @@ describe("Composer slash-command menu", () => {
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).not.toHaveBeenCalled();
 
+    // compositionend defers the isComposing reset to the next macrotask so the
+    // Safari confirming Enter (next test) still observes composition active.
+    // Here the confirming Enter already fired mid-composition above; the next
+    // Enter is a deliberate send, but only once the deferred reset flushes.
     fireEvent.compositionEnd(ta);
+    await flushCompositionReset();
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("オムニジェント", undefined);
+  });
+
+  it("does not send when Safari fires the confirming Enter after compositionend (#433)", async () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    const ta = textarea();
+    fireEvent.compositionStart(ta);
+    fireEvent.change(ta, { target: { value: "オムニジェント" } });
+
+    // Safari order: compositionend BEFORE the confirming keydown, which reports
+    // isComposing=false / keyCode=13 (not the 229 fallback) — the #132 guard
+    // misses it. The deferred reset keeps isComposing true through this keydown.
+    fireEvent.compositionEnd(ta);
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+
+    // After the deferred reset flushes, a deliberate Enter sends normally.
+    await flushCompositionReset();
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("オムニジェント", undefined);
   });
