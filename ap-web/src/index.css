@@ -3,6 +3,11 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist-mono";
+/* Geist Sans — opt-in interface font, selectable in Settings → Appearance →
+ * Fonts. Not the default: the default sans stack stays native (see --font-sans
+ * below). Applied by setting data-chat-font="geist" on <html>; see
+ * src/lib/chatFont.ts. */
+@import "@fontsource-variable/geist";
 
 /* Streamdown ships utility classes pre-compiled in its dist; this @source
  * pragma tells Tailwind v4 to scan those files so the classes survive the
@@ -687,6 +692,17 @@
   }
   html {
     @apply font-sans;
+  }
+  /* Opt-in interface font override. The default (no attribute) keeps the
+   * native system sans stack from --font-sans. When the user picks Geist in
+   * Settings → Appearance → Fonts, src/lib/chatFont.ts sets this attribute on
+   * <html>; the rule re-fronts the same stack with "Geist Variable" so all UI
+   * + chat text uses Geist while keeping the original system fallbacks. The
+   * mono stack (code blocks, terminal) is intentionally left untouched. */
+  html[data-chat-font="geist"] {
+    font-family:
+      "Geist Variable", ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji",
+      "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
   }
   /* Text selection — brand pink highlight. Light: gentle wash + dark pink
    * text. Dark: solid brand pink background + white text. */
