@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib
+import inspect
 import json
 import logging
 import time
@@ -114,6 +115,27 @@ _ToolCallable: TypeAlias = Callable[..., Awaitable[ToolResult]]  # type: ignore[
 ToolExecutor: TypeAlias = Callable[  # type: ignore[explicit-any]
     [str, dict[str, Any]], Awaitable[dict[str, Any]]
 ]
+
+
+def _tool_with_schema_cls() -> type:
+    """Return the SDK's ``ToolWithSchema`` wrapper class.
+
+    Resolved lazily (the optional ``google-antigravity`` package may be absent at
+    import time). ``ToolWithSchema(fn, input_schema=<dict>)`` carries the tool's
+    JSON Schema VERBATIM into the SDK: ``callable_to_tool_proto`` short-circuits
+    on it and emits ``parameters_json_schema=json.dumps(fn.input_schema)``,
+    preserving the exact ``required`` set, enums, nested objects, formats, and
+    descriptions — none of which survive the SDK's ``inspect.signature`` /
+    pydantic fallback for a bare callable.
+
+    :returns: The ``ToolWithSchema`` class from ``google.antigravity``.
+    :raises ImportError: If ``google-antigravity`` is not installed (surfaced on
+        the first turn, the same place the rest of the SDK is imported).
+    """
+    _ensure_antigravity_sdk()
+    from google.antigravity.tools.tool_runner import ToolWithSchema
+
+    return ToolWithSchema
 
 
 def _ensure_antigravity_sdk() -> ModuleType:
@@ -397,13 +419,27 @@ class AntigravityExecutor(Executor):
 
     @staticmethod
     def _tool_signature(tools: list[ToolSpec]) -> str:
-        """Stable cache key for a tool set (names only — enough to detect change).
+        """Stable cache key for the SDK tool-registration surface.
 
         :param tools: Omnigent tool specs for the turn.
-        :returns: Deterministic JSON string of the sorted tool names.
+        :returns: Deterministic JSON string of the registered tool declarations.
         """
-        names = sorted(str(tool.get("name", "")) for tool in tools)
-        return json.dumps(names, separators=(",", ":"))
+        declarations: list[_StrAnyDict] = []
+        for tool in tools:
+            name = tool.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            description = tool.get("description")
+            params = tool.get("parameters")
+            declarations.append(
+                {
+                    "name": name,
+                    "description": description if isinstance(description, str) else "",
+                    "parameters": params if isinstance(params, dict) else {},
+                }
+            )
+        declarations.sort(key=lambda item: str(item["name"]))
+        return json.dumps(declarations, sort_keys=True, separators=(",", ":"), default=str)
 
     async def close_session(self, session_key: str) -> None:
         """Close and drop the SDK agent for *session_key*, if any.
@@ -931,20 +967,28 @@ class AntigravityExecutor(Executor):
         return _OmnigentToolCompleteHook()
 
     def _build_sdk_tools(self, tools: list[ToolSpec]) -> list[SDKTool]:
-        """Build SDK tools (plain callables) from Omnigent tool specs.
+        """Build SDK tools from Omnigent tool specs as ``ToolWithSchema`` wrappers.
 
-        The SDK introspects each callable's ``__name__`` / ``__doc__`` for its
-        function declaration. Each routes through :attr:`_tool_executor`, so
-        the agent reaches Omnigent's tool registry under policy. Returns ``[]``
-        when there are no tools or no executor bridge yet (the agent then runs
-        with its native + MCP tools only).
+        Each tool's ToolSpec ``parameters`` JSON Schema is handed to the SDK
+        VERBATIM via ``ToolWithSchema(fn, input_schema=...)``, so the model sees
+        the exact schema Omnigent advertises — correct ``required`` set, enums,
+        nested objects, array item types, formats, and descriptions all preserved
+        (the SDK's ``callable_to_tool_proto`` emits ``json.dumps(fn.input_schema)``
+        directly for a ``ToolWithSchema``). This mirrors
+        ``cursor_executor._make_custom_tools(input_schema=...)``. Each wrapped
+        callable still routes invocations through :attr:`_tool_executor`, so the
+        agent reaches Omnigent's tool registry under policy.
+
+        Returns ``[]`` when there are no tools or no executor bridge yet (the
+        agent then runs with its native + MCP tools only).
 
         :param tools: Omnigent tool specs (``name`` / ``description`` /
             ``parameters``).
-        :returns: A list of named async callables, or ``[]``.
+        :returns: A list of ``ToolWithSchema`` instances, or ``[]``.
         """
         if not tools or self._tool_executor is None:
             return []
+        tool_with_schema_cls = _tool_with_schema_cls()
         sdk_tools: list[SDKTool] = []
         for tool in tools:
             name = tool.get("name")
@@ -952,16 +996,26 @@ class AntigravityExecutor(Executor):
                 continue
             description = tool.get("description")
             description = description if isinstance(description, str) else ""
-            sdk_tools.append(self._make_tool_callable(name, description))
+            params = tool.get("parameters")
+            # Hand the ToolSpec's parameter schema to the SDK verbatim. Fall back
+            # to an empty-object schema (mirrors cursor) when a spec omits it.
+            schema: _StrAnyDict = (
+                params if isinstance(params, dict) else {"type": "object", "properties": {}}
+            )
+            fn = self._make_tool_callable(name, description)
+            sdk_tools.append(tool_with_schema_cls(fn, input_schema=schema))
         return sdk_tools
 
     def _make_tool_callable(self, tool_name: str, description: str) -> _ToolCallable:
-        """Build a named async callable the SDK can register as a tool.
+        """Build a named async callable that bridges an SDK tool call to Omnigent.
 
         Accepts the SDK's arg shape (kwargs, a single dict, or a JSON string)
         and forwards to :attr:`_tool_executor`. Its ``__name__`` / ``__doc__``
-        are set so the SDK's function-declaration introspection picks up the
-        name and description.
+        are set so the wrapping ``ToolWithSchema`` carries the right name and
+        description to the SDK's function declaration; the argument schema is
+        supplied separately and losslessly via ``ToolWithSchema.input_schema``
+        (see :meth:`_build_sdk_tools`), not derived from this callable's
+        signature.
 
         :param tool_name: The Omnigent tool name, e.g. ``"sys_shell"``.
         :param description: Human-readable tool description for the model.
@@ -984,7 +1038,8 @@ class AntigravityExecutor(Executor):
                     tool_args = {"input": args[0]}
             return await self._tool_executor(tool_name, tool_args)
 
-        # The SDK builds the function declaration from these.
+        # ToolWithSchema copies these onto itself; the SDK reads name/description
+        # from the wrapper for the function declaration.
         _invoke.__name__ = tool_name
         _invoke.__qualname__ = tool_name
         _invoke.__doc__ = description or tool_name
@@ -1036,8 +1091,6 @@ class AntigravityExecutor(Executor):
         :returns: The set of accepted field names, or ``None`` when the
             signature can't be introspected.
         """
-        import inspect
-
         try:
             params = inspect.signature(config_cls).parameters
         except (TypeError, ValueError):
