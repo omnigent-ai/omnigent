@@ -391,3 +391,34 @@ def inject_user_message(
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = time.monotonic()
     raise RuntimeError("Kiro did not accept the submitted message; the draft is still visible")
+
+
+def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
+    """Cancel the in-flight Kiro turn by sending ``Escape`` to the pane.
+
+    The harness ``run_turn`` returns right after the paste, so the runner's
+    in-process cancel floor can't reach the turn — this is the analog of
+    :func:`inject_user_message` for the web UI's Stop button. ``Escape`` stops a
+    running Kiro turn and (verified against kiro-cli 2.10.0) leaves the composer
+    at an empty prompt, so no draft-clear is needed afterwards: unlike
+    cursor-native, Kiro does not restore the interrupted prompt. Mirrors
+    :func:`omnigent.goose_native_bridge.inject_interrupt`.
+
+    :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
+    """
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    # No ``-l``: tmux must interpret ``Escape`` as a key name.
+    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
+
+
+def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
+    """Hard-stop the Kiro session by killing its tmux session.
+
+    Terminates ``kiro-cli`` and the pane outright — the analog of the user
+    manually exiting the attached TUI, for the web UI's "Stop session"
+    affordance. Mirrors :func:`omnigent.goose_native_bridge.kill_session`.
+
+    :raises RuntimeError: If the tmux target is not advertised or kill-session fails.
+    """
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])

@@ -16638,3 +16638,130 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         await _drain_forwarder_runs(runs)
+
+
+async def test_events_interrupt_on_kiro_native_routes_to_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """interrupt on a kiro-native session sends Escape via the kiro bridge.
+
+    Regression for #1137: kiro-native had no entry in the interrupt dispatch
+    ladder, so the web Stop button fell through to the in-process cancel floor —
+    a no-op for a TUI turn the harness task already returned from — and silently
+    did nothing. This pins that the dispatch routes kiro-native to
+    ``kiro_native_bridge.inject_interrupt`` with the snappy 1.0s timeout.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    captured: list[Any] = []
+    monkeypatch.setattr(
+        kiro_native_bridge,
+        "inject_interrupt",
+        lambda bridge_dir, *, timeout_s: captured.append((bridge_dir, timeout_s)),
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_kiro_int", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        int_resp = await client.post(
+            "/v1/sessions/conv_kiro_int/events",
+            json={"type": "interrupt"},
+        )
+
+    assert int_resp.status_code == 204, int_resp.text
+    # 0 = the dispatch fell through to the generic path (the silent no-op bug);
+    # 2+ = the handler ran twice.
+    assert len(captured) == 1, (
+        f"Expected one inject_interrupt call, got {len(captured)}. If 0, the "
+        f"kiro-native interrupt dispatch entry is missing."
+    )
+    bridge_dir, timeout_s = captured[0]
+    assert bridge_dir == kiro_native_bridge.bridge_dir_for_session_id("conv_kiro_int")
+    assert timeout_s == 1.0
+
+
+async def test_events_stop_session_on_kiro_native_kills_tmux_and_publishes_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stop_session on a kiro-native session kills the tmux pane and clears the spinner.
+
+    Mirrors the goose/claude-native stop path: route to
+    ``kiro_native_bridge.kill_session`` and enqueue exactly one
+    ``session.status: idle`` (kiro-cli has no Stop hook on a hard kill).
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    captured: list[Any] = []
+    monkeypatch.setattr(
+        kiro_native_bridge,
+        "kill_session",
+        lambda bridge_dir, *, timeout_s: captured.append((bridge_dir, timeout_s)),
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_kiro_stop", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        stop_resp = await client.post(
+            "/v1/sessions/conv_kiro_stop/events",
+            json={"type": "stop_session"},
+        )
+        queue = _session_event_queues_ref.get("conv_kiro_stop")
+        queued_events: list[dict[str, Any]] = []
+        while queue is not None and not queue.empty():
+            item = queue.get_nowait()
+            if isinstance(item, dict):
+                queued_events.append(item)
+
+    assert stop_resp.status_code == 204, stop_resp.text
+    assert len(captured) == 1, (
+        f"Expected one kill_session call, got {len(captured)}. If 0, the "
+        f"kiro-native stop dispatch entry is missing."
+    )
+    bridge_dir, timeout_s = captured[0]
+    assert bridge_dir == kiro_native_bridge.bridge_dir_for_session_id("conv_kiro_stop")
+    assert timeout_s == 1.0
+    idle_events = [
+        e for e in queued_events if e.get("type") == "session.status" and e.get("status") == "idle"
+    ]
+    assert len(idle_events) == 1, f"stop must publish exactly one idle; got {queued_events!r}"

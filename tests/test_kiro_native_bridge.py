@@ -236,3 +236,39 @@ def test_draft_in_input_region_ignores_kiro_chrome_for_short_messages() -> None:
 
     assert not bridge._draft_in_input_region(pane_after_submit, "c", baseline)
     assert bridge._draft_in_input_region(pane_with_draft, "c", baseline)
+
+
+def test_inject_interrupt_sends_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interrupt cancels the running turn with a single Escape, nothing else.
+
+    Verified against kiro-cli 2.10.0: Escape stops generation and leaves an empty
+    composer, so (unlike cursor) there is no draft to clear afterwards.
+    """
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        bridge, "_wait_for_tmux_info", lambda *_a, **_k: {"socket_path": "/s", "tmux_target": "t"}
+    )
+    monkeypatch.setattr(bridge, "_run_tmux", lambda _sock, *args: calls.append(args))
+
+    bridge.inject_interrupt(tmp_path)
+
+    assert calls == [("send-keys", "-t", "t", "Escape")]
+
+
+def test_kill_session_kills_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hard-stop kills the tmux session (ends ``kiro-cli`` and the pane)."""
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        bridge, "_wait_for_tmux_info", lambda *_a, **_k: {"socket_path": "/s", "tmux_target": "t"}
+    )
+    monkeypatch.setattr(bridge, "_run_tmux", lambda _sock, *args: calls.append(args))
+
+    bridge.kill_session(tmp_path)
+
+    assert calls == [("kill-session", "-t", "t")]
