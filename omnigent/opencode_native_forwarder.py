@@ -63,6 +63,15 @@ _EXTERNAL_OUTPUT_REASONING_DELTA = "external_output_reasoning_delta"
 
 _STATUS_RUNNING = "running"
 _STATUS_IDLE = "idle"
+_STATUS_FAILED = "failed"
+
+# Appended to a failed edge's output when opencode reports a provider-auth
+# error so the web surface can prompt a re-auth (matches the codex-native
+# ``_CODEX_REAUTH_HINT`` phrasing; ``opencode auth login`` per
+# ``omnigent/onboarding/opencode_auth.py``).
+_OPENCODE_REAUTH_HINT = (
+    "OpenCode needs you to re-authenticate. Run `opencode auth login` and retry."
+)
 
 # Bound the dedupe set so a long-lived session can't grow it without limit.
 _MAX_DEDUPE_KEYS = 8192
@@ -324,9 +333,12 @@ class OpenCodeNativeForwarder:
             )
             return None
 
-    async def _post_status(self, status: str) -> None:
+    async def _post_status(self, status: str, *, extra: Mapping[str, Any] | None = None) -> None:
         """Publish a coarse session status edge."""
-        await self._post_event(_EXTERNAL_STATUS, {"status": status})
+        data: dict[str, Any] = {"status": status}
+        if extra:
+            data.update(extra)
+        await self._post_event(_EXTERNAL_STATUS, data)
 
     def _response_id(self, message_id: str | None) -> str:
         """Map an opencode assistant messageID to a per-turn ``response_id``.
@@ -405,8 +417,10 @@ class OpenCodeNativeForwarder:
             self.state.turn_active = True
             await self._post_status(_STATUS_RUNNING)
 
-    async def _end_turn(self) -> None:
-        """Post ``idle`` and clear active state at turn end."""
+    async def _end_turn(
+        self, *, status: str = _STATUS_IDLE, extra: Mapping[str, Any] | None = None
+    ) -> None:
+        """Post the terminal status (idle by default) and clear active state."""
         self.state.turn_active = False
         # Reasoning deltas are per-turn; drop the per-part offsets so the map
         # can't grow across a long-lived session (the next turn's reasoning
@@ -414,7 +428,7 @@ class OpenCodeNativeForwarder:
         self._reasoning_posted.clear()
         if self._bridge_dir is not None:
             update_active_message_id(self._bridge_dir, None, status="idle")
-        await self._post_status(_STATUS_IDLE)
+        await self._post_status(status, extra=extra)
 
     # --- per-event handlers ----------------------------------------------
 
@@ -727,14 +741,32 @@ class OpenCodeNativeForwarder:
         await self._post_event(_EXTERNAL_SESSION_USAGE, data)
 
     async def _on_session_error(self, event: OpenCodeEvent) -> None:
-        """Handle ``session.error`` — log, finalize, end turn."""
-        _logger.warning(
-            "OpenCode session error for session=%s: %s",
-            self._session_id,
-            event.properties.get("error"),
-        )
+        """Handle ``session.error`` — surface a failed (or re-auth) status edge.
+
+        opencode reports provider/auth failures as ``session.error`` with an
+        ``{name, data}`` error. Post ``external_session_status: failed`` with the
+        error message (and a re-auth hint for provider-auth errors) so the web UI
+        shows the failure instead of a silent idle. A ``MessageAbortedError`` is a
+        user interrupt, not a failure, so it takes the normal idle path.
+        """
+        error = event.properties.get("error")
+        _logger.warning("OpenCode session error for session=%s: %s", self._session_id, error)
         await self._flush_pending_text()
-        await self._end_turn()
+        name = error.get("name") if isinstance(error, Mapping) else None
+        data = error.get("data") if isinstance(error, Mapping) else None
+        if name == "MessageAbortedError":
+            await self._end_turn()
+            return
+        message = data.get("message") if isinstance(data, Mapping) else None
+        if not isinstance(message, str) or not message.strip():
+            message = "OpenCode session ended with an error."
+        status_code = data.get("statusCode") if isinstance(data, Mapping) else None
+        is_auth = name == "ProviderAuthError" or (name == "APIError" and status_code in (401, 403))
+        extra: dict[str, Any] = {"output": message.strip()}
+        if is_auth:
+            extra["output"] = f"{message.strip()}\n\n{_OPENCODE_REAUTH_HINT}"
+            extra["reauth_required"] = True
+        await self._end_turn(status=_STATUS_FAILED, extra=extra)
 
     async def _on_compaction_started(self, event: OpenCodeEvent) -> None:
         """Handle ``session.next.compaction.started`` (auto or manual).
