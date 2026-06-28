@@ -27,6 +27,7 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
+  type WorkspaceChangedFilesResult,
 } from "./useWorkspaceChangedFiles";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
@@ -907,5 +908,69 @@ describe("runnerOfflineRetryDelay", () => {
     expect(runnerOfflineRetryDelay(3)).toBe(8000);
     expect(runnerOfflineRetryDelay(4)).toBe(15_000);
     expect(runnerOfflineRetryDelay(10)).toBe(15_000);
+  });
+});
+
+describe("useWorkspaceChangedFiles tracking signal", () => {
+  function ChangedFilesDataProbe({
+    id,
+    onData,
+  }: {
+    id: string | undefined;
+    onData: (data: WorkspaceChangedFilesResult) => void;
+  }) {
+    const query = useWorkspaceChangedFiles(id);
+    useEffect(() => {
+      if (query.isSuccess) onData(query.data);
+    }, [query.isSuccess, query.data, onData]);
+    return null;
+  }
+
+  it("surfaces incomplete tracking with the non-git reason", async () => {
+    // A non-git workspace reports complete:false so the panel can warn that
+    // the (possibly empty) list misses CLI/shell/external edits.
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValueOnce(environmentResponse()).mockResolvedValueOnce(
+      jsonResponse({
+        object: "list",
+        data: [],
+        has_more: false,
+        tracking: { complete: false, reason: "non_git_workspace" },
+      }),
+    );
+
+    const seen: WorkspaceChangedFilesResult[] = [];
+    render(
+      <Wrap>
+        <ChangedFilesDataProbe id="conv_nongit" onData={(d) => seen.push(d)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+    const last = seen.at(-1) as WorkspaceChangedFilesResult;
+    expect(last.available).toBe(true);
+    expect(last.trackingComplete).toBe(false);
+    expect(last.trackingReason).toBe("non_git_workspace");
+  });
+
+  it("defaults to complete tracking when the runner omits the tracking field", async () => {
+    // Older runners don't send `tracking`; treat that as complete so no
+    // spurious "limited" notice appears against a server that can't report it.
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(jsonResponse({ object: "list", data: [], has_more: false }));
+
+    const seen: WorkspaceChangedFilesResult[] = [];
+    render(
+      <Wrap>
+        <ChangedFilesDataProbe id="conv_legacy" onData={(d) => seen.push(d)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+    const last = seen.at(-1) as WorkspaceChangedFilesResult;
+    expect(last.trackingComplete).toBe(true);
+    expect(last.trackingReason).toBeNull();
   });
 });

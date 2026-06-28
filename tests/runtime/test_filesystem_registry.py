@@ -705,6 +705,52 @@ def test_create_filesystem_registry_nested_git_workspace(tmp_path: Path) -> None
     )
 
 
+# ── change-tracking completeness ──────────────────────────────────────────────
+
+
+def test_git_registry_tracks_all_changes(tmp_path: Path) -> None:
+    """A git-backed registry reports complete tracking with no limit reason.
+
+    ``git status`` reflects every working-tree change regardless of which
+    process wrote it, so the changes panel needs no caveat.  Failure means the
+    UI would wrongly show a "tracking limited" notice for git workspaces.
+    """
+    registry = GitFilesystemRegistry(tmp_path, tmp_path)
+    assert registry.tracks_all_changes is True
+    assert registry.tracking_limit_reason is None
+
+
+def test_agent_edit_registry_tracking_is_limited(tmp_path: Path) -> None:
+    """A non-git registry reports incomplete tracking with the non-git reason.
+
+    Only edits routed through ``record_change`` are visible, so native-CLI,
+    shell, and external writes are missed.  Failure means a non-git workspace's
+    necessarily-partial list would read as a definitive "no changes".
+    """
+    registry = AgentEditFilesystemRegistry(tmp_path)
+    assert registry.tracks_all_changes is False
+    assert registry.tracking_limit_reason == "non_git_workspace"
+
+
+def test_factory_tracking_mode_matches_workspace_kind(tmp_path: Path) -> None:
+    """The factory yields a registry whose tracking flags match the workspace.
+
+    Git workspace → complete; plain dir → limited with the non-git reason.
+    Failure means the endpoint would mislabel the tracking completeness.
+    """
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    plain_registry = create_filesystem_registry(plain)
+    assert plain_registry.tracks_all_changes is False
+    assert plain_registry.tracking_limit_reason == "non_git_workspace"
+
+    git_ws = tmp_path / "repo"
+    (git_ws / ".git").mkdir(parents=True)
+    git_registry = create_filesystem_registry(git_ws)
+    assert git_registry.tracks_all_changes is True
+    assert git_registry.tracking_limit_reason is None
+
+
 # ── _parse_git_porcelain_line ─────────────────────────────────────────────────
 
 
