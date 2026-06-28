@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, TypeVar
+from urllib.parse import urlparse
 
 from anyio.streams.memory import (
     MemoryObjectReceiveStream,
@@ -339,6 +340,23 @@ _discovery_cache: TTLCache[str, list[McpToolDef]] = TTLCache(
     maxsize=_DEFAULT_CACHE_MAX_SIZE,
     ttl=_DEFAULT_CACHE_TTL_SECONDS,
 )
+
+
+def _is_sse_endpoint(url: str) -> bool:
+    """
+    Whether an HTTP MCP URL points at a legacy SSE endpoint.
+
+    True when the URL path's last segment is ``sse`` (e.g.
+    ``http://host/mcp/sse`` or a bare ``/sse``). Such servers speak
+    only the legacy SSE transport; the Streamable HTTP client hangs in
+    teardown when pointed at them, so :meth:`_open_http_transport`
+    routes these straight to the SSE client instead of trying — and
+    hanging on — Streamable HTTP first.
+
+    :param url: The configured MCP server URL.
+    :returns: ``True`` for an ``…/sse`` path, ``False`` otherwise.
+    """
+    return urlparse(url).path.rstrip("/").endswith("/sse")
 
 
 def _cache_key(config: MCPServerConfig, cwd: Path | None = None) -> str:
@@ -876,6 +894,12 @@ class McpServerConnection:
             )
         timeout = self.config.timeout
         headers = self._resolve_http_headers()
+        if _is_sse_endpoint(self.config.url):
+            # Legacy-SSE servers (e.g. crawl4ai's /mcp/sse) hang the
+            # Streamable HTTP client in teardown, which would block the
+            # except-clause SSE fallback below from ever running. Route
+            # straight to SSE.
+            return await self._open_sse_transport(stack, timeout, headers)
         try:
             return await self._open_streamable_http_transport(stack, timeout, headers)
         except Exception as exc:
