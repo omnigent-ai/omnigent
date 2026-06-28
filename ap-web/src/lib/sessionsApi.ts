@@ -206,6 +206,12 @@ interface SessionResponseWire {
    * `omnigent.server.schemas.SandboxStatus`.
    */
   sandbox_status?: SandboxStatus | null;
+  /**
+   * Response id of the turn currently in flight, or absent/null when
+   * idle. Lets a client reconnecting mid-turn reopen a streaming
+   * `activeResponse` (the turn-start `running` SSE edge is not replayed).
+   */
+  active_response_id?: string | null;
 }
 
 interface SessionItemsResponseWire {
@@ -291,6 +297,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     codexModelOptions: wire.model_options ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
+    activeResponseId: wire.active_response_id ?? null,
   };
 }
 
