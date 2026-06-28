@@ -521,13 +521,97 @@ describe("AgentPicker trigger label", () => {
     expect(within(trigger).getByText("High")).toHaveClass("text-muted-foreground");
   });
 
+  it("shows the inherited Claude default effort on the trigger", () => {
+    // Issue #1463: a fresh claude-native session has no explicit effort
+    // override, but the effective default is still Medium and must be visible
+    // up front instead of leaving the trigger as model-only.
+    useChatStore.setState({
+      selectedModel: null,
+      selectedEffort: null,
+      llmModel: "claude-sonnet-4-6",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+        })}
+      />,
+    );
+
+    const trigger = screen.getByTestId("agent-picker-trigger");
+    expect(trigger).toHaveTextContent("Sonnet");
+    expect(trigger).toHaveTextContent("Medium");
+    expect(trigger).not.toHaveTextContent("Claude");
+  });
+
+  it("falls back to Claude's default model and effort before the snapshot model resolves", () => {
+    // The issue calls out the pre-hydration/default path too: no explicit
+    // override and no llmModel yet should still read as the effective Claude
+    // defaults, not as "Claude", "Model", or effort-only.
+    useChatStore.setState({ selectedModel: null, selectedEffort: null, llmModel: null });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+        })}
+      />,
+    );
+
+    const trigger = screen.getByTestId("agent-picker-trigger");
+    expect(trigger).toHaveTextContent("Sonnet");
+    expect(trigger).toHaveTextContent("Medium");
+    expect(trigger).not.toHaveTextContent("Claude");
+  });
+
+  it("marks the active model and inherited default effort in the dropdown", () => {
+    // A background tint alone is easy to miss and was indistinguishable from
+    // hover. The current model/effort rows need an explicit readable marker,
+    // including the inherited default effort before any override is set.
+    useChatStore.setState({
+      selectedModel: null,
+      selectedEffort: null,
+      llmModel: null,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+        })}
+      />,
+    );
+
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/model " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    const sonnet = screen
+      .getAllByTestId("model-picker-item")
+      .find((item) => item.getAttribute("data-model-id") === "sonnet");
+    expect(sonnet).toHaveAttribute("data-active", "true");
+    expect(within(sonnet!).getByText("Current")).toBeInTheDocument();
+
+    const medium = screen
+      .getAllByTestId("effort-picker-item")
+      .find((item) => item.getAttribute("data-effort-level") === "medium");
+    expect(medium).toHaveAttribute("data-active", "true");
+    expect(within(medium!).getByText("Current")).toBeInTheDocument();
+  });
+
   it("still renders an enabled trigger when the model/effort label is unresolved", () => {
     // Regression guard: a claude-native session before the snapshot fills
-    // llmModel/selectedEffort has no model label, no effort label, and no
-    // agent switcher — but CLAUDE_NATIVE_MODELS still gives the dropdown
-    // model rows to switch (hasPickerActions). The trigger must NOT vanish
-    // (which would also take the model dropdown and the bare-`/model` path
-    // with it); it falls back to a stable identity label and stays enabled.
+    // llmModel/selectedEffort still has static Claude model rows to switch.
+    // The trigger must NOT vanish (which would also take the model dropdown
+    // and the bare-`/model` path with it); it now surfaces Claude's effective
+    // default model when the live snapshot has not resolved yet.
     useChatStore.setState({ selectedModel: null, selectedEffort: null, llmModel: null });
     renderWithTooltips(
       <Composer
@@ -545,8 +629,9 @@ describe("AgentPicker trigger label", () => {
     // Enabled because there are still model rows to switch — so the dropdown
     // (and the bare-`/model` open path) stays reachable.
     expect(trigger).toBeEnabled();
-    // Falls back to the bound agent's display label rather than rendering empty.
-    expect(trigger).toHaveTextContent("Claude");
+    // Uses Claude's default model instead of falling back to the harness name.
+    expect(trigger).toHaveTextContent("Sonnet");
+    expect(trigger).not.toHaveTextContent("Claude");
   });
 
   it("surfaces a cursor-native session's model from the override, not the cross-session sticky", () => {
