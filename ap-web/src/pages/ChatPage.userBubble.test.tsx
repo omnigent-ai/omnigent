@@ -101,6 +101,29 @@ describe("UserBubble markdown rendering", () => {
   });
 });
 
+describe("UserBubble queued badge", () => {
+  it("shows a 'Queued' badge for a queued pending bubble", () => {
+    renderBubble(userBubble("hi there", { queued: true }));
+    const badge = screen.getByTestId("message-delivery-status");
+    expect(badge).toHaveAttribute("data-delivery-status", "queued");
+    expect(badge).toHaveTextContent("Queued");
+  });
+
+  it("shows no badge for a plain (non-queued) bubble — including after pickup promotes it", () => {
+    // A committed bubble carries no `queued`, so drop-on-pickup falls out
+    // for free: once the consume event promotes the optimistic entry, the
+    // bubble renders here with no badge.
+    renderBubble(userBubble("hi there"));
+    expect(screen.queryByTestId("message-delivery-status")).toBeNull();
+  });
+
+  it("shows no badge on a [System: ...] notification even if flagged queued", () => {
+    // System markers swap to the muted SystemMessageView before any badge.
+    renderBubble(userBubble("[System: task done]", { queued: true }));
+    expect(screen.queryByTestId("message-delivery-status")).toBeNull();
+  });
+});
+
 describe("AssistantBubble lifecycle rendering", () => {
   it("shows an interrupted indicator for cancelled assistant bubbles", () => {
     renderBubble(assistantBubble("cancelled"));

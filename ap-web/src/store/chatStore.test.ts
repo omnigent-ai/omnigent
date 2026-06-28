@@ -2413,6 +2413,86 @@ describe("chatStore — send (cross-session routing)", () => {
   });
 });
 
+describe("chatStore — queued delivery badge", () => {
+  it("stamps queued=true on a send made while a turn is already streaming", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "streaming",
+    });
+
+    await useChatStore.getState().send("queue me", "agent_xyz");
+
+    const pending = useChatStore.getState().pendingUserMessages;
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.queued).toBe(true);
+  });
+
+  it("leaves queued unset on a send made while fully idle", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+    });
+
+    await useChatStore.getState().send("start now", "agent_xyz");
+
+    const pending = useChatStore.getState().pendingUserMessages;
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.queued).toBeUndefined();
+  });
+
+  it("stamps queued=true when the server loop is busy but local status is idle (waiting drain)", async () => {
+    // The streaming response ended (local `status` back to "idle") but the
+    // agent loop is parked on background-tool/sub-agent drain. The message
+    // is still queued into the running task, so the badge must show it —
+    // this is the case the local flag alone misses.
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "waiting",
+    });
+
+    await useChatStore.getState().send("queue behind drain", "agent_xyz");
+
+    const pending = useChatStore.getState().pendingUserMessages;
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.queued).toBe(true);
+  });
+
+  it("drops the queued badge when the agent picks the message up (consume → promote)", async () => {
+    // Drop-on-pickup: the "Queued" flag rides only on the optimistic
+    // pending entry. Its session.input.consumed event promotes it into
+    // `blocks` as a committed bubble, which carries no `queued` — so the
+    // badge vanishes on pickup with no extra state to track.
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "streaming",
+    });
+
+    await useChatStore.getState().send("queue me", "agent_xyz");
+    expect(useChatStore.getState().pendingUserMessages[0]!.queued).toBe(true);
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "msg_q_1",
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "queue me" }] },
+    });
+
+    const state = useChatStore.getState();
+    // Pending entry (and its queued flag) is gone; the promoted committed
+    // bubble carries no queued state.
+    expect(state.pendingUserMessages).toEqual([]);
+    const promoted = state.blocks.find((b) => b.type === "user_message") as UserMessageBlock;
+    expect(promoted).toBeDefined();
+    expect("queued" in promoted).toBe(false);
+  });
+});
+
 describe("chatStore — send (file attachments)", () => {
   it("refreshes the pending entry with real file_ids after upload", async () => {
     // Claude-native's session.input.consumed is text-only, so the

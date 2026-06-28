@@ -1436,6 +1436,17 @@ describe("bubblesEqual — React.memo comparator", () => {
     expect(bubblesEqual(none, alice)).toBe(false);
     expect(bubblesEqual(alice, alice)).toBe(true);
   });
+
+  it("reports not-equal when a user bubble's queued flag differs", () => {
+    // The "Queued" badge derives from this flag, so toggling it (queued →
+    // committed) must repaint. Without the queued compare, the memo would
+    // skip the re-render and the badge would linger.
+    const content: MessageContentBlock[] = [{ type: "input_text", text: "Hello" }];
+    const queued: Bubble = { kind: "user", itemId: "u1", content, queued: true };
+    const plain: Bubble = { kind: "user", itemId: "u1", content };
+    expect(bubblesEqual(queued, plain)).toBe(false);
+    expect(bubblesEqual(queued, queued)).toBe(true);
+  });
 });
 
 describe("buildBubbles — incremental reuse cache", () => {

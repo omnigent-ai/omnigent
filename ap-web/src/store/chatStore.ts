@@ -141,6 +141,19 @@ export interface PendingUserMessage {
    * on snapshot-replayed entries (they're already server-owned).
    */
   posted?: boolean;
+  /**
+   * True when this send's POST went out while the agent was already busy
+   * at submit time — either a turn was streaming locally
+   * (`status === "streaming"`) or the server reported the loop
+   * `running`/`waiting` (the latter covers an agent parked on
+   * background-tool/sub-agent drain, which the local flag can't see). In
+   * that case the session API queues the message into the running task's
+   * inbox instead of starting a turn. Drives the "Queued" bubble badge
+   * until the agent drains it (its `session.input.consumed` event).
+   * Deliberately unset for snapshot-replayed entries (a reconnected
+   * viewer must not show a stuck "Queued") and slash echoes.
+   */
+  queued?: boolean;
 }
 
 /**
@@ -750,6 +763,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ status: "streaming", activeResponse: null });
     }
 
+    // Whether this send is being queued into a turn that's already in
+    // progress (vs. starting a fresh turn). Drives the "Queued" badge.
+    // The local `status` flag covers the synchronous case AND the brief
+    // window after a send before the server confirms `running`; the
+    // server `sessionStatus` additionally covers `waiting` — the agent
+    // parked on background-tool/sub-agent drain, where the streaming
+    // response has ended (local `status` back to `idle`) but the loop is
+    // still busy and the message will still be queued. (Mirror of
+    // `computeIsWorking`, inlined to avoid a ChatPage import cycle.)
+    const serverBusy = (() => {
+      const ss = get().sessionStatus;
+      return ss === "running" || ss === "waiting";
+    })();
+    const isQueuedSend = alreadyStreaming || serverBusy;
+
     // Push to `pendingUserMessages` BEFORE the POST so the bubble
     // renders immediately AND so `session.input.consumed` finds an
     // entry to promote even if the SSE event races ahead of the POST
@@ -772,7 +800,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((s) => ({
       pendingUserMessages: [
         ...s.pendingUserMessages,
-        { tempId, content, ...(selfAuthor !== null ? { author: selfAuthor } : {}) },
+        {
+          tempId,
+          content,
+          ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+          // Sent into a turn that's already running (or an agent parked on
+          // background-work drain) → the server queues it into the running
+          // task's inbox. Surface that as a "Queued" badge until its
+          // consumed event drains it.
+          ...(isQueuedSend ? { queued: true } : {}),
+        },
       ],
     }));
 
@@ -3646,6 +3683,9 @@ export function handleSessionEvent(event: StreamEvent): void {
       //      the drop and strand the bubble as a duplicate.
       //   3. No pending entry — render the event payload as a fresh
       //      committed bubble (TUI-typed message, or another client).
+      // The "Queued" badge rides on the optimistic pending entry; promoting
+      // it into `blocks` here drops the entry, so the badge disappears the
+      // moment the agent picks the message up — no extra state needed.
       useChatStore.setState((s) => {
         if (hasCommittedItem(s.blocks, event.itemId)) return {};
 

@@ -131,6 +131,13 @@ export type Bubble =
        * optimistic→committed swap (no remount/flink).
        */
       stableKey?: string;
+      /**
+       * True when this (still-optimistic) message was POSTed while a turn
+       * was already streaming, so the server queued it into the running
+       * task's inbox rather than starting a turn. Drives the "Queued"
+       * bubble badge. Unset once the message is committed.
+       */
+      queued?: boolean;
     }
   | {
       kind: "assistant";
@@ -891,6 +898,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.itemId !== b.itemId ||
       a.createdBy !== b.createdBy ||
       a.stableKey !== b.stableKey ||
+      a.queued !== b.queued ||
       a.content.length !== b.content.length
     )
       return false;

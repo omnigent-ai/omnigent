@@ -18,6 +18,7 @@ import {
   CheckIcon,
   AlertTriangleIcon,
   ChevronDownIcon,
+  ClockIcon,
   CornerUpLeftIcon,
   CopyIcon,
   FileTextIcon,
@@ -247,6 +248,7 @@ export function buildPendingBubbles(
       itemId: p.tempId,
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
+      ...(p.queued ? { queued: true } : {}),
     };
   });
 }
@@ -2698,6 +2700,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
+  // "Queued": the message was POSTed while the agent was busy, so it waits
+  // in the running task's inbox. The flag rides on the optimistic pending
+  // entry; when the agent picks the message up its `session.input.consumed`
+  // event promotes the bubble into committed history (which carries no
+  // `queued`), so the badge simply disappears — no pickup signal needed.
+  const queued = bubble.queued === true;
   return (
     <Message
       from="user"
@@ -2791,6 +2799,20 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
         </MessageContent>
       </div>
+      {/* "Queued" indicator, right-aligned under the bubble: shows while the
+          message waits in a busy agent's inbox, and disappears on its own
+          when the agent picks it up (the bubble promotes to committed).
+          Subtle muted text — never on a plain idle send. */}
+      {queued && (
+        <div
+          className="ml-auto mt-0.5 flex w-fit items-center gap-1 text-xs text-muted-foreground"
+          data-testid="message-delivery-status"
+          data-delivery-status="queued"
+        >
+          <ClockIcon className="size-3 shrink-0" />
+          <span>Queued</span>
+        </div>
+      )}
     </Message>
   );
 }
