@@ -99,6 +99,44 @@ _DEFAULT_IDLE_TIMEOUT_S = 30 * 60  # 30 minutes
 # without hammering ``time.monotonic()`` more than necessary.
 _DEFAULT_REAPER_INTERVAL_S = 60
 
+# Env override for the harness idle-reap window, so operators can tune it
+# without code changes (mirrors the runner-level ``runner.idle_timeout_s``).
+# ``0`` disables harness reaping entirely.
+_HARNESS_IDLE_TIMEOUT_ENV = "OMNIGENT_HARNESS_IDLE_TIMEOUT_S"
+
+
+def _resolve_harness_idle_timeout_s() -> float:
+    """Resolve the harness idle-reap window in seconds.
+
+    Honors :envvar:`OMNIGENT_HARNESS_IDLE_TIMEOUT_S` (``0`` disables reaping);
+    otherwise the 30-minute default. An unparseable or negative value logs a
+    warning and falls back to the default rather than failing the runner at
+    boot — an env typo shouldn't take the runner down.
+    """
+    raw = os.environ.get(_HARNESS_IDLE_TIMEOUT_ENV)
+    if not raw:
+        return float(_DEFAULT_IDLE_TIMEOUT_S)
+    try:
+        value = float(raw)
+    except ValueError:
+        _logger.warning(
+            "%s=%r is not a number; using default %ss",
+            _HARNESS_IDLE_TIMEOUT_ENV,
+            raw,
+            _DEFAULT_IDLE_TIMEOUT_S,
+        )
+        return float(_DEFAULT_IDLE_TIMEOUT_S)
+    if value < 0:
+        _logger.warning(
+            "%s=%r is negative; using default %ss",
+            _HARNESS_IDLE_TIMEOUT_ENV,
+            raw,
+            _DEFAULT_IDLE_TIMEOUT_S,
+        )
+        return float(_DEFAULT_IDLE_TIMEOUT_S)
+    return value
+
+
 # Grace period between SIGTERM and SIGKILL when releasing a
 # subprocess. Long enough for a well-behaved harness to flush
 # in-flight responses + close the FastAPI app cleanly; short
@@ -488,11 +526,15 @@ class HarnessProcessManager:
     def __init__(
         self,
         *,
-        idle_timeout_s: float = _DEFAULT_IDLE_TIMEOUT_S,
+        idle_timeout_s: float | None = None,
         reaper_interval_s: float = _DEFAULT_REAPER_INTERVAL_S,
         tmp_parent: Path | None = None,
     ) -> None:
-        self._idle_timeout_s = idle_timeout_s
+        # ``None`` (the default at both construction sites) resolves from the
+        # OMNIGENT_HARNESS_IDLE_TIMEOUT_S env var, else the 30-minute default.
+        self._idle_timeout_s = (
+            idle_timeout_s if idle_timeout_s is not None else _resolve_harness_idle_timeout_s()
+        )
         self._reaper_interval_s = reaper_interval_s
         self._tmp_parent = tmp_parent if tmp_parent is not None else _default_tmp_parent()
         # Pre-allocate the instance dir path so it stays stable
