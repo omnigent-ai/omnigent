@@ -809,13 +809,19 @@ describe("SubagentsPanel", () => {
       // The inline "Disconnected" word is hidden (quiet dot, like idle/done).
       expect(row).not.toHaveTextContent(/Disconnected/);
       expect(row).not.toHaveTextContent(/Failed/);
-      // Blue --disconnected dot — not the red failure tone, and crucially not
-      // the shared amber --warning (still owned by "Needs response").
-      expect(indicator.querySelector(".bg-disconnected")).not.toBeNull();
-      expect(indicator.querySelector(".bg-warning")).toBeNull();
-      expect(indicator.querySelector(".bg-destructive")).toBeNull();
+      // Positive quiet-dot guarantee: disconnected falls through to the
+      // generic quiet-dot path, so the wrapper carries the standard muted text
+      // class (same as idle/done) and the blue --disconnected dot is the ONLY
+      // color hook — no warning/destructive bleed on the wrapper or the dot,
+      // and crucially never the shared amber --warning (owned by "Needs
+      // response").
+      expect(indicator).toHaveClass("text-muted-foreground");
       expect(indicator).not.toHaveClass("text-warning");
       expect(indicator).not.toHaveClass("text-destructive");
+      const dot = indicator.querySelector("span.rounded-full");
+      expect(dot).toHaveClass("bg-disconnected");
+      expect(dot).not.toHaveClass("bg-warning");
+      expect(dot).not.toHaveClass("bg-destructive");
       // The cause is still surfaced in the accessible label / tooltip.
       expect(indicator).toHaveAttribute("aria-label", `Disconnected: ${message}`);
     },
@@ -847,53 +853,62 @@ describe("SubagentsPanel", () => {
     expect(indicator.querySelector(".bg-destructive")).not.toBeNull();
   });
 
-  it("renders a quiet blue disconnected dot on the main row when the parent failed with a runner-disconnect code", () => {
-    // The session snapshot collapses a runner exit to status "failed" but
-    // preserves the cause in lastTaskError.code (runner_failed_to_start /
-    // runner_disconnected). The main row must branch on it to render the
-    // quiet blue disconnected dot rather than the red "Failed" pill.
-    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
-    useSessionMock.mockReturnValue({
-      session: {
-        id: "conv_root",
-        agentId: "ag_root",
-        agentName: null,
-        runnerId: null,
-        status: "failed",
-        lastTaskError: {
-          code: "runner_failed_to_start",
-          message: "runner exited before the first turn",
+  it.each([
+    ["runner_disconnected", "Runner disconnected unexpectedly."],
+    ["runner_failed_to_start", "runner exited before the first turn"],
+  ])(
+    "renders a quiet blue disconnected dot on the main row when the parent failed with the runner-disconnect code %s",
+    (code, message) => {
+      // The session snapshot collapses a runner exit to status "failed" but
+      // preserves the cause in lastTaskError.code (runner_failed_to_start /
+      // runner_disconnected). The main row must branch on it to render the
+      // quiet blue disconnected dot rather than the red "Failed" pill.
+      // Parametrized over BOTH disconnect codes, mirroring the child-row
+      // it.each above so neither code can regress on the main row.
+      useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+      useSessionMock.mockReturnValue({
+        session: {
+          id: "conv_root",
+          agentId: "ag_root",
+          agentName: null,
+          runnerId: null,
+          status: "failed",
+          lastTaskError: { code, message },
+          createdAt: 0,
+          title: null,
+          labels: {},
+          items: [],
+          pendingElicitations: [],
+          permissionLevel: 4,
+          parentSessionId: null,
+          subAgentName: null,
         },
-        createdAt: 0,
-        title: null,
-        labels: {},
-        items: [],
-        pendingElicitations: [],
-        permissionLevel: 4,
-        parentSessionId: null,
-        subAgentName: null,
-      },
-      isLoading: false,
-      error: null,
-    } as unknown as ReturnType<typeof useSession>);
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
 
-    renderPanel({ rootSessionId: "conv_root" });
+      renderPanel({ rootSessionId: "conv_root" });
 
-    const mainRow = screen.getByTestId("subagent-main-row");
-    const indicator = within(mainRow).getByTestId("subagent-status-dot");
-    // Quiet blue dot, no inline word — distinct from the red "Failed" pill.
-    expect(mainRow).not.toHaveTextContent(/Disconnected/);
-    expect(mainRow).not.toHaveTextContent(/Failed/);
-    expect(indicator.querySelector(".bg-disconnected")).not.toBeNull();
-    expect(indicator.querySelector(".bg-warning")).toBeNull();
-    expect(indicator).not.toHaveClass("text-warning");
-    expect(indicator).not.toHaveClass("text-destructive");
-    // The disconnect cause stays in the tooltip / accessible label.
-    expect(indicator).toHaveAttribute(
-      "aria-label",
-      "Disconnected: runner exited before the first turn",
-    );
-  });
+      const mainRow = screen.getByTestId("subagent-main-row");
+      const indicator = within(mainRow).getByTestId("subagent-status-dot");
+      // Quiet blue dot, no inline word — distinct from the red "Failed" pill.
+      expect(mainRow).not.toHaveTextContent(/Disconnected/);
+      expect(mainRow).not.toHaveTextContent(/Failed/);
+      // Positive quiet-dot guarantee: the wrapper carries the standard muted
+      // quiet-dot text class (same path as idle/done) and the blue dot is the
+      // ONLY color hook — no warning/destructive class bleeds onto either the
+      // wrapper or the dot.
+      expect(indicator).toHaveClass("text-muted-foreground");
+      expect(indicator).not.toHaveClass("text-warning");
+      expect(indicator).not.toHaveClass("text-destructive");
+      const dot = indicator.querySelector("span.rounded-full");
+      expect(dot).toHaveClass("bg-disconnected");
+      expect(dot).not.toHaveClass("bg-warning");
+      expect(dot).not.toHaveClass("bg-destructive");
+      // The disconnect cause stays in the tooltip / accessible label.
+      expect(indicator).toHaveAttribute("aria-label", `Disconnected: ${message}`);
+    },
+  );
 
   it("renders red 'Failed' on the main row for a genuine parent failure (non-disconnect code)", () => {
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
