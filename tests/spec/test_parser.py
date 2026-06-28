@@ -203,6 +203,49 @@ def test_parse_llm_connection_unresolved_var_raises(
         parse(tmp_path)
 
 
+def test_parse_inline_mcp_tools_whitelist(tmp_path: Path) -> None:
+    """A per-server ``tools:`` whitelist on an inline MCP tool propagates to
+    ``MCPServerConfig.tools`` (regression: it was silently dropped, so the
+    documented allow-list was a no-op and all tools were exposed)."""
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "github": {
+                "type": "mcp",
+                "command": "npx",
+                "args": ["-y", "server-github"],
+                "tools": ["search_issues", "get_pull_request"],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    cfg = next(m for m in spec.mcp_servers if m.name == "github")
+    assert cfg.tools == ["search_issues", "get_pull_request"]
+
+
+def test_parse_inline_mcp_tools_absent_is_none(tmp_path: Path) -> None:
+    """Omitting ``tools:`` leaves the allow-list as ``None`` (expose all)."""
+    config = {
+        "spec_version": 1,
+        "tools": {"github": {"type": "mcp", "command": "npx", "args": []}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    cfg = next(m for m in parse(tmp_path).mcp_servers if m.name == "github")
+    assert cfg.tools is None
+
+
+def test_parse_inline_mcp_tools_non_list_raises(tmp_path: Path) -> None:
+    """A non-list ``tools:`` value is a clear error, not a silent type bug."""
+    config = {
+        "spec_version": 1,
+        "tools": {"github": {"type": "mcp", "command": "npx", "tools": "search_issues"}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"'tools' must be a list"):
+        parse(tmp_path)
+
+
 def test_parse_expand_env_false_keeps_var_references(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

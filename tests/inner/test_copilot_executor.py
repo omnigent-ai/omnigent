@@ -253,6 +253,38 @@ def test_usage_accumulation_and_finalize() -> None:
     assert _finalize_usage({}) is None
 
 
+def test_usage_accumulates_copilot_aic_cost() -> None:
+    # ``copilotUsage.totalNanoAiu`` (the authoritative AI-credit cost) is summed
+    # across the turn's usage events and converted to ``cost_usd`` in finalize:
+    # 1 AIC = 1e9 nano-AIU = $0.01, so nano-AIU / 1e11 = USD.
+    acc: dict[str, int] = {}
+    _accumulate_usage(
+        acc,
+        {"inputTokens": 10, "outputTokens": 2, "copilotUsage": {"totalNanoAiu": 1_832_000_000}},
+    )
+    _accumulate_usage(
+        acc,
+        {"inputTokens": 3, "outputTokens": 1, "copilotUsage": {"totalNanoAiu": 68_000_000}},
+    )
+    usage = _finalize_usage(acc)
+    assert usage is not None
+    assert usage["input_tokens"] == 13
+    # (1_832_000_000 + 68_000_000) / 1e11 = 0.019 USD (1.9 AIC).
+    assert usage["cost_usd"] == pytest.approx(0.019)
+    # The private accumulator key must not leak into the usage dict.
+    assert "_cost_nano_aiu" not in usage
+
+
+def test_usage_without_copilot_cost_omits_cost_usd() -> None:
+    # A usage event with no ``copilotUsage`` block yields no ``cost_usd`` key,
+    # so the catalog cost path stays in charge for those turns.
+    acc: dict[str, int] = {}
+    _accumulate_usage(acc, {"inputTokens": 5, "outputTokens": 1})
+    usage = _finalize_usage(acc)
+    assert usage is not None
+    assert "cost_usd" not in usage
+
+
 def test_ambient_github_token_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(var, raising=False)

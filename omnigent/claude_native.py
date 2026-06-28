@@ -61,6 +61,7 @@ from omnigent._wrapper_labels import (
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
+from omnigent.claude_launcher import resolve_claude_launch
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     augment_claude_args,
@@ -3966,6 +3967,10 @@ def _claude_terminal_request(
         ap_auth_headers=ap_auth_headers,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
     )
+    # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
+    # command/args to wrap the same fully-augmented Claude launch. Identity by
+    # default. See omnigent.claude_launcher.
+    command, args = resolve_claude_launch(command, args)
     spec: dict[str, Any] = {
         "command": command,
         "args": args,

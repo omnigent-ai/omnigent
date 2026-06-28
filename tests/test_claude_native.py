@@ -7,6 +7,8 @@ import contextlib
 import io
 import json
 import os
+import sys
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -106,6 +108,50 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
         "TaskCreated",
         "UserPromptSubmit",
     ]
+
+
+def test_claude_terminal_request_default_launch_is_unwrapped(tmp_path, monkeypatch) -> None:
+    """Without ``OMNIGENT_CLAUDE_LAUNCHER`` the command/args are unchanged."""
+    monkeypatch.delenv("OMNIGENT_CLAUDE_LAUNCHER", raising=False)
+    monkeypatch.chdir(tmp_path)
+    body = claude_native._claude_terminal_request(
+        ("--resume", "s"),
+        command="claude",
+        bridge_dir=Path("/tmp/omnigent-test-bridge"),
+    )
+    spec = body["spec"]
+    assert spec["command"] == "claude"
+    assert spec["args"][:2] == ["--resume", "s"]
+
+
+def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) -> None:
+    """
+    A registered launcher plugin rewrites the spawn command, keeping the bridge.
+
+    Exercises the local-CLI wiring of :func:`resolve_claude_launch`: with a
+    launcher plugin selected, the terminal spec runs the wrapped command
+    (here ``isaac -- <augmented args>``) while the Omnigent bridge
+    (``--mcp-config`` / ``--settings``) survives intact in the passed-through
+    argv.
+    """
+    launcher_mod = types.ModuleType("fake_isaac_launcher")
+    launcher_mod.launch = lambda command, args: ("isaac", ["--", *args])
+    monkeypatch.setitem(sys.modules, "fake_isaac_launcher", launcher_mod)
+    monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "fake_isaac_launcher:launch")
+    monkeypatch.chdir(tmp_path)
+    body = claude_native._claude_terminal_request(
+        ("--resume", "s"),
+        command="claude",
+        bridge_dir=Path("/tmp/omnigent-test-bridge"),
+    )
+    spec = body["spec"]
+    assert spec["command"] == "isaac"
+    # Claude's argv is now passed through isaac after the ``--`` separator.
+    assert spec["args"][0] == "--"
+    assert spec["args"][1:3] == ["--resume", "s"]
+    # The bridge MCP + hook injection still rides along.
+    assert "--mcp-config" in spec["args"]
+    assert "--settings" in spec["args"]
 
 
 def test_claude_terminal_request_injects_claude_config() -> None:

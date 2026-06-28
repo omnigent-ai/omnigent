@@ -780,6 +780,12 @@ class Usage(BaseModel):
         (e.g. supervisors that delegate / use the harness default).
         ``None`` when the executor doesn't report it; the cost path
         then falls back to the session override / spec model.
+    :param cost_usd: Authoritative per-turn cost in USD reported
+        directly by the harness/provider (e.g. GitHub Copilot's
+        AI-credit total). When present, the server-side cost path uses
+        it in preference to the catalog token-price estimate; ``None``
+        when the harness doesn't report a cost (the common case, where
+        cost is computed from token counts x catalog pricing).
     """
 
     input_tokens: int = 0
@@ -790,6 +796,7 @@ class Usage(BaseModel):
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     model: str | None = None
+    cost_usd: float | None = None
 
 
 class ErrorDetail(BaseModel):
@@ -1476,7 +1483,12 @@ class SessionResponse(BaseModel):
         be found (deleted or orphaned session).
     :param status: Session lifecycle status. One of
         ``"idle"`` (no loop running), ``"running"`` (loop
-        executing), or ``"failed"`` (terminal failure).
+        executing), ``"waiting"`` (loop parked on background
+        work / sub-agents), or ``"failed"`` (terminal failure).
+        Current read paths collapse ``"waiting"`` -> ``"running"``
+        before building this snapshot; the literal stays a superset
+        of what the runtime can produce so a server that forwards
+        the raw status never 500s on serialization.
     :param created_at: Unix epoch seconds of creation.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
@@ -1679,7 +1691,7 @@ class SessionResponse(BaseModel):
     id: str
     agent_id: str
     agent_name: str | None = None
-    status: Literal["idle", "running", "failed"]
+    status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
@@ -2048,7 +2060,7 @@ class SessionListItem(BaseModel):
     id: str
     agent_id: str
     agent_name: str | None = None
-    status: Literal["idle", "running", "failed"]
+    status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     updated_at: int
     title: str | None = None

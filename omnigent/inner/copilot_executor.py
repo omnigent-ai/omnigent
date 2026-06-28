@@ -788,7 +788,9 @@ def _accumulate_usage(acc: dict[str, int], data: dict[str, Any]) -> None:  # typ
     """Sum the token counts from one ASSISTANT_USAGE event into *acc*.
 
     Copilot emits one usage event per underlying model call, so a turn with
-    tool round-trips reports usage several times; we accumulate.
+    tool round-trips reports usage several times; we accumulate. The
+    authoritative AI-credit cost (``copilotUsage.totalNanoAiu``, in nano-AIU) is
+    summed too and converted to ``cost_usd`` in :func:`_finalize_usage`.
     """
     mapping = {
         "inputTokens": "input_tokens",
@@ -799,6 +801,11 @@ def _accumulate_usage(acc: dict[str, int], data: dict[str, Any]) -> None:  # typ
         value = data.get(wire_key)
         if isinstance(value, (int, float)):
             acc[usage_key] = acc.get(usage_key, 0) + int(value)
+    copilot_usage = data.get("copilotUsage")
+    if isinstance(copilot_usage, dict):
+        nano_aiu = copilot_usage.get("totalNanoAiu")
+        if isinstance(nano_aiu, (int, float)):
+            acc["_cost_nano_aiu"] = acc.get("_cost_nano_aiu", 0) + int(nano_aiu)
 
 
 def _finalize_usage(acc: dict[str, int]) -> dict[str, Any] | None:  # type: ignore[explicit-any]
@@ -806,7 +813,11 @@ def _finalize_usage(acc: dict[str, int]) -> dict[str, Any] | None:  # type: igno
     if not acc:
         return None
     usage: dict[str, Any] = dict(acc)  # type: ignore[explicit-any]
+    nano_aiu = usage.pop("_cost_nano_aiu", 0)
     usage["total_tokens"] = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+    if nano_aiu:
+        # 1 AIC = 1e9 nano-AIU = $0.01, so nano-AIU / 1e11 = USD.
+        usage["cost_usd"] = nano_aiu / 1e11
     return usage
 
 
