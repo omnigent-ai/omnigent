@@ -160,10 +160,12 @@ def _chat_to_anthropic(
     if reasoning_effort := extra.pop("reasoning_effort", None):
         effort = validate_effort_or_llm_error(reasoning_effort, "Anthropic", ANTHROPIC_EFFORTS)
         if effort is not None:
-            payload["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": _effort_to_budget(effort, max_tokens),
-            }
+            payload["thinking"] = {"type": "adaptive"}
+            payload.setdefault("output_config", {})["effort"] = effort
+            # Adaptive thinking on newer models (Opus 4.6+) does not support
+            # temperature or top_p — remove them if they were set.
+            payload.pop("temperature", None)
+            payload.pop("top_p", None)
 
     return payload
 
