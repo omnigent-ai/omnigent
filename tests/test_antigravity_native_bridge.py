@@ -18,6 +18,7 @@ from omnigent.antigravity_native_bridge import (
     build_antigravity_native_spawn_env,
     build_mcp_config,
     clear_bridge_state,
+    ensure_agy_feedback_survey_disabled,
     ensure_agy_onboarding_complete,
     inject_user_message_via_tui,
     prepare_bridge_dir,
@@ -1215,3 +1216,141 @@ def test_send_interaction_keys_via_tui_rejects_empty_keys(tmp_path: Path) -> Non
     """No keys is a programming error, not an empty send-keys call."""
     with pytest.raises(RuntimeError, match="at least one key"):
         send_interaction_keys_via_tui(tmp_path / "bridge")
+
+
+def _agy_settings_path(home: Path) -> Path:
+    return home / ".gemini" / "antigravity-cli" / "settings.json"
+
+
+def test_ensure_agy_feedback_survey_disabled_creates_missing_settings(tmp_path: Path) -> None:
+    """A home with no settings.json gets one carrying just the disable key."""
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    assert json.loads(_agy_settings_path(tmp_path).read_text(encoding="utf-8")) == {
+        "showFeedbackSurvey": False
+    }
+
+
+def test_ensure_agy_feedback_survey_disabled_merges_preserving_keys(tmp_path: Path) -> None:
+    """The user's other settings (model/trustedWorkspaces/…) survive the merge."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text(
+        json.dumps(
+            {
+                "enableTelemetry": False,
+                "model": "Gemini 3.5 Flash (High)",
+                "trustedWorkspaces": ["/work/a"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    assert data["showFeedbackSurvey"] is False
+    assert data["model"] == "Gemini 3.5 Flash (High)"
+    assert data["trustedWorkspaces"] == ["/work/a"]
+    assert data["enableTelemetry"] is False
+
+
+def test_ensure_agy_feedback_survey_disabled_idempotent_no_rewrite(tmp_path: Path) -> None:
+    """Already-false short-circuits before any (reformatting) rewrite."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    original = '{"showFeedbackSurvey": false, "model": "x"}'  # compact + unsorted
+    settings.write_text(original, encoding="utf-8")
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    # Untouched byte-for-byte: the function returned at the already-disabled guard
+    # rather than rewriting (which would indent + sort the keys).
+    assert settings.read_text(encoding="utf-8") == original
+
+
+def test_ensure_agy_feedback_survey_disabled_skips_malformed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A malformed settings.json is left untouched (never clobbered)."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text("{ not valid json", encoding="utf-8")
+    with caplog.at_level(logging.WARNING):
+        ensure_agy_feedback_survey_disabled(tmp_path)
+    assert settings.read_text(encoding="utf-8") == "{ not valid json"
+    assert "not valid JSON" in caplog.text
+
+
+def test_ensure_agy_feedback_survey_disabled_skips_non_dict(tmp_path: Path) -> None:
+    """A JSON file that isn't an object is left untouched."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text('["a", "b"]', encoding="utf-8")
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    assert settings.read_text(encoding="utf-8") == '["a", "b"]'
+
+
+def test_ensure_agy_feedback_survey_disabled_leaves_non_utf8_untouched(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Non-UTF-8 bytes must not crash the launch nor clobber the file (#1494 review)."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_bytes(b"\xff\xfe not valid utf-8 \x00")
+    with caplog.at_level(logging.WARNING):
+        ensure_agy_feedback_survey_disabled(tmp_path)  # must NOT raise
+    assert settings.read_bytes() == b"\xff\xfe not valid utf-8 \x00"
+    assert "not valid UTF-8" in caplog.text
+
+
+def test_ensure_agy_feedback_survey_disabled_skips_unreadable_existing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An existing-but-unreadable file (OSError != FileNotFoundError) is not clobbered."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text('{"model": "x"}', encoding="utf-8")
+
+    def _boom(self: Path, *args: object, **kwargs: object) -> str:
+        raise PermissionError("unreadable")
+
+    monkeypatch.setattr(Path, "read_text", _boom)
+    with caplog.at_level(logging.WARNING):
+        ensure_agy_feedback_survey_disabled(tmp_path)
+    # Path.read_text is patched, so read back via the builtin open.
+    with open(settings, encoding="utf-8") as handle:
+        assert handle.read() == '{"model": "x"}'
+    assert "could not read" in caplog.text
+
+
+def test_ensure_agy_feedback_survey_disabled_on_empty_file(tmp_path: Path) -> None:
+    """An empty settings.json is treated as create-fresh."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text("", encoding="utf-8")
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"showFeedbackSurvey": False}
+
+
+def test_ensure_agy_feedback_survey_disabled_flips_true_to_false(tmp_path: Path) -> None:
+    """An explicit ``true`` is flipped to ``false`` (other keys preserved)."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"showFeedbackSurvey": True, "model": "x"}), encoding="utf-8")
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    assert data == {"showFeedbackSurvey": False, "model": "x"}
+
+
+def test_ensure_agy_feedback_survey_disabled_follows_symlink(tmp_path: Path) -> None:
+    """A symlinked settings.json (dotfiles) is followed, not replaced (agy review)."""
+    real = tmp_path / "dotfiles" / "agy-settings.json"
+    real.parent.mkdir(parents=True)
+    real.write_text(json.dumps({"model": "x"}), encoding="utf-8")
+    link = _agy_settings_path(tmp_path)
+    link.parent.mkdir(parents=True)
+    link.symlink_to(real)
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    # The symlink is preserved (not clobbered into a regular file) and the real
+    # target gained the key.
+    assert link.is_symlink()
+    assert json.loads(real.read_text(encoding="utf-8")) == {
+        "model": "x",
+        "showFeedbackSurvey": False,
+    }
