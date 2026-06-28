@@ -294,13 +294,12 @@ class RunnerToolPolicyGate:
                     data=composed_data,
                 )
         if pending_ask is not None:
-            # Attach any data accumulated after the ASK verdict.
-            return PolicyVerdict(
-                action="ask",
-                policy_name=pending_ask.policy_name,
-                reason=pending_ask.reason,
-                data=composed_data,
-            )
+            # Return the verdict captured at ASK time — its data field is the
+            # snapshot of composed_data at the moment the ASK fired, which is
+            # what the ASK policy intended to show the user (e.g. redacted
+            # args). Rebuilding with the post-loop composed_data would let a
+            # subsequent ALLOW policy silently overwrite that redaction.
+            return pending_ask
         if composed_data is not None:
             return PolicyVerdict(action="allow", data=composed_data)
         return _ALLOW
