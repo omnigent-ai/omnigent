@@ -44,6 +44,8 @@ from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStor
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.entity_group_store.sqlalchemy_store import SqlAlchemyEntityGroupStore
+from omnigent.stores.entity_store.sqlalchemy_store import SqlAlchemyEntityStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.job_store.sqlalchemy_store import SqlAlchemyJobStore
 
@@ -596,6 +598,8 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         job_store=SqlAlchemyJobStore(db_uri),
+        entity_store=SqlAlchemyEntityStore(db_uri),
+        entity_group_store=SqlAlchemyEntityGroupStore(db_uri),
     )
 
 

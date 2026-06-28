@@ -18,9 +18,15 @@
 
 import { useMemo } from "react";
 import { useEntities } from "@/lib/entityStore";
+import { useEntityGroups } from "@/lib/entityGroupStore";
 import { useJobs } from "@/lib/jobsStore";
 import { treeToGraph } from "@/lib/flowTree";
 import { generateFlowText } from "@/lib/flowToText";
+
+/** How a group renders its icon: a bundled component (built-ins) or an image URL. */
+export type ActionGroupIcon =
+  | { kind: "component"; key: string }
+  | { kind: "url"; url: string };
 
 export interface ActionDef {
   /** Stable identifier, e.g. an entity id or "job:<jobId>". */
@@ -34,10 +40,12 @@ export interface ActionDef {
 }
 
 export interface ActionGroup {
-  /** Stable group id, e.g. "entities" or "jobs". */
+  /** Stable group id, e.g. an entity-group id, "entities", or "jobs". */
   id: string;
   /** Display name. */
   name: string;
+  /** Group icon, resolved by the picker; absent for the fallback/Jobs groups. */
+  icon?: ActionGroupIcon;
   actions: ActionDef[];
 }
 
@@ -52,29 +60,56 @@ export function useActionCatalog(excludeJobId?: string): {
   loading: boolean;
 } {
   const entities = useEntities();
+  const entityGroups = useEntityGroups();
   const jobs = useJobs();
 
   const groups = useMemo<ActionGroup[]>(() => {
     const out: ActionGroup[] = [];
 
-    if (entities.length) {
-      out.push({
-        id: "entities",
-        name: "Entities",
-        actions: entities.map((e) => ({
-          id: e.id,
-          label: e.title,
-          description: e.instruction,
-          instruction: e.instruction,
-        })),
-      });
+    // Bucket entities by their group id (null = ungrouped).
+    const byGroup = new Map<string, typeof entities>();
+    const ungrouped: typeof entities = [];
+    for (const e of entities) {
+      if (e.groupId) {
+        const list = byGroup.get(e.groupId) ?? [];
+        list.push(e);
+        byGroup.set(e.groupId, list);
+      } else {
+        ungrouped.push(e);
+      }
+    }
+
+    const toAction = (e: (typeof entities)[number]) => ({
+      id: e.id,
+      label: e.title,
+      description: e.instruction,
+      instruction: e.instruction,
+    });
+
+    // One ActionGroup per entity group (built-ins first, per the store's sort),
+    // each carrying its icon. Empty groups are omitted from the picker.
+    for (const g of entityGroups) {
+      const members = byGroup.get(g.id) ?? [];
+      if (!members.length) continue;
+      const icon: ActionGroupIcon | undefined = g.iconKey
+        ? { kind: "component", key: g.iconKey }
+        : g.iconUrl
+          ? { kind: "url", url: g.iconUrl }
+          : undefined;
+      out.push({ id: g.id, name: g.name, icon, actions: members.map(toAction) });
+    }
+
+    // Entities not assigned to any group fall back to a plain "Entities" group.
+    if (ungrouped.length) {
+      out.push({ id: "entities", name: "Entities", actions: ungrouped.map(toAction) });
     }
 
     const jobActions = jobs
       .filter((j) => j.id !== excludeJobId)
       .map((j) => {
         // A job's instruction is the narrative rendered from its flow.
-        const instruction = generateFlowText(treeToGraph(j.tree)).narrative || `Run the “${j.name}” flow.`;
+        const instruction =
+          generateFlowText(treeToGraph(j.tree)).narrative || `Run the “${j.name}” flow.`;
         return {
           id: `job:${j.id}`,
           label: j.name,
@@ -83,11 +118,17 @@ export function useActionCatalog(excludeJobId?: string): {
         };
       });
     if (jobActions.length) {
-      out.push({ id: "jobs", name: "Jobs", actions: jobActions });
+      // Jobs wired in as steps carry Omnigent's own mark.
+      out.push({
+        id: "jobs",
+        name: "Jobs",
+        icon: { kind: "component", key: "otto" },
+        actions: jobActions,
+      });
     }
 
     return out;
-  }, [entities, jobs, excludeJobId]);
+  }, [entities, entityGroups, jobs, excludeJobId]);
 
   // Sourced from local stores/hooks — always ready, no async load.
   return { groups, loading: false };

@@ -35,6 +35,7 @@ class EntityStore(ABC):
         title: str,
         instruction: str,
         created_by: str | None = None,
+        group_id: str | None = None,
     ) -> Entity:
         """
         Create a new entity. The store mints the id.
@@ -42,6 +43,7 @@ class EntityStore(ABC):
         :param title: Human-readable title.
         :param instruction: Instruction text folded into a flow when used.
         :param created_by: Owning user id, or ``None`` in single-user mode.
+        :param group_id: Owning entity group, or ``None`` if ungrouped.
         :returns: The newly created :class:`Entity`.
         """
         ...
@@ -74,6 +76,7 @@ class EntityStore(ABC):
         *,
         title: str | None = None,
         instruction: str | None = None,
+        group_id: str | None = None,
     ) -> Entity | None:
         """
         Patch the given fields and bump ``updated_at``. Only non-``None``
@@ -81,6 +84,8 @@ class EntityStore(ABC):
         id is unknown.
 
         :param entity_id: Unique entity identifier, e.g. ``"ent_abc123"``.
+        :param group_id: New owning group id. ``None`` leaves it unchanged;
+            pass the empty string to clear it (move to ungrouped).
         :returns: The updated :class:`Entity`, or ``None`` if not found.
         """
         ...

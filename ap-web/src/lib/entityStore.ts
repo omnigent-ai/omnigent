@@ -27,6 +27,10 @@ export interface Entity {
   title: string;
   /** Text folded into the flow narrative when this entity is used as a step. */
   instruction: string;
+  /** Owning group id, or null if ungrouped. */
+  groupId: string | null;
+  /** Whether this is a read-only code-owned built-in (e.g. a Jira action). */
+  isBuiltin: boolean;
   /** Epoch ms. */
   createdAt: number;
   updatedAt: number;
@@ -38,27 +42,6 @@ const EVENT = "omnigent-entities-changed";
 /** In-memory cache so `useEntities` can read synchronously. */
 const cache = new Map<string, Entity>();
 let listLoaded = false;
-let seeded = false;
-
-/**
- * First-run seed — the Jira actions, created once if the backend has no
- * entities yet. Guarded so concurrent mounts / reloads don't duplicate it
- * (the empty-list check + module `seeded` flag run after the list loads).
- */
-const SEED: ReadonlyArray<{ title: string; instruction: string }> = [
-  {
-    title: "Fetch ticket body & metadata",
-    instruction: "Fetch the Jira ticket's description, status, assignee, and fields.",
-  },
-  {
-    title: "Post an update to the ticket",
-    instruction: "Post a comment or update to the Jira ticket.",
-  },
-  {
-    title: "Resolve the ticket",
-    instruction: "Transition the Jira ticket to a resolved/done state.",
-  },
-];
 
 function emit(): void {
   window.dispatchEvent(new Event(EVENT));
@@ -69,6 +52,8 @@ function fromApi(e: ApiEntity): Entity {
     id: e.id,
     title: e.title,
     instruction: e.instruction,
+    groupId: e.groupId,
+    isBuiltin: e.isBuiltin,
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };
@@ -85,13 +70,9 @@ function cachedList(): Entity[] {
 }
 
 async function refreshList(): Promise<void> {
-  let entities = await apiListEntities();
-  // First run on a fresh backend: seed the Jira entities, once.
-  if (entities.length === 0 && !seeded) {
-    seeded = true;
-    await Promise.all(SEED.map((s) => apiCreateEntity(s).catch(() => null)));
-    entities = await apiListEntities();
-  }
+  // Built-in entities (Jira/GitHub actions) are now code-owned on the backend
+  // and returned by the list endpoint — no client-side seeding.
+  const entities = await apiListEntities();
   cache.clear();
   for (const e of entities) put(fromApi(e));
   listLoaded = true;
@@ -106,17 +87,25 @@ export function getEntity(id: string): Entity | undefined {
   return cache.get(id);
 }
 
-/** Create a new entity. Returns it. */
-export async function createEntity(title: string, instruction: string): Promise<Entity> {
-  const e = put(fromApi(await apiCreateEntity({ title: title.trim() || "Untitled", instruction })));
+/** Create a new entity, optionally in a group. Returns it. */
+export async function createEntity(
+  title: string,
+  instruction: string,
+  groupId?: string | null,
+): Promise<Entity> {
+  const e = put(
+    fromApi(
+      await apiCreateEntity({ title: title.trim() || "Untitled", instruction, groupId }),
+    ),
+  );
   emit();
   return e;
 }
 
-/** Patch title and/or instruction. */
+/** Patch title, instruction, and/or group (groupId: null clears the group). */
 export async function updateEntity(
   id: string,
-  patch: Partial<Pick<Entity, "title" | "instruction">>,
+  patch: { title?: string; instruction?: string; groupId?: string | null },
 ): Promise<void> {
   const e = fromApi(await apiUpdateEntity(id, patch));
   put(e);

@@ -909,6 +909,10 @@ class SqlEntity(Base):
     :param title: Human-readable title shown on the flow step.
     :param instruction: Instruction text folded into a flow when used.
     :param created_by: Owning user id, or ``None`` in single-user mode.
+    :param group_id: Owning entity group, or ``None`` if ungrouped. A plain
+        column with no foreign key: an entity may reference a built-in group
+        id (which has no DB row), and ``EntityGroupStore.delete_group`` nulls
+        dependents when a user group is deleted.
     """
 
     __tablename__ = "entities"
@@ -919,8 +923,46 @@ class SqlEntity(Base):
     title: Mapped[str] = mapped_column(String(256))
     instruction: Mapped[str] = mapped_column(Text)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    group_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         Index("ix_entities_created_by_updated_at", "created_by", "updated_at"),
         Index("ix_entities_updated_at", "updated_at"),
+        Index("ix_entities_group_id", "group_id"),
+    )
+
+
+class SqlEntityGroup(Base):
+    """
+    SQLAlchemy model for the ``entity_groups`` table.
+
+    An *entity group* is a named, icon-bearing category for entities, shown in
+    the flow builder's step picker. Built-in groups (Jira/GitHub) are code-owned
+    and never stored here; this table holds only user-created groups.
+
+    :param id: Unique group identifier, e.g. ``"grp_0f1a2b3c..."``.
+    :param created_at: Unix epoch seconds when the group was created.
+    :param updated_at: Unix epoch seconds of the last update.
+    :param name: Human-readable group name.
+    :param icon_key: Bundled-icon key (built-ins only); ``None`` for user rows.
+    :param icon_artifact_key: Artifact-store key of an uploaded icon image, or
+        ``None`` if the group has no custom icon.
+    :param icon_content_type: MIME type of the uploaded icon, or ``None``.
+    :param created_by: Owning user id, or ``None`` in single-user mode.
+    """
+
+    __tablename__ = "entity_groups"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int] = mapped_column(Integer)
+    name: Mapped[str] = mapped_column(String(256))
+    icon_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    icon_artifact_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    icon_content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    __table_args__ = (
+        Index("ix_entity_groups_created_by_updated_at", "created_by", "updated_at"),
+        Index("ix_entity_groups_updated_at", "updated_at"),
     )

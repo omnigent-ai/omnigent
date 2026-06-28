@@ -26,6 +26,9 @@ class Entity:
     :param instruction: The instruction text folded into a flow's narrative
         when this entity is used as a step.
     :param created_by: Owning user id, or ``None`` in single-user mode.
+    :param group_id: The :class:`~omnigent.entities.entity_group.EntityGroup`
+        this entity belongs to, or ``None`` if ungrouped. Built-in entities
+        reference a built-in group id (e.g. ``"grp_builtin_jira"``).
     """
 
     id: str
@@ -34,3 +37,4 @@ class Entity:
     title: str
     instruction: str
     created_by: str | None = None
+    group_id: str | None = None
