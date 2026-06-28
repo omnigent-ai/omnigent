@@ -19,10 +19,16 @@ that store, extract new user/assistant messages, and POST them as
 ``external_conversation_item`` events — which also seeds the session title from
 the first user message (the same hook claude/codex rely on).
 
-Status (``running``/``idle``) is intentionally NOT posted here: the runner's
-PTY-activity watcher owns those edges for cursor-native (see
-``_publish_turn_status`` in :mod:`omnigent.runner.app`), exactly as for
-claude-native and pi-native.
+The web-facing ``running``/``idle`` *spinner* edges are intentionally NOT posted
+here: the runner's PTY-activity watcher owns those ``session.status`` edges for
+cursor-native (see ``_publish_turn_status`` in :mod:`omnigent.runner.app`),
+exactly as for claude-native and pi-native. That watcher drives only the web
+"Working…" spinner, though — it never wakes a parent orchestrator. So this
+forwarder additionally POSTs an ``external_session_status: idle`` event once per
+completed turn (the cursor ``stop`` hook's turn-end markers, tailed via
+:mod:`omnigent.cursor_native_status`) — the SAME server contract
+claude-/codex-/opencode-native use to mark a sub-agent turn terminal and wake its
+parent's inbox.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent import cursor_native_status
 from omnigent._native_post_delivery import post_may_have_been_delivered
 from omnigent.cursor_native_bridge import FORK_HISTORY_CLOSE_TAG, FORK_HISTORY_OPEN_TAG
 
@@ -721,6 +728,30 @@ async def _patch_external_session_id(
         )
 
 
+async def _post_external_session_status(
+    client: httpx.AsyncClient, *, session_id: str, status: str
+) -> None:
+    """POST one ``external_session_status`` event to the Sessions API.
+
+    For a sub-agent conversation the server maps an ``idle`` edge to a terminal
+    completion that wakes the parent orchestrator's inbox — the SAME contract
+    claude-/codex-/opencode-native use (see their ``_post_external_session_status``
+    / ``_post_status``). cursor-agent exposes turn completion only through its
+    ``stop`` hook, which records a marker
+    (:func:`omnigent.cursor_native_status.record_turn_end`); this turns that
+    marker into the authoritative wake signal. The PTY-activity watcher's
+    ``session.status: idle`` edge only drives the web spinner and never wakes a
+    parent, which is why this explicit post is required.
+
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": {"status": status}},
+    )
+    resp.raise_for_status()
+
+
 async def _post_conversation_item(
     client: httpx.AsyncClient, *, session_id: str, item: _MirrorItem
 ) -> None:
@@ -1124,6 +1155,26 @@ async def forward_cursor_store_to_session(
                             state=model_state,
                             model=observed_model,
                         )
+                # Turn over the cursor ``stop`` hook's turn-completion markers to
+                # an ``external_session_status: idle`` edge — the signal that wakes
+                # a parent orchestrator (the PTY watcher's spinner status never
+                # does). Checked every poll (independent of store binding) so a
+                # turn-end is never missed, and deduped against a persisted
+                # posted-count so a supervisor restart never re-wakes the parent
+                # for a turn it already reported. Best-effort: a failed post leaves
+                # the count unadvanced so the next poll retries.
+                total_turn_ends = await asyncio.to_thread(
+                    cursor_native_status.count_turn_ends, bridge_dir
+                )
+                if total_turn_ends > await asyncio.to_thread(
+                    cursor_native_status.read_posted_count, bridge_dir
+                ):
+                    await _post_external_session_status(
+                        client, session_id=session_id, status="idle"
+                    )
+                    await asyncio.to_thread(
+                        cursor_native_status.write_posted_count, bridge_dir, total_turn_ends
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
