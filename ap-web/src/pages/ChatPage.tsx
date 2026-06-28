@@ -4731,7 +4731,9 @@ function AgentPicker({
       <>
         <span className="text-foreground">{modelLabel}</span>
         {effortTriggerLabel && <span className="text-muted-foreground"> {effortTriggerLabel}</span>}
-        {permissionModeLabel && <span className="text-muted-foreground"> • {permissionModeLabel}</span>}
+        {permissionModeLabel && (
+          <span className="text-muted-foreground"> • {permissionModeLabel}</span>
+        )}
       </>
     );
   } else if (effortTriggerLabel) {
@@ -4870,7 +4872,11 @@ function AgentPicker({
                 key={mode.id}
                 data-testid="permission-mode-picker-item"
                 data-permission-mode={mode.id}
-                data-active={permissionMode === mode.id || (!permissionMode && mode.id === "default") ? "true" : undefined}
+                data-active={
+                  permissionMode === mode.id || (!permissionMode && mode.id === "default")
+                    ? "true"
+                    : undefined
+                }
                 onSelect={() =>
                   void useChatStore
                     .getState()
