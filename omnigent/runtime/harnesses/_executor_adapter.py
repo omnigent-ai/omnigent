@@ -775,8 +775,8 @@ class ExecutorAdapter(HarnessApp):
         Future until the runner delivers the verdict.
 
         The round-trip has a timeout (see ``_POLICY_EVAL_TIMEOUT_S``
-        in ``_scaffold.py``) so a stalled verdict defaults to ALLOW
-        instead of hanging the executor.
+        in ``_scaffold.py``) so a stalled verdict fails closed instead of
+        hanging the executor.
 
         :param phase: Proto-style phase string, e.g.
             ``"PHASE_LLM_REQUEST"`` or ``"PHASE_LLM_RESPONSE"``.

@@ -5979,6 +5979,16 @@ async def _session_labels_for_runner_spawn(
 # to dispatch locally. See designs/RUNNER_MCP.md §Explicit dispatch
 # marker.
 _RUNNER_DISPATCHED_FIELD = "omnigent_runner_dispatched"
+_POLICY_ACTION_ALLOW = "POLICY_ACTION_ALLOW"
+_POLICY_ACTION_DENY = "POLICY_ACTION_DENY"
+_POLICY_ACTION_ASK = "POLICY_ACTION_ASK"
+_POLICY_ACTION_UNSPECIFIED = "POLICY_ACTION_UNSPECIFIED"
+_VALID_POLICY_ACTIONS = {
+    _POLICY_ACTION_ALLOW,
+    _POLICY_ACTION_DENY,
+    _POLICY_ACTION_ASK,
+    _POLICY_ACTION_UNSPECIFIED,
+}
 
 
 def _encode_sse_event(event: dict[str, Any]) -> bytes:
@@ -6038,7 +6048,7 @@ async def _evaluate_policy_via_omnigent(
     # (the tool already ran) fail OPEN so a transient outage never hangs
     # the turn.
     _fail_closed = phase in FAIL_CLOSED_PHASES
-    _default_action = "POLICY_ACTION_DENY" if _fail_closed else "POLICY_ACTION_ALLOW"
+    _default_action = _POLICY_ACTION_DENY if _fail_closed else _POLICY_ACTION_ALLOW
     verdict_action = _default_action
     verdict_reason: str | None = (
         f"Omnigent policy evaluation unavailable; failing closed for {phase}."
@@ -6071,21 +6081,29 @@ async def _evaluate_policy_via_omnigent(
         )
         if ap_resp.status_code == 200:
             result = ap_resp.json()
-            # A well-formed 200 carries "result"; a malformed body that
-            # omits it falls back to _default_action — i.e. DENY on a
-            # tool-call phase. That's deliberate: a 200 we can't read is
-            # an unevaluable verdict, which fails closed like any other.
-            verdict_action = result.get("result", _default_action)
-            verdict_reason = result.get("reason")
-            verdict_data = result.get("data")
+            result_action = result.get("result") if isinstance(result, dict) else None
+            if result_action in _VALID_POLICY_ACTIONS:
+                verdict_action = result_action
+                verdict_reason = result.get("reason")
+                result_data = result.get("data")
+                verdict_data = result_data if isinstance(result_data, dict) else None
+            else:
+                verdict_reason = "Policy evaluation returned an invalid verdict."
+                _logger.warning(
+                    "AP policy evaluate returned invalid verdict %r for %s; defaulting to %s",
+                    result_action,
+                    evaluation_id,
+                    _default_action,
+                )
         else:
+            verdict_reason = "Policy evaluation failed."
             _logger.warning(
                 "AP policy evaluate returned %d for %s; defaulting to %s",
                 ap_resp.status_code,
                 evaluation_id,
                 _default_action,
             )
-    except Exception:  # noqa: BLE001 — fail-open (LLM phases) / fail-closed (tool phases)
+    except Exception:  # noqa: BLE001 - fail-open (LLM phases) / fail-closed (tool phases)
         _logger.warning(
             "AP policy evaluate failed for %s; defaulting to %s",
             evaluation_id,
