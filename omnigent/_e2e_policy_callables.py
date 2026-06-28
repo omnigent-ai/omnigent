@@ -17,8 +17,6 @@ their own policy callables via pip-installed packages.
 
 from __future__ import annotations
 
-from typing import Any
-
 from omnigent.policies.schema import PolicyEvent, PolicyResponse
 from omnigent.policies.types import PolicyResult
 from omnigent.spec.types import PolicyAction
@@ -29,7 +27,9 @@ from omnigent.spec.types import PolicyAction
 _SENTINEL = "BLOCK_THIS_TOKEN"
 
 
-_ALLOW: dict[str, Any] = {"result": "ALLOW"}
+def _allow() -> PolicyResponse:
+    """Return a fresh ALLOW decision for test policy callables."""
+    return {"result": "ALLOW"}
 
 
 def block_on_sentinel(event: PolicyEvent) -> PolicyResponse:
@@ -47,7 +47,7 @@ def block_on_sentinel(event: PolicyEvent) -> PolicyResponse:
             "result": "DENY",
             "reason": f"contains reserved token {_SENTINEL!r}",
         }
-    return _ALLOW
+    return _allow()
 
 
 # Trigger token for the e2e-label-gate fixture. When a user
