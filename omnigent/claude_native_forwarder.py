@@ -435,6 +435,12 @@ class _ForwardDedupeState:
     # sub-agent spend so the gate can block mid-turn. Separate baseline
     # because it can advance while ``posted_cost`` (S) is frozen.
     posted_policy_cost: float | None = None
+    # Response id of the last turn-start ``running`` status POSTed, so the
+    # id-bearing running edge fires exactly once per turn even when an
+    # assistant item is held across polls for delta ordering (which leaves
+    # ``state.current_response_id`` unadvanced). ``None`` until the first
+    # turn-start edge. Reset on /clear and /fork like the other baselines.
+    posted_running_response_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -824,6 +830,14 @@ async def forward_claude_transcript_to_session(
                         task_subjects=task_subjects,
                         task_statuses=task_statuses,
                         task_order=task_order,
+                        # The turn-end edges (Stop→idle / StopFailure→failed)
+                        # carry the turn's response id so ap-web can CLOSE the
+                        # streaming ``activeResponse`` opened by the turn-start
+                        # ``running`` edge (_forward_available_items). The
+                        # transcript forwarder ran just above, so
+                        # ``state.current_response_id`` is the active turn's id
+                        # (the user-message reset only fires on the next turn).
+                        response_id=state.current_response_id,
                     )
                     subagent_state = await _forward_available_subagents(
                         client=client,
@@ -2383,6 +2397,7 @@ async def _forward_available_status_events(
     task_subjects: dict[str, str],
     task_statuses: dict[str, str],
     task_order: list[str],
+    response_id: str | None = None,
 ) -> HookForwardState:
     """
     Forward currently available hook events as ``session.status``.
@@ -2417,6 +2432,11 @@ async def _forward_available_status_events(
     :param task_order: Mutable ordered list of task ids in creation order,
         e.g. ``["1", "2", "3"]``. Appended in-place from ``TaskCreated``
         events. Used to render the task list in a stable order.
+    :param response_id: Active turn's response id, stamped on the
+        ``Stop``→``idle`` / ``StopFailure``→``failed`` edges so ap-web
+        closes the streaming ``activeResponse`` opened by the matching
+        turn-start ``running`` edge. ``None`` when no turn id is known
+        (the status still posts, just without a turn association).
     :returns: Updated state. On post failure, returns the last
         durable state so successfully-posted statuses are not
         retried and the failing event is retried later.
@@ -2576,6 +2596,7 @@ async def _forward_available_status_events(
                 client,
                 session_id=session_id,
                 status=status,
+                response_id=response_id,
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc)
@@ -2597,6 +2618,7 @@ async def _forward_available_status_events(
                         session_id=session_id,
                         bridge_dir=bridge_dir,
                         reason=f"hook status {status} rejected",
+                        response_id=response_id,
                     )
                 durable = next_durable
                 await _write_hook_state_async(bridge_dir, durable)
@@ -2729,6 +2751,38 @@ async def _forward_available_items(
     # never fired ``UserPromptSubmit``). PTY-activity status makes it
     # obsolete: the pane keeps changing through a mid-turn compaction, so
     # the runner's watcher holds the session ``running`` directly.
+    #
+    # Turn-start edge: the first time we see a turn's response id, publish a
+    # ``running`` status carrying it. The PTY watcher already drives the
+    # running/idle BADGE with a bare (id-less) status; this id-bearing edge is
+    # what lets ap-web open a *streaming* ``activeResponse`` for the turn, so
+    # the forwarded tool-call cards (which carry the same response id) render
+    # LIVE — spinner + elapsed timer — instead of as static completed cards.
+    # Deduped on the persistent ``dedupe`` baseline (NOT ``state``): when an
+    # assistant item is held across polls for delta ordering, this function
+    # early-returns with ``state`` unadvanced, so a ``state``-based guard would
+    # re-fire ``running`` every poll of the hold window. Best-effort — a failed
+    # status post must not abort item forwarding (the items below are the
+    # primary payload); the turn-end idle/failed edge still carries the id to
+    # close the lifecycle, and the badge is unaffected either way.
+    if current_response_id is not None and dedupe.posted_running_response_id != current_response_id:
+        try:
+            await _post_external_session_status(
+                client,
+                session_id=session_id,
+                status="running",
+                response_id=current_response_id,
+            )
+            dedupe.posted_running_response_id = current_response_id
+        except httpx.HTTPError:
+            _logger.warning(
+                "Failed to forward Claude turn-start running status; "
+                "session=%s bridge_dir=%s response_id=%s",
+                session_id,
+                bridge_dir,
+                current_response_id,
+                exc_info=True,
+            )
     updated = state
     for item in items:
         if item.source_id in seen:
@@ -2770,6 +2824,7 @@ async def _forward_available_items(
                     session_id=session_id,
                     bridge_dir=bridge_dir,
                     reason=f"transcript item {item.source_id} rejected",
+                    response_id=current_response_id,
                 )
                 seen.add(item.source_id)
                 seen_source_ids.append(item.source_id)
@@ -3536,6 +3591,7 @@ async def _post_external_session_status(
     *,
     session_id: str,
     status: str,
+    response_id: str | None = None,
 ) -> None:
     """
     Post one ``external_session_status`` event to the Sessions API.
@@ -3544,14 +3600,25 @@ async def _post_external_session_status(
     :param session_id: Omnigent session/conversation id.
     :param status: Session status value, e.g. ``"idle"`` or
         ``"failed"``.
+    :param response_id: Optional id of the assistant turn this status
+        edge belongs to. When set, the server attaches it to the
+        ``session.status`` SSE event so ap-web can drive the bubble's
+        streaming lifecycle — that's what makes native Claude's
+        forwarded tool cards render LIVE (spinner + elapsed timer)
+        rather than as static completed cards. ``None`` (the default)
+        preserves the bare, turn-agnostic status edges (e.g. the
+        sub-agent quiescence badge) that don't map to a turn.
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
+    data: dict[str, Any] = {"status": status}
+    if response_id is not None:
+        data["response_id"] = response_id
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
             "type": "external_session_status",
-            "data": {"status": status},
+            "data": data,
         },
     )
     resp.raise_for_status()
@@ -3746,6 +3813,7 @@ async def _post_forwarder_failed_status(
     session_id: str,
     bridge_dir: Path,
     reason: str,
+    response_id: str | None = None,
 ) -> None:
     """
     Best-effort publish a failed status after dropping a poison event.
@@ -3755,10 +3823,16 @@ async def _post_forwarder_failed_status(
     :param bridge_dir: Native Claude bridge directory.
     :param reason: Diagnostic reason for the failure event, e.g.
         ``"transcript item item-1 rejected"``.
+    :param response_id: Active turn's response id, so this ``failed``
+        edge closes the streaming ``activeResponse`` for the matching
+        turn rather than leaving its tool cards spinning. ``None`` when
+        no turn id is known.
     :returns: None.
     """
     try:
-        await _post_external_session_status(client, session_id=session_id, status="failed")
+        await _post_external_session_status(
+            client, session_id=session_id, status="failed", response_id=response_id
+        )
     except httpx.HTTPError:
         _logger.warning(
             "Failed to publish Claude forwarder failure status; "

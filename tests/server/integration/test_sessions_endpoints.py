@@ -2853,6 +2853,42 @@ async def test_publish_status_keeps_failed_sticky_against_trailing_idle(
     assert cache_after == "idle"
 
 
+async def test_publish_status_tracks_in_flight_response_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_publish_status`` records the in-flight response id and clears it on end.
+
+    A ``running``/``waiting`` edge carrying a ``response_id`` opens the
+    ``_session_active_response_cache`` entry (projected onto the snapshot as
+    ``active_response_id`` so a mid-turn reconnect reopens the streaming
+    ``activeResponse``); any ``idle``/``failed`` edge clears it. A bare
+    ``running`` (no id, e.g. the PTY badge edge) must NOT clobber a tracked id.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, _event: None,
+    )
+    sid = "conv_active_resp"
+    sessions_module._session_status_cache.pop(sid, None)
+    sessions_module._session_active_response_cache.pop(sid, None)
+    try:
+        # Turn start: running with the turn id opens the tracked entry.
+        sessions_module._publish_status(sid, "running", response_id="resp_turn_1")
+        assert sessions_module._session_active_response_cache.get(sid) == "resp_turn_1"
+        # Bare PTY running (no id) must not erase the tracked turn id.
+        sessions_module._publish_status(sid, "running")
+        assert sessions_module._session_active_response_cache.get(sid) == "resp_turn_1"
+        # Turn end: idle clears it.
+        sessions_module._publish_status(sid, "idle", response_id="resp_turn_1")
+        assert sessions_module._session_active_response_cache.get(sid) is None
+    finally:
+        sessions_module._session_status_cache.pop(sid, None)
+        sessions_module._session_active_response_cache.pop(sid, None)
+
+
 async def test_patch_runner_rebind_clears_stale_failed_status(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
