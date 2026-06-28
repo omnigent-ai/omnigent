@@ -1538,7 +1538,6 @@ def test_truncate_label_long_value_fits_column() -> None:
     assert len(result) <= _LABEL_VALUE_MAX_LEN
 
 
-
 def test_truncate_label_empty_string() -> None:
     """Empty string is returned unchanged (no off-by-one crash)."""
     assert _truncate_label("") == ""
