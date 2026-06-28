@@ -138,6 +138,10 @@ export default defineConfig({
     // vitest's default glob descends into the nested electron package and
     // tries to run its node:test files (which aren't vitest suites).
     include: ["src/**/*.{test,spec}.?(c|m)[jt]s?(x)"],
+    // Playwright browser specs (*.browser.spec.ts) run under @playwright/test,
+    // not vitest/jsdom — exclude them so vitest doesn't try to import the
+    // playwright runner and fail.
+    exclude: ["**/node_modules/**", "**/*.browser.spec.ts"],
     coverage: {
       provider: "v8",
       // With `include` set, vitest counts every matching source file (untested

@@ -3229,6 +3229,12 @@ def server(
             port=port,
             log_config=_server_uvicorn_log_config(),
             ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+            # Disable WebSocket per-message-deflate (uvicorn defaults it on).
+            # Our hottest WS frames are tiny, latency-sensitive terminal
+            # keystrokes/echoes; compressing them adds CPU and a setup cost for
+            # no size win, hurting interactive feel. Matches the codex-native WS
+            # client, which already connects with compression disabled.
+            ws_per_message_deflate=False,
             timeout_graceful_shutdown=_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
         )
     finally:

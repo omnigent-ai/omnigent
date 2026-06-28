@@ -14,6 +14,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { TypeAheadAddon } from "./typeahead/terminalTypeAheadAddon";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
@@ -172,6 +173,27 @@ export const SYNC_ECHO_WINDOW_MS = 750;
 export const SYNC_ECHO_MAX_BYTES = 2048;
 
 /**
+ * Predictive local echo (type-ahead) mode. A remote PTY has no local echo, so
+ * every keystroke costs a network round-trip before it paints. The
+ * {@link TypeAheadAddon} (ported from VS Code) predicts the on-screen effect of
+ * keystrokes and renders them immediately (dimmed), reconciling against the
+ * authoritative PTY echo — masking RTT.
+ *
+ * - ``"auto"``: the addon self-gates on measured latency, only showing
+ *   predictions once median RTT exceeds {@link LOCAL_ECHO_LATENCY_THRESHOLD_MS}.
+ *   Fast/local links stay dormant (no overhead, no flicker).
+ * - ``"on"``: always predict (subject to the addon's accuracy gate).
+ * - ``"off"``: addon is never constructed — identical to the legacy behavior.
+ */
+export type LocalEchoMode = "auto" | "on" | "off";
+
+/**
+ * Network delay (ms) above which ``"auto"`` mode starts showing predictions.
+ * Matches VS Code's ``terminal.integrated.localEchoLatencyThreshold`` default.
+ */
+export const LOCAL_ECHO_LATENCY_THRESHOLD_MS = 30;
+
+/**
  * Decide whether an inbound PTY chunk should be painted synchronously
  * rather than queued through xterm's async ``write``.
  *
@@ -294,6 +316,20 @@ export class TerminalSession {
   private readonly listenerCtl: AbortController;
   private readonly resizeObserver: ResizeObserver;
   private readonly dataDispose: { dispose: () => void };
+  /**
+   * Predictive local-echo addon (ported from VS Code), or ``null`` when local
+   * echo is ``"off"``. When present, inbound PTY bytes are routed through its
+   * {@link TypeAheadAddon.beforeServerInput} before painting so prediction
+   * rollbacks/rollforwards are interleaved with the real echo.
+   */
+  private readonly typeAhead: TypeAheadAddon | null;
+  /**
+   * Streaming decoder for the local-echo path: the addon works on strings, so
+   * inbound bytes are decoded with ``{ stream: true }`` to hold back any
+   * multi-byte sequence split across WebSocket frames (never hand a half
+   * character to the prediction matcher). Only allocated when type-ahead is on.
+   */
+  private readonly outputDecoder: TextDecoder | null;
   /** ``performance.now()`` of the last keystroke; gates the echo fast path. */
   private lastUserInputAt = 0;
   /** Guards {@link dispose} so calling it twice is a safe no-op. */
@@ -312,6 +348,8 @@ export class TerminalSession {
    *     server. This is a best-effort UI activity signal, not a shell
    *     job-state oracle.
    * :param onInput: Called when user input is sent to the terminal.
+   * :param localEcho: Predictive local-echo mode. Defaults to ``"auto"``
+   *     (self-gating on measured latency). See {@link LocalEchoMode}.
    */
   constructor(
     container: HTMLElement,
@@ -320,6 +358,7 @@ export class TerminalSession {
     isDark = false,
     onActivity?: TerminalActivityListener,
     onInput?: TerminalInputListener,
+    localEcho: LocalEchoMode = "auto",
   ) {
     this.term = new Terminal({
       // Match the system mono stack at the configured base size. The
@@ -360,6 +399,20 @@ export class TerminalSession {
     // Load the GPU renderer after open() (it needs the mounted canvas).
     // Falls back to the DOM renderer when WebGL is unavailable.
     this.webgl = loadWebglRenderer(this.term);
+    // Predictive local echo. Loaded after open() so the addon's `activate`
+    // sees a mounted terminal. `"off"` skips construction entirely (no
+    // overhead). `"auto"` uses VS Code's latency threshold so prediction only
+    // engages on slow links; `"on"` forces it (threshold 0).
+    if (localEcho === "off") {
+      this.typeAhead = null;
+    } else {
+      this.typeAhead = new TypeAheadAddon({
+        latencyThreshold: localEcho === "on" ? 0 : LOCAL_ECHO_LATENCY_THRESHOLD_MS,
+        style: "dim",
+      });
+      this.term.loadAddon(this.typeAhead);
+    }
+    this.outputDecoder = this.typeAhead ? new TextDecoder() : null;
     try {
       this.fit.fit();
     } catch (err) {
@@ -506,6 +559,10 @@ export class TerminalSession {
     } catch {
       /* noop */
     }
+    // Dispose the type-ahead addon (its timers/listeners) before the terminal.
+    // `term.dispose()` would also dispose loaded addons, but doing it explicitly
+    // keeps teardown order obvious and cancels the pending rollback timeout.
+    this.typeAhead?.dispose();
     // Dispose the WebGL renderer before the terminal so its canvas and
     // GL context are released while the terminal still owns them.
     this.webgl?.dispose();
@@ -522,8 +579,24 @@ export class TerminalSession {
    * future xterm that drops it — falls back to the async public ``write``.
    * Correctness never depends on the private API; it only shaves a frame
    * off the echo when present.
+   *
+   * When predictive local echo is active, bytes are first decoded (streaming,
+   * to keep multi-byte sequences intact across frames) and routed through the
+   * type-ahead timeline, which interleaves prediction rollbacks/rollforwards
+   * with the real echo. That rewritten string is then written normally — the
+   * sync-echo fast path is bypassed because prediction already masks the RTT
+   * the fast path was shaving frames off of, and the rewritten stream is no
+   * longer the raw byte chunk the fast path assumes.
    */
   private writeOutput(bytes: Uint8Array): void {
+    if (this.typeAhead && this.outputDecoder) {
+      const decoded = this.outputDecoder.decode(bytes, { stream: true });
+      if (decoded.length === 0) {
+        return; // an incomplete multi-byte sequence; wait for the rest
+      }
+      this.term.write(this.typeAhead.beforeServerInput(decoded));
+      return;
+    }
     if (shouldEchoSynchronously(bytes.length, performance.now() - this.lastUserInputAt)) {
       // eslint-disable-next-line no-underscore-dangle
       const core = (this.term as unknown as TerminalCore)._core;
