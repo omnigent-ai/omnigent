@@ -4091,6 +4091,7 @@ async def _auto_create_antigravity_terminal(
         ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
         AntigravityNativeBridgeState,
         clear_bridge_state,
+        ensure_agy_feedback_survey_disabled,
         ensure_agy_onboarding_complete,
         prepare_bridge_dir,
         seed_isolated_agy_home,
@@ -4197,6 +4198,10 @@ async def _auto_create_antigravity_terminal(
         **env_overrides,
         **await asyncio.to_thread(seed_isolated_agy_home, bridge_dir),
     }
+    # agy's periodic feedback survey shares its "esc to cancel" footer with the
+    # running-turn marker, so a web turn injected while it is up is misread as an
+    # active turn and lost (#1494). Disable it in the launch HOME before agy starts.
+    await asyncio.to_thread(ensure_agy_feedback_survey_disabled, Path(env_overrides["HOME"]))
     # Start the shared comment/sys_* relay against THIS session's bridge dir before
     # launch so its tool_relay.json is on disk when agy first scans the MCP server.
     # ``await_notify=False``: agy starts its MCP client lazily, so awaiting the
