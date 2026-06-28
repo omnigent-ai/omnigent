@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.metadata
 import io
 import json
 import os
-import sys
-import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,10 +133,16 @@ def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) ->
     (``--mcp-config`` / ``--settings``) survives intact in the passed-through
     argv.
     """
-    launcher_mod = types.ModuleType("fake_isaac_launcher")
-    launcher_mod.launch = lambda command, args: ("isaac", ["--", *args])
-    monkeypatch.setitem(sys.modules, "fake_isaac_launcher", launcher_mod)
-    monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "fake_isaac_launcher:launch")
+
+    from omnigent.claude_launcher import ClaudeLauncher
+
+    class _IsaacLauncher(ClaudeLauncher):
+        def launch(self, command, args):
+            return "isaac", ["--", *args]
+
+    entry_point = SimpleNamespace(name="isaac", load=lambda: _IsaacLauncher)
+    monkeypatch.setattr(importlib.metadata, "entry_points", lambda *, group: [entry_point])
+    monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "isaac")
     monkeypatch.chdir(tmp_path)
     body = claude_native._claude_terminal_request(
         ("--resume", "s"),
