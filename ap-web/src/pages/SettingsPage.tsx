@@ -56,6 +56,13 @@ import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { absoluteTime } from "@/lib/relativeTime";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { type ThemeMode, normalizeThemeMode } from "@/components/theme/themeMode";
+import {
+  type ChatFont,
+  CHAT_FONT_LABELS,
+  chatFonts,
+  readChatFont,
+  writeChatFont,
+} from "@/lib/chatFont";
 import { useIsEmbedded } from "@/lib/embedded";
 import { type CliStatus, getCliStatus, isElectronShell, resetCliPath } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -108,6 +115,26 @@ const themeCards: { mode: ThemeMode; label: string; icon: typeof SunIcon }[] = [
   { mode: "dark", label: "Dark", icon: MoonIcon },
 ];
 
+/** A labeled subsection within a Section: a small heading above its control. */
+function SettingGroup({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-3">
+      <h2 className="text-sm font-medium">{label}</h2>
+      {children}
+    </div>
+  );
+}
+
+/**
+ * Per-font preview string, rendered in the font it selects so the choice is
+ * visible before committing. "System" reverts to the document default by
+ * clearing the inline family; "Geist" names the imported variable face.
+ */
+const fontPreviewFamily: Record<ChatFont, string | undefined> = {
+  system: undefined,
+  geist: '"Geist Variable", ui-sans-serif, system-ui, sans-serif',
+};
+
 function AppearanceSection() {
   // Embedded: the host owns the theme (embed.tsx forces light), so the
   // selector would be a no-op — match ThemeModeMenu and hide it.
@@ -115,36 +142,86 @@ function AppearanceSection() {
   const { theme, setTheme } = useTheme();
   const mode = normalizeThemeMode(theme);
 
-  return (
-    <Section title="Appearance" description="Choose how Omnigent looks on this device.">
-      {isEmbedded ? (
+  // Font lives in localStorage (see lib/chatFont), not next-themes. Mirror it
+  // into local state so the radio selection updates on click; the DOM/storage
+  // write happens in writeChatFont.
+  const [font, setFont] = useState<ChatFont>(readChatFont);
+  const onPickFont = useCallback((next: ChatFont) => {
+    setFont(next);
+    writeChatFont(next);
+  }, []);
+
+  if (isEmbedded) {
+    return (
+      <Section title="Appearance" description="Choose how Omnigent looks on this device.">
         <p className="text-sm text-muted-foreground">
           Appearance is controlled by the host application.
         </p>
-      ) : (
-        <div className="grid grid-cols-3 gap-3" role="radiogroup" aria-label="Theme">
-          {themeCards.map(({ mode: cardMode, label, icon: Icon }) => {
-            const selected = mode === cardMode;
-            return (
-              <button
-                key={cardMode}
-                type="button"
-                role="radio"
-                aria-checked={selected}
-                data-testid={`theme-${cardMode}`}
-                onClick={() => setTheme(cardMode)}
-                className={cn(
-                  "flex flex-col items-center gap-2 rounded-lg border-2 p-4 transition-colors hover:bg-muted",
-                  selected ? "border-primary bg-primary/5" : "border-border",
-                )}
-              >
-                <Icon className="size-6 text-muted-foreground" />
-                <span className="text-sm font-medium">{label}</span>
-              </button>
-            );
-          })}
-        </div>
-      )}
+      </Section>
+    );
+  }
+
+  return (
+    <Section title="Appearance" description="Choose how Omnigent looks on this device.">
+      <div className="flex flex-col gap-8">
+        <SettingGroup label="Theme">
+          <div className="grid grid-cols-3 gap-3" role="radiogroup" aria-label="Theme">
+            {themeCards.map(({ mode: cardMode, label, icon: Icon }) => {
+              const selected = mode === cardMode;
+              return (
+                <button
+                  key={cardMode}
+                  type="button"
+                  role="radio"
+                  aria-checked={selected}
+                  data-testid={`theme-${cardMode}`}
+                  onClick={() => setTheme(cardMode)}
+                  className={cn(
+                    "flex flex-col items-center gap-2 rounded-lg border-2 p-4 transition-colors hover:bg-muted",
+                    selected ? "border-primary bg-primary/5" : "border-border",
+                  )}
+                >
+                  <Icon className="size-6 text-muted-foreground" />
+                  <span className="text-sm font-medium">{label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </SettingGroup>
+
+        <SettingGroup label="Font">
+          <div className="grid grid-cols-2 gap-3" role="radiogroup" aria-label="Font">
+            {chatFonts.map((value) => {
+              const selected = font === value;
+              return (
+                <button
+                  key={value}
+                  type="button"
+                  role="radio"
+                  aria-checked={selected}
+                  data-testid={`font-${value}`}
+                  onClick={() => onPickFont(value)}
+                  className={cn(
+                    "flex flex-col items-start gap-1 rounded-lg border-2 p-4 transition-colors hover:bg-muted",
+                    selected ? "border-primary bg-primary/5" : "border-border",
+                  )}
+                >
+                  <span className="text-sm font-medium">{CHAT_FONT_LABELS[value]}</span>
+                  <span
+                    className="text-lg text-muted-foreground"
+                    style={{ fontFamily: fontPreviewFamily[value] }}
+                  >
+                    Ag
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Applies to all interface text. Code and terminal output always use a monospace font.
+          </p>
+        </SettingGroup>
+      </div>
     </Section>
   );
 }
