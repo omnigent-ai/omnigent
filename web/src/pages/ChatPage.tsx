@@ -2654,7 +2654,10 @@ function CompactionLoadingIndicator() {
           {elapsed > 0 && <span className="text-muted-foreground">({elapsed}s)</span>}
         </div>
         <div className="mt-2 h-1 overflow-hidden rounded-full bg-muted">
-          <div className="h-full w-1/3 animate-pulse rounded-full bg-muted-foreground/40" />
+          <div
+            className="h-full w-1/3 rounded-full bg-muted-foreground/40"
+            style={{ animation: "compaction-slide 1.5s ease-in-out infinite alternate" }}
+          />
         </div>
       </MessageContent>
     </Message>
