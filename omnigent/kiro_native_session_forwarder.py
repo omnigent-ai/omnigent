@@ -270,24 +270,6 @@ async def _post_conversation_message(
     resp.raise_for_status()
 
 
-async def _post_session_status(
-    client: httpx.AsyncClient,
-    *,
-    session_id: str,
-    status: str,
-    response_id: str | None = None,
-) -> None:
-    """POST one Kiro turn-status edge as an external session status."""
-    data: dict[str, str] = {"status": status}
-    if response_id is not None:
-        data["response_id"] = response_id
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": "external_session_status", "data": data},
-    )
-    resp.raise_for_status()
-
-
 async def _patch_external_session_id(
     client: httpx.AsyncClient,
     *,
@@ -371,25 +353,19 @@ async def forward_kiro_session_to_omnigent(
                         state.byte_offset,
                     )
                     for message in messages:
+                        # Mirror the transcript only. Running/idle status for
+                        # kiro-native is owned by the PTY watcher's ``emit_status``
+                        # (``runner/resource_registry.py``), matching the other
+                        # forwarder-backed native harnesses (goose/qwen/hermes),
+                        # whose forwarders mirror the transcript, not the
+                        # running/idle session status. Posting status here too
+                        # double-sourced it (#1137).
                         await _post_conversation_message(
                             client,
                             session_id=session_id,
                             agent_name=agent_name,
                             message=message,
                         )
-                        if message.role == "user":
-                            await _post_session_status(
-                                client,
-                                session_id=session_id,
-                                status="running",
-                            )
-                        elif message.role == "assistant":
-                            await _post_session_status(
-                                client,
-                                session_id=session_id,
-                                status="idle",
-                                response_id=f"kiro:{message.message_id}",
-                            )
                     if byte_offset != state.byte_offset:
                         state.byte_offset = byte_offset
                         _write_state(bridge_dir, state)

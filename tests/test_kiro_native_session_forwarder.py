@@ -207,7 +207,6 @@ async def test_forward_kiro_session_posts_conversation_messages(
     )
     monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
     posted: list[tuple[str, str, forwarder._KiroConversationMessage]] = []
-    statuses: list[tuple[str, str, str | None]] = []
     external_ids: list[tuple[str, str]] = []
 
     async def _fake_post(
@@ -219,16 +218,6 @@ async def test_forward_kiro_session_posts_conversation_messages(
     ) -> None:
         del client
         posted.append((session_id, agent_name, message))
-
-    async def _fake_status(
-        client: httpx.AsyncClient,
-        *,
-        session_id: str,
-        status: str,
-        response_id: str | None = None,
-    ) -> None:
-        del client
-        statuses.append((session_id, status, response_id))
 
     async def _fake_patch_external_session_id(
         client: httpx.AsyncClient,
@@ -243,7 +232,6 @@ async def test_forward_kiro_session_posts_conversation_messages(
         raise asyncio.CancelledError
 
     monkeypatch.setattr(forwarder, "_post_conversation_message", _fake_post)
-    monkeypatch.setattr(forwarder, "_post_session_status", _fake_status)
     monkeypatch.setattr(
         forwarder,
         "_patch_external_session_id",
@@ -276,10 +264,9 @@ async def test_forward_kiro_session_posts_conversation_messages(
             ),
         ),
     ]
-    assert statuses == [
-        ("conv_kiro", "running", None),
-        ("conv_kiro", "idle", "kiro:assistant-1"),
-    ]
+    # The forwarder no longer posts session status; running/idle for
+    # kiro-native is owned by the PTY watcher's emit_status (#1137). See
+    # test_forward_kiro_session_does_not_post_session_status for the guard.
     assert external_ids == [("conv_kiro", "kiro-session")]
     state = json.loads((tmp_path / "bridge" / "kiro_session_forwarder.json").read_text())
     assert state["session_id"] == "kiro-session"
@@ -344,7 +331,6 @@ async def test_forward_kiro_session_prefers_expected_resume_session(
     )
     monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
     posted: list[forwarder._KiroConversationMessage] = []
-    statuses: list[tuple[str, str | None]] = []
     external_ids: list[str] = []
 
     async def _fake_post(
@@ -356,16 +342,6 @@ async def test_forward_kiro_session_prefers_expected_resume_session(
     ) -> None:
         del client, session_id, agent_name
         posted.append(message)
-
-    async def _fake_status(
-        client: httpx.AsyncClient,
-        *,
-        session_id: str,
-        status: str,
-        response_id: str | None = None,
-    ) -> None:
-        del client, session_id
-        statuses.append((status, response_id))
 
     async def _fake_patch_external_session_id(
         client: httpx.AsyncClient,
@@ -380,7 +356,6 @@ async def test_forward_kiro_session_prefers_expected_resume_session(
         raise asyncio.CancelledError
 
     monkeypatch.setattr(forwarder, "_post_conversation_message", _fake_post)
-    monkeypatch.setattr(forwarder, "_post_session_status", _fake_status)
     monkeypatch.setattr(
         forwarder,
         "_patch_external_session_id",
@@ -406,7 +381,7 @@ async def test_forward_kiro_session_prefers_expected_resume_session(
             message_id="resumed-assistant", role="assistant", text="resumed reply"
         ),
     ]
-    assert statuses == [("running", None), ("idle", "kiro:resumed-assistant")]
+    # No session status is posted by the forwarder anymore (#1137).
     assert external_ids == ["resumed-session"]
     state = json.loads((bridge_dir / "kiro_session_forwarder.json").read_text())
     assert state["session_id"] == "resumed-session"
@@ -487,3 +462,75 @@ async def test_forward_kiro_session_waits_for_expected_resume_session(
 
     assert posted == []
     assert external_ids == []
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_does_not_post_session_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for #1137: the forwarder mirrors the transcript but must NOT
+    post ``external_session_status``. Running/idle for kiro-native is owned by
+    the PTY watcher's ``emit_status`` (runner/resource_registry.py); posting it
+    here too double-sourced the session status. Captures real HTTP via a mock
+    transport so it guards the behaviour however status might be sent."""
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="kiro-session",
+        cwd=workspace,
+        lines=[
+            {
+                "version": "v1",
+                "kind": "Prompt",
+                "data": {"message_id": "user-1", "content": [{"kind": "text", "data": "hey"}]},
+            },
+            {
+                "version": "v1",
+                "kind": "AssistantMessage",
+                "data": {
+                    "message_id": "assistant-1",
+                    "content": [{"kind": "text", "data": "Hey!"}],
+                },
+            },
+        ],
+    )
+    monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
+
+    posted_event_types: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            posted_event_types.append(json.loads(request.content)["type"])
+        return httpx.Response(200, json={})
+
+    real_async_client = forwarder.httpx.AsyncClient
+
+    def _client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
+        return real_async_client(*args, transport=httpx.MockTransport(_handler), **kwargs)
+
+    monkeypatch.setattr(forwarder.httpx, "AsyncClient", _client_factory)
+
+    async def _cancel_sleep(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+
+    # The transcript is still mirrored…
+    assert "external_conversation_item" in posted_event_types
+    # …but the forwarder posts no session status (the PTY watcher owns it).
+    assert "external_session_status" not in posted_event_types
