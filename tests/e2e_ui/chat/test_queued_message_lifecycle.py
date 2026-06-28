@@ -34,6 +34,15 @@ User-message bubbles are ``data-testid="message-bubble"`` +
 ``data-role="user"`` (see ``ChatPage.tsx``). The user's own message
 text is deterministic regardless of the LLM's reply, so assertions key
 off unique sentinel strings — no dependence on model output.
+
+The final test also covers the **"Queued" badge** (``data-testid=
+"message-delivery-status"``): a message sent while a turn is in flight
+carries ``queued`` on its optimistic pending entry, so the bubble shows
+a "Queued" chip; when the agent picks the message up its
+``session.input.consumed`` promotes the bubble into committed history
+(which has no ``queued``), so the chip drops on its own — drop-on-pickup,
+no extra client state. The badge is optimistic (client send-time state),
+so it's observable in the natural in-flight window without gating the LLM.
 """
 
 from __future__ import annotations
@@ -49,6 +58,10 @@ _NAV_MSG = "sentinel-nav-7f3a remember this exact phrase"
 _PROMOTE_MSG = "sentinel-promote-91b2 keep this bubble"
 _QUEUE_MSG_A = "sentinel-queue-a-4d1e first of two"
 _QUEUE_MSG_B = "sentinel-queue-b-8c6f second of two"
+# Badge test: A holds the turn open (blocked on the mock gate) so B,
+# sent while A streams, is observably "Queued" before it's picked up.
+_BADGE_MSG_A = "sentinel-badge-a-2f7d hold the turn open"
+_BADGE_MSG_B = "sentinel-badge-b-3e9a queued behind the first"
 
 _COMPOSER_PLACEHOLDER = "Ask the agent anything…"
 
@@ -56,6 +69,11 @@ _COMPOSER_PLACEHOLDER = "Ask the agent anything…"
 def _user_bubble(page: Page, text: str):
     """Locator for the user-message bubble carrying ``text``."""
     return page.locator('[data-testid="message-bubble"][data-role="user"]').filter(has_text=text)
+
+
+def _queued_badge(page: Page, text: str):
+    """Locator for the "Queued" chip on the user bubble carrying ``text``."""
+    return _user_bubble(page, text).locator('[data-testid="message-delivery-status"]')
 
 
 def _send(page: Page, text: str) -> None:
@@ -183,3 +201,53 @@ def test_second_message_queued_while_first_streams_both_render(
     expect(assistant).to_have_text(re.compile(r"\S"), timeout=60_000)
     expect(_user_bubble(page, _QUEUE_MSG_A)).to_have_count(1, timeout=60_000)
     expect(_user_bubble(page, _QUEUE_MSG_B)).to_have_count(1, timeout=60_000)
+
+
+def test_queued_badge_shows_then_drops_on_pickup(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A message queued behind a live turn shows "Queued", then it drops.
+
+    Same setup as ``test_second_message_queued_while_first_streams_both_render``
+    (send A, then send B while A's turn is still in flight), but asserting
+    the delivery badge rather than just bubble survival:
+
+    1. While B is queued behind A's active turn, B's optimistic bubble
+       carries ``queued`` (set from the live ``status``/``sessionStatus``
+       at submit time), so its "Queued" chip renders — the state the UI
+       couldn't show before: a message visibly waiting behind a busy agent.
+    2. Once both turns drain, B has been picked up and its
+       ``session.input.consumed`` promotes it into committed history (which
+       has no ``queued``), so the chip disappears on its own — drop-on-
+       pickup, the whole point of the simplified design. No extra client
+       state, no pickup signal.
+
+    The badge is optimistic (driven by client send-time state), so step 1
+    doesn't depend on gating the LLM — it's observable in the same natural
+    in-flight window the sibling test relies on. Step 2's assertion waits
+    out the turns, so it's robust even if the window in step 1 is brief.
+    """
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    # Send A; as soon as its bubble is up the turn is (about to be) working.
+    _send(page, _BADGE_MSG_A)
+    expect(_user_bubble(page, _BADGE_MSG_A)).to_be_visible(timeout=10_000)
+
+    # Queue B immediately, while A's turn is in flight. B's "Queued" chip
+    # renders from the optimistic send-time state.
+    _send(page, _BADGE_MSG_B)
+    expect(_user_bubble(page, _BADGE_MSG_B)).to_be_visible(timeout=10_000)
+    badge = _queued_badge(page, _BADGE_MSG_B)
+    expect(badge).to_be_visible(timeout=10_000)
+    expect(badge).to_have_text("Queued")
+
+    # Let both turns drain. Once B is picked up its bubble promotes to
+    # committed (no `queued`), so the "Queued" chip drops on its own.
+    assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
+    expect(assistant).to_have_text(re.compile(r"\S"), timeout=60_000)
+    expect(_queued_badge(page, _BADGE_MSG_B)).to_have_count(0, timeout=60_000)
+    # Both messages still render exactly once (sanity: no drop/dup).
+    expect(_user_bubble(page, _BADGE_MSG_A)).to_have_count(1, timeout=60_000)
+    expect(_user_bubble(page, _BADGE_MSG_B)).to_have_count(1)

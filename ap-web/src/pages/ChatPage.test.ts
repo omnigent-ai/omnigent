@@ -334,6 +334,19 @@ describe("buildPendingBubbles", () => {
     // p.author ("bob") wins over the viewer's selfAuthor ("alice").
     expect(bubble.createdBy).toBe("bob@example.com");
   });
+
+  it("propagates the queued flag so the bubble can show a 'Queued' badge", () => {
+    const queuedPending = [
+      { tempId: "tmp_q", content: [{ type: "input_text" as const, text: "later" }], queued: true },
+    ];
+    const [bubble] = buildPendingBubbles(queuedPending, null) as [Extract<Bubble, { kind: "user" }>];
+    expect(bubble.queued).toBe(true);
+  });
+
+  it("omits queued for a normal (idle) send", () => {
+    const [bubble] = buildPendingBubbles(pending, null) as [Extract<Bubble, { kind: "user" }>];
+    expect(bubble.queued).toBeUndefined();
+  });
 });
 
 // ── mergePendingBubbles ────────────────────────────────────────────────────
