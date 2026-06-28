@@ -450,6 +450,101 @@ def test_pi_uses_anthropic_global_default(config_home: Path) -> None:
     assert env["HARNESS_PI_MODEL"] == "claude-default-model"
 
 
+# ── Keychain-backed credentials for the pi harness ────────────────────────
+
+
+def test_pi_keychain_ref_resolves_when_secret_present(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A ``keychain:`` api_key_ref with the secret present boots pi successfully.
+
+    The openrouter provider stores its key in the omnigent secret store
+    (``api_key_ref: keychain:openrouter``).  When the secret IS present,
+    ``_optional_provider_family`` must resolve it and inject it as the pi
+    gateway auth command — not silently skip the family.
+
+    Failure means the pi harness cannot use providers configured with
+    keychain-backed credentials even when the key is actually stored.
+    """
+    import json as _json
+
+    # Force the file backend so the test does not need the OS keychain.
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    # Write the secret into the isolated config home's secrets.json.
+    (config_home / "secrets.json").write_text(_json.dumps({"openrouter": "sk-or-testkey"}))
+
+    config: dict[str, object] = {
+        "providers": {
+            "openrouter": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key_ref": "keychain:openrouter",
+                    "models": {"default": "openai/gpt-4o"},
+                },
+            }
+        }
+    }
+    _write_config(config_home, config)
+    spec = _make_spec(harness="pi")
+
+    env = _build_pi_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_PI_GATEWAY"] == "true"
+    # pi maps the openai family to its "openai" family name.
+    assert env["HARNESS_PI_GATEWAY_BASE_URLS"] == (
+        '{"openai": "https://openrouter.ai/api/v1"}'
+    )
+    assert env["HARNESS_PI_GATEWAY_HOST"] == "https://openrouter.ai"
+    # The keychain secret must be resolved to its plaintext value and injected
+    # via printf so the pi subprocess receives the real key.
+    assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "printf %s sk-or-testkey"
+    assert env["HARNESS_PI_MODEL"] == "openai/gpt-4o"
+
+
+def test_pi_keychain_ref_missing_secret_raises_clear_error(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A ``keychain:`` api_key_ref with the secret absent raises a clear error.
+
+    When a family uses ``api_key_ref: keychain:<name>`` but the named secret
+    is not in the store, the error must propagate with a user-readable message
+    (e.g. "no stored secret named 'openrouter'") rather than being silently
+    swallowed by ``_optional_provider_family`` and turning into the confusing
+    "provider configures no family whose credentials resolve" message.
+
+    Failure (wrong error text or no error at all) means a user who mis-typed
+    the keychain name or forgot to run ``omnigent setup`` gets a confusing
+    error that does not point them at the real problem.
+    """
+    from omnigent.errors import OmnigentError
+
+    # Force the file backend; no secrets.json written — the key is absent.
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+
+    config: dict[str, object] = {
+        "providers": {
+            "openrouter": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key_ref": "keychain:openrouter",
+                    "models": {"default": "openai/gpt-4o"},
+                },
+            }
+        }
+    }
+    _write_config(config_home, config)
+    spec = _make_spec(harness="pi")
+
+    with pytest.raises(OmnigentError, match="openrouter"):
+        _build_pi_spawn_env(spec, workdir=None)
+
+
 # ── Named ProviderAuth selection ───────────────────────────────────────────
 
 

@@ -796,22 +796,31 @@ def _optional_provider_family(entry: ProviderEntry, family_name: str) -> FamilyC
     """Return a provider family, or ``None`` if absent *or* its key env var is unset.
 
     For the ``pi`` harness, which carries a single credential but probes
-    both families: a family whose ``$VAR`` is unresolved is treated as
-    unavailable rather than fatal, so e.g. a user who only exported
-    ``ANTHROPIC_API_KEY`` can still run pi on the anthropic family.
+    both families: a family whose inline ``$VAR`` / ``env:<VAR>`` credential is
+    unresolved is treated as unavailable rather than fatal, so e.g. a user
+    who only exported ``ANTHROPIC_API_KEY`` can still run pi on the anthropic
+    family.
 
-    The only :class:`OmnigentError` raised at family-access time comes from
-    the deferred ``$VAR`` expansion (structural validation already happened
-    at parse time), so catching it here narrowly means "this family's
-    credential is not configured". A ``keychain:`` ref raises ``ValueError``
-    (deferred — see :func:`resolve_secret`); that propagates so the user
-    sees the clear "not yet supported" message rather than a silent skip.
+    A family configured with a ``keychain:<name>`` ref is an explicit,
+    deliberate choice — if the named secret is missing or inaccessible, the
+    :class:`OmnigentError` propagates so the user gets a clear message
+    (e.g. "no stored secret named 'openrouter'") instead of the confusing
+    "no family resolves" fallthrough.  Only env-var misses are soft-skipped.
 
     :param entry: The resolved provider entry.
     :param family_name: Family key, e.g. ``"openai"`` or ``"anthropic"``.
     :returns: The :class:`FamilyConfig`, or ``None`` when the family is
         absent or its credential env var is unset.
+    :raises OmnigentError: When the family is configured with a
+        ``keychain:`` ref but the named secret is not stored.
     """
+    raw = entry.families.get(family_name)
+    if raw is None:
+        return None
+    # Keychain refs are explicit: a missing secret is a user error, not a
+    # "family not configured" signal.  Let OmnigentError propagate.
+    if raw.api_key_ref is not None and raw.api_key_ref.startswith("keychain:"):
+        return entry.family(family_name)
     try:
         return entry.family(family_name)
     except OmnigentError:
