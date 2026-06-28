@@ -4458,6 +4458,15 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
+const CLAUDE_NATIVE_PERMISSION_MODES = [
+  { id: "default", label: "Default permissions" },
+  { id: "auto", label: "Auto-approve" },
+  { id: "acceptEdits", label: "Accept edits" },
+  { id: "plan", label: "Plan mode" },
+  { id: "dontAsk", label: "Don't ask" },
+  { id: "bypassPermissions", label: "Bypass permissions" },
+] as const;
+
 type NativeModelPickerKind = "claude" | "codex" | "cursor" | "opencode";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
@@ -4638,6 +4647,7 @@ function AgentPicker({
   const selectedModel = useChatStore((s) => s.selectedModel);
   const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const llmModel = useChatStore((s) => s.llmModel);
+  const permissionMode = useChatStore((s) => s.permissionMode);
 
   // Codex and cursor both populate the picker from the server-provided
   // ``codexModelOptions`` channel (the snapshot's ``model_options`` field);
@@ -4674,10 +4684,7 @@ function AgentPicker({
   // carried over from some other session) nor the meaningless `llmModel`
   // default. The other vendor-owns wrappers have no Omnigent-visible model and
   // stay null.
-  const pickerSelectedModel =
-    modelPickerKind === "cursor" || modelPickerKind === "opencode"
-      ? sessionModelOverride
-      : selectedModel;
+  const pickerSelectedModel = sessionModelOverride ?? selectedModel;
   // SDK/bundle agents (no native picker) never have the cross-session sticky
   // applied to them, so their live model is the session's own — the applied
   // override or the bound default — never `selectedModel` (a pick carried over
@@ -4685,7 +4692,9 @@ function AgentPicker({
   // on a Claude-SDK agent like Polly). claude-/codex-native keep `selectedModel`:
   // there the sticky IS the applied model.
   const nonNativeModel =
-    modelPickerKind === null ? (sessionModelOverride ?? llmModel) : (selectedModel ?? llmModel);
+    modelPickerKind === null
+      ? (sessionModelOverride ?? llmModel)
+      : (sessionModelOverride ?? selectedModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
     ? modelPickerKind === "cursor"
       ? sessionModelOverride
@@ -4701,7 +4710,12 @@ function AgentPicker({
     showEffort && selectedEffort
       ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
       : null;
-  const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort;
+  const permissionModeLabel =
+    modelPickerKind === "claude" && permissionMode && permissionMode !== "default"
+      ? CLAUDE_NATIVE_PERMISSION_MODES.find((p) => p.id === permissionMode)?.label
+      : null;
+  const hasPickerActions =
+    showAgents || modelOptions.length > 0 || showEffort || modelPickerKind === "claude";
 
   // Model in foreground (black), effort in muted (grey). Static fallbacks
   // first; the final `else` returns null so a session with nothing to show
@@ -4717,6 +4731,7 @@ function AgentPicker({
       <>
         <span className="text-foreground">{modelLabel}</span>
         {effortTriggerLabel && <span className="text-muted-foreground"> {effortTriggerLabel}</span>}
+        {permissionModeLabel && <span className="text-muted-foreground"> • {permissionModeLabel}</span>}
       </>
     );
   } else if (effortTriggerLabel) {
@@ -4817,8 +4832,6 @@ function AgentPicker({
             })}
           </>
         )}
-        {/* Skip the leading rule when Effort is the only section, so the
-            dropdown doesn't open with a stray divider at the top. */}
         {showEffort && (
           <>
             {(showAgents || modelOptions.length > 0) && <DropdownMenuSeparator className="my-1" />}
@@ -4842,6 +4855,34 @@ function AgentPicker({
                 )}
               >
                 <span className="flex-1 truncate">{level}</span>
+              </DropdownMenuItem>
+            ))}
+          </>
+        )}
+        {modelPickerKind === "claude" && (
+          <>
+            {(showAgents || modelOptions.length > 0 || showEffort) && (
+              <DropdownMenuSeparator className="my-1" />
+            )}
+            <PickerSectionHeader>Permission Mode</PickerSectionHeader>
+            {CLAUDE_NATIVE_PERMISSION_MODES.map((mode) => (
+              <DropdownMenuItem
+                key={mode.id}
+                data-testid="permission-mode-picker-item"
+                data-permission-mode={mode.id}
+                data-active={permissionMode === mode.id || (!permissionMode && mode.id === "default") ? "true" : undefined}
+                onSelect={() =>
+                  void useChatStore
+                    .getState()
+                    .setPermissionMode(mode.id)
+                    .catch(() => {})
+                }
+                className={cn(
+                  "items-center gap-2 rounded-sm px-2 py-1.5 text-xs",
+                  "data-[active=true]:bg-accent/60 data-[active=true]:text-foreground",
+                )}
+              >
+                <span className="flex-1 truncate">{mode.label}</span>
               </DropdownMenuItem>
             ))}
           </>

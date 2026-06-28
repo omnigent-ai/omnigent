@@ -14664,6 +14664,48 @@ def create_runner_app(
                 )
             return Response(status_code=204)
 
+        if body_type == "permission_mode_change":
+            harness = _session_harness_name(conversation_id)
+            if harness == "claude-native":
+                permission_mode = body.get("permission_mode") if isinstance(body, dict) else None
+                if not isinstance(permission_mode, str) or not permission_mode:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_input",
+                            "detail": "Body 'permission_mode' must be a non-empty string",
+                        },
+                    )
+                snapshot = await _session_snapshot(conversation_id)
+                if snapshot.workspace:
+                    workspace_path = Path(snapshot.workspace)
+                    if workspace_path.exists() and workspace_path.is_dir():
+                        claude_dir = workspace_path / ".claude"
+                        settings_file = claude_dir / "settings.json"
+                        try:
+                            claude_dir.mkdir(parents=True, exist_ok=True)
+                            settings_data = {}
+                            if settings_file.exists():
+                                try:
+                                    settings_data = json.loads(settings_file.read_text(encoding="utf-8"))
+                                except (json.JSONDecodeError, OSError):
+                                    settings_data = {}
+                            if not isinstance(settings_data, dict):
+                                settings_data = {}
+                            if permission_mode == "default":
+                                if "permissions" in settings_data and isinstance(settings_data["permissions"], dict):
+                                    settings_data["permissions"].pop("defaultMode", None)
+                                    if not settings_data["permissions"]:
+                                        settings_data.pop("permissions", None)
+                            else:
+                                if "permissions" not in settings_data or not isinstance(settings_data["permissions"], dict):
+                                    settings_data["permissions"] = {}
+                                settings_data["permissions"]["defaultMode"] = permission_mode
+                            settings_file.write_text(json.dumps(settings_data, indent=2), encoding="utf-8")
+                        except Exception as exc:
+                            _logger.warning("Failed to write permission mode to %s: %s", settings_file, exc)
+            return Response(status_code=204)
+
         if body_type == "plan_mode_change":
             # Codex-native exposes Plan/Default as a structured app-server
             # collaboration mode, not a terminal slash-command. Other
