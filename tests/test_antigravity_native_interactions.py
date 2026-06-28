@@ -525,6 +525,39 @@ async def test_freshest_waiting_overrides_stale_captured_index() -> None:
     assert deliver.calls[0]["step_index"] == 6  # NOT the stale 5
 
 
+@pytest.mark.asyncio
+async def test_delivery_pins_to_captured_step_over_distinct_higher_gate() -> None:
+    """Captured step STILL WAITING + a DISTINCT higher-index same-kind WAITING gate
+    in the snapshot → deliver to the CAPTURED step, never the higher one.
+
+    Guards the mis-delivery the #1472 review flagged: ``_freshest_waiting`` alone
+    picks the highest index, so verdict-A could land on gate-B if agy ever exposes
+    two same-kind gates at once. The pin (``_waiting_step_at``) keeps the verdict on
+    the gate it was surfaced for. The complementary timeout-retry case — captured
+    gone, deliver to the fresher index — is covered by
+    ``test_freshest_waiting_overrides_stale_captured_index``.
+    """
+    pending = _pending_question(step_index=5)  # the gate we surfaced
+    captured = _question_step(step_index=5)  # still WAITING at verdict time
+    distinct = _question_step(step_index=6)  # a DIFFERENT same-kind gate, higher index
+    request, _ = _elicitation_returner(ElicitationResult(action="accept", content={"0": "First"}))
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([captured, distinct]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    assert len(deliver.calls) == 1
+    assert deliver.calls[0]["step_index"] == 5  # pinned to captured, NOT the higher 6
+
+
 # ---------------------------------------------------------------------------
 # (e) elicitation returns None (timeout / cancel)
 # ---------------------------------------------------------------------------
