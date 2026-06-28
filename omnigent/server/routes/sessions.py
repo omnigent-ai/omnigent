@@ -2246,7 +2246,7 @@ def _pending_elicitation_snapshot_for_session(
 def _build_session_response(
     conv: Conversation,
     items: list[ConversationItem],
-    status: Literal["idle", "running", "failed"],
+    status: Literal["idle", "running", "waiting", "failed"],
     permission_level: int | None = None,
     llm_model: str | None = None,
     context_window: int | None = None,

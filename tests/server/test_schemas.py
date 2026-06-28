@@ -708,3 +708,42 @@ def test_session_create_external_rejects_repo_url_workspace() -> None:
             host_id="host_abc",
             workspace="https://github.com/org/repo",
         )
+
+
+@pytest.mark.parametrize("status", ["idle", "running", "waiting", "failed"])
+def test_session_response_status_accepts_canonical_set(status: str) -> None:
+    """
+    ``SessionResponse.status`` accepts the full canonical lifecycle set,
+    including ``"waiting"``.
+
+    The wire ``session.status`` event already models ``"waiting"`` (a turn
+    parked on background work / sub-agents). The REST snapshot collapses
+    ``"waiting"`` -> ``"running"`` on every current read path, so the value
+    does not normally reach this model — but a server >= 0.3.0 is documented
+    (``server/API.md``) to serialize the canonical set, and keeping the
+    Literal a strict subset means any future or alternate-backend path that
+    forwards the raw status would 500 on serialization. Widening keeps the
+    model a superset of what the runtime can produce.
+    """
+    from omnigent.server.schemas import SessionResponse
+
+    resp = SessionResponse(id="conv_x", agent_id="ag_x", status=status, created_at=0)
+    assert resp.status == status
+    assert resp.model_dump()["status"] == status
+
+
+@pytest.mark.parametrize("status", ["idle", "running", "waiting", "failed"])
+def test_session_list_item_status_accepts_canonical_set(status: str) -> None:
+    """``SessionListItem.status`` accepts the same canonical set as the snapshot."""
+    from omnigent.server.schemas import SessionListItem
+
+    item = SessionListItem(id="conv_x", agent_id="ag_x", status=status, created_at=0, updated_at=0)
+    assert item.status == status
+
+
+def test_session_response_status_rejects_unknown_value() -> None:
+    """A status outside the canonical set still fails loud (fail-closed wire shape)."""
+    from omnigent.server.schemas import SessionResponse
+
+    with pytest.raises(ValidationError):
+        SessionResponse(id="conv_x", agent_id="ag_x", status="launching", created_at=0)

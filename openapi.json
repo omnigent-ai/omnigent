@@ -3769,6 +3769,7 @@
             "enum": [
               "idle",
               "running",
+              "waiting",
               "failed"
             ],
             "title": "Status",
@@ -4482,10 +4483,11 @@
             "type": "array"
           },
           "status": {
-            "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), or `\"failed\"` (terminal failure).",
+            "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Current read paths collapse `\"waiting\"` -> `\"running\"` before building this snapshot; the literal stays a superset of what the runtime can produce so a server that forwards the raw status never 500s on serialization.",
             "enum": [
               "idle",
               "running",
+              "waiting",
               "failed"
             ],
             "title": "Status",
