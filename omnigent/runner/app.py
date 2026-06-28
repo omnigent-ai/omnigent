@@ -7662,7 +7662,7 @@ def create_runner_app(
     # drops don't lose events — the relay drains on reconnect.
     _session_event_queues = _session_event_queues_ref
     # Per-session async inbox queues for sys_call_async /
-    # sys_read_inbox (SESSION_REARCHITECTURE Step 7 partial).
+    # sys_read_inbox (SESSION_REARCHITECTURE Step 7).
     _session_inboxes = _session_inboxes_ref
     # Per-session background async tasks keyed by handle_id.
     # Each entry is (task, cancel_event) so cancellation is instant.

@@ -5136,6 +5136,134 @@ def _format_async_task_item(payload: dict[str, Any]) -> str:
     return f"[System: task {handle_id} {status} — {tool}: {output}]"
 
 
+# ── Async-tool auto-delivery (SESSION_REARCHITECTURE Step 7) ─────
+#
+# When a background ``_bg()`` task completes, the result is pushed to the
+# session inbox for explicit pull via ``sys_read_inbox``. Auto-delivery
+# additionally POSTs the formatted completion as a ``[System: task ...]``
+# user message to ``/v1/sessions/{id}/events``, which persists it in
+# ``conversation_items`` and wakes the LLM if idle — mirroring the
+# sub-agent wake path in ``app.py``.  The inbox entry is NOT drained:
+# ``sys_read_inbox`` tool output is a ``function_call_output`` (not a
+# user message), so the per-conversation ``[System: task ...]`` user
+# message count stays at 1 regardless of whether the LLM also calls
+# ``sys_read_inbox``.
+
+_auto_deliver_bg_tasks: set[asyncio.Task[None]] = set()
+
+_AUTO_DELIVER_MAX_ATTEMPTS = 3
+_AUTO_DELIVER_RETRY_BASE_DELAY_S = 0.5
+_AUTO_DELIVER_RETRY_MAX_DELAY_S = 4.0
+
+# Thin indirection so tests can patch ``tool_dispatch._sleep`` instead of
+# the global ``asyncio.sleep`` singleton (which leaks across workers).
+_sleep = asyncio.sleep
+
+
+async def _auto_deliver_async_completion(
+    payload: dict[str, Any],
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+) -> None:
+    """
+    POST a completed async-tool payload as a user message to ``/events``.
+
+    Retries transient failures with exponential backoff, mirroring
+    :func:`omnigent.runner.app._deliver_subagent_wake_post`.  On
+    terminal failure the payload remains in the session inbox for
+    ``sys_read_inbox`` to drain — no result is lost.
+
+    :param payload: Completed/failed/cancelled async-tool inbox
+        payload with ``handle_id``, ``tool_name``, ``status``,
+        ``output`` keys.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: Session id to deliver to, e.g.
+        ``"conv_abc123"``.
+    :returns: None.
+    """
+    formatted = _format_async_task_item(payload)
+    for attempt in range(1, _AUTO_DELIVER_MAX_ATTEMPTS + 1):
+        try:
+            resp = await server_client.post(
+                f"/v1/sessions/{conversation_id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": formatted}],
+                    },
+                },
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            return
+        except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+            last = attempt >= _AUTO_DELIVER_MAX_ATTEMPTS
+            retryable = isinstance(exc, asyncio.TimeoutError) or (
+                isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500
+            )
+            _logger.debug(
+                "Async-tool auto-deliver attempt %d/%d for session=%s failed (retryable=%s): %r",
+                attempt,
+                _AUTO_DELIVER_MAX_ATTEMPTS,
+                conversation_id,
+                retryable,
+                exc,
+            )
+            if last or not retryable:
+                _logger.warning(
+                    "Async-tool auto-deliver failed for session=%s handle=%s "
+                    "after %d attempt(s); result remains in inbox for "
+                    "sys_read_inbox",
+                    conversation_id,
+                    payload.get("handle_id"),
+                    attempt,
+                )
+                return
+            delay_s = min(
+                _AUTO_DELIVER_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)),
+                _AUTO_DELIVER_RETRY_MAX_DELAY_S,
+            )
+            await _sleep(delay_s)
+
+
+def _schedule_auto_delivery(
+    payload: dict[str, Any],
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
+) -> None:
+    """
+    Fire-and-forget auto-delivery of an async-tool completion.
+
+    Called from ``_bg()`` after each ``session_inbox.put_nowait()``.
+    Silently no-ops when the server client or conversation id is
+    unavailable (e.g. unit-test contexts without a live server).
+
+    :param payload: Inbox payload just pushed to the session queue.
+    :param server_client: HTTP client, or ``None`` in test contexts.
+    :param conversation_id: Session id, or ``None``.
+    :returns: None.
+    """
+    if server_client is None or conversation_id is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(
+        _auto_deliver_async_completion(
+            payload,
+            server_client=server_client,
+            conversation_id=conversation_id,
+        ),
+        name=f"auto-deliver-{payload.get('handle_id', 'unknown')}",
+    )
+    task.add_done_callback(_auto_deliver_bg_tasks.discard)
+    _auto_deliver_bg_tasks.add(task)
+
+
 def _subagent_child_id(payload: dict[str, Any]) -> str | None:
     """
     Extract the child session id from a sub-agent inbox payload.
@@ -5423,7 +5551,8 @@ def _spawn_async_tool(
 
     Returns a handle immediately. On completion, the result is
     pushed to the session's inbox queue for ``sys_read_inbox``
-    to drain.
+    to drain, and auto-delivered as a ``[System: task ...]``
+    user message via ``POST /v1/sessions/{id}/events``.
 
     :param args: Must contain ``"tool"`` (target tool name) and
         ``"args"`` (JSON string of target tool arguments).
@@ -5485,43 +5614,59 @@ def _spawn_async_tool(
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if cancel_event.is_set():
-                session_inbox.put_nowait(
-                    {
-                        "handle_id": handle_id,
-                        "tool_name": target_tool,
-                        "status": "cancelled",
-                        "output": "",
-                    }
-                )
-                return ""
-            result = next(iter(done)).result()
-            session_inbox.put_nowait(
-                {
-                    "handle_id": handle_id,
-                    "tool_name": target_tool,
-                    "status": "completed",
-                    "output": result,
-                }
-            )
-            return result
-        except asyncio.CancelledError:
-            session_inbox.put_nowait(
-                {
+                cancel_payload = {
                     "handle_id": handle_id,
                     "tool_name": target_tool,
                     "status": "cancelled",
                     "output": "",
                 }
+                session_inbox.put_nowait(cancel_payload)
+                _schedule_auto_delivery(
+                    cancel_payload,
+                    server_client=server_client,
+                    conversation_id=conversation_id,
+                )
+                return ""
+            result = next(iter(done)).result()
+            completed_payload = {
+                "handle_id": handle_id,
+                "tool_name": target_tool,
+                "status": "completed",
+                "output": result,
+            }
+            session_inbox.put_nowait(completed_payload)
+            _schedule_auto_delivery(
+                completed_payload,
+                server_client=server_client,
+                conversation_id=conversation_id,
+            )
+            return result
+        except asyncio.CancelledError:
+            cancel_payload = {
+                "handle_id": handle_id,
+                "tool_name": target_tool,
+                "status": "cancelled",
+                "output": "",
+            }
+            session_inbox.put_nowait(cancel_payload)
+            _schedule_auto_delivery(
+                cancel_payload,
+                server_client=server_client,
+                conversation_id=conversation_id,
             )
             raise
         except Exception as exc:  # noqa: BLE001
-            session_inbox.put_nowait(
-                {
-                    "handle_id": handle_id,
-                    "tool_name": target_tool,
-                    "status": "failed",
-                    "output": str(exc),
-                }
+            failed_payload = {
+                "handle_id": handle_id,
+                "tool_name": target_tool,
+                "status": "failed",
+                "output": str(exc),
+            }
+            session_inbox.put_nowait(failed_payload)
+            _schedule_auto_delivery(
+                failed_payload,
+                server_client=server_client,
+                conversation_id=conversation_id,
             )
             return f"Error: {exc}"
         finally:
