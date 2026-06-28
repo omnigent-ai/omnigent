@@ -95,6 +95,10 @@ _ENV_OPENCODE_CONFIG_DENYLIST = frozenset(
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
 
+# Escape hatch: set truthy to bypass the OpenCode CLI version gate (e.g. to
+# try an as-yet-unvalidated 1.18+/v2 release). Mirrors OMNIGENT_NO_UPDATE_CHECK.
+_SKIP_VERSION_CHECK_ENV = "OMNIGENT_OPENCODE_SKIP_VERSION_CHECK"
+
 
 class OpenCodeVersionError(RuntimeError):
     """Raised when the installed ``opencode`` CLI is an unsupported version."""
@@ -393,7 +397,16 @@ class OpenCodeNativeServer:
         """
         if self._verify_version:
             self.version = resolve_opencode_version(self.opencode_path)
-            check_opencode_version(self.version)
+            if os.environ.get(_SKIP_VERSION_CHECK_ENV):
+                _logger.warning(
+                    "%s set; skipping OpenCode version gate (got %s, supported >=%s,<%s)",
+                    _SKIP_VERSION_CHECK_ENV,
+                    self.version,
+                    OPENCODE_MIN_VERSION,
+                    OPENCODE_MAX_VERSION_EXCLUSIVE,
+                )
+            else:
+                check_opencode_version(self.version)
         if self.port is None:
             self.port = self._explicit_port or allocate_loopback_port()
         argv = self.build_argv()

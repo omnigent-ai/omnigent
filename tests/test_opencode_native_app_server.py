@@ -182,6 +182,63 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert server.process.pid == 4242
 
 
+async def test_start_raises_on_unsupported_version_without_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.18.0")
+    monkeypatch.delenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", raising=False)
+    server = OpenCodeNativeServer(
+        bridge_dir=tmp_path,
+        workspace=tmp_path,
+        port=49231,
+        verify_version=True,
+    )
+
+    class _FakeProc:
+        pid = 4242
+
+        def poll(self) -> None:
+            return None
+
+    async def fake_wait(self: OpenCodeNativeServer) -> None:
+        return None
+
+    monkeypatch.setattr(appsrv.subprocess, "Popen", lambda argv, **kwargs: _FakeProc())
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
+    with pytest.raises(OpenCodeVersionError):
+        await server.start()
+
+
+async def test_start_skips_version_gate_when_env_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.18.0")
+    monkeypatch.setenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", "1")
+    server = OpenCodeNativeServer(
+        bridge_dir=tmp_path,
+        workspace=tmp_path,
+        port=49231,
+        verify_version=True,
+    )
+
+    class _FakeProc:
+        pid = 4242
+
+        def poll(self) -> None:
+            return None
+
+    async def fake_wait(self: OpenCodeNativeServer) -> None:
+        return None
+
+    monkeypatch.setattr(appsrv.subprocess, "Popen", lambda argv, **kwargs: _FakeProc())
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
+    await server.start()
+    assert server.version == "1.18.0"
+    assert server.process is not None
+
+
 def test_find_opencode_cli_absolute_executable(tmp_path: Path) -> None:
     exe = tmp_path / "opencode"
     exe.write_text("#!/bin/sh\n")
