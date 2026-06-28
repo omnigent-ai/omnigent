@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
@@ -442,6 +443,43 @@ def test_publish_session_status_rejects_unknown_status() -> None:
 
     with pytest.raises(ValidationError):
         _publish_session_status("conv_abc", "bogus")
+
+
+@pytest.mark.asyncio
+async def test_relay_runner_disconnect_does_not_publish_failed_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner transport loss ends the relay without poisoning status cache."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    published: list[dict[str, Any]] = []
+    session_id = "conv_runner_disconnect"
+    sessions_module._session_status_cache[session_id] = "running"
+
+    class _BrokenRunnerClient(httpx.AsyncClient):
+        def stream(self, *args: Any, **kwargs: Any) -> object:  # type: ignore[override]
+            del args, kwargs
+            raise httpx.ConnectError("runner tunnel closed")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    try:
+        await sessions_module._relay_runner_stream(  # type: ignore[arg-type]
+            session_id,
+            _BrokenRunnerClient(),
+            object(),  # type: ignore[arg-type]
+        )
+    finally:
+        cache_after = sessions_module._session_status_cache.get(session_id)
+        sessions_module._session_status_cache.pop(session_id, None)
+
+    assert cache_after == "running"
+    assert not any(
+        event.get("type") == "session.status" and event.get("status") == "failed"
+        for event in published
+    )
 
 
 def test_session_created_event_payload_shape() -> None:

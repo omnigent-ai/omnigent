@@ -9611,16 +9611,11 @@ async def _relay_runner_stream(
             session_id,
             exc_info=True,
         )
-        # Publish a failed status so the client's SSE stream sees a
-        # clean error event instead of silent truncation (#1114).
-        _publish_status(
-            session_id,
-            "failed",
-            ErrorDetail(
-                code="runner_disconnected",
-                message="Runner disconnected unexpectedly.",
-            ),
-        )
+        # End the relay cleanly without turning runner liveness into a
+        # task failure. The UI learns the runner is offline through the
+        # existing runner_online/liveness path; poisoning the session
+        # status cache with ``failed`` makes a benign disconnect look like
+        # a failed task in the Subagents panel.
     except asyncio.CancelledError:
         raise
     finally:
@@ -13761,7 +13756,6 @@ def create_sessions_router(
             conversation=access.conversation,
             liveness_lookup=liveness_lookup if include_liveness else None,
             include_items=include_items,
-            runner_exit_reports=runner_exit_reports,
             refresh_state=refresh_state,
             host_store=getattr(request.app.state, "host_store", None),
             sandbox_config=getattr(request.app.state, "sandbox_config", None),
@@ -14729,7 +14723,6 @@ def create_sessions_router(
             agent_store,
             agent_cache,
             liveness_lookup=liveness_lookup,
-            runner_exit_reports=runner_exit_reports,
         )
 
     # ── POST /sessions/{source_id}/fork ─────────────────────────
@@ -19888,7 +19881,6 @@ async def _get_session_snapshot(
     conversation: Conversation | None = None,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
     include_items: bool = True,
-    runner_exit_reports: RunnerExitReports | None = None,
     refresh_state: bool = False,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxConfig | None = None,
@@ -20015,20 +20007,9 @@ async def _get_session_snapshot(
     if isinstance(raw_label, str) and raw_label.isdigit():
         last_total_tokens = int(raw_label)
     last_task_error = _last_task_error_from_labels(conv.labels)
-    # Runner-crash durability: if the session's bound runner reported an
-    # unexpected exit (host.runner_exited → RunnerExitReports), surface the
-    # cause as last_task_error so a reload/late-open still renders the error
-    # banner — the live session.status:failed push is gone by then. status
-    # already reads "failed" from the cache (set by _on_runner_exited). The
-    # report is keyed by the CURRENT runner_id, so a successful relaunch
-    # (new token-bound runner_id) naturally stops matching. Access is gated
-    # by the session-snapshot's own authorization, so the unscoped get is
-    # correct here (the report is this session's own runner).
-    if runner_exit_reports is not None and conv.runner_id is not None:
-        exit_error = runner_exit_reports.get(conv.runner_id)
-        if exit_error is not None:
-            last_task_error = {"code": "runner_failed_to_start", "message": exit_error}
-            status = "failed"
+    # Runner exit/disconnect is represented by runner_online/liveness, not
+    # by session ``status='failed'``. Genuine task failures still arrive via
+    # explicit failed status events and persisted last-task-error labels.
     llm_model: str | None = None
     context_window: int | None = None
     agent_name: str | None = None
