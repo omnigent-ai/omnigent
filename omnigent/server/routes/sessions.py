@@ -14532,7 +14532,14 @@ def create_sessions_router(
 
         permission_mode = body.permission_mode
         if permission_mode is not None:
-            valid_modes = {"default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
+            valid_modes = {
+                "default",
+                "auto",
+                "acceptEdits",
+                "plan",
+                "dontAsk",
+                "bypassPermissions",
+            }
             if permission_mode not in valid_modes:
                 raise OmnigentError(
                     f"invalid permission_mode: must be one of {sorted(valid_modes)}",
@@ -14555,7 +14562,9 @@ def create_sessions_router(
             resolved_launch_args = new_args
             terminal_launch_args = resolved_launch_args
         else:
-            terminal_launch_args = resolved_launch_args if body.terminal_launch_args is not None else None
+            terminal_launch_args = (
+                resolved_launch_args if body.terminal_launch_args is not None else None
+            )
 
         if body.runner_id is not None:
             # Empty string is the clear sentinel (None = leave unchanged);

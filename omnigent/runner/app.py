@@ -14687,23 +14687,33 @@ def create_runner_app(
                             settings_data = {}
                             if settings_file.exists():
                                 try:
-                                    settings_data = json.loads(settings_file.read_text(encoding="utf-8"))
+                                    settings_data = json.loads(
+                                        settings_file.read_text(encoding="utf-8")
+                                    )
                                 except (json.JSONDecodeError, OSError):
                                     settings_data = {}
                             if not isinstance(settings_data, dict):
                                 settings_data = {}
                             if permission_mode == "default":
-                                if "permissions" in settings_data and isinstance(settings_data["permissions"], dict):
+                                if "permissions" in settings_data and isinstance(
+                                    settings_data["permissions"], dict
+                                ):
                                     settings_data["permissions"].pop("defaultMode", None)
                                     if not settings_data["permissions"]:
                                         settings_data.pop("permissions", None)
                             else:
-                                if "permissions" not in settings_data or not isinstance(settings_data["permissions"], dict):
+                                if "permissions" not in settings_data or not isinstance(
+                                    settings_data["permissions"], dict
+                                ):
                                     settings_data["permissions"] = {}
                                 settings_data["permissions"]["defaultMode"] = permission_mode
-                            settings_file.write_text(json.dumps(settings_data, indent=2), encoding="utf-8")
-                        except Exception as exc:
-                            _logger.warning("Failed to write permission mode to %s: %s", settings_file, exc)
+                            settings_file.write_text(
+                                json.dumps(settings_data, indent=2), encoding="utf-8"
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            _logger.warning(
+                                "Failed to write permission mode to %s: %s", settings_file, exc
+                            )
             return Response(status_code=204)
 
         if body_type == "plan_mode_change":
