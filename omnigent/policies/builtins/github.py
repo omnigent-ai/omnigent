@@ -768,6 +768,37 @@ def _classify_gh_api(rest: list[str], repo: str | None) -> _ShellOp:
     )
 
 
+def _segment_hides_gated_invocation(tokens: list[str]) -> bool:
+    """
+    Whether a gated git/gh invocation sits behind an unrecognized leading token.
+
+    :func:`real_invocation_tokens` only strips the command wrappers we know
+    about; one we don't (``stdbuf``, ``nice``, ``timeout`` …) leaves the real
+    ``git`` / ``gh`` command deeper in the token list, where the first-token
+    dispatch in :func:`_classify_shell_command` misses it and the segment is
+    silently allowed. This is the fail-closed backstop: spot a ``git
+    <remote-subcmd>`` or ``gh <non-ignored-group>`` token pair anywhere past the
+    first token so the caller can surface it for approval instead.
+
+    Matching on a *command + subcommand* token pair (not a bare mention) keeps
+    benign text like ``echo "git push later"`` — one quoted token, no adjacent
+    pair — from tripping the gate.
+
+    :param tokens: Real-invocation tokens of a segment whose leading token was
+        not itself recognized as ``git`` / ``gh``.
+    :returns: ``True`` if a gated git/gh invocation appears behind the leading
+        token, else ``False``.
+    """
+    gated_git = _GIT_READ_SUBCMDS | _GIT_WRITE_SUBCMDS
+    for i in range(1, len(tokens) - 1):
+        word, following = tokens[i], tokens[i + 1]
+        if word == "git" and following in gated_git:
+            return True
+        if word == "gh" and not following.startswith("-") and following not in _GH_IGNORE_GROUPS:
+            return True
+    return False
+
+
 def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
     """
     Parse a shell command string into the git / gh remote ops it performs.
@@ -782,8 +813,9 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
         leave it 0.
     :returns: One :class:`_ShellOp` per git/gh remote invocation found. Local
         git commands and non-git/gh segments produce no op. A segment that
-        starts with git/gh but cannot be tokenized yields an ``"unparseable"``
-        op so the caller can ASK rather than silently allow.
+        starts with git/gh but cannot be tokenized — or hides a gated git/gh
+        invocation behind an unrecognized leading wrapper — yields an
+        ``"unparseable"`` op so the caller can ASK rather than silently allow.
     """
     if _depth > MAX_SHELL_NESTING:
         return []
@@ -818,6 +850,16 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
             op = _classify_git(tokens)
         elif tokens[0] == "gh":
             op = _classify_gh(tokens)
+        elif _segment_hides_gated_invocation(tokens):
+            # An unrecognized leading wrapper hides a real git/gh invocation —
+            # fail closed (ASK) rather than let it through unchecked.
+            op = _ShellOp(
+                kind="unparseable",
+                repo=None,
+                branches=frozenset(),
+                branch_targeted=False,
+                detail=segment[:60],
+            )
         else:
             op = None
         if op is not None:
