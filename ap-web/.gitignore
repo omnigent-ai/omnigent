@@ -14,6 +14,13 @@ dist-ssr
 coverage
 *.local
 
+# Playwright (browser test runner)
+test-results
+playwright-report
+.playwright
+# Harness screenshot captured during a local browser-test run (transient)
+src/components/blocks/typeahead/__harness__/.prediction.png
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

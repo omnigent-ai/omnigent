@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { resolveWebSocketUrl } from "@/lib/host";
 import {
   type ConnectionState,
+  type LocalEchoMode,
   type TerminalActivityListener,
   type TerminalInputListener,
   isUnexpectedTerminalClose,
@@ -65,6 +66,12 @@ interface TerminalViewProps {
   onResume?: () => void | Promise<void>;
   /** Whether the optional resume action is currently in flight. */
   resumePending?: boolean;
+  /**
+   * Predictive local-echo (type-ahead) mode. ``"auto"`` (default) engages only
+   * on high-latency links; ``"off"`` disables it entirely. Changing this
+   * re-dials the session (it's an addressing input). See {@link LocalEchoMode}.
+   */
+  localEcho?: LocalEchoMode;
 }
 
 export function TerminalView({
@@ -76,6 +83,7 @@ export function TerminalView({
   onInput,
   onResume,
   resumePending = false,
+  localEcho = "auto",
 }: TerminalViewProps) {
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
   const [connectAttempt, setConnectAttempt] = useState(0);
@@ -172,6 +180,7 @@ export function TerminalView({
           isDarkRef.current,
           notifyActivity,
           notifyInput,
+          localEcho,
         );
         sessionRef.current = terminalSession;
       });
@@ -182,7 +191,7 @@ export function TerminalView({
         onStateChangeRef.current?.(null);
       };
     },
-    [sessionId, terminalId, readOnly, notifyState, notifyActivity, notifyInput],
+    [sessionId, terminalId, readOnly, notifyState, notifyActivity, notifyInput, localEcho],
   );
 
   // Push theme changes into the live session without remounting.
