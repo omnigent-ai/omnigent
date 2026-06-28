@@ -805,6 +805,11 @@ def test_classify_codex_error_auth_vs_generic() -> None:
     assert fwd._classify_codex_error({"codexErrorInfo": "Unauthorized"}, "nope") == auth
     assert fwd._classify_codex_error({"codexErrorInfo": {"type": "Unauthorized"}}, "nope") == auth
     assert fwd._classify_codex_error({"codexErrorInfo": {"httpStatusCode": 401}}, "nope") == auth
+    # The real app-server enum serializes lowercase snake_case; it must match
+    # via the structured path (message "nope" has no auth substring to fall
+    # back on), case-insensitively.
+    assert fwd._classify_codex_error({"codexErrorInfo": "unauthorized"}, "nope") == auth
+    assert fwd._classify_codex_error({"codexErrorInfo": {"type": "unauthorized"}}, "nope") == auth
     # Message-text fallback when codexErrorInfo is absent.
     assert fwd._classify_codex_error({}, "Please run codex login") == auth
     assert fwd._classify_codex_error({}, "ChatGPT session expired") == auth

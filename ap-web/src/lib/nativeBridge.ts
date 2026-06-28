@@ -120,6 +120,49 @@ interface ElectronDesktopApi extends NativeShellApi {
   switchServer?: (url: string) => Promise<void>;
   /** Return this window to the shell's "connect to server" setup page. */
   openServerSetup?: () => void;
+  /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
+  getHostIdentity?: () => Promise<HostIdentity | null>;
+  /** Start / stop / restart this machine's host daemon for the window's server. */
+  controlHost?: (action: HostControlAction) => Promise<HostActionResult>;
+  /** Subscribe to host status-change pings (re-read on fire); returns an unsubscribe. */
+  onHostStatusChanged?: (callback: () => void) => () => void;
+  /** The local `omni` CLI status (installed, resolved path, version, source). */
+  getCliStatus?: () => Promise<CliStatus | null>;
+  /** Clear the CLI-path override (revert to auto-detection); resolves status. */
+  resetCliPath?: () => Promise<CliStatus | null>;
+}
+
+/** A lifecycle action for the host daemon. */
+export type HostControlAction = "start" | "stop" | "restart";
+
+/** Status of the local `omni` CLI, from the desktop shell. */
+export interface CliStatus {
+  /** Whether the CLI was found and is runnable. */
+  installed: boolean;
+  /** The resolved binary path (configured override or auto-detected), or null. */
+  path: string | null;
+  /** The CLI's reported version, or null. */
+  version: string | null;
+  /** How the path was resolved: an explicit override, PATH, or a known location. */
+  source: "configured" | "path" | "candidate" | null;
+  /** The install one-liner to show when the CLI is missing. */
+  installCommand: string;
+  /** Whether a just-submitted path was accepted (present on pick/set results). */
+  accepted?: boolean;
+}
+
+/** This machine's identity, read from local config (fast — no subprocess). */
+export interface HostIdentity {
+  /** Whether the `omnigent` CLI was found and is runnable. */
+  cliInstalled: boolean;
+  /** This machine's host id, or null if it has none yet. */
+  hostId: string | null;
+}
+
+/** Result of a host control action from the desktop shell. */
+export interface HostActionResult {
+  ok: boolean;
+  error?: string;
 }
 
 /** Data backing the title-bar server picker, from the Electron shell. */
@@ -412,5 +455,90 @@ export function openServerSetup(): void {
     electron.openServerSetup();
   } catch (err) {
     console.warn("[nativeBridge] electron openServerSetup failed:", err);
+  }
+}
+
+/**
+ * Fetch this machine's identity (CLI installed + host id) from the desktop
+ * shell. Fast — reads local config, no runner-status subprocess — so callers
+ * that only need to recognize "this machine" (e.g. the host picker) don't wait
+ * on the slow status check. Resolves `null` outside the Electron shell.
+ */
+export async function getHostIdentity(): Promise<HostIdentity | null> {
+  const electron = electronApi();
+  if (!electron?.getHostIdentity) return null;
+  try {
+    return await electron.getHostIdentity();
+  } catch (err) {
+    console.warn("[nativeBridge] electron getHostIdentity failed:", err);
+    return null;
+  }
+}
+
+/**
+ * Start / stop / restart this machine's host daemon for the window's server,
+ * via the desktop shell. Resolves `{ ok, error? }`; a no-op `{ ok: false }`
+ * outside the shell.
+ */
+export async function controlHost(action: HostControlAction): Promise<HostActionResult> {
+  const electron = electronApi();
+  if (!electron?.controlHost) return { ok: false, error: "not running under the desktop shell" };
+  try {
+    return await electron.controlHost(action);
+  } catch (err) {
+    console.warn("[nativeBridge] electron controlHost failed:", err);
+    return { ok: false, error: String(err) };
+  }
+}
+
+/**
+ * Subscribe to host status-change pings from the desktop shell. The shell fires
+ * these only on real events — a host child connecting or exiting, or a control
+ * action — never on a timer, so the callback should re-read what it needs (e.g.
+ * the server's host list) when it fires.
+ *
+ * Returns an unsubscribe function. A no-op (returning a no-op unsubscribe)
+ * outside the Electron shell or under a shell too old to push updates, so
+ * callers can register it unconditionally.
+ */
+export function onHostStatusChanged(callback: () => void): () => void {
+  const electron = electronApi();
+  if (!electron?.onHostStatusChanged) return () => {};
+  try {
+    return electron.onHostStatusChanged(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] electron onHostStatusChanged failed:", err);
+    return () => {};
+  }
+}
+
+/**
+ * Fetch the local `omni` CLI status from the desktop shell (installed, resolved
+ * path, version, source). Resolves `null` outside the Electron shell or under a
+ * shell too old to expose the CLI bridge.
+ */
+export async function getCliStatus(): Promise<CliStatus | null> {
+  const electron = electronApi();
+  if (!electron?.getCliStatus) return null;
+  try {
+    return await electron.getCliStatus();
+  } catch (err) {
+    console.warn("[nativeBridge] electron getCliStatus failed:", err);
+    return null;
+  }
+}
+
+/**
+ * Clear the saved CLI-path override so the shell reverts to auto-detection,
+ * then resolve the freshly-detected status. Resolves `null` outside the shell.
+ */
+export async function resetCliPath(): Promise<CliStatus | null> {
+  const electron = electronApi();
+  if (!electron?.resetCliPath) return null;
+  try {
+    return await electron.resetCliPath();
+  } catch (err) {
+    console.warn("[nativeBridge] electron resetCliPath failed:", err);
+    return null;
   }
 }

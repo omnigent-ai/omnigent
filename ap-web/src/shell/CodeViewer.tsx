@@ -315,14 +315,15 @@ export function CodeViewer({
         selection.removeAllRanges();
         selection.addRange(range);
         selectAllPendingRef.current = true;
-      } else if (e.key === "Escape") {
+      } else if (e.key === "Escape" && searchOpen) {
+        e.preventDefault();
         setSearchOpen(false);
         setSearchQuery("");
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [panelOpen, isMarkdownEditor, showMonaco, setSearchOpen, searchInputRef]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [panelOpen, isMarkdownEditor, showMonaco, searchOpen, setSearchOpen, searchInputRef]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // In Monaco mode the custom search bar isn't rendered; the editor opens its
   // native find when `searchOpen` is set (once it has mounted), then calls this

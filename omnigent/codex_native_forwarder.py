@@ -141,10 +141,13 @@ _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
 # shape varies by version, so detecting either keeps the fix robust.
 #
 # ``codexErrorInfo`` is the app-server's structured classification (e.g.
-# ``Unauthorized``, ``UsageLimitExceeded``); auth-class values get a re-auth
-# hint. httpStatusCode 401/403 is treated as auth too.
+# ``unauthorized``, ``usage_limit_exceeded``); auth-class values get a re-auth
+# hint. httpStatusCode 401/403 is treated as auth too. Values are stored and
+# compared case-insensitively: the app-server enum serializes as lowercase
+# snake_case (``unauthorized``), but older/alternate spellings (``Unauthorized``)
+# are matched too.
 _CODEX_ERROR_ITEM_TYPE = "error"
-_CODEX_AUTH_ERROR_INFO = frozenset({"Unauthorized"})
+_CODEX_AUTH_ERROR_INFO = frozenset({"unauthorized"})
 _CODEX_AUTH_HTTP_STATUS = frozenset({401, 403})
 # Message-substring fallback for app-server versions that omit codexErrorInfo.
 # Surface-only, so recall is favored over precision: a false positive only
@@ -736,9 +739,10 @@ def _classify_codex_error(error: dict[str, Any], message: str) -> str:
     """
     Classify a Codex ``turn.error`` / ``error`` item as auth-related or generic.
 
-    Prefers the structured ``codexErrorInfo`` (``Unauthorized`` or an
-    httpStatusCode of 401/403); falls back to substring matching against
-    :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes that omit it.
+    Prefers the structured ``codexErrorInfo`` (an ``unauthorized`` variant,
+    case-insensitive, or an httpStatusCode of 401/403); falls back to substring
+    matching against :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes
+    that omit it.
 
     :param error: The ``turn.error`` object.
     :param message: Its already-extracted message text.
@@ -753,7 +757,8 @@ def _classify_codex_error(error: dict[str, Any], message: str) -> str:
     elif isinstance(info, dict):
         variant = info.get("type") or info.get("kind") or info.get("variant")
         http_status = info.get("httpStatusCode")
-    if variant in _CODEX_AUTH_ERROR_INFO or http_status in _CODEX_AUTH_HTTP_STATUS:
+    variant_is_auth = variant is not None and variant.lower() in _CODEX_AUTH_ERROR_INFO
+    if variant_is_auth or http_status in _CODEX_AUTH_HTTP_STATUS:
         return _CODEX_ERROR_KIND_AUTH
     lowered = message.lower()
     if any(fragment in lowered for fragment in _CODEX_AUTH_ERROR_FRAGMENTS):

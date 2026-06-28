@@ -31,6 +31,7 @@ from collections.abc import Callable
 from typing import Protocol, cast
 
 import click
+from rich.cells import cell_len
 from rich.console import Console
 from rich.text import Text
 
@@ -70,6 +71,23 @@ def clear_screen() -> None:
     # the cursor — together they wipe the leaked subprocess output.
     sys.stdout.write("\033[2J\033[3J\033[H")
     sys.stdout.flush()
+
+
+def _truncate_cells(text: str, max_cells: int) -> str:
+    """Truncate *text* to a terminal-cell budget, adding an ellipsis if needed."""
+    if cell_len(text) <= max_cells:
+        return text
+    ellipsis = "…"
+    budget = max(0, max_cells - cell_len(ellipsis))
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        width = cell_len(ch)
+        if used + width > budget:
+            break
+        out.append(ch)
+        used += width
+    return "".join(out) + ellipsis
 
 
 def _render_menu(
@@ -118,9 +136,9 @@ def _render_menu(
 
     render_console.print()
     if status:
-        render_console.print(Text.from_markup(f"  [bold green]{status}[/]"))
+        render_console.print(Text(f"  {status}", style="bold green"))
         render_console.print()
-    render_console.print(Text.from_markup(f"  [bold {ACCENT}]{title}[/]"))
+    render_console.print(Text(f"  {title}", style=f"bold {ACCENT}"))
     if not compact:
         # The compact overview hugs the title to the list (Hermes-style); other
         # menus keep a blank line below the title for breathing room.
@@ -175,14 +193,17 @@ def _render_menu(
 
     if descriptions is not None and descriptions[selected]:
         render_console.print()
-        render_console.print(Text.from_markup(f"    [dim italic]{descriptions[selected]}[/]"))
+        description = descriptions[selected]
+        if compact:
+            description = _truncate_cells(description, max(8, width - 4))
+        render_console.print(Text(f"    {description}", style="dim italic"))
 
     render_console.print()
     # The compact overview is a top-level menu (Esc exits setup), so it shows a
     # navigate/select/exit hint in the spirit of other modern CLIs; nested menus
     # keep the "Esc back" wording, where Esc returns rather than exits.
     hint = (
-        "↑/↓ navigate  ·  Enter select  ·  Esc to exit"
+        "↑/↓ nav  ·  Enter select  ·  Esc exit"
         if compact
         else "↑/↓ move  ·  Enter select  ·  Esc back"
     )
@@ -361,7 +382,7 @@ def select(
         No-op on the numbered fallback.
     :param compact: When ``True`` (TTY only), render the dense top-level
         overview layout: the title hugs the list (no blank line below it) and
-        the footer reads ``navigate · select · Esc to exit`` (Esc exits rather
+        the footer reads ``nav · select · Esc exit`` (Esc exits rather
         than goes back). Intended for the setup harness overview. No-op on the
         numbered fallback.
     :returns: The chosen zero-based index into *options* (always a

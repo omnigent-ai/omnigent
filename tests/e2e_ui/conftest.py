@@ -1391,16 +1391,21 @@ def terminal_session(
     try:
         yield (live_server, session_id)
     finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        # Restore the "found" state: if we respawned the runner (a prior
-        # test had killed it), tear our copy down so it doesn't outlive us.
-        if respawned_runner is not None:
-            respawned_runner.terminate()
+        try:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        finally:
             try:
-                respawned_runner.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                respawned_runner.kill()
-                respawned_runner.wait(timeout=5)
+                reset_mock_llm(mock_llm_server_url)
+            finally:
+                # Restore the "found" state: if we respawned the runner (a prior
+                # test had killed it), tear our copy down so it doesn't outlive us.
+                if respawned_runner is not None:
+                    respawned_runner.terminate()
+                    try:
+                        respawned_runner.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        respawned_runner.kill()
+                        respawned_runner.wait(timeout=5)
 
 
 _TWO_AGENT_PARENT_NAME = "hitchhikers_chat"

@@ -2454,6 +2454,44 @@ describe("Mobile session menu", () => {
     expect(screen.getByRole("menuitem", { name: /Shells/i })).toBeInTheDocument();
   });
 
+  it("shows the Shells entry on mobile when the agent declares shell access", () => {
+    // No user shells exist yet (only the embedded REPL, excluded from the
+    // Shells inventory), but the agent declares a terminals: block. Mobile
+    // must mirror the desktop rail so the empty-state "+ New shell" entry
+    // point is reachable before the first shell exists.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      {
+        id: "conv_sdk",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+      },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+    } as ReturnType<typeof useSessionAgent>);
+
+    renderShell("/c/conv_sdk");
+    openSessionMenu();
+
+    const shellsEntry = screen.getByRole("menuitem", { name: /^Shells$/i });
+    expect(shellsEntry).toBeInTheDocument();
+    expect(shellsEntry).not.toHaveTextContent(/0/);
+    fireEvent.click(shellsEntry);
+
+    const drawer = screen.getByTestId("shells-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(within(drawer).getByTestId("inline-terminals-section")).toBeInTheDocument();
+  });
+
   it("opens the Agents drawer and mounts the subagents panel", () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },

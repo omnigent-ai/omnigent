@@ -1816,6 +1816,31 @@ def _host(
     return HostProcess(identity, server_url)
 
 
+def test_build_connect_headers_adds_org_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A recorded ?o= selector rides the tunnel handshake.
+
+    The WS upgrade must name the workspace via ``X-Databricks-Org-Id`` or it
+    routes to the account. The header rides alongside the Origin sentinel,
+    independent of the bearer/managed-token branch.
+
+    :param monkeypatch: The pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import omnigent.runner._entry as entry_mod
+
+    # No managed token + no real Databricks creds: isolate the bearer
+    # branch so only the routing header is under test.
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_org_id", lambda _url: "2850744067564480"
+    )
+
+    headers = _host("https://acme.databricks.com/api/2.0/omnigent")._build_connect_headers()
+
+    assert headers["X-Databricks-Org-Id"] == "2850744067564480"
+
+
 async def test_run_retries_on_login_redirect(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

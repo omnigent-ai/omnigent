@@ -51,6 +51,13 @@ vi.mock("@/hooks/useDirectorySessions", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: vi.fn(),
 }));
+// The composer's project chip lists projects via useProjects; stub it to an
+// empty list so it doesn't fire its own authenticatedFetch (which would skew
+// the create-POST call-count / call-order assertions below).
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
+  useProjects: () => ({ data: [] }),
+}));
 
 const authenticatedFetchMock = vi.mocked(authenticatedFetch);
 const useHostsMock = vi.mocked(useHosts);
@@ -567,7 +574,7 @@ function setupLandingMocks() {
   ]);
 }
 
-function renderLanding(infoOverrides: Partial<ServerInfo> = {}) {
+function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -586,13 +593,34 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}) {
     <QueryClientProvider client={client}>
       <CapabilitiesProvider info={info}>
         <TooltipProvider>
-          <MemoryRouter>
+          <MemoryRouter initialEntries={[route]}>
             <NewChatLandingScreen />
           </MemoryRouter>
         </TooltipProvider>
       </CapabilitiesProvider>
     </QueryClientProvider>,
   );
+}
+
+/**
+ * Open the agent/harness picker and open <agentId>'s config submenu via
+ * keyboard (ArrowRight). A plain click on a knobbed row instead COMMITS the
+ * pick and closes the menu, so config flows use the keyboard to drill in.
+ */
+function openAgentConfig(agentId: string): void {
+  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  fireEvent.keyDown(screen.getByTestId(`new-chat-landing-agent-${agentId}`), { key: "ArrowRight" });
+}
+
+/** Open the picker and commit (select + close) an agent by clicking its row. */
+function selectAgent(agentId: string): void {
+  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+}
+
+/** Dismiss any open menu. */
+function closeMenu(): void {
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
 }
 
 describe("NewChatLandingScreen", () => {
@@ -756,14 +784,15 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
   });
 
-  it("shows permission-mode options behind the run-mode pill for the claude-native agent", () => {
+  it("shows the Claude Code config knobs (model / effort / permission mode) in the picker submenu", () => {
     renderLanding();
-    // The radios live behind the composer's left-side run-mode pill — absent
-    // until the menu opens.
+    // The knobs live in the agent picker's per-entry submenu — absent until opened.
     expect(screen.queryByTestId("new-chat-landing-permission-plan")).toBeNull();
-    // a1 (Claude Code, claude-native) is the default agent → the composer
-    // surfaces the permission-mode pill with the permission-mode radios.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-pill"), { button: 0 });
+    // a1 (Claude Code, claude-native) is the default agent. Open its config
+    // submenu: model + effort + permission-mode radios all appear together.
+    openAgentConfig("a1");
+    expect(screen.getByTestId("new-chat-landing-model-sonnet")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-effort-medium")).toBeTruthy();
     const planOption = screen.getByTestId("new-chat-landing-permission-plan");
     expect(planOption.textContent).toContain("Plan");
     // The footer line explains the SELECTED mode until a row is hovered —
@@ -773,21 +802,12 @@ describe("NewChatLandingScreen", () => {
     expect(detail.textContent).toContain("Prompts before edits and commands");
     fireEvent.pointerEnter(planOption);
     expect(detail.textContent).toContain("Plans only; makes no edits");
-    // Switch to Codex (a2: codex-native) — the run-mode pill stays visible
-    // but now shows approval-mode radios instead of permission-mode radios.
-    // Close the menu first (Escape), then switch agents.
-    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    expect(screen.queryByTestId("new-chat-landing-approval-pill")).not.toBeNull();
   });
 
-  it("shows approval-mode options behind the run-mode pill for the codex-native agent", () => {
+  it("shows the Codex approval-mode knobs in the picker submenu", () => {
     renderLanding();
-    // Switch to Codex first.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    // Open Codex's (a2) config submenu — it carries the approval-mode radios.
+    openAgentConfig("a2");
     const fullAccessOption = screen.getByTestId("new-chat-landing-approval-full-access");
     expect(fullAccessOption.textContent).toContain("Full access");
     // The footer line explains the SELECTED mode until a row is hovered.
@@ -800,10 +820,10 @@ describe("NewChatLandingScreen", () => {
 
   it("arms codex full bypass only after the confirmation phrase is typed", async () => {
     renderLanding();
-    // Switch to Codex, open the Advanced menu.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    // Commit Codex as the selected agent, then reopen its config submenu where
+    // the bypass opt-in lives (arming requires Codex to be the live selection).
+    selectAgent("a2");
+    openAgentConfig("a2");
     const toggle = screen.getByTestId(
       "new-chat-landing-bypass-sandbox-switch",
     ) as HTMLButtonElement;
@@ -843,30 +863,28 @@ describe("NewChatLandingScreen", () => {
 
   it("disarms the dangerous bypass when the agent changes (re-confirm per context)", () => {
     renderLanding();
-    // Arm bypass on Codex (a2): type the phrase, flip the switch, close tray.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    // Arm bypass on Codex (a2): commit it, open its submenu, type the phrase,
+    // flip the switch, close the menu.
+    selectAgent("a2");
+    openAgentConfig("a2");
     fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
       target: { value: "bypass sandbox" },
     });
     fireEvent.click(screen.getByTestId("new-chat-landing-bypass-sandbox-switch"));
-    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    closeMenu();
     // Armed → the persistent banner is up under the composer.
     expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeTruthy();
 
     // Switch away to Claude (a1): the armed bypass must clear immediately, so
     // the persistent banner disappears (Claude has no bypass toggle at all).
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a1"));
+    selectAgent("a1");
     expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeNull();
 
-    // Switch back to Codex and reopen Advanced: the toggle is OFF and disabled
-    // again — the confirmation phrase must be re-typed for this fresh context.
-    // Without the reset effect it would re-render armed from stale state.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    // Switch back to Codex and reopen its submenu: the toggle is OFF and
+    // disabled again — the confirmation phrase must be re-typed for this fresh
+    // context. Without the reset effect it would re-render armed from stale state.
+    selectAgent("a2");
+    openAgentConfig("a2");
     const toggle = screen.getByTestId(
       "new-chat-landing-bypass-sandbox-switch",
     ) as HTMLButtonElement;
@@ -881,15 +899,14 @@ describe("NewChatLandingScreen", () => {
       json: async () => ({ id: "conv_new" }),
     } as unknown as Response);
     renderLanding();
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-approval-pill"), { button: 0 });
+    selectAgent("a2");
+    openAgentConfig("a2");
     fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
       target: { value: "bypass sandbox" },
     });
     fireEvent.click(screen.getByTestId("new-chat-landing-bypass-sandbox-switch"));
     // Close the menu and submit a real task.
-    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    closeMenu();
     // The persistent banner remains visible under the composer after the
     // Advanced tray closes.
     expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeTruthy();
@@ -925,6 +942,25 @@ describe("NewChatLandingScreen", () => {
     // Singular copy proves the count (1) flowed through, not just that *some*
     // banner rendered.
     expect(banner.textContent).toContain("1 other agent is");
+  });
+
+  it("caps each footer chip label with truncate so a long label can't wrap the row", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    // The host / working-directory / project / worktree chips each clamp their
+    // label to a fixed max width and `truncate` it, so a long value (a deep
+    // working-directory path, a long project or branch name) is ellipsized
+    // rather than growing the chip and pushing the tray onto a second row.
+    // Dropping `truncate` or the `max-w-*` cap would regress the single-row
+    // layout this guards.
+    const label = (testid: string) => screen.getByTestId(testid).querySelector("span.truncate");
+
+    expect(label("new-chat-landing-workspace-chip")?.className).toContain("max-w-20");
+    expect(label("new-chat-landing-host-chip")?.className).toContain("max-w-24");
+    expect(label("new-chat-landing-project-chip")?.className).toContain("max-w-16");
+    expect(label("new-chat-landing-branch-chip")?.className).toContain("max-w-16");
   });
 
   it("suppresses the conflict banner once a git branch is named", async () => {
@@ -1145,6 +1181,83 @@ describe("NewChatLandingScreen", () => {
     } as unknown as Response);
     // The resolved create navigates without surfacing an error.
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-error")).toBeNull());
+  });
+
+  it("files the new session under a project picked in the composer chip", async () => {
+    // Both the create POST and the follow-up label PATCH read .ok / .json.
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const invalidateSpy = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+    renderLanding();
+
+    // Open the project chip → "New project…" → type a name → commit.
+    fireEvent.click(screen.getByTestId("new-chat-landing-project-chip"));
+    fireEvent.click(screen.getByText("New project…"));
+    const nameInput = screen.getByPlaceholderText("Project name…");
+    fireEvent.change(nameInput, { target: { value: "docs" } });
+    fireEvent.keyDown(nameInput, { key: "Enter" });
+    // The chip reflects the pick.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain("docs"),
+    );
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "write the docs" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    // Create POST first, then a PATCH that sets the omni_project label on the
+    // freshly-created session id.
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
+    const [createUrl] = authenticatedFetchMock.mock.calls[0];
+    expect(createUrl).toBe("/v1/sessions");
+    const [patchUrl, patchInit] = authenticatedFetchMock.mock.calls[1];
+    expect(patchUrl).toBe("/v1/sessions/conv_new");
+    expect((patchInit as RequestInit).method).toBe("PATCH");
+    const patchBody = JSON.parse((patchInit as RequestInit).body as string) as {
+      labels: Record<string, string>;
+    };
+    expect(patchBody.labels).toEqual({ omni_project: "docs" });
+
+    // The target folder fetches its own paginated list (useProjectSessions),
+    // so filing the new session must invalidate it — otherwise the row only
+    // appears after a manual refresh.
+    await waitFor(() =>
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] }),
+    );
+    invalidateSpy.mockRestore();
+  });
+
+  it("pre-fills the project chip from the ?project= query param", async () => {
+    // The sidebar's per-project "new session" pencil lands here with the
+    // project pre-selected — the chip reflects it with no interaction.
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding({}, "/?project=Sprint%2042");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain(
+        "Sprint 42",
+      ),
+    );
+
+    // Creating a session files it under that pre-filled project.
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "kick off the sprint" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
+    const [patchUrl, patchInit] = authenticatedFetchMock.mock.calls[1];
+    expect(patchUrl).toBe("/v1/sessions/conv_new");
+    const patchBody = JSON.parse((patchInit as RequestInit).body as string) as {
+      labels: Record<string, string>;
+    };
+    expect(patchBody.labels).toEqual({ omni_project: "Sprint 42" });
   });
 
   it.each([

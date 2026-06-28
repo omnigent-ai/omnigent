@@ -238,6 +238,58 @@ async def test_create_session_rejects_malformed_model_override(
     )
 
 
+async def test_create_session_with_reasoning_effort_persists(
+    client: httpx.AsyncClient,
+) -> None:
+    """Create-time ``reasoning_effort`` lands on the row and the snapshot.
+
+    This is the seam the ap-web new-session model/effort picker relies on:
+    the value must be persisted before the runner fetches the session
+    snapshot (native Claude Code reads it as ``--effort`` at terminal
+    launch).
+    """
+    agent = await create_test_agent(client)
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "initial_items": [],
+            "reasoning_effort": "high",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    created = resp.json()
+    # The create response itself must carry the effort — the runner's
+    # launch-config fetch consumes this exact snapshot shape.
+    assert created["reasoning_effort"] == "high"
+
+    get = await client.get(f"/v1/sessions/{created['id']}")
+    assert get.status_code == 200
+    assert get.json()["reasoning_effort"] == "high"
+
+
+async def test_create_session_rejects_invalid_reasoning_effort(
+    client: httpx.AsyncClient,
+) -> None:
+    """Create-time ``reasoning_effort`` outside the effort vocabulary 400s.
+
+    Validated before any row exists so a bad value never creates an orphan
+    session, mirroring the ``model_override`` charset guard.
+    """
+    agent = await create_test_agent(client)
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "initial_items": [],
+            "reasoning_effort": "turbo",
+        },
+    )
+    assert resp.status_code == 400, (
+        f"reasoning_effort 'turbo' should 400, got {resp.status_code}: {resp.text}"
+    )
+
+
 class _CaptureClient:
     """Stub runner client that records the POSTed body for inspection."""
 

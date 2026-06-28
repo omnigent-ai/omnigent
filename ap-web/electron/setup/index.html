@@ -46,6 +46,10 @@
         background: var(--background);
         color: var(--foreground);
         padding: 0 16px;
+        /* App chrome, not a document — suppress text selection everywhere
+           except the input fields (re-enabled below). */
+        -webkit-user-select: none;
+        user-select: none;
       }
       .card {
         width: 100%;
@@ -79,6 +83,9 @@
         background: transparent;
         color: var(--foreground);
         outline: none;
+        /* Re-enable selection in the editable fields (body suppresses it). */
+        -webkit-user-select: text;
+        user-select: text;
       }
       input::placeholder {
         color: var(--muted-foreground);
@@ -98,19 +105,21 @@
         opacity: 0.5;
         cursor: default;
       }
+      /* Connect (to a remote server) is the secondary path, below the prominent
+         "Start locally" action that leads the card. */
       #connect {
         margin-top: 16px;
         padding: 9px 12px;
         font-weight: 500;
-        border: none;
-        background: var(--primary);
-        color: var(--primary-foreground);
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--foreground);
       }
       #connect:hover:not(:disabled) {
-        background: color-mix(in srgb, var(--primary) 90%, transparent);
+        background: color-mix(in srgb, var(--foreground) 5%, transparent);
       }
       .recents {
-        margin-top: 24px;
+        margin-top: 12px;
       }
       .recents-title {
         margin: 0 0 8px;
@@ -139,6 +148,158 @@
         line-height: 1.4;
         min-height: 18px;
       }
+      /* Separator between the prominent "Start locally" action and the
+         connect-to-a-server form below it. */
+      .divider {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin: 20px 0;
+        color: var(--muted-foreground);
+        font-size: 12px;
+      }
+      .divider::before,
+      .divider::after {
+        content: "";
+        flex: 1;
+        height: 1px;
+        background: var(--border);
+      }
+      /* "Start locally" — the prominent primary action (filled), leading the
+         card above the connect form. */
+      #start-local {
+        margin-top: 0;
+        padding: 10px 12px;
+        font-weight: 600;
+        border: none;
+        background: var(--primary);
+        color: var(--primary-foreground);
+      }
+      #start-local:hover:not(:disabled) {
+        background: color-mix(in srgb, var(--primary) 90%, transparent);
+      }
+      /* Settings gear (top-right) — opens the Omnigent CLI modal. no-drag so it's
+         clickable over the drag strip. */
+      .gear-btn {
+        position: fixed;
+        top: 8px;
+        right: 12px;
+        z-index: 10;
+        -webkit-app-region: no-drag;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 30px;
+        height: 30px;
+        padding: 0;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: transparent;
+        color: var(--muted-foreground);
+      }
+      .gear-btn:hover {
+        color: var(--foreground);
+        background: color-mix(in srgb, var(--foreground) 5%, transparent);
+      }
+      /* A small accent dot draws the eye to the gear when the CLI is missing. */
+      .gear-btn.attention::after {
+        content: "";
+        position: absolute;
+        top: 3px;
+        right: 3px;
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--destructive);
+      }
+      .modal-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 16px;
+        background: color-mix(in srgb, #000 45%, transparent);
+      }
+      /* The author `display: flex` above outranks the UA `[hidden]` rule, so
+         hiding needs an explicit, higher-specificity rule — without this the
+         modal shows on load and won't close. */
+      .modal-overlay[hidden] {
+        display: none;
+      }
+      .modal {
+        width: 100%;
+        max-width: 26rem;
+        padding: 16px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        background: var(--background);
+        color: var(--foreground);
+        font-size: 13px;
+        line-height: 1.45;
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+      }
+      .modal p {
+        margin: 6px 0;
+      }
+      .modal a {
+        color: var(--foreground);
+        text-decoration: underline;
+      }
+      .modal-title {
+        font-weight: 600;
+        font-size: 15px;
+        margin: 0 0 4px;
+      }
+      .modal-close {
+        margin-top: 14px;
+        padding: 9px 12px;
+        font-weight: 500;
+        border: none;
+        background: var(--primary);
+        color: var(--primary-foreground);
+      }
+      .modal-close:hover {
+        background: color-mix(in srgb, var(--primary) 90%, transparent);
+      }
+      #cli-path-label {
+        font-weight: 500;
+        margin: 10px 0 2px;
+      }
+      .path-row button,
+      #cli-redetect {
+        width: auto;
+        flex: none;
+        padding: 6px 12px;
+        font-size: 12px;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--foreground);
+      }
+      #cli-redetect {
+        margin-top: 8px;
+      }
+      #cli-redetect:hover {
+        background: color-mix(in srgb, var(--foreground) 5%, transparent);
+      }
+      .path-row {
+        display: flex;
+        gap: 8px;
+        margin-top: 8px;
+      }
+      .path-row input {
+        flex: 1;
+      }
+      .cli-note {
+        margin-top: 6px;
+        font-size: 12px;
+        color: var(--muted-foreground);
+        min-height: 16px;
+      }
+      .cli-note.bad {
+        color: var(--destructive);
+      }
       /* With the native title bar hidden (titleBarStyle "hiddenInset" on
          macOS), this strip is the window's only drag surface on the setup
          page. Harmless elsewhere. */
@@ -154,6 +315,32 @@
   </head>
   <body>
     <div class="drag-strip"></div>
+    <button
+      type="button"
+      id="cli-gear"
+      class="gear-btn"
+      aria-label="Configure the Omnigent CLI"
+      title="Configure the Omnigent CLI"
+      hidden
+    >
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        width="16"
+        height="16"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        aria-hidden="true"
+      >
+        <path
+          d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"
+        />
+        <circle cx="12" cy="12" r="3" />
+      </svg>
+    </button>
     <div class="card">
       <picture>
         <source
@@ -162,9 +349,14 @@
         />
         <img class="logo" src="../../platform-assets/logos/omnigents-logo.svg" alt="Omnigents" />
       </picture>
-      <p class="sub">
-        Enter the URL of the Omnigents server. The desktop app loads its web UI directly.
-      </p>
+      <p class="sub">Run an Omnigents server on this machine, or connect to an existing one.</p>
+      <div id="local-section">
+        <!-- Always enabled: when the CLI is missing this opens the settings
+             modal (install / set path) instead of failing to start. -->
+        <button id="start-local">Start locally</button>
+        <div class="divider">or connect to a server</div>
+      </div>
+
       <label for="url">Server URL</label>
       <input
         id="url"
@@ -175,9 +367,43 @@
       />
       <button id="connect">Connect</button>
       <div class="err" id="err"></div>
+
       <div class="recents" id="recents" hidden>
         <p class="recents-title">Recent servers</p>
         <div id="recents-list"></div>
+      </div>
+    </div>
+
+    <!-- Omnigent CLI settings, opened from the gear. Hidden by default. -->
+    <div class="modal-overlay" id="cli-modal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-label="Omnigent CLI settings">
+        <p class="modal-title">Omnigent CLI</p>
+        <p class="cli-note" id="cli-status"></p>
+        <div id="cli-install" hidden>
+          <p>
+            <a
+              href="https://omnigent.ai/quickstart/install#install-omnigent"
+              target="_blank"
+              rel="noreferrer"
+              >Install the Omnigent CLI ↗</a
+            >
+          </p>
+          <p>Already installed it? Re-detect, or set the path below.</p>
+          <button type="button" id="cli-redetect">Re-detect</button>
+        </div>
+        <p id="cli-path-label">Path to the Omnigent CLI</p>
+        <div class="path-row">
+          <input
+            id="cli-path"
+            type="text"
+            placeholder="/path/to/omni"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <button type="button" id="cli-browse">Browse…</button>
+        </div>
+        <p class="cli-note" id="cli-path-note"></p>
+        <button type="button" id="cli-modal-close" class="modal-close">Done</button>
       </div>
     </div>
     <script src="../src/url.js"></script>
@@ -273,7 +499,8 @@
         button.disabled = true;
         try {
           // setServerUrl persists the URL and navigates this window to it —
-          // after which the server's SPA takes over the window.
+          // after which the server's SPA takes over the window. Connecting this
+          // machine as a runner is done later from the host menu, not here.
           await setup.setServerUrl(value);
         } catch (e) {
           err.textContent = String(e && e.message ? e.message : e);
@@ -285,6 +512,157 @@
       input.addEventListener("keydown", (e) => {
         if (e.key === "Enter") connect();
       });
+
+      // --- Start locally + omnigent CLI detection ---------------------------
+      // "Start locally" runs `omnigent server` via the main process, then
+      // connects this window to it through the normal flow. It
+      // needs the local omnigent CLI, so we detect the CLI on load and, when
+      // it's missing, show install instructions plus a way to point at the
+      // binary. Remote Connect never depends on the CLI.
+      const startLocalBtn = document.getElementById("start-local");
+      const localSection = document.getElementById("local-section");
+      const cliGear = document.getElementById("cli-gear");
+      const cliModal = document.getElementById("cli-modal");
+      const cliModalClose = document.getElementById("cli-modal-close");
+      const cliStatus = document.getElementById("cli-status");
+      const cliInstall = document.getElementById("cli-install");
+      const cliRedetect = document.getElementById("cli-redetect");
+      const cliPathInput = document.getElementById("cli-path");
+      const cliBrowse = document.getElementById("cli-browse");
+      const cliPathNote = document.getElementById("cli-path-note");
+      // Tracks the last resolved install state so the Start-locally click can
+      // open settings (instead of failing) when the CLI isn't available.
+      let cliInstalled = false;
+
+      async function refreshCliStatus() {
+        let status;
+        try {
+          status = await setup.getCliStatus();
+        } catch {
+          return;
+        }
+        const installed = Boolean(status.installed);
+        cliInstalled = installed;
+        // Modal contents: install one-liner only when missing. The resolved /
+        // auto-detected path is shown as the field's PLACEHOLDER (the value
+        // stays empty until the user types an override), so the field reads as
+        // "auto" by default.
+        cliInstall.hidden = installed;
+        cliStatus.textContent = installed
+          ? status.version
+            ? `Found: ${status.version}`
+            : "Omnigent CLI found."
+          : "Omnigent CLI not found.";
+        cliPathInput.placeholder = status.path || "/path/to/omni";
+        // Draw the eye to the (otherwise quiet) gear when the CLI is missing.
+        cliGear.classList.toggle("attention", !installed);
+      }
+
+      // Validate + persist the typed path. Returns true when there's nothing to
+      // do (empty) or the path was accepted — i.e. it's safe to close the modal;
+      // false when a non-empty path was rejected (keep the modal open with the
+      // error showing).
+      async function applyCliPath(value) {
+        const p = (value || "").trim();
+        if (p === "") return true;
+        cliPathNote.className = "cli-note";
+        cliPathNote.textContent = "Checking…";
+        let result;
+        try {
+          result = await setup.setCliPath(p);
+        } catch {
+          result = { accepted: false };
+        }
+        if (result && result.accepted) {
+          cliPathNote.textContent = result.version
+            ? `Found: ${result.version}`
+            : "Found the Omnigent CLI.";
+          // Clear the value so the field reverts to showing the (now-updated)
+          // resolved path as its placeholder.
+          cliPathInput.value = "";
+          await refreshCliStatus();
+          return true;
+        }
+        cliPathNote.className = "cli-note bad";
+        cliPathNote.textContent = "That path is not a runnable Omnigent CLI.";
+        return false;
+      }
+
+      function openCliModal() {
+        cliModal.hidden = false;
+        void refreshCliStatus();
+      }
+      function closeCliModal() {
+        cliModal.hidden = true;
+      }
+
+      if (setup.getCliStatus) {
+        // The gear is the only entry point to the CLI settings — hidden by
+        // default, revealed once we know the bridge exists.
+        cliGear.hidden = false;
+        cliGear.addEventListener("click", openCliModal);
+        // "Done" commits the typed path (it isn't applied on every keystroke).
+        // On an invalid path, keep the modal open so the error stays visible.
+        cliModalClose.addEventListener("click", async () => {
+          if (await applyCliPath(cliPathInput.value)) closeCliModal();
+        });
+        cliModal.addEventListener("click", (e) => {
+          if (e.target === cliModal) closeCliModal(); // backdrop click
+        });
+        document.addEventListener("keydown", (e) => {
+          if (e.key === "Escape" && !cliModal.hidden) closeCliModal();
+        });
+        cliBrowse.addEventListener("click", async () => {
+          const picked = await setup.browseCliPath();
+          if (picked) {
+            cliPathInput.value = picked;
+            await applyCliPath(picked);
+          }
+        });
+        cliPathInput.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") applyCliPath(cliPathInput.value);
+        });
+        // Re-run auto-detection (getCliStatus re-resolves every call) — the
+        // post-install path: install via the link, then click to pick it up.
+        cliRedetect.addEventListener("click", async () => {
+          cliStatus.textContent = "Checking…";
+          await refreshCliStatus();
+        });
+        startLocalBtn.addEventListener("click", async () => {
+          // No CLI yet → open settings (install / set path) rather than fail.
+          if (!cliInstalled) {
+            openCliModal();
+            return;
+          }
+          err.textContent = "";
+          const prev = startLocalBtn.textContent;
+          startLocalBtn.disabled = true;
+          startLocalBtn.textContent = "Starting…";
+          try {
+            const result = await setup.startLocalServer();
+            if (result && result.ok && result.url) {
+              // Hand off to the normal connect/navigate flow; on success the
+              // window loads the server and this page goes away. Connecting this
+              // machine as a runner is done later from the host menu.
+              input.value = result.url;
+              await setup.setServerUrl(result.url);
+              return;
+            }
+            err.textContent = (result && result.error) || "Could not start the local server.";
+          } catch (e) {
+            err.textContent = String(e && e.message ? e.message : e);
+          }
+          startLocalBtn.textContent = prev;
+          startLocalBtn.disabled = false;
+        });
+        // Resolve CLI status so the Start-locally click knows whether to start
+        // or open settings, and so the gear's attention dot reflects reality.
+        refreshCliStatus();
+      } else {
+        // Older shell without the CLI bridge: hide the whole local section.
+        localSection.hidden = true;
+      }
+
       input.focus();
     </script>
   </body>

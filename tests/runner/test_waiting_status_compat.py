@@ -26,6 +26,8 @@ from omnigent.runner.app import _version_supports_waiting_status
         ("0.3.1", True),
         ("0.4.0", True),  # later minor: still supports "waiting"
         ("1.0.0", True),
+        ("source", False),  # source installs can report non-PEP-440 metadata
+        ("not-a-version", False),  # malformed probes fail closed
     ],
 )
 def test_version_supports_waiting_status(server_version: str, expected: bool) -> None:

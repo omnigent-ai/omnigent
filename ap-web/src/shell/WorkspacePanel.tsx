@@ -1,5 +1,5 @@
 import { BotIcon, FileIcon, ListTodoIcon, TerminalIcon, XIcon } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FilesPanel } from "./FilesPanel";
@@ -250,6 +250,12 @@ export function WorkspacePanel({
   filesPanelShowHidden,
   onShowHiddenChange,
 }: WorkspacePanelProps) {
+  // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
+  // window keydown listener on every render — an inline arrow would change
+  // identity each render and thrash the effect's add/remove cycle.
+  const handleCloseTab = useCallback(() => {
+    if (selectedFilePath !== null) onCloseFile(selectedFilePath);
+  }, [onCloseFile, selectedFilePath]);
   return (
     <aside
       aria-label="Workspace"
@@ -411,6 +417,7 @@ export function WorkspacePanel({
             conversationId={conversationId}
             path={selectedFilePath}
             onClose={onShowScopeView}
+            onCloseTab={handleCloseTab}
             onNavigateTo={openFileViewer}
             permissionLevel={permissionLevel}
             onCommentsOpenChange={onCommentsOpenChange}
