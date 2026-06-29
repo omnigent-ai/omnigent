@@ -23,6 +23,7 @@ import cachetools
 
 from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms.context_window import fetch_model_pricing
 from omnigent.policies.base import Policy
 from omnigent.policies.function import resolve_function_policy
@@ -853,9 +854,10 @@ def _load_session_policy_specs(
     Load enabled session policies from the store and convert
     them to :class:`FunctionPolicySpec` instances.
 
-    Only ``type="python"`` policies are instantiable today.
-    ``type="url"`` policies are skipped silently
-    (URL policy evaluation is a future extension).
+    Only ``type="python"`` policies are instantiable today. An
+    enabled policy of an unsupported type (e.g. ``type="url"``)
+    raises :class:`OmnigentError` rather than being skipped, so a
+    stored guardrail that never enforces fails loudly.
 
     :param conversation_id: The session whose policies to load,
         e.g. ``"conv_abc123"``.
@@ -863,6 +865,8 @@ def _load_session_policy_specs(
         ``None`` returns an empty list.
     :returns: List of :class:`FunctionPolicySpec` for enabled
         session policies, in ``created_at ASC`` order.
+    :raises OmnigentError: If an enabled policy has an unsupported
+        ``type`` (e.g. ``type="url"``).
     """
     if policy_store is None:
         return []
@@ -871,13 +875,11 @@ def _load_session_policy_specs(
     for policy in stored:
         if not policy.enabled:
             continue
-        converted = _stored_policy_to_spec(policy)
-        if converted is not None:
-            specs.append(converted)
+        specs.append(_stored_policy_to_spec(policy))
     return specs
 
 
-def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec | None:
+def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec:
     """
     Convert a stored :class:`Policy` entity to a
     :class:`FunctionPolicySpec`.
@@ -888,12 +890,15 @@ def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec | None:
     all phases (``on=None``) — the callable itself decides
     whether to act by inspecting ``event["type"]``.
 
-    For ``type="url"``, returns ``None`` (URL policy evaluation
-    is a future extension).
+    For ``type="url"``, raises :class:`OmnigentError` (URL policy evaluation
+    is unimplemented). A stored policy that never enforces is a silent
+    safety hole, so converting an unsupported type fails loudly rather than
+    returning ``None``.
 
     :param policy: The stored session policy entity.
-    :returns: A :class:`FunctionPolicySpec`, or ``None`` if the
-        policy type is not yet supported at evaluation time.
+    :returns: A :class:`FunctionPolicySpec`.
+    :raises OmnigentError: If the policy ``type`` cannot be evaluated yet
+        (e.g. ``type="url"``).
     """
     if policy.type == "python":
         return FunctionPolicySpec(
@@ -906,8 +911,16 @@ def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec | None:
                 arguments=policy.factory_params,
             ),
         )
-    # type="url" — future extension; skip silently.
-    return None
+    # Any non-"python" type (today only "url") cannot be evaluated yet.
+    # Reject loudly and fail closed: a stored policy that silently never
+    # enforces is worse than a visible failure the operator can act on.
+    raise OmnigentError(
+        f"Session policy {policy.name!r} (id {policy.id!r}) has unsupported "
+        f"type {policy.type!r}; only type='python' policies can be evaluated "
+        f"today. URL policy evaluation is a future extension. Remove or "
+        f"disable this policy, since storing it does not enforce anything.",
+        code=ErrorCode.INVALID_INPUT,
+    )
 
 
 __all__ = ["build_policy_engine"]
