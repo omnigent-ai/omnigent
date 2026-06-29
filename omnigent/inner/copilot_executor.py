@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Any, TypeAlias
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.reasoning_effort import COPILOT_EFFORTS, validate_effort
 
 from .datamodel import OSEnvSpec
 from .executor import (
@@ -114,6 +115,36 @@ def _resolve_model(model: str | None) -> str | None:
             )
         return None
     return model
+
+
+def _resolve_reasoning_effort(config: ExecutorConfig | None) -> str | None:
+    """Resolve the per-turn Copilot reasoning effort from ``config.extra``.
+
+    The runtime adapter threads a web ``/reasoning`` pick into
+    ``config.extra["reasoning_effort"]`` (see
+    :class:`~omnigent.runtime.harnesses._executor_adapter.ExecutorAdapter`).
+    The Copilot SDK exposes it only as ``create_session(reasoning_effort=...)``,
+    so like the model it is fixed at session creation (a change recreates the
+    session in :meth:`run_turn`). ``None`` lets the model use its default.
+
+    A value Copilot can't honor is dropped with a warning rather than raising:
+    an unsupported effort must not sink the whole turn (parity with the codex
+    native path). Per-model support is enforced by the Copilot backend.
+
+    Note: ``config.extra`` may also carry ``max_tokens`` (set by the adapter),
+    but the Copilot SDK has no per-turn output-token cap — the only
+    ``max_output_tokens`` lever is a model *capability* override folded into
+    context-window math, not a generation limit — so it is intentionally not
+    forwarded here.
+    """
+    if config is None:
+        return None
+    raw_effort = config.extra.get("reasoning_effort")
+    try:
+        return validate_effort(raw_effort, "copilot", COPILOT_EFFORTS)
+    except ValueError:
+        logger.warning("Ignoring unsupported copilot reasoning effort: %r", raw_effort)
+        return None
 
 
 def _tools_fingerprint(tools: list[ToolSpec]) -> str:
@@ -227,6 +258,7 @@ class _CopilotSessionState:
     session: Any = None  # copilot.CopilotSession
     system_prompt: str | None = None
     model: str | None = None
+    reasoning_effort: str | None = None
     tools_fingerprint: str | None = None
     has_sent_prompt: bool = False
     # call_id -> tool name, populated on TOOL_EXECUTION_START so the matching
@@ -382,6 +414,7 @@ class CopilotExecutor(Executor):
         model: str | None,
         tools: list[ToolSpec],
         system_prompt: str,
+        reasoning_effort: str | None = None,
     ) -> None:
         """Start the SDK client and create the session if not already live.
 
@@ -430,6 +463,7 @@ class CopilotExecutor(Executor):
                 tools=self._make_tools(tools) or None,
                 on_permission_request=PermissionHandler.approve_all,
                 working_directory=cwd,
+                reasoning_effort=reasoning_effort or None,
             )
         except BaseException:
             await _safe_stop(client)
@@ -446,15 +480,18 @@ class CopilotExecutor(Executor):
     ) -> AsyncIterator[ExecutorEvent]:
         session_key = self._session_key(messages)
         model = _resolve_model((config.model if config else None) or self._model_override)
+        reasoning_effort = _resolve_reasoning_effort(config)
         tools_fp = _tools_fingerprint(tools)
         state = self._session_states.setdefault(session_key, _CopilotSessionState())
 
-        # System prompt, model, and tool set are all fixed at session creation,
-        # so a change to any of them means a fresh session (otherwise a changed
-        # tool set would leave the initial ``tools`` stale for the conversation).
+        # System prompt, model, reasoning effort, and tool set are all fixed at
+        # session creation, so a change to any of them means a fresh session
+        # (otherwise a changed tool set would leave the initial ``tools`` stale
+        # for the conversation, and a new ``/reasoning`` pick would never apply).
         if state.session is not None and (
             state.system_prompt != system_prompt
             or state.model != model
+            or state.reasoning_effort != reasoning_effort
             or state.tools_fingerprint != tools_fp
         ):
             await self._close_state(state)
@@ -463,10 +500,11 @@ class CopilotExecutor(Executor):
         is_first_turn = not state.has_sent_prompt
         state.system_prompt = system_prompt
         state.model = model
+        state.reasoning_effort = reasoning_effort
         state.tools_fingerprint = tools_fp
 
         try:
-            await self._ensure_session(state, model, tools, system_prompt)
+            await self._ensure_session(state, model, tools, system_prompt, reasoning_effort)
         except Exception as exc:  # noqa: BLE001 — surfaced as ExecutorError (CancelledError propagates)
             await self.close_session(session_key)
             yield ExecutorError(message=f"Failed to start copilot-sdk session: {exc}")
