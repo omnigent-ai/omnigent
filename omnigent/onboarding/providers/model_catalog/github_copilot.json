@@ -386,6 +386,21 @@
         "response_schema": true
       }
     },
+    "mai-code-1-flash": {
+      "mode": "chat",
+      "context_window": {
+        "max_input": 128000,
+        "max_output": 64000,
+        "max_tokens": 64000
+      },
+      "capabilities": {
+        "function_calling": true,
+        "vision": false,
+        "reasoning": false,
+        "prompt_caching": false,
+        "response_schema": true
+      }
+    },
     "text-embedding-3-small": {
       "mode": "embedding",
       "context_window": {
