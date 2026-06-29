@@ -30,8 +30,10 @@ _BOOT_MODULES = (
     "omnigent.runtime",
     "omnigent.server.app",
     "omnigent.server.server_config",
+    "omnigent.spec",
     "omnigent.stores.agent_store.sqlalchemy_store",
     "omnigent.stores.artifact_store.local",
+    "omnigent.stores.policy_store.sqlalchemy_store",
     "uvicorn",
 )
 
