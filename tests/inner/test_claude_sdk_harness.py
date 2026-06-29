@@ -443,3 +443,56 @@ def test_bundle_dir_unset_passes_none(
 
     assert captured["bundle_dir"] is None
     assert captured["agent_name"] is None
+
+
+def test_executor_factory_falls_back_to_runner_workspace_for_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cwd falls back to OMNIGENT_RUNNER_WORKSPACE when HARNESS_CLAUDE_SDK_CWD is unset.
+
+    Without this fallback the claude-sdk harness was the only native harness that
+    left the executor cwd unset, so the SDK inherited the host daemon's process
+    cwd (``os.getcwd()``) and discovered the wrong project ``CLAUDE.md``. Mirrors
+    pi / kimi / hermes / goose / qwen, which already resolve
+    ``_ENV_CWD or OMNIGENT_RUNNER_WORKSPACE``.
+    """
+    monkeypatch.delenv("HARNESS_CLAUDE_SDK_CWD", raising=False)
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "/tmp/runner-workspace")
+
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, *, cwd: str | None, **_kwargs: Any) -> None:
+        captured["cwd"] = cwd
+
+    with patch(
+        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        _fake_init,
+    ):
+        claude_sdk_harness._build_claude_sdk_executor()
+
+    assert captured["cwd"] == "/tmp/runner-workspace"
+
+
+def test_executor_factory_cwd_env_takes_precedence_over_runner_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit HARNESS_CLAUDE_SDK_CWD wins over OMNIGENT_RUNNER_WORKSPACE.
+
+    Per-spawn / per-sub-agent cwd (e.g. a git worktree) must not be clobbered by
+    the runner-level workspace fallback.
+    """
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_CWD", "/tmp/worktree-cwd")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "/tmp/runner-workspace")
+
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, *, cwd: str | None, **_kwargs: Any) -> None:
+        captured["cwd"] = cwd
+
+    with patch(
+        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        _fake_init,
+    ):
+        claude_sdk_harness._build_claude_sdk_executor()
+
+    assert captured["cwd"] == "/tmp/worktree-cwd"
