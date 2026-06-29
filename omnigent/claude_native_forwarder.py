@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 
-from omnigent._native_post_delivery import post_may_have_been_delivered
+from omnigent._native_post_delivery import append_dead_letter, post_may_have_been_delivered
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeHookRecord,
@@ -1280,6 +1280,20 @@ async def _forward_available_subagents(
                     decision.attempts,
                     _http_status_for_log(exc),
                 )
+                # Persist the dropped start payload so it is recoverable on
+                # disk instead of silently lost (#1120; replay is #1579).
+                append_dead_letter(
+                    bridge_dir,
+                    session_id=parent_session_id,
+                    event_type="external_subagent_start",
+                    payload={
+                        "subagent_id": subagent_id,
+                        "agent_type": meta["agentType"],
+                        "description": meta["description"],
+                        "tool_use_id": meta["toolUseId"],
+                    },
+                    reason="permanent HTTP failure after retries",
+                )
                 # Park this sub-agent: insert a sentinel entry so we
                 # don't keep retrying. ``child_conversation_id=""``
                 # is filtered out by the tail / status loops below.
@@ -1375,6 +1389,19 @@ async def _forward_available_subagents(
                         item.source_id,
                         decision.attempts,
                         _http_status_for_log(exc),
+                    )
+                    # Persist the dropped item so it is recoverable on disk
+                    # instead of silently lost (#1120; replay is #1579).
+                    append_dead_letter(
+                        bridge_dir,
+                        session_id=entry.child_conversation_id,
+                        event_type="external_conversation_item",
+                        payload={
+                            "item_type": item.item_type,
+                            "item_data": item.data,
+                            "response_id": item.response_id,
+                        },
+                        reason="permanent HTTP failure after retries",
                     )
                     # Skip this item and continue — alternative is to
                     # block the whole sub-agent forever on one poison
@@ -2852,6 +2879,19 @@ async def _forward_available_items(
                     item.item_type,
                     decision.attempts,
                     _http_status_for_log(exc),
+                )
+                # Persist the dropped item so it is recoverable on disk
+                # instead of silently lost (#1120; replay is #1579).
+                append_dead_letter(
+                    bridge_dir,
+                    session_id=session_id,
+                    event_type="external_conversation_item",
+                    payload={
+                        "item_type": item.item_type,
+                        "item_data": item.data,
+                        "response_id": item.response_id,
+                    },
+                    reason="permanent HTTP failure after retries",
                 )
                 await _post_forwarder_failed_status(
                     client,

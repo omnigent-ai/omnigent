@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import httpx
 import pytest
 
-from omnigent._native_post_delivery import post_may_have_been_delivered
+from omnigent._native_post_delivery import (
+    _DEAD_LETTER_BACKUP_FILE,
+    _DEAD_LETTER_FILE,
+    _DEAD_LETTER_MAX_BYTES,
+    append_dead_letter,
+    post_may_have_been_delivered,
+)
 
 
 @pytest.mark.parametrize(
@@ -58,3 +67,79 @@ def test_post_may_have_been_delivered_classification(
         committed despite the error.
     """
     assert post_may_have_been_delivered(exc) is may_have_been_delivered
+
+
+def test_append_dead_letter_writes_parseable_line(tmp_path: Path) -> None:
+    """
+    A dropped forward payload is appended as one parseable JSON line.
+
+    :param tmp_path: Pytest temp dir standing in for a bridge dir.
+    """
+    append_dead_letter(
+        tmp_path,
+        session_id="conv_abc123",
+        event_type="external_conversation_item",
+        payload={"item_type": "message", "item_data": {"role": "assistant"}},
+        reason="permanent HTTP failure after retries",
+    )
+
+    dl_path = tmp_path / _DEAD_LETTER_FILE
+    lines = dl_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["session_id"] == "conv_abc123"
+    assert record["event_type"] == "external_conversation_item"
+    assert record["reason"] == "permanent HTTP failure after retries"
+    assert record["payload"] == {
+        "item_type": "message",
+        "item_data": {"role": "assistant"},
+    }
+    assert isinstance(record["ts"], (int, float))
+
+
+def test_append_dead_letter_rotates_at_cap_keeping_newest(tmp_path: Path) -> None:
+    """
+    At the cap the file rotates to a ``.1`` backup and keeps the newest item.
+
+    A sustained outage must retain the most recent drops, not stop at the
+    oldest: the full file moves to ``dead_letter.jsonl.1`` and the new record
+    lands in a fresh ``dead_letter.jsonl``.
+
+    :param tmp_path: Pytest temp dir standing in for a bridge dir.
+    """
+    dl_path = tmp_path / _DEAD_LETTER_FILE
+    backup_path = tmp_path / _DEAD_LETTER_BACKUP_FILE
+    # Use a sparse file (truncate) to reach the cap without writing 50 MB.
+    with dl_path.open("wb") as fh:
+        fh.truncate(_DEAD_LETTER_MAX_BYTES + 1)
+    capped_size = dl_path.stat().st_size
+
+    append_dead_letter(
+        tmp_path,
+        session_id="conv_abc123",
+        event_type="external_session_usage",
+        payload={"context_tokens": 1},
+        reason="post failed",
+    )
+
+    # Old content rotated out to the backup; the newest record is in the
+    # fresh active file as the sole line.
+    assert backup_path.stat().st_size == capped_size
+    lines = dl_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["event_type"] == "external_session_usage"
+    assert record["payload"] == {"context_tokens": 1}
+
+
+def test_append_dead_letter_never_raises_on_unwritable_dir() -> None:
+    """A bogus / unwritable bridge dir is swallowed, not raised."""
+    bogus = Path("/this/path/does/not/exist/and/cannot/be/made\x00")
+    # Must return without raising despite the invalid path.
+    append_dead_letter(
+        bogus,
+        session_id="conv_abc123",
+        event_type="external_conversation_item",
+        payload={"item_type": "message"},
+        reason="post failed",
+    )

@@ -7,13 +7,14 @@ import contextlib
 import json
 import logging
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from omnigent._native_post_delivery import post_may_have_been_delivered
+from omnigent._native_post_delivery import append_dead_letter, post_may_have_been_delivered
 from omnigent.claude_native_bridge import url_component
 from omnigent.codex_native_app_server import (
     CodexAppServerClient,
@@ -1529,6 +1530,9 @@ async def supervise_forwarder(
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
+    # Bind the bridge dir so failed durable-event posts can be dead-lettered
+    # to {bridge_dir}/dead_letter.jsonl instead of being silently lost (#1120).
+    _dead_letter_dir.set(bridge_dir)
     if client is None:
         client = client_for_transport(app_server_url, client_name="omnigent-codex-forwarder")
         await client.connect()
@@ -5334,6 +5338,14 @@ class _ForwardHealth:
 _FORWARD_DEGRADED_THRESHOLD = 5
 _forward_health = _ForwardHealth()
 
+# Bridge dir for the active forwarder, used to dead-letter permanently
+# undeliverable durable events (#1120). Set per-forwarder at entry.
+_dead_letter_dir: ContextVar[Path | None] = ContextVar("_codex_dead_letter_dir", default=None)
+
+# Only durable (persisted) event types are worth dead-lettering — ephemeral
+# stream/usage-delta events have no standalone recovery value.
+_DEAD_LETTER_EVENT_TYPES = frozenset({"external_conversation_item", "external_session_usage"})
+
 
 def _reset_forward_health() -> None:
     """
@@ -5413,6 +5425,16 @@ async def _post_session_event(
         _note_forward_success()
     else:
         _note_forward_failure(event_type)
+        dl_dir = _dead_letter_dir.get()
+        if event_type in _DEAD_LETTER_EVENT_TYPES and dl_dir is not None:
+            reason = f"http {response.status_code}" if response is not None else "post failed"
+            append_dead_letter(
+                dl_dir,
+                session_id=session_id,
+                event_type=event_type,
+                payload=data,
+                reason=reason,
+            )
     return response
 
 

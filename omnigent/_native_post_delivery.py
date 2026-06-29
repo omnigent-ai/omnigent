@@ -19,12 +19,90 @@ the codex/antigravity forwarders so a single implementation is maintained.
 
 from __future__ import annotations
 
+import json
 import logging
+import time
 from collections.abc import Callable, Coroutine
+from pathlib import Path
 
 import httpx
 
 _logger = logging.getLogger(__name__)
+
+# Dead-letter sink for permanently-undeliverable forward payloads (#1120).
+_DEAD_LETTER_FILE = "dead_letter.jsonl"
+# When the active file reaches this size it is rotated to a single ``.1``
+# backup and a fresh file is started, so the most recent drops are always
+# retained (keep-newest). Disk stays bounded at ~2x this size (current + .1).
+_DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024  # 50 MB per session
+_DEAD_LETTER_BACKUP_FILE = _DEAD_LETTER_FILE + ".1"
+
+
+def append_dead_letter(
+    bridge_dir: Path,
+    *,
+    session_id: str,
+    event_type: str,
+    payload: dict[str, object],
+    reason: str,
+) -> None:
+    """
+    Append one undeliverable forward payload to ``{bridge_dir}/dead_letter.jsonl`` (#1120).
+
+    Write-only recovery artifact so a permanently-failed transcript/usage POST is
+    recoverable on disk instead of silently lost. Replay is tracked separately (#1579).
+    Best-effort: never raises (a dead-letter failure must not disrupt forwarding). When
+    the file reaches :data:`_DEAD_LETTER_MAX_BYTES` it is rotated to a single ``.1``
+    backup and a fresh file is started, so the most recent drops are kept (the oldest
+    rotate out); disk stays bounded at ~2x the cap.
+
+    :param bridge_dir: Native forwarder bridge directory the dead-letter file lives in.
+    :param session_id: Omnigent conversation id the dropped event targeted,
+        e.g. ``"conv_abc123"``.
+    :param event_type: Session event type that was dropped, e.g.
+        ``"external_conversation_item"``.
+    :param payload: The event ``data`` payload that failed to deliver.
+    :param reason: Short human-readable cause, e.g.
+        ``"permanent HTTP failure after retries"``.
+    :returns: None.
+    """
+    try:
+        path = bridge_dir / _DEAD_LETTER_FILE
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Keep-newest: at the cap, rotate the full file to a single .1 backup
+        # (overwriting any prior backup) and start fresh. A sustained outage
+        # then retains the most recent items rather than stopping at the oldest.
+        if path.exists() and path.stat().st_size >= _DEAD_LETTER_MAX_BYTES:
+            path.replace(bridge_dir / _DEAD_LETTER_BACKUP_FILE)
+            # Log the session id rather than the bridge path: the path is
+            # deterministic per session and logging it trips CodeQL's
+            # clear-text-sensitive-data heuristic (a bridge dir is not a secret).
+            _logger.warning(
+                "dead-letter file reached cap (%d bytes); rotated to %s and "
+                "started fresh (oldest dead-lettered forwards dropped): session=%s",
+                _DEAD_LETTER_MAX_BYTES,
+                _DEAD_LETTER_BACKUP_FILE,
+                session_id,
+            )
+        line = json.dumps(
+            {
+                "ts": time.time(),
+                "session_id": session_id,
+                "event_type": event_type,
+                "reason": reason,
+                "payload": payload,
+            }
+        )
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception as exc:  # noqa: BLE001 - dead-lettering must never disrupt forwarding.
+        _logger.warning(
+            "failed to dead-letter undeliverable forward: type=%s session=%s error=%r",
+            event_type,
+            session_id,
+            exc,
+        )
+
 
 # Transport failures proving a POST never reached the server (no bytes
 # sent) — safe to retry. See :func:`post_may_have_been_delivered`.
