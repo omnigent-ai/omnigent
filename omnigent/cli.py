@@ -3009,6 +3009,9 @@ def server(
     _ensure_sqlite_parent_dir(db_uri)
 
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from omnigent.stores.push_subscription_store.sqlalchemy_store import (
+        SqlAlchemyPushSubscriptionStore,
+    )
 
     agent_store = SqlAlchemyAgentStore(db_uri)
     file_store = SqlAlchemyFileStore(db_uri)
@@ -3016,6 +3019,7 @@ def server(
     comment_store = SqlAlchemyCommentStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
+    push_subscription_store = SqlAlchemyPushSubscriptionStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
@@ -3054,11 +3058,22 @@ def server(
 
             routing_client = LLMRoutingClient(_policy_client)
 
+    # Web Push (#8): load/persist the server's stable VAPID key so a browser's
+    # subscription survives restarts. The `vapid.subject` config is the JWT
+    # contact (some push services require a real mailto/URL).
+    from omnigent.server.vapid_keys import load_or_create_vapid_key
+
+    _vapid_cfg = cfg.get("vapid") or {}
+    vapid_private_key = load_or_create_vapid_key(Path(art_loc) / "vapid_private_key.pem")
+    vapid_subject = str(_vapid_cfg.get("subject") or "mailto:admin@localhost")
+
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
         default_policies=parse_default_policies(cfg.get("policies")),
         llm=server_llm,
         routing_client=routing_client,
+        vapid_private_key=vapid_private_key,
+        vapid_subject=vapid_subject,
     )
     init_runtime(
         conversation_store=conversation_store,
@@ -3068,6 +3083,7 @@ def server(
         artifact_store=artifact_store,
         comment_store=comment_store,
         policy_store=policy_store,
+        push_subscription_store=push_subscription_store,
         caps=caps,
     )
 
@@ -3152,6 +3168,8 @@ def server(
 
         account_store = SqlAlchemyAccountStore(db_uri)
 
+    from omnigent.server.routes.push import create_push_router
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -3169,6 +3187,15 @@ def server(
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
+        # Web Push REST API (#8). Mounted via the generic extra_routers
+        # seam so create_app's signature stays untouched.
+        extra_routers=[
+            (
+                create_push_router(push_subscription_store, auth_provider, permission_store),
+                "/v1",
+                ["push"],
+            ),
+        ],
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
