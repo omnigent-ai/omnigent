@@ -115,6 +115,81 @@ describe("useHosts", () => {
     expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_laptop", "host_legacy"]);
   });
 
+  it("retains sandbox hosts when includeSandbox is set", async () => {
+    // The chat-header HostBadge needs sandbox-backed hosts so it can
+    // label them ("Databricks Sandbox"); the default filtered call must
+    // stay sandbox-free for the pickers.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        hosts: [
+          {
+            host_id: "host_sandbox",
+            name: "managed-abc123",
+            owner: "alice",
+            status: "online",
+            sandbox_provider: "lakebox",
+          },
+          {
+            host_id: "host_laptop",
+            name: "Laptop",
+            owner: "alice",
+            status: "online",
+            sandbox_provider: null,
+          },
+        ],
+      }),
+    );
+
+    const { result } = renderHook(() => useHosts({ includeSandbox: true }), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_sandbox", "host_laptop"]);
+  });
+
+  it("keeps the filtered and unfiltered lists in separate cache entries", async () => {
+    // The filtered (picker) and unfiltered (badge) calls share an
+    // endpoint but use distinct query keys. If they ever collapsed back
+    // to a bare ["hosts"] key, the second queryFn's result would clobber
+    // the first in cache and both consumers would see the same list.
+    // Mounting both in ONE QueryClient and asserting they diverge guards
+    // that regression. mockResolvedValue (persistent) feeds both fetches.
+    fetchMock.mockResolvedValue(
+      mockResponse({
+        hosts: [
+          {
+            host_id: "host_sandbox",
+            name: "managed-abc123",
+            owner: "alice",
+            status: "online",
+            sandbox_provider: "lakebox",
+          },
+          {
+            host_id: "host_laptop",
+            name: "Laptop",
+            owner: "alice",
+            status: "online",
+            sandbox_provider: null,
+          },
+        ],
+      }),
+    );
+
+    const { result } = renderHook(
+      () => ({
+        filtered: useHosts(),
+        all: useHosts({ includeSandbox: true }),
+      }),
+      { wrapper },
+    );
+    await waitFor(() => {
+      expect(result.current.filtered.isSuccess).toBe(true);
+      expect(result.current.all.isSuccess).toBe(true);
+    });
+
+    expect(result.current.filtered.data?.map((h) => h.host_id)).toEqual(["host_laptop"]);
+    expect(result.current.all.data?.map((h) => h.host_id)).toEqual(["host_sandbox", "host_laptop"]);
+  });
+
   it("surfaces an error when the request fails", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ detail: "nope" }, 503));
 
