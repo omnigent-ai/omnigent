@@ -292,7 +292,8 @@ export function useMonacoCommentLayer({
     if (!ed || !sel || sel.isEmpty() || !path) return;
     const start = sel.getStartPosition();
     const end = sel.getEndPosition();
-    const endLine = end.column === 1 && end.lineNumber > start.lineNumber ? end.lineNumber - 1 : end.lineNumber;
+    const endLine =
+      end.column === 1 && end.lineNumber > start.lineNumber ? end.lineNumber - 1 : end.lineNumber;
     useChatStore.getState().addComposerAttachment({
       path,
       isDir: false,

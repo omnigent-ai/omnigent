@@ -55,54 +55,54 @@ export function FileMentionMenu({
           <div className="px-3 py-2 text-[13px] text-muted-foreground">Loading…</div>
         ) : (
           <div ref={listRef} role="listbox" className="max-h-80 overflow-y-auto p-1">
-          {entries.map((entry, i) => {
-            const isDir = entry.type === "directory";
-            return (
-              <div
-                key={`${entry.type}:${entry.path}`}
-                role="option"
-                aria-selected={i === activeIndex}
-                data-testid={`file-mention-item-${i}`}
-                data-active={i === activeIndex ? "true" : undefined}
-                className={cn(
-                  "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] text-foreground",
-                  i === activeIndex && "bg-accent",
-                )}
-              >
-                <button
-                  type="button"
-                  // preventDefault keeps the textarea focused while clicking.
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => (isDir ? onOpenDir(entry.path) : onAttach(entry.path, false))}
-                  className="flex min-w-0 flex-1 items-center gap-2 hover:text-foreground"
-                  title={isDir ? `Open ${entry.name}` : `Attach ${entry.name}`}
-                >
-                  {isDir ? (
-                    <FolderIcon className="size-3.5 shrink-0 text-slate-500 dark:text-slate-400" />
-                  ) : (
-                    <FileTextIcon className="size-3.5 shrink-0 text-slate-500 dark:text-slate-400" />
+            {entries.map((entry, i) => {
+              const isDir = entry.type === "directory";
+              return (
+                <div
+                  key={`${entry.type}:${entry.path}`}
+                  role="option"
+                  aria-selected={i === activeIndex}
+                  data-testid={`file-mention-item-${i}`}
+                  data-active={i === activeIndex ? "true" : undefined}
+                  className={cn(
+                    "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] text-foreground",
+                    i === activeIndex && "bg-accent",
                   )}
-                  <span className="truncate">
-                    {entry.name}
-                    {isDir ? "/" : ""}
-                  </span>
-                </button>
-                {isDir && (
+                >
                   <button
                     type="button"
+                    // preventDefault keeps the textarea focused while clicking.
                     onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => onAttach(entry.path, true)}
-                    className="flex shrink-0 items-center gap-0.5 rounded-md border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
-                    aria-label={`Attach whole folder ${entry.name}`}
-                    title={`Attach whole folder ${entry.name}`}
+                    onClick={() => (isDir ? onOpenDir(entry.path) : onAttach(entry.path, false))}
+                    className="flex min-w-0 flex-1 items-center gap-2 hover:text-foreground"
+                    title={isDir ? `Open ${entry.name}` : `Attach ${entry.name}`}
                   >
-                    <PlusIcon className="size-3" />
-                    folder
+                    {isDir ? (
+                      <FolderIcon className="size-3.5 shrink-0 text-slate-500 dark:text-slate-400" />
+                    ) : (
+                      <FileTextIcon className="size-3.5 shrink-0 text-slate-500 dark:text-slate-400" />
+                    )}
+                    <span className="truncate">
+                      {entry.name}
+                      {isDir ? "/" : ""}
+                    </span>
                   </button>
-                )}
-              </div>
-            );
-          })}
+                  {isDir && (
+                    <button
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => onAttach(entry.path, true)}
+                      className="flex shrink-0 items-center gap-0.5 rounded-md border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
+                      aria-label={`Attach whole folder ${entry.name}`}
+                      title={`Attach whole folder ${entry.name}`}
+                    >
+                      <PlusIcon className="size-3" />
+                      folder
+                    </button>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
       </div>

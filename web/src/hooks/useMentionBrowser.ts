@@ -49,8 +49,15 @@ export interface MentionBrowser {
  * state and supplies the directory listing (its data source differs).
  */
 export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser {
-  const { mention, setMention, mentionEntries, text, setText, textareaRef, isMobile = false } =
-    params;
+  const {
+    mention,
+    setMention,
+    mentionEntries,
+    text,
+    setText,
+    textareaRef,
+    isMobile = false,
+  } = params;
   const [mentionIndex, setMentionIndex] = useState(-1);
   const [mentionedItems, setMentionedItems] = useState<MentionItem[]>([]);
   const mentionOpen = mentionEntries.length > 0;

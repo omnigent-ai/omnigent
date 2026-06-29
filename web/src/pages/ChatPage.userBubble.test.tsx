@@ -117,11 +117,7 @@ describe("AssistantBubble lifecycle rendering", () => {
 
 describe("UserBubble @-mention attachment chips", () => {
   it("shows file and folder chips from [Attached: …] markers and hides the markers", () => {
-    renderBubble(
-      userBubble(
-        "[Attached: src/server.ts]\n[Attached: docs/]\n\nsummarize these",
-      ),
-    );
+    renderBubble(userBubble("[Attached: src/server.ts]\n[Attached: docs/]\n\nsummarize these"));
 
     // The marker paths surface as chips (folder keeps its trailing slash)...
     expect(screen.getByText("@src/server.ts")).toBeInTheDocument();

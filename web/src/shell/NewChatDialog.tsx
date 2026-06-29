@@ -1959,7 +1959,11 @@ export function NewChatLandingScreen() {
   const workspaceRoot = workspaceTrimmed.replace(/\/+$/, "");
   // Absolute dir to list = workspace root + the drilled sub-path.
   const mentionAbsDir =
-    mentionEnabled && mention ? (mentionDir ? `${workspaceRoot}/${mentionDir}` : workspaceRoot) : null;
+    mentionEnabled && mention
+      ? mentionDir
+        ? `${workspaceRoot}/${mentionDir}`
+        : workspaceRoot
+      : null;
   const mentionFsQuery = useHostFilesystem(
     mentionEnabled && mention ? selectedHostId : null,
     mentionAbsDir,

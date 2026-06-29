@@ -411,9 +411,7 @@ export function CodeViewer({
   // attached. Monaco does the equivalent via ``onDidScrollChange``.
   useEffect(() => {
     const handleMouseDown = (e: MouseEvent) => {
-      if (
-        !(e.target as HTMLElement).closest("[data-add-comment-btn], [data-attach-agent-btn]")
-      ) {
+      if (!(e.target as HTMLElement).closest("[data-add-comment-btn], [data-attach-agent-btn]")) {
         setSelectionAnchor(null);
       }
     };

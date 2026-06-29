@@ -1666,7 +1666,13 @@ describe("NewChatLandingScreen attachments", () => {
 describe("NewChatLandingScreen @-file-mention", () => {
   const ROOT = "/Users/corey/repo";
   function dir(path: string): HostFilesystemEntry {
-    return { name: path.split("/").pop() ?? "", path, type: "directory", bytes: null, modified_at: 0 };
+    return {
+      name: path.split("/").pop() ?? "",
+      path,
+      type: "directory",
+      bytes: null,
+      modified_at: 0,
+    };
   }
   function file(path: string): HostFilesystemEntry {
     return { name: path.split("/").pop() ?? "", path, type: "file", bytes: 10, modified_at: 0 };
@@ -1758,9 +1764,7 @@ describe("NewChatLandingScreen @-file-mention", () => {
     // the "/Users/corey/repo/…" absolute path the host filesystem returned.
     await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
     const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
-    expect((payload as { text: string }).text).toBe(
-      "[Attached: omnigent/cli.py]\n\nexplain this",
-    );
+    expect((payload as { text: string }).text).toBe("[Attached: omnigent/cli.py]\n\nexplain this");
   });
 
   it("suppresses stale parent rows while a drilled directory is still loading", async () => {
