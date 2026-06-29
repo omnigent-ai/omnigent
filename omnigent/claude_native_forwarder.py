@@ -1280,8 +1280,7 @@ async def _forward_available_subagents(
                     decision.attempts,
                     _http_status_for_log(exc),
                 )
-                # Persist the dropped start payload so it is recoverable on
-                # disk instead of silently lost (#1120; replay is #1579).
+                # Dead-letter the dropped payload for recovery (#1120; replay #1579).
                 append_dead_letter(
                     bridge_dir,
                     session_id=parent_session_id,
@@ -1390,8 +1389,7 @@ async def _forward_available_subagents(
                         decision.attempts,
                         _http_status_for_log(exc),
                     )
-                    # Persist the dropped item so it is recoverable on disk
-                    # instead of silently lost (#1120; replay is #1579).
+                    # Dead-letter the dropped item for recovery (#1120; replay #1579).
                     append_dead_letter(
                         bridge_dir,
                         session_id=entry.child_conversation_id,
@@ -2880,8 +2878,7 @@ async def _forward_available_items(
                     decision.attempts,
                     _http_status_for_log(exc),
                 )
-                # Persist the dropped item so it is recoverable on disk
-                # instead of silently lost (#1120; replay is #1579).
+                # Dead-letter the dropped item for recovery (#1120; replay #1579).
                 append_dead_letter(
                     bridge_dir,
                     session_id=session_id,

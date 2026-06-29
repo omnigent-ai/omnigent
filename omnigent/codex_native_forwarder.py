@@ -1530,8 +1530,7 @@ async def supervise_forwarder(
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
-    # Bind the bridge dir so failed durable-event posts can be dead-lettered
-    # to {bridge_dir}/dead_letter.jsonl instead of being silently lost (#1120).
+    # Bind bridge dir so failed durable-event posts can be dead-lettered (#1120).
     _dead_letter_dir.set(bridge_dir)
     if client is None:
         client = client_for_transport(app_server_url, client_name="omnigent-codex-forwarder")
@@ -5338,12 +5337,10 @@ class _ForwardHealth:
 _FORWARD_DEGRADED_THRESHOLD = 5
 _forward_health = _ForwardHealth()
 
-# Bridge dir for the active forwarder, used to dead-letter permanently
-# undeliverable durable events (#1120). Set per-forwarder at entry.
+# Bridge dir for dead-lettering undeliverable durable events; set per-forwarder (#1120).
 _dead_letter_dir: ContextVar[Path | None] = ContextVar("_codex_dead_letter_dir", default=None)
 
-# Only durable (persisted) event types are worth dead-lettering — ephemeral
-# stream/usage-delta events have no standalone recovery value.
+# Durable event types worth dead-lettering (not ephemeral deltas).
 _DEAD_LETTER_EVENT_TYPES = frozenset({"external_conversation_item", "external_session_usage"})
 
 

@@ -31,9 +31,7 @@ _logger = logging.getLogger(__name__)
 
 # Dead-letter sink for permanently-undeliverable forward payloads (#1120).
 _DEAD_LETTER_FILE = "dead_letter.jsonl"
-# When the active file reaches this size it is rotated to a single ``.1``
-# backup and a fresh file is started, so the most recent drops are always
-# retained (keep-newest). Disk stays bounded at ~2x this size (current + .1).
+# At this size the file rotates to a single .1 backup (keep-newest); disk ~2x this.
 _DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024  # 50 MB per session
 _DEAD_LETTER_BACKUP_FILE = _DEAD_LETTER_FILE + ".1"
 
@@ -69,14 +67,11 @@ def append_dead_letter(
     try:
         path = bridge_dir / _DEAD_LETTER_FILE
         bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        # Keep-newest: at the cap, rotate the full file to a single .1 backup
-        # (overwriting any prior backup) and start fresh. A sustained outage
-        # then retains the most recent items rather than stopping at the oldest.
+        # Keep-newest: at the cap, rotate to a single .1 backup and start fresh.
         if path.exists() and path.stat().st_size >= _DEAD_LETTER_MAX_BYTES:
             path.replace(bridge_dir / _DEAD_LETTER_BACKUP_FILE)
-            # Log the session id rather than the bridge path: the path is
-            # deterministic per session and logging it trips CodeQL's
-            # clear-text-sensitive-data heuristic (a bridge dir is not a secret).
+            # Log session_id, not path (logging a bridge path trips CodeQL's
+            # clear-text-sensitive-data heuristic; a bridge dir is not a secret).
             _logger.warning(
                 "dead-letter file reached cap (%d bytes); rotated to %s and "
                 "started fresh (oldest dead-lettered forwards dropped): session=%s",
