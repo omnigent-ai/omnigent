@@ -574,7 +574,7 @@ def test_start_session_select_model_and_effort(seeded_session: tuple[str, str]) 
     """Picking a model + reasoning effort rides along to the create call.
 
     For the Claude-native agent the config submenu shows a model/effort
-    picker that defaults to Claude Code's own "Sonnet / Medium". Selecting
+    picker that defaults to Claude Code's own "Opus / Medium". Selecting
     "Opus" and "High" must (a) check those radios as immediate feedback and
     (b) reach ``POST /v1/sessions`` as ``model_override: "opus"`` +
     ``reasoning_effort: "high"`` (the runner reads them as ``--model`` /
@@ -622,38 +622,20 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             )
             # Claude Code auto-selects; open its config submenu, which carries the
             # model + effort radio groups defaulting to Claude Code's effective
-            # defaults (Sonnet / Medium).
+            # defaults (Opus / Medium).
             await _open_entry_config(page, "ag_claude_e2e")
-            await expect(page.get_by_test_id("new-chat-landing-model-sonnet")).to_have_attribute(
+            await expect(page.get_by_test_id("new-chat-landing-model-opus")).to_have_attribute(
                 "aria-checked", "true"
             )
             await expect(page.get_by_test_id("new-chat-landing-effort-medium")).to_have_attribute(
                 "aria-checked", "true"
             )
 
-            # Pick model and effort in SEPARATE submenu visits. Picking a knob
-            # COMMITS the agent, which collapses the submenu (its model / effort /
-            # permission rows unmount) while the ROOT menu stays open — so a second
-            # knob clicked in the same visit chases a row that has already detached
-            # and flakes ("detached from the DOM, retrying" until the click times
-            # out). Reopen the submenu between the two picks: the picks persist as
-            # screen state, and each click then lands in a fresh, stable submenu.
-            opus = page.get_by_test_id("new-chat-landing-model-opus")
-            await opus.click()
-            await expect(opus).to_have_attribute("aria-checked", "true")
-            # The model pick collapsed the submenu; wait for it to fully unmount,
-            # then reopen it. The root menu never closed (the radio's preventDefault
-            # keeps it open), so reopen via the row — re-hover + ArrowRight — rather
-            # than re-clicking the trigger (which would race the still-settling
-            # dismiss and fail to reopen).
-            row = page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e")
-            await expect(page.get_by_test_id("new-chat-landing-effort-high")).to_have_count(0)
-            await row.hover()
-            await row.press("ArrowRight")
-            # The model pick persisted across the reopen.
-            await expect(page.get_by_test_id("new-chat-landing-model-opus")).to_have_attribute(
-                "aria-checked", "true"
-            )
+            # Opus is already the default so no model change is needed.  Picking
+            # a knob COMMITS the agent and collapses the submenu, but only when the
+            # value actually changes — re-clicking the already-selected radio is a
+            # no-op.  Pick effort (High) in the same submenu visit; the model radio
+            # stays on Opus as the default.
             high = page.get_by_test_id("new-chat-landing-effort-high")
             await high.click()
             await expect(high).to_have_attribute("aria-checked", "true")

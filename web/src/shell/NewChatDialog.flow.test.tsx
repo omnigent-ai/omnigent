@@ -699,7 +699,7 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Claude Code's effective defaults (Sonnet / Medium) ride along on the
+    // Claude Code's effective defaults (Opus / Medium) ride along on the
     // create without the user opening the picker — the runner reads them as
     // --model / --effort at terminal launch.
     typeMessage("go");
@@ -708,7 +708,7 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string);
-    expect(body.model_override).toBe("sonnet");
+    expect(body.model_override).toBe("opus");
     expect(body.reasoning_effort).toBe("medium");
   });
 
