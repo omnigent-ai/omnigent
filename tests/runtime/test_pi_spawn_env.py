@@ -205,7 +205,7 @@ def test_telemetry_env_injected_when_configured_and_span_active(
 ) -> None:
     """
     Issue #1051: with OTLP configured and an active omnigent span,
-    the pi builder injects ``TRACEPARENT`` plus the OTLP exporter
+    the pi builder injects the OTLP exporter
     knobs so the pi subprocess's LLM provider spans nest under the
     omnigent agent span. The Claude SDK-specific flags must NOT be
     set — pi doesn't read them.
@@ -225,7 +225,7 @@ def test_telemetry_env_injected_when_configured_and_span_active(
     with tracer.start_as_current_span("agent"):
         env = _build_pi_spawn_env(_make_spec(model="openai/gpt-5.4"), workdir=None)
 
-    assert "TRACEPARENT" in env
+    assert "TRACEPARENT" not in env
     assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://localhost:4317"
     # pi does not read the Claude SDK flags. Gating those to claude_sdk=True
     # keeps them out of unrelated subprocess envs.
@@ -244,5 +244,5 @@ def test_no_telemetry_env_leaks_when_unset(
 
     env = _build_pi_spawn_env(_make_spec(model="openai/gpt-5.4"), workdir=None)
 
-    for key in ("TRACEPARENT", "OTEL_EXPORTER_OTLP_ENDPOINT"):
+    for key in ("OTEL_EXPORTER_OTLP_ENDPOINT",):
         assert key not in env, f"unexpected {key!r} in spawn env: {env!r}"

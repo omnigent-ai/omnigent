@@ -250,7 +250,7 @@ def test_telemetry_env_injected_when_configured_and_span_active(
 ) -> None:
     """
     Issue #1051: with OTLP configured and an active omnigent span,
-    the builder injects ``TRACEPARENT`` plus the Claude Agent SDK's
+    the builder forwards the OTLP exporter knobs plus the Claude Agent SDK's
     telemetry-enable flags so the SDK's provider subprocess spans
     nest under the omnigent agent span in the same trace.
 
@@ -273,7 +273,7 @@ def test_telemetry_env_injected_when_configured_and_span_active(
     with tracer.start_as_current_span("agent"):
         env = _build_claude_sdk_spawn_env(_make_spec(auth=ApiKeyAuth(api_key="x")), workdir=None)
 
-    assert "TRACEPARENT" in env
+    assert "TRACEPARENT" not in env
     assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://localhost:4317"
     assert env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
     assert env["OTEL_TRACES_EXPORTER"] == "otlp"
@@ -291,9 +291,7 @@ def test_no_telemetry_env_leaks_when_unset(
 
     env = _build_claude_sdk_spawn_env(_make_spec(auth=ApiKeyAuth(api_key="x")), workdir=None)
 
-    for key in (
-        "TRACEPARENT",
-        "OTEL_EXPORTER_OTLP_ENDPOINT",
+    for key in (        "OTEL_EXPORTER_OTLP_ENDPOINT",
         "CLAUDE_CODE_ENABLE_TELEMETRY",
         "OTEL_TRACES_EXPORTER",
     ):

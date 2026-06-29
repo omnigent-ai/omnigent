@@ -340,9 +340,9 @@ def test_get_otel_subprocess_env_endpoint_with_active_span(
 ) -> None:
     """
     Inside an active span with an endpoint configured, the helper
-    emits both the OTLP exporter knobs AND the TRACEPARENT — this
-    is the normal in-flight executor case where a child process
-    must nest under the omnigent agent span in the same trace.
+    emits the OTLP exporter knobs but NOT a TRACEPARENT, because
+    subprocess is long-running per session and per-request trace
+    context cannot be carried via a one-shot env var.
     """
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
@@ -356,12 +356,10 @@ def test_get_otel_subprocess_env_endpoint_with_active_span(
 
     assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://localhost:4317"
     assert env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
-    assert "TRACEPARENT" in env
-    parts = env["TRACEPARENT"].split("-")
-    assert len(parts) == 4
-    # The TRACEPARENT trace_id must equal our derived hex so the
-    # subprocess's spans land in the same trace as the parent.
-    assert parts[1] == _RESP_HEX
+    # TRACEPARENT is NOT included by design even when a span is active —
+    # subprocess is long-running per session; per-request trace context
+    # belongs in a follow-up over the SDK channel (PR #1070 design).
+    assert "TRACEPARENT" not in env
 
 
 def test_get_otel_subprocess_env_claude_sdk_sets_sdk_flags(
