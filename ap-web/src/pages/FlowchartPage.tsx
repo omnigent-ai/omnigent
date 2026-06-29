@@ -71,12 +71,25 @@ import { cn } from "@/lib/utils";
 // of the UI (no rainbow fills). Node type is conveyed by a small accent dot
 // (`chip`) and the uppercase tag, not the whole box. `chip` is also reused in
 // the "+" menu's generic-node buttons.
+/** Schedule interval units the UI offers; storage stays canonical in minutes. */
+type ScheduleUnit = "minute" | "hour" | "day";
+const MINUTES_PER_UNIT: Record<ScheduleUnit, number> = {
+  minute: 1,
+  hour: 60,
+  day: 60 * 24,
+};
+const UNIT_LABELS: Record<ScheduleUnit, string> = {
+  minute: "min",
+  hour: "hours",
+  day: "days",
+};
+
 const KIND_META: Record<FlowNodeType, { tag: string; chip: string }> = {
   start: { tag: "Start", chip: "bg-emerald-500" },
   process: { tag: "Process", chip: "bg-primary" },
   decision: { tag: "Decision", chip: "bg-amber-500" },
   io: { tag: "Input/Output", chip: "bg-violet-500" },
-  end: { tag: "End", chip: "bg-muted-foreground" },
+  end: { tag: "End", chip: "bg-red-500" },
 };
 
 // ---------------------------------------------------------------------------
@@ -423,7 +436,7 @@ function StepView({
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
-type OutputTab = "narrative" | "outline" | "mermaid" | "runs";
+type OutputTab = "narrative" | "mermaid" | "runs";
 
 export function FlowchartPage() {
   const { jobId } = useParams<{ jobId: string }>();
@@ -501,11 +514,21 @@ export function FlowchartPage() {
     void updateJob(jobId, { name: trimmed });
   }, [jobId, name, job?.name]);
 
-  // Schedule (time trigger): a job can fire automatically every N minutes. The
-  // 1-min minimum matches the server poll cadence. Persisted on the job.
+  // Schedule (time trigger): a job can fire automatically every N minutes/hours/
+  // days. Storage stays canonical in minutes (the server poll cadence, 1-min
+  // minimum); the UI picks a value + unit and converts. Persisted on the job.
   const schedule = job?.schedule ?? null;
   const scheduleEnabled = !!schedule?.enabled;
   const intervalMinutes = schedule?.intervalMinutes ?? 5;
+  // Display the stored minutes as the largest unit it divides cleanly into, so
+  // "120 min" shows as "2 hours" — but never below the stored granularity.
+  const intervalUnit: ScheduleUnit =
+    intervalMinutes % MINUTES_PER_UNIT.day === 0
+      ? "day"
+      : intervalMinutes % MINUTES_PER_UNIT.hour === 0
+        ? "hour"
+        : "minute";
+  const intervalValue = intervalMinutes / MINUTES_PER_UNIT[intervalUnit];
   const onToggleSchedule = useCallback(
     (enabled: boolean) => {
       if (!jobId) return;
@@ -515,11 +538,13 @@ export function FlowchartPage() {
     },
     [jobId, intervalMinutes],
   );
+  // Persist a new value/unit pair as canonical minutes (≥ 1).
   const onChangeInterval = useCallback(
-    (minutes: number) => {
-      if (!jobId || Number.isNaN(minutes)) return;
+    (value: number, unit: ScheduleUnit) => {
+      if (!jobId || Number.isNaN(value)) return;
+      const minutes = Math.max(Math.round(value * MINUTES_PER_UNIT[unit]), 1);
       void updateJob(jobId, {
-        schedule: { enabled: scheduleEnabled, intervalMinutes: Math.max(minutes, 1) },
+        schedule: { enabled: scheduleEnabled, intervalMinutes: minutes },
       });
     },
     [jobId, scheduleEnabled],
@@ -586,8 +611,9 @@ export function FlowchartPage() {
   }, [jobId, tree, running]);
 
   const copyOutput = useCallback(() => {
-    const text =
-      tab === "mermaid" ? result.mermaid : tab === "outline" ? result.outline : result.narrative;
+    // The "Narrative" tab renders the outline text (the old free-form narrative
+    // tab was removed and this one renamed).
+    const text = tab === "mermaid" ? result.mermaid : result.outline;
     void navigator.clipboard.writeText(text).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1200);
@@ -688,14 +714,27 @@ export function FlowchartPage() {
             type="number"
             min={1}
             step={1}
-            aria-label="Schedule interval in minutes"
+            aria-label="Schedule interval value"
             data-testid="job-schedule-interval"
-            value={intervalMinutes}
-            onChange={(e) => onChangeInterval(Number(e.target.value))}
+            value={intervalValue}
+            onChange={(e) => onChangeInterval(Number(e.target.value), intervalUnit)}
             disabled={!jobId || !scheduleEnabled}
             className="h-7 w-16 px-2 text-sm"
           />
-          <span className="text-xs whitespace-nowrap text-muted-foreground">min</span>
+          <select
+            aria-label="Schedule interval unit"
+            data-testid="job-schedule-unit"
+            value={intervalUnit}
+            onChange={(e) => onChangeInterval(intervalValue, e.target.value as ScheduleUnit)}
+            disabled={!jobId || !scheduleEnabled}
+            className="h-7 rounded-md border border-input bg-background px-1.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {(["minute", "hour", "day"] as const).map((u) => (
+              <option key={u} value={u}>
+                {UNIT_LABELS[u]}
+              </option>
+            ))}
+          </select>
         </div>
         <Button variant="outline" size="sm" onClick={onSave} disabled={!jobId}>
           <SaveIcon className="size-3.5" /> {saved ? "Saved!" : "Save"}
@@ -746,7 +785,6 @@ export function FlowchartPage() {
             <div className="flex items-center gap-2 border-b border-border px-3 py-2">
               <TabsList variant="line" className="flex-1">
                 <TabsTrigger value="narrative">Narrative</TabsTrigger>
-                <TabsTrigger value="outline">Outline</TabsTrigger>
                 <TabsTrigger value="mermaid">Mermaid</TabsTrigger>
                 <TabsTrigger value="runs">
                   Runs{job && job.runs.length > 0 ? ` (${job.runs.length})` : ""}
@@ -765,15 +803,6 @@ export function FlowchartPage() {
 
             <div className="min-h-0 flex-1 overflow-auto">
               <TabsContent value="narrative" className="p-4">
-                {result.narrative ? (
-                  <pre className="font-sans text-sm leading-relaxed whitespace-pre-wrap">
-                    {result.narrative}
-                  </pre>
-                ) : (
-                  <p className="text-sm text-muted-foreground italic">Nothing to show yet.</p>
-                )}
-              </TabsContent>
-              <TabsContent value="outline" className="p-4">
                 {result.outline ? (
                   <pre className="font-mono text-xs leading-relaxed whitespace-pre-wrap">
                     {result.outline}
