@@ -19,6 +19,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ActivityIcon,
   ArrowLeftIcon,
   CheckCircle2Icon,
   CopyIcon,
@@ -53,6 +54,8 @@ import {
   type Slot,
 } from "@/lib/flowTree";
 import { runJob, updateJob, useJob, type Run } from "@/lib/jobsStore";
+import { getSession } from "@/lib/sessionsApi";
+import { fetchLastAssistantText } from "@/lib/lastAssistantText";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { getIconComponent } from "@/components/icons/iconRegistry";
@@ -844,6 +847,93 @@ function RunStatusIcon({ status }: { status: Run["status"] }) {
   return <XCircleIcon className="size-4 text-red-500" />;
 }
 
+/**
+ * A brief, on-demand status of where a run's flow execution currently is.
+ *
+ * Clicking toggles a one-shot fetch of the run's session: the session status
+ * (idle / running / waiting / failed) plus, when available, the agent's latest
+ * output text — which, under the execution-engine system prompt, narrates the
+ * current step ("Step 3 — …"). Lazy by design: nothing fetches until clicked,
+ * and each open re-fetches so the status is fresh without background polling.
+ *
+ * Native runs persist no assistant items, so the progress line may be absent —
+ * the session status still gives a useful "running vs done vs failed" signal.
+ */
+function RunStatusButton({ run }: { run: Run }) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+  const [progress, setProgress] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    if (!run.sessionId) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const [session, latest] = await Promise.all([
+        getSession(run.sessionId).catch(() => null),
+        fetchLastAssistantText(run.sessionId, 240).catch(() => undefined),
+      ]);
+      setStatus(session?.status ?? null);
+      setProgress(latest ?? null);
+      if (!session) setError("Couldn't reach the session.");
+    } finally {
+      setLoading(false);
+    }
+  }, [run.sessionId]);
+
+  const onToggle = useCallback(() => {
+    setOpen((wasOpen) => {
+      if (!wasOpen) void load(); // refetch on each open
+      return !wasOpen;
+    });
+  }, [load]);
+
+  if (!run.sessionId) return null;
+  return (
+    <div className="mt-2 inline-flex flex-col">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
+      >
+        <ActivityIcon className="size-3.5" /> Status
+      </button>
+      {open && (
+        <div className="mt-1.5 max-w-[360px] rounded-md border border-border bg-card p-2 text-xs">
+          {loading ? (
+            <span className="inline-flex items-center gap-1 text-muted-foreground">
+              <Loader2Icon className="size-3.5 animate-spin" /> Checking…
+            </span>
+          ) : error ? (
+            <span className="text-muted-foreground">{error}</span>
+          ) : (
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center gap-1.5">
+                <span className="text-muted-foreground">Session:</span>
+                <span className="font-medium capitalize">{status ?? "unknown"}</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Currently: </span>
+                {progress ? (
+                  <span className="whitespace-pre-wrap">{progress}</span>
+                ) : (
+                  <span className="text-muted-foreground italic">
+                    {run.status === "running"
+                      ? "Executing — no step reported yet (open the session to watch live)."
+                      : "No progress detail available."}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function RunsList({ runs }: { runs: Run[] }) {
   const ordered = [...runs].sort((a, b) => b.startedAt - a.startedAt);
   if (!ordered.length) {
@@ -886,14 +976,33 @@ function RunsList({ runs }: { runs: Run[] }) {
               </pre>
             </details>
             {/* The run executes in its own session in the background; opening
-                it is always one explicit click away (never auto-navigated). */}
+                it is always one explicit click away (never auto-navigated).
+                A run is a native Claude-CLI session whose conversation lives in
+                the terminal, so seed the AppShell's panel-key (the empty
+                PANEL_NO_TERMINAL_KEY sentinel → terminal view, which resolves
+                to the agent's own terminal) before navigating, landing the
+                session on its terminal instead of the empty chat surface. */}
             {run.sessionId ? (
-              <Link
-                to={`/c/${run.sessionId}`}
-                className="mt-2 inline-block text-xs font-medium text-primary hover:underline"
-              >
-                Open session →
-              </Link>
+              <div className="flex items-start gap-4">
+                <Link
+                  to={`/c/${run.sessionId}`}
+                  onClick={() => {
+                    try {
+                      sessionStorage.setItem(
+                        `omnigent.ap-web.panel-key:${run.sessionId}`,
+                        "",
+                      );
+                    } catch {
+                      // sessionStorage unavailable (private mode / quota) — fall
+                      // back to the default chat view; not worth blocking the nav.
+                    }
+                  }}
+                  className="mt-2 inline-block text-xs font-medium text-primary hover:underline"
+                >
+                  Open session →
+                </Link>
+                <RunStatusButton run={run} />
+              </div>
             ) : null}
           </div>
         );

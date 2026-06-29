@@ -175,9 +175,14 @@ async function refreshJob(id: string): Promise<Job | undefined> {
   return cacheJob(toJob(api, runs));
 }
 
-/** Render the narrative the backend persists for a tree. */
+/**
+ * Render the text the backend persists for a tree and dispatches as the run's
+ * session message. We use the *outline* (the numbered, unambiguous step list —
+ * the same text shown under the builder's "Narrative" tab) rather than the
+ * prose narrative, so the agent receives the structured breakdown.
+ */
 function narrativeFor(tree: FlowStep): string {
-  return generateFlowText(treeToGraph(tree)).narrative;
+  return generateFlowText(treeToGraph(tree)).outline;
 }
 
 /** Create a job from a tree, rendering its narrative. Returns the new job. */
