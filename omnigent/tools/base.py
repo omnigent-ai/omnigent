@@ -53,12 +53,21 @@ class ToolContext:
         addressing). ``None`` when not available (older workflow
         paths, unit tests) — tools that require it should fail
         loud.
+    :param user_id: The *acting* collaborator who triggered the current
+        turn — the authenticated sender of the message being processed,
+        not the session owner (#5). In a shared session this lets a tool
+        act under the actor's own identity, e.g. resolve that user's
+        per-user vault secret via
+        :func:`omnigent.runtime.credentials.resolve_user_secret`. ``None``
+        in single-user mode, for owner-initiated turns with no distinct
+        actor, or when the identity wasn't threaded (older paths, tests).
     """
 
     task_id: str
     agent_id: str
     workspace: Path | None = None
     conversation_id: str | None = None
+    user_id: str | None = None
 
 
 class Tool(abc.ABC):
