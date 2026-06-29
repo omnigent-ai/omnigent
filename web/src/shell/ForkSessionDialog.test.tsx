@@ -349,6 +349,55 @@ describe("ForkSessionDialog", () => {
     expect(screen.getByTestId("fork-session-agent-option-ag_claude_native")).toBeInTheDocument();
   });
 
+  it("excludes the source's agent and resolves its label for a '(switch …)' clone", () => {
+    // The in-place Switch Agent flow names its clone "<builtin> (switch <id>)"
+    // (server: cloned_agent_name = f"{name} (switch …)"). The previous
+    // single-layer, fork-only strip left that suffix in place, so forking a
+    // switched session showed the raw slug as the "same as source" label and
+    // re-listed the current built-in as a switch target. agentRootName peels
+    // the "(switch …)" layer too.
+    setAgents(AVAILABLE_AGENTS, "claude-native");
+    useSessionAgentMock.mockReturnValue({
+      data: {
+        id: "ag_claude_switch",
+        name: "claude-native-ui (switch ag_c537b7b)",
+        harness: "claude-native",
+      },
+    } as unknown as ReturnType<typeof useSessionAgent>);
+    renderDialog();
+    openAgentSelect();
+
+    // Label resolves to the built-in's display name, not the raw suffixed slug.
+    expect(screen.getByTestId("fork-session-agent-option-same")).toHaveTextContent("Claude Code");
+    // The built-in the source was switched to is hidden (no duplicate).
+    expect(
+      screen.queryByTestId("fork-session-agent-option-ag_claude_native"),
+    ).not.toBeInTheDocument();
+    // Other same-family targets remain.
+    expect(screen.getByTestId("fork-session-agent-option-ag_claude_sdk")).toBeInTheDocument();
+  });
+
+  it("excludes the source's agent for a nested fork-of-a-fork clone", () => {
+    // Nested clones accumulate suffixes: "<builtin> (fork a) (fork b)". A
+    // single-layer strip would leave "<builtin> (fork a)", miss the match, and
+    // re-list the built-in. agentRootName recurses to the root.
+    setAgents(AVAILABLE_AGENTS, "claude-native");
+    useSessionAgentMock.mockReturnValue({
+      data: {
+        id: "ag_claude_nested",
+        name: "claude-native-ui (fork ag_b629fd6) (fork ag_a286ffe)",
+        harness: "claude-native",
+      },
+    } as unknown as ReturnType<typeof useSessionAgent>);
+    renderDialog();
+    openAgentSelect();
+
+    expect(screen.getByTestId("fork-session-agent-option-same")).toHaveTextContent("Claude Code");
+    expect(
+      screen.queryByTestId("fork-session-agent-option-ag_claude_native"),
+    ).not.toBeInTheDocument();
+  });
+
   it("passes the chosen agent_id when switching agent", async () => {
     forkSessionMock.mockResolvedValue({
       id: "conv_fork",

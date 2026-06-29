@@ -36,7 +36,7 @@ import { useHosts, type Host } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
-import { forkTargetCarriesHistory } from "@/lib/forkHarness";
+import { agentRootName, forkTargetCarriesHistory } from "@/lib/forkHarness";
 import { getCliServerUrl } from "@/lib/host";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
@@ -213,13 +213,17 @@ export function ForkSessionForm({
   const onDifferentHost =
     isCodingSource && selectedHostId !== null && selectedHostId !== sourceHostId;
 
-  // The source's bound agent, stripped of any " (fork <id>)" suffix the
-  // fork route appends when cloning an agent. A fork-of-a-fork's source
-  // agent is named e.g. "databricks_coding_agent (fork ag_5c78e6a)", which
-  // wouldn't match the built-in "databricks_coding_agent" by name — strip
-  // the suffix so the dedup below still hides it.
+  // The source's bound agent, reduced to its ROOT name by peeling every
+  // " (fork <id>)" / " (switch <id>)" clone suffix the fork/switch routes
+  // append. A fork-of-a-fork or a switched session is named e.g.
+  // "databricks_coding_agent (fork ag_a) (fork ag_b)" or
+  // "claude-native-ui (switch ag_c)", neither of which matches a built-in by
+  // name. agentRootName peels ALL layers — a single-layer / fork-only strip
+  // (the previous regex here) would miss nested clones and every "(switch …)"
+  // clone the in-place switch-agent flow creates — so the label resolves and
+  // the dedup below still hides the source's own agent.
   const sourceAgentName = sourceAgent?.name ?? null;
-  const sourceAgentBaseName = sourceAgentName?.replace(/ \(fork [^)]+\)$/, "") ?? null;
+  const sourceAgentBaseName = sourceAgentName ? agentRootName(sourceAgentName) : null;
 
   // Friendly label for the source's agent — the "same as source" option shows
   // this so the user sees the actual agent they're keeping. The source's YAML
