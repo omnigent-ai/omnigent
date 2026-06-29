@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
+import { useSchedules } from "@/hooks/useSchedules";
 import { useConversations } from "@/hooks/useConversations";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
@@ -122,6 +123,8 @@ export function AppShell() {
   // Read early: the conversationId scopes the per-session workspace state
   // (rail open/width/tab/open files) used throughout this component.
   const { conversationId } = useParams<{ conversationId: string }>();
+  // Schedules (#6): drives the right-rail Schedules tab; empty until one exists.
+  const schedulesQuery = useSchedules(conversationId);
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
   const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).rightRailTab ?? "files") : "files",
@@ -446,6 +449,8 @@ export function AppShell() {
     () =>
       ({
         files: showFilesPanel,
+        // Schedules tab appears once the conversation has loops/monitors.
+        schedules: (schedulesQuery.data?.length ?? 0) > 0,
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
         subagents: true,
@@ -463,6 +468,7 @@ export function AppShell() {
       }) as const,
     [
       showFilesPanel,
+      schedulesQuery.data,
       hideTerminalsTab,
       railTerminals.length,
       agentSupportsShells,
@@ -483,9 +489,9 @@ export function AppShell() {
   // convergent even when several tabs vanish at once.
   useEffect(() => {
     if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "subagents", "terminals", "todos"] as const).find(
-      (t) => railTabsAvailable[t],
-    );
+    const next = (
+      ["files", "subagents", "terminals", "todos", "schedules"] as const
+    ).find((t) => railTabsAvailable[t]);
     if (next) setRightRailTab(next);
   }, [railTabsAvailable, rightRailTab]);
 
@@ -1165,6 +1171,7 @@ export function AppShell() {
                       rightRailTab={rightRailTab}
                       onRightRailTabChange={handleRightRailTabChange}
                       showFilesPanel={showFilesPanel}
+                      showSchedulesTab={railTabsAvailable.schedules}
                       changedCount={changedCount}
                       showShellsTab={railTabsAvailable.terminals}
                       terminalsLength={railTerminals.length}
