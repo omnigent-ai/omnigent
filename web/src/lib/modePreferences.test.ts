@@ -1,58 +1,99 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readLastModeForHarness, writeLastModeForHarness } from "./modePreferences";
+import { readHarnessOptions, writeHarnessOption } from "./modePreferences";
+
+const KEY = "omnigent:last-mode-by-harness";
 
 afterEach(() => {
   localStorage.clear();
   vi.restoreAllMocks();
 });
 
-describe("modePreferences", () => {
-  it("returns null when nothing is stored for a harness", () => {
-    // A first-time visitor has no pick on record — read must say so (null)
-    // so the composer seeds the harness default.
-    expect(readLastModeForHarness("claude-native")).toBeNull();
+describe("modePreferences (per-harness options)", () => {
+  it("returns an empty object when nothing is stored for a harness", () => {
+    // A first-time visitor has no picks on record — read says so ({}) so the
+    // composer seeds the harness defaults / leaves knobs unselected.
+    expect(readHarnessOptions("claude-native")).toEqual({});
   });
 
-  it("returns null for a null/empty harness", () => {
-    writeLastModeForHarness("claude-native", "auto");
-    expect(readLastModeForHarness(null)).toBeNull();
-    expect(readLastModeForHarness(undefined)).toBeNull();
-    expect(readLastModeForHarness("")).toBeNull();
+  it("returns an empty object for a null/empty harness", () => {
+    writeHarnessOption("claude-native", { mode: "auto" });
+    expect(readHarnessOptions(null)).toEqual({});
+    expect(readHarnessOptions(undefined)).toEqual({});
+    expect(readHarnessOptions("")).toEqual({});
   });
 
-  it("round-trips a written mode", () => {
-    writeLastModeForHarness("claude-native", "plan");
-    expect(readLastModeForHarness("claude-native")).toBe("plan");
+  it("round-trips written option knobs", () => {
+    writeHarnessOption("claude-native", { mode: "plan", model: "opus", effort: "high" });
+    expect(readHarnessOptions("claude-native")).toEqual({
+      mode: "plan",
+      model: "opus",
+      effort: "high",
+    });
   });
 
-  it("keeps each harness's pick independent", () => {
-    // The whole point: a Codex pick must not leak into Claude Code's slot.
-    writeLastModeForHarness("claude-native", "auto");
-    writeLastModeForHarness("codex-native", "full-access");
-    writeLastModeForHarness("cursor-native", "yolo");
-    expect(readLastModeForHarness("claude-native")).toBe("auto");
-    expect(readLastModeForHarness("codex-native")).toBe("full-access");
-    expect(readLastModeForHarness("cursor-native")).toBe("yolo");
+  it("merges a partial patch, preserving the other knobs", () => {
+    // The whole point of remembering independently: setting the model later
+    // must not clobber an already-stored mode/effort.
+    writeHarnessOption("claude-native", { mode: "plan", effort: "high" });
+    writeHarnessOption("claude-native", { model: "opus" });
+    expect(readHarnessOptions("claude-native")).toEqual({
+      mode: "plan",
+      model: "opus",
+      effort: "high",
+    });
   });
 
-  it("overwrites the previous pick for the same harness", () => {
-    writeLastModeForHarness("claude-native", "auto");
-    writeLastModeForHarness("claude-native", "plan");
-    expect(readLastModeForHarness("claude-native")).toBe("plan");
+  it("keeps each harness's options independent", () => {
+    // A Codex pick must not leak into Claude Code's slot.
+    writeHarnessOption("claude-native", { mode: "auto" });
+    writeHarnessOption("codex-native", { mode: "full-access" });
+    writeHarnessOption("cursor-native", { mode: "yolo" });
+    expect(readHarnessOptions("claude-native")).toEqual({ mode: "auto" });
+    expect(readHarnessOptions("codex-native")).toEqual({ mode: "full-access" });
+    expect(readHarnessOptions("cursor-native")).toEqual({ mode: "yolo" });
+  });
+
+  it("overwrites a knob's previous value for the same harness", () => {
+    writeHarnessOption("claude-native", { mode: "auto" });
+    writeHarnessOption("claude-native", { mode: "plan" });
+    expect(readHarnessOptions("claude-native")).toEqual({ mode: "plan" });
   });
 
   it("ignores a null/empty harness on write", () => {
-    writeLastModeForHarness(null, "auto");
-    writeLastModeForHarness("", "auto");
-    expect(localStorage.getItem("omnigent:last-mode-by-harness")).toBeNull();
+    writeHarnessOption(null, { mode: "auto" });
+    writeHarnessOption("", { mode: "auto" });
+    expect(localStorage.getItem(KEY)).toBeNull();
+  });
+
+  it("migrates the legacy bare-string value to { mode } on read", () => {
+    // This store originally held a single mode string per harness. A returning
+    // user's pre-generalization data must still resolve so their remembered
+    // mode survives — not reset to default.
+    localStorage.setItem(KEY, JSON.stringify({ "claude-native": "plan" }));
+    expect(readHarnessOptions("claude-native")).toEqual({ mode: "plan" });
+  });
+
+  it("drops non-string fields and structurally-corrupt entries", () => {
+    localStorage.setItem(
+      KEY,
+      JSON.stringify({
+        "claude-native": { model: "opus", effort: 5, nested: { a: 1 } },
+        "codex-native": ["not", "an", "object"],
+        "cursor-native": 42,
+      }),
+    );
+    // Only the string-valued field survives; the bad fields/entries fall away.
+    expect(readHarnessOptions("claude-native")).toEqual({ model: "opus" });
+    expect(readHarnessOptions("codex-native")).toEqual({});
+    expect(readHarnessOptions("cursor-native")).toEqual({});
   });
 
   it("tolerates a corrupted blob", () => {
-    localStorage.setItem("omnigent:last-mode-by-harness", "not json{");
-    expect(readLastModeForHarness("claude-native")).toBeNull();
+    localStorage.setItem(KEY, "not json{");
+    expect(readHarnessOptions("claude-native")).toEqual({});
     // A later write recovers — it doesn't propagate the corruption.
-    writeLastModeForHarness("claude-native", "plan");
-    expect(readLastModeForHarness("claude-native")).toBe("plan");
+    writeHarnessOption("claude-native", { mode: "plan" });
+    expect(readHarnessOptions("claude-native")).toEqual({ mode: "plan" });
   });
 
   it("never throws when storage is inaccessible", () => {
@@ -62,7 +103,7 @@ describe("modePreferences", () => {
     vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
       throw new Error("access denied");
     });
-    expect(() => writeLastModeForHarness("claude-native", "auto")).not.toThrow();
-    expect(readLastModeForHarness("claude-native")).toBeNull();
+    expect(() => writeHarnessOption("claude-native", { mode: "auto" })).not.toThrow();
+    expect(readHarnessOptions("claude-native")).toEqual({});
   });
 });

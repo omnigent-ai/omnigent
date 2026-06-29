@@ -53,7 +53,7 @@ import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
-import { readLastModeForHarness, writeLastModeForHarness } from "@/lib/modePreferences";
+import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
@@ -145,13 +145,14 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
   },
 ];
 
-// Claude-native model + reasoning-effort defaults for the new-session
-// model/effort picker. These are Claude Code's own effective defaults, so a
-// fresh session shows "Opus Medium" and rides along as `model_override` /
-// `reasoning_effort` on the create. Effort levels mirror CLAUDE_NATIVE_EFFORT
-// _LEVELS in ChatPage's in-session picker (ANTHROPIC_EFFORTS server-side).
-const CLAUDE_NATIVE_DEFAULT_MODEL = "opus";
-const CLAUDE_NATIVE_DEFAULT_EFFORT = "medium";
+// Claude-native reasoning-effort options for the new-session model/effort
+// picker. There is deliberately no hardcoded model/effort default: a fresh
+// session leaves both unselected and omits `model_override` / `reasoning_effort`
+// from the create, so Claude Code falls back to its own configured model — the
+// same "no override" semantics the in-session picker's `null` state and the
+// `/model default` / `/effort default` commands use. Effort levels mirror
+// CLAUDE_NATIVE_EFFORT_LEVELS in ChatPage's in-session picker (ANTHROPIC_EFFORTS
+// server-side).
 const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
   { value: "low", label: "Low" },
   { value: "medium", label: "Medium" },
@@ -1323,31 +1324,48 @@ function AgentHarnessPicker({
   const knobSectionsFor = (agent: AvailableAgent): ReactNode => {
     const isSelected = agent.id === effectiveAgentId;
     const entryHarness = nativeCodingAgentForAvailableAgent(agent)?.harness ?? null;
-    // The value to show: the live shared state when this entry is the active
-    // selection, else the entry harness's last pick (or its default).
+    // All of this entry harness's remembered knobs (mode / model / effort),
+    // read once. The value to SHOW: the live shared state when this entry is the
+    // active selection, else the stored pick.
+    const stored = entryHarness ? readHarnessOptions(entryHarness) : {};
     const modeValue = (modes: readonly { value: string }[], dflt: string, live: string): string => {
       if (isSelected) return live;
-      const stored = entryHarness ? readLastModeForHarness(entryHarness) : null;
-      return stored != null && modes.some((m) => m.value === stored) ? stored : dflt;
+      return stored.mode != null && modes.some((m) => m.value === stored.mode) ? stored.mode : dflt;
     };
     const onModeChange = (setMode: (m: string) => void) => (mode: string) => {
       onSelectAgent(agent);
-      if (entryHarness) writeLastModeForHarness(entryHarness, mode);
+      if (entryHarness) writeHarnessOption(entryHarness, { mode });
       setMode(mode);
     };
+    // Same show-the-live-pick-or-the-stored-last logic for the model/effort
+    // knobs (only the claude-native entry has them). Resolves to "" (nothing
+    // checked → no override sent → Claude Code's own default) when nothing's
+    // stored or the stored id has since retired.
+    const modelValue = isSelected
+      ? pickedModel
+      : stored.model != null && CLAUDE_NATIVE_MODELS.some((m) => m.id === stored.model)
+        ? stored.model
+        : "";
+    const effortValue = isSelected
+      ? pickedEffort
+      : stored.effort != null && CLAUDE_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
+        ? stored.effort
+        : "";
 
     if (nativeAgentHasCapability(agent, "permissionMode")) {
       return (
         <>
           <ModelEffortOptions
-            model={pickedModel}
-            effort={pickedEffort}
+            model={modelValue}
+            effort={effortValue}
             onModelChange={(m) => {
               onSelectAgent(agent);
+              if (entryHarness) writeHarnessOption(entryHarness, { model: m });
               setPickedModel(m);
             }}
             onEffortChange={(e) => {
               onSelectAgent(agent);
+              if (entryHarness) writeHarnessOption(entryHarness, { effort: e });
               setPickedEffort(e);
             }}
           />
@@ -1785,10 +1803,12 @@ export function NewChatLandingScreen() {
   // every agent switch so a pick never leaks across agents.
   const [pickedHarness, setPickedHarness] = useState<string | null>(null);
   // Per-session model + reasoning effort for the claude-native model picker.
-  // Default to Claude Code's own effective defaults (Sonnet / Medium); the
-  // pick rides along as `model_override` / `reasoning_effort` on the create.
-  const [pickedModel, setPickedModel] = useState<string>(CLAUDE_NATIVE_DEFAULT_MODEL);
-  const [pickedEffort, setPickedEffort] = useState<string>(CLAUDE_NATIVE_DEFAULT_EFFORT);
+  // "" = unselected: nothing is checked and `model_override` / `reasoning_effort`
+  // are omitted from the create, so Claude Code uses its own configured model.
+  // An explicit pick rides along and is remembered (seeded back on a later visit
+  // via the harness-seed effect below).
+  const [pickedModel, setPickedModel] = useState<string>("");
+  const [pickedEffort, setPickedEffort] = useState<string>("");
   // Per-session cost-control switch ("Cost Optimized" pill). Unset
   // (null) defers to the agent spec's default and is omitted from
   // the create body.
@@ -1913,30 +1933,44 @@ export function NewChatLandingScreen() {
   useEffect(() => {
     setBypassSandbox(false);
   }, [effectiveAgentId]);
-  // The selected native harness, used to persist/seed its mode pick (the
-  // mode knob is harness-specific). null for non-native agents, which have
-  // no mode knob to remember.
+  // The selected native harness, used to persist/seed its option knobs (mode /
+  // model / effort), which are harness-specific. null for non-native agents,
+  // which have no knobs to remember.
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
-  // Seed the harness's mode knob from the user's last pick when the selected
+  // Seed the harness's knobs from the user's last picks when the selected
   // harness changes (including the first mount), so a returning user starts a
-  // new session on the mode they used last for that harness instead of the
+  // new session on the options they used last for that harness instead of the
   // default. Keyed on the harness so an in-session edit isn't clobbered on
   // re-render — only a harness switch reseeds.
   useEffect(() => {
     if (!selectedNativeHarness) return;
-    const stored = readLastModeForHarness(selectedNativeHarness);
-    // Resolve to the stored value when it's still valid for this harness,
-    // else the harness default. The else branch must RESET (not early-return)
-    // because codex-native and opencode-native share the single approvalMode
-    // state: returning early would leave the previously-selected harness's
-    // mode in place — e.g. codex's "full-access" carried onto OpenCode — and
-    // flow into the launch args unchanged. A stale value not in the current
-    // list resolves to the default for the same reason.
+    const stored = readHarnessOptions(selectedNativeHarness);
+    // Resolve the mode to the stored value when it's still valid for this
+    // harness, else the harness default. The else branch must RESET (not
+    // early-return) because codex-native and opencode-native share the single
+    // approvalMode state: returning early would leave the previously-selected
+    // harness's mode in place — e.g. codex's "full-access" carried onto
+    // OpenCode — and flow into the launch args unchanged. A stale value not in
+    // the current list resolves to the default for the same reason.
     const resolve = (modes: readonly { value: string }[], dflt: string) =>
-      stored != null && modes.some((m) => m.value === stored) ? stored : dflt;
+      stored.mode != null && modes.some((m) => m.value === stored.mode) ? stored.mode : dflt;
     if (supportsPermissionMode) {
       setPermissionMode(
         resolve(CLAUDE_NATIVE_PERMISSION_MODES, CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE),
+      );
+      // The model + effort picker remembers its own last pick (same per-harness
+      // snapshot the mode knob uses), validated against the current vocab. With
+      // nothing stored (or a retired id) it resolves to "" — unselected, so the
+      // create omits the override and Claude Code uses its own configured model.
+      setPickedModel(
+        stored.model != null && CLAUDE_NATIVE_MODELS.some((m) => m.id === stored.model)
+          ? stored.model
+          : "",
+      );
+      setPickedEffort(
+        stored.effort != null && CLAUDE_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
+          ? stored.effort
+          : "",
       );
     } else if (supportsApprovalMode) {
       setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
@@ -2330,9 +2364,11 @@ export function NewChatLandingScreen() {
             // Model + reasoning effort, persisted on the session row before
             // the runner launches. Only claude-native surfaces the picker, so
             // only its agents carry the choice; the runner reads them as
-            // `--model` / `--effort` at terminal launch.
-            model_override: agentSupportsPermissionMode ? pickedModel : undefined,
-            reasoning_effort: agentSupportsPermissionMode ? pickedEffort : undefined,
+            // `--model` / `--effort` at terminal launch. An unselected ("")
+            // knob is omitted so Claude Code keeps its own configured model.
+            model_override: agentSupportsPermissionMode && pickedModel ? pickedModel : undefined,
+            reasoning_effort:
+              agentSupportsPermissionMode && pickedEffort ? pickedEffort : undefined,
             // Smart routing toggle — server-side, available for any agent.
             cost_control_mode_override: costControlMode ?? undefined,
             harness_override: pickedHarness ?? undefined,

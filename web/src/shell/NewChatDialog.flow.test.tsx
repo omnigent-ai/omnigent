@@ -563,7 +563,7 @@ describe("NewChatLandingScreen create flow", () => {
     // WITHOUT the user re-opening the pill.
     localStorage.setItem(
       "omnigent:last-mode-by-harness",
-      JSON.stringify({ "claude-native": "plan" }),
+      JSON.stringify({ "claude-native": { mode: "plan" } }),
     );
     setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
@@ -600,7 +600,7 @@ describe("NewChatLandingScreen create flow", () => {
     // visit can seed from it.
     await waitFor(() =>
       expect(JSON.parse(localStorage.getItem("omnigent:last-mode-by-harness") ?? "{}")).toEqual({
-        "claude-native": "acceptEdits",
+        "claude-native": { mode: "acceptEdits" },
       }),
     );
   });
@@ -610,7 +610,7 @@ describe("NewChatLandingScreen create flow", () => {
     // its default — modes are keyed per harness, not shared.
     localStorage.setItem(
       "omnigent:last-mode-by-harness",
-      JSON.stringify({ "codex-native": "full-access" }),
+      JSON.stringify({ "codex-native": { mode: "full-access" } }),
     );
     setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
 
@@ -690,7 +690,7 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.terminal_launch_args).toBeUndefined();
   });
 
-  it("rides the default model + effort along to create for claude-native", async () => {
+  it("omits model + effort on create when the picker is untouched for claude-native", async () => {
     setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
@@ -699,17 +699,17 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Claude Code's effective defaults (Opus / Medium) ride along on the
-    // create without the user opening the picker — the runner reads them as
-    // --model / --effort at terminal launch.
+    // No model/effort default is forced: leaving the picker untouched omits
+    // both from the create (undefined is dropped by JSON.stringify), so Claude
+    // Code launches on its own configured model rather than a UI-forced one.
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string);
-    expect(body.model_override).toBe("opus");
-    expect(body.reasoning_effort).toBe("medium");
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
   });
 
   it("rides a picked model + effort along to create for claude-native", async () => {
@@ -734,6 +734,79 @@ describe("NewChatLandingScreen create flow", () => {
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string);
     expect(body.model_override).toBe("opus");
+    expect(body.reasoning_effort).toBe("high");
+  });
+
+  it("seeds the model + effort from the last pick for claude-native on a new session", async () => {
+    // A returning user's last model/effort pick for this harness is on record;
+    // the new session must auto-fill it and post it WITHOUT re-opening the
+    // picker — the same remember-your-pick behavior the permission mode has.
+    localStorage.setItem(
+      "omnigent:last-mode-by-harness",
+      JSON.stringify({ "claude-native": { model: "opus", effort: "high" } }),
+    );
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_native" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBe("opus");
+    expect(body.reasoning_effort).toBe("high");
+  });
+
+  it("persists a picked model for claude-native, preserving the stored effort", async () => {
+    // Effort is already on record. Picking only the model must merge — not
+    // clobber — so the next session seeds BOTH from storage.
+    localStorage.setItem(
+      "omnigent:last-mode-by-harness",
+      JSON.stringify({ "claude-native": { effort: "high" } }),
+    );
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_native");
+    fireEvent.click(screen.getByTestId("new-chat-landing-model-opus"));
+
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem("omnigent:last-mode-by-harness") ?? "{}")).toEqual({
+        "claude-native": { model: "opus", effort: "high" },
+      }),
+    );
+  });
+
+  it("ignores a retired stored model id and omits the override on create", async () => {
+    // A stale stored model no longer in the picker's vocab must not ride along —
+    // resolve to unselected so the create never posts a dead model id (and the
+    // valid stored effort still seeds).
+    localStorage.setItem(
+      "omnigent:last-mode-by-harness",
+      JSON.stringify({ "claude-native": { model: "ancient-model", effort: "high" } }),
+    );
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_native" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBeUndefined();
     expect(body.reasoning_effort).toBe("high");
   });
 
