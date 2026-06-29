@@ -74,7 +74,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # auto-registered (#12) so agents + the Omnigent MCP can manage
         # tasks and schedules without the spec opting in.
         "create_work_item",
-        "list_tasks",
+        "list_work_items",
         "update_work_item",
         "create_loop",
         "create_monitor",

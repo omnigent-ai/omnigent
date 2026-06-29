@@ -121,7 +121,7 @@ def test_builtin_names_size_matches_registry() -> None:
                 "search_conversations",
                 "export_agent",
                 "create_work_item",
-                "list_tasks",
+                "list_work_items",
                 "update_work_item",
                 "create_loop",
                 "create_monitor",

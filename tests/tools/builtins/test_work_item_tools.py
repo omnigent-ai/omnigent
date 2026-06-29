@@ -10,7 +10,7 @@ from omnigent.stores.work_item_store.sqlalchemy_store import SqlAlchemyWorkItemS
 from omnigent.tools.base import ToolContext
 from omnigent.tools.builtins.work_items import (
     CreateWorkItemTool,
-    ListTasksTool,
+    ListWorkItemsTool,
     UpdateWorkItemTool,
 )
 
@@ -56,7 +56,7 @@ def test_create_list_update_flow(wired_store: SqlAlchemyWorkItemStore) -> None:
     assert dup["created"] is False
     assert dup["work_item"]["id"] == wid
 
-    listed = json.loads(ListTasksTool().invoke(json.dumps({}), _CTX))
+    listed = json.loads(ListWorkItemsTool().invoke(json.dumps({}), _CTX))
     assert listed["count"] == 1
     assert listed["work_items"][0]["id"] == wid
 
@@ -75,9 +75,13 @@ def test_create_list_update_flow(wired_store: SqlAlchemyWorkItemStore) -> None:
     assert upd["work_item"]["status"] == "needs_review"
     assert upd["work_item"]["pr_url"].endswith("/pull/9")
 
-    only_review = json.loads(ListTasksTool().invoke(json.dumps({"status": "needs_review"}), _CTX))
+    only_review = json.loads(
+        ListWorkItemsTool().invoke(json.dumps({"status": "needs_review"}), _CTX)
+    )
     assert only_review["count"] == 1
-    assert json.loads(ListTasksTool().invoke(json.dumps({"status": "done"}), _CTX))["count"] == 0
+    assert (
+        json.loads(ListWorkItemsTool().invoke(json.dumps({"status": "done"}), _CTX))["count"] == 0
+    )
 
 
 def test_validation_errors(wired_store: SqlAlchemyWorkItemStore) -> None:
@@ -99,5 +103,5 @@ def test_validation_errors(wired_store: SqlAlchemyWorkItemStore) -> None:
 
 def test_store_unconfigured(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("omnigent.runtime.get_work_item_store", lambda: None)
-    out = json.loads(ListTasksTool().invoke(json.dumps({}), _CTX))
+    out = json.loads(ListWorkItemsTool().invoke(json.dumps({}), _CTX))
     assert "error" in out

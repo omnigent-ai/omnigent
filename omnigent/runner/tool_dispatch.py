@@ -305,7 +305,7 @@ _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 _WORK_MANAGEMENT_TOOLS = frozenset(
     {
         "create_work_item",
-        "list_tasks",
+        "list_work_items",
         "update_work_item",
         "create_loop",
         "create_monitor",
@@ -340,6 +340,11 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _TERMINAL_TOOLS
+    # Work-item (#3) + schedule (#6) builtins (#12): native harnesses ignore
+    # the harness ``tools`` list, so they must be advertised through the relay
+    # too, or a real Claude/Codex agent can't create or track work. They
+    # dispatch via the same runner→server REST proxy as the non-native path.
+    | _WORK_MANAGEMENT_TOOLS
 )
 
 
@@ -2626,15 +2631,13 @@ async def _execute_work_management_tool(
             }
             return _result(await server_client.post("/v1/work-items", json=body, timeout=30.0))
 
-        if tool_name == "list_tasks":
+        if tool_name == "list_work_items":
             params: dict[str, Any] = {
                 k: args[k]
                 for k in ("status", "conversation_id", "limit")
                 if args.get(k) is not None
             }
-            return _result(
-                await server_client.get("/v1/work-items", params=params, timeout=30.0)
-            )
+            return _result(await server_client.get("/v1/work-items", params=params, timeout=30.0))
 
         if tool_name == "update_work_item":
             work_item_id = args.get("work_item_id")

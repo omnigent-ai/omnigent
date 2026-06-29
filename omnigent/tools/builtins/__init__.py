@@ -69,7 +69,7 @@ from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.web_search import WebSearchTool
 from omnigent.tools.builtins.work_items import (
     CreateWorkItemTool,
-    ListTasksTool,
+    ListWorkItemsTool,
     UpdateWorkItemTool,
 )
 
@@ -82,7 +82,7 @@ __all__ = [
     "DeleteScheduleTool",
     "ListCommentsTool",
     "ListSchedulesTool",
-    "ListTasksTool",
+    "ListWorkItemsTool",
     "LoadSkillTool",
     "ReadSkillFileTool",
     "SysAgentDownloadTool",
@@ -195,15 +195,15 @@ def _create_work_item(config: dict[str, str]) -> Tool:
     return CreateWorkItemTool()
 
 
-def _create_list_tasks(config: dict[str, str]) -> Tool:
+def _create_list_work_items(config: dict[str, str]) -> Tool:
     """
-    Lazy factory for ListTasksTool.
+    Lazy factory for ListWorkItemsTool.
 
     :param config: Tool config (unused).
-    :returns: A ListTasksTool instance.
+    :returns: A ListWorkItemsTool instance.
     """
     del config
-    return ListTasksTool()
+    return ListWorkItemsTool()
 
 
 def _create_update_work_item(config: dict[str, str]) -> Tool:
@@ -285,7 +285,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "export_agent": _create_export_agent,
     # Tasks / Work-Items (#3, #12) — backed by the WorkItemStore.
     "create_work_item": _create_work_item,
-    "list_tasks": _create_list_tasks,
+    "list_work_items": _create_list_work_items,
     "update_work_item": _create_update_work_item,
     # Schedules (#6, #12) — loops & monitors, backed by the ScheduleStore.
     "create_loop": _create_loop,

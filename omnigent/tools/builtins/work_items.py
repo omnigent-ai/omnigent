@@ -5,7 +5,7 @@ Three LLM-callable tools backed by the :class:`WorkItemStore`:
 - :class:`CreateWorkItemTool` (``create_work_item``) — create a tracked
   work item, idempotently by ``dedup_key`` (so the same external event
   ingested twice resolves to one row).
-- :class:`ListTasksTool` (``list_tasks``) — list work items, optionally
+- :class:`ListWorkItemsTool` (``list_work_items``) — list work items, optionally
   filtered by status / conversation.
 - :class:`UpdateWorkItemTool` (``update_work_item``) — update an item's
   status, PR URL, plan, title, or linked conversation.
@@ -187,13 +187,13 @@ class CreateWorkItemTool(Tool):
         return json.dumps({"created": True, "work_item": _item_dict(item)})
 
 
-class ListTasksTool(Tool):
+class ListWorkItemsTool(Tool):
     """List work items, optionally filtered by status / conversation."""
 
     @classmethod
     def name(cls) -> str:
-        """:returns: ``"list_tasks"``."""
-        return "list_tasks"
+        """:returns: ``"list_work_items"``."""
+        return "list_work_items"
 
     @classmethod
     def description(cls) -> str:
@@ -204,7 +204,7 @@ class ListTasksTool(Tool):
         )
 
     def get_schema(self) -> dict[str, Any]:
-        """:returns: OpenAI tool schema for ``list_tasks``."""
+        """:returns: OpenAI tool schema for ``list_work_items``."""
         return {
             "type": "function",
             "function": {

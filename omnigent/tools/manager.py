@@ -539,7 +539,7 @@ class ToolManager:
         """
         for name in (
             "create_work_item",
-            "list_tasks",
+            "list_work_items",
             "update_work_item",
             "create_loop",
             "create_monitor",

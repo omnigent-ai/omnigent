@@ -39,11 +39,14 @@ async def test_create_work_item_posts_body() -> None:
     assert json.loads(out) == {"ok": True}
 
 
-async def test_list_tasks_passes_filters_as_query() -> None:
+async def test_list_work_items_passes_filters_as_query() -> None:
     reqs: list[httpx.Request] = []
     client = _recording_client(reqs)
     await _execute_work_management_tool(
-        "list_tasks", json.dumps({"status": "new"}), conversation_id="conv_1", server_client=client
+        "list_work_items",
+        json.dumps({"status": "new"}),
+        conversation_id="conv_1",
+        server_client=client,
     )
     await client.aclose()
     assert reqs[0].method == "GET"
@@ -116,7 +119,7 @@ async def test_delete_schedule_deletes_by_id() -> None:
 async def test_guards() -> None:
     # No server client → clear error, no crash.
     out = await _execute_work_management_tool(
-        "list_tasks", "{}", conversation_id="c", server_client=None
+        "list_work_items", "{}", conversation_id="c", server_client=None
     )
     assert "requires server access" in out
 
