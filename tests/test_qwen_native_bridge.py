@@ -82,9 +82,7 @@ def test_mcp_launch_env_points_at_per_session_approvals(tmp_path: Path) -> None:
     """The launch env isolates the approvals store inside the bridge dir."""
     bridge_dir = tmp_path / "bridge"
     env = qwen_native_bridge.mcp_launch_env(bridge_dir)
-    assert env == {
-        "QWEN_CODE_MCP_APPROVALS_PATH": str(bridge_dir / "mcpApprovals.json")
-    }
+    assert env == {"QWEN_CODE_MCP_APPROVALS_PATH": str(bridge_dir / "mcpApprovals.json")}
 
 
 def test_approve_mcp_server_runs_qwen_with_workspace_cwd_and_env(
@@ -110,9 +108,7 @@ def test_approve_mcp_server_runs_qwen_with_workspace_cwd_and_env(
     assert calls["cwd"] == str(workspace)
     # The approve must target the SAME isolated store the TUI will read.
     assert isinstance(calls["env"], dict)
-    assert calls["env"]["QWEN_CODE_MCP_APPROVALS_PATH"] == str(
-        bridge_dir / "mcpApprovals.json"
-    )
+    assert calls["env"]["QWEN_CODE_MCP_APPROVALS_PATH"] == str(bridge_dir / "mcpApprovals.json")
 
 
 def test_approve_mcp_server_returns_false_on_failure(
