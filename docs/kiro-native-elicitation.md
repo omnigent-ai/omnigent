@@ -70,6 +70,7 @@ For new records:
 - A response for a still-parked request posts `external_elicitation_resolved`, clears the web card when the Terminal wins, and cancels the parked web-delivery task. Cancelling reliably aborts a verdict still waiting on the web user. If a web verdict is already mid-delivery through tmux, the keystroke worker cannot be interrupted, so the per-keypress focus and title re-validation (above) is what stops it: a verdict whose prompt has changed or vanished fails closed rather than landing on a later prompt.
 - A web verdict delivered through tmux is treated as a delivery attempt; Kiro's matching ACP result remains the internal confirmation that the prompt resolved.
 - Once a prompt is parked, the mirror handles one approval at a time; any further Kiro prompt that arrives while it is pending stays Terminal-only (the authoritative fallback) rather than queuing a second card.
+- The single slot is released as soon as the parked delivery task finishes, not only when a recorder response arrives. A verdict that was delivered, that failed its focus/title checks, or that timed out therefore cannot leave the slot occupied for the rest of the session and silently block every later prompt. A late recorder response for an already-released request finds no parked entry and is ignored.
 
 ## Security Notes
 
