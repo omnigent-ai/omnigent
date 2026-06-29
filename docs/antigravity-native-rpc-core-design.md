@@ -55,7 +55,7 @@ agy still runs in a runner-owned tmux terminal (terminal-first UX preserved). Th
 3. **Read driver** — polls `GetCascadeTrajectorySteps` (or consumes `StreamAgentStateUpdates`) and posts mapped items; dedup by `stepIndex`/step identity. Replaces the transcript-tail forwarder loop.
 4. **Interaction bridge** — on a `WAITING` step, surface an omnigent elicitation (reuse the existing registry / `response.elicitation_request` SSE / `/resolve` / web UI). On resolve, run the **tight detect→deliver loop**: re-read the freshest `WAITING` step, build the `interaction` (`askQuestion` or `permission`), POST `HandleCascadeUserInteraction`; handle timeout/re-ask.
 5. **Executor** — `run_turn` keeps tmux `send-keys` for turns (§7); `interrupt_session` → `CancelCascadeSteps` (real interrupt).
-6. **Reused from #892 unchanged** — onboarding/agy-auth + Gemini provider, harness registration/aliases, the runner-owned terminal infra + auto-create + reattach fixes, the Docker agy-version pin, the ap-web picker/agent card, model catalog/override wiring.
+6. **Reused from #892 unchanged** — onboarding/agy-auth + Gemini provider, harness registration/aliases, the runner-owned terminal infra + auto-create + reattach fixes, the Docker agy-version pin, the web picker/agent card, model catalog/override wiring.
 
 ## 4. Data flows
 
@@ -74,7 +74,7 @@ agy still runs in a runner-owned tmux terminal (terminal-first UX preserved). Th
 
 ## 6. What is reused (from #892)
 
-Onboarding/auth, Gemini provider config, harness registration/aliases, runner-owned terminal + auto-create + the reattach/no-double-forward fixes, the Docker `AGY_EXPECTED_VERSION` pin, the ap-web Antigravity picker/agent card, model catalog/override/effort wiring. The three review fixes already committed on the branch (`1cd8f5aa`, `874f8f5c`, `708ee883`) stay relevant (terminal/launch infra + test hygiene).
+Onboarding/auth, Gemini provider config, harness registration/aliases, runner-owned terminal + auto-create + the reattach/no-double-forward fixes, the Docker `AGY_EXPECTED_VERSION` pin, the web Antigravity picker/agent card, model catalog/override/effort wiring. The three review fixes already committed on the branch (`1cd8f5aa`, `874f8f5c`, `708ee883`) stay relevant (terminal/launch infra + test hygiene).
 
 ## 7. Open questions (resolve in the plan)
 

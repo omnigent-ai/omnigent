@@ -36,33 +36,33 @@ repos:
         types: [python]
         files: ^tests/
 
-      - id: ap-web-prettier
-        name: ap-web prettier
+      - id: web-prettier
+        name: web prettier
         language: system
-        entry: npm --prefix ap-web exec -- prettier --write
-        files: ^ap-web/.*\.(css|html|js|jsx|json|md|mdx|ts|tsx|yaml|yml)$
+        entry: npm --prefix web exec -- prettier --write
+        files: ^web/.*\.(css|html|js|jsx|json|md|mdx|ts|tsx|yaml|yml)$
         # Exclude generated assets: web-ui build output, Xcode asset catalogs,
         # and Apple Icon Composer `.icon` bundles (machine-formatted; prettier
         # fights the tooling).
-        exclude: ^(omnigent/server/static/web-ui/assets/|ap-web/.*\.xcassets/|ap-web/.*\.icon/)
+        exclude: ^(omnigent/server/static/web-ui/assets/|web/.*\.xcassets/|web/.*\.icon/)
 
       # iOS Swift formatting + linting via Apple's `swift format` (config:
-      # ap-web/ios/.swift-format). The wrapper no-ops when the Swift toolchain
+      # web/ios/.swift-format). The wrapper no-ops when the Swift toolchain
       # is absent, so these run on macOS dev machines but skip the ubuntu-latest
       # CI pre-commit job — there is no Swift there. Enforcement is local.
-      - id: ap-web-ios-swift-format
-        name: ap-web ios swift-format
+      - id: web-ios-swift-format
+        name: web ios swift-format
         language: system
-        entry: ap-web/ios/bin/swift-format.sh format --in-place --parallel
-        files: ^ap-web/ios/.*\.swift$
-        exclude: ^ap-web/ios/(build|vendor)/
+        entry: web/ios/bin/swift-format.sh format --in-place --parallel
+        files: ^web/ios/.*\.swift$
+        exclude: ^web/ios/(build|vendor)/
 
-      - id: ap-web-ios-swift-lint
-        name: ap-web ios swift format lint
+      - id: web-ios-swift-lint
+        name: web ios swift format lint
         language: system
-        entry: ap-web/ios/bin/swift-format.sh format lint --strict --parallel
-        files: ^ap-web/ios/.*\.swift$
-        exclude: ^ap-web/ios/(build|vendor)/
+        entry: web/ios/bin/swift-format.sh format lint --strict --parallel
+        files: ^web/ios/.*\.swift$
+        exclude: ^web/ios/(build|vendor)/
 
       # Local `uv` runs rewrite uv.lock's registry to whatever index is
       # configured on the developer's machine (e.g. the Databricks PyPI

@@ -66,7 +66,7 @@ _PTY_READ_CHUNK: Final[int] = 4096
 # Default per-frame cap: merge queued PTY chunks into bounded sends so
 # huge bursts stream.
 _WS_COALESCE_MAX_BYTES: Final[int] = 64 * 1024
-# Keep these in sync with ap-web's SYNC_ECHO_* constants so the server
+# Keep these in sync with web's SYNC_ECHO_* constants so the server
 # emits frames the browser is still willing to write synchronously after
 # input.
 _INTERACTIVE_WS_COALESCE_MAX_BYTES: Final[int] = 2048
@@ -146,7 +146,7 @@ class _SpawnedPty:
 
 
 # Terminal type advertised to tmux for the attach client. The far end
-# of this bridge is always an xterm.js-compatible emulator (the ap-web
+# of this bridge is always an xterm.js-compatible emulator (the web
 # terminal or the REPL's embedded terminal), never the bridging
 # process's own controlling terminal — so its capabilities, not the
 # ambient ``TERM``, describe the client. Inheriting ambient ``TERM``

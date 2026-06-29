@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.metadata
 import io
 import json
 import os
-import sys
-import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,10 +133,16 @@ def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) ->
     (``--mcp-config`` / ``--settings``) survives intact in the passed-through
     argv.
     """
-    launcher_mod = types.ModuleType("fake_isaac_launcher")
-    launcher_mod.launch = lambda command, args: ("isaac", ["--", *args])
-    monkeypatch.setitem(sys.modules, "fake_isaac_launcher", launcher_mod)
-    monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "fake_isaac_launcher:launch")
+
+    from omnigent.claude_launcher import ClaudeLauncher
+
+    class _IsaacLauncher(ClaudeLauncher):
+        def launch(self, command, args):
+            return "isaac", ["--", *args]
+
+    entry_point = SimpleNamespace(name="isaac", load=lambda: _IsaacLauncher)
+    monkeypatch.setattr(importlib.metadata, "entry_points", lambda *, group: [entry_point])
+    monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "isaac")
     monkeypatch.chdir(tmp_path)
     body = claude_native._claude_terminal_request(
         ("--resume", "s"),
@@ -1992,7 +1997,7 @@ async def test_create_claude_session_omits_title_for_generic_seed_path() -> None
     user message. The sidebar fills the create-to-first-message gap
     by rendering a default label off the
     ``omnigent.wrapper = claude-code-native-ui`` label
-    (see ``ap-web/src/shell/sidebarNav.ts::conversationDisplayLabel``).
+    (see ``web/src/shell/sidebarNav.ts::conversationDisplayLabel``).
     The labels must still reach the server unchanged because that
     sidebar fallback keys off the wrapper label.
     """
@@ -6086,3 +6091,71 @@ class _capture_warnings:
         self._logger.removeHandler(self._handler)
         self._logger.setLevel(self._prev_level)
         return False
+
+
+def test_claude_transcript_records_handles_compaction_item() -> None:
+    """Compaction items replace prior records with compacted_messages."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "msg_2",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi there"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "cmp_1",
+            "type": "compaction",
+            "summary": "compaction summary",
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "compacted reply"}],
+                },
+            ],
+            "response_id": "compact_1",
+        },
+        {
+            "id": "msg_3",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "after compaction"}],
+            "response_id": "resp_2",
+        },
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+    )
+    types = [r.get("type") for r in records]
+    # Should have compacted user + assistant + post-compaction user
+    assert "user" in types
+    assert "assistant" in types
+    # Pre-compaction "hi there" should be gone, replaced by "compacted reply"
+    all_text = " ".join(
+        str(r.get("message", {}).get("content", ""))
+        for r in records
+        if r.get("type") == "assistant"
+    )
+    assert "compacted reply" in all_text
+    assert "hi there" not in all_text
+    # Post-compaction message should be present
+    user_texts = [
+        str(r.get("message", {}).get("content", "")) for r in records if r.get("type") == "user"
+    ]
+    assert any("after compaction" in t for t in user_texts)

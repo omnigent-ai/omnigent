@@ -2566,13 +2566,25 @@ def _find_spec_by_name(
     when the parent is a coordinator). To keep that fallback safe, the
     researcher is reconstructed deterministically from the parent (the
     same pure builder ``WebFetchTool`` uses) instead of returning ``None``,
-    but only when the parent actually declares the ``web_fetch`` builtin.
-    That builtin is the sole reason the researcher ever exists, so a parent
-    without it has no such child and the name falls through to normal
-    resolution (``None``). Reconstructing unconditionally would let a
+    but only when some node in the tree actually declares the ``web_fetch``
+    builtin. That builtin is the sole reason the researcher ever exists, so a
+    tree without it anywhere has no such child and the name falls through to
+    normal resolution (``None``). Reconstructing unconditionally would let a
     caller-controlled ``sub_agent_name`` coerce any parent into a
     shell-capable researcher (``build_researcher_spec`` synthesizes an
     ``OSEnvSpec``), widening the parent's tool boundary.
+
+    The owning node need not be the root: a nested sub-agent may own
+    ``web_fetch`` while the handed-in root does not. The gate locates the
+    ``web_fetch`` owner via a root-first pre-order walk
+    (:func:`_find_web_fetch_owner`) and reconstructs from THAT owner, not the
+    root, so the researcher inherits the owner's LLM and sandbox/egress
+    boundary (``build_researcher_spec`` derives both from its argument). When
+    several nodes own ``web_fetch`` the first pre-order owner wins; this is a
+    deliberate limitation tied to the ``__web_researcher`` name not being
+    unique per owner (plumbing an "effective parent" through every call site
+    is out of scope). The root-owner case is unchanged: the owner is the
+    root, so the output is identical to before.
 
     :param spec: The root agent spec to search.
     :param name: The sub-agent name to find,
@@ -2584,18 +2596,43 @@ def _find_spec_by_name(
     found = _search_sub_agent_tree(spec, name)
     if found is not None:
         return found
-    # Built-in web_fetch researcher: derived from the parent, never
-    # persisted in the bundle, so reconstruct it on a resolve-miss rather
-    # than letting callers fall back to the parent spec. Gated on the parent
+    # Built-in web_fetch researcher: derived from its owner, never persisted
+    # in the bundle, so reconstruct it on a resolve-miss rather than letting
+    # callers fall back to the parent spec. Gated on some node in the tree
     # declaring the ``web_fetch`` builtin, the only reason the researcher
-    # exists (``WebFetchTool.__init__`` appends it). Imported lazily to keep
-    # the tools layer off this module's import path.
+    # exists (``WebFetchTool.__init__`` appends it). The owner may be nested,
+    # so reconstruct from the owner (root-first pre-order) — never the root —
+    # to inherit the owner's LLM and sandbox/egress boundary. Imported lazily
+    # to keep the tools layer off this module's import path.
     from omnigent.tools.builtins.web_fetch import RESEARCHER_NAME
 
-    if name == RESEARCHER_NAME and any(entry.name == "web_fetch" for entry in spec.tools.builtins):
-        from omnigent.tools.builtins.web_fetch import build_researcher_spec
+    if name == RESEARCHER_NAME:
+        owner = _find_web_fetch_owner(spec)
+        if owner is not None:
+            from omnigent.tools.builtins.web_fetch import build_researcher_spec
 
-        return build_researcher_spec(spec)
+            return build_researcher_spec(owner)
+    return None
+
+
+def _find_web_fetch_owner(spec: AgentSpec) -> AgentSpec | None:
+    """
+    Find the first node owning the ``web_fetch`` builtin, root-first.
+
+    Pre-order DFS (root, then children left-to-right), mirroring
+    :func:`_search_sub_agent_tree`. The ``web_fetch`` owner is the node whose
+    ``tools.builtins`` carries an entry named ``web_fetch``; that node's spec
+    is the correct parent for ``build_researcher_spec`` (its LLM + sandbox).
+
+    :param spec: The agent spec whose sub-tree to search.
+    :returns: The first node (root-first) owning ``web_fetch``, or ``None``.
+    """
+    if any(entry.name == "web_fetch" for entry in spec.tools.builtins):
+        return spec
+    for sa in spec.sub_agents:
+        owner = _find_web_fetch_owner(sa)
+        if owner is not None:
+            return owner
     return None
 
 

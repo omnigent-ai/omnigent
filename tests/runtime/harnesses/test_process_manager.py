@@ -40,6 +40,7 @@ from omnigent.runtime.harnesses.process_manager import (
     _AP_PID_FILE,
     _TMP_PARENT_ENV_VAR,
     HarnessProcessManager,
+    NoLiveHarnessError,
     _pid_alive,
     _pids_holding_socket,
 )
@@ -423,6 +424,24 @@ async def test_get_client_any_harness_sentinel_reuses_subprocess(
         # spuriously tripped the harness-change branch (the bug this guards).
         assert pid_any == pid_first
         assert _pid_alive(pid_first)
+    finally:
+        await manager.shutdown()
+
+
+async def test_get_client_any_harness_sentinel_no_subprocess_raises(
+    manager: HarnessProcessManager,
+) -> None:
+    """``get_client(conv, "any")`` raises ``NoLiveHarnessError`` when no
+    subprocess is live.
+
+    Before the fix, this fell through to ``_spawn_entry("any", ...)``
+    which called ``_resolve_module_path("any")`` and raised the misleading
+    ``RuntimeError: unknown harness 'any'; registered names: [...]``.
+    """
+    await manager.start()
+    try:
+        with pytest.raises(NoLiveHarnessError, match="no live harness subprocess"):
+            await manager.get_client("conv_never_spawned", "any")
     finally:
         await manager.shutdown()
 

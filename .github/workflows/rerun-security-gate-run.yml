@@ -134,12 +134,12 @@ jobs:
           # `labeled` trigger is in-progress/green and skipped -- no double-run.
           WORKFLOWS=(
             "Lint" "CI" "E2E Tests" "E2E UI Tests" "Integration Tests"
-            "ap-web Tests" "Polly AI Review"
+            "web Tests" "Polly AI Review"
           )
 
           for wf in "${WORKFLOWS[@]}"; do
             # Reset per iteration: `read` leaves these UNTOUCHED on EOF (a
-            # workflow with no run for this SHA -- e.g. path-filtered ap-web
+            # workflow with no run for this SHA -- e.g. path-filtered web
             # Tests), which would otherwise carry over the previous workflow's
             # run id/conclusion and re-run the wrong run.
             id=""; conclusion=""

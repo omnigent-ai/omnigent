@@ -9,7 +9,7 @@ errors) lands in follow-up tests once stable selectors are in place.
 Selectors are accessibility-first where they're stable: the textarea
 is found by its placeholder, the Send button by its accessible name
 (a hidden ``<span class="sr-only">Send</span>`` per
-``ap-web/src/pages/ChatPage.tsx``). Real message bubbles use
+``web/src/pages/ChatPage.tsx``). Real message bubbles use
 ``data-testid="message-bubble"`` + ``data-role={user|assistant}``.
 Without the testid we can't distinguish the streaming "Working…"
 shimmer (also rendered as ``<Message from="assistant">``) from a
@@ -42,7 +42,7 @@ def test_send_message_renders_assistant_response(
       hello_world model unavailable).
     - The SDK reducer didn't render output (TS reducer parity drift
       vs ``omnigent_client/_stream.py`` — see
-      ``ap-web/README.md`` § Reducer parity).
+      ``web/README.md`` § Reducer parity).
 
     Starts from ``/c/<id>`` rather than ``/`` because the home route
     no longer renders a composer — see :func:`seeded_session`.

@@ -140,6 +140,10 @@ _SPAWN_POLL_INTERVAL_S = 0.05
 _ORPHAN_SIGTERM_GRACE_S = 3.0
 
 
+class NoLiveHarnessError(RuntimeError):
+    """Raised when ``get_client`` is called with ``harness="any"`` and no subprocess is live."""
+
+
 def _default_tmp_parent() -> Path:
     """
     Resolve the deployment-level parent for harness Unix sockets.
@@ -684,6 +688,10 @@ class HarnessProcessManager:
                     await self._close_entry(entry)
                     entry = None
             if entry is None:
+                if harness == "any":
+                    raise NoLiveHarnessError(
+                        f"no live harness subprocess for conversation {conversation_id!r}"
+                    )
                 entry = await self._spawn_entry(conversation_id, harness, env)
                 self._entries[conversation_id] = entry
             # Use ``time.monotonic()`` directly rather than

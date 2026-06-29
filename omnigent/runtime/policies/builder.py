@@ -23,6 +23,7 @@ import cachetools
 
 from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms.context_window import fetch_model_pricing
 from omnigent.policies.base import Policy
 from omnigent.policies.function import resolve_function_policy
@@ -48,6 +49,11 @@ from omnigent.stores.policy_store import PolicyStore
 # are skipped entirely, so sessions/deployments that don't use it pay
 # nothing extra per evaluation.
 _USER_DAILY_COST_POLICY_PATH = "omnigent.policies.builtins.cost.user_daily_cost_budget"
+
+# Dotted path of the per-subagent cost-budget factory. The engine is
+# seeded with the subtree-scoped usage ONLY when a policy set includes
+# this handler — otherwise the subtree usage lookup is skipped.
+_SUBAGENT_COST_POLICY_PATH = "omnigent.policies.builtins.cost.subagent_cost_budget"
 
 # Hardcoded policy that always ASKs before sys_add_policy executes.
 # Injected unconditionally into every engine so agents cannot add
@@ -88,6 +94,66 @@ def _needs_user_daily_cost(specs: list[PolicySpec]) -> bool:
         and s.function.path == _USER_DAILY_COST_POLICY_PATH
         for s in specs
     )
+
+
+def _needs_subtree_usage(specs: list[PolicySpec]) -> bool:
+    """
+    Return whether any policy in *specs* is the per-subagent cost-budget.
+
+    Drives the conditional injection: only when this returns ``True``
+    does :func:`build_policy_engine` compute the subtree usage seed.
+
+    :param specs: The merged policy specs for the engine.
+    :returns: ``True`` when a :class:`FunctionPolicySpec` references the
+        ``subagent_cost_budget`` factory.
+    """
+    return any(
+        isinstance(s, FunctionPolicySpec)
+        and s.function is not None
+        and s.function.path == _SUBAGENT_COST_POLICY_PATH
+        for s in specs
+    )
+
+
+def _normalize_usage_for_engine(usage: dict[str, float]) -> dict[str, float]:
+    """
+    Normalize a usage dict for injection into the policy engine.
+
+    Removes display-only fields (``by_model``) and converts the
+    enforcement-cost field (``policy_cost_usd``) to the engine's
+    canonical ``total_cost_usd`` key. Both operations are idempotent:
+    if a field is absent, the operation is a no-op.
+
+    :param usage: The usage dict to normalize (modified in-place).
+    :returns: The normalized dict (same object, for chaining).
+    """
+    usage.pop("by_model", None)
+    policy_cost = usage.pop("policy_cost_usd", None)
+    if policy_cost is not None:
+        usage["total_cost_usd"] = policy_cost
+    return usage
+
+
+def _subtree_usage_seed(
+    conversation_id: str,
+    conversation_store: ConversationStore,
+) -> dict[str, float]:
+    """
+    SUBTREE-scoped usage seed for the per-subagent cost budget.
+
+    Unlike :func:`_policy_usage_seed` (which seeds from the whole session
+    tree via ``root_conversation_id``), this seeds from ``conversation_id``
+    itself — so the budget gates on this conversation's own subtree cost
+    (itself + its descendants), not the whole session.
+
+    :param conversation_id: Conversation to seed the subtree usage for,
+        e.g. ``"conv_child"``.
+    :param conversation_store: Store to read the subtree usage from.
+    :returns: Subtree usage seed dict; when an enforcement cost exists its
+        ``total_cost_usd`` is the enforcement total.
+    """
+    usage = load_session_usage(conversation_id, conversation_store)
+    return _normalize_usage_for_engine(usage)
 
 
 def _resolve_session_owner_cached(
@@ -271,6 +337,13 @@ def build_policy_engine(
     # not just its own subtree. The cost read is the enforcement total
     # (in-flight sub-agent spend); see _policy_usage_seed.
     initial_usage = _policy_usage_seed(conversation_id, conversation_store)
+    # Conditional injection (#1a): only compute subtree usage when a
+    # subagent_cost_budget policy is present.
+    initial_subtree_usage = (
+        _subtree_usage_seed(conversation_id, conversation_store)
+        if _needs_subtree_usage(all_policy_specs)
+        else None
+    )
     # Conditional injection (#1): only pay the owner + daily-cost lookups
     # when a per-user daily cost-budget policy is actually present.
     initial_user_daily_cost = (
@@ -307,6 +380,7 @@ def build_policy_engine(
         initial_labels=initial_labels,
         initial_session_state=initial_session_state,
         initial_usage=initial_usage,
+        initial_subtree_usage=initial_subtree_usage,
         initial_user_daily_cost=initial_user_daily_cost,
         token_pricing=token_pricing,
         initial_model=initial_model,
@@ -764,13 +838,7 @@ def _policy_usage_seed(
     if conv is None:
         return {}
     usage = load_session_usage(conv.root_conversation_id, conversation_store)
-    # ``by_model`` is a display-only breakdown; drop it so the engine's usage
-    # context carries only the flat numeric counters the gate reads.
-    usage.pop("by_model", None)
-    policy_cost = usage.pop("policy_cost_usd", None)
-    if policy_cost is not None:
-        usage["total_cost_usd"] = policy_cost
-    return usage
+    return _normalize_usage_for_engine(usage)
 
 
 def _load_tree_conversations(
@@ -853,9 +921,10 @@ def _load_session_policy_specs(
     Load enabled session policies from the store and convert
     them to :class:`FunctionPolicySpec` instances.
 
-    Only ``type="python"`` policies are instantiable today.
-    ``type="url"`` policies are skipped silently
-    (URL policy evaluation is a future extension).
+    Only ``type="python"`` policies are instantiable today. An
+    enabled policy of an unsupported type (e.g. ``type="url"``)
+    raises :class:`OmnigentError` rather than being skipped, so a
+    stored guardrail that never enforces fails loudly.
 
     :param conversation_id: The session whose policies to load,
         e.g. ``"conv_abc123"``.
@@ -863,6 +932,8 @@ def _load_session_policy_specs(
         ``None`` returns an empty list.
     :returns: List of :class:`FunctionPolicySpec` for enabled
         session policies, in ``created_at ASC`` order.
+    :raises OmnigentError: If an enabled policy has an unsupported
+        ``type`` (e.g. ``type="url"``).
     """
     if policy_store is None:
         return []
@@ -871,13 +942,11 @@ def _load_session_policy_specs(
     for policy in stored:
         if not policy.enabled:
             continue
-        converted = _stored_policy_to_spec(policy)
-        if converted is not None:
-            specs.append(converted)
+        specs.append(_stored_policy_to_spec(policy))
     return specs
 
 
-def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec | None:
+def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec:
     """
     Convert a stored :class:`Policy` entity to a
     :class:`FunctionPolicySpec`.
@@ -888,12 +957,15 @@ def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec | None:
     all phases (``on=None``) — the callable itself decides
     whether to act by inspecting ``event["type"]``.
 
-    For ``type="url"``, returns ``None`` (URL policy evaluation
-    is a future extension).
+    For ``type="url"``, raises :class:`OmnigentError` (URL policy evaluation
+    is unimplemented). A stored policy that never enforces is a silent
+    safety hole, so converting an unsupported type fails loudly rather than
+    returning ``None``.
 
     :param policy: The stored session policy entity.
-    :returns: A :class:`FunctionPolicySpec`, or ``None`` if the
-        policy type is not yet supported at evaluation time.
+    :returns: A :class:`FunctionPolicySpec`.
+    :raises OmnigentError: If the policy ``type`` cannot be evaluated yet
+        (e.g. ``type="url"``).
     """
     if policy.type == "python":
         return FunctionPolicySpec(
@@ -906,8 +978,16 @@ def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec | None:
                 arguments=policy.factory_params,
             ),
         )
-    # type="url" — future extension; skip silently.
-    return None
+    # Any non-"python" type (today only "url") cannot be evaluated yet.
+    # Reject loudly and fail closed: a stored policy that silently never
+    # enforces is worse than a visible failure the operator can act on.
+    raise OmnigentError(
+        f"Session policy {policy.name!r} (id {policy.id!r}) has unsupported "
+        f"type {policy.type!r}; only type='python' policies can be evaluated "
+        f"today. URL policy evaluation is a future extension. Remove or "
+        f"disable this policy, since storing it does not enforce anything.",
+        code=ErrorCode.INVALID_INPUT,
+    )
 
 
 __all__ = ["build_policy_engine"]

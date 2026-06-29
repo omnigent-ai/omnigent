@@ -1039,9 +1039,9 @@ def test_client_server_attachment_extension_parity() -> None:
         attachment_upload_limit,
     )
 
-    ts_path = Path(__file__).resolve().parents[2] / "ap-web" / "src" / "lib" / "attachments.ts"
+    ts_path = Path(__file__).resolve().parents[2] / "web" / "src" / "lib" / "attachments.ts"
     if not ts_path.exists():
-        pytest.skip("ap-web/src/lib/attachments.ts not present (server-only checkout)")
+        pytest.skip("web/src/lib/attachments.ts not present (server-only checkout)")
     block = ts_path.read_text().split("TEXT_CODE_EXTENSIONS = new Set([")[1].split("]")[0]
     client_exts = re.findall(r'"(\.[a-z0-9]+)"', block)
     assert client_exts, "could not parse client TEXT_CODE_EXTENSIONS"

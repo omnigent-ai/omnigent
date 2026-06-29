@@ -1355,3 +1355,178 @@ async def test_persist_codex_compaction_item_empty_items_fallback() -> None:
     body = kwargs["json"]
     assert body["data"]["last_item_id"].startswith("compact_boundary_")
     assert "compacted_messages" not in body["data"]
+
+
+def test_read_compacted_history_extracts_replacement_history_and_window_id(
+    tmp_path: Path,
+) -> None:
+    """_read_compacted_history returns replacement_history and window_id."""
+    import json as _json
+
+    rollout = tmp_path / "rollout.jsonl"
+    lines = [
+        _json.dumps({"type": "session_meta", "payload": {"id": "abc"}}),
+        _json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user"}}),
+        _json.dumps(
+            {
+                "type": "compacted",
+                "payload": {
+                    "message": "summary",
+                    "replacement_history": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "hi"}],
+                        },
+                        {
+                            "type": "compaction",
+                            "encrypted_content": "gAAAA_test_token",
+                        },
+                    ],
+                    "window_id": 2,
+                },
+            }
+        ),
+    ]
+    rollout.write_text("\n".join(lines) + "\n")
+
+    result = fwd._read_compacted_history(rollout)
+
+    assert result is not None
+    assert result["window_id"] == 2
+    assert len(result["replacement_history"]) == 2
+    assert result["replacement_history"][0]["type"] == "message"
+    assert result["replacement_history"][0]["role"] == "user"
+    assert result["replacement_history"][1]["type"] == "compaction"
+    assert result["replacement_history"][1]["encrypted_content"] == "gAAAA_test_token"
+
+
+def test_read_compacted_history_returns_none_for_no_compacted_entry(
+    tmp_path: Path,
+) -> None:
+    """_read_compacted_history returns None when no Compacted entry exists."""
+    import json as _json
+
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(_json.dumps({"type": "session_meta", "payload": {"id": "abc"}}) + "\n")
+
+    assert fwd._read_compacted_history(rollout) is None
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_dead_letters_durable_event_on_permanent_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A permanently-failed durable event is dead-lettered to disk (#1120).
+
+    Drives ``_post_session_event`` (the health-tracking wrapper) with a stubbed
+    inner that returns an HTTP 500, and asserts the dropped
+    ``external_conversation_item`` payload is appended to
+    ``{bridge_dir}/dead_letter.jsonl``.
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    import json as _json
+
+    fwd._reset_forward_health()
+
+    async def _failing_inner(client, session_id, *, event_type, data):
+        return httpx.Response(500, request=httpx.Request("POST", "http://test"))
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _failing_inner)
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        data = {"item_type": "message", "item_data": {"role": "assistant"}}
+        await fwd._post_session_event(
+            MagicMock(),
+            "conv_codex1",
+            event_type="external_conversation_item",
+            data=data,
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    dl_path = tmp_path / "dead_letter.jsonl"
+    lines = dl_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = _json.loads(lines[0])
+    assert record["session_id"] == "conv_codex1"
+    assert record["event_type"] == "external_conversation_item"
+    assert record["payload"] == data
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_does_not_dead_letter_ephemeral_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An ephemeral (non-durable) event is NOT dead-lettered on failure (#1120).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    fwd._reset_forward_health()
+
+    async def _failing_inner(client, session_id, *, event_type, data):
+        return httpx.Response(500, request=httpx.Request("POST", "http://test"))
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _failing_inner)
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        await fwd._post_session_event(
+            MagicMock(),
+            "conv_codex1",
+            event_type="external_output_text_delta",
+            data={"delta": "hi"},
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    assert not (tmp_path / "dead_letter.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_dead_letters_usage_on_permanent_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A permanently-failed ``external_session_usage`` event is dead-lettered (#1120).
+
+    Usage is the other durable type alongside conversation items, so its
+    transcript/usage data must also be recoverable on a sustained outage.
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    import json as _json
+
+    fwd._reset_forward_health()
+
+    async def _failing_inner(client, session_id, *, event_type, data):
+        return httpx.Response(500, request=httpx.Request("POST", "http://test"))
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _failing_inner)
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        data = {"context_tokens": 1234, "model": "databricks-claude-opus-4-7"}
+        await fwd._post_session_event(
+            MagicMock(),
+            "conv_codex_usage",
+            event_type="external_session_usage",
+            data=data,
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    dl_path = tmp_path / "dead_letter.jsonl"
+    lines = dl_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = _json.loads(lines[0])
+    assert record["session_id"] == "conv_codex_usage"
+    assert record["event_type"] == "external_session_usage"
+    assert record["payload"] == data

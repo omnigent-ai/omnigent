@@ -5,7 +5,7 @@ cursor-native is terminal-first and never emits a turn lifecycle event
 turn to anchor to and rendered ABOVE the message that triggered it in the LIVE
 stream — correct only after a page reload. This drives the real browser: send a
 gated command through the web composer, wait for the ``ApprovalCard``
-(``ap-web/src/components/blocks/ApprovalCard.tsx``), and assert it sits below
+(``web/src/components/blocks/ApprovalCard.tsx``), and assert it sits below
 the user message, matching the reload layout. The regression guard for the
 blockStream "standalone bubble for a no-active-turn elicitation" +
 ``reorderCommittedRequestElicitations`` fix.
