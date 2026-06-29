@@ -396,8 +396,8 @@
       "capabilities": {
         "function_calling": true,
         "vision": false,
-        "reasoning": false,
-        "prompt_caching": false,
+        "reasoning": true,
+        "prompt_caching": true,
         "response_schema": true
       }
     },
