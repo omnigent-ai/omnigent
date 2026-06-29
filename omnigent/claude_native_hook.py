@@ -33,6 +33,7 @@ from omnigent.native_policy_hook import (
     evaluation_response_to_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
+    policy_hook_reauth,
     post_evaluate_with_retry,
 )
 
@@ -516,52 +517,6 @@ def _conversation_url_for_active_session(
     return fallback_url
 
 
-def _build_reauth(
-    ap_server_url: str, headers: dict[str, str]
-) -> Callable[[], dict[str, str] | None]:
-    """
-    Build a callable that re-mints the Omnigent bearer for ``ap_server_url``.
-
-    The native hooks authenticate with a one-shot ``ap_auth_headers`` snapshot
-    written into ``permission_hook.json`` at launch (``build_hook_settings``),
-    which dies with the ~1h Databricks OAuth token lifetime. When the Apps front
-    door later bounces a hook POST to its OAuth login flow (302→``/oidc/``) or
-    returns ``401``, this callable re-mints a fresh bearer through the SAME
-    factory the runner's refresh-capable ``_RunnerDatabricksAuth`` uses
-    (:func:`omnigent.runner._entry._make_auth_token_factory`), preserving the
-    other headers (e.g. the ``X-Databricks-Org-Id`` workspace-routing header)
-    so neither half is dropped. Best-effort: returns ``None`` when no refresh
-    mechanism is available (local unauthenticated servers, import failure, or a
-    transient mint failure), letting the caller fail closed.
-
-    :param ap_server_url: Omnigent server base URL the hook POSTs to — also the
-        key the token factory uses to resolve the stored OIDC token.
-    :param headers: The current (lapsed) outbound headers; the fresh bearer is
-        merged over a copy so routing headers survive.
-    :returns: A zero-arg callable returning fresh headers, or ``None``.
-    """
-
-    def _reauth() -> dict[str, str] | None:
-        # Lazy import: only paid on the rare re-auth path, keeping the
-        # per-tool-call hot path free of the runner/databricks-SDK import.
-        try:
-            from omnigent.runner._entry import _make_auth_token_factory
-        except Exception:  # noqa: BLE001 — re-auth is best-effort; fail closed if unavailable
-            return None
-        factory = _make_auth_token_factory(ap_server_url)
-        if factory is None:
-            return None
-        try:
-            token = factory()
-        except Exception:  # noqa: BLE001 — transient SDK/refresh failure; fail closed
-            return None
-        if not token:
-            return None
-        return {**headers, "Authorization": f"Bearer {token}"}
-
-    return _reauth
-
-
 def _post_hook_with_reattach(
     url: str,
     headers: dict[str, str],
@@ -695,7 +650,11 @@ def _main_permission_request(argv: list[str]) -> int:
         f"{url_component(session_id)}/hooks/permission-request"
     )
     resp = _post_hook_with_reattach(
-        url, headers, payload, "claude permission", reauth=_build_reauth(ap_server_url, headers)
+        url,
+        headers,
+        payload,
+        "claude permission",
+        reauth=policy_hook_reauth(ap_server_url, headers),
     )
     if resp is None:
         return 0
@@ -763,7 +722,11 @@ def _main_ask_user_question(argv: list[str]) -> int:
         f"{url_component(session_id)}/hooks/permission-request"
     )
     resp = _post_hook_with_reattach(
-        url, headers, payload, "ask-user-question", reauth=_build_reauth(ap_server_url, headers)
+        url,
+        headers,
+        payload,
+        "ask-user-question",
+        reauth=policy_hook_reauth(ap_server_url, headers),
     )
     if resp is None or not resp.content:
         return 0
@@ -915,7 +878,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         eval_request,
         _EVALUATE_POLICY_TIMEOUT_S,
         "evaluate-policy hook",
-        reauth=_build_reauth(ap_server_url, headers),
+        reauth=policy_hook_reauth(ap_server_url, headers),
     )
     if resp is None:
         return _fail_closed()

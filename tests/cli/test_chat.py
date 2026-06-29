@@ -2874,7 +2874,7 @@ def test_databricks_token_auth_sets_org_header(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
     monkeypatch.setattr(
-        "omnigent.cli_auth.databricks_org_id_headers",
+        "omnigent.cli_auth.databricks_request_headers",
         lambda _url: {"X-Databricks-Org-Id": "2850744067564480"},
     )
     # Isolate from real Databricks SDK resolution: the bearer is irrelevant

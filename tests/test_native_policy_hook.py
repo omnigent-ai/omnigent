@@ -528,3 +528,134 @@ def test_post_evaluate_with_retry_reauth_unavailable_fails_closed(
     )
     assert resp is None
     assert len(seen_headers) == 1  # one attempt only; no retry loop
+
+
+# ── shared policy-hook header plumbing (writer + reader) ─────────────
+
+
+def test_policy_hook_request_headers_merges_baked_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reader merges the executor-baked auth + routing headers.
+
+    The import-free hook subprocess can't resolve credentials in-process, so
+    the executor bakes them into ``_OMNIGENT_AUTH_HEADERS``; the reader must
+    fold them onto ``Content-Type`` for the policy POST.
+    """
+    monkeypatch.setenv(
+        "_OMNIGENT_AUTH_HEADERS",
+        '{"Authorization": "Bearer tok", "X-Databricks-Org-Id": "org123"}',
+    )
+    assert native_policy_hook.policy_hook_request_headers() == {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer tok",
+        "X-Databricks-Org-Id": "org123",
+    }
+
+
+@pytest.mark.parametrize("raw", ["", "not json", "[1,2]"])
+def test_policy_hook_request_headers_tolerates_missing_or_bad_env(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Absent / malformed env → just ``Content-Type`` (local-unauth path).
+
+    A bad value must not crash the hook nor inject garbage headers — the
+    server simply decides without auth (a local unauthenticated server needs
+    none).
+    """
+    if raw:
+        monkeypatch.setenv("_OMNIGENT_AUTH_HEADERS", raw)
+    else:
+        monkeypatch.delenv("_OMNIGENT_AUTH_HEADERS", raising=False)
+    assert native_policy_hook.policy_hook_request_headers() == {"Content-Type": "application/json"}
+
+
+def test_policy_hook_wrapper_script_bakes_auth_and_routing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The writer bakes bearer + routing into the wrapper via the one builder.
+
+    A new harness wiring up its hook through this helper gets auth AND
+    workspace routing for free — the gap that left the cursor/hermes hooks
+    posting unauthenticated and unrouted.
+    """
+    import omnigent.cli_auth as cli_auth
+    import omnigent.runner._entry as entry
+
+    monkeypatch.setattr(
+        entry, "_make_auth_token_factory", lambda *, server_url=None: lambda: "tok"
+    )
+    monkeypatch.setattr(cli_auth, "load_databricks_org_id", lambda _url: "org123")
+
+    script = native_policy_hook.policy_hook_wrapper_script(
+        "https://acme.databricks.com/api/2.0/omnigent", "conv_x", "/path/hook.py"
+    )
+
+    assert script.startswith("#!/bin/sh\n")
+    assert "_OMNIGENT_SERVER_URL=https://acme.databricks.com/api/2.0/omnigent" in script
+    assert "_OMNIGENT_SESSION_ID=conv_x" in script
+    # The baked headers carry BOTH the bearer and the routing header.
+    line = next(
+        ln for ln in script.splitlines() if ln.startswith("export _OMNIGENT_AUTH_HEADERS=")
+    )
+    assert "Bearer tok" in line
+    assert "X-Databricks-Org-Id" in line and "org123" in line
+
+
+def test_policy_hook_wrapper_script_omits_auth_when_unauthenticated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No token + no recorded selector → empty auth dict (local-unauth runs).
+
+    The wrapper still exports the (empty) header dict, so the reader yields
+    just ``Content-Type`` — non-workspace callers are unaffected.
+    """
+    import omnigent.cli_auth as cli_auth
+    import omnigent.runner._entry as entry
+
+    monkeypatch.setattr(entry, "_make_auth_token_factory", lambda *, server_url=None: None)
+    monkeypatch.setattr(cli_auth, "load_databricks_org_id", lambda _url: None)
+
+    script = native_policy_hook.policy_hook_wrapper_script(
+        "http://127.0.0.1:6767", "conv_local", "/path/hook.py"
+    )
+    line = next(
+        ln for ln in script.splitlines() if ln.startswith("export _OMNIGENT_AUTH_HEADERS=")
+    )
+    assert "Bearer" not in line
+    assert "X-Databricks-Org-Id" not in line
+
+
+def test_policy_hook_reauth_remints_and_preserves_routing_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared reauth re-mints the bearer and keeps the routing header.
+
+    When a baked one-shot token lapses, the four hooks (codex/kimi/cursor/
+    hermes) that wire this builder must mint a fresh bearer through the same
+    factory the refresh-capable runtime auth uses — without dropping the
+    workspace-routing header that travels alongside it.
+    """
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda _server_url: lambda: "fresh-token",
+    )
+    reauth = native_policy_hook.policy_hook_reauth(
+        "https://acme.databricks.com/api/2.0/omnigent",
+        {"Authorization": "Bearer stale", "X-Databricks-Org-Id": "o9"},
+    )
+    assert reauth() == {"Authorization": "Bearer fresh-token", "X-Databricks-Org-Id": "o9"}
+
+
+def test_policy_hook_reauth_returns_none_without_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No refresh mechanism (local/unauth) → ``None`` so the caller fails closed."""
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda _server_url: None,
+    )
+    reauth = native_policy_hook.policy_hook_reauth(
+        "http://127.0.0.1:6767", {"Content-Type": "application/json"}
+    )
+    assert reauth() is None

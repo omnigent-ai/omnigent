@@ -1879,47 +1879,6 @@ def test_evaluate_policy_retries_5xx_and_succeeds(
     assert call_count == 3
 
 
-def test_build_reauth_remints_and_preserves_routing_header(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    ``_build_reauth`` re-mints the bearer and keeps the routing header.
-
-    The fresh token must be merged OVER the existing headers so the
-    ``X-Databricks-Org-Id`` workspace-routing header (which the Apps server
-    needs to avoid a 403 reroute to the account) is preserved, not dropped.
-    """
-    monkeypatch.setattr(
-        "omnigent.runner._entry._make_auth_token_factory",
-        lambda server_url=None: lambda: "fresh-token",
-    )
-    reauth = claude_native_hook._build_reauth(
-        "https://ap.example.com",
-        {"Authorization": "Bearer stale", "X-Databricks-Org-Id": "o9"},
-    )
-    assert reauth() == {"Authorization": "Bearer fresh-token", "X-Databricks-Org-Id": "o9"}
-
-
-def test_build_reauth_returns_none_without_factory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    ``_build_reauth`` returns ``None`` when no refresh mechanism is available.
-
-    Local unauthenticated servers (no token factory) must not synthesize an
-    auth header; returning ``None`` lets the caller fall through to its normal
-    handling (which fails closed for a tool-call gate).
-    """
-    monkeypatch.setattr(
-        "omnigent.runner._entry._make_auth_token_factory",
-        lambda server_url=None: None,
-    )
-    reauth = claude_native_hook._build_reauth(
-        "https://ap.example.com", {"Authorization": "Bearer stale"}
-    )
-    assert reauth() is None
-
-
 def test_evaluate_policy_reauths_on_expired_token_instead_of_failing_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

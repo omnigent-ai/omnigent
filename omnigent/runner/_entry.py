@@ -220,9 +220,9 @@ class _RunnerDatabricksAuth(httpx.Auth):
         # account (the forwarder's POST /events otherwise 403s). Empty when
         # none recorded. Set once here; it persists across the retry yield.
         if self._server_url:
-            from omnigent.cli_auth import databricks_org_id_headers
+            from omnigent.cli_auth import databricks_request_headers
 
-            request.headers.update(databricks_org_id_headers(self._server_url))
+            request.headers.update(databricks_request_headers(self._server_url))
         if self._factory is not None:
             token = self._factory()
             if not token:
@@ -670,7 +670,7 @@ def create_app(
         a second time during runner boot.
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
-    from omnigent.cli_auth import databricks_org_id_headers
+    from omnigent.cli_auth import databricks_request_headers
     from omnigent.runner.app import create_runner_app
     from omnigent.runner.identity import (
         OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -727,7 +727,7 @@ def create_app(
         #
         # The workspace-routing header (empty unless a ?o= selector was
         # recorded for this server) routes these callbacks to the workspace.
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, **databricks_org_id_headers(server_url)},
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, **databricks_request_headers(server_url)},
         timeout=httpx.Timeout(5.0, read=None),
         # NOTE: ``follow_redirects`` deliberately stays False.
         # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the

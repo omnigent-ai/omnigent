@@ -228,21 +228,21 @@ def test_store_and_load_databricks_record(token_dir) -> None:
     )
 
 
-def test_databricks_org_id_headers_from_record(token_dir) -> None:
+def test_databricks_request_headers_org_only(token_dir) -> None:
     """A recorded ?o= selector surfaces as the workspace-routing header.
 
     When the bare host is the account, the request routes by this header
     (equivalently to ``?o=``). A record with no org id (single-workspace
     host) yields no header, so those callers are unaffected.
     """
-    from omnigent.cli_auth import databricks_org_id_headers, store_databricks_auth
+    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
 
     store_databricks_auth(
         server_url="https://acme.databricks.com/api/2.0/omnigent",
         workspace_host="https://acme.databricks.com",
         org_id="2850744067564480",
     )
-    assert databricks_org_id_headers("https://acme.databricks.com/api/2.0/omnigent") == {
+    assert databricks_request_headers("https://acme.databricks.com/api/2.0/omnigent") == {
         "X-Databricks-Org-Id": "2850744067564480"
     }
 
@@ -250,10 +250,10 @@ def test_databricks_org_id_headers_from_record(token_dir) -> None:
         server_url="https://single.databricks.com/api/2.0/omnigent",
         workspace_host="https://single.databricks.com",
     )
-    assert databricks_org_id_headers("https://single.databricks.com/api/2.0/omnigent") == {}
+    assert databricks_request_headers("https://single.databricks.com/api/2.0/omnigent") == {}
 
 
-def test_databricks_auth_headers_pairs_bearer_and_org(token_dir) -> None:
+def test_databricks_request_headers_pairs_bearer_and_org(token_dir) -> None:
     """The paired minter always emits the bearer and the ?o= header together.
 
     The static-dict seams (WS handshakes, hook-config replay) call this so a
@@ -261,7 +261,7 @@ def test_databricks_auth_headers_pairs_bearer_and_org(token_dir) -> None:
     header. A missing token or selector is omitted, so single-workspace and
     local-unauthenticated callers are unaffected.
     """
-    from omnigent.cli_auth import databricks_auth_headers, store_databricks_auth
+    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
 
     store_databricks_auth(
         server_url="https://acme.databricks.com/api/2.0/omnigent",
@@ -270,14 +270,14 @@ def test_databricks_auth_headers_pairs_bearer_and_org(token_dir) -> None:
     )
     recorded = "https://acme.databricks.com/api/2.0/omnigent"
     # Bearer + org travel together.
-    assert databricks_auth_headers(recorded, "tok") == {
+    assert databricks_request_headers(recorded, bearer_token="tok") == {
         "Authorization": "Bearer tok",
         "X-Databricks-Org-Id": "2850744067564480",
     }
     # Recorded selector but no token (local/unauth): org still rides, no bearer.
-    assert databricks_auth_headers(recorded, None) == {"X-Databricks-Org-Id": "2850744067564480"}
+    assert databricks_request_headers(recorded) == {"X-Databricks-Org-Id": "2850744067564480"}
     # No record (unknown server): bearer only, no routing header.
-    assert databricks_auth_headers("https://other.example.com", "tok") == {
+    assert databricks_request_headers("https://other.example.com", bearer_token="tok") == {
         "Authorization": "Bearer tok"
     }
 
