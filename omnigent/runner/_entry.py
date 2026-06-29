@@ -16,7 +16,7 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import AsyncIterator, Callable, Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -858,9 +858,16 @@ def create_app(
 
         shutil.rmtree(_spec_cache_root, ignore_errors=True)
 
-    app.add_event_handler("startup", _start_pm)
-    app.add_event_handler("shutdown", _stop_pm)
+    # starlette 1.x removed add_event_handler; drive startup/shutdown via lifespan.
+    @contextlib.asynccontextmanager
+    async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        await _start_pm()
+        try:
+            yield
+        finally:
+            await _stop_pm()
 
+    app.router.lifespan_context = _lifespan
     return app
 
 
@@ -896,7 +903,9 @@ async def _run_tunnel_from_env() -> None:
     # runner resolves Databricks auth once at boot, not twice.
     app = create_app(auth_token_factory=auth_token_factory)
     idle_timeout_s = _load_runner_idle_timeout_s_from_config()
-    await app.router.startup()
+    # starlette 1.x removed Router.startup/shutdown; drive the lifespan manually.
+    _lifespan_cm = app.router.lifespan_context(app)
+    await _lifespan_cm.__aenter__()
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     last_activity_at = loop.time()
@@ -992,7 +1001,7 @@ async def _run_tunnel_from_env() -> None:
         if idle_task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await idle_task
-        await app.router.shutdown()
+        await _lifespan_cm.__aexit__(None, None, None)
 
 
 def _install_signal_handlers(
