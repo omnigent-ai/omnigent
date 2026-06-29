@@ -31,7 +31,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -54,6 +56,19 @@ _EVENTS_FILE = "qwen_out.ndjson"
 _TMUX_READY_TIMEOUT_S = 30.0
 _TMUX_SEND_TIMEOUT_S = 10.0
 _POLL_INTERVAL_S = 0.2
+
+#: Token config the shared Omnigent MCP relay (``serve-mcp``) reads from the
+#: bridge dir. Mirrors cursor-/claude-native (``cursor_native_bridge.py``).
+_BRIDGE_CONFIG_FILE = "bridge.json"
+#: Name qwen lists the Omnigent MCP server under (shows in ``/mcp``).
+_MCP_SERVER_NAME = "omnigent"
+#: Per-session MCP config passed to qwen via ``--mcp-config <path>``. Lives in
+#: the bridge dir (NOT the workspace), so we never drop a file in the user's repo
+#: and concurrent same-workspace sessions can't collide. CLI-provided MCP servers
+#: are also ungated (no "Untrusted MCP server" prompt), unlike a project
+#: ``.mcp.json`` / ``.qwen/settings.json``. The claude-native ``--mcp-config``
+#: model (it writes no workspace file either).
+_MCP_CONFIG_FILE = "mcp_config.json"
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -94,6 +109,26 @@ def _qwen_project_slug(workspace: Path | str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", real)
 
 
+def qwen_session_recording_path(session_id: str, workspace: Path | str) -> Path:
+    """Return the path to qwen's on-disk chat recording for *session_id*.
+
+    ``~/.qwen/projects/<project-slug>/chats/<session-id>.jsonl`` — the JSONL
+    qwen appends interactive-session events to (``--chat-recording``, on by
+    default), scoped to *workspace*'s project slug. The file may not exist yet
+    (a fresh session creates it on first event). Used both to gate ``--resume``
+    (:func:`qwen_session_recording_exists`) and to tail for the
+    ``chat_compression`` marker (see :mod:`omnigent.qwen_native_forwarder`).
+    """
+    return (
+        Path.home()
+        / ".qwen"
+        / "projects"
+        / _qwen_project_slug(workspace)
+        / "chats"
+        / f"{session_id}.jsonl"
+    )
+
+
 def qwen_session_recording_exists(session_id: str, workspace: Path | str) -> bool:
     """Return whether qwen has an on-disk chat recording for *session_id* in *workspace*.
 
@@ -114,16 +149,8 @@ def qwen_session_recording_exists(session_id: str, workspace: Path | str) -> boo
     :returns: ``True`` if a recording for *session_id* exists under *workspace*'s
         qwen project dir.
     """
-    recording = (
-        Path.home()
-        / ".qwen"
-        / "projects"
-        / _qwen_project_slug(workspace)
-        / "chats"
-        / f"{session_id}.jsonl"
-    )
     try:
-        return recording.is_file()
+        return qwen_session_recording_path(session_id, workspace).is_file()
     except OSError:
         return False
 
@@ -143,6 +170,28 @@ def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         os.chmod(path, 0o700)
+
+
+def _ensure_secure_bridge_dir(bridge_dir: Path) -> None:
+    """Create/validate *bridge_dir* as an owner-only chain before writing secrets.
+
+    ``_ensure_dir`` only ``mkdir(parents=True, exist_ok=True)`` + a suppressed
+    ``chmod`` on the leaf: it trusts pre-existing ancestors, so on a shared host
+    an attacker could pre-create ``$TMPDIR/omnigent-<uid>`` (or a deeper ancestor)
+    as a symlink / world-writable dir and redirect the bridge tree. That tree now
+    holds ``bridge.json`` — a bearer token for the relay's localhost control
+    endpoint — so its directory must be hardened. Delegate to the same
+    ``_ensure_secure_dir`` the shared relay (``start_tool_relay``) already applies
+    to token-bearing trees; it rejects symlinked / non-owned / group-or-other
+    accessible ancestors (the qwen-native root is in its allowlist). Lazy import
+    avoids a cycle (``claude_native_bridge`` resolves qwen's ``bridge_root`` lazily
+    in turn).
+
+    :raises RuntimeError: If any ancestor fails owner-only validation.
+    """
+    from omnigent.claude_native_bridge import _ensure_secure_dir
+
+    _ensure_secure_dir(bridge_dir)
 
 
 def prepare_bridge_files(bridge_dir: Path) -> None:
@@ -171,6 +220,115 @@ def build_qwen_native_spawn_env(session_id: str) -> dict[str, str]:
     bridge_dir = bridge_dir_for_session_id(session_id)
     _ensure_dir(bridge_dir)
     return {BRIDGE_DIR_ENV_VAR: str(bridge_dir)}
+
+
+# ---------------------------------------------------------------------------
+# Omnigent MCP server config — expose Omnigent's builtin tools (sys_*,
+# load_skill, web_fetch, …) to the qwen TUI so it can call them and ``/mcp``
+# lists them. Reuses the shared stdio relay implemented in
+# ``omnigent.claude_native_bridge serve-mcp`` (same server cursor-/claude-/
+# opencode-native point at); only the *registration* surface differs per CLI.
+# ---------------------------------------------------------------------------
+
+
+def write_mcp_bridge_config(bridge_dir: Path) -> None:
+    """Write the token config the shared Omnigent MCP relay reads at startup.
+
+    The ``serve-mcp`` relay (spawned by qwen) reads ``bridge.json`` for a bearer
+    token and exits if it's missing, so this must exist *before* qwen launches.
+    ``bridge.json`` only ever holds ``{token}``; the live tool surface is
+    advertised separately via the ``tool_relay.json`` that the runner's comment
+    relay (``ensure_comment_relay`` → ``_ensure_comment_relay_started``) writes
+    into this same bridge dir when it starts. Mirrors
+    :func:`omnigent.cursor_native_bridge.write_mcp_bridge_config`.
+
+    :raises RuntimeError: If the bridge dir fails owner-only validation
+        (:func:`_ensure_secure_bridge_dir`) — the token is not written.
+    """
+    _ensure_secure_bridge_dir(bridge_dir)
+    config_path = bridge_dir / _BRIDGE_CONFIG_FILE
+    if config_path.exists():
+        return
+    payload = {"token": secrets.token_urlsafe(32)}
+    tmp = bridge_dir / (_BRIDGE_CONFIG_FILE + ".tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, config_path)
+
+
+def build_mcp_server_entry(
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> dict[str, Any]:
+    """Build qwen's ``mcpServers.omnigent`` entry for the Omnigent relay.
+
+    ``trust: true`` auto-approves the qwen-side MCP tool gate so the TUI doesn't
+    add a second in-terminal prompt: Omnigent already gates these calls through
+    its own policy/elicitation engine (surfaced as web cards by the approval
+    mirror), so qwen's prompt would only be a hidden duplicate. Same rationale
+    as cursor's ``autoApprove`` (see ``cursor_native_bridge.build_mcp_config``).
+    """
+    python = python_executable or sys.executable
+    return {
+        "command": python,
+        "args": [
+            "-I",
+            "-m",
+            "omnigent.claude_native_bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            str(bridge_dir),
+        ],
+        "env": {
+            "PYTHONUNBUFFERED": "1",
+            "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+        },
+        "trust": True,
+    }
+
+
+def mcp_config_path(bridge_dir: Path) -> Path:
+    """Return the per-session ``--mcp-config`` file path inside the bridge dir."""
+    return bridge_dir / _MCP_CONFIG_FILE
+
+
+def write_mcp_config(
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> Path:
+    """Write the per-session Omnigent MCP config for qwen's ``--mcp-config`` flag.
+
+    Writes ``{"mcpServers": {"omnigent": ...}}`` to a file *inside the bridge dir*
+    (never the workspace) and the relay token (:func:`write_mcp_bridge_config`).
+    The runner passes the returned path to qwen via ``--mcp-config <path>``. Unlike
+    a project ``.mcp.json`` / ``.qwen/settings.json``, a CLI-provided MCP server:
+
+    - drops no file in the user's (often git) workspace — nothing to accidentally
+      commit, nothing left behind pointing at a dead bridge dir;
+    - is per-session by construction (the file and its ``--bridge-dir`` live in
+      this session's bridge dir), so concurrent same-workspace sessions can't
+      collide on a shared file;
+    - is **not** gated behind qwen's "Untrusted MCP server" prompt (CLI servers
+      carry no project/workspace scope), so no pre-approval step is needed.
+
+    The claude-native ``--mcp-config`` model (it writes no workspace file either).
+
+    :returns: Path to the written ``--mcp-config`` file.
+    """
+    write_mcp_bridge_config(bridge_dir)
+    path = mcp_config_path(bridge_dir)
+    payload = {
+        "mcpServers": {
+            _MCP_SERVER_NAME: build_mcp_server_entry(
+                bridge_dir, python_executable=python_executable
+            )
+        }
+    }
+    tmp = path.with_name(f"{_MCP_CONFIG_FILE}.{secrets.token_hex(8)}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
 
 
 def _append_command(bridge_dir: Path, command: dict[str, Any]) -> None:

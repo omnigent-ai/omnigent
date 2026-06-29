@@ -52,7 +52,7 @@ class _FakeHttpx:
         """
         headers = kwargs.get("headers")
         auth = headers.get("Authorization") if isinstance(headers, dict) else None
-        self.requests.append({"url": url, "authorization": auth})
+        self.requests.append({"url": url, "authorization": auth, "params": kwargs.get("params")})
         return self.responses.pop(0)
 
 
@@ -351,6 +351,98 @@ def test_login_stale_cached_grant_triggers_fresh_login_and_retry(
     # The retry verify presented the freshly minted token, not the stale one.
     assert fake.requests[-1]["authorization"] == "Bearer tok-fresh"
     assert load_databricks_workspace_host(_APPS_URL) == _WORKSPACE
+
+
+# ── ?o= workspace selector ──────────────────────────────────────────
+
+_ORG_ID = "2850744067564480"
+# A login URL where the bare host is the account and ``?o=`` picks the workspace.
+_SELECTOR_URL = f"{_WORKSPACE}/?o={_ORG_ID}"
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (_SELECTOR_URL, _ORG_ID),
+        (f"{_WORKSPACE_API_URL}?o={_ORG_ID}", _ORG_ID),
+        # Selector among other params is still found.
+        (f"{_WORKSPACE}/?foo=bar&o={_ORG_ID}", _ORG_ID),
+        # No selector → None (the single-workspace / Apps case).
+        (_WORKSPACE, None),
+        (_APPS_URL, None),
+        (f"{_WORKSPACE}/?o=", None),
+    ],
+)
+def test_org_id_from_url(url: str, expected: str | None) -> None:
+    """``?o=<workspace-id>`` is extracted from a login URL, else ``None``.
+
+    The selector is the only signal that names the workspace when the bare
+    host is the account; an absent or empty ``o`` must read as ``None`` so
+    single-workspace and Apps URLs keep their current behavior.
+    """
+    assert cli_mod._org_id_from_url(url) == expected
+
+
+@pytest.mark.parametrize(
+    ("workspace_host", "org_id", "expected"),
+    [
+        (_WORKSPACE, "2850744067564480", f"{_WORKSPACE}/?o=2850744067564480"),
+        # No org id → host returned untouched (single-workspace / Apps).
+        (_WORKSPACE, None, _WORKSPACE),
+        # A selector carrying & / = is encoded, not interpolated, so it can't
+        # inject extra query params onto the `databricks auth login --host` URL.
+        (_WORKSPACE, "123&foo=bar", f"{_WORKSPACE}/?o=123%26foo%3Dbar"),
+    ],
+)
+def test_host_with_org_encodes_selector(
+    workspace_host: str, org_id: str | None, expected: str
+) -> None:
+    """``_host_with_org`` appends an URL-encoded ?o= selector (no injection).
+
+    The value is passed straight to ``databricks auth login --host``; encoding
+    it (vs string interpolation) keeps a value with ``&``/``=`` from expanding
+    into extra query params on that URL.
+    """
+    assert cli_mod._host_with_org(workspace_host, org_id) == expected
+
+
+def test_login_threads_org_id_through_workspace_login_and_verify(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """A ``?o=`` login binds the grant to the workspace and routes the verify.
+
+    When the bare host is the account, the browser login must carry ``?o=``
+    so the CLI records ``workspace_id`` (else the grant is account-scoped →
+    HTTP 403), and the verify request must carry ``?o=`` so it routes to the
+    workspace (else it defaults to the account → HTTP 503). The selector is
+    also persisted so later commands replay it.
+    """
+    from omnigent.cli_auth import load_databricks_org_id, load_databricks_workspace_host
+
+    fake = _FakeHttpx(
+        responses=[
+            _response(401, headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'}),
+            _response(200, body={"user_id": "alice@example.com"}),
+        ]
+    )
+    login_calls = _patch_login_env(
+        monkeypatch,
+        fake_httpx=fake,
+        # Force the browser login so the --host argv is observable.
+        cached_tokens=[None, "tok-fresh"],
+    )
+
+    result = CliRunner().invoke(cli_group, ["login", _SELECTOR_URL])
+
+    assert result.exit_code == 0, result.output
+    # The browser login carries the selector so the profile is workspace-scoped.
+    assert login_calls == [f"auth login --host {_WORKSPACE}/?o={_ORG_ID}"]
+    # The verify request routes to the workspace via ?o= (and used the token).
+    assert fake.requests[-1]["params"] == {"o": _ORG_ID}
+    assert fake.requests[-1]["authorization"] == "Bearer tok-fresh"
+    # The selector is persisted (from the URL, authoritative over any header).
+    assert load_databricks_org_id(_SELECTOR_URL) == _ORG_ID
+    assert load_databricks_workspace_host(_SELECTOR_URL) == _WORKSPACE
 
 
 # ── login sets the default server ───────────────────────────────────
@@ -827,6 +919,50 @@ def test_resolve_server_url_defaults_scheme_and_expands(
 
     assert cli_mod._resolve_server_url("example.databricks.com") == _WORKSPACE_API_URL
     assert cli_mod._resolve_server_url("example.databricks.com/omnigent") == _WORKSPACE_API_URL
+
+
+def test_resolve_server_url_strips_query_and_expands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare workspace URL carrying ``?o=`` still expands to the API mount.
+
+    The ``?o=`` selector on the input must not corrupt the probe or defeat
+    expansion — ``omnigent run --server https://<ws>/?o=<id>`` has to reach
+    ``/api/2.0/omnigent`` (the selector rides via the login record /
+    ``X-Databricks-Org-Id``, never the base URL). A regression sends every
+    request to the workspace root, which bounces to ``/login``.
+    """
+    probed = _scripted_normalizer_httpx(
+        monkeypatch,
+        {
+            f"{_WORKSPACE}/v1/me": _response(404, headers={"server": "databricks"}),
+            f"{_WORKSPACE_API_URL}/v1/me": _response(
+                401, headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'}
+            ),
+        },
+    )
+
+    assert cli_mod._resolve_server_url(f"{_WORKSPACE}/?o=2850744067564480") == _WORKSPACE_API_URL
+    # The probes hit the CLEAN root/mount — never a ?o=-corrupted URL (which
+    # would push the path into the query string, e.g. ``…/?o=123/v1/me``).
+    assert probed and all("o=" not in url and "%2F" not in url for url in probed)
+
+
+def test_resolve_server_url_strips_query_on_full_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full ``/api/2.0/omnigent?o=`` URL returns the clean mount with no probe.
+
+    When the user already passes the mount path, only the ``?o=`` needs
+    stripping — the path-carrying URL is returned untouched (no network probe).
+    """
+    probed = _scripted_normalizer_httpx(monkeypatch, {})  # any probe fails the test
+
+    assert (
+        cli_mod._resolve_server_url(f"{_WORKSPACE_API_URL}?o=2850744067564480")
+        == _WORKSPACE_API_URL
+    )
+    assert probed == []
 
 
 def test_workspace_url_expands_web_ui_path_to_api_mount(

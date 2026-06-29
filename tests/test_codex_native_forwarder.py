@@ -16,6 +16,7 @@ only an already-mirrored value is not re-posted.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -27,6 +28,7 @@ from omnigent.codex_native_bridge import (
     read_bridge_state,
     write_bridge_state,
 )
+from omnigent.codex_native_forwarder import _persist_codex_compaction_item
 
 
 class _RecordingClient:
@@ -674,6 +676,86 @@ async def test_elicitation_post_returns_none_when_budget_exhausted(
     assert len(client.posts) == 1
 
 
+class _StatusClient:
+    """httpx client stub whose ``post`` returns a fixed status code."""
+
+    def __init__(self, status_code: int) -> None:
+        """:param status_code: Status to return from every post, e.g. ``400``."""
+        self.status_code = status_code
+        self.posts = 0
+
+    async def post(self, url: str, *, json: dict) -> httpx.Response:
+        """Return the configured status; never raises."""
+        del json
+        self.posts += 1
+        return httpx.Response(self.status_code, request=httpx.Request("POST", url))
+
+
+def test_forward_failures_escalate_to_degraded_once() -> None:
+    """
+    Sustained forward failures flip the degraded latch exactly once (#1120).
+
+    Network drops previously surfaced only as scattered per-item warnings;
+    the latch turns a real outage into a single loud signal and does not
+    re-fire per dropped item.
+    """
+    fwd._reset_forward_health()
+
+    for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD - 1):
+        fwd._note_forward_failure("external_output_text_delta")
+    # Below threshold: not yet degraded.
+    assert fwd._forward_health.degraded_logged is False
+
+    fwd._note_forward_failure("external_output_text_delta")  # crosses threshold
+    assert fwd._forward_health.degraded_logged is True
+    assert fwd._forward_health.consecutive_failures == fwd._FORWARD_DEGRADED_THRESHOLD
+
+    # The latch holds — further failures keep counting but don't re-escalate.
+    fwd._note_forward_failure("external_output_text_delta")
+    assert fwd._forward_health.degraded_logged is True
+    assert fwd._forward_health.consecutive_failures == fwd._FORWARD_DEGRADED_THRESHOLD + 1
+
+
+def test_forward_success_resets_degraded_state() -> None:
+    """
+    A successful forward clears the failure count and degraded latch.
+
+    Recovery must re-arm the indicator so a later outage escalates again.
+    """
+    fwd._reset_forward_health()
+    for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD):
+        fwd._note_forward_failure("external_session_usage")
+    assert fwd._forward_health.degraded_logged is True
+
+    fwd._note_forward_success()
+
+    assert fwd._forward_health.consecutive_failures == 0
+    assert fwd._forward_health.degraded_logged is False
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_tracks_success_and_failure() -> None:
+    """
+    _post_session_event classifies each outcome into forward health (#1120).
+
+    A 2xx clears the failure run; a permanent 4xx counts as a failure so a
+    sustained outage can escalate.
+    """
+    fwd._reset_forward_health()
+
+    # A permanent 4xx is a failure.
+    await fwd._post_session_event(
+        _StatusClient(400), "conv_x", event_type="external_session_status", data={"status": "idle"}
+    )
+    assert fwd._forward_health.consecutive_failures == 1
+
+    # A 2xx resets the run.
+    await fwd._post_session_event(
+        _RecordingClient(), "conv_x", event_type="external_session_status", data={"status": "idle"}
+    )
+    assert fwd._forward_health.consecutive_failures == 0
+
+
 # ── #1108: turn-error "silent success" → surfaced failed ──────────────
 #
 # A failed Codex turn arrives as ``turn/completed`` (a clean success boundary)
@@ -723,6 +805,11 @@ def test_classify_codex_error_auth_vs_generic() -> None:
     assert fwd._classify_codex_error({"codexErrorInfo": "Unauthorized"}, "nope") == auth
     assert fwd._classify_codex_error({"codexErrorInfo": {"type": "Unauthorized"}}, "nope") == auth
     assert fwd._classify_codex_error({"codexErrorInfo": {"httpStatusCode": 401}}, "nope") == auth
+    # The real app-server enum serializes lowercase snake_case; it must match
+    # via the structured path (message "nope" has no auth substring to fall
+    # back on), case-insensitively.
+    assert fwd._classify_codex_error({"codexErrorInfo": "unauthorized"}, "nope") == auth
+    assert fwd._classify_codex_error({"codexErrorInfo": {"type": "unauthorized"}}, "nope") == auth
     # Message-text fallback when codexErrorInfo is absent.
     assert fwd._classify_codex_error({}, "Please run codex login") == auth
     assert fwd._classify_codex_error({}, "ChatGPT session expired") == auth
@@ -1214,3 +1301,113 @@ async def test_reasoning_delta_skips_empty_non_opening_delta() -> None:
 
     assert len(client.posts) == 1
     assert client.posts[0][1]["data"] == {"delta": "", "started": True}
+
+
+# ---------------------------------------------------------------------------
+# _persist_codex_compaction_item
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_persist_codex_compaction_item_posts_event() -> None:
+    """Compaction event is posted with last_item_id and Codex summary."""
+    get_resp = MagicMock()
+    get_resp.json.return_value = {"data": [{"id": "item_codex"}]}
+    get_resp.raise_for_status = MagicMock()
+
+    client = MagicMock()
+    client.get = AsyncMock(return_value=get_resp)
+
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+    client.post = AsyncMock(return_value=post_resp)
+
+    await _persist_codex_compaction_item(client, session_id="conv_codex")
+
+    client.post.assert_called_once()
+    _url, kwargs = client.post.call_args
+    body = kwargs["json"]
+    assert body["type"] == "compaction"
+    assert body["data"]["last_item_id"] == "item_codex"
+    assert "Codex" in body["data"]["summary"]
+    # Codex can't read post-compaction state, so no compacted_messages
+    assert "compacted_messages" not in body["data"]
+
+
+@pytest.mark.asyncio
+async def test_persist_codex_compaction_item_empty_items_fallback() -> None:
+    """When no items exist, last_item_id falls back to compact_boundary_ prefix."""
+    empty_resp = MagicMock()
+    empty_resp.json.return_value = {"data": []}
+    empty_resp.raise_for_status = MagicMock()
+
+    client = MagicMock()
+    client.get = AsyncMock(return_value=empty_resp)
+
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+    client.post = AsyncMock(return_value=post_resp)
+
+    await _persist_codex_compaction_item(client, session_id="conv_codex")
+
+    client.post.assert_called_once()
+    _url, kwargs = client.post.call_args
+    body = kwargs["json"]
+    assert body["data"]["last_item_id"].startswith("compact_boundary_")
+    assert "compacted_messages" not in body["data"]
+
+
+def test_read_compacted_history_extracts_replacement_history_and_window_id(
+    tmp_path: Path,
+) -> None:
+    """_read_compacted_history returns replacement_history and window_id."""
+    import json as _json
+
+    rollout = tmp_path / "rollout.jsonl"
+    lines = [
+        _json.dumps({"type": "session_meta", "payload": {"id": "abc"}}),
+        _json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user"}}),
+        _json.dumps(
+            {
+                "type": "compacted",
+                "payload": {
+                    "message": "summary",
+                    "replacement_history": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "hi"}],
+                        },
+                        {
+                            "type": "compaction",
+                            "encrypted_content": "gAAAA_test_token",
+                        },
+                    ],
+                    "window_id": 2,
+                },
+            }
+        ),
+    ]
+    rollout.write_text("\n".join(lines) + "\n")
+
+    result = fwd._read_compacted_history(rollout)
+
+    assert result is not None
+    assert result["window_id"] == 2
+    assert len(result["replacement_history"]) == 2
+    assert result["replacement_history"][0]["type"] == "message"
+    assert result["replacement_history"][0]["role"] == "user"
+    assert result["replacement_history"][1]["type"] == "compaction"
+    assert result["replacement_history"][1]["encrypted_content"] == "gAAAA_test_token"
+
+
+def test_read_compacted_history_returns_none_for_no_compacted_entry(
+    tmp_path: Path,
+) -> None:
+    """_read_compacted_history returns None when no Compacted entry exists."""
+    import json as _json
+
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(_json.dumps({"type": "session_meta", "payload": {"id": "abc"}}) + "\n")
+
+    assert fwd._read_compacted_history(rollout) is None

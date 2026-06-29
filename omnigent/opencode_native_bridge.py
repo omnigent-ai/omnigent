@@ -51,6 +51,143 @@ _STATE_FILE = "state.json"
 _AUTH_SECRET_FILE = "auth.secret"
 _XDG_DATA_DIR = "xdg-data"
 _XDG_CONFIG_DIR = "xdg-config"
+# Token file the shared ``omnigent.claude_native_bridge serve-mcp`` reads to
+# boot (filename MUST match ``claude_native_bridge._CONFIG_FILE``). opencode
+# launches that serve-mcp as a ``{type:"local"}`` MCP server which relays the
+# Omnigent builtin tools (``sys_*``/``load_skill``/``web_fetch``) advertised in
+# ``tool_relay.json`` by the runner's comment relay.
+_MCP_BRIDGE_CONFIG_FILE = "bridge.json"
+# AP-routing snapshot the detached cost-approval popup process reads to resolve
+# the elicitation against the Omnigent server (mirrors codex-native's
+# ``policy_hook.json``; consumed by ``omnigent.native_cost_popup``).
+_COST_POPUP_CONFIG_FILE = "cost_popup.json"
+# Filename of the opencode plugin that bridges opencode's lifecycle hooks to the
+# Omnigent policy engine (REQUEST + TOOL_RESULT phases the reactive
+# ``permission.asked`` path can't reach).
+_POLICY_PLUGIN_FILE = "omnigent-policy.js"
+
+# The plugin source. opencode loads it (registered by absolute path in the
+# synthesized ``opencode.json`` ``plugin`` field) and iterates the module's
+# function exports as plugins (legacy shape). It reads its Omnigent coordinates
+# from env the runner stamps on ``opencode serve`` and POSTs each hook to
+# ``/v1/sessions/{id}/policies/evaluate`` — the SAME endpoint + ``PHASE_*``
+# contract claude-native's ``UserPromptSubmit`` / ``PostToolUse`` hooks use.
+# Best-effort: any transport error fails OPEN (never locks the session); only an
+# explicit ``POLICY_ACTION_DENY`` blocks a prompt (throw) or withholds a tool
+# result (redact). Raw string so the JS ``\n`` / regex escapes survive verbatim.
+_OPENCODE_POLICY_PLUGIN_JS = r"""
+// Omnigent policy bridge for opencode-native (generated; do not edit).
+// Forwards opencode lifecycle hooks to the Omnigent policy engine so
+// REQUEST-phase (prompt-submit) and TOOL_RESULT-phase policies enforce — the
+// phases the reactive permission.asked path cannot reach.
+const BASE = (process.env.OMNIGENT_POLICY_URL || "").replace(/\/+$/, "");
+const SESSION = process.env.OMNIGENT_SESSION_ID || "";
+const AUTH = process.env.OMNIGENT_POLICY_AUTH || "";
+const TIMEOUT_MS = 600000;
+
+async function evaluate(type, target, data) {
+  // Returns {result, reason}. Not wired (no server/session) -> no-op allow.
+  if (!BASE || !SESSION) return { result: "ALLOW" };
+  const url = BASE + "/v1/sessions/" + encodeURIComponent(SESSION) + "/policies/evaluate";
+  const headers = { "content-type": "application/json" };
+  if (AUTH) headers["authorization"] = AUTH;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify({ event: { type: type, target: target || "", data: data } }),
+      signal: controller.signal,
+    });
+    if (!resp.ok) return { result: "ALLOW" };
+    const body = await resp.json();
+    return body && typeof body === "object" ? body : { result: "ALLOW" };
+  } catch (e) {
+    // Server unreachable / timeout: fail OPEN so a transient blip can't lock
+    // the session. The web approval card (if any) stays parked server-side.
+    return { result: "ALLOW" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function joinText(parts) {
+  if (!Array.isArray(parts)) return "";
+  const out = [];
+  for (const p of parts) {
+    if (p && p.type === "text" && typeof p.text === "string") out.push(p.text);
+  }
+  return out.join("\n");
+}
+
+export const OmnigentPolicyPlugin = async () => ({
+  // REQUEST phase: gate the prompt before the model sees it. A DENY throws,
+  // which opencode surfaces as an aborted turn (true block). On a web-injected
+  // prompt the server auto-allows (it was gated at injection), so this only
+  // gates TUI-typed prompts.
+  "chat.message": async (_input, output) => {
+    const text = output ? joinText(output.parts) : "";
+    if (!text) return;
+    // ``data`` is the {"text": ...} dict the server's _build_evaluation_context
+    // expects for REQUEST (same shape claude's UserPromptSubmit hook sends);
+    // a bare string 500s the evaluate endpoint and fails the gate open.
+    const verdict = await evaluate("PHASE_REQUEST", "", { text: text });
+    if (verdict.result === "POLICY_ACTION_DENY") {
+      // opencode renders any thrown chat.message error as a generic 500 in the
+      // TUI ("Unexpected server error") — its middleware hardcodes that. We
+      // can't change the TUI text from a plugin, but the thrown message is
+      // written to opencode's session log, so carry the policy reason there.
+      throw new Error(
+        "Omnigent policy blocked this prompt: " + (verdict.reason || "request denied"),
+      );
+    }
+  },
+  // TOOL_RESULT phase: gate/redact the tool output before the model sees it.
+  // The tool already ran; a DENY withholds its output (the TOOL_RESULT-phase
+  // suppress semantics) rather than aborting the turn.
+  "tool.execute.after": async (input, output) => {
+    if (!output) return;
+    const verdict = await evaluate(
+      "PHASE_TOOL_RESULT",
+      input && input.tool,
+      { result: output.output },
+    );
+    if (verdict.result === "POLICY_ACTION_DENY") {
+      output.output = "[Omnigent policy withheld this tool result: " +
+        (verdict.reason || "denied") + "]";
+    }
+  },
+});
+"""
+
+
+def write_opencode_policy_plugin(bridge_dir: Path) -> Path:
+    """
+    Write the Omnigent policy-bridge plugin into *bridge_dir* and return its path.
+
+    The runner registers the returned path in the synthesized ``opencode.json``
+    ``plugin`` field and stamps ``OMNIGENT_POLICY_URL`` / ``OMNIGENT_SESSION_ID``
+    / ``OMNIGENT_POLICY_AUTH`` on the ``opencode serve`` process so the plugin
+    can reach ``/policies/evaluate``. Overwritten each launch so a code update
+    ships without stale plugin files.
+
+    :param bridge_dir: OpenCode-native bridge directory.
+    :returns: The written plugin file path (absolute).
+    """
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = bridge_dir / _POLICY_PLUGIN_FILE
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_POLICY_PLUGIN_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(_OPENCODE_POLICY_PLUGIN_JS)
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    return path
+
+
 _STATE_VERSION = 1
 _BRIDGE_ROOT = Path.home() / ".omnigent" / "opencode-native"
 _ID_HASH_CHARS = 32
@@ -173,6 +310,73 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
     return bridge_dir
 
 
+def write_relay_bridge_config(bridge_dir: Path) -> None:
+    """
+    Write a minimal ``bridge.json`` so the shared ``serve-mcp`` can boot.
+
+    The shared ``omnigent.claude_native_bridge serve-mcp`` stdio server (which
+    opencode launches as a ``{type:"local"}`` MCP server) reads this file for an
+    auth token at startup; the relay tools themselves come from
+    ``tool_relay.json`` (written by the runner's comment relay), so this carries
+    only a token — no ``workspace`` key, so no ``sys_os_*`` tools are served
+    (opencode owns its own filesystem tools). Mirrors
+    ``codex_native_bridge.write_mcp_bridge_config``.
+
+    Idempotent: skips if a config already exists so a relaunch never rotates a
+    token the relay HTTP server was already started with.
+
+    :param bridge_dir: OpenCode-native bridge directory.
+    """
+    config_path = bridge_dir / _MCP_BRIDGE_CONFIG_FILE
+    if config_path.exists():
+        return
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    payload = {"token": secrets.token_urlsafe(32)}
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_MCP_BRIDGE_CONFIG_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_name, config_path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def write_cost_popup_config(
+    bridge_dir: Path, *, ap_server_url: str, ap_auth_headers: dict[str, str]
+) -> Path:
+    """
+    Write the AP-routing snapshot the cost-approval popup reads.
+
+    The cost-budget approval modal runs as a detached
+    ``omnigent.native_cost_popup`` subprocess inside a ``tmux display-popup`` on
+    the opencode pane; it must POST the verdict to the Omnigent server but cannot
+    inherit the forwarder's in-memory client, so the base URL + a one-shot auth
+    header snapshot are persisted here (same contract as codex-native's
+    ``policy_hook.json``). Rewritten on each checkpoint so the token is fresh.
+
+    :param bridge_dir: OpenCode-native bridge directory.
+    :param ap_server_url: Omnigent server base URL, e.g. ``"http://127.0.0.1:6767"``.
+    :param ap_auth_headers: Outbound auth headers, e.g.
+        ``{"Authorization": "Bearer <token>"}``; empty for no-auth local mode.
+    :returns: The written config file path (passed to ``launch_cost_popup``).
+    """
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = bridge_dir / _COST_POPUP_CONFIG_FILE
+    payload = {"ap_server_url": ap_server_url, "ap_auth_headers": ap_auth_headers}
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_COST_POPUP_CONFIG_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    return path
+
+
 def xdg_data_home_for_bridge_dir(bridge_dir: Path) -> Path:
     """
     Return the per-session ``XDG_DATA_HOME`` for *bridge_dir*.
@@ -204,6 +408,27 @@ def user_opencode_auth_path() -> Path:
     xdg = os.environ.get("XDG_DATA_HOME", "").strip()
     base = Path(xdg) if xdg else Path.home() / ".local" / "share"
     return base / "opencode" / "auth.json"
+
+
+def user_opencode_config_path() -> Path | None:
+    """
+    Return the user's real OpenCode config path (not the per-session one).
+
+    Honors ``XDG_CONFIG_HOME`` (the runner's own env, which is the user's real
+    config home — the per-session override is set only on the spawned server),
+    defaulting to ``~/.config/opencode/opencode.jsonc``.
+
+    OpenCode accepts both ``.jsonc`` (with comments) and ``.json`` extensions;
+    the ``.jsonc`` variant is checked first.
+    """
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    cfg_dir = base / "opencode"
+    for name in ("opencode.jsonc", "opencode.json"):
+        path = cfg_dir / name
+        if path.is_file():
+            return path
+    return None
 
 
 def seed_opencode_auth(bridge_dir: Path) -> Path | None:
@@ -441,3 +666,30 @@ def update_last_event_id(bridge_dir: Path, last_event_id: str) -> None:
     import dataclasses
 
     write_bridge_state(bridge_dir, dataclasses.replace(state, last_event_id=last_event_id))
+
+
+def update_model_override(bridge_dir: Path, model_override: str | None) -> bool:
+    """
+    Persist a new per-session model override (Omnigent→opencode model switch).
+
+    opencode has no session-level model setting — the model is a per-prompt
+    field — so the executor reads ``model_override`` from this bridge state on
+    every web-injected prompt (see
+    ``OpenCodeNativeExecutor._build_prompt_with_model_override``). Updating it
+    here makes the NEXT injected turn use the new model. A blank/whitespace
+    value clears the override (fall back to opencode's own default).
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :param model_override: New qualified model id (``provider/model``), or
+        ``None`` / blank to clear.
+    :returns: ``True`` when the state existed and was updated, ``False`` when
+        no bridge state is present (server not launched yet).
+    """
+    state = read_bridge_state(bridge_dir)
+    if state is None:
+        return False
+    import dataclasses
+
+    normalized = model_override.strip() if isinstance(model_override, str) else None
+    write_bridge_state(bridge_dir, dataclasses.replace(state, model_override=normalized or None))
+    return True

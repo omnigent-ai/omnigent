@@ -772,6 +772,156 @@ def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
     )
 
 
+@pytest.mark.parametrize(
+    ("codex_args", "expected"),
+    [
+        # ``--flag value`` pair: both dropped.
+        (("--sandbox", "read-only"), []),
+        (("--ask-for-approval", "on-request"), []),
+        # Option-adjacent: the next token is ANOTHER flag, not this flag's
+        # value, so it must survive (the over-match bug dropped --model).
+        (("--sandbox", "--model", "gpt"), ["--model", "gpt"]),
+        # ``--flag=value`` single token: dropped whole, consumes nothing after.
+        (("--ask-for-approval=on-failure",), []),
+        (("--sandbox=read-only", "--model", "gpt"), ["--model", "gpt"]),
+        # Short aliases: ``-a`` (== --ask-for-approval) triggers the SAME codex
+        # startup abort as the long form, so it must be stripped too; ``-s``
+        # (== --sandbox) is harmless but dropped for consistency. Both spellings
+        # (space-separated and ``=value``-joined) are handled.
+        (("-a", "never"), []),
+        (("-a=never",), []),
+        (("-s", "read-only"), []),
+        (("-s=read-only", "--model", "gpt"), ["--model", "gpt"]),
+        # Short alias option-adjacent to another flag: the next flag survives.
+        (("-a", "--model", "gpt"), ["--model", "gpt"]),
+        # Trailing flag at end-of-list: dropped cleanly, no value to consume.
+        (("--model", "gpt", "--sandbox"), ["--model", "gpt"]),
+        # Unrelated arg next to a stripped pair is preserved.
+        (
+            ("--model", "gpt", "--sandbox", "read-only", "--cwd", "/x"),
+            ["--model", "gpt", "--cwd", "/x"],
+        ),
+        # A pre-existing bypass flag is de-duped (the caller re-adds one copy).
+        (("--dangerously-bypass-approvals-and-sandbox", "--model", "gpt"), ["--model", "gpt"]),
+        # No conflicting flags: everything passes through untouched.
+        (("--model", "gpt-5.4-mini"), ["--model", "gpt-5.4-mini"]),
+    ],
+)
+def test_strip_approval_sandbox_flags_only_consumes_real_values(
+    codex_args: tuple[str, ...],
+    expected: list[str],
+) -> None:
+    """
+    ``_strip_approval_sandbox_flags`` drops the conflicting flags without
+    over-matching the token that follows them.
+
+    A ``--sandbox`` / ``--ask-for-approval`` flag consumes the next token as
+    its value ONLY when that token is a real value (does not start with
+    ``-``); a following flag or end-of-list consumes nothing, so unrelated
+    args like ``--model gpt`` are never swallowed. The ``--flag=value``
+    single-token spelling is dropped whole.
+    """
+    assert codex_native_app_server._strip_approval_sandbox_flags(codex_args) == expected
+
+
+def test_build_codex_remote_args_default_keeps_approval_flags_no_bypass() -> None:
+    """
+    Default (``bypass_sandbox=False``) emits NO bypass flag and preserves the
+    approval/sandbox flags the approval-mode presets pass through.
+
+    The web "Full access" / "Read only" presets are sent as
+    ``--sandbox`` / ``--ask-for-approval`` pairs inside ``codex_args``. With
+    bypass off those must reach the TUI verbatim and the dangerous bypass
+    flag must never appear — a regression here would either drop a user's
+    chosen approval preset or silently escalate to full bypass.
+    """
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=("--sandbox", "read-only", "--ask-for-approval", "on-request"),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+    )
+
+    assert "--dangerously-bypass-approvals-and-sandbox" not in args
+    assert args == [
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "on-request",
+        "--remote",
+        "ws://127.0.0.1:9876",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("codex_args", "thread_id", "expected"),
+    [
+        # Fresh thread, no conflicting flags: a single bypass flag is prepended.
+        (
+            (),
+            None,
+            [
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--remote",
+                "ws://127.0.0.1:9876",
+            ],
+        ),
+        # Conflicting approval-preset flags are stripped (flag + its value),
+        # unrelated args (model) survive, and the bypass flag is added once.
+        # codex aborts if the bypass flag is combined with --sandbox /
+        # --ask-for-approval, so leaving them in would break TUI startup.
+        (
+            ("--sandbox", "danger-full-access", "--ask-for-approval", "never", "--model", "gpt"),
+            None,
+            [
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model",
+                "gpt",
+                "--remote",
+                "ws://127.0.0.1:9876",
+            ],
+        ),
+        # Resume path: the bypass flag is a global flag and MUST precede the
+        # ``resume`` subcommand, and a pre-existing bypass flag is de-duped.
+        (
+            ("--dangerously-bypass-approvals-and-sandbox", "--sandbox", "read-only"),
+            "thread_x",
+            [
+                "--dangerously-bypass-approvals-and-sandbox",
+                "resume",
+                "--remote",
+                "ws://127.0.0.1:9876",
+                "thread_x",
+            ],
+        ),
+    ],
+)
+def test_build_codex_remote_args_bypass_emits_flag_and_strips_conflicts(
+    codex_args: tuple[str, ...],
+    thread_id: str | None,
+    expected: list[str],
+) -> None:
+    """
+    ``bypass_sandbox=True`` emits one ``--dangerously-bypass-approvals-and-
+    sandbox`` and strips the conflicting ``--sandbox`` / ``--ask-for-approval``
+    pairs.
+
+    See :func:`omnigent.codex_native_app_server._strip_approval_sandbox_flags`.
+    Asserting the exact argv guards three things: the bypass flag is present
+    exactly once, the conflicting flag pairs are removed (with their values),
+    and the bypass flag lands before any ``resume`` subcommand (codex rejects
+    a global flag placed after a subcommand).
+    """
+    assert (
+        codex_native_app_server.build_codex_remote_args(
+            codex_args=codex_args,
+            thread_id=thread_id,
+            remote_url="ws://127.0.0.1:9876",
+            bypass_sandbox=True,
+        )
+        == expected
+    )
+
+
 def test_codex_app_server_client_uses_codex_remote_handshake(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -9023,3 +9173,106 @@ def test_forwarder_mirrors_codex_context_compaction(tmp_path: Path) -> None:
         {"type": "external_compaction_status", "data": {"status": "in_progress"}},
         {"type": "external_compaction_status", "data": {"status": "completed"}},
     ]
+
+
+def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None:
+    """Compaction items emit a Compacted rollout record and discard prior items."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "msg_2",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi there"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "cmp_1",
+            "type": "compaction",
+            "summary": "compaction summary",
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+                {
+                    "type": "compaction",
+                    "encrypted_content": "gAAAA_encrypted",
+                },
+            ],
+            "window_id": 2,
+            "response_id": "compact_1",
+        },
+        {
+            "id": "msg_3",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "after compaction"}],
+            "response_id": "resp_2",
+        },
+    ]
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+    )
+    # Should have: session_meta, compacted, turn_context, response_item (msg_3), event_msg
+    types = [r["type"] for r in records]
+    assert "session_meta" in types
+    assert "compacted" in types
+    # Pre-compaction response_items should be gone
+    pre_compaction_items = [
+        r
+        for r in records
+        if r["type"] == "response_item"
+        and r["payload"].get("content") == [{"type": "input_text", "text": "hello"}]
+    ]
+    assert len(pre_compaction_items) == 0, "Pre-compaction items should be discarded"
+    # The compacted record should have replacement_history and window_id
+    compacted_records = [r for r in records if r["type"] == "compacted"]
+    assert len(compacted_records) == 1
+    cp = compacted_records[0]["payload"]
+    assert cp["window_id"] == 2
+    assert len(cp["replacement_history"]) == 2
+    assert cp["replacement_history"][1]["encrypted_content"] == "gAAAA_encrypted"
+    # Post-compaction message should still be present
+    post_items = [
+        r
+        for r in records
+        if r["type"] == "response_item"
+        and r["payload"].get("content") == [{"type": "input_text", "text": "after compaction"}]
+    ]
+    assert len(post_items) == 1
+
+
+def test_rollout_records_without_compaction_item_has_no_compacted_entry() -> None:
+    """Sessions without compaction produce no Compacted rollout record."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "response_id": "resp_1",
+        },
+    ]
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+    )
+    types = [r["type"] for r in records]
+    assert "compacted" not in types

@@ -635,7 +635,7 @@ async def test_web_ui_api_prefix_miss_returns_json_not_spa_shell(tmp_path: Path)
     The committed server mounts the SPA at ``/`` after API routers. If a
     route is absent in a stacked build, the static fallback still receives
     ``/v1/...``; API-shaped misses must return JSON 404 instead of
-    ``index.html`` so the ap-web Codex goal controls can surface a normal
+    ``index.html`` so the web Codex goal controls can surface a normal
     request failure.
     """
     web_ui_dist = tmp_path / "web-ui"

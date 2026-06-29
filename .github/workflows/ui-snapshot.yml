@@ -23,7 +23,7 @@ name: UI Snapshot
 #                      baselines; fail (with actual/expected/diff PNGs in the
 #                      artifact) on any mismatch. No secrets, so fork PRs run
 #                      fine. The render job is gated on the `detect` job (below):
-#                      a PR that touches none of the render inputs (ap-web, the
+#                      a PR that touches none of the render inputs (web, the
 #                      visual tests + fixtures, the pinned toolchain) SKIPS the
 #                      render. We gate at the job (not via `on: paths:`) on
 #                      purpose -- a job skipped by `if` reports SUCCESS, so this
@@ -72,7 +72,7 @@ jobs:
   # Cheap pre-flight (no container/build): does this PR touch anything that can
   # change the render? The heavy job below is `if`-gated on it, so non-UI PRs
   # skip the render (no wasted CI, no flaking against unrelated changes). The
-  # render is a pure function of the ap-web bundle + the visual tests + their
+  # render is a pure function of the web bundle + the visual tests + their
   # shared fixtures + the pinned toolchain (npm pin, the image digest in THIS
   # file, and the playwright/plugin versions in the lock), so watch exactly
   # those. Fails open: if the file list can't be fetched, render rather than
@@ -95,7 +95,7 @@ jobs:
           if ! files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename'); then
             echo "ui=true" >> "$GITHUB_OUTPUT"; echo "file list unavailable -> render"; exit 0
           fi
-          pattern='^(ap-web/|tests/e2e_ui/visual/|tests/e2e_ui/conftest\.py|\.github/actions/setup-node/|\.github/workflows/ui-snapshot\.yml|pyproject\.toml|uv\.lock)'
+          pattern='^(web/|tests/e2e_ui/visual/|tests/e2e_ui/conftest\.py|\.github/actions/setup-node/|\.github/workflows/ui-snapshot\.yml|pyproject\.toml|uv\.lock)'
           if printf '%s\n' "$files" | grep -qE "$pattern"; then
             echo "ui=true" >> "$GITHUB_OUTPUT"
             echo "render-affecting files changed:"
@@ -126,7 +126,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
@@ -134,12 +134,12 @@ jobs:
         uses: ./.github/actions/setup-node
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
           enable-cache: true
 
       - name: Cache virtualenv
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
         with:
           path: .venv
           # Namespaced away from e2e-ui.yml's host venv: this venv is built with
@@ -154,14 +154,14 @@ jobs:
       # + system deps under $PLAYWRIGHT_BROWSERS_PATH (/ms-playwright), so the
       # uv-synced playwright 1.60.0 finds them with no download.
 
-      - name: Build ap-web SPA
+      - name: Build web SPA
         # Build BEFORE pytest: Vite's emptyOutDir clobbers the static dir, so
         # never run it alongside the live server. --legacy-peer-deps avoids
         # re-resolving the known React 19 peer conflict under @emoji-mart/react.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          cd ap-web
+          cd web
           npm ci --legacy-peer-deps --no-audit --no-fund
           npm run build
 
@@ -194,7 +194,7 @@ jobs:
       - name: Upload screenshots
         id: upload_screens
         if: ${{ always() && (steps.snapshot.conclusion == 'success' || steps.snapshot.conclusion == 'failure') }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: ui-snapshot-${{ github.run_id }}
           # snapshots/ is this run's render (identical to the baseline on a pass;

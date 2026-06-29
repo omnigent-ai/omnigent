@@ -141,10 +141,13 @@ _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
 # shape varies by version, so detecting either keeps the fix robust.
 #
 # ``codexErrorInfo`` is the app-server's structured classification (e.g.
-# ``Unauthorized``, ``UsageLimitExceeded``); auth-class values get a re-auth
-# hint. httpStatusCode 401/403 is treated as auth too.
+# ``unauthorized``, ``usage_limit_exceeded``); auth-class values get a re-auth
+# hint. httpStatusCode 401/403 is treated as auth too. Values are stored and
+# compared case-insensitively: the app-server enum serializes as lowercase
+# snake_case (``unauthorized``), but older/alternate spellings (``Unauthorized``)
+# are matched too.
 _CODEX_ERROR_ITEM_TYPE = "error"
-_CODEX_AUTH_ERROR_INFO = frozenset({"Unauthorized"})
+_CODEX_AUTH_ERROR_INFO = frozenset({"unauthorized"})
 _CODEX_AUTH_HTTP_STATUS = frozenset({401, 403})
 # Message-substring fallback for app-server versions that omit codexErrorInfo.
 # Surface-only, so recall is favored over precision: a false positive only
@@ -338,6 +341,10 @@ class _CodexForwarderState:
     # identical posts when Codex signals completion via both a
     # ``contextCompaction`` item and a ``thread/compacted`` notification.
     compaction_status_posted: str | None = None
+    # Whether the compaction item has already been persisted for the current
+    # compaction boundary.  Reset to ``False`` when a new ``"in_progress"``
+    # status is posted.
+    compaction_item_persisted: bool = False
     # Codex reasoning item id whose live deltas are currently being mirrored.
     # When a delta arrives for a different item, it opens a new reasoning
     # block (``started=True`` → ``response.reasoning.started``). Reset at each
@@ -732,9 +739,10 @@ def _classify_codex_error(error: dict[str, Any], message: str) -> str:
     """
     Classify a Codex ``turn.error`` / ``error`` item as auth-related or generic.
 
-    Prefers the structured ``codexErrorInfo`` (``Unauthorized`` or an
-    httpStatusCode of 401/403); falls back to substring matching against
-    :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes that omit it.
+    Prefers the structured ``codexErrorInfo`` (an ``unauthorized`` variant,
+    case-insensitive, or an httpStatusCode of 401/403); falls back to substring
+    matching against :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes
+    that omit it.
 
     :param error: The ``turn.error`` object.
     :param message: Its already-extracted message text.
@@ -749,7 +757,8 @@ def _classify_codex_error(error: dict[str, Any], message: str) -> str:
     elif isinstance(info, dict):
         variant = info.get("type") or info.get("kind") or info.get("variant")
         http_status = info.get("httpStatusCode")
-    if variant in _CODEX_AUTH_ERROR_INFO or http_status in _CODEX_AUTH_HTTP_STATUS:
+    variant_is_auth = variant is not None and variant.lower() in _CODEX_AUTH_ERROR_INFO
+    if variant_is_auth or http_status in _CODEX_AUTH_HTTP_STATUS:
         return _CODEX_ERROR_KIND_AUTH
     lowered = message.lower()
     if any(fragment in lowered for fragment in _CODEX_AUTH_ERROR_FRAGMENTS):
@@ -2281,6 +2290,7 @@ async def _handle_event(
             params=params,
             delta_coalescer=delta_coalescer if not is_child else None,
             forwarder_state=forwarder_state,
+            bridge_dir=bridge_dir,
         )
 
 
@@ -2650,6 +2660,18 @@ async def _maybe_handle_turn_event(
         await _post_compaction_status(
             client, session_id, "completed", forwarder_state=forwarder_state
         )
+        if forwarder_state is None or not forwarder_state.compaction_item_persisted:
+            try:
+                await _persist_codex_compaction_item(
+                    client, session_id=session_id, bridge_dir=bridge_dir
+                )
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
+                )
+            else:
+                if forwarder_state is not None:
+                    forwarder_state.compaction_item_persisted = True
         return True
     return False
 
@@ -2722,6 +2744,7 @@ async def _handle_completed_event(
     params: dict[str, Any],
     delta_coalescer: _OutputTextDeltaCoalescer | None,
     forwarder_state: _CodexForwarderState | None,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Flush pending text and mirror one completed Codex item.
@@ -2739,7 +2762,9 @@ async def _handle_completed_event(
         await delta_coalescer.flush()
     if forwarder_state is not None:
         forwarder_state.record_completed_plan(params)
-    await _handle_completed_item(client, session_id, params, forwarder_state=forwarder_state)
+    await _handle_completed_item(
+        client, session_id, params, forwarder_state=forwarder_state, bridge_dir=bridge_dir
+    )
 
 
 async def _handle_terminal_turn_boundary(
@@ -3587,6 +3612,7 @@ async def _handle_completed_item(
     params: dict[str, Any],
     *,
     forwarder_state: _CodexForwarderState | None = None,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Forward one Codex completed item event when it maps to Omnigent history.
@@ -3630,6 +3656,18 @@ async def _handle_completed_item(
         await _post_compaction_status(
             client, session_id, "completed", forwarder_state=forwarder_state
         )
+        if forwarder_state is None or not forwarder_state.compaction_item_persisted:
+            try:
+                await _persist_codex_compaction_item(
+                    client, session_id=session_id, bridge_dir=bridge_dir
+                )
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
+                )
+            else:
+                if forwarder_state is not None:
+                    forwarder_state.compaction_item_persisted = True
         return
     if not _claim_completed_item(params, item, forwarder_state):
         return
@@ -5000,6 +5038,107 @@ async def _post_compaction_status(
     _log_failed_session_event_post(_EXTERNAL_COMPACTION_STATUS_TYPE, response)
     if forwarder_state is not None and response is not None and response.status_code < 400:
         forwarder_state.compaction_status_posted = status
+        if status == "in_progress":
+            forwarder_state.compaction_item_persisted = False
+
+
+async def _persist_codex_compaction_item(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path | None = None,
+) -> None:
+    """Persist a compaction boundary item to the conversation store.
+
+    Codex appends a ``Compacted`` entry to the rollout JSONL after
+    compaction. That entry carries ``replacement_history`` — the
+    post-compaction context. When ``bridge_dir`` is available, we
+    read the latest ``Compacted`` entry from the rollout and use
+    its ``replacement_history`` as ``compacted_messages``.
+    """
+    resp = await client.get(
+        f"/v1/sessions/{session_id}/items",
+        params={"limit": 1, "order": "desc"},
+    )
+    resp.raise_for_status()
+    items = resp.json().get("data", [])
+    last_item_id = items[0]["id"] if items else f"compact_boundary_{session_id}"
+
+    compacted = None
+    if bridge_dir is not None:
+        try:
+            state = read_bridge_state(bridge_dir)
+            if state is not None:
+                codex_home = Path(state.codex_home)
+                thread_id = state.thread_id
+                rollout_files = sorted(
+                    codex_home.glob(f"sessions/**/*rollout-*{thread_id}.jsonl"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if rollout_files:
+                    compacted = _read_compacted_history(rollout_files[0])
+        except Exception:  # noqa: BLE001
+            _logger.debug(
+                "Failed to read codex rollout for compaction persist",
+                exc_info=True,
+            )
+
+    data: dict[str, object] = {
+        "summary": "[Codex compaction — context was compacted in the terminal]",
+        "last_item_id": last_item_id,
+        "model": "unknown",
+        "token_count": 0,
+    }
+    if compacted is not None:
+        if compacted.get("replacement_history"):
+            data["compacted_messages"] = compacted["replacement_history"]
+        if compacted.get("window_id") is not None:
+            data["window_id"] = compacted["window_id"]
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "compaction", "data": data},
+    )
+    resp.raise_for_status()
+
+
+def _read_compacted_history(rollout_path: Path) -> dict[str, object] | None:
+    """Read the last ``Compacted`` entry from a rollout JSONL.
+
+    Codex appends a ``{type: "compacted", payload: {replacement_history: [...],
+    window_id: N}}`` entry after compaction. Returns a dict with
+    ``replacement_history`` and ``window_id`` for persistence, or ``None``.
+
+    :param rollout_path: Path to the rollout JSONL.
+    :returns: Dict with ``replacement_history`` and ``window_id``, or ``None``.
+    """
+    last_compacted = None
+    with rollout_path.open() as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if entry.get("type") == "compacted":
+                last_compacted = entry
+    if last_compacted is None:
+        return None
+    payload = last_compacted.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    history = payload.get("replacement_history")
+    if not isinstance(history, list) or not history:
+        return None
+    # Store the full replacement_history — messages + compaction
+    # tokens. Although the messages duplicate pre-compaction items
+    # in the conversation store, they are needed for rollout
+    # reconstruction (e.g. sandbox recovery where the rollout file
+    # is lost).
+    return {
+        "replacement_history": [item for item in history if isinstance(item, dict)],
+        "window_id": payload.get("window_id"),
+    }
 
 
 async def _handle_reasoning_delta(
@@ -5168,7 +5307,116 @@ def _session_usage_data_from_params(params: dict[str, Any]) -> dict[str, int] | 
     return data
 
 
+@dataclass
+class _ForwardHealth:
+    """
+    Process-level health of Omnigent session-event forwarding (#1120).
+
+    Network failures (connect timeouts, 503s, resets) make
+    ``_post_session_event`` drop transcript/usage events after its bounded
+    retries, previously visible only as scattered per-item warnings. This
+    tracks consecutive permanent failures so a sustained outage escalates
+    to a single loud signal instead of staying effectively silent.
+
+    :param consecutive_failures: Permanent post failures since the last
+        success.
+    :param degraded_logged: Whether the degraded-sync edge has already
+        been logged for the current outage (so it logs once, not per item).
+    """
+
+    consecutive_failures: int = 0
+    degraded_logged: bool = False
+
+
+# After this many consecutive permanent forward failures, sync is treated as
+# degraded and escalated once to ERROR. Small enough to fire during a real
+# outage, large enough to ride out a transient blip the retries already cover.
+_FORWARD_DEGRADED_THRESHOLD = 5
+_forward_health = _ForwardHealth()
+
+
+def _reset_forward_health() -> None:
+    """
+    Reset forward-health tracking (test seam / new forwarder lifetime).
+
+    :returns: None.
+    """
+    global _forward_health
+    _forward_health = _ForwardHealth()
+
+
+def _note_forward_success() -> None:
+    """
+    Record a successful forward, clearing any degraded-sync state.
+
+    :returns: None.
+    """
+    if _forward_health.degraded_logged:
+        _logger.info(
+            "codex-native forward sync recovered after %d consecutive failures",
+            _forward_health.consecutive_failures,
+        )
+    _forward_health.consecutive_failures = 0
+    _forward_health.degraded_logged = False
+
+
+def _note_forward_failure(event_type: str) -> None:
+    """
+    Record a permanent forward failure; escalate once when sync degrades.
+
+    :param event_type: Session event type that failed to post, e.g.
+        ``"external_conversation_item"``.
+    :returns: None.
+    """
+    _forward_health.consecutive_failures += 1
+    if (
+        _forward_health.consecutive_failures >= _FORWARD_DEGRADED_THRESHOLD
+        and not _forward_health.degraded_logged
+    ):
+        _logger.error(
+            "codex-native forward sync degraded: %d consecutive Omnigent "
+            "event-post failures; transcript/usage mirroring may be incomplete "
+            "(latest type=%s)",
+            _forward_health.consecutive_failures,
+            event_type,
+        )
+        _forward_health.degraded_logged = True
+
+
 async def _post_session_event(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    event_type: str,
+    data: dict[str, Any],
+) -> httpx.Response | None:
+    """
+    Post one Omnigent session event, tracking forward-sync health (#1120).
+
+    Thin wrapper over :func:`_post_session_event_inner` that classifies the
+    outcome — a sub-400 response is a success; ``None`` or a >=400 final
+    response is a permanent failure — and updates :data:`_forward_health`
+    so a sustained outage escalates to a single ERROR instead of silently
+    dropping events.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param event_type: Session event type, e.g.
+        ``"external_conversation_item"``.
+    :param data: Event data payload, e.g. ``{"status": "running"}``.
+    :returns: The same value as :func:`_post_session_event_inner`.
+    """
+    response = await _post_session_event_inner(
+        client, session_id, event_type=event_type, data=data
+    )
+    if response is not None and response.status_code < 400:
+        _note_forward_success()
+    else:
+        _note_forward_failure(event_type)
+    return response
+
+
+async def _post_session_event_inner(
     client: httpx.AsyncClient,
     session_id: str,
     *,

@@ -23,9 +23,13 @@ import json
 import logging
 import os
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from omnigent.spec.types import MCPServerConfig
 
 _logger = logging.getLogger(__name__)
 
@@ -129,6 +133,111 @@ def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, o
     return path
 
 
+def build_opencode_mcp_block(
+    servers: Sequence[MCPServerConfig],
+) -> dict[str, dict[str, object]]:
+    """
+    Translate Omnigent MCP server declarations into opencode.json's ``mcp`` block.
+
+    Mirrors how codex/claude expose the agent's MCP servers, but via opencode's
+    own config (no relay): ``stdio`` → ``{type:"local", command:[cmd, *args],
+    environment, enabled}``; ``http`` → ``{type:"remote", url, headers,
+    enabled}``. A ``databricks_profile`` resolves a bearer token into the
+    ``Authorization`` header at spawn (re-resolved on resume, like the gateway
+    provider). Entries opencode can't represent (missing command / url) are
+    skipped.
+
+    :param servers: The agent spec's ``mcp_servers``.
+    :returns: An opencode ``mcp`` block keyed by server name (empty when none
+        are representable).
+    """
+    block: dict[str, dict[str, object]] = {}
+    for server in servers:
+        name = getattr(server, "name", None)
+        if not name:
+            continue
+        if getattr(server, "transport", "http") == "stdio":
+            command = getattr(server, "command", None)
+            if not command:
+                continue
+            entry: dict[str, object] = {
+                "type": "local",
+                "command": [command, *getattr(server, "args", [])],
+                "enabled": True,
+            }
+            env = dict(getattr(server, "env", {}) or {})
+            if env:
+                entry["environment"] = env
+        else:
+            url = getattr(server, "url", None)
+            if not url:
+                continue
+            headers = dict(getattr(server, "headers", {}) or {})
+            profile = getattr(server, "databricks_profile", None)
+            if profile and "Authorization" not in headers:
+                token = _databricks_bearer_token(profile)
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+            entry = {"type": "remote", "url": url, "enabled": True}
+            if headers:
+                entry["headers"] = headers
+        block[str(name)] = entry
+    return block
+
+
+def build_opencode_omnigent_mcp_server(
+    bridge_dir: Path, *, python_executable: str | None = None
+) -> dict[str, dict[str, object]]:
+    """
+    Build the opencode ``mcp`` entry that connects opencode to Omnigent's MCP.
+
+    This is what makes opencode's model call the Omnigent builtin tools
+    (``sys_session_*``, ``sys_agent_*``, ``load_skill``, ``web_fetch``,
+    ``list_comments``/``update_comment``, policy tools, …). opencode launches the
+    SHARED ``omnigent.claude_native_bridge serve-mcp`` as a ``{type:"local"}``
+    stdio MCP server (the same relay codex/cursor/qwen use); ``serve-mcp`` reads
+    the relay URL+token from ``tool_relay.json`` in *bridge_dir* (written by the
+    runner's comment relay) and proxies each tool call back through the Omnigent
+    server, where policy is enforced. The command is sourced from
+    :func:`claude_native_bridge.build_mcp_config` so the invocation stays in one
+    place.
+
+    :param bridge_dir: OpenCode-native bridge directory (must hold ``bridge.json``
+        + ``tool_relay.json``).
+    :param python_executable: Python to run ``serve-mcp`` with; ``None`` uses the
+        runner interpreter (has ``omnigent`` importable).
+    :returns: A one-entry ``mcp`` block ``{"omnigent": {type:"local", …}}``.
+    """
+    from omnigent.claude_native_bridge import build_mcp_config
+
+    claude_cfg = build_mcp_config(bridge_dir, python_executable=python_executable)
+    # build_mcp_config returns {"mcpServers": {"<name>": {command, args, env}}};
+    # opencode wants a flat command list + ``environment``.
+    name, server = next(iter(claude_cfg["mcpServers"].items()))
+    entry: dict[str, object] = {
+        "type": "local",
+        "command": [server["command"], *server.get("args", [])],
+        "enabled": True,
+    }
+    env = dict(server.get("env", {}) or {})
+    if env:
+        entry["environment"] = env
+    return {str(name): entry}
+
+
+def _databricks_bearer_token(profile: str) -> str | None:
+    """Resolve a bearer token for a ``~/.databrickscfg`` profile (best-effort)."""
+    try:
+        from databricks.sdk.core import Config
+
+        headers = Config(profile=profile).authenticate() or {}
+        authz = headers.get("Authorization", "")
+        return authz.split(" ", 1)[1] if authz.lower().startswith("bearer ") else None
+    except Exception as exc:  # noqa: BLE001 - SDK absent / bad profile / auth failure.
+        _logger.info("opencode MCP databricks token resolve failed for %r: %r", profile, exc)
+        return None
+
+
 def resolve_databricks_gateway(
     profile: str | None,
     *,
@@ -192,3 +301,185 @@ def _gateway_endpoint_for_model(model_id: str | None) -> str | None:
         return None
     candidate = model_id.split("/", 1)[1] if model_id.startswith("databricks/") else model_id
     return candidate if candidate.startswith("databricks-") else None
+
+
+def _strip_jsonc_comments(text: str) -> str:
+    """
+    Strip ``//`` line comments and ``/* */`` block comments from JSONC text.
+
+    Uses a character-level state machine to track string boundaries, so
+    ``//`` inside string literals (e.g. URLs like ``"https://example.com"``)
+    are never mistaken for comments.
+    """
+    result: list[str] = []
+    i = 0
+    length = len(text)
+    in_string = False
+    string_char: str | None = None
+
+    while i < length:
+        ch = text[i]
+
+        if in_string:
+            if ch == "\\":
+                result.append(ch)
+                i += 1
+                if i < length:
+                    result.append(text[i])
+                    i += 1
+            elif ch == string_char:
+                in_string = False
+                result.append(ch)
+                i += 1
+            else:
+                result.append(ch)
+                i += 1
+        elif ch in ('"', "'"):
+            in_string = True
+            string_char = ch
+            result.append(ch)
+            i += 1
+        elif ch == "/" and i + 1 < length:
+            next_ch = text[i + 1]
+            if next_ch == "/":
+                i += 2
+                while i < length and text[i] != "\n":
+                    i += 1
+            elif next_ch == "*":
+                i += 2
+                while i + 1 < length:
+                    if text[i] == "*" and text[i + 1] == "/":
+                        i += 2
+                        break
+                    i += 1
+            else:
+                result.append(ch)
+                i += 1
+        else:
+            result.append(ch)
+            i += 1
+
+    return "".join(result)
+
+
+def _strip_trailing_commas(text: str) -> str:
+    """Remove trailing commas before ``}`` or ``]`` (valid in JSONC, invalid in JSON).
+
+    Operates on text that has already had its JSONC comments stripped, so the
+    only commas present are real JSON commas.  Uses a character-level state
+    machine that tracks string boundaries so that ``, }`` or ``, ]`` inside
+    quoted values are never mistaken for trailing commas — preventing silent
+    corruption of provider options like ``"note": "a, }"``.
+    """
+    result: list[str] = []
+    i = 0
+    length = len(text)
+    in_string = False
+    string_char: str | None = None
+
+    while i < length:
+        ch = text[i]
+
+        if in_string:
+            if ch == "\\":
+                result.append(ch)
+                i += 1
+                if i < length:
+                    result.append(text[i])
+                    i += 1
+            elif ch == string_char:
+                in_string = False
+                result.append(ch)
+                i += 1
+            else:
+                result.append(ch)
+                i += 1
+        elif ch in ('"', "'"):
+            in_string = True
+            string_char = ch
+            result.append(ch)
+            i += 1
+        elif ch == ",":
+            j = i + 1
+            while j < length and text[j] in (" ", "\t", "\n", "\r"):
+                j += 1
+            if j < length and text[j] in ("}", "]"):
+                i = j
+            else:
+                result.append(ch)
+                i += 1
+        else:
+            result.append(ch)
+            i += 1
+
+    return "".join(result)
+
+
+def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, object]:
+    """
+    Merge the user's global OpenCode provider definitions into *config*.
+
+    OpenCode reads ``XDG_CONFIG_HOME/opencode/opencode.json(c)`` for custom
+    provider definitions (e.g. OpenAI-compatible endpoints with custom base
+    URLs). When running under Omnigent, the per-session ``XDG_CONFIG_HOME``
+    override hides this global config. This function reads the user's real
+    config and merges any ``provider`` block into *config* so the spawned
+    server sees both the user's providers (with their custom base URLs) and
+    any Omnigent-synthesized providers (e.g. Databricks gateway).
+
+    Only ``provider`` entries are merged — the synthesized config takes
+    precedence for all other keys (model, mcp, plugin, permission, etc.).
+
+    :param config: The synthesized config dict (may be empty).
+    :returns: *config* with user's ``provider`` entries merged in (if any).
+    """
+    from omnigent.opencode_native_bridge import user_opencode_config_path
+
+    user_path = user_opencode_config_path()
+    if user_path is None:
+        return config
+
+    try:
+        raw = user_path.read_text(encoding="utf-8")
+        # Try plain JSON first (handles .json files without comments).
+        # If that fails, strip JSONC comments and trailing commas, then
+        # retry (handles .jsonc).
+        try:
+            user_config = json.loads(raw)
+        except json.JSONDecodeError:
+            cleaned = _strip_jsonc_comments(raw)
+            cleaned = _strip_trailing_commas(cleaned)
+            user_config = json.loads(cleaned)
+    except (OSError, UnicodeDecodeError):
+        return config
+    except json.JSONDecodeError:
+        _logger.warning(
+            "Failed to parse user OpenCode config at %s — ignoring user providers",
+            user_path,
+        )
+        return config
+
+    if not isinstance(user_config, dict):
+        return config
+
+    user_providers = user_config.get("provider")
+    if not isinstance(user_providers, dict) or not user_providers:
+        return config
+
+    result = dict(config)
+    existing = result.get("provider")
+    if isinstance(existing, dict):
+        # Merge user's providers alongside existing ones; don't clobber
+        # synthesized providers (Omnigent's keys like "databricks-gateway"
+        # take priority).
+        merged = dict(existing)
+        for key, value in user_providers.items():
+            if key not in merged:
+                merged[key] = value
+        result["provider"] = merged
+    else:
+        result["provider"] = dict(user_providers)
+
+    result.setdefault("$schema", "https://opencode.ai/config.json")
+
+    return result

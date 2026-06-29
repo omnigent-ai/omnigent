@@ -502,6 +502,102 @@ async def test_external_session_status_event_lands_in_status_cache(
         sessions_module._session_status_cache.pop(session["id"], None)
 
 
+# ── POST /v1/sessions/{id}/events external_session_superseded ─────
+
+
+async def test_external_session_superseded_publishes_redirect_event(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Posting ``external_session_superseded`` republishes a
+    ``session.superseded`` SSE event carrying the redirect target.
+
+    This is the claude-native forwarder's live-only redirect signal after
+    a Claude ``/clear``: a client viewing the old conversation follows to
+    the new one. The event is transient (not persisted) — the handler only
+    publishes to the session stream.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_superseded",
+            "data": {"target_conversation_id": "conv_new"},
+        },
+    )
+    assert resp.status_code in (200, 202)
+
+    superseded = [ev for _sid, ev in published if ev.get("type") == "session.superseded"]
+    assert len(superseded) == 1
+    event = superseded[0]
+    assert event["conversation_id"] == session["id"]
+    assert event["target_conversation_id"] == "conv_new"
+    assert event["reason"] == "clear"
+
+
+async def test_external_session_superseded_requires_target(
+    client: httpx.AsyncClient,
+) -> None:
+    """A superseded event without a target conversation id is rejected."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_superseded", "data": {}},
+    )
+    assert resp.status_code == 400
+
+
+async def test_external_session_superseded_drains_pending_inputs(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Superseding a session discards its unconsumed pending inputs.
+
+    The ``/clear`` the user typed in the web UI is recorded as a pending input
+    but never mirrored back (the session rotated away), so it would otherwise
+    re-hydrate as a stuck optimistic bubble on every reload of the old chat.
+    The superseded handler drains it (without committing it as a user message).
+    """
+    from omnigent.runtime import pending_inputs
+
+    pending_inputs.reset_for_tests()
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    try:
+        # The optimistic pending entry the web composer recorded when the user
+        # sent ``/clear`` from the UI.
+        pending_inputs.record(session["id"], [{"type": "input_text", "text": "/clear"}])
+        assert pending_inputs.snapshot_for(session["id"]) != []
+
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_session_superseded",
+                "data": {"target_conversation_id": "conv_new"},
+            },
+        )
+        assert resp.status_code in (200, 202)
+
+        # Drained — so it won't reappear from the snapshot on reload, and it was
+        # NOT committed as a message item (the fresh session stays empty: no
+        # /clear bubble was promoted into history).
+        assert pending_inputs.snapshot_for(session["id"]) == []
+        items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+        assert not any(item["type"] == "message" for item in items)
+    finally:
+        pending_inputs.reset_for_tests()
+
+
 # ── POST /v1/sessions/{id}/events external_subagent_start ─────────
 
 
@@ -3570,7 +3666,7 @@ async def test_post_external_session_usage_publishes_session_usage(
     persists the value on the conversation labels.
 
     The claude-native forwarder posts this whenever Claude's transcript
-    grows a fresh ``message.usage`` block so the ap-web context ring
+    grows a fresh ``message.usage`` block so the web context ring
     updates without waiting for a ``response.completed`` event (Claude
     Code runs in a separate process and never produces one). Both the
     live SSE path and the snapshot-restore path read from this event:
@@ -4119,6 +4215,81 @@ async def test_accumulate_session_usage_prices_from_usage_model(
     # cost = 1000*1e-6 + 500*2e-6 = 0.002 — priced via usage.model despite the
     # spec model being absent from the catalog.
     assert usage.get("total_cost_usd") == pytest.approx(0.002)
+
+
+async def test_accumulate_session_usage_prefers_provider_cost(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A harness-reported ``cost_usd`` is used verbatim, overriding the catalog estimate.
+
+    Copilot reports the authoritative AI-credit cost it billed; the relay must
+    prefer that over recomputing from token counts x catalog pricing (which can
+    diverge, e.g. when the catalog lacks a cache-write rate).
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    # The catalog WOULD price this turn at 2.0 USD; the provider cost must win.
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "model": "harness-model",
+                "cost_usd": 0.01827875,
+            }
+        },
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+    usage = _read_session_usage(db_uri, session["id"])
+    # Catalog would charge 1000*1e-3 + 500*2e-3 = 2.0; the provider cost wins.
+    assert usage.get("total_cost_usd") == pytest.approx(0.01827875)
+    assert usage["by_model"]["harness-model"]["total_cost_usd"] == pytest.approx(0.01827875)
+
+
+async def test_accumulate_session_usage_provider_cost_prices_uncatalogued_model(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A harness ``cost_usd`` makes a turn priced even when the catalog can't price it.
+
+    Without a catalog entry the token-price path leaves the turn unpriced; an
+    authoritative provider cost should still record ``total_cost_usd``.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: None,  # catalog can't price anything
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "model": "grok-4.3",
+                "cost_usd": 0.0042,
+            }
+        },
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage.get("total_cost_usd") == pytest.approx(0.0042)
+    assert usage["by_model"]["grok-4.3"]["total_cost_usd"] == pytest.approx(0.0042)
 
 
 async def test_accumulate_session_usage_unpriced_without_usage_model(
@@ -5347,7 +5518,7 @@ async def test_post_external_session_usage_rejects_negative_context_tokens(
     """
     Negative or non-int ``context_tokens`` is rejected with a 400.
 
-    Defends ap-web's ring math (``pct = tokensUsed / contextWindow``)
+    Defends web's ring math (``pct = tokensUsed / contextWindow``)
     from inheriting a bogus negative numerator that would clamp the
     arc to zero and silently mislead users about their context budget.
     """
@@ -5370,7 +5541,7 @@ async def test_post_external_session_todos_publishes_session_todos(
     ``external_session_todos`` publishes a ``session.todos`` SSE event.
 
     The claude-native forwarder posts this on every PostToolUse / TodoWrite
-    hook so the ap-web todo panel updates in real time. A regression here
+    hook so the web todo panel updates in real time. A regression here
     would break the panel for ``omnigent claude`` sessions: the UI would
     never receive a ``session.todos`` broadcast and the panel would stay
     blank even when Claude has active tasks.

@@ -33,12 +33,12 @@ on:
       - 'deploy/docker/Dockerfile'
       - 'deploy/docker/entrypoint.py'
       - 'omnigent/**'
-      - 'ap-web/**'
+      - 'web/**'
       - 'sdks/**'
       - 'pyproject.toml'
       - 'setup.py'
       - 'uv.lock'
-      - 'ap-web/package-lock.json'
+      - 'web/package-lock.json'
       - '.github/workflows/oss-publish-images.yml'
   # Daily nightly promotion (07:00 UTC). Retags the current :latest-dev as
   # :latest-nightly — handled by promote-nightly, not a rebuild.
@@ -98,7 +98,7 @@ jobs:
 
       # Needed only for the PEP 440 max() on tag pushes; cheap on other events.
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
           enable-cache: false
 
@@ -258,7 +258,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Syft
-        uses: anchore/sbom-action/download-syft@fc46e51fd3cb168ffb36c6d1915723c47db58abb  # v0.17.7
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
 
       - name: Generate server SBOM
         run: |
@@ -282,7 +282,7 @@ jobs:
             -o spdx-json=openshell-sbom.spdx.json
 
       - name: Upload SBOMs
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: sbom
           path: |
@@ -353,7 +353,7 @@ jobs:
           version: v0.21.6
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
           enable-cache: false
 

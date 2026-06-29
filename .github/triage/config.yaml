@@ -57,7 +57,7 @@ prompt: |
   - `comp:server` — the Omnigent server, API, session management
   - `comp:runner` — the agent runner, execution engine
   - `comp:repr` — serialization, representation layer
-  - `comp:web-ui` — the web frontend (ap-web)
+  - `comp:web-ui` — the web frontend (web)
   - `comp:tui` — the terminal UI, REPL, and CLI
   - `comp:policies` — safety policies, guardrails
   - `comp:harnesses` — SDK harnesses (Claude, Cursor, Antigravity, etc.)

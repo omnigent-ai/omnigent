@@ -8,8 +8,16 @@ configuration in issues, tests, examples, or logs.
 
 ## Development setup
 
-This is a Python package with an optional frontend under `ap-web/`. Use
+This is a Python package with an optional frontend under `web/`. Use
 [`uv`](https://docs.astral.sh/uv/) for local development:
+
+**Supported dev OS: macOS or Linux.** Native Windows is not supported for
+development — some test dependencies are POSIX-only (`pexpect`/`pyte` are
+excluded on Windows), a few modules import POSIX stdlib or call `os.getuid()`
+at import time, and the `pre-commit` hooks assume the Unix `.venv/bin/` layout,
+so `pytest` and `pre-commit` cannot pass natively. On Windows, use
+**WSL2 (Ubuntu)** and clone into the **Linux** filesystem (`~/…`, not `/mnt/c`);
+this matches CI. Git Bash is not sufficient — it runs native-Windows Python.
 
 Install local prerequisites first:
 
@@ -20,7 +28,7 @@ Install local prerequisites first:
 - `bubblewrap` (`bwrap`), **Linux only**, used to OS-sandbox those native
   Claude/Codex/Pi terminals (`apt install bubblewrap` on Debian/Ubuntu). macOS
   uses the built-in `seatbelt` sandbox and needs nothing extra.
-- Node.js 22 LTS or newer with `npm` when working on `ap-web/`.
+- Node.js 22 LTS or newer with `npm` when working on `web/`.
 
 ```bash
 git clone https://github.com/omnigent-ai/omnigent.git
@@ -40,10 +48,10 @@ uv run ruff check . && uv run ruff format --check .
 uv run pre-commit run --all-files
 ```
 
-When touching `ap-web/`:
+When touching `web/`:
 
 ```bash
-cd ap-web && npm install && npm run lint && npm run build
+cd web && npm install && npm run lint && npm run build
 ```
 
 ## Running locally
@@ -59,7 +67,7 @@ omnigent server
 omnigent host --server http://localhost:6767
 
 # Terminal 3: frontend dev server
-cd ap-web
+cd web
 npm run dev
 ```
 
@@ -117,7 +125,7 @@ Two cross-cutting suites sit on top of these:
   user-facing functionality **must** include at least one e2e happy-path test
   (see `.github/copilot-instructions.md`).
 
-### Frontend (`ap-web/`)
+### Frontend (`web/`)
 
 Frontend changes follow the same expectation with a different toolchain:
 

@@ -20,7 +20,7 @@ on:
     - cron: "0 9 * * *"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
-    paths-ignore: ['ap-web/**', 'tests/e2e_ui/**']
+    paths-ignore: ['web/**', 'tests/e2e_ui/**']
   workflow_dispatch:
     inputs:
       branch:
@@ -42,7 +42,7 @@ permissions:
   contents: read
 
 env:
-  # No ap-web SPA build during `uv sync`: this job never serves the
+  # No web SPA build during `uv sync`: this job never serves the
   # bundle and the build hits public npm with no registry mirror.
   OMNIGENT_SKIP_WEB_UI: "true"
   # Never let the test server pick up the runner's own credentials.

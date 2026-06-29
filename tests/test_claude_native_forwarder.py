@@ -300,7 +300,10 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
             assert body == {"target_session_id": "conv_new"}
             return httpx.Response(200, json={"id": "terminal_claude_main"})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_old":
-            assert body == {"runner_id": ""}
+            assert body == {
+                "runner_id": "",
+                "labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"},
+            }
             return httpx.Response(200, json={"id": "conv_old"})
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
@@ -353,7 +356,11 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
             "/v1/sessions/conv_old/resources/terminals/terminal_claude_main/transfer",
             {"target_session_id": "conv_new"},
         ),
-        ("PATCH", "/v1/sessions/conv_old", {"runner_id": ""}),
+        (
+            "PATCH",
+            "/v1/sessions/conv_old",
+            {"runner_id": "", "labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"}},
+        ),
     ]
 
 
@@ -419,7 +426,10 @@ async def test_clear_hook_rotation_survives_old_runner_clear_failure(
             assert body == {"target_session_id": "conv_new"}
             return httpx.Response(200, json={"id": "terminal_claude_main"})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_old":
-            assert body == {"runner_id": ""}
+            assert body == {
+                "runner_id": "",
+                "labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"},
+            }
             return httpx.Response(503, json={"error": {"message": "temporary failure"}})
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
@@ -452,6 +462,201 @@ async def test_clear_hook_rotation_survives_old_runner_clear_failure(
     assert rotated_again is None
     assert create_count == 1
     assert read_active_session_id(bridge_dir) == "conv_new"
+
+
+@pytest.mark.asyncio
+async def test_clear_hook_transfer_failure_does_not_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A terminal-transfer failure during /clear must NOT spin into a session loop.
+
+    Regression guard for the unbounded-session-creation bug: when the terminal
+    transfer fails (e.g. 400 because the target already owns a terminal), the
+    rotation must still consume the clear hook so the forwarder's next poll does
+    not re-rotate and create another replacement session every tick.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir(
+        "conv_old",
+        bridge_id="bridge_shared",
+        workspace=tmp_path,
+    )
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "SessionStart", "source": "clear"},
+    )
+    create_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Mock rotation endpoints with a failing terminal transfer."""
+        nonlocal create_count
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_old":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_old",
+                    "agent_id": "ag_claude",
+                    "runner_id": "runner_one",
+                    "labels": {BRIDGE_ID_LABEL_KEY: "bridge_shared"},
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_count += 1
+            return httpx.Response(201, json={"id": "conv_new"})
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_new":
+            return httpx.Response(200, json={"id": "conv_new"})
+        if (
+            request.method == "POST"
+            and request.url.path
+            == "/v1/sessions/conv_old/resources/terminals/terminal_claude_main/transfer"
+        ):
+            # The failure that triggered the production loop.
+            return httpx.Response(400, json={"error": {"message": "Terminal already exists"}})
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        hook_state = await forwarder._ensure_hook_state(
+            bridge_dir,
+            start_at_end=False,
+            session_id="conv_old",
+        )
+        # The transfer 400 is swallowed: rotation reports no new session...
+        rotated_to = await forwarder._maybe_rotate_session_on_clear(
+            client=client,
+            session_id="conv_old",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+        )
+        # ...and a second poll must NOT re-rotate (the clear hook was consumed).
+        replay_state = await forwarder._ensure_hook_state(
+            bridge_dir,
+            start_at_end=False,
+            session_id="conv_old",
+        )
+        rotated_again = await forwarder._maybe_rotate_session_on_clear(
+            client=client,
+            session_id="conv_old",
+            bridge_dir=bridge_dir,
+            state=replay_state,
+        )
+
+    assert rotated_to is None
+    assert rotated_again is None
+    # Exactly one replacement-session create — not one per poll.
+    assert create_count == 1
+
+
+@pytest.mark.asyncio
+async def test_post_clear_supersession_notifies_old_session() -> None:
+    """
+    A /clear rotation notifies the superseded (old) conversation.
+
+    It POSTs, in order, (1) ``external_session_status: idle`` so the old
+    chat's spinner stops once its terminal moves away, (2) a persisted
+    assistant ``message`` item linking to the new conversation so a reload
+    explains the clear, and (3) a transient ``external_session_superseded``
+    redirect event so a live viewer auto-follows. All three are addressed
+    to the OLD conversation.
+    """
+    calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record each POST and return a benign success."""
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        calls.append((request.method, request.url.path, body))
+        return httpx.Response(200, json={"queued": False, "item_id": "item_x"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._post_clear_supersession(
+            client,
+            old_session_id="conv_old",
+            new_session_id="conv_new",
+            agent_name="claude-native-ui",
+        )
+
+    assert len(calls) == 3
+    # Every post is addressed to the OLD conversation.
+    assert all(
+        (method, path) == ("POST", "/v1/sessions/conv_old/events") for method, path, _ in calls
+    )
+
+    _, _, status_body = calls[0]
+    assert status_body == {
+        "type": "external_session_status",
+        "data": {"status": "idle"},
+    }
+
+    _, _, notice_body = calls[1]
+    assert notice_body is not None
+    assert notice_body["type"] == "external_conversation_item"
+    assert notice_body["data"]["item_type"] == "message"
+    item_data = notice_body["data"]["item_data"]
+    assert item_data["role"] == "assistant"
+    assert item_data["agent"] == "claude-native-ui"
+    notice_text = item_data["content"][0]["text"]
+    assert "/clear" in notice_text
+    assert "/c/conv_new" in notice_text
+
+    _, _, event_body = calls[2]
+    assert event_body == {
+        "type": "external_session_superseded",
+        "data": {"target_conversation_id": "conv_new"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_clear_supersession_skips_when_old_equals_new() -> None:
+    """
+    The notify is a no-op when the old and new ids collapse to one.
+
+    A defensive guard: addressing the "you were cleared" banner + redirect
+    at the live session id would dump them onto the active chat.
+    """
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Fail loudly — no POST should happen."""
+        calls.append((request.method, request.url.path))
+        return httpx.Response(200, json={})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._post_clear_supersession(
+            client,
+            old_session_id="conv_same",
+            new_session_id="conv_same",
+            agent_name="claude-native-ui",
+        )
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_post_clear_supersession_swallows_post_failure() -> None:
+    """
+    A failed notice/redirect POST is swallowed, not raised.
+
+    The rotation has already completed and reset forwarder state by the
+    time this runs, so a notification error must not break the poll loop.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Fail every POST so both best-effort calls hit their except path."""
+        return httpx.Response(500, json={"error": {"message": "boom"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        # Must not raise despite both POSTs returning 500.
+        await forwarder._post_clear_supersession(
+            client,
+            old_session_id="conv_old",
+            new_session_id="conv_new",
+            agent_name="claude-native-ui",
+        )
 
 
 @pytest.mark.asyncio
@@ -2690,7 +2895,13 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
         "external_conversation_item",
         "external_session_status",
     ]
-    assert requests[-1]["data"] == {"status": "failed"}
+    # The failed edge carries the drop reason as ``output`` so the server
+    # surfaces it as the session's failure detail instead of a bare
+    # "failed" badge (#1113).
+    assert requests[-1]["data"] == {
+        "status": "failed",
+        "output": "transcript item poison-item:0:message rejected",
+    }
     assert first.byte_offset == 0
     assert second.byte_offset == transcript_path.stat().st_size
     assert second.line_cursor == 1
@@ -6166,3 +6377,38 @@ async def test_compaction_in_progress_does_not_persist(tmp_path: Path) -> None:
     assert request["body"]["data"]["status"] == "in_progress"
     # _persist_native_compaction_item must NOT be called for in_progress.
     persist_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_external_session_status_attaches_failure_reason() -> None:
+    """A failed status carries its reason as ``output`` in the payload (#1113).
+
+    The server's ``external_session_status`` handler surfaces a failed edge's
+    ``output`` as the session's failure detail, so threading the forwarder's
+    drop reason there makes the UI render it instead of a bare "failed".
+    """
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_x/events":
+            captured.append(json.loads(request.content))
+            return httpx.Response(204)
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._post_external_session_status(
+            client,
+            session_id="conv_x",
+            status="failed",
+            output="transcript item item-1 rejected",
+        )
+        # No reason → no output field (e.g. a normal idle edge).
+        await forwarder._post_external_session_status(client, session_id="conv_x", status="idle")
+
+    assert captured[0]["type"] == "external_session_status"
+    assert captured[0]["data"] == {
+        "status": "failed",
+        "output": "transcript item item-1 rejected",
+    }
+    assert captured[1]["data"] == {"status": "idle"}

@@ -16,14 +16,14 @@ on:
     # Security Gate via rerun-security-gate.yml, so label churn need not re-run
     # the heavy integration suite. (#399 added these for the gate; superseded.)
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore: ['ap-web/**']
+    paths-ignore: ['web/**', 'tests/e2e_ui/**']
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  # No ap-web SPA build during `uv sync`: this job never serves the bundle
+  # No web SPA build during `uv sync`: this job never serves the bundle
   # and the hardened runner has no npm mirror (build would time out).
   OMNIGENT_SKIP_WEB_UI: "true"
   # Never let the test server pick up the runner's own credentials.

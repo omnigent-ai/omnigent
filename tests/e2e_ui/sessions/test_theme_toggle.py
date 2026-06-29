@@ -8,9 +8,9 @@ selection. Unlike the previous sidebar cycle-button, every mode is selectable
 directly regardless of the OS preference (no skipped "redundant" step).
 
 The provider (``components/theme/ThemeProvider.tsx``) is next-themes configured
-with ``attribute="class"`` + ``storageKey="ap-web-theme"`` +
+with ``attribute="class"`` + ``storageKey="web-theme"`` +
 ``defaultTheme="system"``, so a selection toggles the ``dark`` class on
-``<html>`` and writes the choice to ``localStorage["ap-web-theme"]``.
+``<html>`` and writes the choice to ``localStorage["web-theme"]``.
 ``system`` resolves to the emulated ``prefers-color-scheme``; we pin it with
 ``emulate_media`` so the resolved appearance is deterministic on any runner.
 
@@ -29,7 +29,7 @@ def _html_has_dark(page: Page) -> bool:
 
 def _stored_theme(page: Page) -> str | None:
     """The persisted theme preference, or None when unset (default ``system``)."""
-    return page.evaluate("() => window.localStorage.getItem('ap-web-theme')")
+    return page.evaluate("() => window.localStorage.getItem('web-theme')")
 
 
 def _open_appearance(page: Page, base_url: str) -> None:

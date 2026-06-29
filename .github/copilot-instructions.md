@@ -50,7 +50,7 @@ Most backend areas mirror their source directory under `tests/`:
 
 ## Frontend Test Coverage
 
-A pull request that changes behaviour under `ap-web/` should add or update a
+A pull request that changes behaviour under `web/` should add or update a
 **colocated Vitest unit test** — a `*.test.ts` or `*.test.tsx` file beside the
 component or module it touches. If a behaviour change ships without one, flag it.
 

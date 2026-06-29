@@ -1,6 +1,6 @@
 name: E2E UI Tests
 
-# Runs the Playwright UI suite against a freshly built ap-web SPA, split across
+# Runs the Playwright UI suite against a freshly built web SPA, split across
 # a 3-shard matrix. The whole suite (including the native Claude/Codex/Cursor
 # render-parity tests) runs against the in-process mock LLM and needs NO
 # secrets, so it runs on ALL PRs -- same-repo AND fork -- directly, like ci.yml.
@@ -111,7 +111,7 @@ jobs:
           ref: ${{ github.event.inputs.branch || github.ref }}
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version-file: ".python-version"
 
@@ -119,12 +119,12 @@ jobs:
         uses: ./.github/actions/setup-node
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
           enable-cache: true
 
       - name: Cache virtualenv
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
@@ -143,8 +143,26 @@ jobs:
           sudo apt-get install -y bubblewrap tmux
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
+      # Rust toolchain + target cache for the Codex parity sidecar. The
+      # mocked_native_codex_goal_session fixture builds tests/codex_parity/
+      # sidecar via `cargo build` (it pulls openai/codex's core_test_support
+      # crate, a multi-minute cold compile). Without this cache the build runs
+      # from scratch on whichever shard collects test_codex_goal_mode, adding
+      # ~9min to that shard. Mirrors ci.yml's codex-parity job: pin the
+      # toolchain for a stable cache fingerprint, key on the sidecar Cargo.lock.
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
+        with:
+          path: .tmp-codex-parity-target
+          key: codex-parity-sidecar-${{ runner.os }}-${{ hashFiles('tests/codex_parity/sidecar/Cargo.lock') }}
+
       - name: Cache Playwright browsers
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('uv.lock') }}
@@ -155,7 +173,7 @@ jobs:
         run: |
           uv run playwright install --with-deps chromium
 
-      - name: Build ap-web SPA
+      - name: Build web SPA
         # Build BEFORE pytest: Vite's emptyOutDir clobbers the static dir,
         # so never run it under xdist or alongside the live server.
         # --legacy-peer-deps avoids re-resolving the known React 19 peer
@@ -163,7 +181,7 @@ jobs:
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          cd ap-web
+          cd web
           npm ci --legacy-peer-deps --no-audit --no-fund
           npm run build
 
@@ -239,7 +257,7 @@ jobs:
       - name: Upload Playwright traces / videos / screenshots on failure
         id: upload_playwright
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           # Shard suffix avoids the matrix's parallel uploads colliding (v4
           # 409s on dupe names).
@@ -274,7 +292,7 @@ jobs:
       - name: Upload server logs on failure
         id: upload_server_logs
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: e2e-ui-server-logs-${{ github.run_id }}-shard${{ matrix.shard_id }}
           # server.log + runner.log from the live_server fixture's tmp dir,

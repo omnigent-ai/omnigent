@@ -8,7 +8,7 @@
 # against -- commit it directly.
 #
 # Only Docker is required (no local Node/Python/uv). It:
-#   1. builds the ap-web SPA in a Node 20 container, then
+#   1. builds the web SPA in a Node 20 container, then
 #   2. compares the whole visual suite in the pinned Playwright image and
 #      rewrites only the baselines that drift (or are missing) -- baselines that
 #      already match are left byte-for-byte untouched, mirroring the label-driven
@@ -19,7 +19,7 @@
 #   tests/e2e_ui/visual/regen_baseline_docker.sh [--skip-build]
 #
 #   --skip-build  Reuse an existing omnigent/server/static/web-ui build (e.g.
-#                 from a prior `cd ap-web && npm run build`) instead of building
+#                 from a prior `cd web && npm run build`) instead of building
 #                 in a container. The bundle is platform-independent, so a host
 #                 build renders the same pixels.
 set -euo pipefail
@@ -57,8 +57,8 @@ if [ "$SKIP_BUILD" = true ]; then
   }
   echo "Reusing existing SPA build at $BUILD_OUTPUT."
 else
-  echo "Building the ap-web SPA (Node container) ..."
-  docker run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work/ap-web "$NODE_IMAGE" \
+  echo "Building the web SPA (Node container) ..."
+  docker run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work/web "$NODE_IMAGE" \
     bash -c "npm install -g npm@${NPM_VERSION} && npm ci --legacy-peer-deps --no-audit --no-fund && npm run build"
 fi
 
@@ -86,9 +86,9 @@ docker run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work \
   ' || true
 
 # Files Docker wrote are root-owned; hand them back so git add works unprivileged.
-# Includes ap-web (node_modules + build intermediates the Node container wrote).
+# Includes web (node_modules + build intermediates the Node container wrote).
 docker run --rm --platform "$PLATFORM" -v "$PWD":/work "$PW_IMAGE" \
-  chown -R "$(id -u):$(id -g)" /work/tests/e2e_ui/visual /work/"$BUILD_OUTPUT" /work/ap-web 2>/dev/null || true
+  chown -R "$(id -u):$(id -g)" /work/tests/e2e_ui/visual /work/"$BUILD_OUTPUT" /work/web 2>/dev/null || true
 
 echo
 if git diff --quiet -- "$SNAP_ROOT"; then

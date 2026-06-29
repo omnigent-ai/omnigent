@@ -343,10 +343,50 @@ class _ModelInputData(Protocol):
     input: list[ReplayItem]
 
 
+def _patch_openai_sse_keepalive_tolerance() -> None:
+    """Tolerate empty SSE keepalive frames from OpenAI-compatible proxies.
+
+    Some OpenAI-compatible proxies and relays (for example cli-proxy-api) keep
+    long streaming responses alive by periodically emitting an *empty* ``data:``
+    frame rather than an SSE comment. The stock openai client then calls
+    ``json.loads("")`` on that frame and raises ``Expecting value: line 1
+    column 1 (char 0)``, which aborts the whole turn with
+    ``Error streaming response: ...``.
+
+    SSE *comment* keepalives (``: ping``) are already ignored by the decoder;
+    this shim extends the same tolerance to empty-``data`` keepalives by
+    dropping any decoded event whose payload is blank, so a single keepalive no
+    longer kills a long-running streamed response. Best-effort and idempotent:
+    if the openai internals change shape it silently no-ops.
+    """
+    try:
+        from openai import _streaming as _oai_streaming
+    except Exception:  # noqa: BLE001 - openai internals are best-effort.
+        return
+
+    decoder = getattr(_oai_streaming, "SSEDecoder", None)
+    if decoder is None or getattr(decoder, "_omnigent_keepalive_patch", False):
+        return
+
+    _orig_decode = decoder.decode
+
+    def decode(self: Any, line: str) -> Any:  # type: ignore[explicit-any]
+        sse = _orig_decode(self, line)
+        if sse is not None and not (getattr(sse, "data", None) or "").strip():
+            # Empty-data keepalive frame: drop it so the client never calls
+            # json.loads("") on a blank payload mid-stream.
+            return None
+        return sse
+
+    decoder.decode = decode  # type: ignore[method-assign]
+    decoder._omnigent_keepalive_patch = True  # type: ignore[attr-defined]
+
+
 def _ensure_agents_sdk() -> ModuleType:
     try:
         import agents
 
+        _patch_openai_sse_keepalive_tolerance()
         return agents
     except ImportError as exc:
         raise ImportError(
