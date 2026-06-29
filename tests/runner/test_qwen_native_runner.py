@@ -110,3 +110,39 @@ async def test_build_qwen_fork_recording_returns_none_when_no_items(
     assert not qnb.qwen_session_recording_exists(
         qnb.qwen_session_id_for_conversation("conv_empty"), workspace
     )
+
+
+async def test_build_qwen_fork_recording_does_not_clobber_existing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # B2: a relaunch (e.g. after a failed external_session_id persist) re-enters
+    # the fork path. If qwen has already built and since appended live, full-
+    # fidelity turns, the rebuild must NOT overwrite them — it resumes as-is.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    qsid = qnb.qwen_session_id_for_conversation("conv_fork")
+    # Simulate qwen's live recording already on disk (a richer transcript than a
+    # text-only rebuild would produce).
+    recording = qnb.qwen_session_recording_path(qsid, workspace)
+    recording.parent.mkdir(parents=True, exist_ok=True)
+    sentinel = '{"type":"assistant","message":{"role":"model","parts":[{"text":"LIVE"}]}}\n'
+    recording.write_text(sentinel)
+
+    returned = await _build_qwen_fork_recording(
+        _ItemsClient(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "rebuilt"}],
+                }
+            ]
+        ),  # type: ignore[arg-type]
+        session_id="conv_fork",
+        workspace=str(workspace),
+    )
+
+    # Returns the id to resume, and the live recording is untouched.
+    assert returned == qsid
+    assert recording.read_text() == sentinel

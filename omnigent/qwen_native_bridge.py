@@ -206,27 +206,21 @@ def qwen_session_records_from_session_items(
 ) -> list[dict[str, Any]]:
     """Convert Omnigent session items into qwen chat-recording JSONL records.
 
-    qwen's recording is a linked list of records chained by ``uuid`` /
-    ``parentUuid``. We emit only the conversational ``user`` / ``assistant``
-    message records qwen reconstructs history from — the interleaved ``system``
-    snapshot records (``attribution_snapshot`` / ``file_history_snapshot`` /
-    ``ui_telemetry``) qwen writes live are telemetry/file-tracking and are not
-    required for ``--resume`` (verified loadable without them on v0.18.2). Tool
-    calls are intentionally dropped: qwen's tool-record format isn't reproduced
-    here, and the text turns carry the conversational context a cross-harness
-    fork needs.
+    qwen's recording is a linked list chained by ``uuid`` / ``parentUuid``. We
+    emit only the ``user`` / ``assistant`` message records qwen reconstructs
+    history from; the ``system`` snapshot records it writes live are telemetry
+    and not required for ``--resume`` (verified on v0.18.2). Tool calls are
+    dropped — text turns carry the context a cross-harness fork needs.
 
     Omnigent items map as:
 
     - user ``message`` → ``{"type":"user","message":{"role":"user","parts":[{"text"}]}}``
     - assistant ``message`` → ``{"type":"assistant","message":{"role":"model",...}}``
 
-    Cancelled turns aren't restored as completed history: an interrupted
-    assistant turn and its whole response group are skipped when the source
-    tags them and shares a ``response_id`` across the turn (claude/codex/pi),
-    and a trailing unanswered user prompt is dropped at the end (covers a
-    qwen-native source, whose per-event ``response_id`` doesn't group a turn and
-    which never sets ``interrupted``).
+    Cancelled turns aren't restored: an interrupted assistant turn and its
+    response group are skipped (claude/codex/pi share a ``response_id`` across
+    the turn), and a trailing unanswered user prompt is dropped (covers a
+    qwen-native source, whose per-event ``response_id`` doesn't group a turn).
 
     :param items: Flat Omnigent item dicts in chronological order.
     :param qwen_session_id: qwen session id stamped on every record.
@@ -303,14 +297,10 @@ def qwen_session_records_from_session_items(
                 }
             )
             parent_uuid = rec_uuid
-    # Drop a trailing unanswered user prompt — a turn that was cancelled before
-    # any assistant reply. The response-group skip above only catches sources
-    # that tag the interrupted assistant *and* share a response_id across the
-    # turn (claude/codex/pi); a qwen-native SOURCE stamps a distinct per-event
-    # ``response_id`` (``qwen:<uuid>``) and never sets ``interrupted``, so a
-    # cancelled qwen turn would otherwise leave its user prompt dangling. A
-    # committed transcript normally ends on a completed assistant turn, so a
-    # trailing user record means an unanswered prompt either way.
+    # Drop a trailing unanswered user prompt (a turn cancelled before any reply).
+    # The response-group skip can't catch it for a qwen-native source, whose
+    # per-event ``response_id`` (``qwen:<uuid>``) doesn't group a turn; a
+    # committed transcript otherwise ends on a completed assistant turn.
     while records and records[-1]["type"] == "user":
         records.pop()
     return records
@@ -335,9 +325,10 @@ def write_qwen_session_recording(
     - ``meta.json`` — the project-level marker (created if absent; an existing
       one is left untouched so we don't reset another session's ``createdAt``).
 
-    Writes all three so a forked clone's qwen TUI resumes the carried history.
-    The ``.jsonl`` is written atomically (temp + ``os.replace``); qwen overwrites
-    ``runtime.json`` with its own pid/started_at when it takes over on launch.
+    All three are written atomically, and the ``.jsonl`` is committed LAST (after
+    both sidecars): :func:`qwen_session_recording_exists` keys on the ``.jsonl``,
+    so a failed sidecar write leaves no ``.jsonl`` and the launch degrades to a
+    clean fresh start, never the blocking "No saved session found" screen.
 
     :param qwen_session_id: qwen session id (file stem + ``session_id`` field).
     :param workspace: cwd qwen will resume in; its realpath drives the project slug.
@@ -351,23 +342,21 @@ def write_qwen_session_recording(
     chats_dir = recording.parent
     chats_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-    tmp = recording.with_suffix(".jsonl.tmp")
-    try:
-        with tmp.open("w", encoding="utf-8") as handle:
-            for record in records:
-                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
-        os.replace(tmp, recording)
-    except OSError as exc:
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
-        raise RuntimeError(f"Failed to write qwen recording {recording}: {exc}") from exc
-
-    runtime_path = chats_dir / f"{qwen_session_id}.runtime.json"
     try:
         hostname = socket.gethostname() or "omnigent"
     except OSError:
         hostname = "omnigent"
-    runtime_path.write_text(
+
+    # Sidecars first so the gate file (``.jsonl``) lands last: a sidecar failure
+    # then leaves no ``.jsonl`` and the resume gate cleanly picks a fresh launch.
+    meta_path = chats_dir.parent / "meta.json"
+    if not meta_path.exists():
+        stamp = timestamp or _qwen_iso_now()
+        _atomic_write_text(
+            meta_path, json.dumps({"version": 1, "createdAt": stamp, "updatedAt": stamp})
+        )
+    _atomic_write_text(
+        chats_dir / f"{qwen_session_id}.runtime.json",
         json.dumps(
             {
                 "schema_version": 1,
@@ -378,14 +367,29 @@ def write_qwen_session_recording(
                 "started_at": time.time(),
                 "qwen_version": _QWEN_SYNTH_VERSION,
             }
-        )
+        ),
     )
-
-    meta_path = chats_dir.parent / "meta.json"
-    if not meta_path.exists():
-        stamp = timestamp or _qwen_iso_now()
-        meta_path.write_text(json.dumps({"version": 1, "createdAt": stamp, "updatedAt": stamp}))
+    _atomic_write_text(
+        recording, "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in records)
+    )
     return recording
+
+
+def _atomic_write_text(target: Path, text: str) -> None:
+    """Atomically write *text* to *target* (temp file + ``os.replace``).
+
+    :param target: Destination path.
+    :param text: Full file contents to write.
+    :raises RuntimeError: If the file cannot be written; the temp is cleaned up.
+    """
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError as exc:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        raise RuntimeError(f"Failed to write {target}: {exc}") from exc
 
 
 def input_file_path(bridge_dir: Path) -> Path:

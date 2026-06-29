@@ -196,6 +196,35 @@ def test_write_recording_preserves_existing_meta(tmp_path: Path, monkeypatch) ->
     assert json.loads(meta_path.read_text())["createdAt"] == "SENTINEL"
 
 
+def test_write_recording_sidecar_failure_leaves_no_gate_jsonl(tmp_path: Path, monkeypatch) -> None:
+    # The resume gate keys on the .jsonl. If a sidecar write fails, the .jsonl
+    # must NOT exist — otherwise the gate would pick --resume onto a session with
+    # no runtime.json and land on qwen's blocking "No saved session" screen (B1).
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    session_id = str(uuid.uuid4())
+    records = qnb.qwen_session_records_from_session_items(
+        [_user_item("hi"), _assistant_item("ok")], qwen_session_id=session_id, cwd=workspace
+    )
+
+    # Fail the runtime.json sidecar write (it's written before the .jsonl).
+    real_atomic = qnb._atomic_write_text
+
+    def _boom(target: Path, text: str) -> None:
+        if target.name.endswith(".runtime.json"):
+            raise RuntimeError("disk full")
+        real_atomic(target, text)
+
+    monkeypatch.setattr(qnb, "_atomic_write_text", _boom)
+
+    with pytest.raises(RuntimeError):
+        qnb.write_qwen_session_recording(session_id, workspace, records)
+
+    # The gate file was never committed → a clean fresh launch, not the blocking screen.
+    assert not qnb.qwen_session_recording_exists(session_id, workspace)
+
+
 @pytest.mark.skipif(
     shutil.which("qwen") is None or os.environ.get("OMNIGENT_QWEN_E2E") != "1",
     reason="needs the qwen CLI + configured auth; opt in with OMNIGENT_QWEN_E2E=1",

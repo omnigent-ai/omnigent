@@ -2828,16 +2828,17 @@ async def _build_qwen_fork_recording(
 ) -> str | None:
     """Synthesize a qwen chat recording for a forked clone from its Omnigent items.
 
-    A forked clone bound to qwen-native carries its OWN copied Omnigent items but
-    has no qwen recording yet (``external_session_id`` is NULL on a fork). We
-    rebuild a qwen recording from those items under the clone's deterministic
-    session id so the embedded TUI resumes with the prior conversation. Because
-    the rebuild reads harness-neutral Omnigent items (not the source's vendor
-    transcript), it works cross-harness — the source need not be qwen-native
-    (claude-/pi-/codex-native → qwen all carry over).
+    A forked clone has its OWN copied Omnigent items but no qwen recording yet
+    (``external_session_id`` is NULL on a fork). We rebuild a recording from those
+    items under the clone's deterministic session id so the TUI resumes with the
+    prior conversation. The rebuild reads harness-neutral items (not the source's
+    vendor transcript), so it works cross-harness (claude/pi/codex → qwen).
 
-    The id is deterministic per conversation (same as a fresh launch), so a later
-    relaunch recomputes it and resumes via the on-disk-recording check.
+    If a recording for the clone's id already exists, return the id WITHOUT
+    rebuilding — the rebuild is idempotent. Otherwise a relaunch after a failed
+    ``external_session_id`` persist (best-effort; qwen has no re-capture path)
+    would re-enter here and overwrite qwen's live, full-fidelity recording with
+    a text-only rebuild.
 
     :param server_client: Runner Omnigent server client.
     :param session_id: The forked clone's Omnigent conversation id.
@@ -2848,11 +2849,20 @@ async def _build_qwen_fork_recording(
     from omnigent.pi_native_resume import fetch_all_session_items_for_pi_resume
     from omnigent.qwen_native_bridge import (
         qwen_session_id_for_conversation,
+        qwen_session_recording_exists,
         qwen_session_records_from_session_items,
         write_qwen_session_recording,
     )
 
     qwen_session_id = qwen_session_id_for_conversation(session_id)
+    # Already built (e.g. a relaunch after the external_session_id persist failed):
+    # resume the live recording, never clobber it with a fresh text-only rebuild.
+    if qwen_session_recording_exists(qwen_session_id, workspace):
+        _logger.info(
+            "qwen fork-rebuild: recording already present for clone %s; resuming it",
+            session_id,
+        )
+        return qwen_session_id
     try:
         items = await fetch_all_session_items_for_pi_resume(server_client, session_id)
         records = qwen_session_records_from_session_items(
@@ -2964,13 +2974,12 @@ async def _auto_create_qwen_terminal(
     # clean fresh launch). qwen restores history into the TUI from its own
     # checkpoint and emits only NEW events to ``--json-file`` on resume (verified),
     # so the forwarder never re-mirrors the prior transcript — no duplicate bubbles.
-    # Forked clone carrying history into qwen: synthesize a recording from the
-    # clone's copied Omnigent items, then force ``--resume`` so the TUI opens on
-    # the prior conversation. Gated on a NULL ``external_session_id`` so it runs
-    # only on the clone's FIRST launch — once built we persist the id, and every
-    # later relaunch takes the normal resume path below (never clobbering qwen's
-    # live recording, which by then holds post-fork turns). Mirrors pi-native's
-    # fork rebuild (``_resolve_pi_external_session_id`` case 2).
+    # Forked clone carrying history into qwen: rebuild a recording from the
+    # clone's copied Omnigent items and force ``--resume``. Gated on a NULL
+    # ``external_session_id`` so it normally runs only on the FIRST launch;
+    # ``_build_qwen_fork_recording`` is also idempotent (resumes an existing
+    # recording, never clobbers it). Mirrors pi-native's fork rebuild
+    # (``_resolve_pi_external_session_id`` case 2).
     forked_qwen_session_id: str | None = None
     if (
         launch_config.fork_carry_history
