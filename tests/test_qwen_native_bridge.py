@@ -12,14 +12,14 @@ from omnigent import qwen_native_bridge
 
 
 def test_write_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
-    """``write_mcp_config`` writes the omnigent server into ``.qwen/settings.json``."""
+    """``write_mcp_config`` writes the omnigent server into ``.mcp.json``."""
     workspace = tmp_path / "ws"
     workspace.mkdir()
     bridge_dir = tmp_path / "bridge"
 
     path = qwen_native_bridge.write_mcp_config(workspace, bridge_dir)
 
-    assert path == workspace / ".qwen" / "settings.json"
+    assert path == workspace / ".mcp.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     server = data["mcpServers"]["omnigent"]
     # Points at the shared stdio relay implemented in claude_native_bridge.
@@ -33,40 +33,70 @@ def test_write_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
     assert isinstance(token, str) and token
 
 
-def test_write_mcp_config_preserves_existing_settings(tmp_path: Path) -> None:
-    """Merging into an existing settings.json keeps unrelated keys and servers."""
+def test_write_mcp_config_preserves_existing_servers(tmp_path: Path) -> None:
+    """Merging into an existing .mcp.json keeps a user's own mcpServers."""
     workspace = tmp_path / "ws"
-    settings_dir = workspace / ".qwen"
-    settings_dir.mkdir(parents=True)
-    settings = settings_dir / "settings.json"
-    settings.write_text(
-        json.dumps(
-            {
-                "theme": "dark",
-                "mcpServers": {"other": {"command": "x"}},
-            }
-        ),
+    workspace.mkdir()
+    mcp_json = workspace / ".mcp.json"
+    mcp_json.write_text(
+        json.dumps({"mcpServers": {"other": {"command": "x"}}}),
         encoding="utf-8",
     )
 
     qwen_native_bridge.write_mcp_config(workspace, tmp_path / "bridge")
 
-    data = json.loads(settings.read_text(encoding="utf-8"))
-    assert data["theme"] == "dark"
+    data = json.loads(mcp_json.read_text(encoding="utf-8"))
     assert set(data["mcpServers"]) == {"other", "omnigent"}
 
 
-def test_write_mcp_config_recovers_from_malformed_settings(tmp_path: Path) -> None:
-    """A malformed settings.json is replaced rather than crashing the launch."""
+def test_write_mcp_config_parses_jsonc_and_preserves_keys(tmp_path: Path) -> None:
+    """A JSONC .mcp.json (comments) is parsed; user servers/keys are preserved."""
     workspace = tmp_path / "ws"
-    settings_dir = workspace / ".qwen"
-    settings_dir.mkdir(parents=True)
-    (settings_dir / "settings.json").write_text("{ not json", encoding="utf-8")
+    workspace.mkdir()
+    mcp_json = workspace / ".mcp.json"
+    mcp_json.write_text(
+        """{
+          // a user's own server
+          "mcpServers": {
+            "other": {"command": "x"} /* inline */
+          }
+        }""",
+        encoding="utf-8",
+    )
 
-    qwen_native_bridge.write_mcp_config(workspace, tmp_path / "bridge")
+    path = qwen_native_bridge.write_mcp_config(workspace, tmp_path / "bridge")
 
-    data = json.loads((settings_dir / "settings.json").read_text(encoding="utf-8"))
-    assert "omnigent" in data["mcpServers"]
+    assert path is not None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert set(data["mcpServers"]) == {"other", "omnigent"}
+
+
+def test_write_mcp_config_aborts_on_unparseable_file(tmp_path: Path) -> None:
+    """A non-empty file we can't parse even as JSONC is left untouched (returns None)."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    mcp_json = workspace / ".mcp.json"
+    original = '{ "deeply": broken not json'
+    mcp_json.write_text(original, encoding="utf-8")
+
+    result = qwen_native_bridge.write_mcp_config(workspace, tmp_path / "bridge")
+
+    assert result is None
+    # The user's file must be left exactly as it was — never overwritten.
+    assert mcp_json.read_text(encoding="utf-8") == original
+
+
+def test_write_mcp_config_aborts_on_non_object_json(tmp_path: Path) -> None:
+    """A valid-but-non-object .mcp.json (e.g. a list) is not clobbered."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    mcp_json = workspace / ".mcp.json"
+    mcp_json.write_text("[1, 2, 3]", encoding="utf-8")
+
+    result = qwen_native_bridge.write_mcp_config(workspace, tmp_path / "bridge")
+
+    assert result is None
+    assert mcp_json.read_text(encoding="utf-8") == "[1, 2, 3]"
 
 
 def test_write_mcp_bridge_config_is_idempotent(tmp_path: Path) -> None:

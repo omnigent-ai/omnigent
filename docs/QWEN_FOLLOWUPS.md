@@ -246,12 +246,16 @@ comments; this is the *what*, not the *how*.)
     `databricks-*` model), then `omni run`; confirm the runner log's
     `qwen gateway routing:` line shows the Databricks base URL + profile.
 - [x] **Omnigent tools.** Qwen-native now registers the shared Omnigent MCP
-  relay (`omnigent.claude_native_bridge serve-mcp`) in
-  `<workspace>/.qwen/settings.json` (`mcpServers.omnigent`, `trust: true`) before
-  launch, so qwen connects to it on boot, `/mcp` lists it, and the model can call
-  Omnigent's builtin tools (`sys_*`, `load_skill`, `web_fetch`, …). The token is
-  written via `qwen_native_bridge.write_mcp_config`; the server connection is
-  added to `bridge.json` by `ensure_comment_relay`. Mirrors cursor-/claude-native.
+  relay (`omnigent.claude_native_bridge serve-mcp`) in `<workspace>/.mcp.json`
+  (qwen's dedicated project-MCP file — `mcpServers.omnigent`, `trust: true`)
+  before launch, so qwen connects to it on boot, `/mcp` lists it, and the model
+  can call Omnigent's builtin tools (`sys_*`, `load_skill`, `web_fetch`, …). A
+  dedicated file (not the shared `.qwen/settings.json`) avoids touching the
+  user's auth/theme config; the merge is JSONC-aware and fail-safe (an
+  unparseable existing `.mcp.json` is left untouched and MCP wiring is skipped).
+  The token is written via `qwen_native_bridge.write_mcp_config`; the live tool
+  surface is advertised by the `tool_relay.json` that `ensure_comment_relay`
+  writes. Mirrors cursor-/claude-native.
   A project-scoped MCP server is gated behind qwen's "Untrusted MCP server"
   startup prompt, so the runner pre-approves it non-interactively via
   `qwen mcp approve omnigent` (`qwen_native_bridge.approve_mcp_server`, qwen's own

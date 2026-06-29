@@ -62,10 +62,12 @@ _POLL_INTERVAL_S = 0.2
 _BRIDGE_CONFIG_FILE = "bridge.json"
 #: Name qwen lists the Omnigent MCP server under (shows in ``/mcp``).
 _MCP_SERVER_NAME = "omnigent"
-#: qwen reads MCP servers from ``<workspace>/.qwen/settings.json`` (project
-#: scope) — the per-workspace analog of cursor's ``.cursor/mcp.json``.
-_QWEN_SETTINGS_DIR = ".qwen"
-_QWEN_SETTINGS_FILE = "settings.json"
+#: qwen reads project-scoped MCP servers from ``<workspace>/.mcp.json`` (its
+#: ``loadProjectMcpServers`` path) — a dedicated MCP file we own wholesale, the
+#: true analog of cursor's ``.cursor/mcp.json``. Deliberately NOT the shared
+#: ``.qwen/settings.json`` (which also holds auth/theme/gateway config), so we
+#: never risk clobbering unrelated user settings.
+_PROJECT_MCP_FILE = ".mcp.json"
 #: Env var qwen reads to locate its MCP-approvals store, overriding the default
 #: ``~/.qwen/mcpApprovals.json``. We point it at a per-session file in the bridge
 #: dir so approvals don't pollute the user's home and concurrent same-workspace
@@ -217,9 +219,11 @@ def write_mcp_bridge_config(bridge_dir: Path) -> None:
 
     The ``serve-mcp`` relay (spawned by qwen) reads ``bridge.json`` for a bearer
     token and exits if it's missing, so this must exist *before* qwen launches.
-    The server connection (URL, session, workspace) is added to this same file
-    by the runner's comment relay (``ensure_comment_relay``) when it starts.
-    Mirrors :func:`omnigent.cursor_native_bridge.write_mcp_bridge_config`.
+    ``bridge.json`` only ever holds ``{token}``; the live tool surface is
+    advertised separately via the ``tool_relay.json`` that the runner's comment
+    relay (``ensure_comment_relay`` → ``_ensure_comment_relay_started``) writes
+    into this same bridge dir when it starts. Mirrors
+    :func:`omnigent.cursor_native_bridge.write_mcp_bridge_config`.
     """
     _ensure_dir(bridge_dir)
     config_path = bridge_dir / _BRIDGE_CONFIG_FILE
@@ -263,40 +267,113 @@ def build_mcp_server_entry(
     }
 
 
+def _strip_json_comments(text: str) -> str:
+    """Replace ``//`` and ``/* */`` comments with spaces, preserving strings.
+
+    qwen's ``settings.json`` is JSONC — qwen parses it with
+    ``JSON.parse(stripJsonComments(content))`` — so a user's file legitimately
+    contains comments that plain :func:`json.loads` rejects. This mirrors the
+    ``strip-json-comments`` behaviour qwen uses (blank out comment characters in
+    place, leaving lengths/positions intact) while never touching characters
+    inside string literals. Trailing commas are *not* handled — qwen doesn't
+    accept them either (its final ``JSON.parse`` would reject them).
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    in_line_comment = False
+    in_block_comment = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+                out.append(ch)
+            else:
+                out.append(" ")
+            i += 1
+        elif in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                out.append("  ")
+                i += 2
+            else:
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+        elif in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+        elif ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+        elif ch == "/" and nxt == "/":
+            in_line_comment = True
+            out.append("  ")
+            i += 2
+        elif ch == "/" and nxt == "*":
+            in_block_comment = True
+            out.append("  ")
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def write_mcp_config(
     workspace: Path,
     bridge_dir: Path,
     *,
     python_executable: str | None = None,
-) -> Path:
-    """Register the Omnigent MCP server in ``<workspace>/.qwen/settings.json``.
+) -> Path | None:
+    """Register the Omnigent MCP server in ``<workspace>/.mcp.json``.
 
-    Merges (does not overwrite) into any existing project settings so unrelated
-    keys — and other ``mcpServers`` — are preserved; only the ``omnigent`` entry
-    is (re)written. Project scope (not ``~/.qwen/settings.json``) keeps the
-    user's home config — including auth/gateway settings whose precedence the
-    qwen-native design deliberately avoids touching — untouched. Also writes the
-    relay token (:func:`write_mcp_bridge_config`). Mirrors
+    Writes qwen's dedicated project-MCP file (its ``loadProjectMcpServers`` path)
+    rather than the shared ``.qwen/settings.json``, so we never touch the user's
+    auth/theme/gateway config. Merges (does not overwrite) into an existing
+    ``.mcp.json`` so a user's own ``mcpServers`` are preserved; only the
+    ``omnigent`` entry is (re)written. Also writes the relay token
+    (:func:`write_mcp_bridge_config`). The analog of
     :func:`omnigent.cursor_native_bridge.write_mcp_config`.
 
-    :returns: Path to the written ``settings.json``.
+    qwen parses ``.mcp.json`` as JSONC, so an existing file is read through
+    :func:`_strip_json_comments` before parsing. **Fail-safe:** if a non-empty
+    existing file cannot be parsed even as JSONC (or doesn't decode to a JSON
+    object, or can't be read), the merge is aborted and the file is left
+    untouched — overwriting it would silently destroy real user config we simply
+    failed to understand. The caller skips MCP wiring in that case.
+
+    :returns: Path to the written ``.mcp.json``, or ``None`` if the merge was
+        aborted to avoid clobbering an unparseable existing file.
     """
-    write_mcp_bridge_config(bridge_dir)
-    settings_dir = workspace / _QWEN_SETTINGS_DIR
-    settings_dir.mkdir(parents=True, exist_ok=True)
-    path = settings_dir / _QWEN_SETTINGS_FILE
+    path = workspace / _PROJECT_MCP_FILE
 
     data: dict[str, Any] = {}
     if path.is_file():
         try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(existing, dict):
-                data = existing
-        except (OSError, ValueError):
-            # Malformed/unreadable settings: fall back to a fresh file rather
-            # than crash the launch (worst case the user loses stray edits we
-            # couldn't parse — the omnigent server is what matters here).
-            data = {}
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        if raw.strip():
+            try:
+                parsed = json.loads(_strip_json_comments(raw))
+            except ValueError:
+                # Non-empty file we can't parse even as JSONC — may be valid qwen
+                # config we don't understand. Refuse to overwrite it.
+                return None
+            if not isinstance(parsed, dict):
+                return None
+            data = parsed
 
     servers = data.get("mcpServers")
     if not isinstance(servers, dict):
@@ -306,7 +383,11 @@ def write_mcp_config(
     )
     data["mcpServers"] = servers
 
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    write_mcp_bridge_config(bridge_dir)
+    workspace.mkdir(parents=True, exist_ok=True)
+    # Unique temp name so concurrent writers (same-workspace co-tenant sessions)
+    # don't race on a shared ``.mcp.json.tmp`` before the atomic replace.
+    tmp = path.with_name(f"{_PROJECT_MCP_FILE}.{secrets.token_hex(8)}.tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     return path

@@ -2857,22 +2857,32 @@ async def _auto_create_qwen_terminal(
         # next resume reads it from the snapshot and forks can carry history.
         await _persist_qwen_external_session_id(server_client, session_id, qwen_session_id)
     # Expose Omnigent's builtin tools (sys_*, load_skill, web_fetch, …) to qwen
-    # by registering the shared MCP relay in ``<workspace>/.qwen/settings.json``
-    # so qwen connects to it on boot and ``/mcp`` lists it. Written before launch
-    # so the relay's ``bridge.json`` token exists when qwen spawns ``serve-mcp``;
-    # the server connection is added to that file by ``ensure_comment_relay``
-    # below. Only when the relay will actually start (``ensure_comment_relay``
-    # present), else the registered tools would be dead (serve-mcp with nothing
-    # to route calls back to) — mirrors the opencode-native gating.
+    # by registering the shared MCP relay in ``<workspace>/.mcp.json`` (qwen's
+    # dedicated project-MCP file) so qwen connects to it on boot and ``/mcp``
+    # lists it. Written before launch so the relay's ``bridge.json`` token exists
+    # when qwen spawns ``serve-mcp``; the live tool surface is advertised by the
+    # ``tool_relay.json`` that ``ensure_comment_relay`` writes below. Only when
+    # the relay will actually start (``ensure_comment_relay`` present), else the
+    # registered tools would be dead (serve-mcp with nothing to route calls back
+    # to) — mirrors the opencode-native gating.
     mcp_enabled = server_client is not None and ensure_comment_relay is not None
     if mcp_enabled:
-        write_mcp_config(Path(workspace), bridge_dir)
+        # ``None`` means an existing ``.mcp.json`` couldn't be parsed and was
+        # left untouched (fail-safe, see ``write_mcp_config``); skip the rest of
+        # the MCP wiring so the TUI doesn't read a stale/absent approval.
+        if write_mcp_config(Path(workspace), bridge_dir) is None:
+            mcp_enabled = False
+            _logger.warning(
+                "qwen-native: existing .mcp.json could not be parsed; skipping "
+                "Omnigent MCP wiring to avoid overwriting it (session %s).",
+                session_id,
+            )
         # A project-scoped MCP server is gated behind qwen's "Untrusted MCP
         # server" startup prompt; pre-approve it non-interactively (qwen's own
         # ``mcp approve``, hash-exact) so the relay starts and ``/mcp`` lists it
         # without a manual in-terminal step. Run with the SAME cwd + approvals
         # env the TUI launches with (see ``mcp_launch_env`` in the spec below).
-        if not approve_mcp_server(Path(workspace), bridge_dir, qwen_command=qwen_command):
+        elif not approve_mcp_server(Path(workspace), bridge_dir, qwen_command=qwen_command):
             _logger.warning(
                 "qwen-native: could not pre-approve the omnigent MCP server for "
                 "session %s; qwen will show its in-terminal trust prompt.",
