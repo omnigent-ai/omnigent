@@ -118,6 +118,53 @@ def _registry_context_window(model: str) -> int | None:
     return None
 
 
+# Curated context windows for the Gemini models the antigravity (``agy``) native
+# harness drives. Like Qwen, these are absent from litellm's bundled registry
+# (the antigravity model ids are agy displayNames such as ``"Gemini 2.5 Flash"``,
+# not the ``gemini/...`` ids litellm knows) and from the MLflow ``google``
+# catalog, so without this they fall back to the conservative 128K default — far
+# too small for Gemini, which serves a 1M-token window, leaving the antigravity
+# context-occupancy ring mis-sized (or, when it gated on the prior 128K, the
+# ring badly over-reading). Keyed by the *normalized* base id (provider prefix
+# and whitespace stripped, lowercased — see :func:`_gemini_context_window`).
+# Values are Google's published Gemini maxima (1,048,576 input tokens for the
+# 2.5 / 3 Pro and Flash families); an unrecognized Gemini id keeps the 128K
+# fallback (and a spec's ``executor.context_window`` always overrides this).
+_GEMINI_CONTEXT_WINDOWS: dict[str, int] = {
+    "gemini 3 pro": 1_048_576,
+    "gemini 3 flash": 1_048_576,
+    "gemini 3.5 flash": 1_048_576,
+    "gemini 2.5 pro": 1_048_576,
+    "gemini 2.5 flash": 1_048_576,
+    "gemini 1.5 pro": 1_048_576,
+    "gemini 1.5 flash": 1_048_576,
+    "gemini-3-pro": 1_048_576,
+    "gemini-3-flash": 1_048_576,
+    "gemini-3.5-flash": 1_048_576,
+    "gemini-2.5-pro": 1_048_576,
+    "gemini-2.5-flash": 1_048_576,
+    "gemini-1.5-pro": 1_048_576,
+    "gemini-1.5-flash": 1_048_576,
+}
+
+
+def _gemini_context_window(model: str) -> int | None:
+    """Look up a Gemini model's context window from the curated table.
+
+    Normalizes the id the way antigravity model strings reach us — an agy
+    ``displayName`` (``"Gemini 2.5 Flash"``) or a hyphenated id
+    (``"gemini-3.5-flash"``), possibly provider-prefixed — down to a
+    lowercased, prefix-stripped key before matching against
+    :data:`_GEMINI_CONTEXT_WINDOWS`.
+
+    :param model: The model identifier (any namespacing).
+    :returns: The context window in tokens, or ``None`` when the model isn't a
+        recognized Gemini entry (caller falls back to the 128K default).
+    """
+    bare = model.rsplit("/", 1)[-1].strip().lower()
+    return _GEMINI_CONTEXT_WINDOWS.get(bare)
+
+
 # Fallback cache pricing as a multiple of the plain input rate, used when the
 # catalog publishes no explicit cache rate for a model (e.g. ``databricks-*``
 # entries today omit them). Both providers we serve publish the same ratios:
@@ -303,7 +350,11 @@ def get_model_context_window(model: str) -> int:
        ``github.com/mlflow/mlflow/releases``. Covers models not yet
        in litellm's bundled registry, with a family-prefix fallback
        for newly released variants.
-    5. ``_DEFAULT_CONTEXT_WINDOW`` (128 K) — conservative fallback.
+    5. Curated Gemini table (:func:`_gemini_context_window`) — for the
+       antigravity (``agy``) native harness's Gemini ids (agy ``displayName``s
+       absent from both litellm and the MLflow ``google`` catalog) that serve
+       a 1M-token window. Qwen is already covered above by the registry.
+    6. ``_DEFAULT_CONTEXT_WINDOW`` (128 K) — conservative fallback.
 
     :param model: The model identifier, e.g. ``"openai/gpt-4o"`` or
         ``"databricks-gpt-5-5"``.
@@ -322,7 +373,11 @@ def get_model_context_window(model: str) -> int:
     try:
         import litellm
     except ImportError:
-        return _fetch_context_window_from_mlflow(model) or _DEFAULT_CONTEXT_WINDOW
+        return (
+            _fetch_context_window_from_mlflow(model)
+            or _gemini_context_window(model)
+            or _DEFAULT_CONTEXT_WINDOW
+        )
     try:
         info = litellm.get_model_info(model)
         if info:
@@ -340,7 +395,11 @@ def get_model_context_window(model: str) -> int:
                     return int(limit)
         except Exception:
             pass
-    return _fetch_context_window_from_mlflow(model) or _DEFAULT_CONTEXT_WINDOW
+    return (
+        _fetch_context_window_from_mlflow(model)
+        or _gemini_context_window(model)
+        or _DEFAULT_CONTEXT_WINDOW
+    )
 
 
 def resolve_effective_context_window(

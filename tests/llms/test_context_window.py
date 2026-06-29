@@ -15,6 +15,7 @@ import pytest
 from omnigent.llms import context_window
 from omnigent.llms.context_window import (
     ModelPricing,
+    _gemini_context_window,
     _registry_context_window,
     compute_llm_cost,
     fetch_model_pricing,
@@ -410,3 +411,34 @@ def test_get_model_context_window_uses_registry_first(monkeypatch: pytest.Monkey
     assert get_model_context_window("qwen3-coder-plus") == 1_048_576
     # A model the registry doesn't own still falls back to the conservative default.
     assert get_model_context_window("qwen-nonexistent-xyz") == 128_000
+
+
+def test_gemini_context_window_normalizes_id() -> None:
+    """The lookup strips provider prefixes and lowercases before matching.
+
+    Covers both the agy ``displayName`` shape (``"Gemini 2.5 Flash"``) and the
+    hyphenated id shape (``"gemini-3.5-flash"``) the antigravity native harness
+    drives.
+    """
+    assert _gemini_context_window("Gemini 2.5 Flash") == 1_048_576
+    assert _gemini_context_window("Gemini 2.5 Pro") == 1_048_576
+    assert _gemini_context_window("Gemini 3 Pro") == 1_048_576
+    assert _gemini_context_window("gemini-3.5-flash") == 1_048_576
+    assert _gemini_context_window("google/gemini-2.5-pro") == 1_048_576
+    assert _gemini_context_window("GEMINI 2.5 FLASH") == 1_048_576  # case-insensitive
+    # Unknown Gemini variant → None (caller falls back to the default).
+    assert _gemini_context_window("gemini-nonexistent-xyz") is None
+
+
+def test_get_model_context_window_uses_gemini_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A known Gemini model resolves to its curated 1M window, not the 128K default.
+
+    Catalog lookup is disabled so the resolution is hermetic (no network):
+    litellm has no agy displayName entry, MLflow is skipped, so the curated
+    Gemini table answers. This is what feeds the antigravity context ring.
+    """
+    monkeypatch.setenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", "1")
+    monkeypatch.delenv("AP_CONTEXT_WINDOW_OVERRIDE", raising=False)
+    assert get_model_context_window("Gemini 2.5 Flash") == 1_048_576
+    # An unrecognized Gemini model still falls back to the conservative default.
+    assert get_model_context_window("Gemini nonexistent xyz") == 128_000
