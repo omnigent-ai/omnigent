@@ -1091,11 +1091,15 @@ async def test_failed_connect_does_not_offline_another_users_host(
     multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
     """
-    A peer connecting to another owner's host_id fails the upsert
-    (host_id unique constraint) — and must NOT flip that owner's host
-    offline. Before the fix the broad except called set_offline(host_id)
-    on a connection that never registered, letting any authenticated user
-    repeatedly DoS another user's host.
+    A peer connecting to another owner's host_id is refused, and that
+    refusal must NOT flip the existing owner's host offline.
+
+    The cross-owner conflict is now caught before accept() and answered
+    with a 409 (close fallback when the denial-response extension is
+    absent, as in this raw scope). The DoS guarantee is unchanged and
+    arguably stronger: the peer's connection is never accepted, so the
+    broad except that once called set_offline(host_id) on a never-
+    registered connection cannot run.
     """
     app, _registry, host_store, _cs = multi_user_app
 
@@ -1110,12 +1114,11 @@ async def test_failed_connect_does_not_offline_another_users_host(
     scope["headers"] = [(b"x-test-user", b"bob@test.com")]
     comm = ApplicationCommunicator(app, scope)
     await comm.send_input({"type": "websocket.connect"})
-    accepted = await comm.receive_output(timeout=1.0)
-    assert accepted["type"] == "websocket.accept"
-    await comm.send_input(
-        {"type": "websocket.receive", "text": _make_hello("bob-laptop")},
-    )
-    # The failed upsert tears the connection down — drain to completion.
+    # Refused before accept(); no denial extension in this scope, so the
+    # server falls back to a pre-accept close (code 4009).
+    closed = await comm.receive_output(timeout=1.0)
+    assert closed["type"] == "websocket.close"
+    assert closed["code"] == 4009
     with contextlib.suppress(Exception):
         await comm.wait(timeout=2.0)
 
@@ -1123,11 +1126,11 @@ async def test_failed_connect_does_not_offline_another_users_host(
     assert after is not None
     # Bob never claimed the host_id...
     assert after.owner == "alice@test.com"
-    # ...and crucially, Alice's host is still online — set_offline did not
-    # run on Bob's failed (never-registered) connection.
+    # ...and crucially, Alice's host is still online: the pre-accept
+    # refusal never runs set_offline on Bob's never-registered connection.
     assert after.status == "online", (
         "Bob's failed connect to Alice's host_id flipped her host offline "
-        "(set_offline ran on a connection that never registered) — DoS."
+        "(set_offline ran on a connection that never registered) - DoS."
     )
 
 
