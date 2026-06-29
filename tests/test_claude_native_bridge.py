@@ -3771,7 +3771,7 @@ def test_usage_from_transcript_entry_sums_context_tokens() -> None:
     """
     Context-token count must sum the three input-side fields.
 
-    The "context tokens" exposed to ap-web's input-composer ring is
+    The "context tokens" exposed to web's input-composer ring is
     ``input_tokens + cache_creation_input_tokens +
     cache_read_input_tokens``. ``output_tokens`` is generated within
     the same call and does NOT count toward the next prompt's size,

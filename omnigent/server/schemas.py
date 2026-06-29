@@ -1564,7 +1564,7 @@ class SessionResponse(BaseModel):
         e.g. ``"claude-opus-4-7"``. ``None`` means no override is
         active (the agent's ``llm_model`` applies). Set via
         ``PATCH /v1/sessions/{id}`` or the REPL's ``/model``
-        command; both write the same column so the ap-web UI and
+        command; both write the same column so the web UI and
         the TUI stay in sync.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
@@ -1792,7 +1792,7 @@ class UpdateSessionRequest(BaseModel):
         the runner-side side effects — specifically the
         native ``/effort`` / ``/model`` / Codex collaboration-mode
         forwards into the live runtime. Used by automatic bind-time
-        handoffs (ap-web's sticky-pref apply on session switch, the
+        handoffs (web's sticky-pref apply on session switch, the
         REPL's pre-create ``/model`` snapshot) where injecting a
         visible slash command into a freshly-spawned pane would
         render as an unexpected "Command model X" item before the
@@ -2442,7 +2442,7 @@ class SessionTodosEvent(_SSEEventBase):
     Emitted after an ``external_session_todos`` POST from the
     ``omnigent claude`` transcript forwarder, which captures todo
     updates via ``PostToolUse``/``TodoWrite`` hook events from Claude
-    Code and forwards them to the Omnigent server. Lets ap-web render a
+    Code and forwards them to the Omnigent server. Lets web render a
     live todo panel in the right column without polling.
 
     :param type: Always ``"session.todos"``.
@@ -2480,7 +2480,7 @@ class SessionTerminalPendingEvent(_SSEEventBase):
        sub-agents) and carries the authoritative ``pending=False`` clear
        emitted by the runner's ``finally`` block.
 
-    Together they allow ap-web to show a spinner on the Terminal pill
+    Together they allow web to show a spinner on the Terminal pill
     while the backend boots the terminal instead of a silent greyed-out
     button, and to distinguish "still starting up" from "no terminal"
     (killed or never created).

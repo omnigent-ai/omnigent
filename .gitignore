@@ -59,7 +59,7 @@ test-results/
 # tests/e2e_ui/visual/snapshots/ is committed.
 tests/e2e_ui/visual/snapshot_failures/
 
-# ap-web SPA build output, emitted into the server's static dir by
+# web SPA build output, emitted into the server's static dir by
 # `npm run build` / the e2e_ui test fixture. Regenerated on demand;
 # never committed.
 omnigent/server/static/web-ui/

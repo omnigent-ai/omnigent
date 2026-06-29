@@ -54,7 +54,7 @@ runs:
       shell: bash
       run: |
         # Self-contained so the action behaves identically regardless of the
-        # caller's env. No ap-web SPA build during installs (this job never
+        # caller's env. No web SPA build during installs (this job never
         # serves the bundle); blank provider keys so a spawned server can't
         # pick up the runner's own credentials.
         {

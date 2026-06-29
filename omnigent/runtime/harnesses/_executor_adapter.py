@@ -928,7 +928,7 @@ class ExecutorAdapter(HarnessApp):
                 )
             )
         elif isinstance(event, ToolCallComplete):
-            # Paired function_call_output. Downstream consumers (ap-web
+            # Paired function_call_output. Downstream consumers (web
             # blockStream, runner persistence) pair results to requests
             # STRICTLY by call_id and discard empty ones — there is NO
             # positional correlation, so a ToolCallComplete that reaches

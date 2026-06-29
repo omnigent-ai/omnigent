@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 env:
-  # No ap-web SPA build during `uv sync` (setup.py _build_web_ui): this job never
+  # No web SPA build during `uv sync` (setup.py _build_web_ui): this job never
   # serves the bundle, and the build otherwise times out on public npm.
   OMNIGENT_SKIP_WEB_UI: "true"
   # Route uv and pip at PyPI. pre-commit installs hook repos via pip (not uv),
@@ -79,8 +79,8 @@ jobs:
       - name: Set up Node.js
         uses: ./.github/actions/setup-node
 
-      - name: Install ap-web dependencies
-        working-directory: ap-web
+      - name: Install web dependencies
+        working-directory: web
         # Pin the npm registry to the npmjs default.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
@@ -91,20 +91,20 @@ jobs:
       # tolerates cosmetic drift (dev/extraneous flags, metadata) that a
       # fresh resolution would rewrite. Regenerate the lockfile and fail
       # if it differs from the committed one.
-      - name: Check ap-web/package-lock.json is up to date
-        working-directory: ap-web
+      - name: Check web/package-lock.json is up to date
+        working-directory: web
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
           npm install --package-lock-only --legacy-peer-deps --no-audit --no-fund
           git diff --exit-code package-lock.json || {
-            echo "::error::ap-web/package-lock.json is out of date. Run 'npm install --package-lock-only --legacy-peer-deps' in ap-web/ and commit the result."
+            echo "::error::web/package-lock.json is out of date. Run 'npm install --package-lock-only --legacy-peer-deps' in web/ and commit the result."
             exit 1
           }
 
       - name: Run formatting, lint, and typing checks
         run: uv run pre-commit run --all-files --show-diff-on-failure
 
-      - name: Type-check ap-web
-        working-directory: ap-web
+      - name: Type-check web
+        working-directory: web
         run: npm run type-check

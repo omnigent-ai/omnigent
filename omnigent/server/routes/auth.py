@@ -584,7 +584,7 @@ def _sanitize_return_to(raw: str | None) -> str:
     the state cookie protects its *integrity* across the IdP round-trip
     but does nothing for its *safety* — the value still originates with
     the caller. This is the server-side mirror of ``sanitizeReturnTo``
-    in ``ap-web/src/pages/LoginPage.tsx``; the accounts flow navigates
+    in ``web/src/pages/LoginPage.tsx``; the accounts flow navigates
     client-side and is already guarded there, but the OIDC redirect
     happens in Python and bypasses that check.
 

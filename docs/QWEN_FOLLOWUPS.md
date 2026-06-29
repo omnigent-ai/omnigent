@@ -129,7 +129,7 @@ comments; this is the *what*, not the *how*.)
 - [ ] **Composer status line: real model + context ring (Web UI).** For
   native-qwen the composer's model/effort chip is currently **hidden** (web UI
   flag `nativeVendorOwnsModel` in `chatStore.sessionBindingPatch` →
-  `ComposerStatusLine` in `ap-web/src/pages/ChatPage.tsx`). It was showing the
+  `ComposerStatusLine` in `web/src/pages/ChatPage.tsx`). It was showing the
   bound spec's *default* model (`claude-sonnet-4-6`) because the qwen-native-ui
   spec sets no model and qwen picks its model inside the vendor TUI (OpenAI-compat
   env / qwen's own `/model`), so Omnigent's `llmModel` was a misleading default.

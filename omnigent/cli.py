@@ -3204,7 +3204,7 @@ def server(
     if not (_WEB_UI_DIST / "index.html").is_file():
         click.echo(
             "  ⚠ web UI not built — serving API only. "
-            "Run `cd ap-web && npm install && npm run build`, "
+            "Run `cd web && npm install && npm run build`, "
             "then restart (or install a release wheel/image).",
             err=True,
         )

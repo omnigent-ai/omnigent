@@ -1,6 +1,6 @@
 name: E2E UI Tests
 
-# Runs the Playwright UI suite against a freshly built ap-web SPA, split across
+# Runs the Playwright UI suite against a freshly built web SPA, split across
 # a 3-shard matrix. The whole suite (including the native Claude/Codex/Cursor
 # render-parity tests) runs against the in-process mock LLM and needs NO
 # secrets, so it runs on ALL PRs -- same-repo AND fork -- directly, like ci.yml.
@@ -173,7 +173,7 @@ jobs:
         run: |
           uv run playwright install --with-deps chromium
 
-      - name: Build ap-web SPA
+      - name: Build web SPA
         # Build BEFORE pytest: Vite's emptyOutDir clobbers the static dir,
         # so never run it under xdist or alongside the live server.
         # --legacy-peer-deps avoids re-resolving the known React 19 peer
@@ -181,7 +181,7 @@ jobs:
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          cd ap-web
+          cd web
           npm ci --legacy-peer-deps --no-audit --no-fund
           npm run build
 
