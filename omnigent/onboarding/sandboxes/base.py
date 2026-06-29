@@ -14,6 +14,7 @@ App OAuth dance, host registration) lives in ``bootstrap``.
 
 from __future__ import annotations
 
+import shlex
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -21,8 +22,10 @@ from typing import TYPE_CHECKING, ClassVar
 
 import click
 
+from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR
+
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
 
@@ -184,6 +187,16 @@ class SandboxLauncher(ABC):
     # ``host_type="managed"`` instead of a mid-flow capability error.
     supports_cli_bootstrap: ClassVar[bool] = True
 
+    # Whether this provider can resume a stopped sandbox IN PLACE
+    # (reattaching its persistent volume) rather than only provisioning a
+    # fresh one. The server's managed-host wake path checks this BEFORE
+    # attempting a resume: providers with a stop/resume lifecycle + a
+    # persistent volume override it to ``True``; providers whose sandboxes
+    # are ephemeral (Modal — no volume to reattach) leave it ``False``, so a
+    # dormant host there stays gone (the user starts a new session) instead
+    # of being silently revived onto an empty workspace.
+    can_resume: ClassVar[bool] = False
+
     @abstractmethod
     def prepare(self) -> None:
         """
@@ -199,14 +212,120 @@ class SandboxLauncher(ABC):
     @abstractmethod
     def provision(self, name: str) -> str:
         """
-        Create a new sandbox.
+        Create a new sandbox and return its id.
+
+        Exec-model providers create the box here. Entrypoint-as-host providers
+        (whose sandbox boots running the host) may instead just RESERVE the id
+        and defer materialization to :meth:`start_host` — which lets the server
+        register the launch token against the id before the box exists, closing
+        the host dial-back race by construction.
 
         :param name: Human-readable label for the sandbox, e.g.
             ``"omnigent-host"``.
-        :returns: The provider-assigned sandbox id, e.g.
+        :returns: The provider-assigned (or reserved) sandbox id, e.g.
             ``"lovable-wattlebird-1530"``.
         :raises click.ClickException: If provisioning fails.
         """
+
+    def start_host(
+        self,
+        sandbox_id: str,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
+        """
+        Start ``omnigent host`` in the sandbox and return the workspace path.
+
+        The default is the EXEC model: probe ``$HOME``, create
+        ``<HOME>/workspace``, optionally clone the repository into it, and start
+        the host detached (``setsid``-backgrounded, identity + token in the
+        process environment) — all driven through :meth:`run` /
+        :meth:`run_background`. It is shared by every provider whose sandbox is a
+        bare box the server execs into (Modal, Daytona, …); entrypoint-as-host
+        providers (e.g. Kubernetes, whose Pod boots running the host) override it.
+
+        The launch token is registered before this call, so the host
+        authenticates the moment it dials back. The ``repo_*`` arguments arrive
+        as primitives (not the server's ``RepoWorkspace``) so this
+        onboarding-layer method carries no server dependency.
+
+        :param sandbox_id: The sandbox from :meth:`provision`.
+        :param token: The raw launch token the host authenticates with.
+        :param host_id: Server-chosen host identity, e.g. ``"host_a1b2c3d4..."``.
+        :param host_name: Server-chosen host display name, e.g.
+            ``"managed-a1b2c3d4"``.
+        :param server_url: URL of this server the host dials back to.
+        :param repo_url: Repository clone URL, or ``None`` for an empty
+            workspace.
+        :param repo_branch: Branch to clone, or ``None`` for the default branch.
+        :param repo_name: Directory the clone lands in under the workspace, or
+            ``None`` when *repo_url* is ``None``.
+        :param on_stage: Progress observer invoked with ``"cloning"`` before the
+            clone (when *repo_url* is set) and ``"starting"`` before the host
+            launches. Runs on this (worker) thread, so it must be thread-safe.
+            ``None`` disables progress reporting.
+        :returns: The absolute in-sandbox workspace path (the cloned repository
+            directory when *repo_url* is set).
+        :raises click.ClickException: If a sandbox command fails, the clone
+            fails, or the sandbox's ``$HOME`` cannot be resolved.
+        """
+        # The image (and the user it runs as) is operator-supplied, so the home
+        # directory isn't knowable statically — ask the sandbox.
+        home = self.run(sandbox_id, 'printf %s "$HOME"').stdout.strip()
+        if not home:
+            raise click.ClickException(
+                f"could not resolve $HOME inside sandbox '{sandbox_id}' — "
+                "the configured image must provide a usable shell environment"
+            )
+        workspace = f"{home}/workspace"
+        self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace)}")
+        if repo_url is not None:
+            if on_stage is not None:
+                on_stage("cloning")
+            clone_dir = f"{workspace}/{repo_name}"
+            branch_args = (
+                f"--branch {shlex.quote(repo_branch)} --single-branch "
+                if repo_branch is not None
+                else ""
+            )
+            try:
+                self.run(
+                    sandbox_id,
+                    f"git clone {branch_args}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}",
+                )
+            except click.ClickException as exc:
+                # Provider boundary: re-raise with the repository named so the
+                # create-session 502 says WHAT failed to clone, not just that a
+                # sandbox command exited non-zero.
+                raise click.ClickException(
+                    f"failed to clone repository '{repo_url}'"
+                    f"{f' (branch {repo_branch!r})' if repo_branch else ''}: {exc.message}"
+                ) from exc
+            workspace = clone_dir
+        # "starting" covers from here through host registration — the caller's
+        # online poll resolves it.
+        if on_stage is not None:
+            on_stage("starting")
+        env_prefix = " ".join(
+            f"{key}={shlex.quote(value)}"
+            for key, value in (
+                (HOST_TOKEN_ENV_VAR, token),
+                (HOST_ID_ENV_VAR, host_id),
+                (HOST_NAME_ENV_VAR, host_name),
+            )
+        )
+        self.run_background(
+            sandbox_id,
+            f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
+        )
+        return workspace
 
     def attach(self, sandbox_id: str) -> None:
         """
@@ -256,6 +375,30 @@ class SandboxLauncher(ABC):
         :raises click.ClickException: If *check* is ``True`` and the
             command exits non-zero.
         """
+
+    def run_background(
+        self, sandbox_id: str, command: str, *, log_path: str = "/tmp/omnigent-host.log"
+    ) -> RemoteCommandResult:
+        """
+        Start *command* as a detached background process in the sandbox.
+
+        The default wraps the command in ``setsid nohup … & echo launched``
+        so it survives the exec session ending. Providers where backgrounded
+        processes are reaped on exec return (e.g. OpenShell) override this
+        to hold the exec stream open instead.
+
+        :param sandbox_id: Target sandbox.
+        :param command: Shell command to background, e.g.
+            ``"ENV=val omnigent host --server https://…"``.
+        :param log_path: Where stdout/stderr of the backgrounded process
+            are redirected inside the sandbox.
+        :returns: A synthetic result with ``stdout="launched\\n"`` on success.
+        :raises click.ClickException: If the launch command fails.
+        """
+        return self.run(
+            sandbox_id,
+            f"setsid nohup {command} > {log_path} 2>&1 < /dev/null & echo launched",
+        )
 
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
         """
@@ -352,6 +495,27 @@ class SandboxLauncher(ABC):
             "sandbox termination — delete the sandbox with the provider's "
             "own tooling."
         )
+
+    def resume(self, sandbox_id: str) -> None:
+        """
+        Resume a stopped sandbox in place, reattaching its persistent
+        volume, so a dormant managed host can be revived under the SAME
+        sandbox id.
+
+        Optional capability: the default implementation raises
+        :class:`SandboxCapabilityError`. Providers whose backend has a
+        stop/resume lifecycle with a persistent volume override it AND set
+        :attr:`can_resume` to ``True``. Used by the server's managed-host
+        wake path; the host process itself is restarted separately (resume
+        only brings the compute + volume back).
+
+        :param sandbox_id: The stopped sandbox to resume, e.g.
+            ``"sb-a1b2c3"``.
+        :raises SandboxCapabilityError: When the provider cannot resume a
+            stopped sandbox (ephemeral sandboxes / no persistent volume).
+        :raises click.ClickException: If the resume fails.
+        """
+        raise self._capability_error("resume a stopped sandbox")
 
     def exec_foreground(self, sandbox_id: str, command: str) -> int:
         """

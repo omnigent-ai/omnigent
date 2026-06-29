@@ -22,6 +22,8 @@ Two surfaces:
 
 from __future__ import annotations
 
+import os
+
 from omnigent.onboarding.ambient import DetectedProvider, detect_providers
 from omnigent.onboarding.configure_models import (
     build_cli_config_provider_entry,
@@ -32,6 +34,7 @@ from omnigent.onboarding.configure_models import (
 )
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
+    GEMINI_FAMILY,
     LOCAL_KIND,
     OPENAI_FAMILY,
     SUBSCRIPTION_KIND,
@@ -41,8 +44,11 @@ from omnigent.onboarding.provider_config import (
     set_default_provider,
 )
 
-# The families auto-default resolution walks, in a stable order.
-_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
+# The families auto-default resolution walks, in a stable order. ``gemini``
+# is included so a detected-only GEMINI_API_KEY (the antigravity-sdk harness's
+# credential) auto-becomes the gemini-family default in the read-time merge,
+# matching how a detected anthropic / openai key auto-defaults.
+_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY)
 
 # Top-level config key listing detection names the user has dismissed by
 # removing the adopted entry. A detection whose backing credential cannot be
@@ -116,8 +122,8 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
     :param det: A credential found by
         :func:`omnigent.onboarding.ambient.detect_providers`.
     :returns: A raw provider entry body (config shape), or ``None`` when the
-        detection maps to no omnigent harness surface (e.g. a Gemini key,
-        whose ``family`` is ``None``).
+        detection maps to no omnigent harness surface (a ``family``-less
+        ``key`` detection).
     """
     if det.kind == "subscription":
         # ``det.name`` is the CLI login (``"claude"`` / ``"codex"``).
@@ -132,8 +138,15 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
             return None
         return build_cli_config_provider_entry("codex", det.model_provider, det.display_name)
 
+    if det.name == "vertex-claude":
+        # Claude Code on Vertex AI — the CLI authenticates via its own env
+        # vars and GCP ADC.  A subscription entry makes the native-claude
+        # resolver skip gateway routing, letting the CLI use Vertex natively.
+        return build_subscription_provider_entry("claude")
+
     if det.family is None:
-        # An env key we detect but can't route to a harness (e.g. Gemini).
+        # An env key we detect but can't route to a harness (a detection
+        # whose provider maps to no omnigent family).
         return None
 
     if det.kind == "key":
@@ -148,6 +161,19 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
             base_url, wire_api = vendor.base_url, vendor.wire_api
         else:
             base_url, wire_api = default_base_url_for_family(det.family), None
+            # An ``OPENAI_API_KEY`` detection honors a companion
+            # ``OPENAI_BASE_URL`` (the same convention the OpenAI SDK reads,
+            # matching the interactive wizard / non-interactive onboarding /
+            # ``provider_selection._read_credentials_from_env``). Without
+            # this, an env key pointed at an OpenAI-compatible gateway (e.g.
+            # the Databricks AI gateway) is synthesized against
+            # ``api.openai.com`` and every request 401s — the credential is a
+            # gateway token, not an OpenAI key. Scoped to the openai family's
+            # canonical vendor (not a third-party endpoint, handled above).
+            if det.family == OPENAI_FAMILY and env_var == "OPENAI_API_KEY":
+                env_base_url = os.environ.get("OPENAI_BASE_URL")
+                if env_base_url:
+                    base_url = env_base_url
         # No pinned model — the spec / catalog default picks it; /model then
         # shows "(no model pinned)" rather than a fabricated one.
         return build_key_provider_entry(det.family, base_url, api_key_ref, None, wire_api=wire_api)
@@ -176,8 +202,12 @@ def synthesize_detected_entries(
         order.
     :returns: Raw provider entries keyed by the detection name, e.g.
         ``{"anthropic": {"kind": "key", ...}, "codex": {"kind":
-        "subscription", "cli": "codex"}}``. Detections with no harness
-        surface (Gemini) are omitted. The mapping preserves detection order.
+        "subscription", "cli": "codex"}}``. A detected GEMINI_API_KEY is
+        adopted as a ``gemini``-family ``key`` provider (the antigravity-sdk
+        surface) — see :data:`omnigent.onboarding.ambient._ENV_KEY_FAMILY`.
+        Only detections that map to no omnigent family at all (a ``family``-less
+        :class:`DetectedProvider`) are skipped. The mapping preserves detection
+        order.
     """
     entries: dict[str, dict[str, object]] = {}
     for det in detected:

@@ -22,6 +22,8 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostCreateDirFrame,
+    HostCreateDirResultFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -219,6 +221,45 @@ async def test_handle_launch_refuses_unconfigured_harness(
     assert "omnigent setup" in (result.error or "")
     assert result.runner_id is None
     # No runner subprocess may exist after a refusal.
+    assert host._runners == {}
+
+
+async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A native-Cursor refusal must name the ``cursor-agent`` installer and
+    login, not ``omnigent setup`` — which only configures the SDK ``cursor``
+    harness and never installs the ``cursor-agent`` CLI ``omni cursor`` boots.
+
+    Here ``harness_setup_hint`` is the real function (only the readiness check
+    is forced False), so this exercises the connect.py → hint wiring end to end.
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        "omnigent.host.connect.harness_is_configured",
+        lambda harness: False,
+    )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_cursor_native",
+        binding_token="token_abc",
+        workspace=str(workspace),
+        harness="cursor-native",
+    )
+    result = await host._handle_launch(frame)
+
+    assert result.status == "failed"
+    assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    message = result.error or ""
+    assert "'cursor-native'" in message
+    assert "test-laptop" in message
+    assert "cursor.com/install" in message
+    assert "cursor-agent login" in message
+    assert "omnigent setup" not in message
     assert host._runners == {}
 
 
@@ -1014,6 +1055,9 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "DATABRICKS_TOKEN": "dapi-secret",
         "AWS_SECRET_ACCESS_KEY": "aws-secret",
         "SOME_RANDOM_VAR": "x",
+        "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
+        "KUBECONFIG": "/home/alice/.kube/config",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
     }
 
     env = _build_runner_env(
@@ -1042,6 +1086,17 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # needs it to allow --dangerously-skip-permissions under root in
     # sandbox containers. Only the baked host image ever sets it.
     assert env["IS_SANDBOX"] == "1"
+    # The claude-sdk sandbox bypass flag forwards — it is read inside the
+    # harness, so a bare ``OMNIGENT_CLAUDE_SDK_NO_SANDBOX=1 omnigent run …``
+    # must reach the runner without also forcing
+    # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``.
+    assert env["OMNIGENT_CLAUDE_SDK_NO_SANDBOX"] == "1"
+    # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
+    # need it to resolve the user's cluster contexts and namespaces.
+    assert env["KUBECONFIG"] == "/home/alice/.kube/config"
+    # CLAUDE_CODE_SKIP_BEDROCK_AUTH disables AWS SigV4 auth for LiteLLM
+    # proxies — a non-secret boolean, same rationale as CLAUDE_CODE_USE_BEDROCK.
+    assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env
@@ -1074,6 +1129,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "OPENAI_API_KEY": "sk-o",
         "OPENAI_BASE_URL": "https://gateway.example.com/openai",
         "GEMINI_API_KEY": "g-key",
+        "AWS_BEARER_TOKEN_BEDROCK": "absk-fwd",
+        "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-runtime.us-east-1.amazonaws.com",
     }
 
     env = _build_runner_env(
@@ -1093,6 +1150,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "GEMINI_API_KEY",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "ANTHROPIC_BEDROCK_BASE_URL",
     ):
         # Pins each conventional name into the default set — dropping
         # one breaks that harness's credentials on managed sandboxes.
@@ -1463,6 +1522,120 @@ def test_handle_list_dir_pagination_last_page_has_more_false(
     assert result.has_more is False
 
 
+# ── host.create_dir handler ─────────────────────────────
+
+
+def test_handle_create_dir_creates_directory(tmp_path: Path) -> None:
+    """
+    Verify ``_handle_create_dir`` makes the directory and returns its
+    absolute path.
+
+    This is the picker's "New folder" happy path — the returned path
+    is what the picker navigates into afterward.
+    """
+    host = _make_host_process()
+    target = tmp_path / "new-app"
+
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m1", path=str(target)))
+
+    assert isinstance(result, HostCreateDirResultFrame)
+    assert result.status == "ok"
+    assert result.error is None
+    assert result.path == str(target)
+    assert target.is_dir()
+
+
+def test_handle_create_dir_creates_missing_parents(tmp_path: Path) -> None:
+    """
+    Verify missing parent directories are created (``os.makedirs``).
+
+    Lets the picker accept a nested name like ``a/b/c`` in one go
+    rather than forcing the user to create each level.
+    """
+    host = _make_host_process()
+    target = tmp_path / "a" / "b" / "c"
+
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m2", path=str(target)))
+
+    assert result.status == "ok"
+    assert target.is_dir()
+
+
+def test_handle_create_dir_existing_returns_error_not_failed(tmp_path: Path) -> None:
+    """
+    Verify creating an existing directory returns ``status: "ok"`` with
+    an "already exists" error rather than ``status: "failed"``.
+
+    The route maps a non-empty ``error`` to a 409 so the picker shows
+    "directory already exists" inline; surfacing ``failed`` would 502
+    instead.
+    """
+    host = _make_host_process()
+    existing = tmp_path / "dup"
+    existing.mkdir()
+
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m3", path=str(existing)))
+
+    assert result.status == "ok"
+    assert result.error == "directory already exists"
+    assert result.path is None
+
+
+def test_handle_create_dir_leaf_is_file_reports_file_not_directory(tmp_path: Path) -> None:
+    """
+    Verify a regular file at the target path reports a file, not a
+    directory.
+
+    ``os.makedirs`` raises ``FileExistsError`` for both an existing
+    directory and an existing file; the handler must distinguish them
+    so the picker doesn't mislabel "a file is in the way" as
+    "directory already exists".
+    """
+    host = _make_host_process()
+    a_file = tmp_path / "taken"
+    a_file.write_text("hi")
+
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m3b", path=str(a_file)))
+
+    assert result.status == "ok"
+    assert result.error == "a file already exists at that path"
+    assert result.path is None
+
+
+def test_handle_create_dir_parent_is_file_returns_error(tmp_path: Path) -> None:
+    """
+    Verify creating under a path whose parent is a regular file returns
+    a clean error rather than crashing.
+    """
+    host = _make_host_process()
+    a_file = tmp_path / "file.txt"
+    a_file.write_text("hi")
+    target = a_file / "child"
+
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m4", path=str(target)))
+
+    assert result.status == "ok"
+    assert "not a directory" in (result.error or "")
+    assert result.path is None
+
+
+def test_handle_create_dir_expands_tilde(tmp_path: Path, monkeypatch) -> None:
+    """
+    Verify ``~`` expands against the host process owner's home.
+
+    The host owns ``~`` resolution; without expansion ``~/scratch``
+    would become a literal ``~`` subdir of the process cwd.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    host = _make_host_process()
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m5", path="~/scratch"))
+
+    assert result.status == "ok"
+    assert (tmp_path / "scratch").is_dir()
+    assert result.path == str(tmp_path / "scratch")
+
+
 # --- Fail-loud on permanent tunnel failures ----------------------------
 #
 # Before the fix, HostProcess.run() caught every connection exception and
@@ -1641,6 +1814,31 @@ def _host(
     """
     identity = HostIdentity(host_id="host_test_connect", name="test-laptop")
     return HostProcess(identity, server_url)
+
+
+def test_build_connect_headers_adds_org_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A recorded ?o= selector rides the tunnel handshake.
+
+    The WS upgrade must name the workspace via ``X-Databricks-Org-Id`` or it
+    routes to the account. The header rides alongside the Origin sentinel,
+    independent of the bearer/managed-token branch.
+
+    :param monkeypatch: The pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import omnigent.runner._entry as entry_mod
+
+    # No managed token + no real Databricks creds: isolate the bearer
+    # branch so only the routing header is under test.
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_org_id", lambda _url: "2850744067564480"
+    )
+
+    headers = _host("https://acme.databricks.com/api/2.0/omnigent")._build_connect_headers()
+
+    assert headers["X-Databricks-Org-Id"] == "2850744067564480"
 
 
 async def test_run_retries_on_login_redirect(

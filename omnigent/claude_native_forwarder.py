@@ -10,7 +10,8 @@ import logging
 import os
 import tempfile
 import time
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,151 @@ _HOOKS_FILE = "hooks.jsonl"
 # file is reset and the reader restarts from 0. Generous because one
 # prose answer can be hundreds of chunks.
 _MAX_SEEN_DELTA_KEYS = 5000
+
+# Max time an assistant ``message`` item is held waiting for its
+# streamed deltas to forward first. The transcript and deltas file have
+# independent writers, so a short reply's record can hit disk a poll
+# BEFORE its deltas — inverting the deltas-before-done order and
+# rendering the message twice. ~8 polls at 0.25s: well past the one-poll
+# race, short enough that an unmatched item (dropped deltas, or a
+# multi-block message that never byte-equals the whole-message stream)
+# posts with barely noticeable delay — and has no preview to duplicate.
+_ASSISTANT_ITEM_DELTA_HOLD_S = 2.0
+
+# Cap on the delta-ordering bookkeeping. Entries are consumed on match /
+# never revisited after post, so this is a backstop against pathological
+# sessions, not a working-set size.
+_MAX_DELTA_ORDERING_ENTRIES = 256
+
+
+@dataclass
+class _ForwardedDeltaText:
+    """
+    Forwarded streamed-text accumulation for one assistant message.
+
+    :param parts: Forwarded delta strings in arrival order, e.g.
+        ``["Hello ", "world"]``.
+    :param final: Whether the ``final: true`` chunk has forwarded — only
+        then is ``"".join(parts)`` the complete text, safe to byte-compare
+        against a transcript item.
+    """
+
+    parts: list[str] = field(default_factory=list)
+    final: bool = False
+
+
+@dataclass
+class _DeltaOrderingState:
+    """
+    Cross-poll state enforcing deltas-before-done item ordering.
+
+    Filled by :func:`_forward_available_deltas` (forwarded chunk text per
+    ``message_id``) and consumed by :func:`_hold_assistant_item_for_deltas`,
+    which matches an assistant ``message`` item to its forwarded stream by
+    byte-equal text (the transcript carries no ``message_id``).
+
+    :param texts: ``message_id`` → forwarded delta text state. Popped
+        when an item matches it.
+    :param held_since: ``source_id`` → monotonic time first held. Kept
+        after the timeout releases the item so a failed post's retry
+        isn't re-held; bounded.
+    """
+
+    texts: dict[str, _ForwardedDeltaText] = field(default_factory=dict)
+    held_since: dict[str, float] = field(default_factory=dict)
+
+
+def _hold_monotonic() -> float:
+    """
+    Monotonic clock for the assistant-item hold timeout.
+
+    Indirection so tests patch THIS, not the process-global
+    ``time.monotonic`` (see the no-global-singleton-patch test rule).
+
+    :returns: Seconds from an unspecified monotonic epoch.
+    """
+    return time.monotonic()
+
+
+def _item_output_text(data: dict[str, Any]) -> str | None:
+    """
+    Join the ``output_text`` blocks of a message item's content.
+
+    :param data: Item payload, e.g. ``{"role": "assistant", "content":
+        [{"type": "output_text", "text": "Hi"}]}``.
+    :returns: The joined text, or ``None`` when the item carries none.
+    """
+    content = data.get("content")
+    if not isinstance(content, list):
+        return None
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "output_text":
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    if not parts:
+        return None
+    return "".join(parts)
+
+
+def _hold_assistant_item_for_deltas(
+    item: ClaudeTranscriptItem,
+    ordering: _DeltaOrderingState | None,
+    bridge_dir: Path,
+) -> bool:
+    """
+    Decide whether to defer an assistant message item to a later poll.
+
+    Enforces deltas-before-done: an assistant ``message`` item posts only
+    once a complete (``final``-seen) forwarded stream byte-equals its
+    text, or after :data:`_ASSISTANT_ITEM_DELTA_HOLD_S`. Holding returns
+    ``True`` and the caller stops the batch here (cursor unadvanced) so
+    later items can't overtake it. Items that can't have a preview — tool
+    calls, user/text-less messages, no-deltas-file sessions — never hold.
+    The timeout is safe: a message whose deltas never arrive has no live
+    preview, so a late post renders once, like any non-streamed message.
+
+    :param item: The transcript item about to be posted.
+    :param ordering: Shared ordering state, or ``None`` to disable
+        holding (parsing-only test paths).
+    :param bridge_dir: Native Claude bridge directory (for the
+        deltas-file existence check).
+    :returns: ``True`` to hold the item (and the rest of the batch)
+        until the next poll; ``False`` to post it now.
+    """
+    if ordering is None:
+        return False
+    if item.item_type != "message" or item.data.get("role") != "assistant":
+        return False
+    text = _item_output_text(item.data)
+    if not text:
+        return False
+    if not (bridge_dir / MESSAGE_DELTAS_FILE).exists():
+        return False
+    for message_id, entry in ordering.texts.items():
+        if entry.final and "".join(entry.parts) == text:
+            # Deltas fully forwarded — consume the stream (a later
+            # identical-text message matches its own) and post.
+            ordering.texts.pop(message_id)
+            ordering.held_since.pop(item.source_id, None)
+            return False
+    now = _hold_monotonic()
+    first_held = ordering.held_since.setdefault(item.source_id, now)
+    while len(ordering.held_since) > _MAX_DELTA_ORDERING_ENTRIES:
+        del ordering.held_since[next(iter(ordering.held_since))]
+    if now - first_held >= _ASSISTANT_ITEM_DELTA_HOLD_S:
+        # Timestamp kept: a failed post's retry next poll is released
+        # immediately by the elapsed check, not re-held for a full timeout.
+        _logger.debug(
+            "Posting assistant transcript item without matching forwarded "
+            "deltas after %.1fs hold; source_id=%s",
+            _ASSISTANT_ITEM_DELTA_HOLD_S,
+            item.source_id,
+        )
+        return False
+    return True
+
 
 # Seconds of transcript inactivity after which we publish ``idle`` for
 # a sub-agent. The transcript is the only signal we have for sub-agent
@@ -491,6 +637,13 @@ async def forward_claude_transcript_to_session(
     # prevents re-reads on the normal path.
     delta_state = _read_delta_forward_state(bridge_dir)
     seen_delta_keys: dict[tuple[str, int], None] = {}
+    # Deltas-before-done ordering across the two independent tails: the
+    # deltas forwarder records each message's forwarded text, the items
+    # forwarder holds an assistant item until its text matches a complete
+    # forwarded stream (or a short timeout). Per-process like
+    # ``seen_delta_keys``; survives /clear and /fork (message_ids belong
+    # to the long-lived Claude process).
+    delta_ordering = _DeltaOrderingState()
     item_retries = _PostRetryTracker()
     status_retries = _PostRetryTracker()
     subagent_start_retries = _PostRetryTracker()
@@ -535,6 +688,22 @@ async def forward_claude_transcript_to_session(
                     state=hook_state,
                 )
                 if rotation is not None:
+                    # Tell the superseded (old) conversation it was cleared:
+                    # persist a notice linking to the rotated-to session and
+                    # emit a live redirect event. Use the loop's ``session_id``
+                    # (the session being forwarded BEFORE this poll), NOT
+                    # ``current_session_id``: when the hook rotated the bridge's
+                    # active session synchronously, ``current_session_id`` already
+                    # reads the NEW id, whereas ``session_id`` is not reassigned
+                    # to ``rotation`` until below. The call is fully best-effort
+                    # (swallows its own errors) so the state reset below always
+                    # runs.
+                    await _post_clear_supersession(
+                        client,
+                        old_session_id=session_id,
+                        new_session_id=rotation,
+                        agent_name=agent_name,
+                    )
                     session_id = rotation
                     state = None
                     hook_state = None
@@ -623,12 +792,17 @@ async def forward_claude_transcript_to_session(
                     # — would land just AFTER its done event and re-create the
                     # already-finalized preview on the client (duplicate bubble
                     # + a stale trailing preview). See the web reconciler.
+                    # Within-poll order can't cover the cross-poll race
+                    # (transcript flushed, hook delta write not yet);
+                    # ``delta_ordering`` closes it by holding the assistant
+                    # item until its deltas byte-match or a timeout expires.
                     delta_state = await _forward_available_deltas(
                         client=client,
                         session_id=current_session_id,
                         bridge_dir=bridge_dir,
                         state=delta_state,
                         seen_keys=seen_delta_keys,
+                        ordering=delta_ordering,
                     )
                     state = await _forward_available_items(
                         client=client,
@@ -639,6 +813,7 @@ async def forward_claude_transcript_to_session(
                         retry_tracker=item_retries,
                         skip_user_messages=skip_user_messages,
                         dedupe=dedupe,
+                        ordering=delta_ordering,
                     )
                     hook_state = await _forward_available_status_events(
                         client=client,
@@ -675,6 +850,18 @@ async def forward_claude_transcript_to_session(
                         subagent_state=subagent_state,
                         dedupe=dedupe,
                         cost_cache=cost_cache,
+                    )
+                    # Mirror the live statusLine model EVERY poll (not just
+                    # when a turn produced new transcript items, which
+                    # _forward_available_items early-returns without). This
+                    # propagates an in-pane /model switch to model_override
+                    # before the user's next message, so model-gated policies
+                    # (cost-budget hard cap) no longer lag a switch by one turn.
+                    await _forward_model_from_status(
+                        client=client,
+                        session_id=current_session_id,
+                        bridge_dir=bridge_dir,
+                        dedupe=dedupe,
                     )
             except asyncio.CancelledError:
                 raise
@@ -803,6 +990,40 @@ async def _write_subagent_forward_state_async(
     await asyncio.to_thread(_write_subagent_forward_state, bridge_dir, state)
 
 
+def _parse_json_response(resp: httpx.Response, *, context: str) -> Any:
+    """
+    Parse an Omnigent JSON response, failing loudly on a non-JSON body.
+
+    The forwarder calls ``resp.json()`` on Sessions API responses after
+    ``resp.raise_for_status()``. That guards non-2xx statuses but not a
+    2xx body that simply is not JSON: an auth or proxy layer in front of
+    the server — most commonly an expired Databricks Apps OAuth session —
+    can serve an HTML login or error page with a 200 status. A bare
+    ``resp.json()`` then raises an opaque ``json.JSONDecodeError``
+    ("Expecting value: line 1 column 1 (char 0)") with no hint that the
+    body was HTML, and the forwarder supervisor turns that into a silent
+    restart loop. This wrapper re-raises with the response content type
+    and a body snippet so the cause is obvious in logs.
+
+    :param resp: HTTP response whose body is expected to be JSON.
+    :param context: Short request description for the error message,
+        e.g. ``"session conv_abc123 snapshot"``.
+    :returns: The parsed JSON value (object, array, or scalar).
+    :raises RuntimeError: If the response body is not valid JSON.
+    """
+    try:
+        return resp.json()
+    except ValueError as exc:
+        content_type = resp.headers.get("content-type") or "<unknown>"
+        snippet = " ".join(resp.text[:200].split())
+        raise RuntimeError(
+            f"{context} returned a non-JSON body (content-type "
+            f"{content_type!r}); an auth or proxy page was likely served "
+            f"instead of the API response (e.g. an expired login session). "
+            f"Body starts with: {snippet!r}"
+        ) from exc
+
+
 async def _post_external_subagent_start(
     client: httpx.AsyncClient,
     *,
@@ -833,6 +1054,7 @@ async def _post_external_subagent_start(
     :raises KeyError: If the server response is missing
         ``child_session_id`` — indicates a server/forwarder version
         mismatch and is unrecoverable for this sub-agent.
+    :raises RuntimeError: If the server response body is not JSON.
     """
     resp = await client.post(
         f"/v1/sessions/{parent_session_id}/events",
@@ -847,7 +1069,7 @@ async def _post_external_subagent_start(
         },
     )
     resp.raise_for_status()
-    body = resp.json()
+    body = _parse_json_response(resp, context=f"sub-agent start for {parent_session_id!r}")
     return body["child_session_id"]
 
 
@@ -1426,7 +1648,7 @@ async def _forward_session_cost(
     # lower transcript read (e.g. just after a rotation) and suppresses
     # steady-state churn. The two fields advance independently (policy_cost
     # moves mid-turn while display_cost/S is frozen).
-    payload: dict[str, float] = {}
+    payload: dict[str, float | str] = {}
     if display_cost is not None and (
         dedupe.posted_cost is None or display_cost > dedupe.posted_cost
     ):
@@ -1437,6 +1659,17 @@ async def _forward_session_cost(
         payload["policy_cost_usd"] = policy_cost
     if not payload:
         return
+    # Tag a display-cost (S) advance with the active model captured by the
+    # statusLine wrapper (``{"model": "claude-opus-4-8", ...}`` in context.json).
+    # claude-native sends no token counts with its cost, so the server has
+    # nothing to attribute the cost to per-model without this — leaving it out
+    # of the TOKEN USAGE breakdown while the session total still counts it. Sent
+    # only when the display cost moves: that is the value being attributed
+    # (``policy_cost_usd``-only mid-turn posts carry no new display cost).
+    if "cumulative_cost_usd" in payload and isinstance(status_state, dict):
+        model = status_state.get("model")
+        if isinstance(model, str) and model:
+            payload["model"] = model
     try:
         await _post_external_session_usage(
             client,
@@ -1601,10 +1834,9 @@ async def _maybe_rotate_session_on_clear(
         ``"conv_old"``.
     :param bridge_dir: Native Claude bridge directory.
     :param state: Current hook cursor state.
-    :returns: New active session id when rotation occurred, otherwise
-        ``None``.
-    :raises httpx.HTTPError: If Omnigent rejects the create, bind, transfer,
-        or old-session clear calls.
+    :returns: New active session id when rotation succeeded, otherwise
+        ``None`` (no clear pending, or the rotation failed and was consumed
+        to avoid a re-rotation loop).
     """
     result = await asyncio.to_thread(_read_hook_events_for_state, bridge_dir, state)
     clear_record = next(
@@ -1618,14 +1850,13 @@ async def _maybe_rotate_session_on_clear(
     if clear_record is None:
         return None
 
-    if clear_record.clear_rotated_to:
-        new_session_id = clear_record.clear_rotated_to
-    else:
-        new_session_id = await _create_clear_replacement_session(
-            client=client,
-            old_session_id=session_id,
-            bridge_dir=bridge_dir,
-        )
+    # Consume this clear hook EXACTLY ONCE. If the rotation raises partway
+    # (e.g. the terminal transfer returns 400 because the target already owns a
+    # terminal), we must still advance the cursor: otherwise the forwarder's
+    # next poll re-reads the same clear record and re-rotates — creating a fresh
+    # replacement session every poll, unbounded. A single /clear rotates at most
+    # once; a failed rotation is logged and skipped (the old session simply
+    # keeps running) rather than retried forever.
     durable = HookForwardState(
         event_cursor=clear_record.event_cursor,
         byte_offset=clear_record.byte_offset,
@@ -1634,6 +1865,24 @@ async def _maybe_rotate_session_on_clear(
             clear_record.byte_offset,
         ),
     )
+    new_session_id: str | None = None
+    try:
+        if clear_record.clear_rotated_to:
+            new_session_id = clear_record.clear_rotated_to
+        else:
+            new_session_id = await _create_clear_replacement_session(
+                client=client,
+                old_session_id=session_id,
+                bridge_dir=bridge_dir,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _logger.exception(
+            "Claude /clear rotation failed; consuming the clear hook to avoid a "
+            "re-rotation loop. old_session=%s",
+            session_id,
+        )
     await _write_hook_state_async(bridge_dir, durable)
     reset_transcript_forward_state(bridge_dir, reset_hooks=False)
     return new_session_id
@@ -1708,7 +1957,7 @@ async def _create_clear_replacement_session(
         },
     )
     create_resp.raise_for_status()
-    created = create_resp.json()
+    created = _parse_json_response(create_resp, context="clear-replacement session create")
     new_session_id = created.get("id")
     if not isinstance(new_session_id, str) or not new_session_id:
         raise RuntimeError("clear replacement session response did not include id")
@@ -1733,7 +1982,20 @@ async def _create_clear_replacement_session(
     write_active_session_id(bridge_dir, new_session_id)
     clear_resp = await client.patch(
         f"/v1/sessions/{url_component(old_session_id)}",
-        json={"runner_id": ""},
+        json={
+            "runner_id": "",
+            # Re-key the superseded session onto a DISTINCT "-cleared" bridge id.
+            # The new session keeps the original bridge id (set above) and owns
+            # the live terminal/pane in D(original); the old session must NOT
+            # share that dir, or resuming it (host wake-on-message /
+            # ``omnigent claude --resume``) would put a second forwarder on the
+            # live transcript (duplicate items) and trip the executor's
+            # "no longer active after /clear" guard. ``_auto_create_claude_terminal``
+            # recognises this exact marker and cold-resumes the old session in
+            # its own isolated D("{id}-cleared"); the executor spawn_env resolves
+            # the same label, so both agree.
+            "labels": {BRIDGE_ID_LABEL_KEY: f"{old_session_id}-cleared"},
+        },
     )
     if clear_resp.status_code >= 400:
         _logger.warning(
@@ -1767,24 +2029,20 @@ async def _maybe_rotate_session_on_fork(
         ``"conv_old"``.
     :param bridge_dir: Native Claude bridge directory.
     :param state: Current hook cursor state.
-    :returns: New active session id when fork rotation occurred,
-        otherwise ``None``.
-    :raises httpx.HTTPError: If Omnigent rejects the fork, bind, transfer,
-        or old-session clear calls.
+    :returns: New active session id when fork rotation succeeded, otherwise
+        ``None`` (no fork pending, or the rotation failed and was consumed to
+        avoid a re-rotation loop).
     """
     result = await asyncio.to_thread(_read_hook_events_for_state, bridge_dir, state)
     fork_record = next((record for record in result.records if _is_fork_hook_record(record)), None)
     if fork_record is None:
         return None
 
-    if fork_record.fork_rotated_to:
-        new_session_id = fork_record.fork_rotated_to
-    else:
-        new_session_id = await _create_fork_replacement_session(
-            client=client,
-            old_session_id=session_id,
-            bridge_dir=bridge_dir,
-        )
+    # Consume this fork hook EXACTLY ONCE — see the matching guard in
+    # _maybe_rotate_session_on_clear. A rotation that raises partway (e.g. a
+    # terminal-transfer 400) must still advance the cursor so the next poll does
+    # not re-read the same fork record and create another replacement session
+    # without bound.
     durable = HookForwardState(
         event_cursor=fork_record.event_cursor,
         byte_offset=fork_record.byte_offset,
@@ -1793,6 +2051,24 @@ async def _maybe_rotate_session_on_fork(
             fork_record.byte_offset,
         ),
     )
+    new_session_id: str | None = None
+    try:
+        if fork_record.fork_rotated_to:
+            new_session_id = fork_record.fork_rotated_to
+        else:
+            new_session_id = await _create_fork_replacement_session(
+                client=client,
+                old_session_id=session_id,
+                bridge_dir=bridge_dir,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _logger.exception(
+            "Claude /fork rotation failed; consuming the fork hook to avoid a "
+            "re-rotation loop. old_session=%s",
+            session_id,
+        )
     await _write_hook_state_async(bridge_dir, durable)
     await _seed_fork_transcript_forward_state(
         bridge_dir=bridge_dir,
@@ -1828,7 +2104,7 @@ async def _create_fork_replacement_session(
         json={},
     )
     fork_resp.raise_for_status()
-    forked = fork_resp.json()
+    forked = _parse_json_response(fork_resp, context=f"fork of session {old_session_id!r}")
     new_session_id = forked.get("id")
     if not isinstance(new_session_id, str) or not new_session_id:
         raise RuntimeError("fork replacement session response did not include id")
@@ -1942,7 +2218,7 @@ async def _fetch_session_snapshot(
     """
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     resp.raise_for_status()
-    payload = resp.json()
+    payload = _parse_json_response(resp, context=f"session {session_id!r} snapshot")
     if not isinstance(payload, dict):
         raise RuntimeError(f"session {session_id!r} snapshot was not an object")
     return payload
@@ -2211,6 +2487,23 @@ async def _forward_available_status_events(
                         compaction_status,
                         exc_info=True,
                     )
+                # Persist a compaction item so session resume knows
+                # the compaction boundary. Without this, rebuilding
+                # the transcript from the conversation DB loads the
+                # full pre-compaction history.
+                if compaction_status == "completed":
+                    try:
+                        await _persist_native_compaction_item(
+                            client,
+                            session_id=session_id,
+                            bridge_dir=bridge_dir,
+                        )
+                    except Exception:  # noqa: BLE001
+                        _logger.warning(
+                            "Failed to persist compaction item for %s",
+                            session_id,
+                            exc_info=True,
+                        )
                 durable = next_durable
                 await _write_hook_state_async(bridge_dir, durable)
                 continue
@@ -2397,6 +2690,7 @@ async def _forward_available_items(
     retry_tracker: _PostRetryTracker,
     skip_user_messages: bool = False,
     dedupe: _ForwardDedupeState,
+    ordering: _DeltaOrderingState | None = None,
 ) -> TranscriptForwardState:
     """
     Forward currently available transcript items after ``state``.
@@ -2410,6 +2704,11 @@ async def _forward_available_items(
         transcript item posts.
     :param dedupe: Last usage / context-window / model values POSTed;
         mutated in place to suppress duplicate ``external_*`` events.
+    :param ordering: Delta-ordering state shared with
+        :func:`_forward_available_deltas`. An assistant ``message`` item
+        whose deltas haven't fully forwarded is held (batch stops, cursor
+        unadvanced) until they have or a timeout expires — see
+        :func:`_hold_assistant_item_for_deltas`. ``None`` disables holding.
     :returns: The updated transcript cursor state. On post failure it
         is the last durable cursor so retries don't re-post successful
         items.
@@ -2438,6 +2737,11 @@ async def _forward_available_items(
             seen_source_ids.append(item.source_id)
             seen.add(item.source_id)
             continue
+        # Deltas-before-done: defer an assistant message whose deltas
+        # haven't forwarded yet. Stop the batch here (cursor before this
+        # item) so later items can't overtake it.
+        if _hold_assistant_item_for_deltas(item, ordering, bridge_dir):
+            return updated
         retry_key = f"item:{item.source_id}"
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return updated
@@ -2598,37 +2902,18 @@ async def _forward_available_items(
             )
     # Mirror a TUI-side `/model` switch to the web picker. The transcript
     # records the resolved concrete id (e.g. "claude-opus-4-8"); collapse
-    # it to the picker's tier alias. ``observed_model`` is sticky across
-    # polls — the incremental window usually has no fresh message.model —
-    # so a failed POST is retried on the next poll rather than lost.
-    alias = _model_alias_for(result.latest_model)
-    if alias is not None:
-        dedupe.observed_model = alias
-    if dedupe.observed_model is not None and dedupe.observed_model != dedupe.posted_model:
-        if dedupe.posted_model is None:
-            # First observation = the spawn default; seed the baseline
-            # without posting so it can't clobber a pending silent model
-            # handoff. Only a later in-TUI switch is mirrored.
-            dedupe.posted_model = dedupe.observed_model
-        else:
-            try:
-                await _post_external_model_change(
-                    client,
-                    session_id=session_id,
-                    model=dedupe.observed_model,
-                )
-                dedupe.posted_model = dedupe.observed_model
-            except httpx.HTTPError as exc:
-                # Leave posted_model behind observed_model so the next
-                # poll retries (best-effort, like the usage post above).
-                _logger.warning(
-                    "Failed to forward Claude model change; session=%s bridge_dir=%s "
-                    "http_status=%s",
-                    session_id,
-                    bridge_dir,
-                    _http_status_for_log(exc),
-                    exc_info=True,
-                )
+    # it to the picker's tier alias. This transcript-derived observation
+    # only fires when a turn produces a fresh ``message.model``, so it lags
+    # an in-pane switch by one turn — the per-poll statusLine sync
+    # (:func:`_forward_model_from_status`) is the primary, low-latency
+    # source; this stays as a fallback for cold-resume before the first
+    # statusLine render. Both share ``dedupe`` so neither double-posts.
+    await _post_model_change_if_new(
+        client,
+        session_id=session_id,
+        dedupe=dedupe,
+        alias=_model_alias_for(result.latest_model),
+    )
     return updated
 
 
@@ -2811,6 +3096,109 @@ def _validated_transcript_state(
     )
 
 
+async def _post_clear_supersession(
+    client: httpx.AsyncClient,
+    *,
+    old_session_id: str,
+    new_session_id: str,
+    agent_name: str,
+) -> None:
+    """
+    Notify the superseded session that a ``/clear`` rotated it away.
+
+    Posts three best-effort events to the OLD conversation, in order:
+
+    1. An ``external_session_status: idle`` so the old conversation's
+       "Working…" spinner stops — its terminal moved to the new session,
+       so it will never receive the turn-end edge that would normally
+       clear it.
+    2. A persisted assistant ``message`` item linking to the new
+       conversation, so a later reload of the cleared conversation
+       explains what happened and offers the continuation link. This is
+       the durable record — it survives reconnects.
+    3. A transient ``external_session_superseded`` event the server
+       republishes as ``session.superseded``, so a client *actively*
+       viewing the old conversation auto-redirects to the new one.
+
+    Each failure is logged and swallowed: the rotation has already
+    completed and reset forwarder state, and a notification error must
+    not disrupt the poll loop or stop the new session from forwarding.
+
+    :param client: Omnigent HTTP client (``base_url`` = AP server).
+    :param old_session_id: Superseded conversation id, e.g. ``"conv_old"``.
+    :param new_session_id: Rotated-to conversation id, e.g. ``"conv_new"``.
+    :param agent_name: Agent name to stamp on the notice message — an
+        assistant ``message`` item requires one.
+    :returns: None.
+    """
+    if old_session_id == new_session_id:
+        # Defensive: never address the notice/redirect at the live session.
+        # The caller resolves the old id from the pre-rotation forwarder
+        # state, but if that ever collapses to the new id, posting here
+        # would dump the "you were cleared" banner onto the active chat.
+        return
+    try:
+        status_resp = await client.post(
+            f"/v1/sessions/{url_component(old_session_id)}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle"},
+            },
+        )
+        status_resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to post /clear supersession idle status; old_session=%s new_session=%s",
+            old_session_id,
+            new_session_id,
+            exc_info=True,
+        )
+    notice = (
+        "This conversation was ended by `/clear`. "
+        f"Continue in [the new chat](/c/{new_session_id}). "
+        "You can also send a message here to resume this conversation."
+    )
+    try:
+        item_resp = await client.post(
+            f"/v1/sessions/{url_component(old_session_id)}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "assistant",
+                        "agent": agent_name,
+                        "content": [{"type": "output_text", "text": notice}],
+                    },
+                },
+            },
+        )
+        item_resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to post /clear supersession notice; old_session=%s new_session=%s",
+            old_session_id,
+            new_session_id,
+            exc_info=True,
+        )
+    try:
+        event_resp = await client.post(
+            f"/v1/sessions/{url_component(old_session_id)}/events",
+            json={
+                "type": "external_session_superseded",
+                "data": {"target_conversation_id": new_session_id},
+            },
+        )
+        event_resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to post /clear supersession redirect event; old_session=%s new_session=%s",
+            old_session_id,
+            new_session_id,
+            exc_info=True,
+        )
+
+
 async def _post_external_conversation_item(
     client: httpx.AsyncClient,
     *,
@@ -2883,6 +3271,7 @@ async def _forward_available_deltas(
     bridge_dir: Path,
     state: DeltaForwardState,
     seen_keys: dict[tuple[str, int], None],
+    ordering: _DeltaOrderingState | None = None,
 ) -> DeltaForwardState:
     """
     Forward newly appended assistant-text deltas to the active session.
@@ -2903,6 +3292,11 @@ async def _forward_available_deltas(
     :param seen_keys: In-memory ``(message_id, index)`` dedupe ring,
         mutated in place. Guards the rare file-truncation rewind where
         the reader restarts from offset ``0``.
+    :param ordering: Delta-ordering state, mutated in place: each
+        forwarded chunk's text accumulates under its ``message_id`` for
+        :func:`_hold_assistant_item_for_deltas` to byte-match. Accumulated
+        on read, not POST success — a dropped chunk should let the item
+        post, not wait on text that never completes. ``None`` disables it.
     :returns: The updated delta cursor state (offset advanced past the
         records just read).
     """
@@ -2928,6 +3322,13 @@ async def _forward_available_deltas(
         # limit.
         while len(seen_keys) > _MAX_SEEN_DELTA_KEYS:
             del seen_keys[next(iter(seen_keys))]
+        if ordering is not None:
+            entry = ordering.texts.setdefault(delta.message_id, _ForwardedDeltaText())
+            entry.parts.append(delta.delta)
+            if delta.final:
+                entry.final = True
+            while len(ordering.texts) > _MAX_DELTA_ORDERING_ENTRIES:
+                del ordering.texts[next(iter(ordering.texts))]
         try:
             await _post_external_output_text_delta(client, session_id=session_id, delta=delta)
         except httpx.HTTPError as exc:
@@ -2949,7 +3350,7 @@ async def _post_external_session_usage(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    usage: dict[str, float] | None,
+    usage: Mapping[str, float | str] | None,
     context_window: int | None = None,
 ) -> None:
     """
@@ -2960,7 +3361,9 @@ async def _post_external_session_usage(
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
-    :param usage: ``message.usage`` snapshot, or ``None`` to skip.
+    :param usage: ``message.usage`` snapshot, or ``None`` to skip. Values are
+        numeric counters/costs, plus an optional ``model`` string tagging the
+        cost with the active model for per-model attribution.
     :param context_window: Resolved window in tokens, or ``None`` to
         leave the server's persisted value untouched.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
@@ -3031,11 +3434,109 @@ async def _post_external_model_change(
     resp.raise_for_status()
 
 
+async def _post_model_change_if_new(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    dedupe: _ForwardDedupeState,
+    alias: str | None,
+) -> None:
+    """
+    Mirror an observed model tier alias to ``model_override``, deduped.
+
+    Shared by the transcript-driven path (:func:`_forward_available_items`)
+    and the statusLine-driven per-poll path
+    (:func:`_forward_model_from_status`). The FIRST observation is the
+    session's spawn default, not a switch, so it seeds the dedupe baseline
+    WITHOUT posting (posting it could clobber a pending silent model
+    handoff). Every later change posts ``external_model_change``. Both
+    callers pass the same ``dedupe`` so whichever observes a switch first
+    posts it and the other no-ops. Best-effort: a failed POST leaves
+    ``posted_model`` behind ``observed_model`` so the next poll retries.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param dedupe: Shared per-session dedupe state; mutated in place.
+    :param alias: Tier alias just observed (``"opus"`` / ``"sonnet"`` /
+        …), or ``None`` when this source carried no recognizable model on
+        this poll. ``observed_model`` is sticky across polls, so passing
+        ``None`` does NOT clear it — it just means "no fresh observation,"
+        and a previously-observed-but-unposted model is still reconciled
+        (retried) here.
+    """
+    if alias is not None:
+        dedupe.observed_model = alias
+    if dedupe.observed_model is None or dedupe.observed_model == dedupe.posted_model:
+        return
+    if dedupe.posted_model is None:
+        # First observation = the spawn default; seed the baseline without
+        # posting so it can't clobber a pending silent model handoff.
+        dedupe.posted_model = dedupe.observed_model
+        return
+    try:
+        await _post_external_model_change(
+            client,
+            session_id=session_id,
+            model=dedupe.observed_model,
+        )
+        dedupe.posted_model = dedupe.observed_model
+    except httpx.HTTPError:
+        # Leave posted_model behind observed_model so the next poll retries.
+        _logger.warning(
+            "Failed to mirror model change to Omnigent session=%s; model pill / "
+            "cost-budget gate may lag until the next poll",
+            session_id,
+            exc_info=True,
+        )
+
+
+async def _forward_model_from_status(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    dedupe: _ForwardDedupeState,
+) -> None:
+    """
+    Mirror the statusLine-reported active model to ``model_override`` each poll.
+
+    Claude Code rewrites the statusLine stdin on every TUI render — including
+    right after an in-pane ``/model`` switch, BEFORE the next turn runs. The
+    wrapper (:mod:`omnigent.claude_native_status`) persists that model into
+    ``context.json``. Reading it here, every poll and independently of new
+    transcript items, is what lets a policy that gates on the active model
+    (e.g. the session cost-budget hard cap, which only blocks expensive
+    tiers) see the new model on the user's NEXT message — instead of one
+    turn later, which is what happened when the model was derived solely
+    from the next turn's transcript ``message.model``.
+
+    Best-effort and idempotent: shares ``dedupe`` with the transcript path,
+    so a no-op when the model is unchanged.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Claude bridge directory.
+    :param dedupe: Shared per-session model dedupe state.
+    """
+    status_state = await asyncio.to_thread(read_claude_context_state, bridge_dir)
+    if status_state is None:
+        return
+    model = status_state.get("model")
+    alias = _model_alias_for(model if isinstance(model, str) else None)
+    await _post_model_change_if_new(
+        client,
+        session_id=session_id,
+        dedupe=dedupe,
+        alias=alias,
+    )
+
+
 async def _post_external_session_status(
     client: httpx.AsyncClient,
     *,
     session_id: str,
     status: str,
+    output: str | None = None,
 ) -> None:
     """
     Post one ``external_session_status`` event to the Sessions API.
@@ -3044,14 +3545,21 @@ async def _post_external_session_status(
     :param session_id: Omnigent session/conversation id.
     :param status: Session status value, e.g. ``"idle"`` or
         ``"failed"``.
+    :param output: Optional text attached to the event ``data``. On a
+        ``"failed"`` edge the server surfaces it as the session's failure
+        reason (``last_task_error``) so the UI renders a detail instead of
+        a bare "failed" (#1113). Ignored when falsy.
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
+    data: dict[str, Any] = {"status": status}
+    if output:
+        data["output"] = output
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
             "type": "external_session_status",
-            "data": {"status": status},
+            "data": data,
         },
     )
     resp.raise_for_status()
@@ -3087,6 +3595,80 @@ async def _post_external_compaction_status(
         json={
             "type": "external_compaction_status",
             "data": {"status": status},
+        },
+    )
+    resp.raise_for_status()
+
+
+async def _persist_native_compaction_item(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+) -> None:
+    """
+    Persist a compaction boundary item to the conversation store.
+
+    Called when the forwarder observes a compaction-completed signal
+    (``SessionStart source=compact``). Queries the latest conversation
+    item to use as ``last_item_id`` so session resume knows the
+    compaction boundary — items before this marker are summarized
+    and don't need to be loaded.
+
+    After writing the boundary, it also reads the post-compaction
+    transcript from Claude's own session state via
+    ``get_session_messages`` and includes them as ``compacted_messages``
+    so session resume in ephemeral environments can reconstruct context
+    without the CLI's local transcript files.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Bridge directory path used to look up the
+        Claude-native session id.
+    """
+    # Find the last persisted item to use as the compaction boundary.
+    resp = await client.get(
+        f"/v1/sessions/{session_id}/items",
+        params={"limit": 1, "order": "desc"},
+    )
+    resp.raise_for_status()
+    items = resp.json().get("data", [])
+    last_item_id = items[0]["id"] if items else f"compact_boundary_{session_id}"
+
+    # Read the post-compaction session messages so session resume can
+    # reconstruct context in ephemeral environments.
+    compacted_messages: list[dict[str, Any]] | None = None
+    try:
+        from claude_agent_sdk import get_session_messages
+
+        claude_sid = read_claude_session_id(bridge_dir)
+        if claude_sid:
+            msgs = get_session_messages(claude_sid)
+            compacted_messages = [
+                {"type": "message", "role": m.type, "content": m.message.get("content", [])}
+                for m in msgs
+                if isinstance(m.message, dict)
+            ]
+    except Exception:  # noqa: BLE001
+        _logger.debug(
+            "Failed to read Claude session messages for compaction persist",
+            exc_info=True,
+        )
+
+    event_data: dict[str, Any] = {
+        "summary": "[Claude Code compaction — context was compacted in the terminal]",
+        "last_item_id": last_item_id,
+        "model": "unknown",
+        "token_count": 0,
+    }
+    if compacted_messages is not None:
+        event_data["compacted_messages"] = compacted_messages
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "compaction",
+            "data": event_data,
         },
     )
     resp.raise_for_status()
@@ -3184,7 +3766,9 @@ async def _post_forwarder_failed_status(
     :returns: None.
     """
     try:
-        await _post_external_session_status(client, session_id=session_id, status="failed")
+        await _post_external_session_status(
+            client, session_id=session_id, status="failed", output=reason
+        )
     except httpx.HTTPError:
         _logger.warning(
             "Failed to publish Claude forwarder failure status; "

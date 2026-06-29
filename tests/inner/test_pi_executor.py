@@ -2,9 +2,14 @@
 
 import asyncio
 import json
+import logging
 import os
+import shutil
 import socket
+import tempfile
+import textwrap
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -27,7 +32,10 @@ from omnigent.inner.pi_executor import (
     _generate_extension_js,
     _pi_provider_for_model,
     _PiRpcSession,
+    _redact_argv_for_log,
+    _safe_dumps,
     _sanitize_schema,
+    _split_pi_prompt,
     _ToolServer,
 )
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
@@ -311,7 +319,7 @@ def test_sanitize_real_sys_session_send_args_collapses_to_object() -> None:
     # Structured fields the purpose guard and the per-dispatch model
     # override read must survive the collapse.
     assert sanitized_args["type"] == "object"
-    assert set(sanitized_args["properties"]) == {"input", "purpose", "model"}
+    assert set(sanitized_args["properties"]) == {"input", "purpose", "model", "cost_budget"}
     assert sanitized_args["required"] == ["input"]
     # Exact dict: the chosen object branch minus its stripped
     # additionalProperties — anything else means extra keys leaked or
@@ -342,6 +350,73 @@ class TestPiProviderForModel(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _split_pi_prompt tests
+# ---------------------------------------------------------------------------
+
+
+def test_split_pi_prompt_separates_text_and_images():
+    # #515: multimodal blocks must go to Pi's native message + images, not be
+    # JSON-encoded into the text (which the model reads as a literal blob).
+    message, images = _split_pi_prompt(
+        [
+            {"type": "input_text", "text": "what is in this image?"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+        ]
+    )
+    assert message == "what is in this image?"
+    assert images == [{"type": "image", "data": "AAAA", "mimeType": "image/png"}]
+
+
+def test_split_pi_prompt_text_only_has_no_images():
+    message, images = _split_pi_prompt([{"type": "input_text", "text": "hi"}])
+    assert message == "hi"
+    assert images == []
+
+
+def test_split_pi_prompt_rejects_non_data_uri_image():
+    # A non-data-URI input_image (e.g. a file reference) cannot be forwarded
+    # inline to Pi, so it raises a clear ValueError -- run_turn catches this and
+    # surfaces it as an ExecutorError instead of crashing the turn (#516 review).
+    with pytest.raises(ValueError, match="inline data URI"):
+        _split_pi_prompt([{"type": "input_image", "image_url": "file-abc123"}])
+
+
+def test_split_pi_prompt_inlines_text_input_file():
+    # #516 review: a text-like input_file is decoded into the message (so the
+    # model can read it) rather than dropped or hard-failed — mirroring codex.
+    import base64 as _b64
+
+    payload = _b64.b64encode(b"hello from a file").decode()
+    message, images = _split_pi_prompt(
+        [
+            {"type": "input_text", "text": "summarize:"},
+            {"type": "input_file", "file_data": f"data:text/markdown;base64,{payload}"},
+        ]
+    )
+    assert message == "summarize:\nhello from a file"
+    assert images == []
+
+
+def test_split_pi_prompt_skips_binary_input_file():
+    # A binary input_file (e.g. PDF) can't be inlined as text; it's skipped
+    # (with a logged warning), not raised — the turn still runs.
+    message, images = _split_pi_prompt(
+        [
+            {"type": "input_text", "text": "hi"},
+            {"type": "input_file", "file_data": "data:application/pdf;base64,JVBERi0x"},
+        ]
+    )
+    assert message == "hi"
+    assert images == []
+
+
+def test_split_pi_prompt_rejects_genuinely_unknown_block_type():
+    # A block type Pi can't handle at all still fails loudly rather than
+    # silently vanishing -> run_turn surfaces it as an ExecutorError.
+    with pytest.raises(ValueError, match="Unsupported content block type"):
+        _split_pi_prompt([{"type": "input_audio", "audio": "..."}])
+
+
 # _build_models_json tests
 # ---------------------------------------------------------------------------
 
@@ -353,6 +428,28 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertIn("databricks", providers)
         self.assertIn("databricks-anthropic", providers)
         self.assertIn("databricks-completions", providers)
+
+    def test_dynamic_model_declared_image_capable(self):
+        # #515: a dynamically-registered model must advertise image input, or
+        # Pi's transformMessages strips every image block ("model does not
+        # support images") before the message reaches the provider.
+        model = "databricks-qwen2-5-vl-72b"
+        result = _build_models_json("https://host.example.com", "tok", model=model)
+        provider = result["providers"][_pi_provider_for_model(model)]
+        entry = next(e for e in provider["models"] if e["id"] == model)
+        self.assertEqual(entry.get("input"), ["text", "image"])
+
+    def test_static_model_declared_image_capable(self):
+        # #516 review: a STATIC (pre-registered) vision model must also
+        # advertise image input. The dynamic-registration append is gated on
+        # the model not already being listed, so a default model like GPT-5.4
+        # (openai-completions) or Claude would otherwise keep an input-less
+        # entry and have its images stripped.
+        for model in ("databricks-gpt-5-4", "databricks-claude-opus-4-8"):
+            result = _build_models_json("https://host.example.com", "tok", model=model)
+            provider = result["providers"][_pi_provider_for_model(model)]
+            entry = next(e for e in provider["models"] if e["id"] == model)
+            self.assertEqual(entry.get("input"), ["text", "image"], model)
 
     def test_base_urls_use_host(self):
         result = _build_models_json("https://host.example.com/", "tok")
@@ -372,9 +469,11 @@ class TestBuildModelsJson(unittest.TestCase):
             },
         )
         p = result["providers"]
+        # The ucode ``openai`` value is the Codex Responses gateway; GPT and the
+        # catch-all re-route to serving-endpoints, claude keeps its gateway.
         self.assertEqual(
             p["databricks"]["baseUrl"],
-            "https://host.example.com/ai-gateway/codex/v1",
+            "https://host.example.com/serving-endpoints",
         )
         self.assertEqual(
             p["databricks-anthropic"]["baseUrl"],
@@ -382,8 +481,49 @@ class TestBuildModelsJson(unittest.TestCase):
         )
         self.assertEqual(
             p["databricks-completions"]["baseUrl"],
-            "https://host.example.com/ai-gateway/codex/v1",
+            "https://host.example.com/serving-endpoints",
         )
+
+    def test_ucode_codex_gateway_rerouted_off_responses_path(self):
+        # The codex gateway 404s /chat/completions, so it must not survive onto
+        # a completions provider (#241 GPT 404).
+        result = _build_models_json(
+            "https://host.example.com",
+            "tok",
+            {"openai": "https://host.example.com/ai-gateway/codex/v1"},
+        )
+        for name in ("databricks", "databricks-completions"):
+            base_url = result["providers"][name]["baseUrl"]
+            self.assertNotIn("/ai-gateway/codex", base_url)
+            self.assertEqual(base_url, "https://host.example.com/serving-endpoints")
+
+    def test_gemini_model_routed_off_codex_gateway(self):
+        # Gemini falls to the databricks-completions catch-all; it must land on
+        # serving-endpoints, not the codex URL it used to inherit (#241).
+        result = _build_models_json(
+            "https://host.example.com",
+            "tok",
+            {"openai": "https://host.example.com/ai-gateway/codex/v1"},
+            model="databricks-gemini-2-5-pro",
+        )
+        provider = result["providers"][_pi_provider_for_model("databricks-gemini-2-5-pro")]
+        self.assertEqual(provider["baseUrl"], "https://host.example.com/serving-endpoints")
+        self.assertIn(
+            "databricks-gemini-2-5-pro",
+            [entry.get("id") for entry in provider["models"]],
+        )
+
+    def test_generic_openai_base_url_used_as_is(self):
+        # A non-ucode openai URL (no ``/ai-gateway/codex``) must pass through so
+        # the re-route never breaks generic gateways.
+        result = _build_models_json(
+            "https://host.example.com",
+            "tok",
+            {"openai": "https://openrouter.ai/api/v1"},
+        )
+        p = result["providers"]
+        self.assertEqual(p["databricks"]["baseUrl"], "https://openrouter.ai/api/v1")
+        self.assertEqual(p["databricks-completions"]["baseUrl"], "https://openrouter.ai/api/v1")
 
     def test_api_key_set(self):
         result = _build_models_json("https://host.example.com", "mytoken")
@@ -471,6 +611,89 @@ class TestToolServer(unittest.TestCase):
             self.skipTest(f"Loopback TCP bind unavailable in this environment: {exc}")
         finally:
             probe.close()
+
+    async def _run_generated_bridge_tool(
+        self,
+        *,
+        port: int,
+        token: str,
+        timeout: float = 5.0,
+    ) -> dict:
+        """Run the generated JS extension under Node and execute one tool.
+
+        This is intentionally cross-runtime: Python starts the real loopback
+        server, while Node loads the generated Pi extension, captures the
+        registered tool, and calls its ``execute`` method. It exercises the
+        same JSONL/TCP boundary Pi uses without needing a live Pi process.
+        """
+        node_path = shutil.which("node")
+        if node_path is None:
+            self.skipTest("node is required for generated Pi bridge e2e tests")
+
+        schema = [
+            {
+                "name": "exotic",
+                "description": "exercise generated bridge",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            extension_path = tmp_path / "omnigent_tools.js"
+            runner_path = tmp_path / "run_bridge.js"
+            extension_path.write_text(_generate_extension_js(port, schema, token))
+            runner_path.write_text(
+                textwrap.dedent(
+                    """
+                    const extension = require(process.argv[2]);
+                    let registered;
+                    const fakePi = {
+                      on() {},
+                      registerTool(tool) { registered = tool; },
+                    };
+
+                    (async () => {
+                      extension(fakePi);
+                      if (!registered) {
+                        throw new Error("tool was not registered");
+                      }
+                      const result = await registered.execute(
+                        "call-1",
+                        { input: "hello" },
+                        undefined,
+                        undefined,
+                        {}
+                      );
+                      process.stdout.write(JSON.stringify(result));
+                    })().catch((err) => {
+                      process.stderr.write(err && err.stack ? err.stack : String(err));
+                      process.exit(1);
+                    });
+                    """
+                )
+            )
+
+            proc = await asyncio.create_subprocess_exec(
+                node_path,
+                str(runner_path),
+                str(extension_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                stdout, stderr = await proc.communicate()
+                stderr_text = stderr.decode("utf-8", errors="replace")
+                self.fail(f"generated Pi bridge did not resolve within {timeout}s: {stderr_text}")
+            self.assertEqual(
+                proc.returncode,
+                0,
+                stderr.decode("utf-8", errors="replace"),
+            )
+            return json.loads(stdout.decode("utf-8"))
 
     def test_start_and_stop(self):
         async def _test():
@@ -560,6 +783,128 @@ class TestToolServer(unittest.TestCase):
 
             writer.close()
             await server.stop()
+
+        _run(_test())
+
+    def test_non_json_serializable_result_returns_error_frame(self):
+        """A tool result ``json.dumps`` can't encode yields an error frame.
+
+        Regression for F03: serialization happens on the response path
+        *outside* ``_execute``'s try, so a tool returning a ``datetime`` (or
+        ``set``) used to raise ``TypeError`` there, close the socket with zero
+        bytes, and hang the JS ``callTool`` promise — wedging the whole turn.
+        The handler must instead always write a valid frame: here an
+        ``{"error": ...}`` envelope, correlated by ``id``, delivered well
+        within the timeout (proving it did not hang).
+        """
+
+        async def _test():
+            server = _ToolServer()
+            await server.start()
+
+            async def executor(name, args):
+                # A dict carrying values json.dumps rejects by default.
+                return {"when": datetime(2026, 6, 18, 12, 0, 0), "tags": {1, 2, 3}}
+
+            server._tool_executor = executor
+
+            reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+            request = (
+                json.dumps({"id": "req6", "token": server.token, "tool": "exotic", "args": {}})
+                + "\n"
+            )
+            writer.write(request.encode())
+            await writer.drain()
+
+            # The key assertion is that a frame arrives at all (no hang): a
+            # short timeout would fire if the response path crashed/closed.
+            response_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            self.assertTrue(response_line, "tool server closed without writing a frame (hang)")
+            response = json.loads(response_line)
+            self.assertEqual(response["id"], "req6")
+            self.assertIn("unserializable tool result", response["error"])
+            self.assertNotIn("result", response)
+
+            writer.close()
+            await server.stop()
+
+        _run(_test())
+
+    def test_safe_dumps_with_non_serializable_req_id_does_not_raise(self):
+        """``_safe_dumps`` never raises, even on a non-serializable ``req_id``.
+
+        The fallback envelope serializes ``req_id`` too, so a future caller
+        passing an id ``json.dumps`` can't encode (here a ``datetime``) must
+        still yield a valid frame rather than re-raising the very crash the
+        guard exists to prevent. The id is stringified in that envelope.
+        """
+        bad_id = datetime(2026, 6, 18, 12, 0, 0)
+        out = _safe_dumps({"id": bad_id, "result": {"k": "v"}}, bad_id)  # type: ignore[arg-type]
+        payload = json.loads(out)
+        self.assertEqual(payload["id"], str(bad_id))
+        self.assertIn("unserializable tool result", payload["error"])
+        self.assertNotIn("result", payload)
+
+    def test_generated_bridge_returns_error_for_unserializable_tool_result(self):
+        """End-to-end: Node bridge + Python server return an error result.
+
+        The previous unit test proves the TCP server writes an error frame.
+        This test follows the actual Pi bridge path too: generated JS running
+        in Node receives that frame and returns a Pi tool result with
+        ``isError=true`` instead of hanging or throwing.
+        """
+
+        async def _test():
+            server = _ToolServer()
+            await server.start()
+
+            async def executor(name, args):
+                return {"when": datetime(2026, 6, 18, 12, 0, 0), "tags": {1, 2, 3}}
+
+            server._tool_executor = executor
+            try:
+                result = await self._run_generated_bridge_tool(
+                    port=server.port,
+                    token=server.token,
+                )
+            finally:
+                await server.stop()
+
+            self.assertTrue(result["isError"])
+            self.assertEqual(result["content"][0]["type"], "text")
+            payload = json.loads(result["content"][0]["text"])
+            self.assertIn("unserializable tool result", payload["error"])
+
+        _run(_test())
+
+    def test_generated_bridge_resolves_on_bare_socket_close(self):
+        """End-to-end: a zero-byte close resolves the generated JS callTool.
+
+        This exercises the defense-in-depth close handler. If the generated
+        bridge only resolved on ``data`` or ``error`` events, the Node process
+        would hang here until ``wait_for`` timed out.
+        """
+
+        async def _test():
+            async def close_without_response(reader, writer):
+                await reader.readline()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_server(close_without_response, "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            try:
+                result = await self._run_generated_bridge_tool(
+                    port=port,
+                    token="close-token",
+                )
+            finally:
+                server.close()
+                await server.wait_closed()
+
+            self.assertTrue(result["isError"])
+            payload = json.loads(result["content"][0]["text"])
+            self.assertIn("closed connection without a response", payload["error"])
 
         _run(_test())
 
@@ -1168,11 +1513,17 @@ class TestBuildEnvAndDir(unittest.TestCase):
         config = executor._build_env_and_dir([], None, None, None)
         try:
             self.assertIn("PI_CODING_AGENT_DIR", config.env)
-            models_path = os.path.join(config.env["PI_CODING_AGENT_DIR"], "models.json")
-            self.assertTrue(os.path.exists(models_path))
+            managed_dir = Path(config.env["PI_CODING_AGENT_DIR"])
+            models_path = managed_dir / "models.json"
+            self.assertTrue(models_path.is_file())
             with open(models_path) as f:
                 data = json.load(f)
             self.assertIn("providers", data)
+            settings_path = managed_dir / "settings.json"
+            self.assertTrue(settings_path.is_file())
+            with open(settings_path) as f:
+                settings = json.load(f)
+            self.assertIn("retry", settings)
         finally:
             import shutil
 
@@ -1205,6 +1556,42 @@ class TestBuildEnvAndDir(unittest.TestCase):
             import shutil
 
             shutil.rmtree(config.tmp_dir, ignore_errors=True)
+
+
+def test_gateway_seeds_managed_settings_from_global_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gateway mode copies global Pi settings into the managed agent dir."""
+    global_agent = tmp_path / "pi-agent"
+    global_agent.mkdir()
+    (global_agent / "settings.json").write_text(
+        json.dumps({"extensions": ["/ext/demo.ts"], "packages": ["npm:@x/y"]}),
+        encoding="utf-8",
+    )
+    (global_agent / "npm").mkdir()
+    monkeypatch.setattr(
+        "omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR",
+        global_agent,
+    )
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+    ):
+        executor = PiExecutor(gateway=True)
+
+    config = executor._build_env_and_dir([], None, None, None)
+    try:
+        managed_dir = Path(config.env["PI_CODING_AGENT_DIR"])
+        settings = json.loads((managed_dir / "settings.json").read_text(encoding="utf-8"))
+        assert settings["extensions"] == ["/ext/demo.ts"]
+        assert settings["packages"] == ["npm:@x/y"]
+        assert (managed_dir / "npm").is_symlink()
+    finally:
+        shutil.rmtree(config.tmp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2410,8 +2797,9 @@ def test_databricks_default_model_is_resolvable_in_models_json() -> None:
 def test_models_json_lists_only_gateway_verified_models() -> None:
     """
     The hardcoded model lists match the set verified live against the
-    Databricks gateway on the API paths pi uses (Anthropic Messages for
-    Claude, Chat Completions for GPT).
+    Databricks gateway endpoint metadata and the API paths pi uses
+    (Anthropic Messages for Claude, OpenAI-compatible serving endpoints for
+    GPT).
 
     Failure direction matters: a missing working id silently shrinks pi's
     model menu; a reintroduced broken id (``sonnet-4-5-v2`` rejects
@@ -2427,10 +2815,24 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
         "databricks-claude-sonnet-4-5",
     ]
     openai_ids = [m["id"] for m in providers["databricks"]["models"]]
-    assert openai_ids == ["databricks-gpt-5-4-mini", "databricks-gpt-5-4"]
+    assert openai_ids == [
+        "databricks-gpt-5-4-mini",
+        "databricks-gpt-5-4",
+        "databricks-gpt-5-5",
+        "databricks-gpt-5-5-pro",
+    ]
     # The llama serving endpoint no longer exists; the provider stays as
     # the routing home for future non-Claude/GPT endpoints.
     assert providers["databricks-completions"]["models"] == []
+
+
+def test_models_json_uses_oss_verified_gpt_55_caps() -> None:
+    """GPT-5.5 endpoint metadata on the OSS profile advertises 128K output."""
+    models = _build_models_json("https://host.example.com", "tok")
+    by_id = {m["id"]: m for m in models["providers"]["databricks"]["models"]}
+    for model_id in ("databricks-gpt-5-5", "databricks-gpt-5-5-pro"):
+        assert by_id[model_id]["contextWindow"] == 400000
+        assert by_id[model_id]["maxTokens"] == 128000
 
 
 if __name__ == "__main__":
@@ -2459,9 +2861,11 @@ def test_build_models_json_registers_unknown_model_with_routed_provider() -> Non
         model="moonshotai/kimi-k2.6",
     )
     completions = result["providers"]["databricks-completions"]
-    # The run model is registered (bare-id entry, the shape ucode writes)
-    # under the provider _pi_provider_for_model routes it to…
-    assert {"id": "moonshotai/kimi-k2.6"} in completions["models"]
+    # The run model is registered (so Pi resolves it) under the provider
+    # _pi_provider_for_model routes it to, advertising image input so Pi
+    # doesn't strip attached images (#515).
+    entry = next((e for e in completions["models"] if e["id"] == "moonshotai/kimi-k2.6"), None)
+    assert entry == {"id": "moonshotai/kimi-k2.6", "input": ["text", "image"]}
     # …and that provider points at the generic gateway with the
     # Chat-Completions dialect OpenRouter speaks.
     assert completions["baseUrl"] == "https://openrouter.ai/api/v1"
@@ -2580,6 +2984,28 @@ def test_clean_pi_env_passes_pi_and_proxy_config(monkeypatch) -> None:
     assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/ssl/corp-ca.pem"
 
 
+def test_clean_pi_env_includes_omnigent_session_marker(monkeypatch) -> None:
+    """The ``OMNIGENT`` session marker survives the Pi env scrub.
+
+    The marker (set once on the runner) must reach the Pi CLI so the
+    shell commands Pi runs can detect they are inside an Omnigent
+    session, like ``CLAUDE_CODE`` / ``CODEX``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.pi_executor import _clean_pi_env
+    from omnigent.runner.identity import (
+        OMNIGENT_SESSION_ENV_VALUE,
+        OMNIGENT_SESSION_ENV_VAR,
+    )
+
+    monkeypatch.setenv(OMNIGENT_SESSION_ENV_VAR, OMNIGENT_SESSION_ENV_VALUE)
+
+    env = _clean_pi_env()
+
+    assert env.get(OMNIGENT_SESSION_ENV_VAR) == OMNIGENT_SESSION_ENV_VALUE
+
+
 def test_rpc_start_spawns_with_exact_env(monkeypatch) -> None:
     """``_PiRpcSession.start`` passes the caller's env dict verbatim.
 
@@ -2614,6 +3040,189 @@ def test_rpc_start_spawns_with_exact_env(monkeypatch) -> None:
 
     # Exactly the executor-built env — nothing merged from os.environ.
     assert captured["env"] == {"PATH": "/usr/bin", "PI_CODING_AGENT_DIR": "/tmp/pi-agent"}
+
+
+def test_redact_argv_for_log_hides_system_prompt() -> None:
+    """``_redact_argv_for_log`` replaces the system-prompt value with a
+    length-only placeholder while leaving every other flag visible."""
+    secret = "SUPER SECRET SYSTEM PROMPT that must never hit the logs"
+    args = [
+        "/fake/pi",
+        "--mode",
+        "rpc",
+        "--no-session",
+        "--model",
+        "databricks/some-model",
+        "--append-system-prompt",
+        secret,
+        "--extension",
+        "/tmp/ext.js",
+    ]
+
+    redacted = _redact_argv_for_log(args)
+
+    rendered = " ".join(redacted)
+    assert secret not in rendered
+    assert f"[system prompt {len(secret)} chars]" in redacted
+    # Other flags stay visible for debugging.
+    assert "--mode" in redacted
+    assert "rpc" in redacted
+    assert "--model" in redacted
+    assert "databricks/some-model" in redacted
+    assert "--extension" in redacted
+    assert "/tmp/ext.js" in redacted
+
+
+def test_redact_argv_for_log_hides_two_token_system_prompt_flag() -> None:
+    """The two-token ``--system-prompt <value>`` form is redacted too, not just
+    ``--append-system-prompt``."""
+    secret = "REPLACEMENT SYSTEM PROMPT that must never hit the logs"
+    args = ["/fake/pi", "--system-prompt", secret, "--mode", "rpc"]
+
+    redacted = _redact_argv_for_log(args)
+
+    assert secret not in " ".join(redacted)
+    assert f"[system prompt {len(secret)} chars]" in redacted
+    assert "--system-prompt" in redacted
+    assert "--mode" in redacted
+    assert "rpc" in redacted
+
+
+def test_redact_argv_for_log_hides_equals_joined_system_prompt() -> None:
+    """``_redact_argv_for_log`` redacts the equals-joined
+    ``--append-system-prompt=<value>`` / ``--system-prompt=<value>`` forms while
+    keeping the flag name visible."""
+    secret = "SUPER SECRET SYSTEM PROMPT that must never hit the logs"
+    for flag in ("--append-system-prompt", "--system-prompt"):
+        args = ["/fake/pi", "--mode", "rpc", f"{flag}={secret}", "--extension", "/tmp/ext.js"]
+
+        redacted = _redact_argv_for_log(args)
+
+        rendered = " ".join(redacted)
+        assert secret not in rendered
+        assert f"{flag}=[system prompt {len(secret)} chars]" in redacted
+        # Flag name and other tokens stay visible for debugging.
+        assert "--mode" in redacted
+        assert "rpc" in redacted
+        assert "--extension" in redacted
+        assert "/tmp/ext.js" in redacted
+
+
+def test_rpc_start_log_does_not_leak_system_prompt(monkeypatch, caplog) -> None:
+    """``_PiRpcSession.start`` must not write the full ``--append-system-prompt``
+    value to the debug log; it should be redacted to a length placeholder.
+
+    Guards F92: the old code logged ``" ".join(args)`` verbatim, leaking the
+    entire system prompt into debug logs.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Pytest log-capture fixture.
+    """
+    from omnigent.inner import pi_executor as pi_mod
+
+    test_prompt = "TOP-SECRET-SYSTEM-PROMPT-DO-NOT-LOG-12345"
+
+    async def _fake_spawn(*args, **kwargs):
+        return _FakeProcess(stdout_lines=[], stderr_lines=[])
+
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
+
+    async def _test():
+        rpc = _PiRpcSession()
+        await rpc.start(
+            "/fake/pi",
+            env={"PATH": "/usr/bin"},
+            model="some-model",
+            system_prompt=test_prompt,
+            extra_args=["--extension", "/tmp/ext.js"],
+        )
+        await rpc.close()
+
+    with caplog.at_level(logging.DEBUG, logger="omnigent.inner.pi_executor"):
+        _run(_test())
+
+    spawn_logs = [
+        r.getMessage() for r in caplog.records if "PiExecutor: spawning" in r.getMessage()
+    ]
+    assert spawn_logs, "expected a 'PiExecutor: spawning' debug log line"
+    spawn_line = spawn_logs[0]
+
+    assert test_prompt not in spawn_line
+    assert f"[system prompt {len(test_prompt)} chars]" in spawn_line
+    # Non-sensitive flags remain visible for debugging.
+    assert "--mode" in spawn_line
+    assert "--extension" in spawn_line
+
+
+def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog) -> None:
+    """The normal ``PiExecutor.run_turn`` path must pass the system prompt to
+    Pi without leaking it into the spawn debug log.
+
+    This drives the real executor wiring from ``run_turn`` through
+    ``_ensure_rpc`` and ``_PiRpcSession.start`` with only subprocess creation
+    stubbed, so it catches regressions at the behavior boundary users hit.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Pytest log-capture fixture.
+    """
+    from omnigent.inner import pi_executor as pi_mod
+
+    test_prompt = "END-TO-END-SYSTEM-PROMPT-LEAK-SENTINEL-67890"
+    captured: dict[str, list[str]] = {}
+
+    async def _fake_spawn(*args, **kwargs):
+        captured["argv"] = list(args)
+        return _FakeProcess(
+            stdout_lines=[
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "hi"},
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ],
+            stderr_lines=[],
+        )
+
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
+
+    async def _test():
+        executor = PiExecutor(pi_path="/usr/bin/pi")
+        try:
+            return [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    test_prompt,
+                )
+            ]
+        finally:
+            await executor.close()
+
+    with caplog.at_level(logging.DEBUG, logger="omnigent.inner.pi_executor"):
+        events = _run(_test())
+
+    turn_complete = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(turn_complete) == 1
+    assert turn_complete[0].response == "hi"
+
+    argv = captured["argv"]
+    assert "--append-system-prompt" in argv
+    assert argv[argv.index("--append-system-prompt") + 1] == test_prompt
+
+    spawn_logs = [
+        r.getMessage() for r in caplog.records if "PiExecutor: spawning" in r.getMessage()
+    ]
+    assert spawn_logs, "expected a 'PiExecutor: spawning' debug log line"
+    spawn_line = spawn_logs[0]
+
+    assert test_prompt not in spawn_line
+    assert f"[system prompt {len(test_prompt)} chars]" in spawn_line
+    assert "--append-system-prompt" in spawn_line
+    assert "--mode" in spawn_line
 
 
 def test_run_turn_spawn_env_has_no_host_secrets(monkeypatch) -> None:
@@ -2768,16 +3377,25 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
         captured["policy"] = sandbox
         return "/fake/launcher"
 
+    def _fake_resolve_sandbox(_os_env: OSEnvSpec, cwd: Path) -> SandboxPolicy:
+        return SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=[cwd.resolve(strict=False)],
+            write_roots=[cwd.resolve(strict=False)],
+            write_files=[],
+            allow_network=False,
+        )
+
     # ``_try_sandbox_pi`` resolves this name from the module at call
     # time (function-local ``from .sandbox import ...``), so patching
     # the module attribute intercepts the real call.
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve_sandbox)
     monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_create_exec_launcher)
 
     with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor(
             cwd=str(tmp_path),
-            # linux_bwrap policy resolution is pure-Python (the binary
-            # is only needed at wrap time), so this runs anywhere.
             os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
         )
 

@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import codex_native_hook
+from omnigent import codex_native_hook, native_policy_hook
 from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
     codex_home_for_bridge_dir,
@@ -18,6 +18,7 @@ from omnigent.codex_native_bridge import (
     write_bridge_state,
     write_policy_hook_config,
 )
+from tests.native_hook_helpers import make_failing_client
 
 
 class _DenyHttpxClient:
@@ -194,7 +195,7 @@ def test_pre_tool_use_converts_posts_and_returns_deny(
         ap_server_url="http://127.0.0.1:8787",
         ap_auth_headers={"Authorization": "Bearer test-token"},
     )
-    monkeypatch.setattr(codex_native_hook.httpx, "Client", _DenyHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _DenyHttpxClient)
 
     exit_code = _run_hook(
         bridge_dir,
@@ -225,6 +226,49 @@ def test_pre_tool_use_converts_posts_and_returns_deny(
     assert captured.err == ""
 
 
+def test_user_prompt_submit_converts_posts_and_blocks(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A UserPromptSubmit hook converts to PHASE_REQUEST and maps DENY to block.
+
+    This is the request-phase enforcement path for native Codex sessions
+    (the server-level ``_evaluate_input_policy`` skips native message
+    events). The prompt rides in ``event.data.text``; a DENY maps to the
+    top-level ``decision: "block"`` contract — NOT ``permissionDecision`` —
+    which drops the prompt before the model sees it. A break here means a
+    blocked prompt would still reach the model.
+    """
+    _DenyHttpxClient.captured = {}
+    write_policy_hook_config(
+        bridge_dir,
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer test-token"},
+    )
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _DenyHttpxClient)
+
+    exit_code = _run_hook(
+        bridge_dir,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "delete the prod database",
+        },
+        monkeypatch,
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    sent = _DenyHttpxClient.captured["json"]
+    assert sent["event"]["type"] == "PHASE_REQUEST"
+    assert sent["event"]["data"] == {"text": "delete the prod database"}
+    # DENY → top-level decision/reason block (not permissionDecision).
+    result = json.loads(captured.out)
+    assert result == {"decision": "block", "reason": "rm blocked by admin policy"}
+    assert captured.err == ""
+
+
 def test_pre_tool_use_stamps_model_from_config(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -249,7 +293,7 @@ def test_pre_tool_use_stamps_model_from_config(
         ap_server_url="http://127.0.0.1:8787",
         ap_auth_headers={"Authorization": "Bearer test-token"},
     )
-    monkeypatch.setattr(codex_native_hook.httpx, "Client", _DenyHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _DenyHttpxClient)
 
     exit_code = _run_hook(
         bridge_dir,
@@ -283,7 +327,7 @@ def test_pre_tool_use_stamps_harness_without_config_model(
         ap_server_url="http://127.0.0.1:8787",
         ap_auth_headers={"Authorization": "Bearer test-token"},
     )
-    monkeypatch.setattr(codex_native_hook.httpx, "Client", _DenyHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _DenyHttpxClient)
 
     exit_code = _run_hook(
         bridge_dir,
@@ -312,7 +356,7 @@ def test_missing_bridge_state_is_fail_open(
     """
     monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native")
     empty_dir = prepare_bridge_dir("bridge_no_state")
-    monkeypatch.setattr(codex_native_hook.httpx, "Client", _RaisesIfCalled)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RaisesIfCalled)
 
     exit_code = _run_hook(
         empty_dir,
@@ -337,13 +381,84 @@ def test_missing_policy_config_is_fail_open(
     local run with no Omnigent server), so there is nothing to enforce against.
     The hook returns 0 with no output and does not touch the network.
     """
-    monkeypatch.setattr(codex_native_hook.httpx, "Client", _RaisesIfCalled)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RaisesIfCalled)
 
     exit_code = _run_hook(
         bridge_dir,
         {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}},
         monkeypatch,
     )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == ""
+
+
+@pytest.mark.parametrize("mode", ["connect_error", "non_2xx", "empty_body", "malformed_json"])
+def test_pre_tool_use_fails_closed_when_verdict_unavailable(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mode: str,
+) -> None:
+    """
+    A governed PreToolUse call denies when no usable verdict is returned.
+
+    For native harnesses this hook is the sole TOOL_CALL enforcement point,
+    so a server outage / non-2xx / empty / malformed response must fail
+    CLOSED (deny) instead of "no opinion" — the bypass reported in #536.
+    """
+    write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={})
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client(mode))
+
+    exit_code = _run_hook(
+        bridge_dir,
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf /"},
+        },
+        monkeypatch,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    result = json.loads(captured.out)
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny", result
+    assert result["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "tool_output": "ok",
+        },
+        {"hook_event_name": "UserPromptSubmit", "prompt": "hello"},
+    ],
+)
+def test_non_tool_call_phases_fail_open_on_error(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    payload: dict[str, object],
+) -> None:
+    """
+    Off the tool-call gate, an unobtainable verdict stays fail-open.
+
+    PostToolUse runs after the tool executed and the request gate is
+    advisory, so neither denies on a transport error — mirroring the
+    runner-side ``FAIL_CLOSED_PHASES`` (PR #163).
+    """
+    write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={})
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
+
+    exit_code = _run_hook(bridge_dir, payload, monkeypatch)
+
     captured = capsys.readouterr()
     assert exit_code == 0
     assert captured.out == ""

@@ -33,7 +33,9 @@ console = Console()
 _GREEN = "\033[32m"
 _DIM = "\033[90m"
 _BOLD = "\033[1m"
-_CYAN = "\033[36m"
+# Brand accent — Otto's magenta-pink (#F43BA6), matching omnigent.inner.ui so
+# the setup picker's selection pointer reads as the same brand as the banner.
+_ACCENT = "\033[38;2;244;59;166m"
 _RESET = "\033[0m"
 _CHECK = f"{_GREEN}\u2713{_RESET}"
 _CROSS = f"{_DIM}\u2717{_RESET}"
@@ -123,7 +125,7 @@ def _arrow_menu(
             sys.stdout.write(f"\033[{total_lines}A")
 
         for i, label in enumerate(options):
-            pointer = f"{_CYAN}>{_RESET}" if i == cursor else " "
+            pointer = f"{_ACCENT}>{_RESET}" if i == cursor else " "
             if multi:
                 check = f"{_GREEN}*{_RESET}" if i in selected else " "
                 prefix = f" {pointer} {check} "
@@ -396,6 +398,12 @@ _API_HARNESSES: dict[str, dict[str, str]] = {
         "description": "OpenAI API or any OpenAI-compatible endpoint",
         "package": "agents",
         "install": "pip install openai-agents",
+    },
+    "antigravity": {
+        "display": "Antigravity (Gemini)",
+        "description": "Antigravity / Gemini API key, or an OpenAI-compatible gateway",
+        "package": "google.antigravity",
+        "install": "pip install google-antigravity",
     },
 }
 

@@ -11,7 +11,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import claude_native_hook
+from omnigent import claude_native_hook, native_policy_hook
 from omnigent.claude_native_bridge import (
     build_hook_settings,
     prepare_bridge_dir,
@@ -19,6 +19,7 @@ from omnigent.claude_native_bridge import (
     record_hook_event,
     write_active_session_id,
 )
+from tests.native_hook_helpers import make_failing_client
 
 
 @pytest.fixture(autouse=True)
@@ -110,6 +111,58 @@ def test_session_start_hook_emits_conversation_url_system_message(
     }
     assert captured.err == ""
     assert read_transcript_path(bridge_dir) == transcript_path
+
+
+def test_session_start_hook_maps_workspace_hosted_server_to_ui_mount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    SessionStart links to the SPA mount for workspace-hosted servers.
+
+    ``ap_server_url`` is the API proxy base (``/api/2.0/omnigent``);
+    pointing the "Open this session" message there returns JSON, not
+    the web UI. The message must land on the ``/omnigent`` SPA mount
+    with the ``?o=<org>`` selector — matching the CLI's ``Web UI:``
+    line and the tmux status bar.
+    """
+    from omnigent.cli_auth import store_databricks_auth
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path",
+        lambda: tmp_path / "auth_tokens.json",
+    )
+    server = "https://example.databricks.com/api/2.0/omnigent"
+    store_databricks_auth(
+        server,
+        "https://example.databricks.com",
+        org_id="2850744067564480",
+    )
+    bridge_dir = prepare_bridge_dir(
+        "conv_abc",
+        bridge_id="bridge_shared",
+        workspace=tmp_path,
+    )
+    build_hook_settings(bridge_dir, ap_server_url=server)
+    payload = {
+        "hook_event_name": "SessionStart",
+        "transcript_path": str(tmp_path / "session.jsonl"),
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert json.loads(captured.out) == {
+        "systemMessage": (
+            "Open this session in Omnigent: "
+            "https://example.databricks.com/omnigent/c/conv_abc?o=2850744067564480"
+        )
+    }
 
 
 def test_clear_session_start_hook_rotates_before_printing_conversation_url(
@@ -272,7 +325,14 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
             ),
             {"target_session_id": "conv_new"},
         ),
-        ("PATCH", "http://127.0.0.1:8787/v1/sessions/conv_old", {"runner_id": ""}),
+        (
+            "PATCH",
+            "http://127.0.0.1:8787/v1/sessions/conv_old",
+            {
+                "runner_id": "",
+                "labels": {"omnigent.claude_native.bridge_id": "conv_old-cleared"},
+            },
+        ),
     ]
     recorded = (bridge_dir / "hooks.jsonl").read_text(encoding="utf-8")
     assert '"omnigent_clear_rotated_to":"conv_new"' in recorded
@@ -976,6 +1036,18 @@ def test_build_hook_settings_registers_policy_hooks_when_omnigent_server_url_set
     # The last entry is the catch-all policy evaluation hook.
     policy_entry_cmd = post_tool_use_entries[-1]["hooks"][0]["command"]
     assert "evaluate-policy" in policy_entry_cmd
+    # UserPromptSubmit carries the forwarder's status hook PLUS the policy
+    # hook appended as a catch-all. For native sessions this is the sole
+    # REQUEST-phase gate (the server-level _evaluate_input_policy skips
+    # native message events), so a missing policy hook here means native
+    # prompts reach the model with no request-phase policy.
+    user_prompt_entries = hooks["UserPromptSubmit"]
+    user_prompt_cmds = [h["command"] for entry in user_prompt_entries for h in entry["hooks"]]
+    assert any("evaluate-policy" in cmd for cmd in user_prompt_cmds), (
+        f"UserPromptSubmit policy hook not registered; got {user_prompt_cmds!r}"
+    )
+    # The forwarder's status hook must survive (the policy hook is appended).
+    assert any("evaluate-policy" not in cmd for cmd in user_prompt_cmds)
 
 
 def test_build_hook_settings_registers_message_display_hook(
@@ -1114,7 +1186,7 @@ def test_evaluate_policy_pre_tool_use_converts_and_returns_deny(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_abc",
         bridge_id="bridge_shared",
@@ -1157,6 +1229,71 @@ def test_evaluate_policy_pre_tool_use_converts_and_returns_deny(
     assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert result["hookSpecificOutput"]["permissionDecisionReason"] == "Blocked by policy"
     assert captured.err == ""
+
+
+def test_evaluate_policy_stamps_live_model_from_context_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The hook stamps the statusLine-captured live model into the request.
+
+    The statusLine wrapper writes the active model id into ``context.json``
+    on every render. The hook must stamp it (and ``harness``) onto the
+    evaluation request so the cost-budget gate sees the CURRENT model at gate
+    time — not the lagging ``model_override`` mirror. Regression guard for a
+    cheap-model session getting blocked over budget because the model was
+    unresolved (None) and the gate failed closed.
+    """
+    posted: dict[str, object] = {}
+
+    class _FakeHttpxClient:
+        """Sync HTTP client stub capturing the posted EvaluationRequest."""
+
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            """Record constructor inputs. :returns: None."""
+            del headers, timeout
+
+        def __enter__(self) -> _FakeHttpxClient:
+            """:returns: This fake client."""
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            """:returns: None."""
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> object:
+            """Record the request and return an ALLOW verdict. :returns: response."""
+            import httpx
+
+            posted["json"] = json
+            return httpx.Response(
+                200,
+                text='{"result":"POLICY_ACTION_ALLOW"}',
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+    # The statusLine wrapper's capture: the live model the user is on.
+    (bridge_dir / "context.json").write_text(
+        json.dumps({"model": "claude-sonnet-4-6"}), encoding="utf-8"
+    )
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    assert exit_code == 0
+    context = posted["json"]["event"]["context"]
+    # The live model + harness must ride the request so the cost gate doesn't
+    # fail closed on an unresolved model.
+    assert context["model"] == "claude-sonnet-4-6"
+    assert context["harness"] == "claude-native"
 
 
 def test_evaluate_policy_post_tool_use_converts_and_returns_context(
@@ -1579,4 +1716,343 @@ def test_ask_user_question_hook_returns_deny_without_updated_input(
     # No updatedInput on deny — answers are meaningless when the tool is blocked.
     assert "updatedInput" not in hs, (
         "updatedInput must not appear on a deny response — there are no answers to inject"
+    )
+
+
+@pytest.mark.parametrize("mode", ["connect_error", "non_2xx", "empty_body", "malformed_json"])
+def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mode: str,
+) -> None:
+    """
+    A governed PreToolUse call denies when no usable verdict is returned.
+
+    For native harnesses this hook is the sole TOOL_CALL enforcement point,
+    so a server outage / non-2xx / empty / malformed response must fail
+    CLOSED (deny) instead of "no opinion" — the bypass reported in #536.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client(mode))
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "rm -rf /"},
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    result = json.loads(captured.out)
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny", result
+    assert result["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "tool_output": "ok",
+        },
+        {"hook_event_name": "UserPromptSubmit", "prompt": "hello"},
+    ],
+)
+def test_evaluate_policy_non_tool_call_phases_fail_open_on_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    payload: dict[str, object],
+) -> None:
+    """
+    Off the tool-call gate, an unobtainable verdict stays fail-open.
+
+    PostToolUse runs after the tool executed and the request gate is
+    advisory, so neither denies on a transport error — mirroring the
+    runner-side ``FAIL_CLOSED_PHASES`` (PR #163).
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client("connect_error"))
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == ""
+
+
+def test_build_hook_settings_omits_apikeyhelper_when_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``None`` api_key_helper writes no ``apiKeyHelper`` (the Bedrock path).
+
+    ``ClaudeNativeUcodeConfig.api_key_helper`` is now Optional and the Bedrock
+    config returns ``None`` (Bedrock authenticates from AWS_BEARER_TOKEN_BEDROCK,
+    not an apiKeyHelper). The settings writer must omit the key for ``None`` and
+    never write the string ``"None"`` — a regression to an unconditional
+    assignment would also corrupt the existing key/gateway/local flows.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_test", workspace=tmp_path)
+
+    assert "apiKeyHelper" not in build_hook_settings(bridge_dir, api_key_helper=None)
+    with_helper = build_hook_settings(bridge_dir, api_key_helper="printf tok")
+    assert with_helper["apiKeyHelper"] == "printf tok"
+
+
+def test_evaluate_policy_retries_5xx_and_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A transient 5xx from the policy server is retried and the eventual 200 is used.
+
+    Regression guard for DB-hosted deployments where brief server hiccups
+    previously caused a spurious fail-closed deny on every affected tool call.
+    """
+    call_count = 0
+
+    class _FlakyThenOkClient:
+        def __init__(self, *, headers: object, timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _FlakyThenOkClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: object = None) -> httpx.Response:
+            del json
+            nonlocal call_count
+            call_count += 1
+            req = httpx.Request("POST", url)
+            if call_count < 3:
+                return httpx.Response(503, text="upstream down", request=req)
+            return httpx.Response(
+                200,
+                text='{"result":"POLICY_ACTION_ALLOW"}',
+                request=req,
+            )
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    # Sleep is a no-op so retries are instant.
+    monkeypatch.setattr(native_policy_hook.time, "sleep", lambda _: None)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FlakyThenOkClient)
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    # ALLOW verdict → no hook output (hook defers to Claude's own permission system).
+    assert captured.out == ""
+    # Two 503s then one 200 = 3 total attempts.
+    assert call_count == 3
+
+
+def test_build_reauth_remints_and_preserves_routing_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_build_reauth`` re-mints the bearer and keeps the routing header.
+
+    The fresh token must be merged OVER the existing headers so the
+    ``X-Databricks-Org-Id`` workspace-routing header (which the Apps server
+    needs to avoid a 403 reroute to the account) is preserved, not dropped.
+    """
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda server_url=None: lambda: "fresh-token",
+    )
+    reauth = claude_native_hook._build_reauth(
+        "https://ap.example.com",
+        {"Authorization": "Bearer stale", "X-Databricks-Org-Id": "o9"},
+    )
+    assert reauth() == {"Authorization": "Bearer fresh-token", "X-Databricks-Org-Id": "o9"}
+
+
+def test_build_reauth_returns_none_without_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_build_reauth`` returns ``None`` when no refresh mechanism is available.
+
+    Local unauthenticated servers (no token factory) must not synthesize an
+    auth header; returning ``None`` lets the caller fall through to its normal
+    handling (which fails closed for a tool-call gate).
+    """
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda server_url=None: None,
+    )
+    reauth = claude_native_hook._build_reauth(
+        "https://ap.example.com", {"Authorization": "Bearer stale"}
+    )
+    assert reauth() is None
+
+
+def test_evaluate_policy_reauths_on_expired_token_instead_of_failing_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    An expired hook token self-heals: 302→/oidc re-mints and the tool is allowed.
+
+    End-to-end repro of the production bug — an "old" native session (token
+    past the ~1h Databricks OAuth lifetime) hits the Apps front-door
+    ``302 → /oidc`` on every tool call and used to fail CLOSED ("policy
+    evaluation unavailable"). The hook must now re-mint through the token
+    factory and retry, returning the real ALLOW verdict (no deny output).
+    """
+    attempts: list[dict[str, str]] = []
+
+    class _RedirectThenOkClient:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del timeout
+            self._headers = headers
+
+        def __enter__(self) -> _RedirectThenOkClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: object = None) -> httpx.Response:
+            del json
+            attempts.append(dict(self._headers))
+            req = httpx.Request("POST", url)
+            if len(attempts) == 1:
+                return httpx.Response(
+                    302,
+                    headers={"Location": "https://w.example.com/oidc/oauth2/v2.0/authorize"},
+                    request=req,
+                )
+            return httpx.Response(200, text='{"result":"POLICY_ACTION_ALLOW"}', request=req)
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RedirectThenOkClient)
+    # The hook re-mints through the runner's token factory; stub a fresh token.
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda server_url=None: lambda: "fresh-token",
+    )
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="https://omnigents.example.databricksapps.com",
+        ap_auth_headers={"Authorization": "Bearer stale-token", "X-Databricks-Org-Id": "o1"},
+    )
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    # Two attempts: first with the lapsed token, retry with the fresh one.
+    assert len(attempts) == 2
+    assert attempts[0]["Authorization"] == "Bearer stale-token"
+    assert attempts[1]["Authorization"] == "Bearer fresh-token"
+    # Routing header survives the re-mint.
+    assert attempts[1]["X-Databricks-Org-Id"] == "o1"
+    # ALLOW verdict → no hook output → the tool is NOT denied (no fail-closed).
+    assert captured.out == ""
+    assert "re-minted token and retrying" in captured.err
+
+
+def test_evaluate_policy_fails_closed_when_reauth_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    If the token can't be re-minted, the tool still fails CLOSED (safety net).
+
+    Re-auth is best-effort. When no refresh mechanism is available, the
+    authoritative PreToolUse gate must still DENY rather than let an
+    unevaluated tool through — preserving the fail-closed guarantee from #163.
+    """
+
+    class _RedirectClient:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _RedirectClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: object = None) -> httpx.Response:
+            del json
+            return httpx.Response(
+                302,
+                headers={"Location": "https://w.example.com/oidc/x"},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RedirectClient)
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda server_url=None: None,
+    )
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="https://omnigents.example.databricksapps.com",
+        ap_auth_headers={"Authorization": "Bearer stale-token"},
+    )
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    result = json.loads(captured.out)
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert (
+        result["hookSpecificOutput"]["permissionDecisionReason"]
+        == native_policy_hook._EVAL_UNAVAILABLE_REASON
     )

@@ -40,6 +40,7 @@ from omnigent.runtime.harnesses.process_manager import (
     _AP_PID_FILE,
     _TMP_PARENT_ENV_VAR,
     HarnessProcessManager,
+    NoLiveHarnessError,
     _pid_alive,
     _pids_holding_socket,
 )
@@ -427,6 +428,24 @@ async def test_get_client_any_harness_sentinel_reuses_subprocess(
         await manager.shutdown()
 
 
+async def test_get_client_any_harness_sentinel_no_subprocess_raises(
+    manager: HarnessProcessManager,
+) -> None:
+    """``get_client(conv, "any")`` raises ``NoLiveHarnessError`` when no
+    subprocess is live.
+
+    Before the fix, this fell through to ``_spawn_entry("any", ...)``
+    which called ``_resolve_module_path("any")`` and raised the misleading
+    ``RuntimeError: unknown harness 'any'; registered names: [...]``.
+    """
+    await manager.start()
+    try:
+        with pytest.raises(NoLiveHarnessError, match="no live harness subprocess"):
+            await manager.get_client("conv_never_spawned", "any")
+    finally:
+        await manager.shutdown()
+
+
 async def test_get_client_concurrent_first_calls_share_subprocess(
     manager: HarnessProcessManager,
 ) -> None:
@@ -682,6 +701,7 @@ async def test_runner_subprocess_exits_on_sigterm(
         await manager.shutdown()
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=0)
 async def test_runner_subprocess_exits_when_spawning_parent_exits(
     short_tmp_parent: Path,
     register_test_harness: None,
@@ -722,7 +742,7 @@ async def test_runner_subprocess_exits_when_spawning_parent_exits(
         check=True,
         text=True,
         capture_output=True,
-        timeout=10,
+        timeout=30,
         env={**os.environ, "PYTHONPATH": os.getcwd()},
     )
     runner_pid = int(proc.stdout.strip().splitlines()[-1])

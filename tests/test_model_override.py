@@ -90,6 +90,10 @@ def test_validate_model_override_rejects_unsafe_values(value: str) -> None:
         "codex",
         "pi",
         "openai-agents",
+        "cursor",
+        "antigravity",
+        "kiro-native",
+        "native-kiro",
     ],
 )
 def test_harness_supports_model_override_for_plumbed_harnesses(harness: str) -> None:
@@ -107,7 +111,7 @@ def test_harness_supports_model_override_for_plumbed_harnesses(harness: str) -> 
     [
         # No model-override plumbing on the runner path: the persisted
         # value would be silently ignored.
-        "databricks_supervisor",
+        "unknown-harness",
         "totally-unknown",
         None,
     ],
@@ -150,6 +154,16 @@ class TestModelFamilyMismatch:
             ("pi", "databricks-claude-opus-4-8"),
             ("pi", "databricks-gpt-5-4-mini"),
             ("pi", "databricks-meta-llama-3.3-70b-instruct"),
+            # antigravity is Gemini-native: expected Gemini shapes pass, and
+            # so do bare/ambiguous ids the SDK legitimately accepts (only the
+            # Claude/GPT/databricks-gateway families are rejected below).
+            ("antigravity", "gemini-3.5-flash"),
+            ("antigravity", "gemini-2.5-flash"),
+            ("agy", "gemini-3.5-flash"),
+            ("google-antigravity", "gemini-2.5-flash"),
+            ("antigravity", "gemini-2.5-pro"),
+            ("kiro-native", "claude-sonnet-4.5"),
+            ("native-kiro", "gpt-5.4-mini"),
         ],
     )
     def test_compatible_pairs_pass(self, harness: str, model: str) -> None:
@@ -165,6 +179,16 @@ class TestModelFamilyMismatch:
             ("codex-native", "databricks-claude-sonnet-4-6", "only runs GPT models"),
             ("native-codex", "claude-opus-4-8", "only runs GPT models"),
             ("codex", "databricks-meta-llama-3.3-70b-instruct", "only runs GPT models"),
+            # antigravity is Gemini-native: syntactically valid non-Gemini ids
+            # must fail loud at the dispatch gate rather than be persisted as
+            # model_override and land in HARNESS_ANTIGRAVITY_MODEL only to fail
+            # later in the Gemini-native SDK path. The databricks-claude case
+            # also covers the no-gateway-path prefix rejection.
+            ("antigravity", "gpt-5.4-mini", "Gemini-native"),
+            ("antigravity", "databricks-claude-sonnet-4-6", "Gemini-native"),
+            ("antigravity", "claude-opus-4-8", "Gemini-native"),
+            ("agy", "gpt-5.4-mini", "Gemini-native"),
+            ("google-antigravity", "databricks-gpt-5-4", "Gemini-native"),
         ],
     )
     def test_wrong_or_unknown_family_is_rejected(
@@ -175,12 +199,23 @@ class TestModelFamilyMismatch:
         The alias case (``native-claude``) proves canonicalization is
         applied before the family lookup; the llama cases prove an
         undeterminable family fails loud on single-vendor harnesses
-        rather than passing through to a gateway error after spawn.
+        rather than passing through to a gateway error after spawn. The
+        ``agy`` / ``google-antigravity`` cases prove the antigravity rule
+        applies after harness canonicalization too.
         """
         msg = model_family_mismatch(harness, model)
         assert msg is not None
         assert expected_rule in msg
         assert model in msg
+
+    def test_rejection_names_both_multi_model_fallbacks(self) -> None:
+        """Both single-vendor rejections name pi and openai-agents as multi-model fallbacks."""
+        claude_msg = model_family_mismatch("claude-native", "databricks-gpt-5-4")
+        codex_msg = model_family_mismatch("codex-native", "databricks-claude-sonnet-4-6")
+        for msg in (claude_msg, codex_msg):
+            assert msg is not None
+            assert "pi" in msg
+            assert "openai-agents" in msg
 
 
 @pytest.mark.parametrize(

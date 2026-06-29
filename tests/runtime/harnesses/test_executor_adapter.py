@@ -25,6 +25,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.inner.executor import Executor
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
@@ -154,6 +155,12 @@ def use_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MockExecutor that yields a provider-side TurnCancelled."""
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "cancelled")
+
+
+@pytest.fixture
 def use_capture_messages(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Capturing executor: records the messages it received as JSON.
 
@@ -233,13 +240,18 @@ async def test_tool_call_translates_to_paired_function_call_items(
     # function_call_output (observed), completed.
     output_items = [e for e in events if e.event == "response.output_item.done"]
     # The mock yields ToolCallRequest + ToolCallComplete +
-    # TurnComplete. With the two-phase tool lifecycle, the adapter
-    # emits the function_call as in_progress. The function_call_output
-    # is suppressed at the adapter level (line 664 of
-    # _executor_adapter.py) because the scaffold's dispatch_tool is
-    # the single source of output events for dispatched tools. This
-    # test exercises the adapter in isolation, so we only see the
-    # function_call.
+    # TurnComplete. The ToolCallComplete carries NO call_id in its
+    # metadata — it models a ``handles_tools_internally`` executor
+    # (e.g. antigravity) whose tool was run ENTIRELY inside the
+    # SDK and never round-tripped through ``_stable_tool_executor`` /
+    # ctx.dispatch_tool. The adapter must therefore emit BOTH the
+    # observed function_call AND its paired function_call_output —
+    # the inner completion is the ONLY output source for these tools.
+    # (Suppression is scoped to call ids in ``_dispatched_call_ids``,
+    # populated only by ``_stable_tool_executor``; an internal tool's
+    # id is never added, so its completion is not suppressed. The
+    # prior blanket ``_current_ctx is not None`` rule wrongly dropped
+    # it, leaving such calls as perpetual in_progress with no output.)
     fc_items = [e for e in output_items if e.data["item"].get("type") == "function_call"]
     assert len(fc_items) >= 1, (
         f"expected at least 1 function_call; got {len(fc_items)}: "
@@ -251,6 +263,17 @@ async def test_tool_call_translates_to_paired_function_call_items(
     # scaffold upgrades to completed when the tool resolves.
     assert fc["status"] in ("completed", "in_progress")
     assert fc["name"] == "echo_tool"
+    # The paired function_call_output is emitted for the internally-run
+    # tool (this is the FIX-1b behavior — without it the tool renders
+    # as a perpetual in_progress card).
+    fco_items = [e for e in output_items if e.data["item"].get("type") == "function_call_output"]
+    assert len(fco_items) >= 1, (
+        "expected the inner ToolCallComplete to surface a "
+        "function_call_output for a tool run internally by the SDK "
+        f"(no dispatch round-trip); got item types "
+        f"{[e.data['item'].get('type') for e in output_items]}"
+    )
+    assert "tool result" in str(fco_items[0].data["item"].get("output", ""))
     # Stream completes cleanly.
     assert events[-1].event == "response.completed"
 
@@ -378,6 +401,31 @@ async def test_executor_error_terminates_with_response_failed(
     # via the RuntimeError wrap in the adapter; the scaffold
     # builds an ErrorDetail with the exception's str().
     assert "mock error" in error_detail["message"]
+
+
+async def test_turn_cancelled_terminates_with_response_cancelled(
+    use_cancelled: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """TurnCancelled -> response.cancelled terminal event.
+
+    Provider-side cancellation is not driven by an inbound interrupt event, so
+    the adapter must mark the turn context cancelled itself. Otherwise the
+    scaffold sees a clean return and emits response.completed.
+    """
+    conv_id = "conv_cancelled"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    assert events[-1].event == "response.cancelled"
+    terminal_response = events[-1].data["response"]
+    assert terminal_response["status"] == "cancelled"
+    assert terminal_response.get("error") is None
 
 
 # ── Error-code classification ──────────────────────────────────
@@ -751,21 +799,18 @@ def test_classify_inner_exception_dispatches_across_sdks(
     assert classify_inner_exception(RuntimeError("unknown")) is None
 
 
-class _StubExecutor:
+class _StubExecutor(Executor):
     """
     Minimal :class:`Executor` stub — just enough for ExecutorAdapter
     construction in unit tests that don't actually drive a turn.
     The override-method tests above never call ``run_turn``; they
     just need a constructed adapter to invoke
     ``_build_error_detail`` on.
+
+    Subclasses :class:`Executor` so ``executor_factory=lambda: _StubExecutor()``
+    typechecks (the factory expects ``Callable[[], Executor]``); the base
+    provides the no-op ``run_turn`` / capability defaults these tests rely on.
     """
-
-    async def close(self) -> None:
-        """Match Executor's close() signature for completeness."""
-
-    async def close_session(self, session_key: str) -> None:
-        """Match Executor's close_session() signature for completeness."""
-        del session_key
 
 
 def test_translate_input_to_messages_reconstructs_full_history() -> None:
@@ -1023,6 +1068,26 @@ def test_translate_event_mcp_tool_call_request_emits_observed_with_bare_name() -
         f"lets the SDK client dedupe — losing it brings back "
         f"the duplicate-render bug."
     )
+
+
+def test_tool_call_complete_suppressed_for_dispatched_executor() -> None:
+    """A normal internally-handling executor's ``ToolCallComplete`` is
+    suppressed mid-turn (its tools round-trip through dispatch_tool, which
+    emits the output) — the existing dedup contract."""
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    adapter._executor = _StubExecutor()  # type: ignore[assignment]
+    ctx = _RecordingTurnContext()
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    adapter._translate_event(
+        ToolCallComplete(name="", status=ToolCallStatus.SUCCESS, result="out", metadata={}),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    assert ctx.emitted == []
 
 
 def test_translate_event_mcp_request_queues_tool_use_id_for_dispatch() -> None:
@@ -1723,3 +1788,216 @@ async def test_interrupt_drops_inner_session_synchronously() -> None:
         "interrupt must drop the inner session so the next turn rebuilds fresh "
         f"instead of resuming the abandoned generation; got {executor.interrupted!r}"
     )
+
+
+def test_internal_errored_tool_complete_emits_output_with_real_call_id() -> None:
+    """An internally-run errored tool's completion pairs by a NON-empty call_id.
+
+    The antigravity-sdk executor runs builtin tools entirely inside the SDK; a
+    tool that errors surfaces as a :class:`ToolCallComplete` (status ERROR) that
+    never round-trips through ``_stable_tool_executor``, so the adapter's
+    completion branch is the ONLY ``function_call_output`` source. Downstream
+    consumers pair results to their request STRICTLY by ``call_id`` (the web
+    ``blockStream`` Map and the runner persistence sweep both discard an
+    empty-id output), so the output MUST carry the originating request's real
+    call_id.
+
+    The executor fix guarantees every errored-tool ``ToolCallComplete`` carries
+    its request's real id in ``metadata["call_id"]`` (allocated positionally for
+    the SDK's id-less OnToolError path). This test feeds the adapter that exact
+    event shape — a ``ToolCallRequest`` + an ERROR ``ToolCallComplete`` keyed to
+    the SAME id — and asserts the emitted ``function_call_output`` carries that
+    id and is NEVER ``call_id == ""`` (the pre-fix coercion that orphaned the
+    result and left the call a perpetual in-progress card).
+    """
+    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+
+    call_id = "tc_antigravity_err_1"
+    # The internally-run builtin tool call (observed) ...
+    adapter._translate_event(
+        ToolCallRequest(
+            name="run_command",
+            args={"CommandLine": "false"},
+            metadata={"call_id": call_id},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+    # ... then its ERROR completion, keyed to the SAME id (what the fixed SDK
+    # executor now emits for the id-less OnToolError path).
+    adapter._translate_event(
+        ToolCallComplete(
+            name="run_command",
+            status=ToolCallStatus.ERROR,
+            result=None,
+            error="command failed with exit code 1",
+            metadata={"call_id": call_id},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    fco_items = [e for e in ctx.emitted if e.item.get("type") == "function_call_output"]
+    assert len(fco_items) == 1, (
+        f"the internally-run errored tool's ToolCallComplete must surface "
+        f"exactly one function_call_output (its sole output source); got "
+        f"{[e.item.get('type') for e in ctx.emitted]}"
+    )
+    output_call_id = fco_items[0].item.get("call_id")
+    # The load-bearing assertion: the output pairs by the request's REAL id, and
+    # is never the empty string the pre-fix ``or ""`` coercion produced for an
+    # id-less completion (which orphaned the result downstream).
+    assert output_call_id == call_id, (
+        f"function_call_output must carry the originating request's call_id "
+        f"({call_id!r}) so it pairs downstream; got {output_call_id!r}."
+    )
+    assert output_call_id != "", (
+        "function_call_output for an internally-run errored antigravity tool "
+        "must NOT carry call_id=='' — every downstream consumer pairs strictly "
+        "by call_id and discards an empty-id output, orphaning the result."
+    )
+
+
+# ── ToolCallComplete suppression scoped to dispatched call ids ──────────────
+#
+# A tool routed through ``_stable_tool_executor`` → ``ctx.dispatch_tool`` already
+# has its ``function_call_output`` emitted by ``dispatch_tool`` when the Future
+# resolves; ``_stable_tool_executor`` records that call_id in
+# ``_dispatched_call_ids`` so ``_translate_event`` suppresses the duplicate inner
+# ``ToolCallComplete``. The suppression is keyed to the SET — NOT the old blanket
+# ``_current_ctx is not None`` rule, which also swallowed internally-run tools and
+# left them as perpetual in-progress cards. These two tests pin both arms of that
+# branch (it is shared code guarding claude/codex from duplicate outputs).
+
+
+def test_dispatched_id_tool_complete_is_suppressed() -> None:
+    """A ToolCallComplete whose call_id was dispatched (round-tripped) is suppressed.
+
+    ``_stable_tool_executor`` (the ``ctx.dispatch_tool`` path) is the single output
+    source for a dispatched tool — ``dispatch_tool`` already emitted its
+    ``function_call_output``. Emitting another here would duplicate it on the SSE
+    stream and produce a ghost "Waiting for output" card in the Web UI. So a
+    ``ToolCallComplete`` carrying a dispatched id must produce NO emit.
+    """
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+
+    call_id = "tc_dispatched_1"
+    # Mark the id as dispatched, exactly as ``_stable_tool_executor`` does after
+    # routing the call through ``ctx.dispatch_tool``.
+    adapter._dispatched_call_ids.add(call_id)
+
+    adapter._translate_event(
+        ToolCallComplete(
+            name="sys_terminal_launch",
+            status=ToolCallStatus.SUCCESS,
+            result="dispatched-output",
+            metadata={"call_id": call_id},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    assert ctx.emitted == [], (
+        f"a dispatched id's ToolCallComplete must be suppressed (dispatch_tool is "
+        f"its single output source); got {[e.item.get('type') for e in ctx.emitted]}. "
+        f"A second function_call_output here duplicates the result and leaves a "
+        f"ghost 'Waiting for output' card in the Web UI."
+    )
+
+
+def test_non_dispatched_id_tool_complete_emits_output() -> None:
+    """A ToolCallComplete whose id was NOT dispatched DOES emit its output.
+
+    Complements the suppression test: the gate is scoped to ``_dispatched_call_ids``,
+    not a blanket suppression. A tool the inner SDK ran internally (no
+    ``dispatch_tool`` round-trip) has its completion as the ONLY output source, so
+    it must surface a paired ``function_call_output``.
+    """
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+
+    call_id = "tc_internal_1"
+    # Note: call_id is intentionally NOT added to _dispatched_call_ids.
+    adapter._translate_event(
+        ToolCallComplete(
+            name="run_command",
+            status=ToolCallStatus.SUCCESS,
+            result="internal-output",
+            metadata={"call_id": call_id},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    fco_items = [e for e in ctx.emitted if e.item.get("type") == "function_call_output"]
+    assert len(fco_items) == 1, (
+        f"a non-dispatched ToolCallComplete is its tool's only output source and "
+        f"must emit exactly one function_call_output; got "
+        f"{[e.item.get('type') for e in ctx.emitted]}"
+    )
+    assert fco_items[0].item.get("call_id") == call_id
+
+
+def test_idless_tool_complete_is_suppressed() -> None:
+    """A ToolCallComplete with no usable call_id emits nothing (no ghost card).
+
+    ``ExecutorAdapter`` is shared by every adapter-backed harness, so an inner
+    executor that bridges an id-less ``ToolCallComplete`` mid-turn (e.g. pi)
+    must NOT leak a ``function_call_output`` with ``call_id == ""``: downstream
+    consumers pair STRICTLY by call_id and discard empty ones, so such an output
+    cannot pair and only renders a perpetual "Waiting for output" ghost card.
+    The old blanket ``_current_ctx is not None`` rule swallowed these; the
+    id-scoped suppression must keep doing so (the ``or ""`` coercion alone left
+    this path unguarded).
+    """
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+
+    # No ``metadata.call_id`` at all → the ``or ""`` coercion yields an empty id.
+    adapter._translate_event(
+        ToolCallComplete(
+            name="run_command",
+            status=ToolCallStatus.SUCCESS,
+            result="idless-output",
+            metadata={},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    assert ctx.emitted == [], (
+        f"an id-less ToolCallComplete must be suppressed (it cannot pair "
+        f"downstream and only ghosts a 'Waiting for output' card); got "
+        f"{[e.item.get('type') for e in ctx.emitted]}"
+    )
+
+
+async def test_policy_evaluator_no_active_turn_context_is_phase_aware() -> None:
+    """With no active turn context (turn-context desync, #1026) the policy
+    evaluator must not blanket-ALLOW. PHASE_TOOL_CALL fails closed (this adapter
+    is the only enforcement point, never re-checked server-side); advisory LLM
+    phases and the post-execution result phase fail open so a transient desync
+    does not needlessly wedge them — matching the runner's phase-aware default.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    adapter._current_ctx = None
+
+    tool_verdict = await adapter._stable_policy_evaluator("PHASE_TOOL_CALL", {})
+    assert tool_verdict.action == "POLICY_ACTION_DENY"
+    assert tool_verdict.reason == "No active turn context; failing closed for PHASE_TOOL_CALL."
+
+    for advisory_phase in ("PHASE_LLM_REQUEST", "PHASE_LLM_RESPONSE", "PHASE_TOOL_RESULT"):
+        verdict = await adapter._stable_policy_evaluator(advisory_phase, {})
+        assert verdict.action == "POLICY_ACTION_ALLOW", advisory_phase
+        assert verdict.reason is None, advisory_phase

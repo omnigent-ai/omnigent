@@ -1,0 +1,37 @@
+name: "setup-node"
+description: "Set up Node and pin npm, with npm dependency caching keyed on the web lockfile."
+
+# Single source of truth for the JS toolchain across CI. Pins npm to the
+# EXACT version that regenerates the lockfile in oss-regenerate-and-smoke.yml
+# (npm 11.12.1); without this, jobs use whatever npm Node 20 bundles
+# (npm 10.x) and the `package-lock.json` freshness gate in lint.yml would
+# flake on version-skew churn (dev/extraneous flags, metadata). Keep this
+# version in lockstep with the regen workflow so generation and
+# verification never diverge.
+
+inputs:
+  node-version:
+    description: "Node version to use."
+    default: "20"
+    required: false
+  cache:
+    description: "Package-manager cache to enable (passed to actions/setup-node)."
+    default: "npm"
+    required: false
+  cache-dependency-path:
+    description: "Lockfile path used as the cache key."
+    default: "web/package-lock.json"
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: ${{ inputs.cache }}
+        cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+    - name: Pin npm
+      shell: bash
+      run: npm install -g npm@11.12.1

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.metadata
 import io
 import json
 import os
@@ -106,6 +107,56 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
         "TaskCreated",
         "UserPromptSubmit",
     ]
+
+
+def test_claude_terminal_request_default_launch_is_unwrapped(tmp_path, monkeypatch) -> None:
+    """Without ``OMNIGENT_CLAUDE_LAUNCHER`` the command/args are unchanged."""
+    monkeypatch.delenv("OMNIGENT_CLAUDE_LAUNCHER", raising=False)
+    monkeypatch.chdir(tmp_path)
+    body = claude_native._claude_terminal_request(
+        ("--resume", "s"),
+        command="claude",
+        bridge_dir=Path("/tmp/omnigent-test-bridge"),
+    )
+    spec = body["spec"]
+    assert spec["command"] == "claude"
+    assert spec["args"][:2] == ["--resume", "s"]
+
+
+def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) -> None:
+    """
+    A registered launcher plugin rewrites the spawn command, keeping the bridge.
+
+    Exercises the local-CLI wiring of :func:`resolve_claude_launch`: with a
+    launcher plugin selected, the terminal spec runs the wrapped command
+    (here ``isaac -- <augmented args>``) while the Omnigent bridge
+    (``--mcp-config`` / ``--settings``) survives intact in the passed-through
+    argv.
+    """
+
+    from omnigent.claude_launcher import ClaudeLauncher
+
+    class _IsaacLauncher(ClaudeLauncher):
+        def launch(self, command, args):
+            return "isaac", ["--", *args]
+
+    entry_point = SimpleNamespace(name="isaac", load=lambda: _IsaacLauncher)
+    monkeypatch.setattr(importlib.metadata, "entry_points", lambda *, group: [entry_point])
+    monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "isaac")
+    monkeypatch.chdir(tmp_path)
+    body = claude_native._claude_terminal_request(
+        ("--resume", "s"),
+        command="claude",
+        bridge_dir=Path("/tmp/omnigent-test-bridge"),
+    )
+    spec = body["spec"]
+    assert spec["command"] == "isaac"
+    # Claude's argv is now passed through isaac after the ``--`` separator.
+    assert spec["args"][0] == "--"
+    assert spec["args"][1:3] == ["--resume", "s"]
+    # The bridge MCP + hook injection still rides along.
+    assert "--mcp-config" in spec["args"]
+    assert "--settings" in spec["args"]
 
 
 def test_claude_terminal_request_injects_claude_config() -> None:
@@ -1946,7 +1997,7 @@ async def test_create_claude_session_omits_title_for_generic_seed_path() -> None
     user message. The sidebar fills the create-to-first-message gap
     by rendering a default label off the
     ``omnigent.wrapper = claude-code-native-ui`` label
-    (see ``ap-web/src/shell/sidebarNav.ts::conversationDisplayLabel``).
+    (see ``web/src/shell/sidebarNav.ts::conversationDisplayLabel``).
     The labels must still reach the server unchanged because that
     sidebar fallback keys off the wrapper label.
     """
@@ -5713,7 +5764,12 @@ def test_provider_config_for_native_claude_key_injects_base_url_and_helper() -> 
 
     cfg = claude_native._provider_config_for_native_claude(entry)
     assert cfg is not None
-    assert cfg.env == {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
+    # ANTHROPIC_BASE_URL plus the gateway-safety beta-disable flag (gateways
+    # 400 on beta flags they don't implement; see _provider_config_for_native_claude).
+    assert cfg.env == {
+        "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
     # Static key delivered via the apiKeyHelper, never the env (allowlist).
     assert cfg.api_key_helper == "printf %s sk-ant-test"
     assert cfg.model == "claude-sonnet-4-6"
@@ -5740,7 +5796,103 @@ def test_provider_config_for_native_claude_uses_auth_command_verbatim() -> None:
     cfg = claude_native._provider_config_for_native_claude(entry)
     assert cfg is not None
     assert cfg.api_key_helper == "my-cli print-token"
-    assert cfg.env == {"ANTHROPIC_BASE_URL": "https://gw.example/v1"}
+    assert cfg.env == {
+        "ANTHROPIC_BASE_URL": "https://gw.example/v1",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
+
+
+def test_bedrock_config_for_native_claude_static_key() -> None:
+    """A ``bedrock`` provider sets the Bedrock env trio and no apiKeyHelper.
+
+    Bedrock mode authenticates from ``AWS_BEARER_TOKEN_BEDROCK`` in the env and
+    ignores ``apiKeyHelper``, so a static key must land in the env (never a
+    helper) and the base_url maps to ``ANTHROPIC_BEDROCK_BASE_URL``.
+    """
+    from omnigent.onboarding.provider_config import load_providers
+
+    entry = load_providers(
+        {
+            "providers": {
+                "nexus": {
+                    "kind": "bedrock",
+                    "anthropic": {
+                        "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+                        "api_key": "absk-test",
+                        "models": {"default": "us.anthropic.claude-opus-4-5-20251101-v1:0"},
+                    },
+                }
+            }
+        }
+    )["nexus"]
+
+    cfg = claude_native._bedrock_config_for_native_claude(entry)
+    assert cfg is not None
+    assert cfg.env == {
+        "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-runtime.us-east-1.amazonaws.com",
+        "AWS_BEARER_TOKEN_BEDROCK": "absk-test",
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
+    # Bedrock ignores apiKeyHelper; the credential rides the env, not a helper.
+    assert cfg.api_key_helper is None
+    assert cfg.model == "us.anthropic.claude-opus-4-5-20251101-v1:0"
+
+
+def test_bedrock_config_for_native_claude_resolves_auth_command() -> None:
+    """A ``bedrock`` provider with only an ``auth_command`` mints the token.
+
+    Regression: the credential gate previously read ``family.api_key`` alone, so
+    an ``auth_command``-only config (a natural fit for rotating Bedrock bearer
+    tokens) silently fell back to Claude's own login. The command's stdout must
+    become ``AWS_BEARER_TOKEN_BEDROCK`` since Bedrock mode ignores apiKeyHelper.
+    """
+    from omnigent.onboarding.provider_config import load_providers
+
+    entry = load_providers(
+        {
+            "providers": {
+                "nexus": {
+                    "kind": "bedrock",
+                    "anthropic": {
+                        "base_url": "https://gw.example/bedrock",
+                        "auth_command": "printf minted-bedrock-token",
+                        "models": {"default": "us.anthropic.claude-haiku-4-5-20251001-v1:0"},
+                    },
+                }
+            }
+        }
+    )["nexus"]
+
+    cfg = claude_native._bedrock_config_for_native_claude(entry)
+    assert cfg is not None
+    assert cfg.env["AWS_BEARER_TOKEN_BEDROCK"] == "minted-bedrock-token"
+    assert cfg.api_key_helper is None
+
+
+def test_bedrock_config_for_native_claude_non_anthropic_returns_none() -> None:
+    """A ``bedrock`` provider not serving the anthropic surface → ``None``.
+
+    The native Claude path only routes anthropic-surface providers; anything
+    else falls back to Claude Code's own login.
+    """
+    from omnigent.onboarding.provider_config import load_providers
+
+    entry = load_providers(
+        {
+            "providers": {
+                "nexus": {
+                    "kind": "bedrock",
+                    "openai": {
+                        "base_url": "https://gw.example/openai",
+                        "api_key": "sk-o",
+                    },
+                }
+            }
+        }
+    )["nexus"]
+
+    assert claude_native._bedrock_config_for_native_claude(entry) is None
 
 
 def test_resolve_native_claude_config_spec_provider_default(
@@ -5862,3 +6014,148 @@ def test_resolve_native_claude_config_ambient_key(
     assert cfg.env["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"
     # Resolved from the env ref, delivered via the helper (no secret in env).
     assert cfg.api_key_helper == "printf %s sk-ant-ambient"
+
+
+def test_bedrock_config_auth_command_failure_returns_none() -> None:
+    """A failing bedrock auth_command falls back to Claude's own login (None)."""
+    from omnigent.onboarding.provider_config import load_providers
+
+    entry = load_providers(
+        {
+            "providers": {
+                "b": {
+                    "kind": "bedrock",
+                    "anthropic": {
+                        "base_url": "https://gw.example/bedrock",
+                        "auth_command": "exit 7",
+                        "models": {"default": "us.anthropic.claude-haiku-4-5-20251001-v1:0"},
+                    },
+                }
+            }
+        }
+    )["b"]
+    assert claude_native._bedrock_config_for_native_claude(entry) is None
+
+
+def test_bedrock_config_no_model_default_leaves_model_none() -> None:
+    """A bedrock provider without models.default builds with model=None (+warns).
+
+    Claude Code then picks its own default model — usually not enabled on a
+    Bedrock account — so the function warns; the config is still returned.
+    """
+    import logging
+
+    from omnigent.onboarding.provider_config import load_providers
+
+    entry = load_providers(
+        {
+            "providers": {
+                "b": {"kind": "bedrock", "anthropic": {"base_url": "https://x", "api_key": "k"}}
+            }
+        }
+    )["b"]
+    logger = logging.getLogger(claude_native.__name__)
+    with _capture_warnings(logger) as records:
+        cfg = claude_native._bedrock_config_for_native_claude(entry)
+    assert cfg is not None
+    assert cfg.model is None
+    assert any("models.default" in r.getMessage() for r in records)
+
+
+class _capture_warnings:
+    """Minimal context manager capturing WARNING records from *logger*."""
+
+    def __init__(self, logger):
+        self._logger = logger
+        self._records = []
+        self._handler = None
+
+    def __enter__(self):
+        import logging
+
+        class _H(logging.Handler):
+            def __init__(self, sink):
+                super().__init__(level=logging.WARNING)
+                self._sink = sink
+
+            def emit(self, record):
+                self._sink.append(record)
+
+        self._handler = _H(self._records)
+        self._logger.addHandler(self._handler)
+        self._prev_level = self._logger.level
+        self._logger.setLevel(logging.WARNING)
+        return self._records
+
+    def __exit__(self, *exc):
+        self._logger.removeHandler(self._handler)
+        self._logger.setLevel(self._prev_level)
+        return False
+
+
+def test_claude_transcript_records_handles_compaction_item() -> None:
+    """Compaction items replace prior records with compacted_messages."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "msg_2",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi there"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "cmp_1",
+            "type": "compaction",
+            "summary": "compaction summary",
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "compacted reply"}],
+                },
+            ],
+            "response_id": "compact_1",
+        },
+        {
+            "id": "msg_3",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "after compaction"}],
+            "response_id": "resp_2",
+        },
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+    )
+    types = [r.get("type") for r in records]
+    # Should have compacted user + assistant + post-compaction user
+    assert "user" in types
+    assert "assistant" in types
+    # Pre-compaction "hi there" should be gone, replaced by "compacted reply"
+    all_text = " ".join(
+        str(r.get("message", {}).get("content", ""))
+        for r in records
+        if r.get("type") == "assistant"
+    )
+    assert "compacted reply" in all_text
+    assert "hi there" not in all_text
+    # Post-compaction message should be present
+    user_texts = [
+        str(r.get("message", {}).get("content", "")) for r in records if r.get("type") == "user"
+    ]
+    assert any("after compaction" in t for t in user_texts)

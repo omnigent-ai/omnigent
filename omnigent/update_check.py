@@ -7,15 +7,27 @@ Two install shapes are supported:
   ``git fetch`` and ``rev-list`` to count how many commits ``HEAD`` is
   behind ``origin/main`` (or ``origin/master``). The result is cached
   to ``~/.omnigent/.update_check.json`` so the (potentially slow)
-  ``git fetch`` only runs once per staleness window.
+  ``git fetch`` only runs once per staleness window. The notice points
+  the user at ``git pull``.
 
-* **Installed wheel** (``uv tool install git+<repo>``,
-  ``pip install <pkg>``, ``pipx install``, etc.): no clone is reachable
-  on disk, so we read the install metadata that the installer wrote into
-  the package's ``.dist-info/`` directory and nag when the install is
-  more than ``_INSTALL_STALENESS_SECONDS`` old. The exact upgrade
-  command we suggest is tailored to the installer (uv/pip/pipx) and to
-  whether the install came from a VCS URL or a registry.
+* **Installed wheel** (``uv tool install omnigent``,
+  ``pip install omnigent``, ``pipx install``, Homebrew, etc.): no clone
+  is reachable on disk, so we compare the installed version against the
+  latest release on the *configured package index* (via the Simple
+  Repository API — :func:`fetch_latest_version`) and nag *only when a
+  strictly newer release exists* — never merely because the install is
+  old. The index is resolved from ``OMNIGENT_INDEX_URL`` /
+  ``UV_INDEX_URL`` / ``PIP_INDEX_URL`` or, failing those, the uv/pip
+  *config files* (``uv.toml`` / ``pip.conf``); default pypi.org. So it
+  works on corporate mirrors and air-gapped networks — even when the
+  mirror is configured in a file rather than an env var — and stays
+  consistent with what ``omni upgrade`` actually pulls. To avoid adding
+  latency to the hot
+  path, the foreground only ever reads the cached "latest version" and
+  prints from it; the (network) lookup runs in a detached background
+  process (:func:`refresh_update_cache`) that refreshes the cache for the
+  next invocation. The notice fires once per new release (tracked via
+  ``last_notified_version``) and points the user at ``omni upgrade``.
 
 The dispatcher in ``maybe_show_update_notice`` picks the shape based on
 whether a ``.git/`` directory is reachable from this module's path.
@@ -36,8 +48,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    # Imported only for type hints; the Rich import remains lazy at
-    # runtime so importing this module stays cheap.
+    # Imported only for type hints; the heavy/optional imports remain lazy
+    # at runtime so importing this module stays cheap.
+    from collections.abc import Iterable
+
+    import httpx
+    from packaging.version import Version
     from rich.console import Console
 
 _ENV_SKIP = "OMNIGENT_NO_UPDATE_CHECK"
@@ -45,12 +61,33 @@ _CACHE_DIR = Path.home() / ".omnigent"
 _CACHE_FILE = _CACHE_DIR / ".update_check.json"
 _STALENESS_SECONDS = 4 * 60 * 60  # 4 hours
 _GIT_TIMEOUT_SECONDS = 5
-# Wheel-install staleness threshold — nag when the installed build is
-# older than this. Chosen to match the user's "1 day stale" ask; nags
-# print on every CLI invocation once the threshold is crossed, until
-# the user reinstalls.
-_INSTALL_STALENESS_SECONDS = 24 * 60 * 60  # 1 day
 _DIST_NAME = "omnigent"
+# "Is a newer release out?" is answered against the *configured* package
+# index via the Simple Repository API (PEP 503/691) — the universal
+# protocol every index speaks (pypi.org, a corporate mirror, devpi,
+# Artifactory, the Databricks proxy). We deliberately do NOT use PyPI's
+# JSON API (`/pypi/<name>/json`): that is Warehouse-specific and 404s on
+# mirrors, so it would silently never work on air-gapped / mirror-only
+# networks. Querying the same index the user installs from also keeps the
+# notice consistent with what ``omni upgrade`` (uv/pip) actually pulls.
+_DEFAULT_INDEX_URL = "https://pypi.org/simple"
+# Env vars that point at the default index, in precedence order. The
+# explicit ``OMNIGENT_INDEX_URL`` wins; then uv's and pip's. When none is
+# set, :func:`_resolve_index_url` falls back to uv/pip *config files*
+# (uv.toml / pip.conf), so a mirror configured there is honored too.
+# Credentials embedded in the URL are honored (httpx applies them), so
+# authenticated mirrors work transparently.
+_INDEX_ENV_VARS = ("OMNIGENT_INDEX_URL", "UV_DEFAULT_INDEX", "UV_INDEX_URL", "PIP_INDEX_URL")
+# PEP 691 JSON content type to request (falls back to PEP 503 HTML).
+_SIMPLE_JSON_ACCEPT = "application/vnd.pypi.simple.v1+json"
+# Keep the background index lookup snappy. It runs detached so it never
+# blocks the CLI, but a tight timeout still bounds the orphan's lifetime.
+_INDEX_TIMEOUT_SECONDS = 3.0
+# The foreground ``omni upgrade`` is user-initiated and worth waiting on, so it
+# uses a more forgiving timeout (and one retry) than the background refresh — a
+# briefly slow mirror shouldn't make ``omni upgrade --check`` spuriously report
+# "couldn't reach the index".
+_UPGRADE_INDEX_TIMEOUT_SECONDS = 10.0
 # The placeholder that PEP 610 tooling (pip, newer uv) writes into
 # ``direct_url.json`` in place of a URL's userinfo. See
 # ``_unredact_ssh_userinfo`` for why we have to repair it.
@@ -70,18 +107,25 @@ class _CacheEntry:
         has pulled (HEAD moves) so the stale count can be rechecked
         cheaply without a fresh ``git fetch``.
     :param kind: Which detection path wrote this entry —
-        ``"clone"`` for the dev-clone (``git fetch``) path, or some
-        other tag for future install shapes. Defaults to ``"clone"``
-        so legacy caches written before this field existed are
-        treated as clone caches. The wheel-install path does not
-        cache (its dist-info reads are cheap), so no ``"wheel"`` tag
-        is currently written.
+        ``"clone"`` for the dev-clone (``git fetch``) path or
+        ``"wheel"`` for the installed-wheel (PyPI) path. Defaults to
+        ``"clone"`` so legacy caches written before this field existed
+        are treated as clone caches.
+    :param latest_version: The latest release version seen on PyPI for
+        the wheel path, e.g. ``"0.2.0"``. Empty string when unknown
+        (clone path, or no successful PyPI lookup yet).
+    :param last_notified_version: The version the wheel-path notice was
+        last shown for, e.g. ``"0.2.0"``. Used to fire the "update
+        available" notice exactly once per new release rather than on
+        every invocation. Empty string when no notice has been shown.
     """
 
     last_check_epoch: float
     commits_behind: int
     head_sha: str = ""
     kind: str = "clone"
+    latest_version: str = ""
+    last_notified_version: str = ""
 
 
 @dataclass
@@ -203,16 +247,19 @@ def _run_dev_clone_check(repo_root: Path) -> None:
 
 
 def _run_installed_wheel_check() -> None:
-    """Run the installed-wheel update check (metadata-driven).
+    """Run the installed-wheel update check (PyPI-version-driven).
 
-    Reads ``INSTALLER``, ``direct_url.json``, and ``uv_cache.json``
-    from the package's ``.dist-info/`` directory to determine when
-    the package was installed and which installer wrote it. Prints
-    a nag when the install is older than ``_INSTALL_STALENESS_SECONDS``.
+    Compares the installed version against the latest release recorded
+    in the cache and prints an "update available" notice when a strictly
+    newer release exists — and only once per new release, tracked via
+    ``last_notified_version``. The notice points the user at
+    ``omni upgrade``.
 
-    No cache — the underlying dist-info reads are cheap (a few small
-    files), and once the threshold is crossed the user should see the
-    nag on every invocation until they upgrade.
+    The foreground never touches the network: it reads the cached latest
+    version (written by :func:`refresh_update_cache`) and, when that
+    cache is missing or stale, kicks off a detached background refresh so
+    the *next* invocation has fresh data. This keeps the hot path at zero
+    added latency — the failure mode of the old install-age nag.
     """
     try:
         info = _read_installed_wheel_info()
@@ -225,12 +272,385 @@ def _run_installed_wheel_check() -> None:
         # Editable install with no .git/ reachable — most likely a
         # ``pip install -e .`` outside the source tree. The clone path
         # would have caught this if .git/ were reachable; there's no
-        # meaningful "install age" for an editable install, so bail.
+        # PyPI release to compare an editable install against, so bail.
+        return
+    if info.vcs_url:
+        # A git/VCS install tracks a moving ref, not a PyPI release. Its
+        # version string (e.g. a frozen ``0.1.0`` on an unbumped ``main``)
+        # is not comparable to the latest PyPI version: the nag would fire
+        # forever even on a build that is *ahead* of the latest release,
+        # and reinstalling the ref can never change that version. The
+        # ``omni upgrade`` git path re-pulls the ref and reports commit
+        # deltas instead; the passive PyPI nag is simply wrong here.
         return
 
-    age_seconds = int(time.time() - info.install_time_epoch)
-    if age_seconds >= _INSTALL_STALENESS_SECONDS:
-        _print_install_notice(info, age_seconds)
+    cache = _read_cache()
+    if (
+        cache is not None
+        and cache.kind == "wheel"
+        and cache.latest_version
+        and _is_newer(cache.latest_version, info.package_version)
+        and cache.latest_version != cache.last_notified_version
+    ):
+        _print_pypi_notice(info.package_version, cache.latest_version)
+        # Stamp the version we just nagged about so the notice fires
+        # exactly once per new release (until an even newer one ships).
+        _write_cache(
+            _CacheEntry(
+                last_check_epoch=cache.last_check_epoch,
+                commits_behind=0,
+                kind="wheel",
+                latest_version=cache.latest_version,
+                last_notified_version=cache.latest_version,
+            )
+        )
+
+    # Refresh the cached "latest version" out of band when it is missing,
+    # stale, or was written by the (other-shape) clone path.
+    if cache is None or cache.kind != "wheel" or _is_stale(cache):
+        _spawn_background_refresh()
+
+
+def _is_newer(latest: str, current: str) -> bool:
+    """Return whether *latest* is a strictly newer release than *current*.
+
+    Uses PEP 440 comparison (``packaging.version``) so pre-releases,
+    post-releases, and dev builds order correctly. Falls back to a string
+    inequality when either value is not a valid PEP 440 version, so a
+    malformed PyPI response can never crash the check.
+
+    :param latest: Candidate latest version, e.g. ``"0.2.0"``.
+    :param current: The installed version, e.g. ``"0.1.0"``.
+    :returns: ``True`` when ``latest`` is strictly greater than
+        ``current``.
+    """
+    from packaging.version import InvalidVersion, parse
+
+    try:
+        return parse(latest) > parse(current)
+    except InvalidVersion:
+        return latest != current and bool(latest)
+
+
+def _resolve_index_url() -> str:
+    """Resolve the package index to query, honoring uv/pip config.
+
+    Precedence, mirroring how ``uv`` / ``pip`` (and therefore
+    ``omni upgrade``) actually pick an index:
+
+    1. index env vars (:data:`_INDEX_ENV_VARS`) — explicit
+       ``OMNIGENT_INDEX_URL`` first, then uv's and pip's;
+    2. uv's configured default index (``uv.toml``);
+    3. pip's configured ``index-url`` (``pip.conf``);
+    4. :data:`_DEFAULT_INDEX_URL`.
+
+    Reading the config files (not just env vars) is what makes the check
+    work on the common corporate setup where the mirror lives in
+    ``~/.config/uv/uv.toml`` or ``pip.conf`` rather than an env var — the
+    same place ``uv tool install`` found it.
+
+    :returns: The index base URL with any trailing slash stripped, e.g.
+        ``"https://pypi.org/simple"``.
+    """
+    for var in _INDEX_ENV_VARS:
+        value = os.environ.get(var)
+        if value:
+            url = _first_index_token(value)
+            if url:
+                return url
+    for reader in (_index_from_uv_config, _index_from_pip_config):
+        url = reader()
+        if url:
+            return url
+    return _DEFAULT_INDEX_URL
+
+
+def _first_index_token(value: str) -> str:
+    """Return the first (primary) URL from a possibly multi-value index var.
+
+    :param value: An index env var value, e.g.
+        ``"https://a/simple https://b/simple"``.
+    :returns: The first URL with any trailing slash stripped, or ``""``.
+    """
+    tokens = value.replace(",", " ").split()
+    return tokens[0].rstrip("/") if tokens else ""
+
+
+def _user_config_base() -> Path:
+    """Return the XDG user-config dir (``$XDG_CONFIG_HOME`` or ``~/.config``)."""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return Path(xdg) if xdg else Path.home() / ".config"
+
+
+def _index_from_uv_config() -> str:
+    """Read uv's configured *default* index from ``uv.toml``, or ``""``.
+
+    Checks the user config (``$XDG_CONFIG_HOME/uv/uv.toml`` or
+    ``~/.config/uv/uv.toml``) then the system config (``/etc/uv/uv.toml``).
+    Honors the legacy ``index-url`` key and a ``[[index]]`` entry marked
+    ``default = true``. A non-default ``[[index]]`` is *supplementary*
+    (PyPI stays the default) and is deliberately ignored, so we never
+    mistake an extra index for the primary one. Best-effort: any read /
+    parse error skips that file.
+
+    :returns: The configured default index URL (trailing slash stripped),
+        or ``""`` when none is set.
+    """
+    import tomllib
+
+    for path in (_user_config_base() / "uv" / "uv.toml", Path("/etc/uv/uv.toml")):
+        try:
+            data = tomllib.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        legacy = data.get("index-url")
+        if isinstance(legacy, str) and legacy.strip():
+            return legacy.strip().rstrip("/")
+        indexes = data.get("index")
+        if isinstance(indexes, list):
+            for entry in indexes:
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("default") is True
+                    and isinstance(entry.get("url"), str)
+                    and entry["url"].strip()
+                ):
+                    return entry["url"].strip().rstrip("/")
+    return ""
+
+
+def _index_from_pip_config() -> str:
+    """Read pip's configured ``index-url`` from ``pip.conf``, or ``""``.
+
+    Checks ``$PIP_CONFIG_FILE``, the user config
+    (``$XDG_CONFIG_HOME/pip/pip.conf`` or ``~/.config/pip/pip.conf``, plus
+    legacy ``~/.pip/pip.conf``) and common system locations — highest
+    precedence first — returning the first ``[global]`` / ``[install]``
+    ``index-url`` found. Interpolation is disabled so URLs containing
+    ``%`` parse cleanly. Best-effort: any read / parse error skips.
+
+    :returns: The configured ``index-url`` (trailing slash stripped), or
+        ``""`` when none is set.
+    """
+    import configparser
+
+    candidates: list[Path] = []
+    env_file = os.environ.get("PIP_CONFIG_FILE")
+    if env_file:
+        candidates.append(Path(env_file))
+    candidates += [
+        _user_config_base() / "pip" / "pip.conf",
+        Path.home() / ".pip" / "pip.conf",
+        Path("/Library/Application Support/pip/pip.conf"),
+        Path("/etc/pip.conf"),
+    ]
+    for path in candidates:
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            if not parser.read(path):
+                continue
+        except (configparser.Error, OSError, UnicodeDecodeError):
+            continue
+        for section in ("global", "install"):
+            if parser.has_option(section, "index-url"):
+                url = parser.get(section, "index-url").strip()
+                if url:
+                    return url.rstrip("/")
+    return ""
+
+
+def fetch_latest_version(
+    include_prereleases: bool = False,
+    *,
+    timeout: float = _INDEX_TIMEOUT_SECONDS,
+    attempts: int = 1,
+) -> str | None:
+    """Fetch the latest ``omnigent`` release from the configured index.
+
+    Queries the Simple Repository API of the resolved index
+    (:func:`_resolve_index_url`) — PEP 691 JSON when the index serves it,
+    PEP 503 HTML otherwise. Swallows every error so the update check can never
+    break the CLI. The background refresh uses the defaults (one snappy try);
+    the foreground ``omni upgrade`` passes a longer *timeout* and *attempts=2*
+    so a momentarily slow mirror doesn't spuriously read as "unreachable".
+
+    :param include_prereleases: When ``False`` (default), pre-releases and
+        dev releases are excluded so we never nag about a non-final build.
+        When ``True`` (``omni upgrade --pre`` / TestPyPI rc validation),
+        they are considered too.
+    :param timeout: Per-request timeout in seconds.
+    :param attempts: Total number of tries; a transient connection/timeout
+        error retries until they are exhausted. A definitive non-200 response
+        is never retried. Values < 1 are treated as 1.
+    :returns: The latest matching version string (e.g. ``"0.2.0"`` or, with
+        pre-releases, ``"0.2.0rc1"``), or ``None`` on any network / parse
+        error, a non-200 response, or when no matching release is found.
+    """
+    import httpx
+    from packaging.utils import canonicalize_name
+
+    url = f"{_resolve_index_url()}/{canonicalize_name(_DIST_NAME)}/"
+    resp = None
+    for _ in range(max(1, attempts)):
+        try:
+            resp = httpx.get(
+                url,
+                headers={"Accept": _SIMPLE_JSON_ACCEPT},
+                timeout=timeout,
+                follow_redirects=True,
+            )
+            break  # got a response (any status) — don't retry a definitive reply
+        except httpx.HTTPError:
+            resp = None  # transient (timeout / connection reset) — retry if any left
+    if resp is None or resp.status_code != 200:
+        return None
+
+    versions = _parse_simple_versions(resp)
+    if not include_prereleases:
+        versions = [v for v in versions if not (v.is_prerelease or v.is_devrelease)]
+    return str(max(versions)) if versions else None
+
+
+def _parse_simple_versions(resp: httpx.Response) -> list[Version]:
+    """Extract candidate versions from a Simple-API response.
+
+    Prefers the PEP 691 JSON body (``versions`` per PEP 700, else the
+    ``files`` list); falls back to scraping filenames from the PEP 503
+    HTML index when the server ignored our JSON ``Accept`` header.
+
+    :param resp: A 200 response from ``<index>/<name>/``.
+    :returns: Parsed :class:`~packaging.version.Version` objects (possibly
+        empty); callers filter pre-releases and pick the max.
+    """
+    content_type = resp.headers.get("content-type", "")
+    if "json" in content_type:
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+        if not isinstance(data, dict):
+            return []
+        listed = data.get("versions")
+        if isinstance(listed, list):
+            return [v for v in (_safe_version(str(x)) for x in listed) if v is not None]
+        files = data.get("files")
+        if isinstance(files, list):
+            return _versions_from_filenames(
+                f.get("filename", "") for f in files if isinstance(f, dict)
+            )
+        return []
+    # PEP 503 HTML fallback: filenames are the <a> link texts / hrefs.
+    import re
+
+    names = re.findall(r">([^<>]+\.(?:whl|tar\.gz|zip))<", resp.text)
+    return _versions_from_filenames(names)
+
+
+def _versions_from_filenames(filenames: Iterable[str]) -> list[Version]:
+    """Parse versions from wheel / sdist filenames, skipping unparseable ones.
+
+    :param filenames: Distribution filenames, e.g.
+        ``["omnigent-0.2.0-py3-none-any.whl", "omnigent-0.2.0.tar.gz"]``.
+    :returns: The versions successfully parsed out of them.
+    """
+    from packaging.utils import (
+        InvalidSdistFilename,
+        InvalidWheelFilename,
+        parse_sdist_filename,
+        parse_wheel_filename,
+    )
+
+    out: list[Version] = []
+    for filename in filenames:
+        try:
+            if filename.endswith(".whl"):
+                out.append(parse_wheel_filename(filename)[1])
+            elif filename.endswith((".tar.gz", ".zip")):
+                out.append(parse_sdist_filename(filename)[1])
+        except (InvalidWheelFilename, InvalidSdistFilename):
+            continue
+    return out
+
+
+def _safe_version(value: str) -> Version | None:
+    """Parse a version string, returning ``None`` instead of raising.
+
+    :param value: A candidate version, e.g. ``"0.2.0"``.
+    :returns: The :class:`~packaging.version.Version`, or ``None`` when
+        *value* is not a valid PEP 440 version.
+    """
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        return Version(value)
+    except InvalidVersion:
+        return None
+
+
+def refresh_update_cache() -> None:
+    """Refresh the cached "latest released version" for the wheel path.
+
+    Runs in a detached background process spawned by
+    :func:`_spawn_background_refresh` (via ``python -c``), so it must be
+    completely silent and must never raise. Performs the network index
+    lookup the foreground deliberately avoids and writes the result to
+    the shared cache, preserving ``last_notified_version`` so a pending
+    "fire once per release" notice is not re-armed.
+    """
+    # Background best-effort: a crash here must never surface, so swallow
+    # everything (the early returns below still exit cleanly).
+    with contextlib.suppress(Exception):
+        if os.environ.get(_ENV_SKIP):
+            return
+        # Only the wheel shape consults the index; a clone refreshes via git.
+        if _find_repo_root() is not None:
+            return
+        info = _read_installed_wheel_info()
+        if info is None or info.is_editable:
+            return
+        latest = fetch_latest_version()
+        if latest is None:
+            return
+        prev = _read_cache()
+        last_notified = (
+            prev.last_notified_version if prev is not None and prev.kind == "wheel" else ""
+        )
+        _write_cache(
+            _CacheEntry(
+                last_check_epoch=time.time(),
+                commits_behind=0,
+                kind="wheel",
+                latest_version=latest,
+                last_notified_version=last_notified,
+            )
+        )
+
+
+def _spawn_background_refresh() -> None:
+    """Spawn a detached process to refresh the PyPI cache, fire-and-forget.
+
+    Uses ``python -c`` rather than re-invoking the ``omni`` CLI so the
+    refresh cannot recurse back into :func:`maybe_show_update_notice`,
+    and runs in its own session with all standard streams sent to
+    ``/dev/null`` so it neither blocks nor pollutes the foreground.
+    Any spawn failure is swallowed — the worst case is simply that the
+    cache is refreshed on a later invocation instead.
+    """
+    from omnigent.inner import _proc
+
+    with contextlib.suppress(OSError, ValueError):
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "from omnigent.update_check import refresh_update_cache as r; r()",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            **_proc.spawn_kwargs(),
+        )
 
 
 # ------------------------------------------------------------------
@@ -286,6 +706,8 @@ def _read_cache() -> _CacheEntry | None:
             # Legacy caches (written before this field existed) get
             # the default ``"clone"`` — they were all clone caches.
             kind=str(data.get("kind", "clone")),
+            latest_version=str(data.get("latest_version", "")),
+            last_notified_version=str(data.get("last_notified_version", "")),
         )
     except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError):
         return None
@@ -315,6 +737,8 @@ def _write_cache(entry: _CacheEntry) -> None:
             "commits_behind": entry.commits_behind,
             "head_sha": entry.head_sha,
             "kind": entry.kind,
+            "latest_version": entry.latest_version,
+            "last_notified_version": entry.last_notified_version,
         }
     )
     # ``dir=`` on the same filesystem guarantees atomic replace.
@@ -459,6 +883,32 @@ def _print_notice(commits_behind: int) -> None:
         (f"{commits_behind}", "bold"),
         " commit(s) ahead.\nRun ",
         ("git pull", "bold"),
+        " to update.",
+    )
+    console.print(Panel(body, border_style="yellow", expand=False))
+
+
+def _print_pypi_notice(current: str, latest: str) -> None:
+    """Print the installed-wheel "update available" notice to stderr.
+
+    Informational only — it names the new release and points the user at
+    ``omni upgrade``; the actual upgrade (and the graceful server/daemon
+    cycle) lives in that command, not here.
+
+    :param current: The installed version, e.g. ``"0.1.0"``.
+    :param latest: The newer release available on PyPI, e.g. ``"0.2.0"``.
+    """
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+
+    console = Console(stderr=True)
+    body = Text.assemble(
+        ("Update available", "bold yellow"),
+        " — omnigent ",
+        (latest, "bold"),
+        f" is out (you have {current}).\nRun ",
+        ("omni upgrade", "bold"),
         " to update.",
     )
     console.print(Panel(body, border_style="yellow", expand=False))
@@ -791,13 +1241,59 @@ class _UpgradeSuggestion:
     runnable: bool
 
 
-def _build_upgrade_suggestion(info: _InstalledWheelInfo) -> _UpgradeSuggestion:
+# Per-installer flag that allows pre-releases (``omni upgrade --pre``).
+# Only installers with a clean, well-defined flag are listed; others get
+# no suffix (the base command still runs, just stable-only).
+_PRERELEASE_FLAG = {
+    "uv": " --prerelease allow",
+    "pip": " --pre",
+    "pipx": " --pip-args=--pre",
+}
+
+
+def _pip_invocation() -> str:
+    """Return the pip command prefix bound to the running interpreter.
+
+    ``omni upgrade`` shells out to install the new wheel, and a bare
+    ``pip`` is resolved against ``PATH`` — which, in a shell where some
+    *other* environment's ``pip`` shadows the one running ``omni`` (a
+    conda env layered over the venv that actually holds the install,
+    say), targets the wrong environment: it silently upgrades a different
+    copy of omnigent while the running one stays put. ``<sys.executable>
+    -m pip`` pins the upgrade to the interpreter actually running
+    ``omni`` so the new wheel lands where the running CLI lives. Falls
+    back to a bare ``pip`` only when ``sys.executable`` is unknown
+    (frozen / embedded interpreters).
+
+    uv-tool and pipx installs don't need this: they manage per-user tool
+    environments through a global registry, so any ``uv`` / ``pipx`` on
+    ``PATH`` upgrades the same install regardless of the active venv.
+
+    :returns: The pip prefix, e.g. ``"/path/to/.venv/bin/python -m pip"``
+        (the interpreter path shell-quoted so it survives
+        ``shlex.split`` in :func:`_run_upgrade_command`), or ``"pip"``
+        when no interpreter path is available.
+    """
+    import shlex
+
+    if not sys.executable:
+        return "pip"
+    return f"{shlex.quote(sys.executable)} -m pip"
+
+
+def _build_upgrade_suggestion(
+    info: _InstalledWheelInfo, *, allow_prerelease: bool = False
+) -> _UpgradeSuggestion:
     """Build the right upgrade command for the user's install shape.
 
     Picks based on ``detected_installer`` (uv / pip / pipx / poetry /
     unknown) and whether ``direct_url.json`` recorded a VCS URL.
 
     :param info: Metadata from ``_read_installed_wheel_info``.
+    :param allow_prerelease: When ``True`` (``omni upgrade --pre``), append
+        the installer's allow-pre-releases flag (uv ``--prerelease allow``,
+        pip ``--pre``, pipx ``--pip-args=--pre``) so the upgrade can land on
+        a release candidate. A no-op for installers without a known flag.
     :returns: A :class:`_UpgradeSuggestion` whose ``command`` is the
         line printed in the nag panel and whose ``runnable`` flag
         tells the caller whether the line is an actual invocation
@@ -805,20 +1301,21 @@ def _build_upgrade_suggestion(info: _InstalledWheelInfo) -> _UpgradeSuggestion:
         (so the prompt is suppressed).
     """
     installer = info.detected_installer or info.installer
+    pre = _PRERELEASE_FLAG.get(installer or "", "") if allow_prerelease else ""
 
     if info.vcs_url:
         # VCS install — we know the exact source URL.
         if installer == "uv":
             return _UpgradeSuggestion(
-                command=f"uv tool install --reinstall {info.vcs_url}",
+                command=f"uv tool install --reinstall {info.vcs_url}{pre}",
                 runnable=True,
             )
         if installer == "pipx":
             # pipx tracks the original spec; ``reinstall`` re-pulls it.
-            return _UpgradeSuggestion(command=f"pipx reinstall {_DIST_NAME}", runnable=True)
+            return _UpgradeSuggestion(command=f"pipx reinstall {_DIST_NAME}{pre}", runnable=True)
         if installer in ("pip", None):
             return _UpgradeSuggestion(
-                command=f"pip install --force-reinstall {info.vcs_url}",
+                command=f"{_pip_invocation()} install --force-reinstall {info.vcs_url}{pre}",
                 runnable=True,
             )
         if installer == "poetry":
@@ -832,51 +1329,19 @@ def _build_upgrade_suggestion(info: _InstalledWheelInfo) -> _UpgradeSuggestion:
 
     # Registry install — no VCS URL recorded.
     if installer == "uv":
-        return _UpgradeSuggestion(command=f"uv tool upgrade {_DIST_NAME}", runnable=True)
+        return _UpgradeSuggestion(command=f"uv tool upgrade {_DIST_NAME}{pre}", runnable=True)
     if installer == "pipx":
-        return _UpgradeSuggestion(command=f"pipx upgrade {_DIST_NAME}", runnable=True)
+        return _UpgradeSuggestion(command=f"pipx upgrade {_DIST_NAME}{pre}", runnable=True)
     if installer == "pip":
-        return _UpgradeSuggestion(command=f"pip install -U {_DIST_NAME}", runnable=True)
+        return _UpgradeSuggestion(
+            command=f"{_pip_invocation()} install -U {_DIST_NAME}{pre}", runnable=True
+        )
     if installer == "poetry":
         return _UpgradeSuggestion(command=f"poetry update {_DIST_NAME}", runnable=True)
     return _UpgradeSuggestion(
         command=f"reinstall {_DIST_NAME} from your original source",
         runnable=False,
     )
-
-
-def _stdin_is_tty() -> bool:
-    """Return ``True`` when ``sys.stdin`` is connected to a terminal.
-
-    Wrapped as a module-level helper so tests can monkeypatch the
-    answer directly without having to replace ``sys.stdin`` itself
-    (replacing the stream would also break Rich's input-reading path
-    used by the confirmation prompt).
-
-    :returns: ``True`` for an interactive terminal, ``False`` for
-        piped/redirected stdin (CI, ``< /dev/null``, etc.).
-    """
-    return sys.stdin.isatty()
-
-
-def _prompt_yes_no(console: Console, question: str) -> bool:
-    """Prompt the user with a yes/no Rich confirmation, defaulting to no.
-
-    Wrapped as a module-level helper so tests can monkeypatch the
-    answer without having to feed bytes through stdin. The Rich
-    ``Confirm`` import is deferred so this module stays cheap to
-    import.
-
-    :param console: The Rich ``Console`` (stderr) used by the
-        surrounding panel — passing it keeps the prompt visually
-        attached to the nag rather than landing on a separate
-        stream.
-    :param question: Prompt text, e.g. ``"Run this now?"``.
-    :returns: ``True`` for yes, ``False`` for no or an empty answer.
-    """
-    from rich.prompt import Confirm
-
-    return Confirm.ask(question, default=False, console=console)
 
 
 def _run_upgrade_command(command: str, console: Console) -> int:
@@ -910,88 +1375,133 @@ def _run_upgrade_command(command: str, console: Console) -> int:
     return result.returncode
 
 
-def _print_install_notice(info: _InstalledWheelInfo, age_seconds: int) -> None:
-    """Print the wheel-install update notice and optionally run the upgrade.
+def upgrade_command_for_installed() -> _UpgradeSuggestion | None:
+    """Return the upgrade command for the current install, or ``None``.
 
-    Always renders the Rich panel summarizing install age + the
-    recommended upgrade command. When that command is *runnable*
-    (i.e. the installer is one we have a recipe for) AND stdin is
-    an interactive terminal, additionally prompts the user to run
-    the upgrade now. On user confirmation: shells out via
-    ``subprocess.run``, then exits the process regardless of
-    outcome — ``sys.exit(0)`` on success, ``sys.exit(1)`` on
-    failure. The exit on failure matters because the running
-    interpreter still has the OLD modules loaded in memory; if we
-    fell through into the user's original command after a failed
-    upgrade, they would silently keep running the pre-upgrade
-    code while believing they had just attempted to upgrade.
-    Exiting forces them to re-invoke (which either picks up the
-    new code on success, or surfaces the failure clearly so they
-    can investigate).
+    Convenience wrapper used by ``omni upgrade``: reads the installed
+    distribution's metadata and maps it to the installer-appropriate
+    upgrade command (``uv tool upgrade omnigent``, ``pip install -U
+    omnigent``, etc.).
 
-    When the recommended command is NOT runnable (unknown
-    installer fallback), the panel itself is the explanation and
-    we deliberately stay silent afterwards — no prompt, no skip
-    notice. When stdin is not a TTY (CI, piped, redirected) we
-    print a single-line skip notice so the absence of a prompt is
-    visible in logs.
-
-    :param info: Metadata about the install, used to format the
-        upgrade command.
-    :param age_seconds: Seconds since install — gets rounded down to
-        days for display. The minimum displayed value is ``1`` so we
-        never print ``"0 day(s) old"`` even if the threshold logic
-        ever calls us right at the boundary.
+    :returns: A :class:`_UpgradeSuggestion`, or ``None`` when the
+        package is not installed as a wheel (e.g. running from a source
+        checkout with no registered distribution).
     """
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich.text import Text
+    info = _read_installed_wheel_info()
+    if info is None:
+        return None
+    return _build_upgrade_suggestion(info)
 
-    days = max(1, age_seconds // 86400)
-    suggestion = _build_upgrade_suggestion(info)
-    console = Console(stderr=True)
-    body = Text.assemble(
-        ("Update check", "bold yellow"),
-        " — installed build is ",
-        (f"{days}", "bold"),
-        " day(s) old.\nRun ",
-        (suggestion.command, "bold"),
-        " to update.",
+
+def _probe_installed_distribution() -> tuple[str | None, str | None]:
+    """Read the freshly-installed version and VCS commit in a subprocess.
+
+    ``omni upgrade`` swaps the on-disk install while *this* process is
+    running, but the running interpreter already imported the old
+    ``omnigent`` and cached its metadata — re-reading in-process returns the
+    *pre-upgrade* version. A fresh ``sys.executable`` subprocess loads the
+    new metadata from disk, so it reports what the upgrade actually
+    produced. This is what lets ``omni upgrade`` verify the install really
+    advanced instead of trusting the installer's exit code (a no-op upgrade
+    — pinned spec, cooldown, stale index cache, or a git ref that can't move
+    the version — exits 0 without changing anything).
+
+    The version is read via ``importlib.metadata`` (no ``omnigent`` import,
+    so it survives even a broken upgrade); the commit is read from the
+    install's PEP 610 ``direct_url.json`` by re-running this module's own
+    detector, and is empty for registry installs.
+
+    :returns: ``(version, commit_sha)`` of the now-installed distribution.
+        Either element is ``None`` when it can't be determined (subprocess
+        failure, frozen interpreter with no ``sys.executable``, or — for the
+        commit — a non-VCS install).
+    """
+    if not sys.executable:
+        return None, None
+    probe = (
+        "import importlib.metadata as m\n"
+        "try:\n"
+        "    print(m.version('omnigent'))\n"
+        "except Exception:\n"
+        "    print('')\n"
+        "try:\n"
+        "    from omnigent.update_check import _read_installed_wheel_info as r\n"
+        "    i = r()\n"
+        "    print((i.commit_sha or '') if i is not None else '')\n"
+        "except Exception:\n"
+        "    print('')\n"
     )
-    console.print(Panel(body, border_style="yellow", expand=False))
-
-    # Unknown installer → the "command" is prose, not an invocation.
-    # Don't offer to run it and don't print a skip notice — the
-    # panel's "reinstall X from your original source" line already
-    # tells the user we can't help further.
-    if not suggestion.runnable:
-        return
-
-    # Non-interactive stdin: prompting would block forever (CI,
-    # background jobs) or EOF immediately (``< /dev/null``).
-    # Surface the skip explicitly so a log reader can tell why no
-    # prompt was offered when the panel above promised an action.
-    if not _stdin_is_tty():
-        console.print("[dim]Skipped interactive upgrade prompt — stdin is not a TTY.[/dim]")
-        return
-
-    if not _prompt_yes_no(console, "Run this now?"):
-        return
-
-    exit_code = _run_upgrade_command(suggestion.command, console)
-    # Always exit — the running interpreter still has the
-    # pre-upgrade modules loaded. Continuing into the user's
-    # original command would either (a) silently run old code
-    # after a "successful" upgrade or (b) silently run old code
-    # while pretending the failed upgrade was a no-op. Both are
-    # confusing; forcing a re-invoke is the only honest path.
-    if exit_code == 0:
-        console.print(
-            "[green]Upgrade complete.[/green] Re-run your command to use the new version."
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            # A metadata lookup is sub-second; the git timeout is reused only as
+            # a generous upper bound so a wedged interpreter can't hang the CLI.
+            timeout=_GIT_TIMEOUT_SECONDS,
+            check=False,
         )
-        sys.exit(0)
-    console.print(
-        f"[red]Upgrade exited with status {exit_code}.[/red] "
-        "Re-run your command to retry (or unset the upgrade prompt)."
-    )
-    sys.exit(1)
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    if result.returncode != 0:
+        return None, None
+    lines = result.stdout.splitlines()
+    version = lines[0].strip() if lines and lines[0].strip() else None
+    commit = lines[1].strip() if len(lines) >= 2 and lines[1].strip() else None
+    return version, commit
+
+
+def _split_vcs_url(vcs_url: str) -> tuple[str, str | None]:
+    """Split a ``git+<url>[@<rev>]`` into ``(repo_url, revision)``.
+
+    Drops the ``git+`` prefix uv/pip prepend and separates a trailing
+    ``@<rev>`` (branch / tag / sha) when present. An ``@`` that is *userinfo*
+    (``git@host`` in an SSH URL) is NOT a revision: only an ``@`` after the
+    final ``/`` — i.e. past the repo path — is treated as one.
+
+    :param vcs_url: e.g. ``"git+https://host/org/repo.git@main"``.
+    :returns: ``(repo_url, revision_or_None)``, e.g.
+        ``("https://host/org/repo.git", "main")``.
+    """
+    url = vcs_url[4:] if vcs_url.startswith("git+") else vcs_url
+    # Drop a PEP 508 / pip URL fragment (``#egg=...`` / ``#subdirectory=...``).
+    # It is never part of the remote URL or the ref, and leaving it on would
+    # make ``git ls-remote`` query a nonexistent ref and silently return None.
+    url = url.split("#", 1)[0]
+    at = url.rfind("@")
+    if at > url.rfind("/"):  # '@' past the final path segment → revision suffix
+        return url[:at], (url[at + 1 :] or None)
+    return url, None
+
+
+def _remote_git_head(vcs_url: str) -> str | None:
+    """Return the remote commit a ``git+`` install's ref points at, or ``None``.
+
+    Runs ``git ls-remote`` against the bare repo URL for the install's
+    revision (or ``HEAD`` when none was pinned), so ``omni upgrade`` can tell
+    whether a git install is behind its tracked ref *before* re-pulling.
+    Best-effort with a tight timeout: any failure (offline, auth, bad URL, no
+    ``git`` binary) yields ``None`` so ``--check`` degrades to "can't
+    determine" rather than crashing.
+
+    :param vcs_url: A normalized VCS URL, e.g.
+        ``"git+https://github.com/omnigent-ai/omnigent.git"`` or
+        ``"git+https://…/omnigent.git@main"``.
+    :returns: The 40-char commit SHA the ref resolves to, or ``None``.
+    """
+    url, ref = _split_vcs_url(vcs_url)
+    if not url:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", url, ref or "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+            check=True,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    first = result.stdout.split("\n", 1)[0].strip()
+    sha = first.split("\t", 1)[0].strip() if first else ""
+    return sha or None

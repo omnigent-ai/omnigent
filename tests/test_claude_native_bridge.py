@@ -336,6 +336,59 @@ def test_prepare_bridge_dir_refuses_symlinked_ancestor(
     assert not (attacker_dir / "bridge.json").exists()
 
 
+def test_trusted_parent_accepts_qwen_native_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The relay's bridge-root allowlist accepts qwen-native bridge dirs.
+
+    The comment relay (``start_tool_relay`` → ``_ensure_secure_dir`` →
+    ``_trusted_parent_for_bridge_dir``) writes its JSON file under the
+    harness's bridge dir, validating it lives below a known bridge root.
+    qwen-native reuses this relay but keeps files under its own root
+    (``$TMPDIR/omnigent-<uid>/qwen-native``); if that root is missing from the
+    allowlist, every qwen-native session raises ``not under an allowed bridge
+    root`` and the relay never starts (observed in a live runner log). This
+    pins the qwen-native branch so the regression can't return.
+    """
+    from omnigent import qwen_native_bridge
+
+    # Distinct claude root so the qwen target can't match the claude branch
+    # first (the autouse fixture points the claude root at ``tmp_path``).
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    # qwen root mirrors production shape: <uid-scoped temp>/qwen-native.
+    qwen_root = tmp_path / "omnigent-test" / "qwen-native"
+    monkeypatch.setattr(qwen_native_bridge, "_BRIDGE_ROOT", qwen_root)
+
+    target = claude_native_bridge._absolute_syntactic_path(qwen_root / "abc123")
+    trusted = claude_native_bridge._trusted_parent_for_bridge_dir(target)
+
+    # Same anchor as cursor-native: the uid-scoped temp dir's parent.
+    assert trusted == claude_native_bridge._absolute_syntactic_path(qwen_root.parent.parent)
+
+
+def test_trusted_parent_rejects_path_outside_all_roots_and_names_qwen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A path under no known root is refused, and the error names the qwen root."""
+    from omnigent import qwen_native_bridge
+
+    # Distinct claude root so ``outside`` below isn't swept under it (the autouse
+    # fixture points the claude root at ``tmp_path``).
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    qwen_root = tmp_path / "omnigent-test" / "qwen-native"
+    monkeypatch.setattr(qwen_native_bridge, "_BRIDGE_ROOT", qwen_root)
+
+    outside = claude_native_bridge._absolute_syntactic_path(tmp_path / "somewhere-else" / "x")
+    with pytest.raises(RuntimeError, match="not under an allowed bridge root") as exc:
+        claude_native_bridge._trusted_parent_for_bridge_dir(outside)
+    assert "qwen-native" in str(exc.value)
+
+
 def test_record_hook_event_updates_transcript_state(tmp_path: Path) -> None:
     """
     Hook records expose Claude's JSONL transcript path to the executor.
@@ -516,6 +569,42 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
         "content": [{"type": "output_text", "text": "Done."}],
     }
     assert current_response_id == tool_call.response_id
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        "Prompt is too long",
+        "prompt is too long: 210000 tokens > 200000 maximum",
+        "Prompt is too long\n",
+    ],
+)
+def test_read_transcript_rewrites_prompt_too_long(tmp_path: Path, raw_text: str) -> None:
+    """
+    When Claude Code writes "Prompt is too long" to the transcript, the
+    bridge rewrites it to actionable guidance so the web UI shows
+    something useful instead of the raw API error.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "err-1",
+                "message": {"role": "assistant", "content": raw_text},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _, _, items = read_transcript_items_since(transcript_path, 0, agent_name="claude-native-ui")
+
+    assert len(items) == 1
+    text = items[0].data["content"][0]["text"]
+    assert "Context limit reached" in text
+    assert "/compact" in text
+    assert "/clear" in text
 
 
 def test_read_transcript_items_from_offset_skips_existing_prefix(
@@ -2029,6 +2118,61 @@ def test_augment_claude_args_registers_permission_command_hook(
     assert "omnigent.claude_native_status" in settings["statusLine"]["command"]
 
 
+def test_augment_claude_args_registers_user_prompt_submit_policy_hook(
+    tmp_path: Path,
+) -> None:
+    """
+    Passing ``ap_server_url`` wires the evaluate-policy hook onto
+    ``UserPromptSubmit`` alongside the transcript forwarder's status hook.
+
+    For native sessions the server-level ``_evaluate_input_policy`` skips
+    message events, so this hook is the sole REQUEST-phase gate (covering
+    both web-UI-injected and direct-terminal prompts). If it regressed,
+    native prompts would reach the model with no request-phase policy. The
+    forwarder's own UserPromptSubmit hook (status → running) must survive,
+    so the policy hook is appended, not substituted.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        ap_server_url="http://127.0.0.1:8787/",
+        ap_auth_headers={"Authorization": "Bearer xyz"},
+    )
+    settings = json.loads(args[args.index("--settings") + 1])
+    entries = settings["hooks"]["UserPromptSubmit"]
+    commands = [h["command"] for entry in entries for h in entry["hooks"]]
+    # The forwarder status hook stays; the policy hook is appended.
+    assert any("evaluate-policy" in command for command in commands), (
+        f"UserPromptSubmit must carry the evaluate-policy hook; got {commands!r}."
+    )
+    assert any("evaluate-policy" not in command for command in commands), (
+        "The transcript forwarder's UserPromptSubmit hook must not be replaced."
+    )
+
+
+def test_augment_claude_args_omits_user_prompt_submit_policy_hook_without_server(
+    tmp_path: Path,
+) -> None:
+    """
+    Without ``ap_server_url`` the UserPromptSubmit policy hook is not wired.
+
+    Policy hooks only make sense when an Omnigent server is configured to
+    evaluate against; the forwarder's status hook still registers, but no
+    evaluate-policy command should appear (mirrors PreToolUse/PostToolUse,
+    which are also gated behind ``ap_server_url``).
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+    settings = json.loads(args[args.index("--settings") + 1])
+    entries = settings["hooks"]["UserPromptSubmit"]
+    commands = [h["command"] for entry in entries for h in entry["hooks"]]
+    assert all("evaluate-policy" not in command for command in commands)
+
+
 def test_augment_claude_args_keeps_permission_hook_without_launch_session_id(
     tmp_path: Path,
 ) -> None:
@@ -3385,6 +3529,124 @@ async def test_start_tool_relay_accepts_codex_native_bridge_root(
 
 
 @pytest.mark.asyncio
+async def test_start_tool_relay_accepts_antigravity_native_bridge_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Relay startup accepts Antigravity-native's persistent bridge root (#1194).
+
+    Antigravity-native reuses the Claude MCP relay but stores bridge files in
+    ``~/.omnigent/antigravity-native`` (the same ``$HOME/.omnigent/<harness>``
+    shape codex uses). A regression in :func:`_trusted_parent_for_bridge_dir`
+    would reject the bridge dir, the relay would fail to write
+    ``tool_relay.json``, and the wrapped agy would get no ``sys_*`` tools.
+
+    :param tmp_path: Pytest temp directory used as an isolated user
+        state parent.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent import antigravity_native_bridge
+
+    antigravity_root = tmp_path / ".omnigent" / "antigravity-native"
+    monkeypatch.setattr("omnigent.antigravity_native_bridge._BRIDGE_ROOT", antigravity_root)
+    bridge_dir = antigravity_native_bridge.prepare_bridge_dir("conv_agy")
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+
+    async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """
+        Return an empty result for the unused relay tool callback.
+
+        :param name: Tool name, e.g. ``"sys_session_list"``.
+        :param arguments: Tool arguments.
+        :returns: Empty tool result.
+        """
+        del name, arguments
+        return {}
+
+    relay = None
+    try:
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[
+                {
+                    "name": "sys_session_create",
+                    "description": "Spawn an Omnigent sub-agent session.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_executor=_executor,
+            loop=asyncio.get_running_loop(),
+        )
+
+        assert relay_file.exists(), (
+            "Antigravity-native relay did not write tool_relay.json under the "
+            "persistent bridge root"
+        )
+        relay_info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert relay_info["tools"][0]["name"] == "sys_session_create"
+    finally:
+        if relay is not None:
+            relay.close()
+
+
+@pytest.mark.asyncio
+async def test_start_tool_relay_accepts_opencode_native_bridge_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Relay startup accepts OpenCode-native's persistent bridge root.
+
+    opencode-native reuses the Claude MCP relay but stores bridge files in
+    ``~/.omnigent/opencode-native`` (the same ``$HOME/.omnigent/<harness>``
+    shape codex/antigravity use). The missing allowlist entry made ``serve-mcp``
+    crash on startup (``_ensure_secure_dir`` → "not under an allowed bridge
+    root"), which opencode surfaced as ``MCP error -32000: Connection closed``
+    and the wrapped opencode got no ``sys_*`` tools. Guards the regression.
+
+    :param tmp_path: Pytest temp directory used as an isolated user state parent.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent import opencode_native_bridge
+
+    opencode_root = tmp_path / ".omnigent" / "opencode-native"
+    monkeypatch.setattr("omnigent.opencode_native_bridge._BRIDGE_ROOT", opencode_root)
+    bridge_dir = opencode_native_bridge.prepare_bridge_dir("conv_oc")
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+
+    async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """Return an empty result for the unused relay tool callback."""
+        del name, arguments
+        return {}
+
+    relay = None
+    try:
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[
+                {
+                    "name": "sys_session_list",
+                    "description": "List Omnigent sessions.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_executor=_executor,
+            loop=asyncio.get_running_loop(),
+        )
+        assert relay_file.exists(), (
+            "OpenCode-native relay did not write tool_relay.json under the persistent bridge root"
+        )
+        relay_info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert relay_info["tools"][0]["name"] == "sys_session_list"
+    finally:
+        if relay is not None:
+            relay.close()
+
+
+@pytest.mark.asyncio
 async def test_relay_close_keeps_advertisement_owned_by_newer_relay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3509,7 +3771,7 @@ def test_usage_from_transcript_entry_sums_context_tokens() -> None:
     """
     Context-token count must sum the three input-side fields.
 
-    The "context tokens" exposed to ap-web's input-composer ring is
+    The "context tokens" exposed to web's input-composer ring is
     ``input_tokens + cache_creation_input_tokens +
     cache_read_input_tokens``. ``output_tokens`` is generated within
     the same call and does NOT count toward the next prompt's size,
@@ -4833,3 +5095,77 @@ def test_compute_transcript_cumulative_cost_none_when_nothing_priceable(
         claude_native_bridge.compute_transcript_cumulative_cost(priced, include_sidechains=True)
         is None
     )
+
+
+def test_format_terminal_failure_tail_returns_empty_for_blank_pane() -> None:
+    """
+    A pane with no visible text yields no tail block.
+
+    :returns: None.
+    """
+    assert claude_native_bridge._format_terminal_failure_tail("   \n\n  ") == ""
+
+
+def test_format_terminal_failure_tail_includes_recent_error_lines() -> None:
+    """
+    The tail block carries the pane's trailing non-blank lines, so a
+    startup crash surfaces in the readiness-timeout error.
+
+    :returns: None.
+    """
+    pane = "ERROR  JSON Parse error: Unrecognized token '<'\n  at <parse> (:0)\n"
+    tail = claude_native_bridge._format_terminal_failure_tail(pane)
+    assert tail.startswith(" Last terminal output:\n")
+    assert "JSON Parse error: Unrecognized token '<'" in tail
+
+
+def test_format_terminal_failure_tail_caps_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A very long pane is truncated to the configured character cap.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TERMINAL_FAILURE_TAIL_CHARS", 50)
+    pane = "\n".join(f"line {i}" for i in range(100))
+    tail = claude_native_bridge._format_terminal_failure_tail(pane)
+    body = tail.split("\n", 1)[1]
+    assert body.startswith("…")
+    # Leading ellipsis marker plus at most the configured character cap.
+    assert len(body) <= 51
+
+
+def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    On a readiness timeout, the RuntimeError carries Claude Code's own
+    terminal output (e.g. a startup ``JSON Parse error``) so the cause
+    surfaces in the web UI error banner, not only in the terminal.
+
+    Without the tail, the user sees a generic "terminal did not become
+    ready" timeout in the UI while the actual crash sits unread in the
+    terminal pane.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    crash_pane = (
+        "ERROR  JSON Parse error: Unrecognized token '<'\n"
+        "  at <parse> (:0)\n"
+        "  at parse (unknown)\n"
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._capture_pane",
+        lambda socket_path, tmux_target: crash_pane,
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    message = str(excinfo.value)
+    assert "did not become ready" in message
+    assert "Last terminal output:" in message
+    assert "JSON Parse error: Unrecognized token '<'" in message

@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
+from omnigent import native_policy_hook
 from omnigent.native_policy_hook import (
+    _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
+    fail_closed_hook_output,
     hook_payload_to_evaluation_request,
+    post_evaluate_with_retry,
 )
 
 
@@ -60,11 +65,11 @@ def test_post_tool_use_maps_to_phase_tool_result() -> None:
 
 
 @pytest.mark.parametrize("hook_event", ["PreToolUse", "PostToolUse"])
-def test_mcp_tools_are_skipped(hook_event: str) -> None:
+def test_omnigent_mcp_tools_are_skipped(hook_event: str) -> None:
     """
-    MCP tools (``mcp__*``) return None and are never sent to /policies/evaluate.
+    Omnigent MCP tools return None and are never sent to /policies/evaluate.
 
-    MCP tool calls are already policy-checked by the relay path
+    Omnigent MCP tool calls are already policy-checked by the relay path
     (ProxyMcpManager → Omnigent /mcp endpoint → _evaluate_tool_call_policy).
     If this guard regressed, every MCP tool call would be evaluated
     twice — once via the relay, once via this hook.
@@ -75,6 +80,41 @@ def test_mcp_tools_are_skipped(hook_event: str) -> None:
     )
     # None signals the caller to skip the POST entirely.
     assert result is None
+
+
+@pytest.mark.parametrize(
+    "hook_event,expected_type",
+    [("PreToolUse", "PHASE_TOOL_CALL"), ("PostToolUse", "PHASE_TOOL_RESULT")],
+)
+def test_connector_native_mcp_tools_are_evaluated(hook_event: str, expected_type: str) -> None:
+    """
+    Connector-native MCP tools must not be skipped by the native pre-call hook.
+
+    Tools such as ``mcp__github__*`` are injected by the connector layer and
+    do not round-trip through Omnigent's MCP proxy, so this hook is their
+    TOOL_CALL/TOOL_RESULT policy enforcement site.
+    """
+    result = hook_payload_to_evaluation_request(
+        hook_event,
+        {
+            "tool_name": "mcp__github__create_issue",
+            "tool_input": {"title": "blocked?"},
+            "tool_output": "created",
+        },
+    )
+    assert result is not None
+    event = result["event"]
+    assert event["type"] == expected_type
+    if hook_event == "PreToolUse":
+        assert event["data"] == {
+            "name": "mcp__github__create_issue",
+            "arguments": {"title": "blocked?"},
+        }
+    else:
+        assert event["request_data"] == {
+            "name": "mcp__github__create_issue",
+            "arguments": {"title": "blocked?"},
+        }
 
 
 def test_unknown_hook_event_returns_none() -> None:
@@ -195,3 +235,296 @@ def test_post_tool_use_allow_returns_none() -> None:
     """
     output = evaluation_response_to_hook_output("PostToolUse", {"result": "POLICY_ACTION_ALLOW"})
     assert output is None
+
+
+def test_user_prompt_submit_maps_to_phase_request() -> None:
+    """
+    A UserPromptSubmit payload becomes a PHASE_REQUEST EvaluationRequest.
+
+    The prompt text must land in ``event.data.text`` because the server's
+    ``_build_evaluation_context`` reads REQUEST content from ``data.text``
+    (falling back to ``data.content``). If the prompt were dropped, the
+    request-phase gate would evaluate empty content and ALLOW everything.
+    """
+    result = hook_payload_to_evaluation_request(
+        "UserPromptSubmit",
+        {"prompt": "delete the prod database"},
+    )
+    assert result is not None
+    event = result["event"]
+    assert event["type"] == "PHASE_REQUEST"
+    assert event["data"] == {"text": "delete the prod database"}
+    # A context dict must exist so the per-harness hook can stamp model/harness.
+    assert event["context"] == {}
+
+
+def test_user_prompt_submit_missing_prompt_yields_empty_text() -> None:
+    """
+    A UserPromptSubmit payload with no ``prompt`` still produces a request.
+
+    The text falls back to an empty string rather than ``None`` so the
+    server always receives a well-formed REQUEST event.
+    """
+    result = hook_payload_to_evaluation_request("UserPromptSubmit", {})
+    assert result is not None
+    assert result["event"]["data"] == {"text": ""}
+
+
+@pytest.mark.parametrize("action", ["POLICY_ACTION_DENY", "POLICY_ACTION_ASK"])
+def test_user_prompt_submit_blocking_actions_emit_decision_block(action: str) -> None:
+    """
+    DENY (and a stray ASK) block the prompt via top-level ``decision``.
+
+    UserPromptSubmit uses the top-level ``decision`` / ``reason`` contract
+    (NOT ``permissionDecision``) — both harnesses parse ``decision: "block"``
+    to drop the prompt before the model sees it. ASK is meant to be resolved
+    server-side (``_hold_native_ask_gate``), so if the hook ever sees it, it
+    must fail closed by blocking rather than letting the prompt through.
+    """
+    output = evaluation_response_to_hook_output(
+        "UserPromptSubmit",
+        {"result": action, "reason": "no prod mutations"},
+    )
+    assert output is not None
+    # Top-level decision/reason, not hookSpecificOutput.permissionDecision.
+    assert output == {"decision": "block", "reason": "no prod mutations"}
+
+
+def test_user_prompt_submit_block_defaults_reason() -> None:
+    """
+    A block with no reason still carries a non-empty reason.
+
+    Both harnesses drop a block whose reason is empty (the block is treated
+    as invalid), so a missing reason must be defaulted or the gate would
+    silently fail open.
+    """
+    output = evaluation_response_to_hook_output(
+        "UserPromptSubmit", {"result": "POLICY_ACTION_DENY"}
+    )
+    assert output == {"decision": "block", "reason": "Denied by policy"}
+
+
+@pytest.mark.parametrize("action", ["POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"])
+def test_user_prompt_submit_non_blocking_actions_return_none(action: str) -> None:
+    """
+    ALLOW and the no-match default proceed with no output.
+
+    Returning None lets the prompt reach the model. Unlike PreToolUse there
+    is no separate user-consent gate on a prompt to preserve, so ALLOW need
+    not emit anything.
+    """
+    output = evaluation_response_to_hook_output("UserPromptSubmit", {"result": action})
+    assert output is None
+
+
+def test_fail_closed_pre_tool_use_denies() -> None:
+    """
+    An unobtainable verdict on PreToolUse fails CLOSED with ``deny``.
+
+    PreToolUse is the authoritative pre-execution gate for native tools —
+    the sole enforcement point for connector-native ``mcp__*`` tools and
+    native Bash/Write/Edit — so a verdict that cannot be fetched must deny
+    rather than silently let the call through (issue #536).
+    """
+    output = fail_closed_hook_output("PreToolUse")
+    assert output is not None
+    hook_specific = output["hookSpecificOutput"]
+    assert hook_specific["hookEventName"] == "PreToolUse"
+    assert hook_specific["permissionDecision"] == "deny"
+    # A deny is inert without a reason on the consuming harnesses, so one
+    # must always be present.
+    assert hook_specific["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("hook_event", ["UserPromptSubmit", "PostToolUse"])
+def test_fail_closed_non_tool_call_phases_fail_open(hook_event: str) -> None:
+    """
+    Off the tool-call gate, an unobtainable verdict fails OPEN (``None``).
+
+    The request gate is advisory (the tool-call gate still catches
+    dangerous actions) and PostToolUse runs after the tool has executed, so
+    denying there only blocks an already-incurred side effect. This mirrors
+    the runner-side ``FAIL_CLOSED_PHASES`` (PR #163).
+    """
+    assert fail_closed_hook_output(hook_event) is None
+
+
+def test_fail_closed_unknown_event_fails_open() -> None:
+    """
+    An unrecognized hook event fails OPEN (``None``), not closed.
+
+    Only the exact ``PreToolUse`` event denies; any novel event name added
+    by a future harness must fall through to "no opinion" rather than
+    accidentally blocking — the conservative default for an unknown gate.
+    """
+    assert fail_closed_hook_output("SomeNewEvent") is None
+
+
+def _resp(status: int, location: str | None = None) -> httpx.Response:
+    """Build a fake response for re-auth classification tests."""
+    headers = {"Location": location} if location else {}
+    return httpx.Response(status, headers=headers, request=httpx.Request("POST", "https://ap/x"))
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (_resp(401), True),
+        (_resp(302, "https://w.example.com/oidc/oauth2/v2.0/authorize"), True),
+        (_resp(302, "https://omnigents.example.databricksapps.com/.auth/callback"), True),
+        # Unrelated redirect / success must NOT trigger a wasted token round-trip.
+        (_resp(302, "https://w.example.com/some/other/page"), False),
+        (_resp(302, None), False),
+        (_resp(200), False),
+        (_resp(503), False),
+    ],
+)
+def test_is_login_redirect_or_unauthorized_classifies_reauth_signals(
+    response: httpx.Response, expected: bool
+) -> None:
+    """
+    401 and an Apps OAuth-login 302 are re-auth signals; nothing else is.
+
+    The Databricks Apps front door bounces an *expired* bearer with a
+    ``302 → /oidc/`` (or ``/.auth/``), NOT a ``401`` — so a hook that only
+    checked ``401`` silently failed closed once the one-shot token lapsed.
+    This is the classifier that lets the hook re-mint instead.
+    """
+    assert _is_login_redirect_or_unauthorized(response) is expected
+
+
+def _make_redirect_then_ok_client(
+    seen_headers: list[dict[str, str]],
+    *,
+    redirect: httpx.Response,
+    ok: httpx.Response,
+) -> type:
+    """Build an httpx.Client stub: redirect on attempt 1, ``ok`` thereafter."""
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del timeout
+            self._headers = headers
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del url, json
+            seen_headers.append(dict(self._headers))
+            return redirect if len(seen_headers) == 1 else ok
+
+    return _Client
+
+
+def test_post_evaluate_with_retry_reauths_on_login_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 302→/oidc/ re-mints the bearer and retries, returning the real verdict.
+
+    Regression guard for the production bug where an "old" native session
+    (token past the ~1h Databricks OAuth lifetime) failed CLOSED on every tool
+    call. The first attempt carries the lapsed token (302), the retry carries
+    the fresh token and gets the ALLOW verdict — exactly as the runner's
+    refresh-capable ``_RunnerDatabricksAuth`` does for its own callbacks.
+    """
+    seen_headers: list[dict[str, str]] = []
+    redirect = httpx.Response(
+        302,
+        headers={"Location": "https://w.example.com/oidc/oauth2/v2.0/authorize"},
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    ok = httpx.Response(
+        200,
+        text='{"result":"POLICY_ACTION_ALLOW"}',
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_redirect_then_ok_client(seen_headers, redirect=redirect, ok=ok),
+    )
+    reauth_calls: list[int] = []
+
+    def _reauth() -> dict[str, str]:
+        reauth_calls.append(1)
+        return {"Authorization": "Bearer fresh", "X-Databricks-Org-Id": "o1"}
+
+    resp = post_evaluate_with_retry(
+        "https://ap/x",
+        {"Authorization": "Bearer stale"},
+        {"event": {}},
+        5.0,
+        "evaluate-policy hook",
+        reauth=_reauth,
+    )
+
+    assert resp is ok
+    assert reauth_calls == [1]  # re-minted exactly once
+    assert seen_headers[0]["Authorization"] == "Bearer stale"  # first attempt: lapsed token
+    assert seen_headers[1]["Authorization"] == "Bearer fresh"  # retry: fresh token
+
+
+def test_post_evaluate_with_retry_no_reauth_fails_on_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With no ``reauth`` callable, a login-redirect yields ``None`` (legacy).
+
+    Callers without a token source (e.g. codex/kimi today) see the same
+    behavior as before this change: ``raise_for_status`` rejects the 302 as a
+    non-retryable <500, the helper returns ``None``, and the caller fails
+    closed. Guards against the new branch altering that.
+    """
+    seen_headers: list[dict[str, str]] = []
+    redirect = httpx.Response(
+        302,
+        headers={"Location": "https://w.example.com/oidc/x"},
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_redirect_then_ok_client(seen_headers, redirect=redirect, ok=redirect),
+    )
+    resp = post_evaluate_with_retry("https://ap/x", {}, {"event": {}}, 5.0, "evaluate-policy hook")
+    assert resp is None
+    assert len(seen_headers) == 1  # one attempt; a 302 is not retried without reauth
+
+
+def test_post_evaluate_with_retry_reauth_unavailable_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When re-mint yields no token, the helper returns ``None`` (caller fails closed).
+
+    Re-auth is best-effort: a ``reauth`` that returns ``None`` (no creds /
+    transient mint failure) must not loop — it falls through to
+    ``raise_for_status`` (302 → non-retryable) so the caller keeps the
+    fail-closed safety net.
+    """
+    seen_headers: list[dict[str, str]] = []
+    redirect = httpx.Response(
+        302,
+        headers={"Location": "https://w.example.com/oidc/x"},
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_redirect_then_ok_client(seen_headers, redirect=redirect, ok=redirect),
+    )
+    resp = post_evaluate_with_retry(
+        "https://ap/x",
+        {"Authorization": "Bearer stale"},
+        {"event": {}},
+        5.0,
+        "evaluate-policy hook",
+        reauth=lambda: None,
+    )
+    assert resp is None
+    assert len(seen_headers) == 1  # one attempt only; no retry loop

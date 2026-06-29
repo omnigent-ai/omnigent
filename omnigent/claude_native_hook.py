@@ -7,6 +7,7 @@ import json
 import secrets
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from omnigent.claude_native_bridge import (
     read_active_session_id,
     read_bridge_id,
     read_claude_session_id,
+    read_claude_status_model,
     read_permission_hook_config,
     read_seen_claude_session_ids,
     record_hook_event,
@@ -27,8 +29,11 @@ from omnigent.claude_native_bridge import (
 )
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.native_policy_hook import (
+    _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
+    fail_closed_hook_output,
     hook_payload_to_evaluation_request,
+    post_evaluate_with_retry,
 )
 
 # Client-side budget for the permission-request long-poll to AP. Held
@@ -391,7 +396,15 @@ def _create_clear_replacement_session(
     write_active_session_id(bridge_dir, new_session_id)
     clear_resp = client.patch(
         f"{ap_server_url}/v1/sessions/{url_component(old_session_id)}",
-        json={"runner_id": ""},
+        json={
+            "runner_id": "",
+            # Re-key the superseded session onto a DISTINCT "-cleared" bridge id
+            # so its later resume gets its own isolated dir instead of the new
+            # session's live one (which would double-mirror the transcript and
+            # trip the executor guard). Mirrors the async forwarder rotation;
+            # ``_auto_create_claude_terminal`` recognises this marker.
+            "labels": {BRIDGE_ID_LABEL_KEY: f"{old_session_id}-cleared"},
+        },
     )
     if clear_resp.status_code >= 400:
         print(
@@ -494,8 +507,59 @@ def _conversation_url_for_active_session(
     ap_server_url = config.get("ap_server_url")
     session_id = read_active_session_id(bridge_dir)
     if isinstance(ap_server_url, str) and ap_server_url and session_id:
-        return f"{ap_server_url.rstrip('/')}/c/{url_component(session_id)}"
+        # ``ap_server_url`` is the API base; route through the shared
+        # builder so workspace-hosted servers land on the ``/omnigent``
+        # SPA mount (with ``?o=<org>``) rather than the JSON API mount.
+        from omnigent.conversation_browser import conversation_url
+
+        return conversation_url(ap_server_url, session_id)
     return fallback_url
+
+
+def _build_reauth(
+    ap_server_url: str, headers: dict[str, str]
+) -> Callable[[], dict[str, str] | None]:
+    """
+    Build a callable that re-mints the Omnigent bearer for ``ap_server_url``.
+
+    The native hooks authenticate with a one-shot ``ap_auth_headers`` snapshot
+    written into ``permission_hook.json`` at launch (``build_hook_settings``),
+    which dies with the ~1h Databricks OAuth token lifetime. When the Apps front
+    door later bounces a hook POST to its OAuth login flow (302→``/oidc/``) or
+    returns ``401``, this callable re-mints a fresh bearer through the SAME
+    factory the runner's refresh-capable ``_RunnerDatabricksAuth`` uses
+    (:func:`omnigent.runner._entry._make_auth_token_factory`), preserving the
+    other headers (e.g. the ``X-Databricks-Org-Id`` workspace-routing header)
+    so neither half is dropped. Best-effort: returns ``None`` when no refresh
+    mechanism is available (local unauthenticated servers, import failure, or a
+    transient mint failure), letting the caller fail closed.
+
+    :param ap_server_url: Omnigent server base URL the hook POSTs to — also the
+        key the token factory uses to resolve the stored OIDC token.
+    :param headers: The current (lapsed) outbound headers; the fresh bearer is
+        merged over a copy so routing headers survive.
+    :returns: A zero-arg callable returning fresh headers, or ``None``.
+    """
+
+    def _reauth() -> dict[str, str] | None:
+        # Lazy import: only paid on the rare re-auth path, keeping the
+        # per-tool-call hot path free of the runner/databricks-SDK import.
+        try:
+            from omnigent.runner._entry import _make_auth_token_factory
+        except Exception:  # noqa: BLE001 — re-auth is best-effort; fail closed if unavailable
+            return None
+        factory = _make_auth_token_factory(ap_server_url)
+        if factory is None:
+            return None
+        try:
+            token = factory()
+        except Exception:  # noqa: BLE001 — transient SDK/refresh failure; fail closed
+            return None
+        if not token:
+            return None
+        return {**headers, "Authorization": f"Bearer {token}"}
+
+    return _reauth
 
 
 def _post_hook_with_reattach(
@@ -503,6 +567,7 @@ def _post_hook_with_reattach(
     headers: dict[str, str],
     payload: dict[str, Any],
     hook_label: str,
+    reauth: Callable[[], dict[str, str] | None] | None = None,
 ) -> httpx.Response | None:
     """
     POST one permission-style hook payload, surviving severed long-polls.
@@ -522,6 +587,11 @@ def _post_hook_with_reattach(
         rides on a copy.
     :param hook_label: Diagnostic prefix for stderr lines, e.g.
         ``"permission"`` or ``"ask-user-question"``.
+    :param reauth: Optional callable that re-mints fresh auth headers when the
+        server bounces the POST to its OAuth login flow (Apps 302→``/oidc/``)
+        or returns ``401`` — i.e. the one-shot ``ap_auth_headers`` token lapsed.
+        Called at most once; new headers trigger an immediate retry with them.
+        ``None`` keeps the legacy behavior.
     :returns: The successful (2xx) response, or ``None`` when rejected
         or out of budget — callers fail-ask as before.
     """
@@ -532,10 +602,30 @@ def _post_hook_with_reattach(
     deadline = time.monotonic() + _PERMISSION_TIMEOUT_S
     backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
     timeout = httpx.Timeout(_PERMISSION_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
+    reauthed = False
     while True:
         try:
             with httpx.Client(headers=headers, timeout=timeout) as client:
                 resp = client.post(url, json=body)
+                if (
+                    reauth is not None
+                    and not reauthed
+                    and _is_login_redirect_or_unauthorized(resp)
+                ):
+                    # One-shot ``ap_auth_headers`` token lapsed (~1h OAuth
+                    # lifetime): re-mint and retry once rather than fail-asking
+                    # into a terminal prompt no one watches. Mirrors the
+                    # evaluate-policy hook and ``_RunnerDatabricksAuth``.
+                    refreshed = reauth()
+                    if refreshed:
+                        headers = refreshed
+                        reauthed = True
+                        print(
+                            f"omnigent {hook_label} hook: Omnigent auth expired "
+                            "(login redirect/401); re-minted token and retrying",
+                            file=sys.stderr,
+                        )
+                        continue
                 resp.raise_for_status()
                 return resp
         except httpx.HTTPStatusError as exc:
@@ -604,7 +694,9 @@ def _main_permission_request(argv: list[str]) -> int:
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{url_component(session_id)}/hooks/permission-request"
     )
-    resp = _post_hook_with_reattach(url, headers, payload, "claude permission")
+    resp = _post_hook_with_reattach(
+        url, headers, payload, "claude permission", reauth=_build_reauth(ap_server_url, headers)
+    )
     if resp is None:
         return 0
     if resp.content:
@@ -670,7 +762,9 @@ def _main_ask_user_question(argv: list[str]) -> int:
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{url_component(session_id)}/hooks/permission-request"
     )
-    resp = _post_hook_with_reattach(url, headers, payload, "ask-user-question")
+    resp = _post_hook_with_reattach(
+        url, headers, payload, "ask-user-question", reauth=_build_reauth(ap_server_url, headers)
+    )
     if resp is None or not resp.content:
         return 0
     # The Omnigent server returns a PermissionRequest-shaped response:
@@ -708,30 +802,49 @@ def _main_ask_user_question(argv: list[str]) -> int:
 
 def _main_evaluate_policy(argv: list[str]) -> int:
     """
-    Evaluate a Claude Code ``PreToolUse`` or ``PostToolUse`` hook against Omnigent policies.
+    Evaluate a Claude Code ``PreToolUse`` / ``PostToolUse`` /
+    ``UserPromptSubmit`` hook against Omnigent policies.
 
     Reads the hook JSON payload from stdin, converts it into the
     proto-compatible ``EvaluationRequest`` schema (``PHASE_TOOL_CALL``
-    for PreToolUse, ``PHASE_TOOL_RESULT`` for PostToolUse), POSTs to
+    for PreToolUse, ``PHASE_TOOL_RESULT`` for PostToolUse,
+    ``PHASE_REQUEST`` for UserPromptSubmit), POSTs to
     ``/v1/sessions/{id}/policies/evaluate``, and converts the
     ``EvaluationResponse`` back into Claude Code's hook output format.
 
-    For ``PreToolUse``, only constraining verdicts map to a
-    ``permissionDecision``: ``POLICY_ACTION_DENY`` → ``"deny"`` and
-    ``POLICY_ACTION_ASK`` → ``"defer"`` (falls through to the
-    ``PermissionRequest`` hook for interactive approval).
-    ``POLICY_ACTION_ALLOW`` (the engine's default when no policy matches)
-    emits no output — "no opinion" — so Claude's own permission prompt
-    still fires and the ``PermissionRequest`` hook can route it to the
-    web UI. See :func:`omnigent.native_policy_hook.evaluation_response_to_hook_output`.
+    For ``PreToolUse``, only the constraining ``POLICY_ACTION_DENY``
+    verdict maps to a ``permissionDecision`` (``"deny"``); ASK is
+    resolved server-side (the endpoint parks via ``_hold_native_ask_gate``
+    and returns a hard ALLOW/DENY). ``POLICY_ACTION_ALLOW`` (the engine's
+    default when no policy matches) emits no output — "no opinion" — so
+    Claude's own permission prompt still fires and the
+    ``PermissionRequest`` hook can route it to the web UI. See
+    :func:`omnigent.native_policy_hook.evaluation_response_to_hook_output`.
+
+    For ``UserPromptSubmit``, this is the request-phase gate for native
+    sessions (the server-level ``_evaluate_input_policy`` skips native
+    message events). A DENY emits top-level ``decision: "block"``, which
+    drops the prompt before the model sees it; ASK is resolved
+    server-side; ALLOW proceeds with no output.
 
     For ``PostToolUse``, policy denials are surfaced as
     ``additionalContext`` (Claude sees the warning but the tool result
     is already committed — PostToolUse hooks are observational).
 
-    On transport failures the hook returns exit 0 with no output,
-    which Claude Code treats as "no opinion". Fail-open design
-    ensures a network blip doesn't block every tool call.
+    Failure handling is phase-aware (mirroring the runner-side default
+    from PR #163). Once the session is known to be governed (an active
+    session id and a configured ``ap_server_url``) and the round-trip to
+    ``/policies/evaluate`` cannot yield a usable verdict — the server is
+    unreachable, returns non-2xx, or returns an empty / malformed body —
+    a ``PreToolUse`` (``PHASE_TOOL_CALL``) call fails CLOSED with a
+    ``deny`` (this hook is the sole enforcement point for native tools, so
+    a transient outage must not silently let a gated call through), while
+    ``UserPromptSubmit`` and ``PostToolUse`` fail OPEN. Pre-evaluation
+    conditions that mean the session simply is not governed — no active
+    session, no ``ap_server_url``, an unparseable hook payload, or an
+    ``mcp__omnigent__*`` tool already gated on the relay path — still
+    return exit 0 with no output ("no opinion") so non-Omnigent tool
+    calls are never blocked.
 
     :param argv: CLI argv after the ``evaluate-policy`` subcommand,
         e.g. ``["--bridge-dir", "/tmp/x"]``.
@@ -767,23 +880,54 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         # Unrecognized hook event — no policy to evaluate.
         return 0
 
+    # Stamp the live model from this session's statusLine capture (the
+    # statusLine wrapper writes the active model id into ``context.json`` on
+    # every render — including right after an in-pane ``/model`` switch). This
+    # is the cost gate's source of truth at hook time, race-free, unlike the
+    # forwarder's async ``model_override`` mirror which lags a poll behind.
+    # Without it the cost-budget gate can see an unresolved model (None) and
+    # fail closed — blocking a cheap-model (sonnet/haiku) session over budget,
+    # even though only expensive tiers should be gated (the server prefers a
+    # stamped model over its own resolution; see ``PolicyEngine._inject_model``).
+    # hook_payload_to_evaluation_request always returns an event with a
+    # "context" dict, so index it directly (fail loud if that contract changes).
+    context = eval_request["event"]["context"]
+    # Stamp the harness so the over-budget message names claude-native's
+    # model-switch surface (the in-pane ``/model`` picker).
+    context["harness"] = "claude-native"
+    status_model = read_claude_status_model(bridge_dir)
+    if status_model:
+        context["model"] = status_model
+
+    # The session is governed (active id + ap_server_url) and we have a
+    # policy-relevant event: from here a failure to obtain a usable verdict
+    # fails CLOSED for the tool-call gate (see ``fail_closed_hook_output``).
+    def _fail_closed() -> int:
+        out = fail_closed_hook_output(hook_event)
+        if out is not None:
+            sys.stdout.write(json.dumps(out))
+        return 0
+
     url = f"{ap_server_url.rstrip('/')}/v1/sessions/{url_component(session_id)}/policies/evaluate"
-    try:
-        with httpx.Client(
-            headers=headers, timeout=httpx.Timeout(_EVALUATE_POLICY_TIMEOUT_S)
-        ) as client:
-            resp = client.post(url, json=eval_request)
-            resp.raise_for_status()
-    except httpx.HTTPError as exc:
-        print(f"omnigent evaluate-policy hook: Omnigent request failed: {exc}", file=sys.stderr)
-        return 0
+    resp = post_evaluate_with_retry(
+        url,
+        headers,
+        eval_request,
+        _EVALUATE_POLICY_TIMEOUT_S,
+        "evaluate-policy hook",
+        reauth=_build_reauth(ap_server_url, headers),
+    )
+    if resp is None:
+        return _fail_closed()
     if not resp.content:
-        return 0
+        print("omnigent evaluate-policy hook: empty Omnigent response", file=sys.stderr)
+        return _fail_closed()
 
     try:
         eval_response = resp.json()
     except json.JSONDecodeError:
-        return 0
+        print("omnigent evaluate-policy hook: malformed Omnigent response", file=sys.stderr)
+        return _fail_closed()
 
     hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
     if hook_output is not None:

@@ -1,0 +1,235 @@
+name: UI Snapshot
+
+# Visual-regression gate for the committed UI snapshots
+# (tests/e2e_ui/visual/test_*_snapshot.py -- the empty "/" landing, a mocked
+# chat conversation, etc.).
+#
+# Cross-OS rendering note: screenshots differ across rendering environments
+# (font rasterizer + hinting + anti-aliasing), so the committed baseline and the
+# PR comparison MUST be produced by the same renderer. This job renders INSIDE a
+# digest-pinned Playwright image (mcr.microsoft.com/playwright/python) -- the
+# exact same image the local regen script uses
+# (tests/e2e_ui/visual/regen_baseline_docker.sh), so a baseline regenerated
+# locally matches this gate byte-for-byte. The test only renders the SPA, so it
+# needs no LLM credentials and none of the heavy native-CLI setup the main
+# e2e-ui suite uses.
+#
+# Every run (pass or fail) uploads the rendered screenshots as the single
+# `ui-snapshot-<run_id>` artifact (baseline + current + diff PNGs) and links it
+# in the job summary, so they are always one click away.
+#
+# Triggers:
+#   pull_request       compare the rendered pages against the committed
+#                      baselines; fail (with actual/expected/diff PNGs in the
+#                      artifact) on any mismatch. No secrets, so fork PRs run
+#                      fine. The render job is gated on the `detect` job (below):
+#                      a PR that touches none of the render inputs (web, the
+#                      visual tests + fixtures, the pinned toolchain) SKIPS the
+#                      render. We gate at the job (not via `on: paths:`) on
+#                      purpose -- a job skipped by `if` reports SUCCESS, so this
+#                      stays safe to register as a required check, whereas a
+#                      path-filtered *workflow* would sit "pending" and block.
+#   workflow_dispatch  regenerate the baselines with --update-snapshots in the
+#                      same pinned image; the regenerated PNGs are in the
+#                      `ui-snapshot-<run_id>` artifact to download and commit.
+#                      Any collaborator may run this against an arbitrary `ref`;
+#                      the PNGs are human-reviewed before they land, so an
+#                      unreviewed ref can't change a baseline on its own.
+#
+# All baseline-update paths are documented in tests/e2e_ui/visual/README.md
+# (label the PR for same-repo branches, the local Docker script for forks).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/ref to regenerate the baseline against"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: read  # detect: list the PR's changed files
+
+concurrency:
+  group: ui-snapshot-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # No SPA build during `uv sync`: this workflow builds the bundle in a
+  # dedicated step (mirrors e2e-ui.yml), so the setup.py build would be redundant.
+  OMNIGENT_SKIP_WEB_UI: "true"
+  # The pinned image runs as root, where Chromium needs --no-sandbox; the
+  # e2e_ui conftest adds it (+ --disable-dev-shm-usage) when this is set.
+  OMNIGENT_PW_NO_SANDBOX: "1"
+  # Use the image's Python 3.12 (matches .python-version) instead of letting uv
+  # download its own -- no setup-python step needed inside the container.
+  UV_PYTHON_PREFERENCE: only-system
+
+jobs:
+  # Cheap pre-flight (no container/build): does this PR touch anything that can
+  # change the render? The heavy job below is `if`-gated on it, so non-UI PRs
+  # skip the render (no wasted CI, no flaking against unrelated changes). The
+  # render is a pure function of the web bundle + the visual tests + their
+  # shared fixtures + the pinned toolchain (npm pin, the image digest in THIS
+  # file, and the playwright/plugin versions in the lock), so watch exactly
+  # those. Fails open: if the file list can't be fetched, render rather than
+  # risk a false pass.
+  detect:
+    name: Detect render-affecting changes
+    runs-on: ubuntu-latest
+    outputs:
+      ui: ${{ steps.changes.outputs.ui }}
+    steps:
+      - id: changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "${PR:-}" ]; then
+            echo "ui=true" >> "$GITHUB_OUTPUT"; echo "no PR (dispatch) -> render"; exit 0
+          fi
+          if ! files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename'); then
+            echo "ui=true" >> "$GITHUB_OUTPUT"; echo "file list unavailable -> render"; exit 0
+          fi
+          pattern='^(web/|tests/e2e_ui/visual/|tests/e2e_ui/conftest\.py|\.github/actions/setup-node/|\.github/workflows/ui-snapshot\.yml|pyproject\.toml|uv\.lock)'
+          if printf '%s\n' "$files" | grep -qE "$pattern"; then
+            echo "ui=true" >> "$GITHUB_OUTPUT"
+            echo "render-affecting files changed:"
+            printf '%s\n' "$files" | grep -E "$pattern" | sed 's/^/  /'
+          else
+            echo "ui=false" >> "$GITHUB_OUTPUT"
+            echo "no render-affecting files changed -> skip the render"
+          fi
+
+  ui-snapshot:
+    name: UI Snapshot (visual baselines) [non-blocking]
+    needs: detect
+    # Skipped (not failed) when no render input changed -> reports SUCCESS, so a
+    # non-UI PR neither runs the render nor blocks a required check.
+    if: ${{ needs.detect.outputs.ui == 'true' }}
+    runs-on: ubuntu-24.04
+    # Render in the digest-pinned Playwright image (browsers + fonts baked in),
+    # so the committed baseline and the PR comparison are byte-identical and a
+    # locally regenerated baseline matches. Keep this digest in lockstep with
+    # ui-snapshot-update.yml and regen_baseline_docker.sh.
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.60.0-noble@sha256:8ff591d613b01c884cc488339ed4318b4513eaf0c57a164a878ba49e70e3f384
+    # GitHub defaults `run:` steps inside a container to `sh` (dash); force bash
+    # so the snapshot step's arrays / [[ ]] work (bash ships in the image).
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Set up Node 20
+        uses: ./.github/actions/setup-node
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Cache virtualenv
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
+        with:
+          path: .venv
+          # Namespaced away from e2e-ui.yml's host venv: this venv is built with
+          # the container's system Python (different interpreter path), so they
+          # must not share a key or a cross-restore would mismatch.
+          key: venv-uisnapshot-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install project + dev extras
+        run: uv sync --extra all --extra dev
+
+      # No "playwright install": the pinned image already ships matching Chromium
+      # + system deps under $PLAYWRIGHT_BROWSERS_PATH (/ms-playwright), so the
+      # uv-synced playwright 1.60.0 finds them with no download.
+
+      - name: Build web SPA
+        # Build BEFORE pytest: Vite's emptyOutDir clobbers the static dir, so
+        # never run it alongside the live server. --legacy-peer-deps avoids
+        # re-resolving the known React 19 peer conflict under @emoji-mart/react.
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          cd web
+          npm ci --legacy-peer-deps --no-audit --no-fund
+          npm run build
+
+      - name: Compare (PR) or regenerate (dispatch) the visual snapshots
+        id: snapshot
+        # --ui-skip-build: the SPA was built in the previous step. On
+        # workflow_dispatch we pass --update-snapshots, which rewrites the
+        # baseline and intentionally fails the run so a human reviews the image.
+        env:
+          IS_UPDATE: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          EXTRA_ARGS=()
+          if [[ "$IS_UPDATE" == "true" ]]; then
+            EXTRA_ARGS+=(--update-snapshots)
+          fi
+          # -p no:rerunfailures: this gate is deterministic (one static page),
+          # so reruns add nothing; the plugin also spins a teardown socket
+          # thread that emits a noisy unhandled-exception warning when the
+          # live_server subprocess is torn down.
+          uv run pytest tests/e2e_ui/visual -m visual \
+            -v --tb=long --log-level=INFO -r a \
+            -p no:rerunfailures \
+            --ui-skip-build \
+            "${EXTRA_ARGS[@]}"
+
+      # Always (pass or fail) publish the rendered screenshots so they are one
+      # click away. Gated on the snapshot step's own conclusion (not a bare
+      # always()): if an earlier setup step crashed, the snapshot step is skipped
+      # and there is no meaningful render to publish.
+      - name: Upload screenshots
+        id: upload_screens
+        if: ${{ always() && (steps.snapshot.conclusion == 'success' || steps.snapshot.conclusion == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ui-snapshot-${{ github.run_id }}
+          # snapshots/ is this run's render (identical to the baseline on a pass;
+          # the new/regenerated render on a mismatch or --update-snapshots).
+          # snapshot_failures/ adds the actual_/expected_/diff_ PNGs on a
+          # mismatch -- expected_ IS the baseline, so this single artifact
+          # already carries baseline + current + diff.
+          path: |
+            tests/e2e_ui/visual/snapshots/**
+            tests/e2e_ui/visual/snapshot_failures/**
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Link screenshots
+        # Print a clickable artifact link to the job summary + log on every run,
+        # whether the comparison passed or failed.
+        if: ${{ always() && (steps.snapshot.conclusion == 'success' || steps.snapshot.conclusion == 'failure') }}
+        env:
+          SCREENS_URL: ${{ steps.upload_screens.outputs.artifact-url }}
+          SNAPSHOT_OUTCOME: ${{ steps.snapshot.conclusion }}
+        run: |
+          {
+            echo "## UI snapshot screenshots"
+            echo ""
+            echo "Snapshot comparison: \`${SNAPSHOT_OUTCOME}\`"
+            echo ""
+            echo "Artifact (baseline + current + diff PNGs): ${SCREENS_URL:-_(not uploaded)_}"
+            echo ""
+            echo "On a mismatch the artifact's \`snapshot_failures/\` holds \`expected_\` (baseline), \`actual_\` (current) and \`diff_\`; on a pass \`snapshots/\` is the render (identical to the baseline)."
+            echo ""
+            echo "### Updating the baseline (if this UI change is intentional)"
+            echo ""
+            echo "- **Same-repo branch:** add the \`update-ui-snapshot\` label — the bot regenerates + pushes for you."
+            echo "- **Locally with Docker (any branch, incl. forks):** run \`tests/e2e_ui/visual/regen_baseline_docker.sh\` (renders in this same pinned image), then commit + push."
+            echo ""
+            echo "Full instructions, incl. the fork artifact fallback: \`tests/e2e_ui/visual/README.md\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Screenshots artifact: ${SCREENS_URL:-not uploaded}"

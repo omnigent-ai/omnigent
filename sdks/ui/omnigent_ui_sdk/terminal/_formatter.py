@@ -725,14 +725,20 @@ class RichBlockFormatter:
             the second line, in order. Each entry is a short
             human-readable label like ``"/help help"`` or
             ``"Ctrl+O debug"``. When ``None``, defaults to the
-            baseline set the SDK ships (``/help help``,
+            baseline set the SDK ships (``/help help``, ``/quit exit``,
             ``Esc cancel``, ``Ctrl+C exit``). Callers that register
             extra overlays should pass the full list so the hint
             reflects what's actually bound.
         """
         if hints is None:
-            hints = ["/help help", "Esc cancel", "Ctrl+C exit"]
-        hint_line = "Type a message to chat · " + " · ".join(hints)
+            hints = ["/help help", "/quit exit", "Esc cancel", "Ctrl+C exit"]
+        # The lead already points at /help, so drop any redundant /help hint
+        # from the joined remainder — avoids advertising help twice while
+        # keeping /quit and the key hints visible.
+        rest = [h for h in hints if not h.lstrip("/").lower().startswith("help")]
+        hint_line = "Type a message, or /help for commands"
+        if rest:
+            hint_line += " · " + " · ".join(rest)
         return Panel(
             Text.from_markup(
                 f"[{self.accent}]Omnigent[/{self.accent}]"

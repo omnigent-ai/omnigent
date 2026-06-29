@@ -9,6 +9,8 @@ mocks) so a regression in field handling surfaces here.
 
 from __future__ import annotations
 
+import pytest
+
 from omnigent.onboarding.ambient import DetectedProvider
 from omnigent.onboarding.detected import (
     effective_config_with_detected,
@@ -17,6 +19,7 @@ from omnigent.onboarding.detected import (
 )
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
+    GEMINI_FAMILY,
     OPENAI_FAMILY,
     default_provider_for_harness,
     get_default_provider,
@@ -28,6 +31,13 @@ def _anthropic_key() -> DetectedProvider:
     """An ambient ANTHROPIC_API_KEY detection."""
     return DetectedProvider(
         name="anthropic", kind="key", family=ANTHROPIC_FAMILY, source="$ANTHROPIC_API_KEY"
+    )
+
+
+def _gemini_key() -> DetectedProvider:
+    """An ambient GEMINI_API_KEY detection (the antigravity / GEMINI_API_KEY credential)."""
+    return DetectedProvider(
+        name="gemini", kind="key", family=GEMINI_FAMILY, source="$GEMINI_API_KEY"
     )
 
 
@@ -72,6 +82,40 @@ def test_synthesize_env_key_openrouter_uses_vendor_endpoint_and_chat_wire() -> N
     assert openai_block["api_key_ref"] == "env:OPENROUTER_API_KEY"
 
 
+def test_synthesize_env_key_openai_honors_openai_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A detected ``OPENAI_API_KEY`` adopts a companion ``OPENAI_BASE_URL``.
+
+    The OpenAI SDK reads ``OPENAI_BASE_URL`` to target an OpenAI-compatible
+    gateway (e.g. the Databricks AI gateway). Ambient detection must honor
+    it; otherwise the env key is synthesized against ``api.openai.com`` and
+    every request 401s — the credential is a gateway token, not an OpenAI
+    key. This is the regression guard for that intermittent multi-turn 401.
+    """
+    gateway = "https://example.cloud.databricks.com/ai-gateway/openai/v1"
+    monkeypatch.setenv("OPENAI_BASE_URL", gateway)
+    det = DetectedProvider(
+        name="openai", kind="key", family=OPENAI_FAMILY, source="$OPENAI_API_KEY"
+    )
+    entries = synthesize_detected_entries([det])
+    openai_block = entries["openai"]["openai"]
+    assert openai_block["base_url"] == gateway
+    assert openai_block["api_key_ref"] == "env:OPENAI_API_KEY"
+
+
+def test_synthesize_env_key_openai_without_base_url_uses_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent ``OPENAI_BASE_URL``, a detected OpenAI key keeps the vendor default."""
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    det = DetectedProvider(
+        name="openai", kind="key", family=OPENAI_FAMILY, source="$OPENAI_API_KEY"
+    )
+    entries = synthesize_detected_entries([det])
+    assert entries["openai"]["openai"]["base_url"] == "https://api.openai.com/v1"
+
+
 def test_synthesize_subscription_cli() -> None:
     """A codex CLI login becomes a ``subscription`` entry keyed by its CLI."""
     entries = synthesize_detected_entries([_codex_login()])
@@ -79,14 +123,55 @@ def test_synthesize_subscription_cli() -> None:
 
 
 def test_synthesize_skips_familyless_detection() -> None:
-    """A detection with no harness family (e.g. Gemini) is omitted.
+    """A detection with no harness family is omitted.
 
-    We detect the key but have no harness surface for it, so synthesizing
-    an entry would create an unroutable provider. Failure means a Gemini
-    key would show up as a (broken) configured provider.
+    We may detect a key but have no harness surface for it, so synthesizing
+    an entry would create an unroutable provider. Failure means a
+    familyless key would show up as a (broken) configured provider.
     """
-    gemini = DetectedProvider(name="gemini", kind="key", family=None, source="$GEMINI_API_KEY")
-    assert synthesize_detected_entries([gemini]) == {}
+    familyless = DetectedProvider(
+        name="mystery", kind="key", family=None, source="$MYSTERY_API_KEY"
+    )
+    assert synthesize_detected_entries([familyless]) == {}
+
+
+def test_synthesize_env_key_gemini() -> None:
+    """A detected GEMINI_API_KEY becomes a ``gemini``-family ``key`` entry.
+
+    The antigravity harness drives the Gemini SDK directly with a
+    GEMINI_API_KEY, so a detected key must synthesize a routable gemini
+    provider (it used to be dropped as familyless). Failure means the key
+    would be silently ignored, leaving the antigravity harness with no
+    auto-adopted credential.
+    """
+    entries = synthesize_detected_entries([_gemini_key()])
+    assert set(entries) == {"gemini"}
+    parsed = load_providers({"providers": entries})["gemini"]
+    assert parsed.kind == "key"
+    assert set(parsed.families) == {"gemini"}
+    gemini_block = entries["gemini"]["gemini"]
+    # The env var is referenced (env:), never the resolved secret value.
+    assert gemini_block["api_key_ref"] == "env:GEMINI_API_KEY"
+    # Gemini's OpenAI-compatible endpoint (not api.openai.com / anthropic).
+    assert gemini_block["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai"
+
+
+def test_gemini_key_adopted_and_auto_defaults() -> None:
+    """A detected GEMINI_API_KEY is adopted and auto-defaults its family.
+
+    The end-to-end onboarding path: with nothing configured, a detected
+    Gemini key must (1) be returned by ``providers_to_adopt`` so
+    ``configure harnesses`` persists it, and (2) auto-become the gemini
+    family default in the read-time merge so the gemini-surface harness
+    resolves it. Failure means a detected Gemini key would not reach the
+    harness even though it was found on the machine.
+    """
+    adopt = providers_to_adopt({}, [_gemini_key()])
+    assert set(adopt) == {"gemini"}
+    merged = effective_config_with_detected({}, [_gemini_key()])
+    assert get_default_provider(merged, GEMINI_FAMILY).name == "gemini"
+    # And resolves through the harness path the runtime uses.
+    assert default_provider_for_harness(merged, "antigravity-native").name == "gemini"
 
 
 def test_synthesize_local_ollama() -> None:

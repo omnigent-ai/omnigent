@@ -7,12 +7,9 @@ import shutil
 import sys
 import tempfile
 import time
-import warnings
 from pathlib import Path
-from typing import Any
 
 import pytest
-import yaml
 
 try:
     import resource as _resource  # POSIX-only; absent on Windows.
@@ -64,44 +61,15 @@ from tests import _model_pools
 
 pytest_plugins = ["tests._token_usage"]
 
-_KNOWN_FAILURES_PATH = Path(__file__).parent / "known_failures.yaml"
 
-
-def _load_known_failures() -> dict[str, dict[str, Any]]:
-    """Map nodeid -> entry from `tests/known_failures.yaml`."""
-    if not _KNOWN_FAILURES_PATH.exists():
-        return {}
-    data = yaml.safe_load(_KNOWN_FAILURES_PATH.read_text()) or {}
-    return {entry["id"]: entry for entry in (data.get("skips") or [])}
-
-
-_KNOWN_FAILURES: dict[str, dict[str, Any]] = _load_known_failures()
-
-
-def pytest_collection_modifyitems(
-    config: pytest.Config,
-    items: list[pytest.Item],
-) -> None:
-    """Apply skip / xfail markers to tests listed in `tests/known_failures.yaml`.
-
-    Each entry's `mode` selects the marker:
-    - `skip` (default): test does not run.
-    - `xfail`: test runs with `strict=False`. Fails report as
-      `XFAIL` (silent); a passing test reports `XPASS` so the
-      manifest entry can be removed.
-
-    Bypassed entirely when `--no-skip-known` is passed (CLI flag,
-    set by the `force-all-tests` PR label in ci.yml). Useful for
-    validating that manifest entries are still needed.
-
-    Emits a warning at collection end for any manifest entry whose
-    `id` doesn't match a collected test, so renames / removals
-    don't leave stale entries lingering silently.
-
-    Also translates ``@pytest.mark.llm_flaky`` into a rerunfailures
-    ``flaky`` marker; each rerun resolves to a different model via
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Translate ``@pytest.mark.llm_flaky`` into a rerunfailures ``flaky``
+    marker; each rerun resolves to a different model via
     :mod:`tests._model_pools` rotation.
     """
+    is_windows = os.name == "nt"
+    skip_posix = pytest.mark.skip(reason="POSIX-only test; skipped on Windows")
+    skip_windows = pytest.mark.skip(reason="Windows-only test; skipped on POSIX")
     for item in items:
         llm_flaky = item.get_closest_marker("llm_flaky")
         if llm_flaky is not None:
@@ -111,43 +79,12 @@ def pytest_collection_modifyitems(
             reruns = int(llm_flaky.kwargs.get("reruns", 2))
             delay = int(llm_flaky.kwargs.get("reruns_delay", 1))
             item.add_marker(pytest.mark.flaky(reruns=reruns, reruns_delay=delay))
-
-    if config.getoption("--no-skip-known"):
-        return
-    if not _KNOWN_FAILURES:
-        return
-    seen: set[str] = set()
-    for item in items:
-        entry = _KNOWN_FAILURES.get(item.nodeid)
-        if entry is None:
-            continue
-        seen.add(item.nodeid)
-        reason = entry.get("reason", "known failure")
-        issue = entry.get("issue")
-        cluster = entry.get("cluster")
-        prefix = f"known failure (#{issue})" if issue else "known failure"
-        if cluster:
-            prefix = f"{prefix} [{cluster}]"
-        marker_reason = f"{prefix}: {reason}"
-        mode = entry.get("mode", "skip")
-        if mode == "xfail":
-            item.add_marker(pytest.mark.xfail(reason=marker_reason, strict=False))
-        else:
-            if mode != "skip":
-                warnings.warn(
-                    f"known_failures.yaml entry {item.nodeid!r} has invalid "
-                    f"mode {mode!r}; expected 'skip' or 'xfail'. Defaulting to skip.",
-                    stacklevel=1,
-                )
-            item.add_marker(pytest.mark.skip(reason=marker_reason))
-
-    stale = sorted(set(_KNOWN_FAILURES) - seen)
-    if stale:
-        warnings.warn(
-            f"tests/known_failures.yaml has {len(stale)} entries that "
-            f"don't match any collected test (rename or removal?): {stale}",
-            stacklevel=1,
-        )
+        # Auto-skip platform-pinned tests on the wrong OS so the Linux suite
+        # is unchanged and a Windows run doesn't choke on POSIX-only tests.
+        if item.get_closest_marker("posix_only") is not None and is_windows:
+            item.add_marker(skip_posix)
+        if item.get_closest_marker("windows_only") is not None and not is_windows:
+            item.add_marker(skip_windows)
 
 
 # Tmpdir owned by *this* process (master or single worker) for the
@@ -200,6 +137,28 @@ def pytest_configure(config: pytest.Config) -> None:
         os.makedirs(log_dir, exist_ok=True)
         worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
         _PROGRESS_LOG_PATH = os.path.join(log_dir, f"progress-{worker}.log")
+
+    _run_test_environment_guardrails(config)
+
+
+def _run_test_environment_guardrails(config: pytest.Config) -> None:
+    """Enforce test-environment guardrails at session start.
+
+    Hard-fail: :func:`check_test_environment` raises on anything that
+    looks like a real (non-test) DB or a base URL aimed at a dev/prod host
+    or port. Set ``OMNIGENT_DISABLE_TEST_GUARDRAILS=1`` to temporarily
+    downgrade violations to warn-only for deliberate integration runs.
+
+    The resolved DB URI mirrors how a run would pick one: an explicit
+    ``OMNIGENT_DATABASE_URI`` wins (so pointing the suite at a real DB
+    warns loudly), else we fall back to the per-worker tmp MLflow SQLite
+    set just above — a representative throwaway DB that passes cleanly.
+    """
+    from omnigent.testing.guardrails import check_test_environment
+
+    db_uri = os.environ.get("OMNIGENT_DATABASE_URI") or os.environ.get("MLFLOW_TRACKING_URI", "")
+    base_url = config.getoption("--omnigent-server-url", default=None)
+    check_test_environment(db_uri=db_uri, base_url=base_url, warn_only=False)
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
@@ -308,17 +267,6 @@ def pytest_addoption(parser):
 
     :param parser: the pytest option parser.
     """
-    parser.addoption(
-        "--no-skip-known",
-        action="store_true",
-        default=False,
-        help=(
-            "Bypass tests/known_failures.yaml; run every collected test "
-            "including those listed as skipped or xfailed. Set by the "
-            "force-all-tests PR label in ci.yml; useful locally to "
-            "validate that manifest entries are still needed."
-        ),
-    )
     parser.addoption(
         "--integration",
         action="store_true",

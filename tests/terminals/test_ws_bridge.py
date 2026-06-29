@@ -369,6 +369,57 @@ async def test_tmux_session_alive_tracks_real_session(tmp_path: Path) -> None:
     assert await _tmux_session_alive(str(tmp_path / "absent.sock"), "main") is False
 
 
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux required")
+@pytest.mark.asyncio
+async def test_tmux_session_alive_false_for_dead_pane(tmp_path: Path) -> None:
+    """
+    A kept-alive session whose pane process exited reads as not-alive.
+
+    The claude-native terminal opts into ``remain-on-exit`` (#540), so a crashed
+    agent leaves a dead pane on a still-present session. The probe must report
+    that as gone via ``#{pane_dead}`` — otherwise a detach-vs-exit decision
+    would treat the crash as a mere detach and the web client would reconnect
+    to a dead pane forever instead of closing.
+
+    :param tmp_path: Pytest tmp directory for the private socket.
+    """
+    socket_path = tmp_path / "tmux.sock"
+    base = ["tmux", "-S", str(socket_path), "-f", "/dev/null"]
+    # One command sequence on a fresh server (";" separates tmux commands):
+    # set remain-on-exit globally BEFORE new-session so the session inherits it
+    # and survives the inner process exiting. A bare set-option can't run first
+    # on its own — no server exists yet to connect to.
+    subprocess.run(
+        [
+            *base,
+            "set-option",
+            "-g",
+            "remain-on-exit",
+            "on",
+            ";",
+            "new-session",
+            "-d",
+            "-s",
+            "main",
+            "sh -c 'exit 0'",
+        ],
+        check=True,
+    )
+    try:
+        for _ in range(250):
+            if await _tmux_session_alive(str(socket_path), "main") is False:
+                break
+            await asyncio.sleep(0.02)
+        else:  # pragma: no cover - only on a hang/regression
+            raise AssertionError("dead pane was never reported as not-alive")
+        # The session itself is still present (remain-on-exit), proving the
+        # not-alive verdict came from the dead pane, not a vanished session.
+        has = subprocess.run([*base, "has-session", "-t", "main"], capture_output=True)
+        assert has.returncode == 0, "session vanished; remain-on-exit was not honored"
+    finally:
+        subprocess.run([*base, "kill-server"], capture_output=True, check=False)
+
+
 class _ParkingFakeWebSocket:
     """
     WebSocket fake whose client side never ends, isolating the PTY side.
@@ -1176,3 +1227,241 @@ async def test_forward_pty_to_ws_accepts_dynamic_coalesce_cap() -> None:
         f"were {[len(frame) for frame in ws.sent]}."
     )
     assert b"".join(ws.sent) == b"x" * ws_bridge._PTY_READ_CHUNK
+
+
+# ── Additional unit tests (no tmux required) ─────────────────
+
+
+def test_current_coalesce_limit_static_value() -> None:
+    """
+    ``_current_coalesce_limit`` returns the integer unchanged when
+    given a static cap.
+    """
+    from omnigent.terminals.ws_bridge import _current_coalesce_limit
+
+    assert _current_coalesce_limit(4096) == 4096
+
+
+def test_current_coalesce_limit_callable_invoked() -> None:
+    """
+    ``_current_coalesce_limit`` calls the callable and returns its
+    result when given a dynamic cap.
+    """
+    from omnigent.terminals.ws_bridge import _current_coalesce_limit
+
+    assert _current_coalesce_limit(lambda: 2048) == 2048
+
+
+def test_current_coalesce_limit_rejects_zero() -> None:
+    """
+    A zero cap raises ``ValueError`` — a zero cap would make the
+    frame-splitting loop infinite.
+    """
+    from omnigent.terminals.ws_bridge import _current_coalesce_limit
+
+    with pytest.raises(ValueError, match="must be positive"):
+        _current_coalesce_limit(0)
+
+
+def test_current_coalesce_limit_rejects_negative_callable() -> None:
+    """
+    A callable returning a negative value raises ``ValueError``.
+    """
+    from omnigent.terminals.ws_bridge import _current_coalesce_limit
+
+    with pytest.raises(ValueError, match="must be positive"):
+        _current_coalesce_limit(lambda: -5)
+
+
+def test_coalesce_limit_after_input_returns_large_cap_with_no_input() -> None:
+    """
+    Before any client input (``last_client_input_at=None``), the
+    coalesce cap is the full flood cap — output should stream
+    efficiently without the interactive constraint.
+    """
+    from omnigent.terminals.ws_bridge import _coalesce_limit_after_input
+
+    assert _coalesce_limit_after_input(None) == ws_bridge._WS_COALESCE_MAX_BYTES
+
+
+def test_coalesce_limit_after_input_returns_small_cap_within_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When the last client input was within the interactive echo window,
+    the cap shrinks to the interactive size so browser sync-echo works.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.terminals.ws_bridge import _coalesce_limit_after_input
+
+    monkeypatch.setattr(ws_bridge, "_monotonic", lambda: 100.5)
+    # Input was 0.3s ago (within the 0.75s window).
+    assert _coalesce_limit_after_input(100.2) == ws_bridge._INTERACTIVE_WS_COALESCE_MAX_BYTES
+
+
+def test_coalesce_limit_after_input_returns_large_cap_after_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Once the interactive echo window has elapsed, the cap reverts to
+    the full flood cap so output floods stream efficiently again.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.terminals.ws_bridge import _coalesce_limit_after_input
+
+    monkeypatch.setattr(ws_bridge, "_monotonic", lambda: 102.0)
+    # Input was 2s ago (well past the 0.75s window).
+    assert _coalesce_limit_after_input(100.0) == ws_bridge._WS_COALESCE_MAX_BYTES
+
+
+@pytest.mark.asyncio
+async def test_tmux_session_alive_returns_false_on_spawn_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_tmux_session_alive`` returns ``False`` when ``create_subprocess_exec``
+    raises ``OSError`` (tmux binary not found). This is the conservative
+    fallback — any probe error is treated as "session dead".
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+
+    async def _raise_oserror(*args: object, **kwargs: object) -> None:
+        raise OSError("No such file or directory")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _raise_oserror)
+    assert await _tmux_session_alive("/no/such.sock", "main") is False
+
+
+@pytest.mark.asyncio
+async def test_tmux_session_alive_returns_false_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_tmux_session_alive`` returns ``False`` when the has-session probe
+    times out (e.g. a wedged tmux server). The probe must not block the
+    bridge's teardown path.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+
+    class _HangingProcess:
+        returncode: int | None = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await asyncio.sleep(999)
+            return b"", b""
+
+        def kill(self) -> None:
+            pass
+
+    async def _create_hanging(*args: object, **kwargs: object) -> _HangingProcess:
+        return _HangingProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _create_hanging)
+    # Patch the timeout to a tiny value so the test finishes quickly.
+    monkeypatch.setattr(ws_bridge, "_TMUX_HAS_SESSION_TIMEOUT_S", 0.01)
+
+    assert await _tmux_session_alive("/some.sock", "main") is False
+
+
+@pytest.mark.asyncio
+async def test_bridge_closes_ws_with_error_when_tmux_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When ``shutil.which("tmux")`` returns ``None``, the bridge closes
+    the websocket with ``WS_CLOSE_INTERNAL_ERROR`` and returns without
+    crashing.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    close_codes: list[int] = []
+
+    class _FakeWS:
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            close_codes.append(code)
+
+    ws = _FakeWS()
+    await bridge_tmux_pty_to_websocket(
+        ws,  # type: ignore[arg-type]
+        socket_path="/nonexistent.sock",
+        tmux_target="main",
+        read_only=False,
+    )
+
+    assert close_codes == [ws_bridge.WS_CLOSE_INTERNAL_ERROR]
+
+
+@pytest.mark.asyncio
+async def test_reap_child_handles_child_process_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_reap_tmux_attach_child`` exits cleanly when ``os.waitpid``
+    raises ``ChildProcessError`` (the child was already reaped by
+    another path, e.g. a signal handler).
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+
+    def _raise_child_error(pid: int, options: int) -> tuple[int, int]:
+        raise ChildProcessError("No child processes")
+
+    monkeypatch.setattr(os, "waitpid", _raise_child_error)
+
+    # Should return without raising.
+    await _reap_tmux_attach_child(12345)
+
+
+@pytest.mark.asyncio
+async def test_forward_pty_to_ws_handles_empty_queue_then_eof() -> None:
+    """
+    When the queue receives ``None`` (EOF) as the very first item,
+    ``_forward_pty_to_ws`` returns immediately without sending
+    anything. This covers the path where the tmux attach child
+    exits before producing any output.
+    """
+    queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+    queue.put_nowait(None)
+
+    ws = _RecordingWebSocket()
+    await asyncio.wait_for(
+        _forward_pty_to_ws(ws, queue),  # type: ignore[arg-type]
+        timeout=5.0,
+    )
+
+    assert ws.sent == []
+
+
+def test_ws_close_code_constants() -> None:
+    """
+    The WebSocket close codes are in the RFC 6455 application range
+    (4000-4999) and are distinct from each other.
+    """
+    codes = {
+        ws_bridge.WS_CLOSE_TERMINAL_NOT_FOUND,
+        ws_bridge.WS_CLOSE_TERMINAL_DETACHED,
+        ws_bridge.WS_CLOSE_INTERNAL_ERROR,
+    }
+    assert len(codes) == 3, "close codes must be distinct"
+    for code in codes:
+        assert 4000 <= code <= 4999, f"close code {code} outside RFC 6455 app range"
+
+
+def test_monotonic_returns_float() -> None:
+    """
+    ``_monotonic`` is a thin wrapper over ``time.monotonic`` that
+    returns a float. This seems trivial but the wrapper exists as
+    a test seam — verify it works as documented.
+    """
+    from omnigent.terminals.ws_bridge import _monotonic
+
+    val = _monotonic()
+    assert isinstance(val, float)
+    # Monotonic: a second call should be >= the first.
+    assert _monotonic() >= val

@@ -41,6 +41,10 @@ from playwright.sync_api import Page, expect
 # permission read see the stub, not the real (unobservable) API.
 _HARNESS_INIT_SCRIPT = """
 window.__notifs = [];
+// The live notification instances (kept out of __notifs, which is read via
+// page.evaluate and so must stay JSON-serializable). The click test invokes
+// __notifObjects[i].onclick() to exercise the app's click->navigate handler.
+window.__notifObjects = [];
 window.__hidden = false;
 window.__sessionStatuses = [];
 window.__streamStatuses = [];
@@ -123,6 +127,7 @@ class FakeNotification {
     this.options = options || {};
     this.onclick = null;
     window.__notifs.push({ title: title, options: options || {} });
+    window.__notifObjects.push(this);
   }
   close() {}
   static permission = "granted";
@@ -143,7 +148,12 @@ Object.defineProperty(document, "hidden", {
 document.hasFocus = function () { return !window.__hidden; };
 """
 
-_PROMPT = "Write a 400-word essay about the history of timekeeping."
+# Kept deliberately tiny: these tests only need a real ``running`` ->
+# ``idle`` turn to observe, not a long generation. A short reply still
+# exercises the notification body's preview contract (non-empty, capped)
+# while cutting the LLM turn from ~15s of essay tokens to a couple of
+# seconds -- the dominant cost in this suite's slow shard.
+_PROMPT = "Reply with a one-sentence greeting and nothing else."
 
 
 def _reset_session_status_probe(page: Page) -> None:
@@ -252,8 +262,9 @@ def test_idle_notification_fires_when_backgrounded(
     _wait_for_observed_session_status(page, session_id, "idle", timeout=90_000)
     # One more observation window catches duplicate-notification
     # regressions: the single running -> idle transition should produce
-    # exactly one notification.
-    page.wait_for_timeout(10_000)
+    # exactly one notification. A duplicate fires off a re-render right
+    # after the first, so a short settle is enough to catch it.
+    page.wait_for_timeout(3_000)
     notifs = page.evaluate("window.__notifs")
     assert len(notifs) == 1, f"expected exactly one notification, got {notifs}"
     first = notifs[0]
@@ -263,7 +274,7 @@ def test_idle_notification_fires_when_backgrounded(
     # generic fallback. The preview text is real LLM output, so assert
     # the contract rather than exact content: non-empty either way, and
     # a non-fallback body must respect the preview caps
-    # (``previewText`` in ap-web/src/lib/lastAssistantText.ts:
+    # (``previewText`` in web/src/lib/lastAssistantText.ts:
     # ≤160 chars including the "…" elision marker, ≤3 lines).
     body = first["options"]["body"]
     assert isinstance(body, str) and body.strip(), notifs
@@ -304,5 +315,60 @@ def test_idle_notification_suppressed_when_foreground(
 
     # Leave a short post-transition window to be sure no delayed
     # notification slips through.
-    page.wait_for_timeout(10_000)
+    page.wait_for_timeout(3_000)
     assert page.evaluate("window.__notifs.length") == 0, "foreground transition must not notify"
+
+
+def test_idle_notification_click_navigates_to_chat(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """
+    Clicking the OS notification routes into the session it was raised for.
+
+    This is the user-facing contract behind the notification's click
+    handler: ``useIdleNotifications`` builds ``/c/{id}`` and wires it as
+    the notification's ``onClick`` (and, under the desktop shell, as the
+    ``navigatePath`` forwarded over IPC). The browser path runs that
+    closure directly; this test exercises it end-to-end.
+
+    Flow: open the seeded session, send a real prompt, wait until app
+    traffic reports it ``running`` (seeding the baseline), then navigate
+    AWAY to the new-session screen ("/") via the in-app sidebar link — a
+    client-side navigation that keeps ``useIdleNotifications`` mounted, and
+    leaves no conversation actively viewed so the turn-end still notifies.
+    When the real turn finishes the notification fires; invoking its
+    ``onclick`` must route the app back to ``/c/{session_id}``.
+
+    A failure means the notification's click handler no longer navigates to
+    its conversation (the desktop "click does nothing but focus" bug, or a
+    regression in the shared path-building wiring).
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` of a real session
+        bound to the spawned runner.
+    """
+    base_url, session_id = seeded_session
+    page.add_init_script(_HARNESS_INIT_SCRIPT)
+    page.goto(f"{base_url}/c/{session_id}")
+
+    # User gesture mirrors the real lazy-permission flow (stub reports
+    # "granted", so this is harmless).
+    page.mouse.click(5, 5)
+
+    _reset_session_status_probe(page)
+    _send_prompt(page)
+
+    # Reach the running baseline while still viewing the session, then leave
+    # for the new-session screen so the turn-end isn't suppressed as
+    # actively-viewed and a click has somewhere to navigate FROM.
+    _wait_for_observed_session_status(page, session_id, "running", timeout=30_000)
+    page.get_by_test_id("new-chat-button").click()
+    page.wait_for_url(lambda url: f"/c/{session_id}" not in url, timeout=10_000)
+
+    # The real turn completes off-screen and raises the notification.
+    page.wait_for_function("window.__notifObjects.length > 0", timeout=90_000)
+
+    # Click it: the app's onClick focuses then navigates to the session.
+    page.evaluate("window.__notifObjects[0].onclick()")
+    page.wait_for_url(f"**/c/{session_id}", timeout=10_000)

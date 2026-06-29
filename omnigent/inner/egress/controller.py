@@ -42,6 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from omnigent._platform import IS_WINDOWS
+from omnigent.inner.credential_proxy import CredentialRewriteRule
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.egress.rules import parse_rules
@@ -53,6 +55,10 @@ _CA_ENV_KEYS = (
     "NODE_EXTRA_CA_CERTS",
     "CURL_CA_BUNDLE",
     "PIP_CERT",
+    # git/libcurl on macOS can ignore the generic SSL_CERT_FILE in some
+    # builds; set the git-specific CA var too so ``git`` over HTTPS
+    # consistently trusts the egress proxy's MITM CA.
+    "GIT_SSL_CAINFO",
 )
 
 
@@ -123,6 +129,7 @@ def start_egress_proxy(
     tmpdir: Path,
     allow_private_destinations: bool,
     require_auth: bool,
+    credential_rewrites: Sequence[CredentialRewriteRule] | None = None,
 ) -> EgressProxyHandle:
     """Start the parent-side MITM egress proxy.
 
@@ -145,9 +152,22 @@ def start_egress_proxy(
         When ``False``, the proxy accepts any unauthenticated
         request — used by the terminal path where there's no
         out-of-band channel through tmux.
+    :param credential_rewrites: Optional host-scoped real-credential
+        rules the proxy applies for exact-host matches — swap-on-access
+        injection by default, plus synthetic-placeholder swap for entries
+        that opted into ``inject_env`` (secretless ``credential_proxy``
+        support).
     :returns: A live :class:`EgressProxyHandle`. Caller must invoke
         :meth:`EgressProxyHandle.stop` on cleanup.
+    :raises OSError: On Windows, where the L7 egress proxy (a Unix-socket
+        MITM listener) is unavailable.
     """
+    if IS_WINDOWS:
+        raise OSError(
+            "L7 egress filtering (os_env.sandbox.egress_rules) is not supported "
+            "on Windows: the egress proxy relies on a Unix-domain socket. Remove "
+            "the egress rules to run this agent on Windows, or run it on Linux/macOS."
+        )
     parsed_rules = parse_rules(list(rules))
     ca_cert_path, ca_key_path = ensure_ca()
     bundle_path = ensure_ca_bundle(ca_cert_path)
@@ -193,6 +213,7 @@ def start_egress_proxy(
         # request when set. Helper path uses it; terminal path skips
         # it (no out-of-band channel through tmux).
         auth_token=auth_token,
+        credential_rewrites=list(credential_rewrites or []),
     )
 
     loop = asyncio.new_event_loop()

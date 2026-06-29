@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, cast
 import httpx
 from fastapi import FastAPI
 
+from omnigent._platform import IS_WINDOWS
+from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
 
 if TYPE_CHECKING:
@@ -169,14 +171,23 @@ class _RunnerDatabricksAuth(httpx.Auth):
     unauthenticated servers), the auth flow is a no-op.
     """
 
-    def __init__(self, factory: Callable[[], str | None] | None) -> None:
+    def __init__(
+        self,
+        factory: Callable[[], str | None] | None,
+        server_url: str | None = None,
+    ) -> None:
         """
         :param factory: Sync callable that returns a fresh bearer
             token, e.g. the return value of
             :func:`_make_auth_token_factory`. ``None`` disables
             auth (local unauthenticated servers).
+        :param server_url: Omnigent server URL used to look up the ``?o=``
+            workspace selector for the ``X-Databricks-Org-Id`` routing
+            header. Defaults to ``RUNNER_SERVER_URL`` so existing callers
+            (which pass only the factory) need no change.
         """
         self._factory = factory
+        self._server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
 
     def auth_flow(
         self,
@@ -205,6 +216,13 @@ class _RunnerDatabricksAuth(httpx.Auth):
         :raises httpx.RequestError: When the factory is configured
             but returns no token.
         """
+        # Workspace routing: name the workspace or the request routes to the
+        # account (the forwarder's POST /events otherwise 403s). Empty when
+        # none recorded. Set once here; it persists across the retry yield.
+        if self._server_url:
+            from omnigent.cli_auth import databricks_org_id_headers
+
+            request.headers.update(databricks_org_id_headers(self._server_url))
         if self._factory is not None:
             token = self._factory()
             if not token:
@@ -424,29 +442,33 @@ def _parent_process_is_alive(parent_pid: int) -> bool:
     :returns: ``True`` when the process exists or is not visible due
         to permissions, otherwise ``False``.
     """
-    try:
-        os.kill(parent_pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    # Not ``os.kill(parent_pid, 0)``: on Windows that maps to TerminateProcess
+    # and would kill the parent rather than probe it.
+    return _proc.process_alive(parent_pid)
 
 
 def _parent_is_orphaned(parent_pid: int) -> bool:
     """Return whether this process has been orphaned by *parent_pid*.
 
-    The runner is launched as a direct child of ``parent_pid``, so
+    The runner is launched as a direct child of ``parent_pid``, so on POSIX
     ``getppid()`` equals it until the parent dies — at which point the OS
     reparents us to init / a subreaper and ``getppid()`` changes. That
     reparent signal is immune to PID reuse, which can otherwise make the
-    ``os.kill(pid, 0)`` liveness probe succeed against an unrelated process
-    that recycled the dead parent's pid (seen on busy CI hosts).
+    liveness probe succeed against an unrelated process that recycled the
+    dead parent's pid (seen on busy CI hosts).
+
+    Windows has no reparenting, AND ``os.getppid()`` is unreliable there: the
+    interpreter launcher in a venv breaks the parent link, so ``getppid()``
+    does not match the spawning process. Using it would report the runner
+    orphaned the instant it starts, tearing it down immediately. So on Windows
+    rely solely on an explicit liveness probe of the passed-in ``parent_pid``.
 
     :param parent_pid: The launcher's process id, e.g. ``12345``.
     :returns: ``True`` once the parent is gone, otherwise ``False``.
     """
-    return os.getppid() != parent_pid or not _parent_process_is_alive(parent_pid)
+    if not IS_WINDOWS and os.getppid() != parent_pid:
+        return True
+    return not _parent_process_is_alive(parent_pid)
 
 
 def _run_parent_death_killer(
@@ -621,10 +643,17 @@ async def _resolve_agent_spec_from_server(
     # PUT-induced bundle bumps invalidate naturally.
     version = resp.headers.get("X-Agent-Version", "0")
     dest = _agent_cache_dest(spec_cache_root, agent_id, version)
+    # prune_invalid_sub_agents: the server already validated this bundle
+    # before serving it, so a sub-agent that fails validation *here* means
+    # this runner is older than that server and can't run that sub-agent
+    # (e.g. it names a harness this version doesn't know). Drop the
+    # unsupported sub-agent and launch the parent with what this runner
+    # *does* support, rather than failing every dispatch of the agent.
+    # See omnigent.spec.load.
     if not dest.exists():
         dest.mkdir(parents=True)
-        load(resp.content, dest=dest, expand_env=expand_env)
-    spec = load(dest, expand_env=expand_env)
+        load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
     return ResolvedSpec(spec=spec, workdir=dest)
 
 
@@ -641,8 +670,15 @@ def create_app(
         a second time during runner boot.
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
+    from omnigent.cli_auth import databricks_org_id_headers
     from omnigent.runner.app import create_runner_app
-    from omnigent.runner.identity import RUNNER_ID_ENV_VAR, get_stable_runner_id
+    from omnigent.runner.identity import (
+        OMNIGENT_INTERNAL_WS_ORIGIN,
+        OMNIGENT_SESSION_ENV_VALUE,
+        OMNIGENT_SESSION_ENV_VAR,
+        RUNNER_ID_ENV_VAR,
+        get_stable_runner_id,
+    )
     from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
     server_url = _server_url_from_env()
@@ -652,6 +688,14 @@ def create_app(
     # restarts (§5 "Persistence" in RUNNER.md).
     _runner_id = get_stable_runner_id()
     os.environ[RUNNER_ID_ENV_VAR] = _runner_id
+    # Stamp the Omnigent session marker into the runner's environment so
+    # every process this runner spawns can detect it is running inside an
+    # Omnigent agent session, the way Claude Code sets CLAUDE_CODE and
+    # Codex sets CODEX. Harness workers inherit it (the process manager
+    # merges os.environ), native CLI terminals copy os.environ, and the
+    # claude-sdk SDK merges os.environ. The deny-by-default env scrubbers
+    # (os_env, codex, pi) allowlist it so it survives their scrub.
+    os.environ[OMNIGENT_SESSION_ENV_VAR] = OMNIGENT_SESSION_ENV_VALUE
 
     # Keep the harness manager on its default /tmp/omnigent root.
     # Nesting harness UDS paths under caller-provided temp dirs can
@@ -674,6 +718,16 @@ def create_app(
     server_client = httpx.AsyncClient(
         base_url=server_url,
         auth=_RunnerDatabricksAuth(auth_token_factory),
+        # Announce the runner as a first-party non-browser client via the
+        # sentinel Origin. The server's require_trusted_origin CSRF guard on
+        # the multipart routes (POST /v1/sessions bundle create, file upload
+        # — both reached from tool_dispatch over this client) requires a
+        # trusted Origin; the runner sends none otherwise, so the sentinel is
+        # what lets sys_session_create / sys_upload_file through.
+        #
+        # The workspace-routing header (empty unless a ?o= selector was
+        # recorded for this server) routes these callbacks to the workspace.
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, **databricks_org_id_headers(server_url)},
         timeout=httpx.Timeout(5.0, read=None),
         # NOTE: ``follow_redirects`` deliberately stays False.
         # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the
@@ -824,6 +878,20 @@ async def _run_tunnel_from_env() -> None:
     binding_token = _runner_tunnel_binding_token_from_env()
     parent_pid = _runner_parent_pid_from_env()
     runner_id = get_stable_runner_id()
+
+    # Initialize MLflow tracing in the runner process so the
+    # ExecutorAdapter can emit spans for agent turns, tool calls,
+    # and LLM interactions. No-op when OTEL_EXPORTER_OTLP_ENDPOINT
+    # is unset or mlflow is not installed.
+    try:
+        from omnigent.runtime import telemetry
+
+        telemetry.init()
+    except ImportError:
+        _logger.debug("telemetry init skipped in runner (mlflow not installed)")
+    except Exception:  # noqa: BLE001 — best-effort; tracing failure must not crash the runner
+        _logger.debug("telemetry init failed in runner", exc_info=True)
+
     # Reuse the tunnel's token factory for the app's httpx client so the
     # runner resolves Databricks auth once at boot, not twice.
     app = create_app(auth_token_factory=auth_token_factory)
@@ -947,6 +1015,8 @@ def _install_signal_handlers(
     if adopted_event is not None:
         from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
 
+        if RUNNER_ADOPT_SIGNAL is None:
+            return
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
 

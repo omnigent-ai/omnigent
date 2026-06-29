@@ -14,7 +14,7 @@ from typing import Any
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.os_env import OSEnvironment
 from omnigent.spec import AgentSpec
-from omnigent.spec.types import ToolRuntime
+from omnigent.spec.types import SharePolicy, ToolRuntime
 from omnigent.tools._srt import is_srt_available
 from omnigent.tools.base import Tool, ToolContext, is_valid_tool_name
 from omnigent.tools.builtins import (
@@ -34,6 +34,7 @@ from omnigent.tools.builtins import (
     SysSessionGetInfoTool,
     SysSessionListTool,
     SysSessionSendTool,
+    SysSessionShareTool,
     SysTimerCancelTool,
     SysTimerSetTool,
     UpdateCommentTool,
@@ -143,9 +144,8 @@ class ToolManager:
         self._srt_available = is_srt_available()
         self._uv_available = shutil.which("uv") is not None
         # Track the OS environment instance the spec opts into so
-        # ``shutdown`` (which we currently don't ship — TODO) can
-        # close it cleanly. ``None`` when the spec didn't declare
-        # ``os_env``.
+        # ``shutdown`` can close it cleanly. ``None`` when the spec
+        # didn't declare ``os_env``.
         self._os_env: OSEnvironment | None = None
         self._register_skill_tools()
         self._register_builtin_tools()
@@ -386,24 +386,39 @@ class ToolManager:
         ``sys_session_list`` or a prior ``sys_session_send`` handle),
         so they need no ``sub_specs`` map.
 
-        The spawn-lifecycle tools are opt-in, with two distinct grants:
+        ``sys_session_share`` is gated by its OWN dedicated
+        ``agent_session_sharing:`` flag (:class:`SharePolicy`),
+        independent of the spawn grants (and unrelated to sharing via
+        the server API or CLI). Sharing MUTATES access control — it can
+        expose a session to a third party or, via ``__public__``, to
+        anonymous read of the full transcript — and the server can
+        confirm the caller holds manage-level access but cannot
+        distinguish "the owner intended this" from "the agent was
+        prompt-injected into sharing". So it is off unless the spec opts
+        in: ``none`` (default) leaves it unregistered; ``non-public``
+        registers it for granting named users; ``public`` additionally
+        lets it grant ``__public__`` (the tool advertises and enforces
+        that extra tier via ``allow_public``).
 
-        - ``tools.agents`` (declared sub-agents) registers
-          ``sys_session_send`` (named ``(agent, title)`` mode limited
-          to the declared-type enum, plus ``session_id`` mode for
-          driving existing children), ``sys_session_close``, and
-          ``sys_list_models`` (per-worker model availability for
-          picking a valid ``args.model``) — the agent may spawn THE
-          SPECIFIED LIST of sub-agents, nothing else.
-        - ``spawn: true`` (top-level flag) additionally registers
-          ``sys_session_create`` — launching arbitrary children from
-          an existing agent_id or a custom locally-authored bundle
-          (``config_path``). It also registers send/close (an agent
-          must be able to drive and tombstone the children it
-          creates); without declared sub-agents, send's schema omits
-          the named-mode parameters.
+        The spawn-lifecycle tools are a SEPARATE opt-in, gated behind
+        ``tools.agents`` (declared sub-agents) or the top-level
+        ``spawn: true`` flag:
 
-        All writes are child-only, enforced at dispatch/server level;
+        - ``tools.agents`` registers ``sys_session_send`` (named
+          ``(agent, title)`` mode limited to the declared-type enum,
+          plus ``session_id`` mode for driving existing children),
+          ``sys_session_close``, and ``sys_list_models`` (per-worker
+          model availability for picking a valid ``args.model``) — the
+          agent may spawn THE SPECIFIED LIST of sub-agents, nothing else.
+        - ``spawn: true`` additionally registers ``sys_session_create``
+          — launching arbitrary children from an existing agent_id or a
+          custom locally-authored bundle (``config_path``). It also
+          registers send/close (an agent must be able to drive and
+          tombstone the children it creates); without declared
+          sub-agents, send's schema omits the named-mode parameters.
+
+        The spawn writes are child-only and ``sys_session_share`` is
+        owner-authority-bounded, both enforced at dispatch/server level;
         the opt-ins control advertisement, not authority.
         (Cancellation uses the unified ``sys_cancel_task``; inspection
         is via inbox auto-delivery.)
@@ -412,6 +427,20 @@ class ToolManager:
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
         self._tools[SysSessionGetInfoTool.name()] = SysSessionGetInfoTool()
+
+        # Session sharing: opt-in via the dedicated
+        # ``agent_session_sharing`` flag, independent of spawn / declared
+        # sub-agents. ``none`` leaves it unregistered; ``public``
+        # additionally permits __public__ grants (the tool reflects that
+        # in its schema and the runner enforces it). It is its own flag —
+        # not folded into the spawn grant — because letting the agent
+        # expose a session is a distinct authority from spawning
+        # children, and the public tier warrants an explicit extra opt-in
+        # given the prompt-injection exposure.
+        if self._spec.agent_session_sharing is not SharePolicy.NONE:
+            self._tools[SysSessionShareTool.name()] = SysSessionShareTool(
+                allow_public=self._spec.agent_session_sharing is SharePolicy.PUBLIC,
+            )
 
         # send + close: opt-in via declared sub-agents or spawn: true.
         if not (self._spec.tools.agents or self._spec.spawn):
@@ -762,8 +791,31 @@ class ToolManager:
         self._started = True
 
     def shutdown(self) -> None:
-        """Idempotent teardown."""
+        """Idempotent teardown: close OS environment and shut down tools.
+
+        Closes the OS environment that was created during registration
+        (skipped when the environment was pre-resolved from the
+        ``SessionResourceRegistry`` — the registry owns that lifecycle).
+        Then calls ``shutdown()`` on every registered tool so
+        subprocess-backed tools can kill lingering child processes.
+
+        Safe to call multiple times; the second call is a no-op.
+        """
         self._started = False
+
+        os_env = self._os_env
+        if os_env is not None and self._pre_resolved_os_env is None:
+            self._os_env = None
+            try:
+                os_env.close()
+            except Exception:
+                _logger.warning("os_env.close() failed during shutdown", exc_info=True)
+
+        for tool in self._tools.values():
+            try:
+                tool.shutdown()
+            except Exception:
+                _logger.warning("tool %s shutdown failed", tool.name(), exc_info=True)
 
     def get_tool_names(self) -> list[str]:
         """

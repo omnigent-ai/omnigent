@@ -28,6 +28,116 @@ from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.spec import load
 
 
+def _write_codex_auth(path: Path, payload: object) -> None:
+    """Write a test Codex auth.json payload."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _point_codex_auth_check_at(
+    monkeypatch: pytest.MonkeyPatch, auth_path: Path, *, binary_present: bool
+) -> None:
+    """Redirect Codex availability checks away from the real machine state."""
+    monkeypatch.setattr(
+        codex_native,
+        "_resolve_codex_auth_source",
+        lambda: codex_native._CodexAuthSource(auth_path=auth_path),
+    )
+    monkeypatch.setattr(
+        codex_native.shutil,
+        "which",
+        lambda name: f"/tmp/{name}" if binary_present else None,
+    )
+
+
+def test_codex_auth_unavailable_reason_binary_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Missing codex binary reports binary-missing before reading auth.json."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=False)
+
+    assert codex_native._codex_auth_unavailable_reason() == "binary-missing"
+
+
+def test_codex_auth_unavailable_reason_absent_auth_json_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Installed codex without auth.json reports needs-auth."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_chatgpt_tokens_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A real ChatGPT/OAuth auth.json (tokens block) is available.
+
+    Mirrors the openai/codex ``AuthDotJson`` shape: ``auth_mode=chatgpt`` with a
+    ``tokens`` object. There is no top-level expiry field — access-token expiry
+    lives in the JWT and is refreshed via ``refresh_token`` — so presence of the
+    tokens is what marks the credential configured.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    _write_codex_auth(
+        auth_path,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": "header.payload.sig",
+                "access_token": "header.payload.sig",
+                "refresh_token": "opaque-refresh",
+                "account_id": "org_test",
+            },
+            "last_refresh": "2026-06-25T15:04:05Z",
+        },
+    )
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_api_key_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A real API-key auth.json (``auth_mode=api``) is available."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    _write_codex_auth(auth_path, {"auth_mode": "api", "OPENAI_API_KEY": "sk-test"})
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_no_credential_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A parseable auth.json with no credential field reports needs-auth.
+
+    e.g. a stub that records ``auth_mode`` but carries neither an
+    ``OPENAI_API_KEY`` nor a ``tokens`` block — there is nothing to authenticate
+    with, so the picker should warn rather than show Codex as ready.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    _write_codex_auth(auth_path, {"auth_mode": "chatgpt"})
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_malformed_auth_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Installed codex with malformed auth.json reports needs-auth."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.write_text("{not json", encoding="utf-8")
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
 class _FakeTerminalClient:
     """
     Minimal async client for terminal-launch helper tests.
@@ -657,6 +767,156 @@ def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
                 'model="databricks-gpt-5-5"',
                 'model_provider="omnigent_databricks"',
             ),
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("codex_args", "expected"),
+    [
+        # ``--flag value`` pair: both dropped.
+        (("--sandbox", "read-only"), []),
+        (("--ask-for-approval", "on-request"), []),
+        # Option-adjacent: the next token is ANOTHER flag, not this flag's
+        # value, so it must survive (the over-match bug dropped --model).
+        (("--sandbox", "--model", "gpt"), ["--model", "gpt"]),
+        # ``--flag=value`` single token: dropped whole, consumes nothing after.
+        (("--ask-for-approval=on-failure",), []),
+        (("--sandbox=read-only", "--model", "gpt"), ["--model", "gpt"]),
+        # Short aliases: ``-a`` (== --ask-for-approval) triggers the SAME codex
+        # startup abort as the long form, so it must be stripped too; ``-s``
+        # (== --sandbox) is harmless but dropped for consistency. Both spellings
+        # (space-separated and ``=value``-joined) are handled.
+        (("-a", "never"), []),
+        (("-a=never",), []),
+        (("-s", "read-only"), []),
+        (("-s=read-only", "--model", "gpt"), ["--model", "gpt"]),
+        # Short alias option-adjacent to another flag: the next flag survives.
+        (("-a", "--model", "gpt"), ["--model", "gpt"]),
+        # Trailing flag at end-of-list: dropped cleanly, no value to consume.
+        (("--model", "gpt", "--sandbox"), ["--model", "gpt"]),
+        # Unrelated arg next to a stripped pair is preserved.
+        (
+            ("--model", "gpt", "--sandbox", "read-only", "--cwd", "/x"),
+            ["--model", "gpt", "--cwd", "/x"],
+        ),
+        # A pre-existing bypass flag is de-duped (the caller re-adds one copy).
+        (("--dangerously-bypass-approvals-and-sandbox", "--model", "gpt"), ["--model", "gpt"]),
+        # No conflicting flags: everything passes through untouched.
+        (("--model", "gpt-5.4-mini"), ["--model", "gpt-5.4-mini"]),
+    ],
+)
+def test_strip_approval_sandbox_flags_only_consumes_real_values(
+    codex_args: tuple[str, ...],
+    expected: list[str],
+) -> None:
+    """
+    ``_strip_approval_sandbox_flags`` drops the conflicting flags without
+    over-matching the token that follows them.
+
+    A ``--sandbox`` / ``--ask-for-approval`` flag consumes the next token as
+    its value ONLY when that token is a real value (does not start with
+    ``-``); a following flag or end-of-list consumes nothing, so unrelated
+    args like ``--model gpt`` are never swallowed. The ``--flag=value``
+    single-token spelling is dropped whole.
+    """
+    assert codex_native_app_server._strip_approval_sandbox_flags(codex_args) == expected
+
+
+def test_build_codex_remote_args_default_keeps_approval_flags_no_bypass() -> None:
+    """
+    Default (``bypass_sandbox=False``) emits NO bypass flag and preserves the
+    approval/sandbox flags the approval-mode presets pass through.
+
+    The web "Full access" / "Read only" presets are sent as
+    ``--sandbox`` / ``--ask-for-approval`` pairs inside ``codex_args``. With
+    bypass off those must reach the TUI verbatim and the dangerous bypass
+    flag must never appear — a regression here would either drop a user's
+    chosen approval preset or silently escalate to full bypass.
+    """
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=("--sandbox", "read-only", "--ask-for-approval", "on-request"),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+    )
+
+    assert "--dangerously-bypass-approvals-and-sandbox" not in args
+    assert args == [
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "on-request",
+        "--remote",
+        "ws://127.0.0.1:9876",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("codex_args", "thread_id", "expected"),
+    [
+        # Fresh thread, no conflicting flags: a single bypass flag is prepended.
+        (
+            (),
+            None,
+            [
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--remote",
+                "ws://127.0.0.1:9876",
+            ],
+        ),
+        # Conflicting approval-preset flags are stripped (flag + its value),
+        # unrelated args (model) survive, and the bypass flag is added once.
+        # codex aborts if the bypass flag is combined with --sandbox /
+        # --ask-for-approval, so leaving them in would break TUI startup.
+        (
+            ("--sandbox", "danger-full-access", "--ask-for-approval", "never", "--model", "gpt"),
+            None,
+            [
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model",
+                "gpt",
+                "--remote",
+                "ws://127.0.0.1:9876",
+            ],
+        ),
+        # Resume path: the bypass flag is a global flag and MUST precede the
+        # ``resume`` subcommand, and a pre-existing bypass flag is de-duped.
+        (
+            ("--dangerously-bypass-approvals-and-sandbox", "--sandbox", "read-only"),
+            "thread_x",
+            [
+                "--dangerously-bypass-approvals-and-sandbox",
+                "resume",
+                "--remote",
+                "ws://127.0.0.1:9876",
+                "thread_x",
+            ],
+        ),
+    ],
+)
+def test_build_codex_remote_args_bypass_emits_flag_and_strips_conflicts(
+    codex_args: tuple[str, ...],
+    thread_id: str | None,
+    expected: list[str],
+) -> None:
+    """
+    ``bypass_sandbox=True`` emits one ``--dangerously-bypass-approvals-and-
+    sandbox`` and strips the conflicting ``--sandbox`` / ``--ask-for-approval``
+    pairs.
+
+    See :func:`omnigent.codex_native_app_server._strip_approval_sandbox_flags`.
+    Asserting the exact argv guards three things: the bypass flag is present
+    exactly once, the conflicting flag pairs are removed (with their values),
+    and the bypass flag lands before any ``resume`` subcommand (codex rejects
+    a global flag placed after a subcommand).
+    """
+    assert (
+        codex_native_app_server.build_codex_remote_args(
+            codex_args=codex_args,
+            thread_id=thread_id,
+            remote_url="ws://127.0.0.1:9876",
+            bypass_sandbox=True,
         )
         == expected
     )
@@ -7302,6 +7562,84 @@ def test_session_usage_data_without_output_tokens_omits_cumulative_output() -> N
     assert "cumulative_output_tokens" not in data
 
 
+def test_session_usage_data_context_tokens_uses_last_turn_input() -> None:
+    """
+    ``context_tokens`` (the context-ring value) should reflect the LAST
+    turn's input — how much of the window the latest request occupied —
+    not the cumulative total across the whole thread.
+
+    When ``tokenUsage.last`` is present, ``context_tokens`` comes from
+    ``last.inputTokens``; ``cumulative_input_tokens`` still uses
+    ``total.inputTokens`` for cost pricing.
+    """
+    params = {
+        "tokenUsage": {
+            "total": {
+                "inputTokens": 4_800_000,
+                "outputTokens": 200_000,
+                "contextWindow": 1_178_000,
+            },
+            "last": {
+                "inputTokens": 950_000,
+                "outputTokens": 12_000,
+            },
+        },
+    }
+    data = codex_native_forwarder._session_usage_data_from_params(params)
+    assert data is not None
+    # Ring shows current context occupancy from the last turn.
+    assert data["context_tokens"] == 950_000
+    # Cost pricing uses cumulative totals.
+    assert data["cumulative_input_tokens"] == 4_800_000
+    assert data["cumulative_output_tokens"] == 200_000
+    assert data["context_window"] == 1_178_000
+
+
+def test_session_usage_data_context_tokens_falls_back_without_last() -> None:
+    """
+    When ``tokenUsage.last`` is absent (e.g. first frame before a turn
+    completes), ``context_tokens`` falls back to ``total.inputTokens``.
+    """
+    params = {
+        "tokenUsage": {
+            "total": {
+                "inputTokens": 1000,
+                "outputTokens": 250,
+                "contextWindow": 200_000,
+            },
+        },
+    }
+    data = codex_native_forwarder._session_usage_data_from_params(params)
+    assert data is not None
+    assert data["context_tokens"] == 1000
+    assert data["cumulative_input_tokens"] == 1000
+
+
+def test_session_usage_data_context_tokens_falls_back_when_last_missing_input() -> None:
+    """
+    When ``tokenUsage.last`` is present but lacks a usable ``inputTokens``,
+    ``context_tokens`` falls back to ``total.inputTokens`` rather than being
+    omitted (which would leave the UI ring stuck on a stale value from a
+    previous coalescer frame).
+    """
+    params = {
+        "tokenUsage": {
+            "total": {
+                "inputTokens": 3000,
+                "outputTokens": 500,
+                "contextWindow": 200_000,
+            },
+            "last": {
+                "outputTokens": 100,
+                # inputTokens intentionally absent
+            },
+        },
+    }
+    data = codex_native_forwarder._session_usage_data_from_params(params)
+    assert data is not None
+    assert data["context_tokens"] == 3000
+
+
 def test_usage_coalescer_flush_attaches_model_to_every_post() -> None:
     """
     ``flush`` attaches the recorded model to each token-bearing post.
@@ -8735,3 +9073,206 @@ def test_mint_codex_thread_id_is_uuidv7() -> None:
     parsed = _uuid.UUID(minted)
     assert parsed.version == 7
     assert codex_native._CODEX_THREAD_ID_RE.fullmatch(minted)
+
+
+def test_command_execution_appends_sandbox_bypass_guidance_on_namespace_error() -> None:
+    """A codex shell command that fails because codex's own command sandbox
+    cannot start (no unprivileged user namespaces in a hardened container) gets
+    actionable recovery guidance appended, instead of surfacing only the opaque
+    ``bwrap: No permissions to create new namespace`` output (issue #657)."""
+    item = {
+        "command": "/bin/zsh -lc 'echo hi'",
+        "aggregatedOutput": (
+            "bwrap: No permissions to create new namespace, likely because the "
+            "kernel does not allow non-privileged user namespaces.\n"
+        ),
+        "exitCode": 1,
+    }
+    tool_call = codex_native_forwarder._command_execution_tool_call("call_1", item)
+    assert tool_call is not None
+    # The raw bwrap output and the exit code are preserved verbatim...
+    assert "No permissions to create new namespace" in tool_call.output
+    assert "[exit code: 1]" in tool_call.output
+    # ...with actionable recovery guidance appended (the "Full access" preset
+    # and the config sandbox_mode workaround).
+    assert "Full access" in tool_call.output
+    assert "danger-full-access" in tool_call.output
+
+
+def test_command_execution_leaves_normal_output_untouched() -> None:
+    """A successful command keeps its output verbatim — the guidance only fires
+    on the sandbox-namespace failure, never on ordinary output (issue #657)."""
+    item = {"command": "pwd", "aggregatedOutput": "/repo\n", "exitCode": 0}
+    tool_call = codex_native_forwarder._command_execution_tool_call("call_1", item)
+    assert tool_call is not None
+    assert tool_call.output == "/repo\n"
+    assert "Full access" not in tool_call.output
+    assert "danger-full-access" not in tool_call.output
+
+
+def test_forwarder_mirrors_codex_context_compaction(tmp_path: Path) -> None:
+    """
+    Codex context-compaction surfaces as external_compaction_status (#1255).
+
+    A ``contextCompaction`` item/started shows the spinner (in_progress) and
+    the ``thread/compacted`` notification clears it (completed). Both signals
+    were previously dropped, so the web UI never indicated Codex compacted —
+    increasingly relevant with GPT-5.1-Codex-Max auto-compaction.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    forwarder_state = codex_native_forwarder._CodexForwarderState()
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record /events bodies; 202 for events, 200 otherwise."""
+        if request.url.path.endswith("/events"):
+            posted.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": False})
+        return httpx.Response(200, json={})
+
+    async def run() -> None:
+        """Drive a compaction start item then the completion notification."""
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            for event in [
+                {
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": {"type": "contextCompaction", "id": "item_c"},
+                    },
+                },
+                {"method": "thread/compacted", "params": {"threadId": "thread_123"}},
+            ]:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    forwarder_state=forwarder_state,
+                )
+
+    asyncio.run(run())
+
+    compaction = [p for p in posted if p.get("type") == "external_compaction_status"]
+    assert compaction == [
+        {"type": "external_compaction_status", "data": {"status": "in_progress"}},
+        {"type": "external_compaction_status", "data": {"status": "completed"}},
+    ]
+
+
+def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None:
+    """Compaction items emit a Compacted rollout record and discard prior items."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "msg_2",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi there"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "cmp_1",
+            "type": "compaction",
+            "summary": "compaction summary",
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+                {
+                    "type": "compaction",
+                    "encrypted_content": "gAAAA_encrypted",
+                },
+            ],
+            "window_id": 2,
+            "response_id": "compact_1",
+        },
+        {
+            "id": "msg_3",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "after compaction"}],
+            "response_id": "resp_2",
+        },
+    ]
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+    )
+    # Should have: session_meta, compacted, turn_context, response_item (msg_3), event_msg
+    types = [r["type"] for r in records]
+    assert "session_meta" in types
+    assert "compacted" in types
+    # Pre-compaction response_items should be gone
+    pre_compaction_items = [
+        r
+        for r in records
+        if r["type"] == "response_item"
+        and r["payload"].get("content") == [{"type": "input_text", "text": "hello"}]
+    ]
+    assert len(pre_compaction_items) == 0, "Pre-compaction items should be discarded"
+    # The compacted record should have replacement_history and window_id
+    compacted_records = [r for r in records if r["type"] == "compacted"]
+    assert len(compacted_records) == 1
+    cp = compacted_records[0]["payload"]
+    assert cp["window_id"] == 2
+    assert len(cp["replacement_history"]) == 2
+    assert cp["replacement_history"][1]["encrypted_content"] == "gAAAA_encrypted"
+    # Post-compaction message should still be present
+    post_items = [
+        r
+        for r in records
+        if r["type"] == "response_item"
+        and r["payload"].get("content") == [{"type": "input_text", "text": "after compaction"}]
+    ]
+    assert len(post_items) == 1
+
+
+def test_rollout_records_without_compaction_item_has_no_compacted_entry() -> None:
+    """Sessions without compaction produce no Compacted rollout record."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "response_id": "resp_1",
+        },
+    ]
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+    )
+    types = [r["type"] for r in records]
+    assert "compacted" not in types

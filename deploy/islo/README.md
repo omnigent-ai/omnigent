@@ -63,7 +63,7 @@ Sandboxes boot from `ghcr.io/omnigent-ai/omnigent-host:latest`, published
 by CI from the `host` target of
 [`deploy/docker/Dockerfile`](../docker/Dockerfile) with Omnigent and its
 dependencies preinstalled — including the coding-harness CLIs (`claude`,
-`codex`, `pi`), so agents on any harness run without an in-sandbox
+`codex`, `pi`, `kiro-cli`), so agents on any harness run without an in-sandbox
 install.
 
 To use a different image (a fork, or extra tooling baked in), build the
@@ -83,7 +83,7 @@ pulls the image, not Omnigent).
 
 > [!IMPORTANT]
 > **Native terminals need `bubblewrap`.** The `claude-native` /
-> `codex-native` / `pi` harnesses wrap each agent terminal in a bubblewrap
+> `codex-native` / `kiro-native` / `pi` harnesses wrap each agent terminal in a bubblewrap
 > (`bwrap`) OS-sandbox, and on Linux that isolation is mandatory and
 > fail-loud — a host image without the `bwrap` binary makes those terminals
 > fail to start (`linux_bwrap sandbox requires the 'bwrap' binary on PATH`).
@@ -475,14 +475,6 @@ free credits. Rates: [islo.dev](https://islo.dev).
 - **"managed host did not come online within 120s."** Check that
   `server_url` is publicly reachable from Islo's cloud, then inspect the
   in-sandbox host log: `~/.omnigent/logs/host-runner/*.log`.
-- **UI stuck on "Provisioning sandbox…" but a refresh shows the reply.**
-  The host and runner are connected — the browser just isn't receiving live
-  updates. The Web UI streams session state over SSE
-  (`/v1/sessions/{id}/stream`), and some dev tunnels (cloudflared / ngrok
-  quick tunnels) buffer streaming responses. Use an ingress that doesn't
-  buffer SSE, or point your browser directly at the server — `server_url`
-  only needs to be reachable from Islo's cloud for the sandbox dial-back,
-  not from your browser.
 - **Agent has no credentials.** Verify the injected var names match the
   forwarded set above (or are named in `OMNIGENT_RUNNER_ENV_PASSTHROUGH`),
   and that each name was actually set in the launching environment.

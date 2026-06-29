@@ -23,7 +23,7 @@ from omnigent.onboarding import interactive
 
 
 @pytest.fixture()
-def non_tty(monkeypatch):
+def non_tty(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force the interactive module onto its non-TTY numbered fallback.
 
     Patches ``sys.stdin.isatty`` to report ``False`` so :func:`select`
@@ -36,7 +36,7 @@ def non_tty(monkeypatch):
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
 
 
-def _feed(monkeypatch, lines: list[str]) -> None:
+def _feed(monkeypatch: pytest.MonkeyPatch, lines: list[str]) -> None:
     """Route *lines* to ``click.prompt`` as if typed at the console.
 
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -55,7 +55,26 @@ def _feed(monkeypatch, lines: list[str]) -> None:
     monkeypatch.setattr("click.termui.visible_prompt_func", _fake_prompt)
 
 
-def test_select_fallback_returns_chosen_index(non_tty, monkeypatch, capsys) -> None:
+def _feed_hidden(monkeypatch: pytest.MonkeyPatch, lines: list[str]) -> None:
+    """Route *lines* to hidden ``click.prompt`` input without echoing them.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param lines: The hidden lines to feed, one per ``click.prompt`` call.
+    :returns: None.
+    """
+    fed = iter(lines)
+
+    def _fake_prompt(_text: str) -> str:
+        return next(fed)
+
+    monkeypatch.setattr("click.termui.hidden_prompt_func", _fake_prompt)
+
+
+def test_select_fallback_returns_chosen_index(
+    non_tty: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """``select`` non-TTY returns the zero-based index of the typed number.
 
     Feeds ``"2"`` against three options; the fallback must return index
@@ -74,7 +93,11 @@ def test_select_fallback_returns_chosen_index(non_tty, monkeypatch, capsys) -> N
     assert "2. beta" in out
 
 
-def test_select_fallback_reprompts_on_invalid_then_accepts(non_tty, monkeypatch, capsys) -> None:
+def test_select_fallback_reprompts_on_invalid_then_accepts(
+    non_tty: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """``select`` non-TTY rejects an out-of-range pick, then accepts a valid one.
 
     Feeds ``"9"`` (out of range for two options) followed by ``"1"``. The
@@ -95,7 +118,7 @@ def test_select_fallback_reprompts_on_invalid_then_accepts(non_tty, monkeypatch,
     assert "Invalid selection." in out
 
 
-def test_select_rejects_mismatched_descriptions(non_tty) -> None:
+def test_select_rejects_mismatched_descriptions(non_tty: None) -> None:
     """``select`` fails loud when descriptions length differs from options.
 
     A mismatch is a caller bug (the selected description would index out
@@ -106,7 +129,7 @@ def test_select_rejects_mismatched_descriptions(non_tty) -> None:
         interactive.select("Pick", ["a", "b"], descriptions=["only one"])
 
 
-def test_select_empty_options_raises(non_tty) -> None:
+def test_select_empty_options_raises(non_tty: None) -> None:
     """``select`` rejects an empty option list.
 
     There is nothing to choose from, so the function must raise rather
@@ -116,7 +139,11 @@ def test_select_empty_options_raises(non_tty) -> None:
         interactive.select("Pick", [])
 
 
-def test_select_fallback_skips_header_rows_in_numbering(non_tty, monkeypatch, capsys) -> None:
+def test_select_fallback_skips_header_rows_in_numbering(
+    non_tty: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Non-selectable header rows are unnumbered; numbers map to originals.
 
     A grouped tree passes header rows (harness names) interleaved with
@@ -144,7 +171,10 @@ def test_select_fallback_skips_header_rows_in_numbering(non_tty, monkeypatch, ca
     assert "Codex" in out and "3. Codex" not in out
 
 
-def test_select_fallback_default_maps_to_numbered_position(non_tty, monkeypatch) -> None:
+def test_select_fallback_default_maps_to_numbered_position(
+    non_tty: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """An empty enter returns the row at *default* (mapped past headers).
 
     With ``default=2`` (original index of the 2nd selectable row) and a
@@ -161,7 +191,7 @@ def test_select_fallback_default_maps_to_numbered_position(non_tty, monkeypatch)
     assert result == 2
 
 
-def test_select_rejects_mismatched_selectable(non_tty) -> None:
+def test_select_rejects_mismatched_selectable(non_tty: None) -> None:
     """``select`` fails loud when the selectable mask length differs.
 
     A mismatch is a caller bug (the mask would index out of range during
@@ -172,7 +202,7 @@ def test_select_rejects_mismatched_selectable(non_tty) -> None:
         interactive.select("Pick", ["a", "b", "c"], selectable=[True, False])
 
 
-def test_select_rejects_all_header_rows(non_tty) -> None:
+def test_select_rejects_all_header_rows(non_tty: None) -> None:
     """``select`` rejects a mask with no selectable row.
 
     There would be nothing to choose, so the function must raise rather
@@ -215,7 +245,10 @@ def test_first_selectable_falls_to_first_selectable() -> None:
     assert interactive._first_selectable(mask, 3) == 3
 
 
-def test_prompt_text_fallback_returns_typed_value(non_tty, monkeypatch) -> None:
+def test_prompt_text_fallback_returns_typed_value(
+    non_tty: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """``prompt_text`` non-TTY returns the typed string verbatim.
 
     Feeds ``"my-gateway"``; the function must return exactly that. A
@@ -229,7 +262,10 @@ def test_prompt_text_fallback_returns_typed_value(non_tty, monkeypatch) -> None:
     assert result == "my-gateway"
 
 
-def test_prompt_text_fallback_uses_default_on_empty(non_tty, monkeypatch) -> None:
+def test_prompt_text_fallback_uses_default_on_empty(
+    non_tty: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """``prompt_text`` non-TTY returns the default when the user enters nothing.
 
     Feeds an empty line with ``default="databricks"``; the function must
@@ -242,7 +278,60 @@ def test_prompt_text_fallback_uses_default_on_empty(non_tty, monkeypatch) -> Non
     assert result == "databricks"
 
 
-def test_clear_screen_emits_clear_sequence_only_on_a_tty(monkeypatch) -> None:
+def test_prompt_text_fallback_hidden_value_confirms_without_echoing_secret(
+    non_tty: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Hidden ``prompt_text`` feedback confirms paste registration safely."""
+    secret = "sk-test-hidden-secret-1234567890"
+    _feed_hidden(monkeypatch, [secret])
+
+    result = interactive.prompt_text("openai API key", hide_input=True)
+
+    assert result == secret
+    out = capsys.readouterr().out
+    assert "input hidden" in out
+    assert f"received ({len(secret)} characters)" in out
+    assert secret not in out
+
+
+def test_prompt_text_fallback_hidden_empty_input_does_not_confirm(
+    non_tty: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Hidden ``prompt_text`` does not claim an accepted default was pasted."""
+    default = "existing-hidden-secret"
+    _feed_hidden(monkeypatch, [""])
+
+    result = interactive.prompt_text("openai API key", default=default, hide_input=True)
+
+    assert result == default
+    out = capsys.readouterr().out
+    assert "input hidden" in out
+    assert "received" not in out
+    assert default not in out
+
+
+def test_prompt_text_fallback_visible_value_has_no_hidden_feedback(
+    non_tty: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Visible ``prompt_text`` behavior stays unchanged."""
+    value = "plain-provider-name"
+    _feed(monkeypatch, [value])
+
+    result = interactive.prompt_text("Name for this provider", hide_input=False)
+
+    assert result == value
+    out = capsys.readouterr().out
+    assert "input hidden" not in out
+    assert "received" not in out
+
+
+def test_clear_screen_emits_clear_sequence_only_on_a_tty(monkeypatch: pytest.MonkeyPatch) -> None:
     """``clear_screen`` wipes the terminal on a TTY and is a no-op otherwise.
 
     The TTY branch must emit the full clear (screen + scrollback + home) so the
@@ -269,3 +358,109 @@ def test_clear_screen_emits_clear_sequence_only_on_a_tty(monkeypatch) -> None:
     monkeypatch.setattr(sys, "stdout", pipe)
     interactive.clear_screen()
     assert pipe.getvalue() == ""  # no escape sequences leak into non-TTY output
+
+
+def test_render_menu_windows_long_list_to_viewport() -> None:
+    """``max_visible`` renders only the window slice + scroll markers."""
+    options = [f"item-{i}" for i in range(20)]
+    out = interactive._render_menu(
+        "Pick",
+        options,
+        10,
+        descriptions=None,
+        width=80,
+        selectable=[True] * 20,
+        max_visible=5,
+        window_start=8,
+    )
+    # Visible window is options[8:13]; rows outside it are not rendered.
+    for shown in ("item-8", "item-10", "item-12"):
+        assert shown in out
+    assert "item-0" not in out
+    assert "item-19" not in out
+    assert "8 more" in out and "7 more" in out  # ↑/↓ scroll markers
+
+
+def test_render_menu_without_max_visible_renders_all_rows() -> None:
+    """Default (no ``max_visible``) renders every row — no regression."""
+    options = [f"item-{i}" for i in range(20)]
+    out = interactive._render_menu(
+        "Pick", options, 0, descriptions=None, width=80, selectable=[True] * 20
+    )
+    assert "item-0" in out and "item-19" in out
+    assert "more" not in out
+
+
+def test_render_menu_compact_uses_top_level_footer_and_no_title_gap() -> None:
+    """Compact menus hug the title to the list and say Esc exits.
+
+    ``omnigent setup`` uses this for the top-level harness overview: there is
+    no blank spacer below the title, and the footer must read as a compact
+    top-level action (``Esc exit``), not the nested-menu ``Esc back`` copy.
+    """
+    import re
+
+    out = interactive._render_menu(
+        "Configure harnesses",
+        ["Claude    ✓ Subscription", "Quit"],
+        0,
+        descriptions=["", ""],
+        width=80,
+        selectable=[True, True],
+        compact=True,
+    )
+
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    lines = plain.splitlines()
+    title_index = next(i for i, line in enumerate(lines) if "Configure harnesses" in line)
+    assert "❯  Claude" in lines[title_index + 1]
+    assert "↑/↓ nav" in plain
+    assert "Esc exit" in plain
+    assert "Esc back" not in plain
+
+
+def test_render_menu_default_keeps_nested_footer_and_title_gap() -> None:
+    """Non-compact menus keep the older nested-picker spacing and footer copy."""
+    import re
+
+    out = interactive._render_menu(
+        "Pick",
+        ["alpha", "beta"],
+        0,
+        descriptions=["", ""],
+        width=80,
+        selectable=[True, True],
+    )
+
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    lines = plain.splitlines()
+    title_index = next(i for i, line in enumerate(lines) if "Pick" in line)
+    assert lines[title_index + 1] == ""
+    assert "❯  alpha" in lines[title_index + 2]
+    assert "↑/↓ move" in plain
+    assert "Esc back" in plain
+    assert "Esc exit" not in plain
+
+
+def test_render_menu_compact_truncates_long_description_to_one_line() -> None:
+    """Compact selected-row hints stay one physical line on narrow terminals."""
+    import re
+
+    out = interactive._render_menu(
+        "Configure harnesses",
+        ["Hermes    ✗ Not installed", "Quit"],
+        0,
+        descriptions=[
+            "Install with `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`",
+            "",
+        ],
+        width=40,
+        selectable=[True, True],
+        compact=True,
+    )
+
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    hint_lines = [line for line in plain.splitlines() if "Install with" in line]
+    assert len(hint_lines) == 1
+    assert "…" in hint_lines[0]
+    assert len(hint_lines[0]) <= 40

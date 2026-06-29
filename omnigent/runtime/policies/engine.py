@@ -112,6 +112,7 @@ class PolicyEngine:
         initial_labels: dict[str, str],
         initial_session_state: dict[str, Any] | None = None,
         initial_usage: dict[str, float] | None = None,
+        initial_subtree_usage: dict[str, float] | None = None,
         initial_user_daily_cost: dict[str, float | str] | None = None,
         token_pricing: ModelPricing | None = None,
         initial_model: str | None = None,
@@ -145,6 +146,13 @@ class PolicyEngine:
         # persisted usage that predates cache-token tracking.
         self._usage.setdefault("cache_read_input_tokens", 0)
         self._usage.setdefault("cache_creation_input_tokens", 0)
+        # Subtree-scoped usage seed (this conversation + its descendants
+        # only, not the whole session tree). Seeded at build time ONLY when
+        # a ``subagent_cost_budget`` policy is configured — ``None``
+        # otherwise, so sessions without that policy pay no subtree lookup.
+        self._subtree_usage: dict[str, float] | None = (
+            dict(initial_subtree_usage) if initial_subtree_usage is not None else None
+        )
         # The session owner's per-UTC-day cost rollup
         # ({"cost_usd", "ask_approved_usd"}), seeded at build time ONLY
         # when a policy needs it (per-user daily cost-budget configured).
@@ -238,12 +246,17 @@ class PolicyEngine:
            d. Action-list validation and the classifier-only
               carve-out for FunctionPolicy and PromptPolicy.
            e. Accumulate ``set_labels`` writes.
+           f. If the policy returned ``data``, feed it back
+              as ``ctx.content`` so the next policy transforms
+              the already-transformed payload (sequential
+              chaining across the pipeline).
         2. On DENY: short-circuit. Apply accumulated writes
            from any ALLOWing predecessors, then return the
            DENY result (with ``deciding_policy`` set).
         3. After the loop, if any policy ASKed: return an ASK
            result carrying accumulated (but unapplied)
-           writes — the caller applies them only on approve
+           writes and the full ``deciding_policies`` list —
+           the caller applies them only on approve
            (POLICIES.md §7.2).
         4. Otherwise: apply writes, return ALLOW.
 
@@ -267,10 +280,11 @@ class PolicyEngine:
         accumulated: dict[str, str] = {}
         accumulated_state: list[StateUpdate] = []
         ask_reasons: list[str] = []
-        deciding_ask_policy: str | None = None
-        # Last non-None data from any ALLOW-or-ASK policy. If multiple
-        # policies return data, the last one wins — callers that need
-        # chained transforms should compose them in a single callable.
+        deciding_ask_policies: list[str] = []
+        # Sequentially accumulated data: each policy that returns data
+        # has its output fed back into ctx.content so the next policy
+        # in the chain transforms the already-transformed payload rather
+        # than the original. The final value is the fully-composed result.
         composed_data: Any = None
         context = self._context()
 
@@ -281,6 +295,7 @@ class PolicyEngine:
         ctx = self._populate_trajectory(ctx)
         ctx = self._inject_session_state(ctx)
         ctx = self._inject_usage(ctx)
+        ctx = self._inject_subtree_usage(ctx)
         ctx = self._inject_user_daily_cost(ctx)
         ctx = self._inject_model(ctx)
         ctx = self._inject_labels(ctx)
@@ -308,12 +323,14 @@ class PolicyEngine:
                 )
             if result.data is not None:
                 composed_data = result.data
+                # Feed the transformed payload forward so the next policy
+                # in the chain sees this policy's output, not the original.
+                ctx = replace(ctx, content=composed_data)
             if result.action == PolicyAction.ASK:
                 ask_reasons.append(
                     f"{policy.spec.name}: {result.reason or 'approval required'}",
                 )
-                if deciding_ask_policy is None:
-                    deciding_ask_policy = policy.spec.name
+                deciding_ask_policies.append(policy.spec.name)
 
         if ask_reasons:
             # DO NOT apply label writes or state updates here — the ASK
@@ -326,7 +343,7 @@ class PolicyEngine:
                 reason="; ".join(ask_reasons),
                 set_labels=dict(accumulated) if accumulated else None,
                 state_updates=list(accumulated_state) if accumulated_state else None,
-                deciding_policy=deciding_ask_policy,
+                deciding_policies=deciding_ask_policies,
                 data=composed_data,
             )
         if not read_only:
@@ -337,7 +354,6 @@ class PolicyEngine:
             reason=None,
             set_labels=dict(accumulated) if accumulated else None,
             state_updates=list(accumulated_state) if accumulated_state else None,
-            deciding_policy=None,
             data=composed_data,
         )
 
@@ -381,7 +397,7 @@ class PolicyEngine:
             reason=reason,
             set_labels=dict(accumulated) if accumulated else None,
             state_updates=list(accumulated_state) if accumulated_state else None,
-            deciding_policy=deciding_policy,
+            deciding_policies=[deciding_policy],
         )
 
     def _should_fire(
@@ -608,7 +624,17 @@ class PolicyEngine:
                 "cache_read_input_tokens": cache_read_input_tokens,
                 "cache_creation_input_tokens": cache_creation_input_tokens,
             }
-            self._usage["total_cost_usd"] += compute_llm_cost(delta_usage, self._token_pricing)
+            delta_cost = compute_llm_cost(delta_usage, self._token_pricing)
+            self._usage["total_cost_usd"] += delta_cost
+        else:
+            delta_cost = 0.0
+        if self._subtree_usage is not None:
+            self._subtree_usage["input_tokens"] += input_tokens
+            self._subtree_usage["output_tokens"] += output_tokens
+            self._subtree_usage["total_tokens"] += total_tokens
+            self._subtree_usage["cache_read_input_tokens"] += cache_read_input_tokens
+            self._subtree_usage["cache_creation_input_tokens"] += cache_creation_input_tokens
+            self._subtree_usage["total_cost_usd"] += delta_cost
         self._store.set_session_usage(self._conversation_id, dict(self._usage))
 
     def _inject_usage(self, ctx: EvaluationContext) -> EvaluationContext:
@@ -626,6 +652,25 @@ class PolicyEngine:
             set to a defensive copy of the cumulative counters.
         """
         return replace(ctx, usage=dict(self._usage))
+
+    def _inject_subtree_usage(self, ctx: EvaluationContext) -> EvaluationContext:
+        """
+        Return a copy of *ctx* with ``subtree_usage`` populated, when seeded.
+
+        Injects the engine's subtree-scoped cumulative cost so the
+        ``subagent_cost_budget`` policy can gate on the child's own
+        subtree spend rather than the whole session total. When the
+        engine was built without it (``None`` — no policy needs it),
+        *ctx* is returned unchanged.
+
+        :param ctx: Original :class:`EvaluationContext` from the
+            caller.
+        :returns: *ctx* unchanged when no subtree usage was seeded,
+            else a copy with ``subtree_usage`` set to a defensive copy.
+        """
+        if self._subtree_usage is None:
+            return ctx
+        return replace(ctx, subtree_usage=dict(self._subtree_usage))
 
     def _inject_user_daily_cost(self, ctx: EvaluationContext) -> EvaluationContext:
         """
@@ -784,7 +829,7 @@ class PolicyEngine:
         Stateless policies — the default — no-op.
 
         Mirrors the omnigent-native semantics in
-        :meth:`omnigent.inner.policies.PolicyEngine.reset_turn`.
+        :meth:`omnigent.runtime.policies.engine.PolicyEngine.reset_turn`.
         Without this hook, legacy ``max_tool_calls_per_turn``
         callables silently degrade to per-session limits under
         Omnigent mode.

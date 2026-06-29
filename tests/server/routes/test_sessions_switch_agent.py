@@ -180,6 +180,38 @@ class _AgentCacheStub:
         return object()
 
 
+class _LoadedAgentStub:
+    """Loaded-agent stub exposing ``spec.executor.harness_kind``."""
+
+    def __init__(self, harness_kind: str) -> None:
+        class _Executor:
+            def __init__(self, hk: str) -> None:
+                self.harness_kind = hk
+
+        class _Spec:
+            def __init__(self, hk: str) -> None:
+                self.executor = _Executor(hk)
+
+        self.spec = _Spec(harness_kind)
+
+
+class _HarnessAgentCacheStub:
+    """Agent cache stub mapping agent id to harness kind."""
+
+    def __init__(self, harness_by_id: dict[str, str]) -> None:
+        self._harness_by_id = harness_by_id
+
+    def load(
+        self,
+        agent_id: str,
+        bundle_location: str,
+        *,
+        expand_env: bool = False,
+    ) -> _LoadedAgentStub:
+        del bundle_location, expand_env
+        return _LoadedAgentStub(self._harness_by_id[agent_id])
+
+
 # ── Helpers ──────────────────────────────────────────────────────
 
 
@@ -263,7 +295,9 @@ def _patch_family_helpers(
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param same_family: Value ``_same_provider_family`` returns.
-    :param native: Value ``_agent_is_native`` returns.
+    :param native: Value ``_agent_is_native`` /
+        ``_agent_carries_native_fork_history`` return (these switch tests
+        target claude/codex native, which both classify and carry history).
     :param labels: Value ``_presentation_labels_for_agent`` returns.
     :param raise_on_load: Whether the bundle precheck should fail.
     """
@@ -272,6 +306,7 @@ def _patch_family_helpers(
     )
     monkeypatch.setattr(sessions_mod, "_same_provider_family", lambda a, b: same_family)
     monkeypatch.setattr(sessions_mod, "_agent_is_native", lambda a: native)
+    monkeypatch.setattr(sessions_mod, "_agent_carries_native_fork_history", lambda a: native)
     monkeypatch.setattr(sessions_mod, "_presentation_labels_for_agent", lambda a: labels)
 
 
@@ -284,6 +319,8 @@ _CURRENT = _agent("ag_session_scoped", "claude (switch src)", "bundle/claude-sdk
 _BUILTIN_ORIGIN = _agent("ag_builtin_origin", "claude", "bundle/claude-sdk", None)
 _BUILTIN_CLAUDE = _agent("ag_builtin_claude", "claude-native-ui", "bundle/claude-native", None)
 _BUILTIN_CODEX = _agent("ag_builtin_codex", "codex-native-ui", "bundle/codex", None)
+_BUILTIN_CURSOR = _agent("ag_builtin_cursor", "cursor-native-ui", "bundle/cursor", None)
+_BUILTIN_PI = _agent("ag_builtin_pi", "pi-native-ui", "bundle/pi", None)
 
 
 # ── Tests ────────────────────────────────────────────────────────
@@ -375,6 +412,68 @@ async def test_switch_cross_family_resets_model_but_carries_history(
     # rebuilds the transcript from Omnigent items. False here would mean
     # the cross-family gate regressed and the session resumes blank.
     assert call["carry_history_into_native"] is True
+
+
+@pytest.mark.parametrize(
+    "target_agent,target_harness,expected_labels,expected_carry",
+    [
+        # cursor-native has no resumable session file to rebuild → no carry.
+        (
+            _BUILTIN_CURSOR,
+            "cursor-native",
+            {"omnigent.ui": "terminal", "omnigent.wrapper": "cursor-native-ui"},
+            False,
+        ),
+        # pi-native rebuilds its JSONL session file from the copied items →
+        # carry history (parity with claude/codex native).
+        (
+            _BUILTIN_PI,
+            "pi-native",
+            {"omnigent.ui": "terminal", "omnigent.wrapper": "pi-native-ui"},
+            True,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_switch_cursor_pi_native_targets_carry_history_gating(
+    monkeypatch: pytest.MonkeyPatch,
+    target_agent: Agent,
+    target_harness: str,
+    expected_labels: dict[str, str],
+    expected_carry: bool,
+) -> None:
+    """Switching into cursor/pi native keeps terminal UI; carry gates per harness.
+
+    Cross-family from a claude SDK source so ``copy_model_settings`` is always
+    False. ``carry_history_into_native`` is True only for the harness with a
+    rebuildable session file (pi-native), False for cursor-native.
+    """
+    conv_store = _ConversationStore(conversations={"conv_src": _conv()})
+    agent_store = _AgentStore(
+        {
+            "ag_session_scoped": _CURRENT,
+            target_agent.id: target_agent,
+            "ag_builtin_origin": _BUILTIN_ORIGIN,
+        }
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "get_agent_cache",
+        lambda: _HarnessAgentCacheStub(
+            {"ag_session_scoped": "claude_sdk", target_agent.id: target_harness}
+        ),
+    )
+    client = TestClient(_build_app(conv_store, agent_store))
+
+    resp = client.post("/v1/sessions/conv_src/switch-agent", json={"agent_id": target_agent.id})
+
+    assert resp.status_code == 200, resp.text
+    call = conv_store.switch_calls[0]
+    assert call["copy_model_settings"] is False
+    assert call["carry_history_into_native"] is expected_carry, (
+        f"{target_harness} carry_history_into_native should be {expected_carry}."
+    )
+    assert call["presentation_labels"] == expected_labels
 
 
 @pytest.mark.asyncio

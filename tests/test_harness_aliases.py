@@ -5,18 +5,27 @@ from __future__ import annotations
 import pytest
 
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
+from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
 
 
 @pytest.mark.parametrize(
     "alias,canonical",
     [
         ("claude", "claude-sdk"),
+        ("native-pi", "pi-native"),
+        ("native-kiro", "kiro-native"),
         # Docs / runtime-dispatch spelling of the openai-agents harness;
         # specs and OMNIGENT_HARNESSES use "openai-agents".
         ("openai-agents-sdk", "openai-agents"),
         # Canonical names pass through unchanged.
         ("openai-agents", "openai-agents"),
         ("pi", "pi"),
+        # Canonical cursor id passes through unchanged (no alias).
+        ("cursor", "cursor"),
+        # Antigravity SDK harness: user-facing spellings → canonical id.
+        ("agy", "antigravity"),
+        ("google-antigravity", "antigravity"),
+        ("antigravity", "antigravity"),
         # Unknown names return unchanged so callers keep their own errors.
         ("bogus", "bogus"),
         (None, None),
@@ -40,6 +49,10 @@ def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
         ("codex-native", True),
         ("native-claude", True),
         ("native-codex", True),
+        ("pi-native", True),
+        ("native-pi", True),
+        ("kiro-native", True),
+        ("native-kiro", True),
         # SDK harnesses are NOT native — they replay the Omnigent
         # transcript and don't own an on-disk runtime transcript. A
         # regression that classified these as native would wrongly route a
@@ -49,8 +62,11 @@ def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
         ("openai-agents", False),
         ("agents_sdk", False),
         ("codex", False),
+        ("kiro", False),
         # The "claude" shorthand canonicalizes to claude-sdk (not native).
         ("claude", False),
+        # cursor is a headless ACP harness, not a native CLI bridge.
+        ("cursor", False),
         ("some-unknown-harness", False),
         (None, False),
     ],
@@ -58,9 +74,14 @@ def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
 def test_is_native_harness(harness: str | None, expected: bool) -> None:
     """``is_native_harness`` flags only the native CLI harnesses.
 
-    The fork agent-switch gates the native transcript-rebuild path on this:
-    only native targets need a rebuild (SDK targets carry history as
-    context on their own). Misclassifying either way breaks history
-    carry-over on a switch.
+    The runner gates terminal-owned turn sequencing and history replay on
+    this. Misclassifying either way makes native TUI sessions behave like
+    in-process SDK turns, or vice versa.
     """
     assert is_native_harness(harness) is expected
+
+
+def test_kiro_native_is_valid_omnigent_harness_but_plain_kiro_is_not() -> None:
+    """Kiro's native identity is canonical; plain ``kiro`` is not a generic harness."""
+    assert "kiro-native" in OMNIGENT_HARNESSES
+    assert "kiro" not in OMNIGENT_HARNESSES

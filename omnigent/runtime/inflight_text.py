@@ -216,7 +216,7 @@ _native_inflight: dict[str, dict[str, _NativeMessage]] = {}
 # :func:`record_publish` returns a "suppress" verdict for any delta whose
 # message_id is retired, and :func:`omnigent.runtime.session_stream.publish`
 # withholds it from the live fan-out (mirrors the web client's
-# ``retiredLiveMessages`` in ap-web ``chatStore.ts``). Insertion-ordered +
+# ``retiredLiveMessages`` in web ``chatStore.ts``). Insertion-ordered +
 # bounded so a long-lived session can't grow it without limit (vendor
 # message_ids are unique, so an evicted-then-revived id is not a real
 # concern — the race window is a single forwarder poll).

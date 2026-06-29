@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from fastapi import FastAPI
     from mlflow.entities.span import LiveSpan
+    from opentelemetry.sdk._logs.export import LogExporter
     from opentelemetry.sdk.metrics.export import MetricExporter
     from opentelemetry.sdk.trace import ReadableSpan, Span
 
@@ -58,6 +59,7 @@ _W3C_FLAGS_SAMPLED = "01"
 _capture_content: bool = False
 _initialized: bool = False
 _metrics_initialized: bool = False
+_logs_initialized: bool = False
 
 
 class _RemoteParentTraceState:
@@ -285,10 +287,15 @@ def trace_id_from_response_id(response_id: str) -> str:
     if not response_id.startswith(_RESP_PREFIX):
         raise ValueError(f"Expected {_RESP_PREFIX!r} prefix, got {response_id!r}")
     hex_part = response_id[len(_RESP_PREFIX) :]
-    if len(hex_part) != _HEX_LEN:
+    if len(hex_part) > _HEX_LEN:
         raise ValueError(
-            f"Expected {_HEX_LEN} hex chars after prefix, got {len(hex_part)} in {response_id!r}"
+            f"Expected at most {_HEX_LEN} hex chars after prefix, "
+            f"got {len(hex_part)} in {response_id!r}"
         )
+    # Zero-pad short hex suffixes (e.g. 24-char harness-allocated
+    # IDs) to a valid 128-bit W3C trace ID. The padding preserves
+    # uniqueness — the original hex is a prefix of the trace ID.
+    hex_part = hex_part.ljust(_HEX_LEN, "0")
     try:
         int(hex_part, 16)
     except ValueError as exc:
@@ -551,6 +558,108 @@ def _init_otel_metrics() -> None:
         _metrics_initialized = True
 
 
+def _logs_exporter_name() -> str:
+    """
+    Return the configured OpenTelemetry logs exporter name.
+
+    ``OTEL_LOGS_EXPORTER`` is the standard OpenTelemetry knob. If
+    it is unset and an OTLP endpoint is configured, Omnigent uses
+    ``"otlp"`` so log records flow alongside traces and metrics.
+
+    :returns: Exporter name, e.g. ``"otlp"`` or ``"none"``.
+    """
+    configured = os.environ.get("OTEL_LOGS_EXPORTER")
+    if configured is not None:
+        return configured.strip().lower()
+    if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip():
+        return "otlp"
+    return "none"
+
+
+def _create_otlp_log_exporter() -> LogExporter:
+    """
+    Create an OTLP log exporter using standard OTEL environment vars.
+
+    :returns: OTLP log exporter configured from the process
+        environment.
+    :raises ValueError: If ``OTEL_EXPORTER_OTLP_PROTOCOL`` is not
+        supported.
+    """
+    protocol = _otlp_protocol()
+    if protocol == "http/protobuf":
+        from opentelemetry.exporter.otlp.proto.http._log_exporter import (
+            OTLPLogExporter,
+        )
+
+        return OTLPLogExporter()
+    from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
+        OTLPLogExporter,
+    )
+
+    return OTLPLogExporter()
+
+
+def _init_otel_logs() -> None:
+    """
+    Initialize the OpenTelemetry LoggerProvider when configured.
+
+    Bridges Python ``logging`` to OTel so logs emitted inside an
+    active span carry ``trace_id`` and ``span_id`` automatically.
+    No-op when no OTLP endpoint is configured or
+    ``OTEL_LOGS_EXPORTER=none`` is set.
+
+    Mirrors :func:`_init_otel_metrics`: a ``LoggerProvider`` is
+    registered globally, an OTLP log exporter is attached via a
+    ``BatchLogRecordProcessor``, and a ``LoggingHandler`` is
+    installed on the root logger so any ``logging.getLogger`` call
+    in the runtime flows through the bridge.
+    """
+    global _logs_initialized
+
+    if _logs_initialized:
+        return
+
+    exporter_name = _logs_exporter_name()
+    if exporter_name == "none":
+        _logs_initialized = True
+        return
+    if exporter_name != "otlp":
+        _logger.warning(
+            "unsupported OTEL_LOGS_EXPORTER=%s; log bridge disabled",
+            exporter_name,
+        )
+        _logs_initialized = True
+        return
+
+    try:
+        from opentelemetry._logs import set_logger_provider
+        from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+        from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+        from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+
+        service_name = os.environ.get("OTEL_SERVICE_NAME", "omnigent")
+        provider = LoggerProvider(
+            resource=Resource.create({SERVICE_NAME: service_name}),
+        )
+        exporter = _create_otlp_log_exporter()
+        provider.add_log_record_processor(BatchLogRecordProcessor(exporter))
+        set_logger_provider(provider)
+
+        handler = LoggingHandler(logger_provider=provider)
+        root_logger = logging.getLogger()
+        # Mark the handler so re-init does not stack duplicates on
+        # the root logger when init() runs again after a flag reset.
+        handler.set_name("omnigent-otel-log-bridge")
+        for existing in root_logger.handlers:
+            if existing.get_name() == "omnigent-otel-log-bridge":
+                root_logger.removeHandler(existing)
+        root_logger.addHandler(handler)
+        _logs_initialized = True
+    except Exception:
+        _logger.exception("failed to initialize OpenTelemetry logs")
+        _logs_initialized = True
+
+
 def init() -> None:
     """
     Initialize MLflow Tracing for the omnigent runtime.
@@ -603,6 +712,14 @@ def init() -> None:
         import mlflow.tracing
 
         mlflow.tracing.enable()
+
+        # Enable the inner tracing module so TracingContext spans are
+        # created for every agent turn. Without this, telemetry.init()
+        # sets up the OTel provider but no spans are emitted because the
+        # per-session tracing flag stays False.
+        from omnigent.inner.tracing import enable_tracing
+
+        enable_tracing()
     except ImportError:
         # mlflow is an optional dependency (`omnigent[tracing]`). When it
         # is absent, tracing is simply disabled — degrade quietly rather
@@ -614,6 +731,7 @@ def init() -> None:
         _logger.exception("failed to initialize MLflow tracing")
 
     _init_otel_metrics()
+    _init_otel_logs()
 
     # NOTE: FastAPI auto-instrumentation remains opt-in via
     # ``OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION=true``. MLflow's span

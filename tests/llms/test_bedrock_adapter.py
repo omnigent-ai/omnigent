@@ -396,3 +396,155 @@ def test_string_user_content_becomes_text_block() -> None:
     messages = [{"role": "user", "content": "Hello"}]
     converse_msgs, _ = _messages_to_converse(messages)
     assert converse_msgs[0]["content"] == [{"text": "Hello"}]
+
+
+# ── Streaming chunk helpers ──────────────────────────────
+
+
+def test_stream_text_chunk_structure() -> None:
+    """_stream_text_chunk builds a valid Chat Completions text delta chunk."""
+    from omnigent.llms.adapters.bedrock import _stream_text_chunk
+
+    chunk = _stream_text_chunk("bedrock-model", "Hello")
+    assert chunk["model"] == "bedrock-model"
+    assert chunk["object"] == "chat.completion.chunk"
+    assert chunk["choices"][0]["delta"]["content"] == "Hello"
+    assert chunk["choices"][0]["finish_reason"] is None
+
+
+def test_stream_stop_chunk_structure() -> None:
+    """_stream_stop_chunk builds a valid stop chunk."""
+    from omnigent.llms.adapters.bedrock import _stream_stop_chunk
+
+    chunk = _stream_stop_chunk("bedrock-model", "stop")
+    assert chunk["choices"][0]["finish_reason"] == "stop"
+    assert chunk["choices"][0]["delta"] == {}
+
+
+def test_stream_stop_chunk_tool_calls() -> None:
+    """_stream_stop_chunk for tool_use produces tool_calls finish reason."""
+    from omnigent.llms.adapters.bedrock import _stream_stop_chunk
+
+    chunk = _stream_stop_chunk("bedrock-model", "tool_calls")
+    assert chunk["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_stream_usage_chunk_structure() -> None:
+    """_stream_usage_chunk builds a valid usage chunk."""
+    from omnigent.llms.adapters.bedrock import _stream_usage_chunk
+
+    usage = {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}
+    chunk = _stream_usage_chunk("bedrock-model", usage)
+    assert chunk["usage"]["prompt_tokens"] == 10
+    assert chunk["usage"]["completion_tokens"] == 5
+    assert chunk["usage"]["total_tokens"] == 15
+
+
+# ── None content becomes empty blocks ────────────────────
+
+
+def test_none_content_becomes_empty_blocks() -> None:
+    """None content yields empty content block list."""
+    from omnigent.llms.adapters.bedrock import _content_to_converse_blocks
+
+    assert _content_to_converse_blocks(None) == []
+
+
+# ── Unrecognized part becomes text placeholder ───────────
+
+
+def test_unrecognized_part_becomes_text_placeholder() -> None:
+    """Unrecognized content part types render as text placeholder."""
+    result = _translate_part_to_converse({"type": "input_audio", "data": "base64"})
+    assert result == {"text": "[unsupported content: input_audio]"}
+
+
+# ── file_data without data URI raises ────────────────────
+
+
+def test_file_data_without_data_uri_raises() -> None:
+    """input_file without a data: URI prefix raises ValueError."""
+    part = {
+        "type": "input_file",
+        "file_data": "https://example.com/file.pdf",
+    }
+    with pytest.raises(ValueError, match="data: URI"):
+        _translate_part_to_converse(part)
+
+
+# ── file_data without filename ───────────────────────────
+
+
+def test_file_data_without_filename() -> None:
+    """input_file without filename omits name from document block."""
+    part = {
+        "type": "input_file",
+        "file_data": "data:application/pdf;base64,JVBERi0xLjQK",
+    }
+    result = _translate_part_to_converse(part)
+    assert "name" not in result["document"]
+
+
+# ── Non-function tools skipped ───────────────────────────
+
+
+def test_non_function_tools_skipped() -> None:
+    """Non-function tool types are filtered out."""
+    tools = [
+        {"type": "not_function", "whatever": {}},
+        {"type": "function", "function": {"name": "fn", "parameters": {}}},
+    ]
+    result = _convert_tools(tools)
+    assert len(result) == 1
+    assert result[0]["toolSpec"]["name"] == "fn"
+
+
+# ── Tool without description ─────────────────────────────
+
+
+def test_tool_without_description_omits_description() -> None:
+    """Tool specs without description omit the field."""
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "fn", "parameters": {}},
+        }
+    ]
+    result = _convert_tools(tools)
+    assert "description" not in result[0]["toolSpec"]
+
+
+# ── System prompts None when absent ──────────────────────
+
+
+def test_no_system_messages_returns_none_system() -> None:
+    """No system messages -> system_prompts is None."""
+    messages = [{"role": "user", "content": "Hi"}]
+    _, system_prompts = _messages_to_converse(messages)
+    assert system_prompts is None
+
+
+# ── Converse response with empty content ─────────────────
+
+
+def test_converse_response_no_content() -> None:
+    """Response with no text or tool content yields None content and empty tool_calls."""
+    response = {
+        "output": {"message": {"role": "assistant", "content": []}},
+        "stopReason": "end_turn",
+        "usage": {},
+    }
+    chat = _converse_to_chat(response, "bedrock-model")
+    assert chat["choices"][0]["message"]["content"] is None
+    assert chat["choices"][0]["message"]["tool_calls"] is None
+
+
+# ── max_completion_tokens alias ──────────────────────────
+
+
+def test_max_completion_tokens_alias() -> None:
+    """max_completion_tokens is an alias for max_tokens in inference config."""
+    messages = [{"role": "user", "content": "Hi"}]
+    extra = {"max_completion_tokens": 2048}
+    kwargs = _build_converse_kwargs(messages, "model-id", None, extra)
+    assert kwargs["inferenceConfig"]["maxTokens"] == 2048

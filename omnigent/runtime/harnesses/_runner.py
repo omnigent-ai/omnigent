@@ -50,6 +50,9 @@ from types import FrameType
 import uvicorn
 from fastapi import FastAPI
 
+from omnigent._platform import IS_WINDOWS
+from omnigent.inner import _proc
+
 # uvicorn log level for harness subprocesses. ``"warning"`` keeps
 # the per-process noise low (AP and the harness wrap both emit
 # their own structured logs); set to ``"info"`` if you need to
@@ -154,6 +157,14 @@ def _load_harness_app(harness: str, module_path: str, conversation_id: str) -> F
     # state containers (per §Harness in-memory state) key off this.
     app.state.conversation_id = conversation_id
     app.state.harness = harness
+    # S1 (security): the per-spawn bearer token the parent (process_manager)
+    # presents on every ``/v1`` request, delivered via the private spawn env
+    # (``OMNIGENT_HARNESS_AUTH_TOKEN``); the scaffold's auth check compares
+    # against it. Set only on Windows (where the IPC is a loopback-TCP listener);
+    # ``None`` on POSIX (uid-isolated UDS) and when the app is built outside the
+    # runner (e.g. unit tests calling create_app() directly), which both leave
+    # the gate inert.
+    app.state.harness_auth_token = os.environ.get("OMNIGENT_HARNESS_AUTH_TOKEN")
     return app
 
 
@@ -227,19 +238,36 @@ def _start_parent_watchdog(parent_pid: int) -> threading.Thread:
     def _watch() -> None:
         while True:
             time.sleep(_PARENT_POLL_INTERVAL_S)
-            if os.getppid() != parent_pid:
+            # On POSIX a changed getppid (reparented to init) is a PID-reuse-
+            # proof death signal. On Windows there is no reparenting and
+            # os.getppid() is unreliable (the venv launcher breaks the parent
+            # link), so it would falsely report the parent gone the instant
+            # the watchdog starts; rely solely on the explicit liveness probe.
+            if not IS_WINDOWS and os.getppid() != parent_pid:
                 _request_shutdown_with_hard_exit("parent process exit")
                 return
-            try:
-                os.kill(parent_pid, 0)
-            except ProcessLookupError:
+            # Secondary probe for the window before POSIX reparenting is
+            # visible. POSIX uses ``os.kill(parent_pid, 0)``: race-free and a
+            # not-yet-reaped parent still counts as alive (matches
+            # ``_pid_alive``). The psutil probe can transiently raise
+            # ``NoSuchProcess`` for a live process and spuriously trip this
+            # shutdown — a hard exit that skips graceful terminal teardown and
+            # leaks the runner's detached tmux servers. Windows can't use
+            # signal 0 (maps to TerminateProcess and would kill the parent), so
+            # it keeps ``process_alive`` there.
+            if IS_WINDOWS:
+                parent_gone = not _proc.process_alive(parent_pid)
+            else:
+                try:
+                    os.kill(parent_pid, 0)
+                    parent_gone = False
+                except ProcessLookupError:
+                    parent_gone = True
+                except PermissionError:
+                    parent_gone = False
+            if parent_gone:
                 _request_shutdown_with_hard_exit("parent process exit")
                 return
-            except PermissionError:
-                # Process exists but we can't signal it — treat
-                # as alive (same semantics as ``_pid_alive`` in
-                # ``process_manager.py``).
-                pass
 
     t = threading.Thread(target=_watch, name="harness-parent-watchdog", daemon=True)
     t.start()
@@ -288,8 +316,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--socket",
-        required=True,
-        help="Absolute Unix socket path to bind.",
+        default=None,
+        help="Absolute Unix socket path to bind (POSIX). Mutually exclusive with --bind.",
+    )
+    parser.add_argument(
+        "--bind",
+        default=None,
+        help=(
+            "TCP loopback endpoint 'host:port' to bind (Windows, which has no "
+            "usable filesystem UDS). Mutually exclusive with --socket."
+        ),
     )
     parser.add_argument(
         "--conversation-id",
@@ -317,20 +353,39 @@ def main(argv: list[str] | None = None) -> None:
         the live process arguments. Tests pass an explicit list.
     """
     args = _parse_args(argv if argv is not None else sys.argv[1:])
+
+    # Initialize MLflow tracing in the harness subprocess so
+    # ExecutorAdapter can emit spans for agent turns, tool calls,
+    # and LLM interactions. No-op when OTEL_EXPORTER_OTLP_ENDPOINT
+    # is unset or mlflow is not installed.
+    try:
+        from omnigent.runtime import telemetry
+
+        telemetry.init()
+    except Exception:
+        pass  # mlflow not installed or init failed; tracing disabled
+
     app = _load_harness_app(args.harness, args.module, args.conversation_id)
     if args.parent_pid is not None:
         _set_pdeathsig()
         _start_parent_watchdog(args.parent_pid)
-    # ``uds=`` binds to the Unix socket path Omnigent allocated for this
-    # conversation. ``log_level`` keeps per-process noise low — see
-    # ``_UVICORN_LOG_LEVEL`` constant.
-    # ``timeout_graceful_shutdown`` bounds how long uvicorn waits
-    # for active connections after SIGTERM before force-exiting.
+    # Bind the endpoint Omnigent allocated for this conversation: a Unix socket
+    # path (``--socket``, POSIX) or a TCP loopback host:port (``--bind``,
+    # Windows). ``log_level`` keeps per-process noise low — see
+    # ``_UVICORN_LOG_LEVEL``. ``timeout_graceful_shutdown`` bounds how long
+    # uvicorn waits for active connections after SIGTERM before force-exiting.
+    if args.socket:
+        bind_kwargs: dict[str, object] = {"uds": args.socket}
+    elif args.bind:
+        host, _, port = args.bind.rpartition(":")
+        bind_kwargs = {"host": host, "port": int(port)}
+    else:
+        sys.exit("runner: exactly one of --socket or --bind is required")
     config = uvicorn.Config(
         app,
-        uds=args.socket,
         log_level=_UVICORN_LOG_LEVEL,
         timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        **bind_kwargs,
     )
     _HardExitServer(config).run()
 

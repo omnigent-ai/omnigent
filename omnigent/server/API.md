@@ -471,7 +471,7 @@ Fields:
     means no override is active and the bound agent's spec model
     applies. Persisted on `conversations.model_override`; set via
     `PATCH /v1/sessions/{id}` (also the path the REPL's `/model`
-    command uses) so the ap-web picker and the TUI stay in sync.
+    command uses) so the web picker and the TUI stay in sync.
 
   cost_control_mode_override (string or null)
     Per-session cost-control switch: `"on"` activates the spec's
@@ -692,7 +692,7 @@ When liveness is wired, each list item includes two orthogonal signals
 ### Get Session (Snapshot)
 
 ```
-GET /v1/sessions/{session_id}[?include_items=true&include_liveness=true]
+GET /v1/sessions/{session_id}[?include_items=true&include_liveness=true&refresh_state=false]
 
 200 OK — body matches the `SessionResponse` shape above.
 404 Not Found — no session with that id
@@ -716,6 +716,13 @@ Contract" below.
     `runner_online`/`host_online` stay unset. For callers that source
     liveness from the `/health` poll and the live stream (the web
     chat surface), the snapshot's copy is redundant.
+
+  refresh_state (query param, boolean, default `false`)
+    When `true`, runner-derived snapshot overlays (for example skills
+    and Codex-native model options) are refreshed from the bound runner
+    instead of served from AP-process memory. Browser reload/bind
+    requests use this so a page refresh pierces stale capability
+    caches after a server-side bug fix.
 
 When runner liveness is wired (and not skipped via
 `include_liveness=false`), the snapshot includes:
@@ -758,6 +765,7 @@ Content-Type: application/json
   "labels": {"env": "test"},
   "reasoning_effort": "high",
   "model_override": "claude-opus-4-7",
+  "collaboration_mode": "plan",
   "external_session_id": "a1b2c3d4-1234-5678-9abc-def012345678"
 }
 ```
@@ -790,6 +798,14 @@ Request body:
     strings fail with 400 rather than silently clearing.
     Leaves the column unchanged when omitted or `null`.
 
+  collaboration_mode (string, optional)
+    Codex-native collaboration-mode string. `"plan"` enters Plan mode;
+    `"default"` returns to Default mode. Only valid for sessions whose
+    wrapper label is `codex-native-ui`. Explicit toggles are forwarded
+    to the live runner as `plan_mode_change` before the label is
+    persisted; if no live runner or loaded Codex bridge can apply the
+    change, the request fails and the stored mode is left unchanged.
+
   cost_control_mode_override (string or null, optional)
     Per-session cost-control switch: `"on"` activates the spec's
     configured cost-control mode, `"off"` disables cost control for
@@ -809,8 +825,9 @@ Request body:
 200 OK - body matches the `SessionResponse` shape above, with
 `runner_id` set to the newly bound value when `runner_id` was present.
 
-400 Bad Request - runner is not currently registered; or
-`external_session_id` would overwrite a different existing value
+400 Bad Request - runner is not currently registered; `collaboration_mode`
+is used on a non-Codex-native session; or `external_session_id` would
+overwrite a different existing value
 404 Not Found - no session with that id
 
 This is the mutable affinity primitive for Alpha. The same endpoint
@@ -818,6 +835,11 @@ serves create-bind, resume-bind, and recover-bind: the client starts a
 runner, waits for registration, then PATCHes the session to the new
 runner id. The write replaces any previous value in
 `conversations.runner_id`; no history table is maintained.
+
+### Codex-specific APIs
+
+Codex-native session routes, including the Codex Goal subresource, are
+documented in [codex-API.md](codex-API.md).
 
 ### Post Event
 
@@ -907,6 +929,18 @@ Request body matches `SessionEventInput`:
                                   omitted when unpriced. The same value is seeded
                                   on the session snapshot as `total_cost_usd`
                                   (`null` when unpriced).
+      - "external_reasoning_effort_change"
+                                — internal terminal-observed thinking-level
+                                  update from a native forwarder. Persists
+                                  `reasoning_effort` and publishes a
+                                  `session.reasoning_effort` event. Payload:
+                                  `{reasoning_effort: string | null}`; `null`
+                                  clears to the model default.
+      - "external_codex_collaboration_mode_change"
+                                — internal Codex app-server collaboration-mode
+                                  update. Persists the mode kind as label
+                                  `omnigent.codex_native.collaboration_mode`.
+                                  Payload: `{mode: "default" | "plan"}`.
       - "external_compaction_status"
                                 — internal terminal-observed compaction
                                   edge from the claude-native forwarder
@@ -1050,12 +1084,22 @@ Request body matches `SessionForkRequest`:
     source's full native transcript. When null or omitted, the full
     history is copied.
 
+  model_override (string | null, optional)
+    Model id to launch the fork on ("restart with model"), e.g.
+    "databricks-gpt-5-4-mini". Overrides the model the fork would
+    otherwise inherit from the source; the value is validated and
+    family-checked against the fork's harness (a cross-family id —
+    e.g. a Claude model on a codex fork — is rejected with 400).
+    When null or omitted, the fork keeps the source's model (within
+    the same provider family).
+
 201 Created — body matches `SessionResponse` (status "idle",
   items are the deep-copied items from the source session).
 
 400 Bad Request — source session is a sub-agent session, has
-  no agent binding, or up_to_response_id names no response in
-  the source session
+  no agent binding, up_to_response_id names no response in
+  the source session, or model_override is invalid / not in the
+  fork harness's provider family
 404 Not Found — no session with that source_id, or the source's
   agent row is missing
 ```
@@ -1137,6 +1181,8 @@ stream and surface queue/interrupt semantics.
 | Event | Pydantic class | Wire shape (illustrative) |
 |---|---|---|
 | `session.status` | `SessionStatusEvent` | `{type, conversation_id, status: "running" \| "waiting" \| "idle" \| "failed"}` |
+| `session.reasoning_effort` | `SessionReasoningEffortEvent` | `{type, conversation_id, reasoning_effort: string \| null}` |
+| `session.collaboration_mode` | `SessionCollaborationModeEvent` | `{type, conversation_id, mode: string}` |
 | `session.input.consumed` | `SessionInputConsumedEvent` | `{type, data: {queued_item_id, type, data, position}}` (nested envelope) |
 | `session.interrupted` | `SessionInterruptedEvent` | `{type, data: {requested_at, queued_item_id?: null}}` (nested envelope) |
 | `session.created` | `SessionCreatedEvent` | `{type, conversation_id: <parent>, child_conversation_id, agent_id, ...}` — emitted on the PARENT session's stream when a sub-agent is spawned. |

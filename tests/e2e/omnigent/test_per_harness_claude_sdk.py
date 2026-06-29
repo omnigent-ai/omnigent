@@ -1,17 +1,14 @@
 """Phase 0 characterization test — claude-sdk harness, one-shot prompt.
 
 Runs ``omnigent run hello_world.yaml --harness claude-sdk -p
-"..."`` as a real subprocess and snapshots the structural
-observations (exit code, stderr absence, assistant text length).
-Captured against current Omnigent; re-run unchanged in later
-phases to prove the integration preserves behavior.
+"..."`` as a real subprocess against the mock LLM server and
+snapshots the structural observations (exit code, stderr absence,
+assistant text length).
 
 **What breaks if this fails:**
 - Omnigent' ``ClaudeSDKExecutor`` regresses (auth, MCP tool
   bridging, Claude Code binary discovery, or the message-stream
   translation in ``claude_sdk_executor.run_turn``).
-- ``_read_databrickscfg``'s PAT path regresses (the profile
-  token becomes unreadable).
 - ``omnigent.cli._run_agent`` for the ``-p`` one-shot path
   stops printing the assistant text to stdout on turn complete.
 - The Claude Agent SDK dependency or the ``claude`` CLI binary
@@ -19,24 +16,30 @@ phases to prove the integration preserves behavior.
 
 Design reference: ``designs/OMNIGENT_INTEGRATION.md`` §Phase 0
 per-harness suite.
+
+**Serial execution note:** These tests are designed for serial
+execution — do NOT run them under pytest-xdist or any parallel
+runner that shares the mock LLM server process. Each test uses a
+UUID-keyed model name, so concurrent tests use separate queues and
+queue cross-contamination is impossible even without ``reset_mock_llm``.
+The ``reset_mock_llm`` call is kept as a safety guard to clear any
+leftover state from prior test runs in the same session, but it
+would wipe another test's queue if two tests ran simultaneously.
 """
 
 from __future__ import annotations
 
 import subprocess
+import uuid
 from pathlib import Path
 from shutil import which
 from typing import Any
 
 import pytest
 
-from tests._model_pools import resolve_model
 from tests.e2e.omnigent._snapshot import compare_snapshot
+from tests.e2e.omnigent.conftest import configure_mock_llm, reset_mock_llm
 
-# Model + harness are hardcoded because the test name
-# advertises "claude-sdk harness". A per-harness characterization
-# test is meaningless without pinning the harness it covers.
-_MODEL = resolve_model("databricks-claude-sonnet-4-6", key=__name__)
 _HARNESS = "claude-sdk"
 _PROMPT = "say hi in 5 words"
 
@@ -87,46 +90,55 @@ def claude_sdk_available(omnigent_python: Path) -> bool:
 def test_per_harness_claude_sdk_one_shot(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
-    patched_databrickscfg: None,
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
     claude_sdk_available: bool,
 ) -> None:
     """
     ``omnigent run hello_world.yaml --harness claude-sdk -p
     <prompt>`` exits 0 and emits a non-trivial assistant reply.
 
-    Uses the ``patched_databrickscfg`` fixture to swap the
-    active profile's section to a PAT for the duration of the
-    test — necessary because ``ClaudeSDKExecutor`` reads the
-    profile's ``token`` field directly and OAuth profiles
-    produce 403s. This workaround is documented in the
-    integration design doc and disappears once omnigent'
-    ``_read_databrickscfg`` rewrite (audit item for phase 1)
-    lands.
+    Uses the mock LLM server via ``ANTHROPIC_BASE_URL`` so the
+    test runs without real Anthropic credentials. The mock server
+    handles ``/v1/messages`` (the Anthropic-native endpoint) so
+    the ClaudeSDKExecutor's requests are intercepted and answered
+    with canned responses.
 
     :param omnigent_python: Interpreter with omnigent +
         claude-agent-sdk installed.
     :param omnigent_repo_root: Cwd for the subprocess.
-    :param omnigent_credentials_env: Env vars with
-        ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` /
-        ``DATABRICKS_CONFIG_PROFILE`` already populated from
-        ``--llm-api-key``.
-    :param patched_databrickscfg: Fixture that rewrites
-        ``~/.databrickscfg`` to PAT form for the test and
-        restores it on teardown.
+    :param mock_credentials_env: Env vars from the mock-LLM
+        fixture (provides ``OPENAI_BASE_URL``; we add
+        ``ANTHROPIC_BASE_URL`` and ``ANTHROPIC_API_KEY`` below).
+    :param mock_llm_server_url: Base URL of the mock server for
+        configuring canned responses and building
+        ``ANTHROPIC_BASE_URL``.
     :param claude_sdk_available: True when the claude-sdk
         prerequisites (SDK package + ``claude`` binary) are
-        present. If False, the test fails with an explicit
-        reason rather than silently skipping — per the phase 0
-        design, skip reasons must be explicit and environment
-        gaps must be visible.
+        present. If False, the test skips — the ``claude`` binary
+        is a genuine proprietary CLI that CI commonly lacks.
     """
     if not claude_sdk_available:
-        pytest.fail(
+        pytest.skip(
             "claude-sdk harness prerequisites missing: both the "
             "'claude_agent_sdk' Python package and the 'claude' CLI "
-            "binary must be present on PATH."
+            "binary must be present on PATH. Skipping — binary absent."
         )
+
+    model = f"mock-harness-claude-sdk-{uuid.uuid4().hex[:8]}"
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "Hello there, how are you today?"}],
+        key=model,
+    )
+
+    # Build env: start from the mock env and add Anthropic-specific
+    # vars so ClaudeSDKExecutor's /v1/messages calls land on the
+    # mock server rather than api.anthropic.com.
+    env = dict(mock_credentials_env)
+    env["ANTHROPIC_BASE_URL"] = mock_llm_server_url
+    env["ANTHROPIC_API_KEY"] = "mock-key"
 
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
 
@@ -138,7 +150,7 @@ def test_per_harness_claude_sdk_one_shot(
             "run",
             str(yaml_path),
             "--model",
-            _MODEL,
+            model,
             "--harness",
             _HARNESS,
             "-p",
@@ -146,7 +158,7 @@ def test_per_harness_claude_sdk_one_shot(
             "--no-log",
             "--no-session",
         ],
-        env=omnigent_credentials_env,
+        env=env,
         cwd=str(omnigent_repo_root),
         capture_output=True,
         text=True,
@@ -176,8 +188,7 @@ def test_per_harness_claude_sdk_one_shot(
     }
 
     # Full stderr surfaced on failure so CI logs show WHY the
-    # run went wrong (e.g. 403 auth, missing binary) — stderr
-    # here is opaque unless we dump it.
+    # run went wrong — stderr here is opaque unless we dump it.
     diffs = compare_snapshot("test_per_harness_claude_sdk", observed)
     assert diffs == [], (
         "Snapshot mismatch for claude-sdk run:\n"

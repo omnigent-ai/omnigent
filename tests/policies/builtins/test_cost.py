@@ -6,8 +6,9 @@ The policy's hard limit gates both the ``request`` and ``tool_call``
 phases: once reached, DENY (the whole turn on ``request``, or each tool
 call on ``tool_call``) while the session is still on an expensive model
 (forcing a ``/model`` downgrade), ALLOW once it has switched to a cheaper
-one. The soft warning checkpoints ASK on ``tool_call`` only (the
-request-phase path has no approval round-trip).
+one. The soft warning checkpoints ASK on BOTH the ``request`` and
+``tool_call`` phases (each has a server-side approval round-trip that
+persists the crossed checkpoint on accept).
 
 Layers:
 
@@ -412,20 +413,23 @@ def test_request_phase_over_budget_on_cheaper_model_allows() -> None:
     assert policy(_request(6.0, model="claude-sonnet-4-6")) == {"result": "ALLOW"}
 
 
-def test_request_phase_soft_checkpoint_does_not_ask() -> None:
-    """A crossed soft checkpoint does NOT ASK at the request phase → ALLOW.
+def test_request_phase_soft_checkpoint_asks_and_records_it() -> None:
+    """A crossed soft checkpoint ASKs at the request phase → ASK + record.
 
-    The soft gate is tool-call only: the request-phase (input) policy path
-    surfaces an ASK as a plain denial with no approval round-trip and no
-    ``state_updates`` persistence, so emitting "Continue?" there would
-    just block the turn and re-prompt forever. Below the hard cap, an
-    over-threshold request must therefore ALLOW (the warning fires at the
-    first tool call instead). A regression to ASK here would wedge every
-    text-only turn once spend passes the first checkpoint.
+    The request phase has a server-side approval round-trip (the engine
+    parks the whole turn before it reaches the model and applies the ASK's
+    ``state_updates`` only on accept), so a newly-crossed checkpoint must
+    ASK here exactly as it does on ``tool_call`` — warning text-only turns
+    too. The ASK carries the same ``state_updates`` SET so an approved
+    checkpoint (and lower ones) won't re-prompt.
     """
     policy = cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[2.0])
     # $2 is over the soft checkpoint but under the $5 hard cap.
-    assert policy(_request(2.0, model="opus")) == {"result": "ALLOW"}
+    result = policy(_request(2.0, model="opus"))
+    assert result["result"] == "ASK"
+    assert result["state_updates"] == [
+        {"key": _ASK_APPROVED_KEY, "action": "set", "value": 2.0},
+    ]
 
 
 def test_request_phase_below_threshold_allows() -> None:
@@ -434,20 +438,30 @@ def test_request_phase_below_threshold_allows() -> None:
     assert policy(_request(1.0, model="opus")) == {"result": "ALLOW"}
 
 
-def test_tool_call_still_asks_for_soft_checkpoint_after_request_allows() -> None:
-    """The soft warning still fires — at the first tool call, not the request.
+def test_request_phase_approved_checkpoint_does_not_reask() -> None:
+    """An already-approved checkpoint does NOT re-ASK at the request phase.
 
-    Pairs with :func:`test_request_phase_soft_checkpoint_does_not_ask`:
-    the same over-threshold spend that ALLOWs on ``request`` must ASK on
-    ``tool_call`` (where approval + state persistence work). This proves
-    the warning was relocated, not lost.
+    Once the request-phase ASK is approved its crossed value is persisted
+    to ``session_state``; the next request under the same checkpoint must
+    ALLOW (not re-prompt). A regression here would wedge every subsequent
+    turn on the approval card.
     """
     policy = cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[2.0])
-    result = policy(_tool(2.0, model="opus"))
-    assert result["result"] == "ASK"
-    assert result["state_updates"] == [
-        {"key": _ASK_APPROVED_KEY, "action": "set", "value": 2.0},
-    ]
+    event = _request(2.0, model="opus", session_state={_ASK_APPROVED_KEY: 2.0})
+    assert policy(event) == {"result": "ALLOW"}
+
+
+def test_request_approval_carries_over_to_tool_call() -> None:
+    """A request-phase approval suppresses the first tool call's re-ASK.
+
+    The request phase records the crossed checkpoint on approve, so the
+    first tool call of the same over-threshold turn sees it already
+    approved and ALLOWs — the user is warned once per checkpoint, not
+    twice (once on the turn, once on its first tool call).
+    """
+    policy = cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[2.0])
+    state = {_ASK_APPROVED_KEY: 2.0}
+    assert policy(_tool(2.0, model="opus", session_state=state)) == {"result": "ALLOW"}
 
 
 def test_unpriced_session_never_trips() -> None:

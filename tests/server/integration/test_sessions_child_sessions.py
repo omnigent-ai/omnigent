@@ -9,10 +9,11 @@ through the spawn workflow) — the route depends only on
 and the relay-fed ``_session_status_cache``, so direct seeding gives
 fast, deterministic coverage of every response field.
 
-The tasks table has been removed. ``current_task_id``, ``current_task_status``,
-and ``agent_name`` (previously derived from task rows) are now always
-``None``. ``agent_id`` is populated from the conversation row's
-``agent_id`` column.
+The tasks table has been removed. ``current_task_id`` and ``agent_name``
+(previously derived from task rows) are now always ``None``.
+``current_task_status`` is derived from session lifecycle state when
+available, and is otherwise ``None``. ``agent_id`` is populated from the
+conversation row's ``agent_id`` column.
 """
 
 from __future__ import annotations
@@ -206,6 +207,7 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     assert row["agent_name"] is None
     assert row["current_task_id"] is None
     assert row["current_task_status"] is None
+    assert row["last_task_error"] is None
     # No cache entry → busy=False.
     assert row["busy"] is False
 
@@ -215,6 +217,51 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     # No outstanding elicitations → 0 (the index is empty for a freshly
     # seeded child that never published an elicitation_request).
     assert row["pending_elicitations_count"] == 0
+
+
+async def test_child_sessions_surfaces_durable_failure_error(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A child with runner-owned failure labels is visibly failed.
+
+    Terminal/native harnesses can fail before a transcript item exists. The
+    session-status relay persists that failure as labels; the child summary
+    must project them as typed ``last_task_error`` so clients do not parse
+    internal labels or render the row as idle.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="researcher:auth",
+        agent_id=session["agent_id"],
+    )
+    conv_store.set_labels(
+        child.id,
+        {
+            sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "required_terminal_exited",
+            sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: (
+                "Required terminal exited unexpectedly"
+            ),
+        },
+    )
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+
+    assert resp.status_code == 200
+    row = resp.json()["data"][0]
+    assert row["busy"] is False
+    assert row["current_task_status"] == "failed"
+    assert row["last_task_error"] == {
+        "code": "required_terminal_exited",
+        "message": "Required terminal exited unexpectedly",
+    }
 
 
 # ── Pending elicitation count ─────────────────────────────
@@ -1542,3 +1589,107 @@ async def test_multipart_create_with_unknown_parent_404s(
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
     assert resp.status_code == 404, resp.text
+
+
+async def _create_native_child(client: httpx.AsyncClient, name: str) -> dict[str, Any]:
+    """
+    Create a claude-native sub-agent child under a fresh parent.
+
+    :param client: The test HTTP client.
+    :param name: Unique parent agent name for this test.
+    :returns: The created child session JSON.
+    """
+    parent = await _create_parent_with_subagents(
+        client,
+        name=name,
+        sub_agents=[{"name": "impl", "harness": "claude-native"}],
+    )
+    child_resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": parent["agent_id"],
+            "parent_session_id": parent["session_id"],
+            "title": "impl:task-1",
+            "sub_agent_name": "impl",
+        },
+    )
+    assert child_resp.status_code == 201, child_resp.text
+    return child_resp.json()
+
+
+async def test_subagent_idle_forward_recovers_via_parent_when_child_runner_stale(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A sub-agent ``idle`` whose direct forward 503s is re-delivered via recovery.
+
+    Reproduces the production hang's server edge: the child's pinned runner is
+    gone (direct ``_forward_session_change_to_runner`` returns ``None``), so the
+    terminal-status branch must invoke
+    ``_recover_subagent_status_forward_via_parent`` and, when it lands, accept
+    the event (``202`` — the parent gets the child result) instead of the old
+    hard ``503`` that left the parent hanging.
+    """
+    child = await _create_native_child(client, name="orch-recover-ok")
+
+    async def _forward_none(*_args: Any, **_kwargs: Any) -> None:
+        """Child's pinned runner is unreachable — the direct forward fails."""
+        return
+
+    recovered_for: list[str] = []
+
+    async def _recover_spy(child_conv: Any, *_args: Any, **_kwargs: Any) -> Any:
+        """Stand in for recovery: record the child and report a delivered 202."""
+        recovered_for.append(child_conv.id)
+        return sessions_module._RunnerForwardResult(status_code=202, body="")
+
+    monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_none)
+    monkeypatch.setattr(
+        sessions_module, "_recover_subagent_status_forward_via_parent", _recover_spy
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={"type": "external_session_status", "data": {"status": "idle"}},
+    )
+
+    # 202 Accepted is the endpoint's success code; the body confirms the event
+    # was handled (not the old 503 that stranded the parent).
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+    # Recovery was invoked for THIS child (the stale-binding heal path).
+    assert recovered_for == [child["id"]]
+
+
+async def test_subagent_idle_forward_503s_when_recovery_also_fails(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When recovery cannot reach a live parent runner either, the 503 is preserved.
+
+    The runner re-posts on a 503, so failing here (rather than acking a
+    delivery that never happened) keeps the at-least-once contract intact.
+    """
+    child = await _create_native_child(client, name="orch-recover-fail")
+
+    async def _forward_none(*_args: Any, **_kwargs: Any) -> None:
+        """Both the direct forward and (below) recovery cannot reach a runner."""
+        return
+
+    async def _recover_none(*_args: Any, **_kwargs: Any) -> None:
+        """Recovery also fails to resolve a live parent runner."""
+        return
+
+    monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_none)
+    monkeypatch.setattr(
+        sessions_module, "_recover_subagent_status_forward_via_parent", _recover_none
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={"type": "external_session_status", "data": {"status": "idle"}},
+    )
+
+    assert resp.status_code == 503, resp.text
