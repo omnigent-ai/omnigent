@@ -957,10 +957,10 @@ describe("NewChatLandingScreen", () => {
     // layout this guards.
     const label = (testid: string) => screen.getByTestId(testid).querySelector("span.truncate");
 
-    expect(label("new-chat-landing-workspace-chip")?.className).toContain("max-w-20");
-    expect(label("new-chat-landing-host-chip")?.className).toContain("max-w-24");
-    expect(label("new-chat-landing-project-chip")?.className).toContain("max-w-16");
-    expect(label("new-chat-landing-branch-chip")?.className).toContain("max-w-16");
+    expect(label("new-chat-landing-workspace-chip")?.className).toContain("max-w-40");
+    expect(label("new-chat-landing-host-chip")?.className).toContain("max-w-32");
+    expect(label("new-chat-landing-project-chip")?.className).toContain("max-w-32");
+    expect(label("new-chat-landing-branch-chip")?.className).toContain("max-w-32");
   });
 
   it("suppresses the conflict banner once a git branch is named", async () => {
