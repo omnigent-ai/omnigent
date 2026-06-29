@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import importlib
 import sys
+import types
 from pathlib import Path
 from typing import NoReturn
 
+import httpx
 import pytest
 
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -153,3 +155,85 @@ def test_select_artifact_store(
         port=8000,
     )
     assert isinstance(_select_artifact_store(resolved), expected_type)
+
+
+@pytest.mark.asyncio
+async def test_build_app_wires_policy_store_routes_and_config(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Docker build_app must enable persisted policy APIs and config policies."""
+    from deploy.docker.entrypoint import _ResolvedConfig, build_app
+    from omnigent.runtime import get_caps, get_policy_store
+    from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
+
+    fake_module = types.ModuleType("tests.fake_policy_module")
+
+    def allow_all(event: dict[str, object]) -> dict[str, str]:
+        return {"action": "ALLOW"}
+
+    fake_module.allow_all = allow_all
+    fake_module.POLICY_REGISTRY = [
+        {
+            "handler": "tests.fake_policy_module.allow_all",
+            "kind": "callable",
+            "name": "Allow All",
+            "description": "Test policy module entry",
+        }
+    ]
+    monkeypatch.setitem(sys.modules, "tests.fake_policy_module", fake_module)
+
+    built = build_app(
+        _ResolvedConfig(
+            cfg={
+                "policies": {
+                    "admin_default": {
+                        "type": "function",
+                        "handler": "tests.fake_policy_module.allow_all",
+                    },
+                },
+                "policy_modules": ["tests.fake_policy_module"],
+            },
+            database_url=db_uri,
+            artifact_dir=tmp_path / "artifacts",
+            artifact_store_uri=None,
+            host="0.0.0.0",
+            port=8000,
+        )
+    )
+
+    assert isinstance(get_policy_store(), SqlAlchemyPolicyStore)
+    assert [policy.name for policy in get_caps().default_policies] == ["admin_default"]
+
+    route_paths = {route.path for route in built.app.routes}
+    assert "/v1/policies" in route_paths
+    assert "/v1/policies/{policy_id}" in route_paths
+    assert "/v1/sessions/{session_id}/policies" in route_paths
+    assert "/v1/sessions/{session_id}/policies/{policy_id}" in route_paths
+    assert "/v1/sessions/{session_id}/policies/evaluate" in route_paths
+
+    async with built.app.router.lifespan_context(built.app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=built.app),
+            base_url="http://test",
+        ) as client:
+            registry_resp = await client.get("/v1/policy-registry")
+            assert registry_resp.status_code == 200
+            assert "tests.fake_policy_module.allow_all" in {
+                entry["handler"] for entry in registry_resp.json()["data"]
+            }
+
+            create_resp = await client.post(
+                "/v1/policies",
+                json={
+                    "name": "custom_default",
+                    "type": "python",
+                    "handler": "tests.fake_policy_module.allow_all",
+                },
+            )
+            assert create_resp.status_code == 200
+            assert create_resp.json()["name"] == "custom_default"

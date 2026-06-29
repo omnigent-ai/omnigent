@@ -39,6 +39,59 @@ Reset everything (drops the DB and the artifact store):
 docker compose down -v
 ```
 
+## Runtime policies
+
+Policy CRUD uses the same Postgres database as sessions, agents, and
+files. The entrypoint reads `DATABASE_URL`, runs Alembic `upgrade head`
+before building any stores, then wires `SqlAlchemyPolicyStore` into the
+runtime and API app. There is no separate policy-store environment
+variable.
+
+The startup migration path creates or upgrades the `policies` table on
+fresh and existing databases. If the migration fails, the container
+fails startup before serving traffic.
+
+Local end-to-end check:
+
+```bash
+cd deploy/docker
+./bootstrap.sh
+OMNIGENT_AUTH_ENABLED=0 docker compose down -v
+OMNIGENT_AUTH_ENABLED=0 docker compose up -d --build
+curl -fsS http://localhost:8000/health
+curl -fsS http://localhost:8000/openapi.json \
+  | jq -r '.paths | keys[] | select(test("polic"))'
+
+docker compose exec -T postgres sh -lc \
+'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+INSERT INTO users (id, is_admin) VALUES ('\''local'\'', true)
+ON CONFLICT (id) DO UPDATE SET is_admin = true;
+"'
+
+BASE=http://localhost:8000
+HANDLER=omnigent.policies.builtins.safety.ask_on_os_tools
+
+curl -fsS -X POST http://localhost:8000/v1/policies \
+  -H 'content-type: application/json' \
+  -d "{\"name\":\"local_default_policy\",\"type\":\"python\",\"handler\":\"$HANDLER\"}"
+curl -fsS http://localhost:8000/v1/policies | jq '.data'
+
+AGENT_ID=$(curl -fsS "$BASE/v1/agents" | jq -r '.data[0].id')
+SESSION_ID=$(curl -fsS -X POST "$BASE/v1/sessions" \
+  -H 'content-type: application/json' \
+  -d "{\"agent_id\":\"$AGENT_ID\",\"title\":\"policy crud smoke\"}" \
+  | jq -r '.id')
+curl -fsS -X POST "$BASE/v1/sessions/$SESSION_ID/policies" \
+  -H 'content-type: application/json' \
+  -d "{\"name\":\"local_session_policy\",\"type\":\"python\",\"handler\":\"$HANDLER\"}"
+curl -fsS "$BASE/v1/sessions/$SESSION_ID/policies" | jq '.data'
+
+docker compose restart omnigent
+curl -fsS http://localhost:8000/v1/policies | jq '.data'
+docker compose exec -T postgres sh -lc \
+'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "\d+ policies"'
+```
+
 ## Multi-user mode (accounts — default)
 
 Built-in accounts auth: no IdP to register, no proxy to host.

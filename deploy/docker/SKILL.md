@@ -43,7 +43,7 @@ Server is on http://localhost:8000.
 |---|---|
 | `Dockerfile` | Multi-stage build with two final targets. `web-builder` (node:20) runs `npm install && npm run build` on `web/`. `builder` (python:3.12) installs omnigent into `/opt/venv`; `server-builder` overlays the SPA bundle from `web-builder` and adds psycopg. The default target (`runtime`) copies the venv + `/build/` from `server-builder` and runs `entrypoint.py`. `--target host` builds the host image instead (from `builder`: omnigent + git/tmux, no SPA/psycopg/entrypoint). |
 | `Dockerfile.dockerignore` | BuildKit-aware exclude. Trims `deploy/databricks/`, `deploy/aws/`, tests, dev tooling — keeps the build context small. |
-| `entrypoint.py` | Server process entrypoint. Reads `DATABASE_URL`, runs Alembic migrations, builds the SQLAlchemy stores, calls `create_app()`, runs uvicorn. Single source of truth for what env vars the container respects. |
+| `entrypoint.py` | Server process entrypoint. Reads `DATABASE_URL`, runs Alembic migrations, builds the SQLAlchemy stores including the policy store, calls `create_app()`, runs uvicorn. Single source of truth for what env vars the container respects. |
 | `docker-compose.yaml` | Two services: `postgres` (16-alpine, persistent volume) and `omnigent` (built from the Dockerfile, depends on postgres healthcheck). Build context is `../..` (repo root). |
 | `.env.example` | Documents every env var the compose file passes through: `POSTGRES_PASSWORD`, `OMNIGENT_PORT`, all the `OMNIGENT_AUTH_*` and `OMNIGENT_OIDC_*` vars. |
 | `README.md` | Customer-facing quickstart + the OIDC walkthrough (GitHub OAuth, Google Workspace, generic OIDC). |
@@ -63,6 +63,55 @@ docker compose up -d --build
 If you change it in `.env`, you need `docker compose down -v` before
 `up -d` or the server will fail to authenticate against the existing
 cluster.
+
+## Runtime policies
+
+Runtime policy persistence uses the same Postgres database as the rest
+of the server. The Docker entrypoint reads `DATABASE_URL`, runs Alembic
+`upgrade head` before store construction, and then wires
+`SqlAlchemyPolicyStore` into both the runtime and FastAPI app. There is
+no separate policy-store environment variable.
+
+To verify policy CRUD locally:
+
+```bash
+cd deploy/docker
+./bootstrap.sh
+OMNIGENT_AUTH_ENABLED=0 docker compose down -v
+OMNIGENT_AUTH_ENABLED=0 docker compose up -d --build
+curl -fsS http://localhost:8000/health
+curl -fsS http://localhost:8000/openapi.json \
+  | jq -r '.paths | keys[] | select(test("polic"))'
+
+docker compose exec -T postgres sh -lc \
+'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+INSERT INTO users (id, is_admin) VALUES ('\''local'\'', true)
+ON CONFLICT (id) DO UPDATE SET is_admin = true;
+"'
+
+BASE=http://localhost:8000
+HANDLER=omnigent.policies.builtins.safety.ask_on_os_tools
+
+curl -fsS -X POST http://localhost:8000/v1/policies \
+  -H 'content-type: application/json' \
+  -d "{\"name\":\"local_default_policy\",\"type\":\"python\",\"handler\":\"$HANDLER\"}"
+curl -fsS http://localhost:8000/v1/policies | jq '.data'
+
+AGENT_ID=$(curl -fsS "$BASE/v1/agents" | jq -r '.data[0].id')
+SESSION_ID=$(curl -fsS -X POST "$BASE/v1/sessions" \
+  -H 'content-type: application/json' \
+  -d "{\"agent_id\":\"$AGENT_ID\",\"title\":\"policy crud smoke\"}" \
+  | jq -r '.id')
+curl -fsS -X POST "$BASE/v1/sessions/$SESSION_ID/policies" \
+  -H 'content-type: application/json' \
+  -d "{\"name\":\"local_session_policy\",\"type\":\"python\",\"handler\":\"$HANDLER\"}"
+curl -fsS "$BASE/v1/sessions/$SESSION_ID/policies" | jq '.data'
+
+docker compose restart omnigent
+curl -fsS http://localhost:8000/v1/policies | jq '.data'
+docker compose exec -T postgres sh -lc \
+'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "\d+ policies"'
+```
 
 ## Common debugging
 

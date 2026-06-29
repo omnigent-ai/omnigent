@@ -40,3 +40,12 @@ allowed_domains:
 # Extra Python modules scanned for POLICY_REGISTRY lists at startup.
 # policy_modules:
 #   - myorg.policies.safety
+
+# Server-wide runtime policies appended to every session. These are parsed with
+# the same grammar as an agent spec's guardrails.policies block. Policy CRUD
+# endpoints persist default and session-scoped policies in the Postgres
+# database selected by DATABASE_URL.
+# policies:
+#   block_bash_rm:
+#     type: function
+#     handler: myorg.policies.safety.block_bash_rm
